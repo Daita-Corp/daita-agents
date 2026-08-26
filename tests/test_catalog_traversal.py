@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -78,7 +80,9 @@ class _TraversalProjection(TypedDict):
 async def graph_agent(tmp_path: Path):
     database = tmp_path / "empty.sqlite"
     database.touch()
-    agent = await Agent.create("catalog-traversal", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-traversal", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await agent.attach(SQLiteSource(database, name="Traversal"))
     try:
         yield agent, source
@@ -379,7 +383,11 @@ async def test_multi_source_and_target_traversal_stays_source_shard_isolated(
 ):
     first_db = tmp_path / "first.sqlite"
     first_db.touch()
-    agent = await Agent.create("catalog-traversal-multi-source", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-traversal-multi-source",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     first = await agent.attach(SQLiteSource(first_db, name="First"))
     second = await _attach_empty_source(agent, tmp_path, "second")
     try:
@@ -743,8 +751,12 @@ async def test_inactive_sources_and_other_agents_are_never_traversable(
     second_db = tmp_path / "agent-two.sqlite"
     first_db.touch()
     second_db.touch()
-    first = await Agent.create("catalog-traversal-agent-one", root=tmp_path)
-    second = await Agent.create("catalog-traversal-agent-two", root=tmp_path)
+    first = await Agent.create(
+        "catalog-traversal-agent-one", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    second = await Agent.create(
+        "catalog-traversal-agent-two", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     first_source = await first.attach(SQLiteSource(first_db))
     second_source = await second.attach(SQLiteSource(second_db))
     try:

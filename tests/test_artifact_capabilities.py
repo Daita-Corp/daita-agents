@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -224,6 +226,7 @@ async def test_artifact_save_local_uses_only_committed_current_agent_artifact(
         model_profile=_profile(first_provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         foreign_id = (await first.run("Create a file.")).artifacts[0].artifact_id
@@ -235,6 +238,7 @@ async def test_artifact_save_local_uses_only_committed_current_agent_artifact(
         "artifact-owner-two",
         root=tmp_path,
         downloads_directory=second_downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         with pytest.raises(ArtifactError) as failure:
@@ -286,6 +290,7 @@ async def test_system_and_persistent_save_preflight_are_preauthorized_for_explic
         id_factory=_ids(),
         approval_handler=approve,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.run("Create and download a file.")
@@ -326,12 +331,15 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
         id_factory=_ids(),
         approval_handler=approve,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         created = await agent.run("Create a file.")
         artifact_id = created.artifacts[0].artifact_id
         run_id = "run-ffffffffffffffffffffffffffffffff"
-        destination = await agent._embedded._artifact_delivery.register_one_time(
+        delivery = agent._embedded._artifact_delivery
+        assert delivery is not None
+        destination = await delivery.register_one_time(
             one_time,
             run_id=run_id,
         )
@@ -409,6 +417,7 @@ async def test_export_location_change_always_requires_exact_once_only_model_appr
         id_factory=_ids(),
         approval_handler=approve,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Use Downloads for future exports.")
@@ -462,17 +471,16 @@ async def test_export_location_rejects_one_time_grant_and_rechecks_config_under_
         id_factory=_ids(),
         approval_handler=change_then_approve,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.set_export_destination(persistent)
         run_id = "run-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        one_time_view = await agent._embedded._artifact_delivery.register_one_time(
-            one_time, run_id=run_id
-        )
+        delivery = agent._embedded._artifact_delivery
+        assert delivery is not None
+        one_time_view = await delivery.register_one_time(one_time, run_id=run_id)
         with pytest.raises(ArtifactError) as rejected:
-            await agent._embedded._artifact_delivery.preflight_set_default(
-                one_time_view.destination_id
-            )
+            await delivery.preflight_set_default(one_time_view.destination_id)
         assert rejected.value.code == "artifact_destination_unauthorized"
         result = await agent.run("Change the future export location to Downloads.")
         tool_results = tuple(
@@ -498,6 +506,7 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
         model=provider,
         model_profile=_profile(provider),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Create and download a Markdown file.")
@@ -536,6 +545,7 @@ async def test_context_does_not_create_artifacts_for_ordinary_analysis_or_reads(
         model=provider,
         model_profile=_profile(provider),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Summarize the approach in chat.")
@@ -558,6 +568,7 @@ async def test_model_artifact_tools_use_exact_pinned_surface_without_classificat
         model=provider,
         model_profile=_profile(provider),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Show my user profile.")
@@ -594,6 +605,7 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
         model=provider,
         model_profile=_profile(provider),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Make Downloads my default export location.")

@@ -1,3 +1,4 @@
+from _workspace_support import workspace_for
 import asyncio
 import threading
 from collections.abc import Mapping
@@ -223,6 +224,7 @@ async def _agent(
         approval_handler=approval_handler,
         observer=observer,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
 
 
@@ -421,6 +423,7 @@ async def test_callback_exception_is_an_ordinary_tool_error_and_loop_continues(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=broken,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("try learning")
@@ -898,6 +901,7 @@ async def test_approval_state_is_not_persisted_across_restart(tmp_path):
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = (await _execute(reopened, _memory_call(content="not-approved")))[0]
@@ -925,6 +929,7 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run(
@@ -973,6 +978,7 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Save this as a reusable workflow for future runs.")
@@ -1016,6 +1022,7 @@ async def test_weak_learning_signal_stays_in_transcript_without_a_write(tmp_path
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Revenue happened to be 42 in this one result.")
@@ -1066,7 +1073,9 @@ async def test_learning_tool_descriptions_route_documents_and_require_write_firs
 
 
 async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
-    bootstrap = await Agent.create("replace-not-duplicate", root=tmp_path)
+    bootstrap = await Agent.create(
+        "replace-not-duplicate", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await bootstrap.save_skill(
             "monthly-revenue",
@@ -1114,6 +1123,7 @@ async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run(
@@ -1740,6 +1750,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
         model_profile=_profile(first_provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = (await _execute(agent, _skill_save_call(name="persisted")))[0]
@@ -1756,6 +1767,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
         model=reopened_provider,
         model_profile=_profile(reopened_provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert reopened_provider.requests == ()

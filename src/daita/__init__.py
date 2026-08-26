@@ -1,7 +1,6 @@
 """Export the public APIs for configuring and running a Daita agent."""
 
 from .adapters import (
-    LocalDirectorySource,
     MCPAdmissionError,
     MCPAuthentication,
     MCPAuthenticationMode,
@@ -93,6 +92,7 @@ from .semantics import (
     SemanticValidationError,
 )
 from .skills import Skill, SkillSummary
+from .workspace import LocalWorkspace
 
 __version__ = "1.0.0"
 
@@ -112,7 +112,7 @@ __all__ = [
     "ApprovalRequest",
     "ConversationRun",
     "CatalogSummary",
-    "LocalDirectorySource",
+    "LocalWorkspace",
     "DocumentCandidateContent",
     "DeliveryState",
     "DeliverySubject",

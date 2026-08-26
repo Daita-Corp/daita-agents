@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from daita import Agent
+from daita import Agent, LocalWorkspace
 from daita.llm import (
     FinishReason,
     ModelProfile,
@@ -140,8 +140,11 @@ async def create_offline_agent(
     root: Path,
     model: ScriptedModel,
 ) -> Agent:
+    workspace_root = root.parent / "workspace"
+    workspace_root.mkdir(mode=0o700, exist_ok=True)
     return await Agent.create(
         name,
+        workspace=LocalWorkspace(workspace_root),
         root=root,
         model=model,
         model_profile=OFFLINE_PROFILE,

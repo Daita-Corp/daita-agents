@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import sqlite3
 import threading
@@ -159,6 +161,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     xlsx_id = "artifact-00000000000000000000000000000001"
@@ -351,8 +354,11 @@ async def test_exact_artifact_read_does_not_cross_agent_homes(tmp_path: Path) ->
         model=provider,
         model_profile=_profile(provider),
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
-    second = await Agent.create("artifact-agent-two", root=tmp_path)
+    second = await Agent.create(
+        "artifact-agent-two", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         created = await first.run("Create a private artifact.")
         artifact_id = created.artifacts[0].artifact_id
@@ -386,6 +392,7 @@ async def test_artifact_convert_rejects_non_xlsx_without_creating_a_child(
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     text_id = "artifact-00000000000000000000000000000001"
     provider.replace_script(
@@ -445,6 +452,7 @@ async def test_artifact_conversion_cancellation_leaves_no_child_or_staging(
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     xlsx_id = "artifact-00000000000000000000000000000001"

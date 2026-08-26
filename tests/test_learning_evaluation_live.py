@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import json
 import os
 import re
@@ -278,6 +280,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
         approval_handler=approve_exact_definition,
         secret_provider=EnvironmentSecretProvider(),
         limits=limits,
+        workspace=workspace_for(tmp_path),
     )
     credential = SecretReference.environment(_DATABASE_PASSWORD)
     source = await agent.attach_postgresql(
@@ -330,6 +333,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
         approval_handler=approve_exact_definition,
         secret_provider=EnvironmentSecretProvider(),
         limits=limits,
+        workspace=workspace_for(tmp_path),
     )
     learned_exit = await reopened.run(
         "Using analytics.orders, analytics.order_items, analytics.products, "

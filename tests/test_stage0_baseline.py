@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import sqlite3
 from datetime import UTC, datetime
 
@@ -239,6 +241,7 @@ async def test_sensitive_admitted_source_excludes_route_before_provider_io(tmp_p
         root=tmp_path,
         model=router,
         model_profile=router.model_profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach(SQLiteSource(database))

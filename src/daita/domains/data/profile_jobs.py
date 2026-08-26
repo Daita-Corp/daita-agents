@@ -48,7 +48,6 @@ from ...loop.models import RunInput
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .capabilities import SqlReadBackend, SqlReadResult
-from .file_capabilities import LocalFileReadBackend, LocalFileReadResult
 from .sql import ResourceSchema
 
 DATA_PROFILE_DOMAIN_OWNER_ID = "data_profile_jobs"
@@ -305,10 +304,10 @@ class DataProfileAdmission:
                 self._agent_id,
                 source_id,
             )
-            if adapter not in {"sqlite", "postgresql", "local-directory"}:
+            if adapter not in {"sqlite", "postgresql"}:
                 raise CapabilityInputError(
                     "data_profile_adapter_unsupported",
-                    "The first data-profile job supports SQLite, PostgreSQL, CSV, and JSON resources.",
+                    "The first data-profile job supports SQLite and PostgreSQL resources.",
                 )
             adapters[source_id] = adapter
             for current_schema in await self._catalog.resource_schemas(
@@ -422,13 +421,11 @@ class DataProfileExecutor:
         catalog: DataProfileCatalog,
         sqlite_backend: SqlReadBackend,
         postgresql_backend: SqlReadBackend,
-        local_file_backend: LocalFileReadBackend,
     ) -> None:
         self._agent_id = agent_id
         self._catalog = catalog
         self._sqlite = sqlite_backend
         self._postgresql = postgresql_backend
-        self._local = local_file_backend
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         job_id = request.arguments["job_id"]
@@ -537,15 +534,7 @@ class DataProfileExecutor:
         binding: JobResourceBinding,
         schema: ResourceSchema,
         sample_rows: int,
-    ) -> SqlReadResult | LocalFileReadResult:
-        if binding.adapter_id == "local-directory":
-            return await self._local.execute_read(
-                agent_id=self._agent_id,
-                source_id=binding.source_id,
-                resource_id=binding.resource_id,
-                max_rows=sample_rows,
-                max_bytes=_MAX_PROFILE_READ_BYTES,
-            )
+    ) -> SqlReadResult:
         backend = self._sqlite if binding.adapter_id == "sqlite" else self._postgresql
         sql = f"SELECT * FROM {_quoted_relation(schema.name)} LIMIT {sample_rows}"
         result = await backend.execute_read(
@@ -574,6 +563,7 @@ class DataProfileCapabilityDomain:
         catalog: DataProfileCatalog,
         admission: DataProfileAdmission,
         learning: LearningCandidateGuard,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data-profile declarations have the wrong owner")
@@ -586,6 +576,9 @@ class DataProfileCapabilityDomain:
         self._catalog = catalog
         self._admission = admission
         self._learning = learning
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
         self._selected_profiles: dict[str, str] = {}
@@ -603,6 +596,8 @@ class DataProfileCapabilityDomain:
         self._selected_profiles.pop(run_id, None)
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
+        if run.id in self._files_only_run_ids:
+            return ()
         facts = await self._catalog.source_routing_facts(
             run.agent_id,
             (() if run.source_id is None else (run.source_id,)),
@@ -716,7 +711,6 @@ def data_profile_declarations(
     owner: JobOwner,
     sqlite_backend: SqlReadBackend,
     postgresql_backend: SqlReadBackend,
-    local_file_backend: LocalFileReadBackend,
     clock,
 ) -> tuple[DataProfileDeclarations, DataProfileAdmission]:
     internal = Capability(
@@ -763,7 +757,6 @@ def data_profile_declarations(
             catalog=catalog,
             sqlite_backend=sqlite_backend,
             postgresql_backend=postgresql_backend,
-            local_file_backend=local_file_backend,
         ),
     )
     return (

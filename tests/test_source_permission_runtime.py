@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -54,7 +56,11 @@ async def _agent_with_scope(
 ) -> tuple[Agent, Path, str, dict[str, CatalogResource]]:
     database = tmp_path / f"{mode.value}.sqlite"
     _database(database)
-    agent = await Agent.create(f"permission-runtime-{mode.value}", root=tmp_path)
+    agent = await Agent.create(
+        f"permission-runtime-{mode.value}",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     registration = await agent.attach(SQLiteSource(database))
     resources = {
         resource.name: resource

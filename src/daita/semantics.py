@@ -1587,6 +1587,8 @@ class SemanticCapabilityDomain:
         catalog: SemanticDomainCatalog,
         store: SemanticStore,
         learning: LearningCandidateGuard,
+        *,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("semantic declarations have the wrong domain owner")
@@ -1603,6 +1605,9 @@ class SemanticCapabilityDomain:
         self._catalog = catalog
         self._store = store
         self._learning = learning
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
         self._explicit_learning_runs: set[str] = set()
@@ -1633,6 +1638,8 @@ class SemanticCapabilityDomain:
             raise SemanticValidationError(issue[1])
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
+        if run.id in self._files_only_run_ids:
+            return ()
         facts = await self._catalog.source_routing_facts(
             run.agent_id,
             (() if run.source_id is None else (run.source_id,)),
@@ -2124,7 +2131,6 @@ class SemanticCapabilityDomain:
                 not in {
                     "data.sqlite.query_result",
                     "data.postgresql.query_result",
-                    "data.file.read_result",
                 }
             ):
                 return (

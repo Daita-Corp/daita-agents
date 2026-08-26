@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import json
 import sqlite3
@@ -18,7 +20,6 @@ from daita import (
     AgentEventKind,
     JobExecutionMode,
     JobStatus,
-    LocalDirectorySource,
     SQLiteSource,
 )
 from daita.adapters.job_profiles import (
@@ -146,7 +147,7 @@ def _database(path: Path) -> None:
 async def _seed_agent(tmp_path: Path, name: str) -> tuple[str, str]:
     database = tmp_path / f"{name}.sqlite"
     _database(database)
-    agent = await Agent.create(name, root=tmp_path)
+    agent = await Agent.create(name, root=tmp_path, workspace=workspace_for(tmp_path))
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = await agent.list_catalog_resources(source_id=source.id)
@@ -495,6 +496,7 @@ async def test_job_context_is_agent_scoped_and_result_first(tmp_path: Path) -> N
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent._embedded._store.admit_job(
@@ -539,6 +541,7 @@ async def test_daita_data_profile_runs_after_originating_interaction_and_reopens
         limits=EAGER_LIMITS,
         connected_job_profiles=(unused_profile,),
         observer=events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         exit = await agent.run("Profile the customer data.", source_id=source_id)
@@ -569,7 +572,9 @@ async def test_daita_data_profile_runs_after_originating_interaction_and_reopens
     finally:
         await agent.close()
 
-    reopened = await Agent.open("stage-b-daita", root=tmp_path)
+    reopened = await Agent.open(
+        "stage-b-daita", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         persisted = await reopened.inspect_job(job_id)
         assert persisted is not None
@@ -577,66 +582,6 @@ async def test_daita_data_profile_runs_after_originating_interaction_and_reopens
         assert (await reopened.read_job_result(job_id)) is not None
     finally:
         await reopened.close()
-
-
-async def test_data_profile_reads_csv_and_json_through_the_existing_file_domain(
-    tmp_path: Path,
-) -> None:
-    files = tmp_path / "profile-files"
-    files.mkdir()
-    (files / "customers.csv").write_text(
-        "id,region\n1,north\n2,south\n",
-        encoding="utf-8",
-    )
-    (files / "orders.json").write_text(
-        '[{"id": 10, "amount": 5.5}, {"id": 11, "amount": null}]',
-        encoding="utf-8",
-    )
-    seed = await Agent.create("stage-b-local-files", root=tmp_path)
-    try:
-        source = await seed.attach(LocalDirectorySource(files))
-        resources = await seed.list_catalog_resources(source_id=source.id)
-        profiled_resources = tuple(
-            item for item in resources if item.name in {"customers.csv", "orders.json"}
-        )
-        assert len(profiled_resources) == 2
-        await seed._embedded._store.replace_source_permission_scopes(
-            SourceReadScope(
-                agent_id=seed.id,
-                source_id=source.id,
-                mode=SourceReadMode.ALL,
-            ),
-            (),
-        )
-    finally:
-        await seed.close()
-
-    provider = MockModelProvider(
-        (_call_resources(tuple(item.id for item in profiled_resources)), _stop())
-    )
-    agent = await Agent.open(
-        "stage-b-local-files",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        limits=EAGER_LIMITS,
-    )
-    try:
-        await agent.run("Profile both local files.", source_id=source.id)
-        job_id = _job_id(provider)
-        inspection = await _terminal(agent, job_id)
-        assert inspection.summary.status is JobStatus.SUCCEEDED
-        result = await agent.read_job_result(job_id)
-        assert result is not None
-        assert result.summary["profiled_resources"] == 2
-        payload = await agent.read_artifact(result.artifact_refs[0].artifact_id)
-        document = json.loads(payload.content)
-        assert {item["name"] for item in document["resources"]} == {
-            "customers.csv",
-            "orders.json",
-        }
-    finally:
-        await agent.close()
 
 
 async def test_explicit_external_selection_reconciles_a_lost_start_response(
@@ -652,6 +597,7 @@ async def test_explicit_external_selection_reconciles_a_lost_start_response(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         connected_job_profiles=(profile,),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run(
@@ -692,6 +638,7 @@ async def test_external_cancel_intent_is_durable_before_lost_response(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         connected_job_profiles=(profile,),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run(
@@ -755,6 +702,7 @@ async def test_invalid_external_selection_fails_before_admission_or_io(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         connected_job_profiles=(() if profile is None else (profile,)),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run(
@@ -793,6 +741,7 @@ async def test_external_result_bound_fails_closed_without_daita_fallback(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         connected_job_profiles=(profile,),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run(
@@ -824,6 +773,7 @@ async def test_external_binding_drift_is_rejected_before_external_io(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         connected_job_profiles=(profile,),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run(
@@ -856,6 +806,7 @@ async def test_external_cancel_intent_precedes_fresh_profile_revalidation(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         connected_job_profiles=(profile,),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run(
@@ -899,6 +850,7 @@ async def test_reopen_past_deadline_reconciles_authoritative_external_success(
         limits=EAGER_LIMITS,
         clock=clock,
         connected_job_profiles=(profile,),
+        workspace=workspace_for(tmp_path),
     )
     await agent.run(
         "Start external work that must be reconciled after host loss.",
@@ -918,6 +870,7 @@ async def test_reopen_past_deadline_reconciles_authoritative_external_success(
         root=tmp_path,
         clock=clock,
         connected_job_profiles=(profile,),
+        workspace=workspace_for(tmp_path),
     )
     try:
         inspection = await _terminal(reopened, job_id)
@@ -941,6 +894,7 @@ async def test_public_and_model_job_result_reads_are_side_effect_free(
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Profile the source.", source_id=source_id)
@@ -985,6 +939,7 @@ async def test_same_source_jobs_run_concurrently_and_cancelling_one_isolates_its
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     _, executor = agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID
@@ -1045,6 +1000,7 @@ async def test_host_reopen_fences_and_safely_restarts_an_interrupted_daita_job(
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     _, executor = agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID
@@ -1072,7 +1028,9 @@ async def test_host_reopen_fences_and_safely_restarts_an_interrupted_daita_job(
         if not closed:
             await agent.close()
 
-    reopened = await Agent.open("stage-b-host-reopen", root=tmp_path)
+    reopened = await Agent.open(
+        "stage-b-host-reopen", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         terminal = await _terminal(reopened, job_id)
         assert terminal.summary.status is JobStatus.SUCCEEDED
@@ -1093,7 +1051,9 @@ async def test_stale_internal_capability_digest_fails_before_executor_or_source_
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source_id, _ = await _seed_agent(tmp_path, "stage-b-stale-capability")
-    agent = await Agent.open("stage-b-stale-capability", root=tmp_path)
+    agent = await Agent.open(
+        "stage-b-stale-capability", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     _, executor = agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID
     )
@@ -1141,6 +1101,7 @@ async def test_revoked_read_scope_is_rechecked_before_internal_executor_io(
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     _, executor = agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID
@@ -1199,6 +1160,7 @@ async def test_external_start_revalidates_current_scope_after_persisting_intent(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         connected_job_profiles=(profile,),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run(
@@ -1245,6 +1207,7 @@ async def test_published_artifact_wins_a_cancellation_completion_race(
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     store = agent._embedded._store
     original_finalize = store.finalize_job_attempt

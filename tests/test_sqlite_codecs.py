@@ -119,6 +119,36 @@ def _source() -> SourceRegistration:
     )
 
 
+@pytest.mark.parametrize(
+    ("adapter_id", "message"),
+    (
+        ("local-directory", "removed pre-production file-source state"),
+        ("future-adapter", "unsupported current adapter"),
+    ),
+)
+def test_source_codec_rejects_adapters_outside_the_current_state_shape(
+    adapter_id: str,
+    message: str,
+) -> None:
+    source = _source()
+    payload = json.loads(encode_source(source))
+    payload["fields"]["adapter_id"] = adapter_id
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ValueError, match=message):
+        decode_source(encoded)
+    unsupported = SourceRegistration.build(
+        agent_id=source.agent_id,
+        adapter_id=adapter_id,
+        native_identity=source.native_identity,
+        display_name=source.display_name,
+        configuration=source.configuration,
+        attached_at=source.attached_at,
+    )
+    with pytest.raises(ValueError, match=message):
+        encode_source(unsupported)
+
+
 def _receipt() -> DatabaseWriteReceipt:
     return DatabaseWriteReceipt.start(
         agent_id="agent-codec",

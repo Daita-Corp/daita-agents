@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import os
 from collections.abc import Mapping
 from decimal import Decimal
@@ -278,6 +280,7 @@ async def test_daita_catalogs_and_queries_large_multi_schema_postgresql(tmp_path
         model=provider,
         model_profile=_profile(provider),
         secret_provider=secrets,
+        workspace=workspace_for(tmp_path),
     )
     try:
         probe = await agent.probe_postgresql(
@@ -454,6 +457,7 @@ async def test_terminal_write_permissions_use_large_support_tickets(
         model=provider,
         model_profile=_profile(provider),
         secret_provider=secrets,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_postgresql(
@@ -534,6 +538,7 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
         model_profile=_profile(provider),
         secret_provider=secrets,
         approval_handler=approve_once,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_postgresql(

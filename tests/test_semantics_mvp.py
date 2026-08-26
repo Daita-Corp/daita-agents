@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -420,6 +422,7 @@ async def test_public_semantic_api_validates_catalog_and_evidence_and_survives_r
         model=provider,
         model_profile=_profile(provider),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         registration = await agent.attach_sqlite(database)
@@ -483,7 +486,9 @@ async def test_public_semantic_api_validates_catalog_and_evidence_and_survives_r
     finally:
         await agent.close()
 
-    reopened = await Agent.open("semantic-public", root=tmp_path)
+    reopened = await Agent.open(
+        "semantic-public", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         assert reopened.home == home
         view = await reopened.read_semantic_annotation("booked-revenue")
@@ -516,6 +521,7 @@ async def test_catalog_revision_staleness_is_read_time_only_and_never_recalled(
         model=first_provider,
         model_profile=_profile(first_provider),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_sqlite(database)
@@ -580,6 +586,7 @@ async def test_catalog_revision_staleness_is_read_time_only_and_never_recalled(
         model=provider,
         model_profile=_profile(provider),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await reopened.run("What does invoices.booked_at mean?")

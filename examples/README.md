@@ -3,7 +3,9 @@
 These examples use only the package in `src` and the completed public
 `Agent` API. Unless `--root` is provided, each walkthrough creates a fresh
 temporary root and removes it on exit. A supplied root should be dedicated to
-that example.
+that example. The shared helper also admits a separate sibling workspace,
+matching the required local `Agent.create(..., workspace=LocalWorkspace(...))`
+contract.
 
 The data walkthroughs exercise the MVP's read-only catalog and data tools with
 a tiny scripted provider, so they are deterministic, offline, and free of

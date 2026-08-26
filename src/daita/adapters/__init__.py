@@ -22,12 +22,6 @@ from .protocols import (
     SourceStore,
     StaleResourceError,
 )
-from .local_files import (
-    LocalDirectoryReadBackend,
-    LocalDirectoryResourceAdapter,
-    LocalDirectorySource,
-    LocalDirectorySourceError,
-)
 from .mcp import (
     MCPAdmissionError,
     MCPAuthentication,
@@ -59,10 +53,6 @@ __all__ = [
     "DiscoveryLimitError",
     "DiscoveryRequest",
     "DiscoveryResult",
-    "LocalDirectoryReadBackend",
-    "LocalDirectoryResourceAdapter",
-    "LocalDirectorySource",
-    "LocalDirectorySourceError",
     "MCPAdmissionError",
     "MCPAuthentication",
     "MCPAuthenticationMode",

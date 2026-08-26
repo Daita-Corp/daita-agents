@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -84,6 +86,7 @@ async def _create_artifact_agent(
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     result = await agent.run("Create a TXT file.")
     return agent, result.artifacts[0]
@@ -100,7 +103,10 @@ async def test_public_known_id_read_and_save_work_after_restart_without_rerunnin
     finally:
         await agent.close()
     reopened = await Agent.open(
-        "public-restart", root=tmp_path, downloads_directory=downloads
+        "public-restart",
+        root=tmp_path,
+        downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert (await reopened.read_artifact(ref.artifact_id)).content == (
@@ -129,7 +135,10 @@ async def test_public_save_path_is_one_time_and_public_set_location_is_persisten
     finally:
         await agent.close()
     reopened = await Agent.open(
-        "public-paths", root=tmp_path, downloads_directory=downloads
+        "public-paths",
+        root=tmp_path,
+        downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert (await reopened.export_destination()).destination_id == (
@@ -438,6 +447,7 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Create and download a Markdown report.")
@@ -462,6 +472,7 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
         "artifact-vertical",
         root=tmp_path,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert (await reopened.read_artifact(artifact_id)).content == (

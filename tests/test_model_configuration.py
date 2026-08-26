@@ -1,3 +1,4 @@
+from _workspace_support import workspace_for
 import asyncio
 import json
 import subprocess
@@ -113,7 +114,7 @@ def _tool_validation_response(provider_id: str) -> ModelResponse:
 
 
 async def _create_unconfigured(root: Path, name: str = "atlas") -> None:
-    agent = await Agent.create(name, root=root)
+    agent = await Agent.create(name, root=root, workspace=workspace_for(root))
     await agent.close()
 
 
@@ -134,6 +135,7 @@ async def _configure(
         root=root,
         keychain=keychain,
         model_validator=provider,
+        workspace=workspace_for(root),
     )
     try:
         return await agent.configure_model(
@@ -163,7 +165,9 @@ async def test_model_configuration_round_trips_without_persisting_the_key(tmp_pa
     assert route.candidates[0].secret_reference is not None
     assert route.candidates[0].secret_reference.to_uri() in persisted
 
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
     try:
         assert reopened.model_route == route
         assert reopened.model_profile == route.model_profile
@@ -192,6 +196,7 @@ async def test_explicit_model_injection_precedes_persisted_config_without_rewrit
         root=tmp_path,
         model=injected,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert agent.model_profile == profile
@@ -220,6 +225,7 @@ async def test_limits_override_retains_the_persisted_model_route(tmp_path):
         root=tmp_path,
         keychain=keychain,
         limits=limits,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert reopened.model_route == route
@@ -239,7 +245,7 @@ async def test_malformed_incomplete_or_oversized_config_fails_closed(
     path.write_bytes(content)
 
     with pytest.raises(Exception, match="model configuration"):
-        await Agent.open("atlas", root=tmp_path)
+        await Agent.open("atlas", root=tmp_path, workspace=workspace_for(tmp_path))
 
 
 async def test_symlinked_config_fails_closed(tmp_path):
@@ -250,7 +256,7 @@ async def test_symlinked_config_fails_closed(tmp_path):
     path.symlink_to(target)
 
     with pytest.raises(Exception, match="model configuration"):
-        await Agent.open("atlas", root=tmp_path)
+        await Agent.open("atlas", root=tmp_path, workspace=workspace_for(tmp_path))
 
 
 @pytest.mark.parametrize("mutation", ("missing_reference", "terminal_control"))
@@ -269,7 +275,7 @@ async def test_incomplete_or_terminal_unsafe_route_fails_closed(tmp_path, mutati
     path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(Exception, match="model configuration"):
-        await Agent.open("atlas", root=tmp_path)
+        await Agent.open("atlas", root=tmp_path, workspace=workspace_for(tmp_path))
 
 
 async def test_validation_requires_one_exact_tool_call_and_uses_route_retries(tmp_path):
@@ -353,7 +359,9 @@ async def test_manual_model_retains_explicit_limits_and_disables_parallel_tools(
     assert route.model_profile.max_output_tokens == 4_321
     assert route.model_profile.supports_tools is True
     assert route.model_profile.supports_parallel_tools is False
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
     try:
         assert reopened.model_profile == route.model_profile
     finally:
@@ -391,7 +399,9 @@ async def test_stale_profile_is_rejected_with_reconfiguration_error(tmp_path):
         AgentModelConfigurationError,
         match="must be replaced",
     ):
-        await Agent.open("atlas", root=tmp_path, keychain=keychain)
+        await Agent.open(
+            "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+        )
 
 
 async def test_failed_validation_preserves_previous_route_and_credential(tmp_path):
@@ -486,6 +496,7 @@ async def test_config_write_failure_preserves_old_route_and_removes_new_key(
         root=tmp_path,
         keychain=keychain,
         model_validator=_provider("anthropic:new-model"),
+        workspace=workspace_for(tmp_path),
     )
 
     def fail_write(home: Path, config) -> None:
@@ -547,7 +558,9 @@ async def test_old_credential_cleanup_failure_does_not_reverse_committed_route(
         new_reference.name: "new-secret",
     }
 
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
     try:
         assert reopened.model_route == replacement
     finally:
@@ -588,6 +601,7 @@ async def test_cancellation_during_post_commit_cleanup_returns_committed_route(
         root=tmp_path,
         keychain=keychain,
         model_validator=_provider("anthropic:new-model"),
+        workspace=workspace_for(tmp_path),
     )
     configuring = asyncio.create_task(
         agent.configure_model(
@@ -605,7 +619,9 @@ async def test_cancellation_during_post_commit_cleanup_returns_committed_route(
     finally:
         await agent.close()
 
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
     try:
         assert reopened.model_route == replacement
     finally:
@@ -626,6 +642,7 @@ async def test_same_instance_run_after_configuration_requires_reopen(tmp_path):
         root=tmp_path,
         keychain=keychain,
         model_validator=_provider("anthropic:new-model"),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.configure_model(
@@ -653,6 +670,7 @@ async def test_persisted_model_reference_must_belong_to_current_agent_and_provid
             root=tmp_path,
             keychain=keychain,
             model_validator=_provider(f"openai:{model}"),
+            workspace=workspace_for(tmp_path),
         )
         try:
             route = await agent.configure_model(
@@ -677,7 +695,9 @@ async def test_persisted_model_reference_must_belong_to_current_agent_and_provid
     before_events = tuple(keychain.events)
 
     with pytest.raises(Exception, match="model configuration"):
-        await Agent.open("beta", root=tmp_path, keychain=keychain)
+        await Agent.open(
+            "beta", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+        )
 
     assert tuple(keychain.events) == before_events
     assert keychain.values[references["alpha"].name] == "alpha-secret"
@@ -968,6 +988,7 @@ async def test_custom_provider_requires_an_explicit_base_url_before_key_storage(
         root=tmp_path,
         keychain=keychain,
         model_validator=_provider("custom:test-model"),
+        workspace=workspace_for(tmp_path),
     )
     try:
         with pytest.raises(ValueError, match="base URL"):
@@ -1000,6 +1021,7 @@ async def test_cancelled_close_keeps_writer_lock_until_admitted_configuration_fi
         root=tmp_path,
         keychain=keychain,
         model_validator=_provider("openai:replacement"),
+        workspace=workspace_for(tmp_path),
     )
     configure = asyncio.create_task(
         agent.configure_model(
@@ -1017,14 +1039,18 @@ async def test_cancelled_close_keeps_writer_lock_until_admitted_configuration_fi
     await asyncio.sleep(0)
 
     with pytest.raises(Exception, match="host_active"):
-        await Agent.open("atlas", root=tmp_path, keychain=keychain)
+        await Agent.open(
+            "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+        )
 
     release_set.set()
     route = await configure
     with pytest.raises(asyncio.CancelledError):
         await closing
 
-    reopened = await Agent.open("atlas", root=tmp_path, keychain=keychain)
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
     try:
         assert reopened.model_route == route
     finally:

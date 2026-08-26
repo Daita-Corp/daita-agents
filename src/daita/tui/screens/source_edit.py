@@ -39,9 +39,7 @@ class SourceEditScreen(Screen[bool]):
             )
             yield Button("Choose source", id="edit-source-choose")
             yield Input(placeholder="Display name", id="edit-source-name")
-            yield Input(
-                placeholder="SQLite file or local directory", id="edit-source-path"
-            )
+            yield Input(placeholder="SQLite file", id="edit-source-path")
             yield Input(placeholder="Host", id="edit-pg-host")
             yield Input(placeholder="Port", id="edit-pg-port")
             yield Input(placeholder="Database", id="edit-pg-database")
@@ -164,7 +162,7 @@ class SourceEditScreen(Screen[bool]):
         self._preview_error = None
         self._show_error("")
         try:
-            if self._adapter_id in {"sqlite", "local-directory"}:
+            if self._adapter_id == "sqlite":
                 raw_path = self.query_one("#edit-source-path", Input).value.strip()
                 if not raw_path:
                     raise ValueError("Enter the replacement path.")

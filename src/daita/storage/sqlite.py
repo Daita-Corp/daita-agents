@@ -120,6 +120,7 @@ from ..semantics import (
     semantic_annotation_sha256,
 )
 from .sqlite_codecs import (
+    CurrentSourceAdapterError,
     decode_autonomous_followup,
     decode_catalog_snapshot,
     decode_catalog_sync,
@@ -396,6 +397,8 @@ def _decode_source_state(
         raise SourcePermissionStateError("stored source permission state is invalid")
     try:
         registration = decode_source(source_data)
+    except CurrentSourceAdapterError as error:
+        raise SourcePermissionStateError(str(error)) from None
     except (TypeError, ValueError):
         raise SourcePermissionStateError(
             "stored source registration is invalid"

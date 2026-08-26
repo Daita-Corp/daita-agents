@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import os
 import sqlite3
 from collections.abc import AsyncIterator
@@ -169,6 +171,7 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
         model=eligible_route,
         model_profile=eligible_route.model_profile,
         limits=limits,
+        workspace=workspace_for(tmp_path / "eligible-agent-home"),
     )
     try:
         source = await eligible.attach(
@@ -213,6 +216,7 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
         model=ineligible_route,
         model_profile=ineligible_route.model_profile,
         limits=limits,
+        workspace=workspace_for(tmp_path / "ineligible-agent-home"),
     )
     try:
         blocked_source = await ineligible.attach(

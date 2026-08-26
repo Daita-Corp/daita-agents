@@ -342,13 +342,6 @@ class SourceSetupScreen(Screen[bool]):
                     Path(path_value).expanduser(),
                     name=name,
                 )
-            elif kind == "directory":
-                if not path_value:
-                    raise ValueError("A local directory requires a path")
-                registration = await self.app.controller.attach_directory(  # type: ignore[attr-defined]
-                    Path(path_value).expanduser(),
-                    name=name,
-                )
             elif kind == "postgresql":
                 registration = await self._attach_postgresql(name, path_value)
             else:

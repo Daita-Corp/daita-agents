@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import json
 import sqlite3
@@ -242,6 +244,7 @@ async def _mcp_limit_agent(tmp_path, name: str):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -266,6 +269,7 @@ async def _attach_two_bindings(tmp_path):
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     inspection = await agent.inspect_mcp_server(endpoint=alpha.endpoint)
     assert inspection.server_name == "fixture-alpha"
@@ -341,6 +345,7 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
         limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         statuses = await reopened.list_mcp_servers()
@@ -388,6 +393,7 @@ async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_pa
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -411,6 +417,7 @@ async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_pa
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert tuple(alpha.request_methods) == requests_after_attach
@@ -579,6 +586,7 @@ async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_p
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -695,6 +703,7 @@ async def test_existing_binding_identity_cannot_be_redirected_to_another_server(
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.attach_mcp_server(
@@ -738,6 +747,7 @@ async def test_cli_and_tui_expose_bounded_mcp_administration(tmp_path, monkeypat
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
 
     async def open_agent(*args, **kwargs):
@@ -774,8 +784,11 @@ async def test_cli_and_tui_expose_bounded_mcp_administration(tmp_path, monkeypat
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    controller = PresentationController(root=tmp_path)
+    controller = PresentationController(
+        root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     controller.agent = reopened
     try:
         shown = await controller.dispatch_command("/mcp")
@@ -863,6 +876,7 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     first = await agent.attach_mcp_server(
         endpoint=identity.endpoint,
@@ -892,8 +906,11 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = reopened
     async with app.run_test(size=(100, 34)) as pilot:
         await app._show_chat()
@@ -925,8 +942,11 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     reopen_calls: list[bool] = []
 
@@ -940,6 +960,7 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
             mcp_client_factory=factory,
             observer=observer,
             approval_handler=approval_handler,
+            workspace=workspace_for(tmp_path),
         )
         app.controller.agent = reopened
         return reopened
@@ -1014,6 +1035,7 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     attached = await agent.attach_mcp_server(
         endpoint=identity.endpoint,
@@ -1036,8 +1058,11 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = reopened
     async with app.run_test(size=(104, 38)) as pilot:
         await app._show_chat()
@@ -1121,8 +1146,11 @@ async def test_tui_attach_exposes_bounded_schema_rejection_reason(tmp_path):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    controller = PresentationController(root=tmp_path)
+    controller = PresentationController(
+        root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     controller.agent = agent
     try:
         with pytest.raises(
@@ -1168,6 +1196,7 @@ async def test_revocation_after_frozen_context_blocks_io_and_is_binding_isolated
         limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         run = asyncio.create_task(reopened.run("Prepare both calls."))
@@ -1210,6 +1239,7 @@ async def test_revocation_serializes_with_call_time_inspection(tmp_path):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1239,6 +1269,7 @@ async def test_revocation_serializes_with_call_time_inspection(tmp_path):
         model_profile=provider.model_profile,
         limits=EAGER_LIMITS,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         run = asyncio.create_task(reopened.run("Run the admitted call."))
@@ -1290,6 +1321,7 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         by_id = {
@@ -1316,6 +1348,7 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         by_id = {
@@ -1327,7 +1360,7 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
         await reopened.close()
 
 
-async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path):
+async def test_workspace_sensitivity_and_call_time_auth_use_current_admission(tmp_path):
     alpha, beta = conformance_identities()
     secrets = MappingSecretProvider({"env:BETA_TOKEN": "fixture-beta-secret"})
     factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha, beta))
@@ -1337,6 +1370,7 @@ async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     public_status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1386,6 +1420,7 @@ async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path
         limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         secrets.values["env:BETA_TOKEN"] = "wrong-at-call-time"
@@ -1399,9 +1434,9 @@ async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path
             if isinstance(block, ToolResultBlock)
             and block.output.get("kind") != "toolbox_load_receipt"
         )
-        assert not blocks[0].is_error
+        assert _error_code(blocks[0]) == "mcp_outbound_sensitivity_exceeded"
         assert _error_code(blocks[1]) == "mcp_authentication_failed"
-        assert alpha.calls == [("lookup", {"query": "x"})]
+        assert alpha.calls == []
         assert beta.calls == []
         assert "wrong-at-call-time" not in repr(blocks)
     finally:
@@ -1416,6 +1451,7 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     high = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1467,6 +1503,7 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         model_profile=provider.model_profile,
         limits=EAGER_LIMITS,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await reopened.run("Exercise the monotonic run floor.")
@@ -1481,12 +1518,12 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         )
         assert len(provider.requests) == 5
         assert tuple(request.sensitivity for request in provider.logical_requests) == (
-            ModelSensitivity.PUBLIC,
+            ModelSensitivity.INTERNAL,
             ModelSensitivity.CONFIDENTIAL,
             ModelSensitivity.CONFIDENTIAL,
         )
         assert blocks[0].sensitivity is ModelSensitivity.CONFIDENTIAL
-        assert blocks[0].sensitivity_provenance["run_sensitivity_floor"] == "public"
+        assert blocks[0].sensitivity_provenance["run_sensitivity_floor"] == "internal"
         assert _error_code(blocks[1]) == "mcp_outbound_sensitivity_exceeded"
         assert alpha.calls == [("lookup", {"query": "x"})]
     finally:
@@ -1502,6 +1539,7 @@ async def test_host_close_waits_for_remote_call_then_closes_mcp_client(tmp_path)
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1531,6 +1569,7 @@ async def test_host_close_waits_for_remote_call_then_closes_mcp_client(tmp_path)
         model_profile=provider.model_profile,
         limits=EAGER_LIMITS,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     activated = tuple(reopened._embedded._mcp_activated_bindings.values())
     run = asyncio.create_task(reopened.run("Use the blocking MCP read."))
@@ -1553,6 +1592,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1586,6 +1626,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
         model_profile=provider.model_profile,
         limits=EAGER_LIMITS,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await reopened.run("Exercise the result boundary.")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import io
 import json
@@ -228,6 +230,7 @@ async def test_explicit_review_creates_only_inactive_idempotent_candidate(tmp_pa
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.run(
@@ -287,6 +290,7 @@ async def test_review_skips_unreadable_history_and_reviews_new_compatible_runs(
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=ids,
+        workspace=workspace_for(tmp_path),
     )
     await agent.run("Historical request.")
     await agent.close()
@@ -314,6 +318,7 @@ async def test_review_skips_unreadable_history_and_reviews_new_compatible_runs(
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=ids,
+        workspace=workspace_for(tmp_path),
     )
     try:
         unavailable = await agent.review_learning_candidates()
@@ -347,6 +352,7 @@ async def test_local_review_preparation_failure_is_not_a_provider_failure(
         model=foreground,
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
+        workspace=workspace_for(tmp_path),
     )
 
     async def fail_artifact_state(self):
@@ -403,6 +409,7 @@ async def test_acceptance_uses_fresh_foreground_approval_and_marks_only_on_succe
         reviewer_model=reviewer,
         approval_handler=approve,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that booked revenue excludes completed refunds.")
@@ -460,6 +467,7 @@ async def test_denied_acceptance_has_no_active_effect_and_remains_awaiting(tmp_p
         reviewer_model=reviewer,
         approval_handler=deny,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that booked revenue excludes completed refunds.")
@@ -502,6 +510,7 @@ async def test_acceptance_without_approval_handler_fails_closed(tmp_path):
         limits=EAGER_LIMITS,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that booked revenue excludes completed refunds.")
@@ -567,6 +576,7 @@ async def test_acceptance_run_cannot_mutate_content_other_than_selected_candidat
         reviewer_model=reviewer,
         approval_handler=approve,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that booked revenue excludes completed refunds.")
@@ -605,6 +615,7 @@ async def test_cancelled_review_writes_no_candidate_or_review_stamp(tmp_path):
         reviewer_model=reviewer,
         reviewer_profile=reviewer.model_profile,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that our fiscal year begins in February.")
@@ -635,6 +646,7 @@ async def test_edit_reject_and_clear_are_individual_and_bounded(tmp_path):
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that our fiscal year begins in February.")
@@ -683,6 +695,7 @@ async def test_memory_terminal_surface_lists_shows_and_rejects_one_candidate(
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that our fiscal year begins in February.")
@@ -692,7 +705,9 @@ async def test_memory_terminal_surface_lists_shows_and_rejects_one_candidate(
         assert "Pending candidates:" in output.getvalue()
         assert candidate.candidate.id in output.getvalue()
 
-        controller = PresentationController(root=tmp_path)
+        controller = PresentationController(
+            root=tmp_path, workspace=workspace_for(tmp_path)
+        )
         controller.agent = agent
         shown = await controller.dispatch_command(
             f"/memory show {candidate.candidate.id}"
@@ -721,6 +736,7 @@ async def test_assistant_only_and_transient_proposals_are_deterministically_drop
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("What is booked revenue?")
@@ -762,6 +778,7 @@ async def test_source_scoped_candidate_cannot_be_accepted_through_another_source
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         source_a = await agent.attach_sqlite(first_path, name="first")
@@ -826,6 +843,7 @@ async def test_malformed_provider_and_cost_preconditions_have_no_candidate_effec
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that our fiscal year begins in February.")
@@ -865,6 +883,7 @@ async def test_malformed_and_token_exhausted_reviews_fail_closed_without_retry(
             model_profile=foreground.model_profile,
             reviewer_model=reviewer,
             id_factory=_ids(),
+            workspace=workspace_for(tmp_path),
         )
         try:
             await agent.run("Remember that our fiscal year begins in February.")
@@ -896,6 +915,7 @@ async def test_duplicate_model_proposals_collapse_before_persistence(tmp_path):
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that our fiscal year begins in February.")
@@ -927,6 +947,7 @@ async def test_reviewer_never_accepts_more_than_four_proposals(tmp_path):
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember these durable business conventions.")
@@ -951,6 +972,7 @@ async def test_candidate_obsolescence_is_derived_without_mutating_candidate_row(
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that our fiscal year begins in February.")
@@ -995,6 +1017,7 @@ async def test_candidate_rows_and_review_metadata_never_copy_transcript_material
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run(
@@ -1033,6 +1056,7 @@ async def test_reviewer_is_disabled_by_default_and_foreground_never_invokes_it(
         model=foreground,
         model_profile=foreground.model_profile,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Remember this.")
@@ -1119,6 +1143,7 @@ async def test_reviewer_request_excludes_secret_shaped_input_material(tmp_path):
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         memory_secret = "MEMORY_SECRET_123456"
@@ -1197,6 +1222,7 @@ async def test_reviewer_redacts_secret_values_inside_bounded_tool_results(tmp_pa
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_sqlite(database, name="credentials")
@@ -1282,6 +1308,7 @@ async def test_review_measurements_count_a_model_call_before_persistence_failure
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Remember that booked revenue excludes completed refunds.")

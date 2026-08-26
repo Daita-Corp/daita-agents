@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import inspect
 from collections.abc import Mapping
 from dataclasses import replace
@@ -439,7 +441,9 @@ def test_registry_digest_includes_presentation_and_effects_cannot_be_pinned() ->
 async def test_production_inventory_has_exact_membership_and_phase1_loading_policy(
     tmp_path,
 ) -> None:
-    agent = await Agent.create("phase1-toolbox-inventory", root=tmp_path)
+    agent = await Agent.create(
+        "phase1-toolbox-inventory", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         registry = agent._embedded._capabilities
         assert registry.tool_names
@@ -451,7 +455,8 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
             "catalog_search",
             "data_query_postgresql",
             "data_query_sqlite",
-            "data_read_file",
+            "file_read",
+            "file_search",
             "job_inspect",
             "job_list",
             "job_read_results",
@@ -480,10 +485,14 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
             "artifact_read",
             "artifact_save_local",
             "artifact_set_export_location",
-            "data_export_file",
             "data_export_postgresql",
             "data_export_sqlite",
         }
+        assert {
+            name
+            for name in registry.tool_names
+            if registry.resolve_tool(name)[0].presentation.toolbox_id is ToolboxId.FILES
+        } == {"file_read", "file_search"}
         assert registry.resolve_tool("start_data_profile")[
             0
         ].presentation.toolbox_id is (ToolboxId.JOBS)
@@ -908,6 +917,7 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
         root=tmp_path,
         model=MockModelProvider((), provider_id="mock:phase1-context"),
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         runtime = agent._embedded._capability_runtime
@@ -1037,6 +1047,7 @@ async def test_tool_free_wrap_up_reprojects_after_a_terminal_step_load(
         model=provider,
         model_profile=profile,
         limits=LoopLimits(max_steps=1),
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Prepare a document tool.")

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -118,14 +120,20 @@ def _registration(
 
 async def test_default_read_scope_round_trips_through_agent_reopen(tmp_path):
     agent = await Agent.create(
-        "source-permissions-reopen", root=tmp_path, clock=lambda: NOW
+        "source-permissions-reopen",
+        root=tmp_path,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     registration = _registration(agent.id)
     await agent._embedded._store.register_source(registration)
     await agent.close()
 
     reopened = await Agent.open(
-        "source-permissions-reopen", root=tmp_path, clock=lambda: NOW
+        "source-permissions-reopen",
+        root=tmp_path,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert await reopened.list_sources() == (registration,)
@@ -148,7 +156,12 @@ async def test_default_read_scope_round_trips_through_agent_reopen(tmp_path):
 async def test_detach_revokes_scopes_and_storage_reattachment_starts_read_only(
     tmp_path,
 ):
-    agent = await Agent.create("source-write-detach", root=tmp_path, clock=lambda: NOW)
+    agent = await Agent.create(
+        "source-write-detach",
+        root=tmp_path,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
     registration = _registration(agent.id)
     registered = await agent._embedded._store.register_source(registration)
     detached = await agent.detach(registration.id)
@@ -200,6 +213,7 @@ async def test_postgresql_refresh_preserves_read_scope_outside_connection_identi
         f"postgresql-refresh-{read_mode.value}",
         root=tmp_path,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     registration = _registration(agent.id)
     registered = await agent._embedded._store.register_source(registration)
@@ -294,6 +308,7 @@ async def test_committed_source_edit_deletes_only_the_previous_owned_credential(
         root=tmp_path,
         keychain=keychain,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     old_reference = await agent.store_postgresql_password("old-secret")
     new_reference = await agent.store_postgresql_password("new-secret")
@@ -467,7 +482,12 @@ def test_each_write_relevant_column_fact_changes_structural_revision(changed):
 async def test_catalog_projection_round_trips_ordered_keys_and_column_write_facts(
     tmp_path,
 ):
-    agent = await Agent.create("catalog-write-facts", root=tmp_path, clock=lambda: NOW)
+    agent = await Agent.create(
+        "catalog-write-facts",
+        root=tmp_path,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
     registration = _registration(agent.id)
     await agent._embedded._store.register_source(registration)
     columns = (
@@ -550,7 +570,12 @@ async def test_catalog_projection_round_trips_ordered_keys_and_column_write_fact
     finally:
         await agent.close()
 
-    reopened = await Agent.open("catalog-write-facts", root=tmp_path, clock=lambda: NOW)
+    reopened = await Agent.open(
+        "catalog-write-facts",
+        root=tmp_path,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         assert (
             await reopened._embedded._data_view.resource_schemas(agent_id, source_id)

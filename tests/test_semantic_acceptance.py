@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
@@ -124,7 +126,12 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
             "id INTEGER PRIMARY KEY, booked_at TEXT, paid_at TEXT, "
             "refund_state TEXT)"
         )
-    seed = await Agent.create("semantic-acceptance", root=tmp_path, clock=lambda: NOW)
+    seed = await Agent.create(
+        "semantic-acceptance",
+        root=tmp_path,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         source = await seed.attach_sqlite(database)
         resource = (await seed.list_catalog_resources())[0]
@@ -223,6 +230,7 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.learn("When we say booked revenue, use invoices.booked_at.")
@@ -266,6 +274,7 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         model_profile=_profile(reopened_provider),
         id_factory=_ids("reopen"),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await reopened.run("How should invoices booked revenue be calculated?")
@@ -304,6 +313,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_sqlite(database)
@@ -429,7 +439,7 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert conflict_maintenance["requires_revalidation"] is True
         semantic_domain.clear_explicit_learning_run(read_run.id)
 
-        controller = PresentationController(root=None)
+        controller = PresentationController(root=None, workspace=workspace_for(None))
         controller.agent = agent
         rendered = (await controller.dispatch_command("/memory")).message
         assert "Global memory:" in rendered

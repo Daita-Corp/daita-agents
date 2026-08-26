@@ -85,16 +85,6 @@ POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID = "data.postgresql.export_tabular.executor
 POSTGRESQL_TABULAR_EXPORT_TOOL_NAME = "data_export_postgresql"
 TABULAR_EXPORT_OUTPUT_KIND = "artifact.tabular_export"
 
-LOCAL_FILE_COPY_CAPABILITY_ID = "data.file.export_copy"
-LOCAL_FILE_COPY_EXECUTOR_ID = "data.file.export_copy.executor"
-LOCAL_FILE_COPY_TOOL_NAME = "data_export_file"
-LOCAL_FILE_COPY_OUTPUT_KIND = "artifact.file_copy"
-LOCAL_FILE_COPY_ALLOWED_EXTENSIONS = (
-    ("text/csv", (".csv",)),
-    ("application/json", (".json",)),
-)
-MAX_LOCAL_FILE_COPY_SECONDS = 60.0
-
 ARTIFACT_LIST_CAPABILITY_ID = "artifact.list"
 ARTIFACT_LIST_EXECUTOR_ID = "artifact.list.executor"
 ARTIFACT_LIST_TOOL_NAME = "artifact_list"
@@ -217,79 +207,6 @@ class ExactTabularExportBackend(Protocol):
         timeout_seconds: float,
         progress: ExactTabularProgress | None = None,
     ) -> ExactTabularExportResult: ...
-
-
-@dataclass(frozen=True, slots=True)
-class LocalFileCopyResult:
-    """One byte-preserving read of an exact current cataloged local resource."""
-
-    source_id: str
-    source_revision: str
-    resource_id: str
-    resource_revision: str
-    filename: str
-    format: str
-    media_type: str
-    content: bytes
-    sensitivity: Sensitivity
-
-    def __post_init__(self) -> None:
-        for value, name, maximum in (
-            (self.source_id, "source_id", 512),
-            (self.source_revision, "source_revision", 1_024),
-            (self.resource_id, "resource_id", 512),
-            (self.resource_revision, "resource_revision", 1_024),
-            (self.filename, "filename", 2_048),
-            (self.media_type, "media_type", 128),
-        ):
-            if (
-                not isinstance(value, str)
-                or not value.strip()
-                or value != value.strip()
-                or len(value) > maximum
-            ):
-                raise ValueError(f"local-file copy {name} is invalid")
-        if self.format not in {"csv", "json"}:
-            raise ValueError("local-file copy format is invalid")
-        expected_media_type = "text/csv" if self.format == "csv" else "application/json"
-        if self.media_type != expected_media_type:
-            raise ValueError("local-file copy media type does not match its format")
-        if (
-            not isinstance(self.content, bytes)
-            or not self.content
-            or len(self.content) > MAX_ARTIFACT_BYTES
-        ):
-            raise ValueError("local-file copy content is outside its byte bound")
-        if not isinstance(self.sensitivity, Sensitivity):
-            raise TypeError("local-file copy sensitivity must be Sensitivity")
-
-
-class LocalFileCopyBackend(Protocol):
-    async def execute_copy(
-        self,
-        *,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-        max_bytes: int,
-    ) -> LocalFileCopyResult: ...
-
-
-class LocalFileCopyIncompleteError(RuntimeError):
-    """Bounded source-copy failure translated at the artifact runtime boundary."""
-
-    def __init__(self, reason: str, *, completed_bytes: int = 0) -> None:
-        if reason not in {"byte_limit", "source_changed"}:
-            raise ValueError("local-file copy failure reason is invalid")
-        if (
-            not isinstance(completed_bytes, int)
-            or isinstance(completed_bytes, bool)
-            or completed_bytes < 0
-        ):
-            raise ValueError("completed_bytes must be non-negative")
-        self.reason = reason
-        self.completed_bytes = completed_bytes
-        super().__init__(reason)
 
 
 def resolved_exact_export_sensitivity(
@@ -455,115 +372,6 @@ class SQLiteTabularExportExecutor(_TabularExportExecutor):
 
 class PostgreSQLTabularExportExecutor(_TabularExportExecutor):
     executor_id = POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID
-
-
-class LocalFileCopyExecutor:
-    executor_id = LOCAL_FILE_COPY_EXECUTOR_ID
-
-    def __init__(
-        self,
-        agent_id: str,
-        backend: LocalFileCopyBackend,
-        *,
-        max_bytes: int = MAX_ARTIFACT_BYTES,
-        max_seconds: float = MAX_LOCAL_FILE_COPY_SECONDS,
-    ) -> None:
-        if not isinstance(agent_id, str) or not agent_id.strip():
-            raise ValueError("agent_id must be non-empty text")
-        if not callable(getattr(backend, "execute_copy", None)):
-            raise TypeError("backend must provide execute_copy")
-        if (
-            not isinstance(max_bytes, int)
-            or isinstance(max_bytes, bool)
-            or not 1 <= max_bytes <= MAX_ARTIFACT_BYTES
-        ):
-            raise ValueError("max_bytes is outside the artifact byte bound")
-        if (
-            not isinstance(max_seconds, (int, float))
-            or isinstance(max_seconds, bool)
-            or max_seconds <= 0
-        ):
-            raise ValueError("max_seconds must be positive")
-        self._agent_id = agent_id
-        self._backend = backend
-        self._max_bytes = max_bytes
-        self._max_seconds = float(max_seconds)
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        source_id = request.arguments["source_id"]
-        resource_id = request.arguments["resource_id"]
-        filename = request.arguments.get("filename")
-        assert isinstance(source_id, str)
-        assert isinstance(resource_id, str)
-        assert filename is None or isinstance(filename, str)
-        try:
-            async with asyncio.timeout(self._max_seconds):
-                result = await self._backend.execute_copy(
-                    agent_id=self._agent_id,
-                    source_id=source_id,
-                    resource_id=resource_id,
-                    max_bytes=self._max_bytes,
-                )
-        except LocalFileCopyIncompleteError as error:
-            message = (
-                "The local-file copy exceeds its byte limit."
-                if error.reason == "byte_limit"
-                else "The local file changed after its catalog snapshot."
-            )
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                message,
-                {
-                    "reason": error.reason,
-                    "completed_rows": 0,
-                    "completed_columns": 0,
-                    "completed_bytes": error.completed_bytes,
-                },
-            ) from error
-        except TimeoutError as error:
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "The local-file copy exceeded its execution-time limit.",
-                {
-                    "reason": "time_limit",
-                    "completed_rows": 0,
-                    "completed_columns": 0,
-                    "completed_bytes": 0,
-                },
-            ) from error
-        if result.source_id != source_id or result.resource_id != resource_id:
-            raise ValueError("local-file backend returned different resource scope")
-        safe_filename = canonical_artifact_filename(
-            filename or result.filename,
-            result.media_type,
-            LOCAL_FILE_COPY_ALLOWED_EXTENSIONS,
-        )
-        draft = ArtifactDraft(
-            content=result.content,
-            suggested_filename=safe_filename,
-            media_type=result.media_type,
-            sensitivity=resolved_exact_export_sensitivity((result.sensitivity,)),
-            provenance=ArtifactProvenance(
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                resource_bindings=(
-                    ArtifactResourceBinding(
-                        source_id=result.source_id,
-                        source_revision=result.source_revision,
-                        resource_id=result.resource_id,
-                        resource_revision=result.resource_revision,
-                    ),
-                ),
-            ),
-        )
-        return ToolOutput(
-            kind=LOCAL_FILE_COPY_OUTPUT_KIND,
-            data={
-                "format": result.format,
-                "filename": safe_filename,
-                "byte_size": len(result.content),
-            },
-            artifact=draft,
-        )
 
 
 class ArtifactListExecutor:
@@ -845,34 +653,42 @@ class ArtifactSetExportLocationExecutor:
 
 
 def artifact_declarations(
-    delivery: LocalArtifactDelivery,
+    delivery: LocalArtifactDelivery | None,
     artifacts: AgentHomeArtifactStore,
     *,
     agent_id: str,
-    local_file_backend: LocalFileCopyBackend,
     sqlite_backend: ExactTabularExportBackend,
     postgresql_backend: ExactTabularExportBackend,
     clock: Callable[[], datetime],
 ) -> ArtifactCapabilityDeclarations:
-    declarations = artifact_capability_declarations()
+    include_local_delivery = delivery is not None
+    declarations = artifact_capability_declarations(
+        include_local_delivery=include_local_delivery
+    )
+    delivery_executors: tuple[Executor, ...] = ()
+    if delivery is not None:
+        delivery_executors = (
+            ArtifactSaveLocalExecutor(delivery),
+            ArtifactSetExportLocationExecutor(delivery),
+        )
     return ArtifactCapabilityDeclarations(
         capabilities=declarations.capabilities,
         executors=(
             DocumentArtifactExecutor(),
-            LocalFileCopyExecutor(agent_id, local_file_backend),
             SQLiteTabularExportExecutor(agent_id, sqlite_backend, clock=clock),
             PostgreSQLTabularExportExecutor(agent_id, postgresql_backend, clock=clock),
             ArtifactListExecutor(artifacts),
             ArtifactReadExecutor(artifacts),
             ArtifactConvertExecutor(artifacts),
-            ArtifactSaveLocalExecutor(delivery),
-            ArtifactSetExportLocationExecutor(delivery),
+            *delivery_executors,
         ),
         tool_views=declarations.tool_views,
     )
 
 
-def artifact_capability_declarations() -> CapabilityDeclarations:
+def artifact_capability_declarations(
+    *, include_local_delivery: bool = True
+) -> CapabilityDeclarations:
     document = Capability(
         id=DOCUMENT_CREATE_CAPABILITY_ID,
         description=(
@@ -924,47 +740,6 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
         capability_id=POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         executor_id=POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID,
         adapter_name="PostgreSQL",
-    )
-    local_file_copy = Capability(
-        id=LOCAL_FILE_COPY_CAPABILITY_ID,
-        description=(
-            "Create one byte-identical artifact from a current attached cataloged "
-            "CSV or JSON resource without conversion or preview serialization."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source_id": {"type": "string", "minLength": 1, "maxLength": 512},
-                "resource_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 512,
-                },
-                "filename": {"type": "string", "minLength": 1, "maxLength": 120},
-            },
-            "required": ["source_id", "resource_id"],
-            "additionalProperties": False,
-        },
-        output_kind=LOCAL_FILE_COPY_OUTPUT_KIND,
-        output_schema={
-            "type": "object",
-            "properties": {
-                "format": {"type": "string", "enum": ["csv", "json"]},
-                "filename": {"type": "string"},
-                "byte_size": {"type": "integer", "minimum": 1},
-            },
-            "required": ["format", "filename", "byte_size"],
-            "additionalProperties": False,
-        },
-        executor_id=LOCAL_FILE_COPY_EXECUTOR_ID,
-        artifact_policy=ArtifactPolicy(
-            allowed_media_types=frozenset({"text/csv", "application/json"}),
-            allowed_extensions=LOCAL_FILE_COPY_ALLOWED_EXTENSIONS,
-            artifact_required=True,
-            max_artifact_count=1,
-            max_bytes_per_artifact=MAX_ARTIFACT_BYTES,
-            max_total_bytes_per_call=MAX_ARTIFACT_BYTES,
-        ),
     )
     artifact_list = Capability(
         id=ARTIFACT_LIST_CAPABILITY_ID,
@@ -1147,14 +922,12 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
     )
     capabilities = (
         document,
-        local_file_copy,
         sqlite_tabular,
         postgresql_tabular,
         artifact_list,
         artifact_read,
         artifact_convert,
-        save,
-        set_location,
+        *((save, set_location) if include_local_delivery else ()),
     )
     views = (
         ToolView(
@@ -1168,19 +941,6 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
                 summary="Create a bounded Markdown or text document artifact.",
                 when_to_use="Use when the requested deliverable is a document.",
                 keywords=("artifact", "document", "markdown", "text"),
-            ),
-        ),
-        ToolView(
-            name=LOCAL_FILE_COPY_TOOL_NAME,
-            capability_id=local_file_copy.id,
-            description=local_file_copy.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Copy one attached CSV or JSON file into an artifact.",
-                when_to_use="Use for byte-identical export of an attached data file.",
-                keywords=("artifact", "export", "file", "copy"),
             ),
         ),
         ToolView(
@@ -1251,31 +1011,37 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
                 keywords=("artifact", "convert", "xlsx", "csv"),
             ),
         ),
-        ToolView(
-            name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-            capability_id=save.id,
-            description=save.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Deliver one committed artifact to an authorized local destination.",
-                when_to_use="Use after artifact creation when local delivery is required.",
-                keywords=("artifact", "save", "deliver", "local"),
-            ),
-        ),
-        ToolView(
-            name=ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-            capability_id=set_location.id,
-            description=set_location.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Set an authorized destination as the future export default.",
-                when_to_use="Use only when the user explicitly changes the persistent default.",
-                keywords=("artifact", "destination", "export", "default"),
-            ),
+        *(
+            (
+                ToolView(
+                    name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+                    capability_id=save.id,
+                    description=save.description,
+                    presentation=ToolPresentation(
+                        toolbox_id=ToolboxId.ARTIFACTS,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
+                        summary="Deliver one committed artifact to an authorized local destination.",
+                        when_to_use="Use after artifact creation when local delivery is required.",
+                        keywords=("artifact", "save", "deliver", "local"),
+                    ),
+                ),
+                ToolView(
+                    name=ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+                    capability_id=set_location.id,
+                    description=set_location.description,
+                    presentation=ToolPresentation(
+                        toolbox_id=ToolboxId.ARTIFACTS,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
+                        summary="Set an authorized destination as the future export default.",
+                        when_to_use="Use only when the user explicitly changes the persistent default.",
+                        keywords=("artifact", "destination", "export", "default"),
+                    ),
+                ),
+            )
+            if include_local_delivery
+            else ()
         ),
     )
     return CapabilityDeclarations(
@@ -1298,29 +1064,27 @@ _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
 _ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
-        LOCAL_FILE_COPY_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
     }
 )
 _ARTIFACT_ADAPTER_CAPABILITIES = {
-    "local-directory": frozenset({LOCAL_FILE_COPY_CAPABILITY_ID}),
     "sqlite": frozenset({SQLITE_TABULAR_EXPORT_CAPABILITY_ID}),
     "postgresql": frozenset({POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}),
 }
-_ARTIFACT_CAPABILITIES = frozenset(
+_BASE_ARTIFACT_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
-        LOCAL_FILE_COPY_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_LIST_CAPABILITY_ID,
         ARTIFACT_READ_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
-        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
-        ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     }
+)
+_LOCAL_DELIVERY_CAPABILITIES = frozenset(
+    {ARTIFACT_SAVE_LOCAL_CAPABILITY_ID, ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID}
 )
 
 
@@ -1380,19 +1144,30 @@ class ArtifactCapabilityDomain:
         catalog: ArtifactDomainCatalog,
         transcripts: ArtifactTranscriptReader,
         artifacts: AgentHomeArtifactStore,
-        delivery: LocalArtifactDelivery,
+        delivery: LocalArtifactDelivery | None,
         learning: LearningCandidateGuard,
+        *,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("artifact declarations have the wrong domain owner")
-        if {item.id for item in declarations.capabilities} != _ARTIFACT_CAPABILITIES:
+        declared_ids = {item.id for item in declarations.capabilities}
+        if declared_ids not in {
+            _BASE_ARTIFACT_CAPABILITIES,
+            _BASE_ARTIFACT_CAPABILITIES | _LOCAL_DELIVERY_CAPABILITIES,
+        }:
             raise ValueError("artifact domain requires its exact capabilities")
+        if bool(declared_ids & _LOCAL_DELIVERY_CAPABILITIES) != (delivery is not None):
+            raise ValueError("artifact local delivery composition is inconsistent")
         self._declarations = declarations
         self._catalog = catalog
         self._transcripts = transcripts
         self._artifacts = artifacts
         self._delivery = delivery
         self._learning = learning
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -1401,9 +1176,13 @@ class ArtifactCapabilityDomain:
         return self._declarations
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
-        facts = await self._catalog.source_routing_facts(
-            run.agent_id,
-            (() if run.source_id is None else (run.source_id,)),
+        facts = (
+            ()
+            if run.id in self._files_only_run_ids
+            else await self._catalog.source_routing_facts(
+                run.agent_id,
+                (() if run.source_id is None else (run.source_id,)),
+            )
         )
         adapters = {
             adapter_id
@@ -1548,24 +1327,6 @@ class ArtifactCapabilityDomain:
                 )
         if capability.id in _EXACT_TABULAR_CAPABILITIES:
             await self._validate_sql(run, capability, arguments)
-        if capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
-            source_id = arguments.get("source_id")
-            resource_id = arguments.get("resource_id")
-            if (
-                not isinstance(source_id, str)
-                or not isinstance(resource_id, str)
-                or not await self._catalog.is_current_tabular_file(
-                    run.agent_id,
-                    source_id,
-                    resource_id,
-                )
-            ):
-                raise CapabilityInputError(
-                    "file_not_current_or_tabular",
-                    "The selected file is not a current tabular catalog resource.",
-                    {"source_id": source_id, "resource_id": resource_id},
-                )
-            await self._require_readable(run, source_id, (resource_id,))
         return arguments
 
     async def side_effect_plan(
@@ -1582,6 +1343,7 @@ class ArtifactCapabilityDomain:
                 approval_arguments=fingerprint,
             )
         if capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID:
+            assert self._delivery is not None
             return SideEffectPlan(
                 approval_arguments=fingerprint,
                 approval_reason=self._delivery.approval_prompt_for_default(fingerprint),
@@ -1668,12 +1430,6 @@ class ArtifactCapabilityDomain:
                 and output.data.get("row_count") == draft.provenance.row_count
                 and output.data.get("column_count") == len(draft.provenance.columns)
             )
-        elif capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
-            valid = (
-                output.data.get("format") in {"csv", "json"}
-                and output.data.get("filename") == draft.suggested_filename
-                and output.data.get("byte_size") == len(draft.content)
-            )
         elif capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
             valid = (
                 output.data.get("source_artifact_id")
@@ -1708,8 +1464,6 @@ class ArtifactCapabilityDomain:
                     arguments,
                     draft,
                 )
-            if capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
-                return await self._bind_file_copy(run, arguments, draft)
             if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
                 return await self._bind_conversion(run, arguments, draft)
             raise ToolOutputValidationError(
@@ -1766,7 +1520,7 @@ class ArtifactCapabilityDomain:
             if block.output.get("kind") not in {
                 "data.sqlite.query_result",
                 "data.postgresql.query_result",
-                "data.file.read_result",
+                "data.local_file.read_result",
             }:
                 raise CapabilityInputError(
                     "invalid_argument_value",
@@ -1780,6 +1534,10 @@ class ArtifactCapabilityDomain:
                     "Artifact evidence result data is unavailable.",
                     {"name": "evidence_call_ids", "call_id": call_id},
                 )
+            if block.sensitivity is not None:
+                sensitivities.append(Sensitivity(block.sensitivity.value))
+            if block.output.get("kind") == "data.local_file.read_result":
+                continue
             source_id = data.get("source_id")
             source_revision = data.get("source_revision")
             if not isinstance(source_id, str) or not isinstance(source_revision, str):
@@ -1788,27 +1546,14 @@ class ArtifactCapabilityDomain:
                     "Artifact evidence source identity is unavailable.",
                     {"name": "evidence_call_ids", "call_id": call_id},
                 )
-            resources: tuple[tuple[str, str], ...]
-            if block.output.get("kind") == "data.file.read_result":
-                resource_id = data.get("resource_id")
-                resource_revision = data.get("resource_revision")
-                resources = (
-                    ((resource_id, resource_revision),)
-                    if isinstance(resource_id, str)
-                    and isinstance(resource_revision, str)
-                    else ()
-                )
-            else:
-                raw_revisions = data.get("resource_revisions")
-                resources = tuple(
-                    (resource_id, revision)
-                    for item in (
-                        raw_revisions if isinstance(raw_revisions, tuple) else ()
-                    )
-                    if isinstance(item, Mapping)
-                    and isinstance((resource_id := item.get("resource_id")), str)
-                    and isinstance((revision := item.get("revision")), str)
-                )
+            raw_revisions = data.get("resource_revisions")
+            resources = tuple(
+                (resource_id, revision)
+                for item in (raw_revisions if isinstance(raw_revisions, tuple) else ())
+                if isinstance(item, Mapping)
+                and isinstance((resource_id := item.get("resource_id")), str)
+                and isinstance((revision := item.get("revision")), str)
+            )
             schemas = schema_cache.get(source_id)
             if schemas is None:
                 schemas = {
@@ -1956,78 +1701,6 @@ class ArtifactCapabilityDomain:
         return replace(
             draft,
             provenance=replace(provenance, resource_bindings=bindings),
-        )
-
-    async def _bind_file_copy(
-        self,
-        run: RunInput,
-        arguments: Mapping[str, object],
-        draft: ArtifactDraft,
-    ) -> ArtifactDraft:
-        source_id = arguments.get("source_id")
-        resource_id = arguments.get("resource_id")
-        if not isinstance(source_id, str) or not isinstance(resource_id, str):
-            raise ToolOutputValidationError(
-                "local-file copy execution arguments are unavailable"
-            )
-        provenance = draft.provenance
-        if len(provenance.resource_bindings) != 1:
-            raise ToolOutputValidationError(
-                "local-file copy provenance differs from byte-copy facts"
-            )
-        binding = provenance.resource_bindings[0]
-        identity = await self._catalog.resource_identity(run.agent_id, resource_id)
-        if (
-            await self._catalog.source_adapter_id(run.agent_id, source_id)
-            != "local-directory"
-            or identity != (source_id, "file", binding.resource_revision)
-            or not await self._catalog.is_current_tabular_file(
-                run.agent_id,
-                source_id,
-                resource_id,
-            )
-        ):
-            raise _incomplete_export(draft, "catalog_changed")
-        schema = next(
-            (
-                item
-                for item in await self._catalog.resource_schemas(
-                    run.agent_id,
-                    source_id,
-                )
-                if item.resource_id == resource_id
-            ),
-            None,
-        )
-        if (
-            schema is None
-            or schema.revision is None
-            or schema.source_revision is None
-            or schema.revision != binding.resource_revision
-            or schema.source_revision != binding.source_revision
-            or binding.source_id != source_id
-            or binding.resource_id != resource_id
-        ):
-            raise _incomplete_export(draft, "catalog_changed")
-        try:
-            sensitivity = Sensitivity(schema.sensitivity_class)
-        except ValueError:
-            sensitivity = Sensitivity.RESTRICTED
-        if draft.sensitivity is not _resolved_sensitivity((sensitivity,)):
-            raise _incomplete_export(draft, "catalog_changed")
-        return replace(
-            draft,
-            provenance=ArtifactProvenance(
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                resource_bindings=(
-                    ArtifactResourceBinding(
-                        source_id=source_id,
-                        source_revision=schema.source_revision,
-                        resource_id=resource_id,
-                        resource_revision=schema.revision,
-                    ),
-                ),
-            ),
         )
 
     async def _bind_conversion(
@@ -2358,15 +2031,6 @@ __all__ = [
     "ExactTabularExportBackend",
     "ExactTabularProgress",
     "ExactTabularExportResult",
-    "LOCAL_FILE_COPY_CAPABILITY_ID",
-    "LOCAL_FILE_COPY_EXECUTOR_ID",
-    "LOCAL_FILE_COPY_OUTPUT_KIND",
-    "LOCAL_FILE_COPY_TOOL_NAME",
-    "LocalFileCopyBackend",
-    "LocalFileCopyExecutor",
-    "LocalFileCopyIncompleteError",
-    "LocalFileCopyResult",
-    "MAX_LOCAL_FILE_COPY_SECONDS",
     "POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID",
     "POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID",
     "POSTGRESQL_TABULAR_EXPORT_TOOL_NAME",

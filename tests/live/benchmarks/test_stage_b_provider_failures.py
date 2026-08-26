@@ -8,6 +8,8 @@ cancel, or corrupt the independently admitted job.
 
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 from pathlib import Path
 
 import pytest
@@ -56,6 +58,7 @@ async def _open(
         model=provider,
         model_profile=profile,
         limits=OFFLINE_EAGER_LIMITS,
+        workspace=workspace_for(home.root),
     )
 
 

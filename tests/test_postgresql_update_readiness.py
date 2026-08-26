@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 from dataclasses import fields
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -608,7 +610,9 @@ async def test_public_agent_readiness_delegates_exact_scope_without_mutation(
         facts=_facts(),
     )
     calls: list[dict[str, object]] = []
-    agent = await Agent.create("public-readiness", root=tmp_path)
+    agent = await Agent.create(
+        "public-readiness", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
 
     async def readiness(**kwargs: object) -> PostgreSQLUpdateReadiness:
         calls.append(kwargs)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import sqlite3
 from collections.abc import Mapping
@@ -65,7 +67,6 @@ SEED_LIMITS = LoopLimits()
 ALLOWED_CAPABILITIES = (
     "catalog.inspect",
     "catalog.schema",
-    "data.file.read",
     "data.postgresql.query",
     "data.sqlite.query",
     "jobs.inspect",
@@ -247,7 +248,9 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -261,6 +264,7 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
         model_profile=provider.model_profile,
         limits=LIMITS,
         id_factory=ids,
+        workspace=workspace_for(tmp_path),
     )
     provider.replace_script(
         (
@@ -341,7 +345,9 @@ async def test_failed_terminal_job_delivers_grounded_no_result_report(
 ) -> None:
     database = tmp_path / "failed-source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-failed-job", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-failed-job", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -355,6 +361,7 @@ async def test_failed_terminal_job_delivers_grounded_no_result_report(
         model=seed,
         model_profile=seed.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     _, executor = agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID
@@ -388,6 +395,7 @@ async def test_failed_terminal_job_delivers_grounded_no_result_report(
         model=provider,
         model_profile=provider.model_profile,
         limits=LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         items = await _inbox(agent)
@@ -425,7 +433,9 @@ async def test_injected_router_fallback_is_scoped_sticky_and_delivers_once(
 ) -> None:
     database = tmp_path / "fallback-source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-router-fallback", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-router-fallback", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -439,6 +449,7 @@ async def test_injected_router_fallback_is_scoped_sticky_and_delivers_once(
         model=seed,
         model_profile=seed.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile before fallback", source_id=source.id)
@@ -489,6 +500,7 @@ async def test_injected_router_fallback_is_scoped_sticky_and_delivers_once(
         model=router,
         model_profile=router.model_profile,
         limits=LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         items = await _inbox(agent)
@@ -517,7 +529,9 @@ async def test_store_deduplicates_exact_event_and_rejects_conflicts(
     provider = MockModelProvider(
         (_start_profile("placeholder"), _stop("accepted")),
     )
-    agent = await Agent.create("stage-c-store", root=tmp_path)
+    agent = await Agent.create(
+        "stage-c-store", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await agent.attach(SQLiteSource(database))
     resource = (await agent.list_catalog_resources(source_id=source.id))[0]
     await agent.close()
@@ -532,6 +546,7 @@ async def test_store_deduplicates_exact_event_and_rejects_conflicts(
         model=provider,
         model_profile=provider.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile")
@@ -646,7 +661,9 @@ async def test_store_deduplicates_exact_event_and_rejects_conflicts(
 async def test_unavailable_pricing_fails_before_run_creation(tmp_path: Path) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-unpriced", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-unpriced", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -661,6 +678,7 @@ async def test_unavailable_pricing_fails_before_run_creation(tmp_path: Path) -> 
         model=provider,
         model_profile=provider.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile")
@@ -676,6 +694,7 @@ async def test_unavailable_pricing_fails_before_run_creation(tmp_path: Path) -> 
         model=unpriced,
         model_profile=unpriced.model_profile,
         limits=LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         for _ in range(300):
@@ -704,7 +723,9 @@ async def test_revoked_resource_scope_blocks_followup_before_reasoning(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-revoked", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-revoked", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -719,6 +740,7 @@ async def test_revoked_resource_scope_blocks_followup_before_reasoning(
         model=seed,
         model_profile=seed.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile")
@@ -735,6 +757,7 @@ async def test_revoked_resource_scope_blocks_followup_before_reasoning(
         model=provider,
         model_profile=provider.model_profile,
         limits=LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         for _ in range(300):
@@ -765,7 +788,9 @@ async def test_host_loss_before_run_creation_recovers_stale_claim(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-pre-run-loss", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-pre-run-loss", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -780,6 +805,7 @@ async def test_host_loss_before_run_creation_recovers_stale_claim(
         model=seed,
         model_profile=seed.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile")
@@ -842,6 +868,7 @@ async def test_host_loss_before_run_creation_recovers_stale_claim(
         model_profile=provider.model_profile,
         limits=LIMITS,
         clock=lambda: recovered_time,
+        workspace=workspace_for(tmp_path),
     )
     try:
         items = await _inbox(agent)
@@ -863,7 +890,9 @@ async def test_host_loss_after_terminal_commit_retries_delivery_not_reasoning(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-post-run-loss", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-post-run-loss", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -885,6 +914,7 @@ async def test_host_loss_after_terminal_commit_retries_delivery_not_reasoning(
         model_profile=provider.model_profile,
         limits=LIMITS,
         id_factory=ids,
+        workspace=workspace_for(tmp_path),
     )
     entered_finalizer = asyncio.Event()
     never = asyncio.Event()
@@ -923,6 +953,7 @@ async def test_host_loss_after_terminal_commit_retries_delivery_not_reasoning(
         model=recovery,
         model_profile=recovery.model_profile,
         limits=LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         items = await _inbox(agent)
@@ -950,7 +981,9 @@ async def test_one_delivery_failure_does_not_block_a_sibling_followup(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-sibling", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-sibling", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -970,6 +1003,7 @@ async def test_one_delivery_failure_does_not_block_a_sibling_followup(
         model=seed,
         model_profile=seed.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile first")
@@ -1023,6 +1057,7 @@ async def test_one_delivery_failure_does_not_block_a_sibling_followup(
         model=provider,
         model_profile=provider.model_profile,
         limits=LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         items = await _inbox(agent)
@@ -1047,7 +1082,9 @@ async def test_delivery_is_blocked_when_destination_sensitivity_is_too_low(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-sensitive", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-sensitive", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -1062,6 +1099,7 @@ async def test_delivery_is_blocked_when_destination_sensitivity_is_too_low(
         model=seed,
         model_profile=seed.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile")
@@ -1109,6 +1147,7 @@ async def test_delivery_is_blocked_when_destination_sensitivity_is_too_low(
         model=provider,
         model_profile=provider.model_profile,
         limits=LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         items = await _inbox(agent)
@@ -1135,7 +1174,9 @@ async def test_completed_model_text_without_all_job_evidence_fails_closed(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-evidence", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-evidence", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -1167,6 +1208,7 @@ async def test_completed_model_text_without_all_job_evidence_fails_closed(
         model_profile=provider.model_profile,
         limits=LIMITS,
         id_factory=ids,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile")
@@ -1191,7 +1233,9 @@ async def test_cleared_origin_conversation_does_not_revoke_followup(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-cleared", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-cleared", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -1206,6 +1250,7 @@ async def test_cleared_origin_conversation_does_not_revoke_followup(
         model=seed,
         model_profile=seed.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("origin text must not be required after clearing")
@@ -1229,6 +1274,7 @@ async def test_cleared_origin_conversation_does_not_revoke_followup(
         model=provider,
         model_profile=provider.model_profile,
         limits=LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         items = await _inbox(agent)
@@ -1250,7 +1296,9 @@ async def test_followup_history_excludes_other_conversation_sources(
     second_database = tmp_path / "second.sqlite"
     _database(first_database)
     _database(second_database)
-    bootstrap = await Agent.create("stage-c-cross-source", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-cross-source", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     first = await bootstrap.attach(SQLiteSource(first_database))
     second = await bootstrap.attach(SQLiteSource(second_database))
     first_resource = (await bootstrap.list_catalog_resources(source_id=first.id))[0]
@@ -1275,6 +1323,7 @@ async def test_followup_history_excludes_other_conversation_sources(
         model_profile=provider.model_profile,
         limits=LIMITS,
         id_factory=ids,
+        workspace=workspace_for(tmp_path),
     )
     try:
         first_result = await agent.run(
@@ -1359,7 +1408,9 @@ async def test_terminal_event_uses_bounded_result_preview_and_exact_digest(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-event-bound", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-event-bound", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -1374,6 +1425,7 @@ async def test_terminal_event_uses_bounded_result_preview_and_exact_digest(
         model=seed,
         model_profile=seed.model_profile,
         limits=SEED_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile")
@@ -1485,7 +1537,9 @@ async def test_inbox_uses_bounded_report_preview_and_run_reference(
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
-    bootstrap = await Agent.create("stage-c-report-bound", root=tmp_path)
+    bootstrap = await Agent.create(
+        "stage-c-report-bound", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await bootstrap.attach(SQLiteSource(database))
     resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
     await bootstrap.close()
@@ -1508,6 +1562,7 @@ async def test_inbox_uses_bounded_report_preview_and_run_reference(
         model_profile=provider.model_profile,
         limits=LIMITS,
         id_factory=ids,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("profile")

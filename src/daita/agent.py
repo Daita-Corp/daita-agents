@@ -90,6 +90,7 @@ from .storage.sqlite_records import (
     SourcePermissionsPreview,
     SourceReadMode,
 )
+from .workspace import LocalWorkspace
 
 
 class Agent:
@@ -125,6 +126,7 @@ class Agent:
         cls,
         name: str,
         *,
+        workspace: LocalWorkspace,
         root: str | Path | None = None,
         config: AgentConfig | None = None,
         model: ModelProvider | None = None,
@@ -148,6 +150,7 @@ class Agent:
         return cls(
             await EmbeddedAgent.create(
                 name,
+                workspace=workspace,
                 root=root,
                 config=config,
                 model=model,
@@ -174,6 +177,7 @@ class Agent:
         cls,
         name: str,
         *,
+        workspace: LocalWorkspace,
         root: str | Path | None = None,
         config: AgentConfig | None = None,
         model: ModelProvider | None = None,
@@ -197,6 +201,7 @@ class Agent:
         return cls(
             await EmbeddedAgent.open(
                 name,
+                workspace=workspace,
                 root=root,
                 config=config,
                 model=model,
@@ -229,6 +234,10 @@ class Agent:
     @property
     def home(self) -> Path:
         return self._embedded.home
+
+    @property
+    def workspace(self) -> LocalWorkspace:
+        return self._embedded.workspace
 
     @property
     def model_profile(self) -> ModelProfile | None:
@@ -298,12 +307,14 @@ class Agent:
         *,
         conversation_id: str | None = None,
         source_id: str | None = None,
+        files_only: bool = False,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
             message,
             conversation_id=conversation_id,
             source_id=source_id,
+            files_only=files_only,
             job_executor_profile_id=job_executor_profile_id,
         )
 
@@ -642,49 +653,6 @@ class Agent:
             path,
             confirmation_handler=confirmation_handler,
             name=name,
-        )
-
-    async def attach_local_directory(
-        self,
-        root: str | Path,
-        *,
-        name: str | None = None,
-    ) -> SourceRegistration:
-        return await self._embedded.attach_local_directory(root, name=name)
-
-    async def edit_local_directory_source(
-        self,
-        source_id: str,
-        root: str | Path,
-        *,
-        confirmation_handler: SourceEditConfirmationHandler,
-        name: str | None = None,
-        max_depth: int = 8,
-        max_files: int = 1_000,
-        max_file_bytes: int = 2 * 1024 * 1024,
-        max_columns: int = 512,
-        max_rows: int = 100_000,
-        max_json_nodes: int = 500_000,
-        max_json_depth: int = 32,
-        max_key_bytes: int = 1_024,
-        max_string_bytes: int = 256 * 1024,
-        max_cell_bytes: int = 1024 * 1024,
-    ) -> SourceEditResult | None:
-        return await self._embedded.edit_local_directory_source(
-            source_id,
-            root,
-            confirmation_handler=confirmation_handler,
-            name=name,
-            max_depth=max_depth,
-            max_files=max_files,
-            max_file_bytes=max_file_bytes,
-            max_columns=max_columns,
-            max_rows=max_rows,
-            max_json_nodes=max_json_nodes,
-            max_json_depth=max_json_depth,
-            max_key_bytes=max_key_bytes,
-            max_string_bytes=max_string_bytes,
-            max_cell_bytes=max_cell_bytes,
         )
 
     async def store_postgresql_password(self, password: str) -> SecretReference:

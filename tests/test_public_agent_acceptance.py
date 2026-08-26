@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 from collections.abc import Iterable, Mapping
 
 from daita import (
@@ -115,6 +117,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         limits=EAGER_LIMITS,
         approval_handler=approve,
         observer=events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.set_memory(initial_memory)
@@ -200,6 +203,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         model_profile=_profile(reopened_provider),
         approval_handler=approve,
         observer=events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert await reopened.read_memory() == updated_memory

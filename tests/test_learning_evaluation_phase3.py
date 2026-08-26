@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -313,6 +315,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         observer=events.append,
         approval_handler=approve,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     source = await baseline_agent.attach_sqlite(database, name="Commerce fixture")
     resources = {
@@ -406,6 +409,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         observer=events.append,
         approval_handler=approve,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     learned_lifecycle_start = len(events)
     teaching_exit = await teaching_agent.learn(
@@ -482,6 +486,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         limits=EAGER_LIMITS,
         observer=events.append,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     learned_exit = await learned_agent.run(
         "Using orders, order_items, products, customers, and regions, calculate "
@@ -526,6 +531,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         observer=events.append,
         approval_handler=deny,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     denied_source = await denied_agent.attach_sqlite(database, name="Denied fixture")
     denied_resources = {
@@ -592,6 +598,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         limits=EAGER_LIMITS,
         observer=events.append,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     denied_follow_up = await denied_reopened.run(
         "Calculate paid contribution margin.",

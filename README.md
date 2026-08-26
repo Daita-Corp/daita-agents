@@ -26,7 +26,7 @@ remains read only.
 
 | | |
 | --- | --- |
-| **Talk to real data** | Query SQLite, PostgreSQL, CSV, and JSON without writing SQL. |
+| **Talk to real data** | Query SQLite and PostgreSQL without writing SQL, and search or read files in one admitted workspace. |
 | **Use your preferred model** | OpenAI, Anthropic, Gemini, Grok, Ollama, a custom OpenAI compatible endpoint, or supported Codex, Claude Code, and Grok Build subscriptions. |
 | **Keep useful context** | Persist conversations, user approved memory, and reusable Markdown skills. |
 | **Stay in control** | Validate reads against the current catalog and require resource scoped readiness, preview, and exact approval for the limited PostgreSQL update. |
@@ -51,8 +51,9 @@ installed Python 3.11 or 3.12 explicitly:
 pipx install --python python3.12 daita-agents
 ```
 
-The first launch guides you through creating an agent, choosing a model, and
-attaching a read only source inside our Textual application; setup,
+The first launch admits one local workspace, then guides you through creating
+an agent, choosing a model, and optionally attaching a read-only source inside
+our Textual application; setup,
 chat, pickers, secret entry, confirmations, and approvals never fall back to a
 second line oriented interface. API backed models store their key in the OS
 keychain; local Ollama models need no key. Choosing **Codex subscription** starts
@@ -97,6 +98,11 @@ requests, not successful copies. If pointer or clipboard support is
 unavailable, use the terminal's own selection bypass modifier (often Shift)
 and copy command.
 
+The Files toolbox is independent of attached Sources. Use `/files <question>`
+for a files-only turn, `/workspace` to inspect the admitted root, and ordinary
+questions when Daita may use both workspace files and the selected source.
+Workspace file names and content are always treated as untrusted data.
+
 `/memory edit`, `/user edit`, `/memory edit <candidate-id>`, and `/skills
 create` or `/skills edit` use the configured `$EDITOR`. Textual temporarily
 restores the ordinary terminal while that external editor runs, then reacquires
@@ -120,9 +126,11 @@ Data access is read first. Capability metadata records data access separately
 from operational effect: ordinary queries read data without an operational
 effect, the durable-profile start reads current catalog scope and starts one
 job, and the explicitly scoped PostgreSQL update is the only current data
-mutation. SQL and local paths are checked against the current catalog before
-source I/O, and every requested tool call receives one ordered result even if
-another call fails.
+mutation. SQL is checked against the current catalog before source I/O.
+Workspace paths are separately validated through descriptor-relative
+containment, with no symlink following, traversal, secret-file reads, or
+special-file reads. Every requested tool call receives one ordered result even
+if another call fails.
 
 Agent identity, source registrations, catalog snapshots, transcripts, and
 terminal results live in a small SQLite database inside the agent home.
@@ -171,10 +179,10 @@ inactive inbox. `/memory accept <id>` handles exactly one candidate through a
 fresh foreground run and the normal approval path. There is no bulk
 acceptance.
 
-File requests use the same direct loop. Exact SQL results can become CSV or
-XLSX artifacts, while attached cataloged CSV and JSON resources can be copied
-byte-for-byte without passing source bytes through the model. A later turn can
-use a bounded model-only `artifact_list` for the current conversation,
+File requests use the same direct loop. The pinned `file_search` and
+`file_read` tools expose only bounded workspace-relative results and never add
+a Files-domain writer. Exact SQL results can become CSV or XLSX artifacts. A
+later turn can use a bounded model-only `artifact_list` for the current conversation,
 `artifact_read` for a bounded preview of an exact known ID owned by the agent,
 and `artifact_convert` for the supported current-conversation Daita XLSX `Data`
 snapshot to CSV conversion. This lets a new conversation read an exact artifact
@@ -190,6 +198,8 @@ internal artifact IDs but never deletes copies already delivered to user-owned
 directories.
 
 For the complete implementation boundaries, see [AGENTS.md](AGENTS.md).
+For workspace selection and read guarantees, see
+[Local workspaces](docs/LOCAL_WORKSPACES.md).
 
 ## Advanced/headless CLI
 
@@ -197,10 +207,11 @@ The zero argument `daita` command is the normal path. Automation friendly
 commands use the same public API:
 
 ```bash
-daita --root /private/tmp/daita create atlas
-daita --root /private/tmp/daita attach atlas sqlite /absolute/path/sales.db
-daita --root /private/tmp/daita run atlas "Summarize sales" \
+daita --root /private/tmp/daita --workspace /absolute/path/project create atlas
+daita --root /private/tmp/daita --workspace /absolute/path/project attach atlas sqlite /absolute/path/sales.db
+daita --root /private/tmp/daita --workspace /absolute/path/project run atlas "Summarize sales" \
   --model openai:gpt-4.1-mini
+daita --root /private/tmp/daita --workspace /absolute/path/project run atlas "Summarize the notes" --files-only
 ```
 
 `run` writes one JSON record. Provider credentials and PostgreSQL passwords
@@ -274,7 +285,8 @@ the operation can be retried.
 
 ## Python and examples
 
-The public async API supports creating and opening agents, attaching sources,
+The public async API requires an explicit `LocalWorkspace` when creating or
+opening a local agent. It also supports attaching sources,
 administering explicit remote MCP read bindings, running questions, continuing
 conversations, and inspecting transcripts.
 Start with the deterministic offline

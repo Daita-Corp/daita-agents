@@ -229,12 +229,16 @@ class MCPCapabilityDomain:
         agent_id: str,
         bindings: tuple[MCPActivatedBinding, ...],
         store: MCPBindingStore,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("MCP declarations belong to another domain")
         self._declarations = declarations
         self._agent_id = agent_id
         self._store = store
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._binding_by_capability = {
             tool.capability_id: (activated.binding, tool)
             for activated in bindings
@@ -251,7 +255,7 @@ class MCPCapabilityDomain:
         return self._declarations
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
-        if run.agent_id != self._agent_id:
+        if run.agent_id != self._agent_id or run.id in self._files_only_run_ids:
             return ()
         projected: list[str] = []
         bindings: dict[str, MCPServerBinding] = {}
@@ -394,6 +398,7 @@ async def activate_mcp_domain(
     client_factory: MCPClientFactory,
     secrets: SecretProvider,
     clock: Callable[[], datetime],
+    files_only_run_ids: set[str] | None = None,
 ) -> tuple[
     MCPCapabilityDomain | None,
     tuple[MCPActivatedBinding, ...],
@@ -478,6 +483,7 @@ async def activate_mcp_domain(
         agent_id=agent_id,
         bindings=tuple(activated),
         store=store,
+        files_only_run_ids=files_only_run_ids,
     )
     return domain, tuple(activated), tuple(item.executor for item in activated)
 

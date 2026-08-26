@@ -1,3 +1,4 @@
+from _workspace_support import workspace_for
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -1013,6 +1014,7 @@ async def test_embedded_streaming_persists_only_one_finalized_sqlite_message(tmp
         model=provider,
         model_profile=provider.model_profile,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("question")

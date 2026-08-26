@@ -90,8 +90,13 @@ class WelcomeView(Static):
                         style="dim",
                     ),
                     Text(),
-                    Text("Ask a question to begin", style="bold"),
-                    Text("Type / for commands  ·  @ for sources", style="dim"),
+                    Text(
+                        "Ask about workspace files; a source is optional", style="bold"
+                    ),
+                    Text(
+                        "Type / for commands  ·  /files for workspace  ·  @ for sources",
+                        style="dim",
+                    ),
                 )
             )
         while len(lines) < len(_LOGO_LINES):
@@ -154,8 +159,12 @@ class WelcomeView(Static):
         if self._booting:
             content.append("\nStarting your workspace…", style="dim")
         else:
-            content.append("\nAsk a question to begin", style="bold")
-            content.append("\nType / for commands  ·  @ for sources", style="dim")
+            content.append(
+                "\nAsk about workspace files; a source is optional", style="bold"
+            )
+            content.append(
+                "\nType / for commands  ·  /files for workspace", style="dim"
+            )
         return content
 
     def _refresh_content(self) -> None:

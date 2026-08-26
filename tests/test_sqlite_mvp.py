@@ -1,3 +1,4 @@
+from _workspace_support import workspace_for
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -266,7 +267,7 @@ async def test_default_agent_root_uses_final_daita_home(
     monkeypatch: pytest.MonkeyPatch,
 ):
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    agent = await Agent.create("default-root")
+    agent = await Agent.create("default-root", workspace=workspace_for(None))
     try:
         assert agent.home == tmp_path / ".daita" / "agents" / "default-root"
     finally:
@@ -296,6 +297,7 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     provider._script = (
@@ -333,7 +335,9 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
     assert isinstance(rows[0], Mapping)
     assert rows[0]["product"] == "beta"
 
-    reopened = await Agent.open("sales", root=tmp_path)
+    reopened = await Agent.open(
+        "sales", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         restored = await reopened.transcript(result.run_id)
         assert restored == transcript
@@ -357,7 +361,11 @@ async def test_invalid_sql_is_a_model_visible_tool_error(tmp_path):
         supports_tools=True,
     )
     agent = await Agent.create(
-        "sales", root=tmp_path, model=provider, model_profile=profile
+        "sales",
+        root=tmp_path,
+        model=provider,
+        model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     provider._script = (

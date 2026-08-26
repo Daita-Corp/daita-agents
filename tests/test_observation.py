@@ -1,3 +1,4 @@
+from _workspace_support import workspace_for
 import asyncio
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, replace
@@ -722,6 +723,7 @@ async def test_public_create_and_open_inject_the_observer(tmp_path):
         model=first_provider,
         model_profile=profile,
         observer=created_events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("create path")
@@ -736,6 +738,7 @@ async def test_public_create_and_open_inject_the_observer(tmp_path):
         model=second_provider,
         model_profile=profile,
         observer=opened_events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await reopened.run("open path")

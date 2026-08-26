@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -12,7 +14,7 @@ from _capability_runtime_support import execute_projected
 
 import daita.catalog.service as catalog_service
 import daita.storage.sqlite as sqlite_store
-from daita import Agent, LocalDirectorySource, SQLiteSource
+from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import (
     CapabilityInputError,
@@ -734,7 +736,9 @@ async def test_schema_slice_spans_eight_tables_with_exact_compact_structure(
 ):
     database = tmp_path / "fixture.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-eight", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-eight", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = await agent.list_catalog_resources(source_id=source.id)
@@ -844,7 +848,9 @@ async def test_connected_schema_selects_direct_and_required_bridge_paths(
 ):
     database = tmp_path / "connected.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-connected", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-connected", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = {
@@ -914,7 +920,9 @@ async def test_connected_schema_builds_deterministic_three_seed_join_tree(
 ):
     database = tmp_path / "join-tree.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-join-tree", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-join-tree", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = {
@@ -960,7 +968,9 @@ async def test_connected_schema_three_seed_tree_reuses_one_shared_bridge(
 ):
     database = tmp_path / "shared-bridge.sqlite"
     database.touch()
-    agent = await Agent.create("catalog-schema-shared-bridge", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-shared-bridge", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resource_ids, relationships = await _commit_schema_graph(
@@ -1011,7 +1021,9 @@ async def test_connected_schema_three_seed_tree_reuses_one_shared_bridge(
 async def test_connected_schema_labels_bounded_single_seed_neighbors(tmp_path: Path):
     database = tmp_path / "neighbors.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-neighbors", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-neighbors", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         customer = next(
@@ -1040,7 +1052,9 @@ async def test_connected_schema_query_seeds_are_diversified_and_keep_match_terms
 ):
     database = tmp_path / "query-seeds.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-query-seeds", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-query-seeds", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.attach(SQLiteSource(database))
         projection = await _schema(
@@ -1107,7 +1121,9 @@ async def test_connected_schema_preserves_composite_field_pairs_and_reverse_path
                     REFERENCES parent (tenant_id, entity_id)
             );
         """)
-    agent = await Agent.create("catalog-schema-composite", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-composite", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = {
@@ -1135,7 +1151,11 @@ async def test_connected_schema_uses_only_connector_paths_with_duplicate_names(
 ):
     database = tmp_path / "connector-only.sqlite"
     database.touch()
-    agent = await Agent.create("catalog-schema-connector-only", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-connector-only",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resource_ids, relationships = await _commit_schema_graph(
@@ -1211,7 +1231,9 @@ async def test_connected_schema_uses_only_connector_paths_with_duplicate_names(
 async def test_connected_schema_paths_ignore_snapshot_insertion_order(tmp_path: Path):
     database = tmp_path / "path-order.sqlite"
     database.touch()
-    agent = await Agent.create("catalog-schema-path-order", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-path-order", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         nodes = {
@@ -1268,8 +1290,12 @@ async def test_connected_schema_is_agent_isolated(tmp_path: Path):
     second_database = tmp_path / "agent-second.sqlite"
     first_database.touch()
     second_database.touch()
-    first_agent = await Agent.create("catalog-schema-agent-first", root=tmp_path)
-    second_agent = await Agent.create("catalog-schema-agent-second", root=tmp_path)
+    first_agent = await Agent.create(
+        "catalog-schema-agent-first", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    second_agent = await Agent.create(
+        "catalog-schema-agent-second", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await first_agent.attach(SQLiteSource(first_database))
         second_source = await second_agent.attach(SQLiteSource(second_database))
@@ -1293,7 +1319,9 @@ async def test_connected_schema_is_agent_isolated(tmp_path: Path):
 async def test_connected_schema_rejects_non_tabular_file_paths(tmp_path: Path):
     database = tmp_path / "non-tabular.sqlite"
     database.touch()
-    agent = await Agent.create("catalog-schema-non-tabular", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-non-tabular", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resource_ids, _ = await _commit_schema_graph(
@@ -1337,7 +1365,9 @@ async def test_schema_capability_validates_output_and_is_smaller_than_inspection
 ):
     database = tmp_path / "capability.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-capability", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-capability", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = await agent.list_catalog_resources(source_id=source.id)
@@ -1402,7 +1432,11 @@ async def test_catalog_search_capability_exposes_correct_returned_and_scoped_cou
 ):
     database = tmp_path / "search-capability-counts.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-search-capability-counts", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-search-capability-counts",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         await agent.attach(SQLiteSource(database))
         registry: CapabilityRegistry = agent._embedded._capabilities
@@ -1428,7 +1462,9 @@ async def test_catalog_search_capability_exposes_correct_returned_and_scoped_cou
 async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_explicit(
     tmp_path: Path,
 ):
-    agent = await Agent.create("catalog-input-contracts", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-input-contracts", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         registry: CapabilityRegistry = agent._embedded._capabilities
         search_definition = registry.tool_definition("catalog_search")
@@ -1599,6 +1635,7 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach(SQLiteSource(database))
@@ -1658,7 +1695,9 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
 async def test_catalog_tool_contract_exposes_and_enforces_progressive_bounds(
     tmp_path: Path,
 ):
-    agent = await Agent.create("catalog-progressive-contract", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-progressive-contract", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         registry: CapabilityRegistry = agent._embedded._capabilities
         schema_definition = registry.tool_definition("catalog_schema")
@@ -1854,7 +1893,9 @@ async def test_structural_search_ranks_direct_matches_before_one_hop_neighbors(
                 order_id INTEGER NOT NULL REFERENCES orders(id)
             );
             """)
-    agent = await Agent.create("catalog-structural-search", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-structural-search", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.attach(SQLiteSource(database))
         result = await agent.search_catalog(
@@ -1896,7 +1937,9 @@ async def test_schema_scope_is_strict_current_and_source_file_is_not_read(
         )
     with sqlite3.connect(second_database) as connection:
         connection.execute("CREATE TABLE second_table (id INTEGER PRIMARY KEY)")
-    agent = await Agent.create("catalog-schema-scope", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-scope", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         first = await agent.attach(SQLiteSource(first_database))
         second = await agent.attach(SQLiteSource(second_database))
@@ -1935,7 +1978,9 @@ async def test_schema_refresh_filters_old_resources_and_carries_new_revisions(
         connection.execute(
             "CREATE TABLE current_table (id INTEGER PRIMARY KEY, value TEXT)"
         )
-    agent = await Agent.create("catalog-schema-refresh", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-refresh", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         old_resource = (await agent.list_catalog_resources(source_id=source.id))[0]
@@ -1975,7 +2020,9 @@ async def test_connected_schema_refresh_removes_stale_join_paths(tmp_path: Path)
                 bridge_id INTEGER NOT NULL REFERENCES bridge(id)
             );
         """)
-    agent = await Agent.create("catalog-schema-stale-path", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-stale-path", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = {
@@ -2020,7 +2067,9 @@ async def test_connected_schema_reuses_one_compilation_per_exact_generation(
 ):
     database = tmp_path / "schema-compilation.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-compilation", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-compilation", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = {
@@ -2051,7 +2100,11 @@ async def test_schema_slice_reopens_with_one_decode_and_identical_payload(
 ):
     database = tmp_path / "coherent-reopen.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-coherent-reopen", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-coherent-reopen",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     source = await agent.attach(SQLiteSource(database))
     resources = await agent.list_catalog_resources(source_id=source.id)
     resource_ids = tuple(resource.id for resource in resources)
@@ -2067,7 +2120,11 @@ async def test_schema_slice_reopens_with_one_decode_and_identical_payload(
         return original_decode(value)
 
     monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
-    reopened = await Agent.open("catalog-schema-coherent-reopen", root=tmp_path)
+    reopened = await Agent.open(
+        "catalog-schema-coherent-reopen",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         first = await _schema(reopened, resource_ids=resource_ids)
         second = await _schema(reopened, resource_ids=resource_ids)
@@ -2084,7 +2141,11 @@ async def test_schema_slice_retries_a_generation_conflict_only_once(
 ):
     database = tmp_path / "generation-conflict.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-generation-conflict", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-generation-conflict",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resource = (await agent.list_catalog_resources(source_id=source.id))[0]
@@ -2122,7 +2183,9 @@ async def test_validation_schemas_use_one_bulk_current_generation(
             CREATE VIEW account_lookup AS
             SELECT account_id, email FROM accounts;
         """)
-    agent = await Agent.create("catalog-validation-bulk", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-validation-bulk", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         service = agent._embedded._catalog_service
@@ -2229,7 +2292,9 @@ async def test_validation_schema_reopen_decodes_and_compiles_once(
 ):
     database = tmp_path / "validation-reopen.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-validation-reopen", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-validation-reopen", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await agent.attach(SQLiteSource(database))
     agent_id = agent.id
     source_id = source.id
@@ -2252,7 +2317,9 @@ async def test_validation_schema_reopen_decodes_and_compiles_once(
 
     monkeypatch.setattr(sqlite_store, "decode_catalog_snapshot", counting_decode)
     monkeypatch.setattr(catalog_service, "_compile_source_index", counting_compile)
-    reopened = await Agent.open("catalog-validation-reopen", root=tmp_path)
+    reopened = await Agent.open(
+        "catalog-validation-reopen", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         store = reopened._embedded._store
         snapshot_read_count = 0
@@ -2304,7 +2371,9 @@ async def test_validation_schema_refresh_replaces_all_current_structural_facts(
             );
             CREATE TABLE stale_table (id INTEGER PRIMARY KEY, stale_value TEXT);
         """)
-    agent = await Agent.create("catalog-validation-refresh", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-validation-refresh", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         service = agent._embedded._catalog_service
@@ -2382,7 +2451,11 @@ async def test_validation_projection_retries_one_generation_conflict(
 ):
     database = tmp_path / "validation-transient-conflict.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-validation-transient-conflict", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-validation-transient-conflict",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         store = agent._embedded._store
@@ -2413,7 +2486,11 @@ async def test_validation_projection_reports_repeated_generation_conflict(
 ):
     database = tmp_path / "validation-repeated-conflict.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-validation-repeated-conflict", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-validation-repeated-conflict",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         store = agent._embedded._store
@@ -2447,8 +2524,12 @@ async def test_validation_projection_enforces_active_source_and_agent_isolation(
         connection.execute("CREATE TABLE first_private (id INTEGER PRIMARY KEY)")
     with sqlite3.connect(second_database) as connection:
         connection.execute("CREATE TABLE second_private (id INTEGER PRIMARY KEY)")
-    first = await Agent.create("catalog-validation-first", root=tmp_path)
-    second = await Agent.create("catalog-validation-second", root=tmp_path)
+    first = await Agent.create(
+        "catalog-validation-first", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    second = await Agent.create(
+        "catalog-validation-second", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         first_source = await first.attach(SQLiteSource(first_database))
         first_other_source = await first.attach(SQLiteSource(second_database))
@@ -2489,7 +2570,9 @@ async def test_validation_projection_translates_tabular_resource_kinds_and_order
 ):
     database = tmp_path / "validation-kinds.sqlite"
     database.touch()
-    agent = await Agent.create("catalog-validation-kinds", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-validation-kinds", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         nodes = {
@@ -2557,47 +2640,15 @@ async def test_validation_projection_translates_tabular_resource_kinds_and_order
         await agent.close()
 
 
-async def test_validation_projection_translates_csv_and_json_files(tmp_path: Path):
-    files = tmp_path / "validation-files"
-    files.mkdir()
-    (files / "records.csv").write_text("id,name\n1,Ada\n", encoding="utf-8")
-    (files / "events.json").write_text(
-        '[{"event_id": 1, "kind": "created"}]',
-        encoding="utf-8",
-    )
-    (files / "ignored.txt").write_text("not cataloged", encoding="utf-8")
-    agent = await Agent.create("catalog-validation-files", root=tmp_path)
-    try:
-        source = await agent.attach(LocalDirectorySource(files))
-        schemas = await agent._embedded._data_view.resource_schemas(
-            agent.id,
-            source.id,
-        )
-        by_name = {item.name: item for item in schemas}
-        assert set(by_name) == {"events.json", "records.csv"}
-        assert by_name["events.json"].columns == ("event_id", "kind")
-        assert by_name["events.json"].column_declared_types == (
-            ("event_id", "JSON"),
-            ("kind", "JSON"),
-        )
-        assert by_name["records.csv"].columns == ("id", "name")
-        assert by_name["records.csv"].column_declared_types == (
-            ("id", "TEXT"),
-            ("name", "TEXT"),
-        )
-        assert all(item.resource_kind == "file" for item in schemas)
-        assert all(item.writable is False for item in schemas)
-    finally:
-        await agent.close()
-
-
 async def test_validation_projection_empty_source_is_bounded_without_source_io(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     database = tmp_path / "validation-empty.sqlite"
     database.touch()
-    agent = await Agent.create("catalog-validation-empty", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-validation-empty", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         database.rename(tmp_path / "validation-empty-unavailable.sqlite")
@@ -2628,7 +2679,9 @@ async def test_connected_schema_reports_no_path_depth_and_resource_bounds(
     _fixture_database(database)
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE isolated (id INTEGER PRIMARY KEY)")
-    agent = await Agent.create("catalog-schema-unresolved", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-unresolved", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = {
@@ -2680,7 +2733,9 @@ async def test_connected_schema_reports_graph_and_relationship_work_bounds(
 ):
     database = tmp_path / "work-bounds.sqlite"
     _fixture_database(database)
-    agent = await Agent.create("catalog-schema-work-bounds", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-work-bounds", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = {
@@ -2741,7 +2796,9 @@ async def test_connected_schema_never_invents_cross_source_paths(tmp_path: Path)
         connection.execute("CREATE TABLE duplicate (id INTEGER PRIMARY KEY)")
     with sqlite3.connect(second_database) as connection:
         connection.execute("CREATE TABLE duplicate (id INTEGER PRIMARY KEY)")
-    agent = await Agent.create("catalog-schema-cross-source", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-cross-source", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         first = await agent.attach(SQLiteSource(first_database, name="First"))
         second = await agent.attach(SQLiteSource(second_database, name="Second"))
@@ -2781,7 +2838,9 @@ async def test_schema_resource_and_relationship_bounds_are_explicit(tmp_path: Pa
                 "id INTEGER PRIMARY KEY, "
                 "parent_id INTEGER REFERENCES parent(id))"
             )
-    agent = await Agent.create("catalog-schema-bounds", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-schema-bounds", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         resources = await agent.list_catalog_resources(source_id=source.id)
@@ -2834,8 +2893,12 @@ async def test_schema_and_structural_search_order_ignore_catalog_insertion_order
     second_database = tmp_path / "reverse.sqlite"
     _fixture_database(first_database)
     _fixture_database(second_database, reverse=True)
-    first_agent = await Agent.create("catalog-order-first", root=tmp_path)
-    second_agent = await Agent.create("catalog-order-second", root=tmp_path)
+    first_agent = await Agent.create(
+        "catalog-order-first", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    second_agent = await Agent.create(
+        "catalog-order-second", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         first_source = await first_agent.attach(SQLiteSource(first_database))
         second_source = await second_agent.attach(SQLiteSource(second_database))
@@ -2938,6 +3001,7 @@ async def test_inventory_uses_one_catalog_tool_call_and_records_efficiency(
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.attach(SQLiteSource(database))
@@ -2981,6 +3045,7 @@ async def test_regional_margin_plan_uses_one_schema_slice_before_querying(
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.attach(SQLiteSource(database))
@@ -3020,6 +3085,7 @@ async def test_one_connected_schema_call_supplies_bridges_before_one_data_query(
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.attach(SQLiteSource(database))
@@ -3054,6 +3120,7 @@ async def test_unchanged_revision_reuses_schema_but_refresh_requires_new_slice(
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach(SQLiteSource(database))

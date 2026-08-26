@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import sqlite3
 import threading
@@ -508,6 +510,7 @@ async def _sqlite_export_agent(
         id_factory=_ids(),
         downloads_directory=downloads,
         clock=lambda: _CREATED_AT,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     return agent, provider, source.id, database
@@ -621,6 +624,7 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
         root=tmp_path,
         downloads_directory=downloads,
         clock=lambda: _CREATED_AT,
+        workspace=workspace_for(tmp_path),
     )
     try:
         ref = result.artifacts[0]

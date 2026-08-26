@@ -23,7 +23,7 @@ from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.job_profiles import ConnectedJobProfile
-from ..adapters.local_files import LocalDirectoryReadBackend, LocalDirectorySource
+from ..adapters.local_workspace import LocalWorkspaceBackend
 from ..adapters.mcp import (
     MCPAuthentication,
     MCPBindingState,
@@ -88,7 +88,8 @@ from ..catalog.service import CatalogService
 from ..config import AgentConfig
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
-    LOCAL_FILE_READ_CAPABILITY_ID,
+    LOCAL_FILE_CAPABILITY_IDS,
+    LOCAL_FILE_EXECUTOR_IDS,
     POSTGRESQL_QUERY_CAPABILITY_ID,
     SQLITE_QUERY_CAPABILITY_ID,
     ArtifactCapabilityDomain,
@@ -96,7 +97,7 @@ from ..domains.data import (
     DataCapabilityDomain,
     DataContextBuilder,
     artifact_declarations,
-    local_file_read_declarations,
+    local_file_declarations,
     postgresql_query_declarations,
     postgresql_update_declarations,
     postgresql_update_preview_declarations,
@@ -224,6 +225,7 @@ from ..storage.sqlite_records import (
     SourceReadScope,
     postgresql_update_authorization_fingerprint,
 )
+from ..workspace import LocalWorkspace
 
 _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -253,7 +255,6 @@ _T = TypeVar("_T")
 _STAGE_C_ALLOWED_CAPABILITY_IDS = (
     CATALOG_INSPECT_CAPABILITY_ID,
     CATALOG_SCHEMA_CAPABILITY_ID,
-    LOCAL_FILE_READ_CAPABILITY_ID,
     POSTGRESQL_QUERY_CAPABILITY_ID,
     SQLITE_QUERY_CAPABILITY_ID,
     JOB_INSPECT_CAPABILITY_ID,
@@ -469,6 +470,8 @@ class EmbeddedAgent:
         *,
         identity: AgentIdentity,
         home: Path,
+        workspace: LocalWorkspace | None,
+        workspace_backend: LocalWorkspaceBackend | None,
         writer_lock: _WriterLock,
         store: SQLiteStateStore,
         loop: AgentLoop | None,
@@ -490,8 +493,9 @@ class EmbeddedAgent:
         skill_store: SkillStore,
         candidate_reviewer: OneShotCandidateReviewer,
         data_context_builder: DataContextBuilder | None,
+        files_only_run_ids: set[str],
         artifact_store: AgentHomeArtifactStore,
-        artifact_delivery: LocalArtifactDelivery,
+        artifact_delivery: LocalArtifactDelivery | None,
         candidate_acceptance_supported: bool,
         mutation_lock: asyncio.Lock,
         model_profile: ModelProfile | None,
@@ -508,6 +512,8 @@ class EmbeddedAgent:
     ) -> None:
         self.identity = identity
         self.home = home
+        self._workspace = workspace
+        self._workspace_backend = workspace_backend
         self.model_profile = model_profile
         self.model_route = model_route
         self._limits = limits
@@ -541,6 +547,7 @@ class EmbeddedAgent:
         self._skill_store = skill_store
         self._candidate_reviewer = candidate_reviewer
         self._data_context_builder = data_context_builder
+        self._files_only_run_ids = files_only_run_ids
         self._artifact_store = artifact_store
         self._artifact_delivery = artifact_delivery
         self._candidate_acceptance_supported = candidate_acceptance_supported
@@ -553,6 +560,12 @@ class EmbeddedAgent:
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._model_reopen_required = False
+
+    @property
+    def workspace(self) -> LocalWorkspace:
+        if self._workspace is None:
+            raise AgentHomeError("hosted composition has no local workspace")
+        return self._workspace
 
     @classmethod
     async def list(
@@ -655,6 +668,8 @@ class EmbeddedAgent:
         cls,
         name: str,
         *,
+        workspace: LocalWorkspace | None = None,
+        hosted: bool = False,
         root: str | Path | None = None,
         config: AgentConfig | None = None,
         model: ModelProvider | None = None,
@@ -676,6 +691,7 @@ class EmbeddedAgent:
         downloads_directory: Path | None = None,
         connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
+        _validate_workspace_composition(workspace, hosted=hosted)
         if downloads_directory is not None and not isinstance(
             downloads_directory, Path
         ):
@@ -701,8 +717,15 @@ class EmbeddedAgent:
             writer_lock.release()
             raise asyncio.CancelledError
         store: SQLiteStateStore | None = None
+        workspace_backend: LocalWorkspaceBackend | None = None
         published = False
         try:
+            workspace_backend = await _open_workspace_backend(
+                workspace,
+                hosted=hosted,
+                home=home,
+                clock=resolved_clock,
+            )
             if any(
                 path.exists() or path.is_symlink()
                 for path in (home / "agent.toml", home / "state.db")
@@ -722,18 +745,25 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_ids,
             )
-            artifact_delivery = await LocalArtifactDelivery.open(
-                agent_id=identity.id,
-                agent_home=home,
-                artifacts=artifact_store,
-                sources=store,
-                downloads_directory=downloads_directory,
-                clock=resolved_clock,
-                id_factory=resolved_ids,
+            artifact_delivery = (
+                None
+                if hosted
+                else await LocalArtifactDelivery.open(
+                    agent_id=identity.id,
+                    agent_home=home,
+                    artifacts=artifact_store,
+                    sources=store,
+                    downloads_directory=downloads_directory,
+                    clock=resolved_clock,
+                    id_factory=resolved_ids,
+                )
             )
             embedded = await cls._compose(
                 identity=identity,
                 home=home,
+                workspace=workspace,
+                workspace_backend=workspace_backend,
+                hosted=hosted,
                 writer_lock=writer_lock,
                 store=store,
                 model=model,
@@ -767,6 +797,8 @@ class EmbeddedAgent:
             return embedded
         except BaseException:
             try:
+                if workspace_backend is not None:
+                    await workspace_backend.close()
                 if store is not None:
                     await store.close()
             finally:
@@ -780,6 +812,8 @@ class EmbeddedAgent:
         cls,
         name: str,
         *,
+        workspace: LocalWorkspace | None = None,
+        hosted: bool = False,
         root: str | Path | None = None,
         config: AgentConfig | None = None,
         model: ModelProvider | None = None,
@@ -801,6 +835,7 @@ class EmbeddedAgent:
         downloads_directory: Path | None = None,
         connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
+        _validate_workspace_composition(workspace, hosted=hosted)
         if downloads_directory is not None and not isinstance(
             downloads_directory, Path
         ):
@@ -840,7 +875,14 @@ class EmbeddedAgent:
             writer_lock.release()
             raise asyncio.CancelledError
         store: SQLiteStateStore | None = None
+        workspace_backend: LocalWorkspaceBackend | None = None
         try:
+            workspace_backend = await _open_workspace_backend(
+                workspace,
+                hosted=hosted,
+                home=home,
+                clock=resolved_clock,
+            )
             manifest, cancelled = await _await_sync_completion(
                 lambda: _read_manifest(home, name)
             )
@@ -852,6 +894,7 @@ class EmbeddedAgent:
                 raise AgentIdentityMismatchError(
                     "agent.toml does not match state.db identity"
                 )
+            await store.list_sources(identity.id)
             _, cancelled = await _await_async_completion(
                 lambda: store.recover_unfinished_runs(
                     identity.id,
@@ -880,18 +923,25 @@ class EmbeddedAgent:
                 clock=resolved_clock,
                 id_factory=resolved_ids,
             )
-            artifact_delivery = await LocalArtifactDelivery.open(
-                agent_id=identity.id,
-                agent_home=home,
-                artifacts=artifact_store,
-                sources=store,
-                downloads_directory=downloads_directory,
-                clock=resolved_clock,
-                id_factory=resolved_ids,
+            artifact_delivery = (
+                None
+                if hosted
+                else await LocalArtifactDelivery.open(
+                    agent_id=identity.id,
+                    agent_home=home,
+                    artifacts=artifact_store,
+                    sources=store,
+                    downloads_directory=downloads_directory,
+                    clock=resolved_clock,
+                    id_factory=resolved_ids,
+                )
             )
             return await cls._compose(
                 identity=identity,
                 home=home,
+                workspace=workspace,
+                workspace_backend=workspace_backend,
+                hosted=hosted,
                 writer_lock=writer_lock,
                 store=store,
                 model=model,
@@ -917,6 +967,8 @@ class EmbeddedAgent:
                 connected_job_profiles=connected_job_profiles,
             )
         except BaseException:
+            if workspace_backend is not None:
+                await workspace_backend.close()
             if store is not None:
                 await store.close()
             writer_lock.release()
@@ -928,6 +980,9 @@ class EmbeddedAgent:
         *,
         identity: AgentIdentity,
         home: Path,
+        workspace: LocalWorkspace | None,
+        workspace_backend: LocalWorkspaceBackend | None,
+        hosted: bool,
         writer_lock: _WriterLock,
         store: SQLiteStateStore,
         model: ModelProvider | None,
@@ -949,7 +1004,7 @@ class EmbeddedAgent:
         observer: AgentObserver | None,
         approval_handler: ApprovalHandler | None,
         artifact_store: AgentHomeArtifactStore,
-        artifact_delivery: LocalArtifactDelivery,
+        artifact_delivery: LocalArtifactDelivery | None,
         connected_job_profiles: tuple[ConnectedJobProfile, ...],
     ) -> Self:
         catalog_service = CatalogService(store, store)
@@ -979,8 +1034,16 @@ class EmbeddedAgent:
             identity.id,
             postgresql_preview_backend,
         )
-        local_file_backend = LocalDirectoryReadBackend(store, store, data_view)
-        local_files = local_file_read_declarations(identity.id, local_file_backend)
+        if hosted != (workspace is None and workspace_backend is None):
+            raise AgentHomeError("workspace composition is inconsistent")
+        if hosted != (artifact_delivery is None):
+            raise AgentHomeError("artifact delivery composition is inconsistent")
+        local_files = (
+            None
+            if workspace_backend is None
+            else local_file_declarations(workspace_backend)
+        )
+        files_only_run_ids: set[str] = set()
         mutation_lock = asyncio.Lock()
         memory_store = MemoryStore(home, mutation_lock)
         skill_store = SkillStore(home, mutation_lock)
@@ -1022,7 +1085,6 @@ class EmbeddedAgent:
                 artifact_delivery,
                 artifact_store,
                 agent_id=identity.id,
-                local_file_backend=local_file_backend,
                 sqlite_backend=sqlite_backend,
                 postgresql_backend=postgresql_backend,
                 clock=clock,
@@ -1044,7 +1106,6 @@ class EmbeddedAgent:
             owner=job_owner,
             sqlite_backend=sqlite_backend,
             postgresql_backend=postgresql_backend,
-            local_file_backend=local_file_backend,
             clock=clock,
         )
         learning_candidate_guard = LearningCandidateGuard()
@@ -1056,7 +1117,7 @@ class EmbeddedAgent:
                 *postgresql.capabilities,
                 *postgresql_preview.capabilities,
                 *postgresql_update.capabilities,
-                *local_files.capabilities,
+                *(local_files.capabilities if local_files is not None else ()),
             ),
             executor_ids=tuple(
                 item.executor_id
@@ -1066,7 +1127,7 @@ class EmbeddedAgent:
                     *postgresql.capabilities,
                     *postgresql_preview.capabilities,
                     *postgresql_update.capabilities,
-                    *local_files.capabilities,
+                    *(local_files.capabilities if local_files is not None else ()),
                 )
             ),
             tool_views=(
@@ -1075,7 +1136,7 @@ class EmbeddedAgent:
                 *postgresql.tool_views,
                 *postgresql_preview.tool_views,
                 *postgresql_update.tool_views,
-                *local_files.tool_views,
+                *(local_files.tool_views if local_files is not None else ()),
             ),
         )
         memory_declarations = CapabilityDeclarations(
@@ -1124,6 +1185,13 @@ class EmbeddedAgent:
             data_declarations,
             data_view,
             learning_candidate_guard,
+            workspace_id=(
+                None if workspace_backend is None else workspace_backend.workspace_id
+            ),
+            workspace_sensitivity=(
+                None if workspace_backend is None else workspace_backend.sensitivity
+            ),
+            files_only_run_ids=files_only_run_ids,
         )
         memory_domain = MemoryCapabilityDomain(
             memory_declarations,
@@ -1138,6 +1206,7 @@ class EmbeddedAgent:
             data_view,
             store,
             learning_candidate_guard,
+            files_only_run_ids=files_only_run_ids,
         )
         artifact_domain = (
             None
@@ -1149,6 +1218,7 @@ class EmbeddedAgent:
                 artifact_store,
                 artifact_delivery,
                 learning_candidate_guard,
+                files_only_run_ids=files_only_run_ids,
             )
         )
         job_domain = JobCapabilityDomain(job_declaration_bundle, job_owner)
@@ -1157,6 +1227,7 @@ class EmbeddedAgent:
             catalog=data_view,
             admission=data_profile_admission,
             learning=learning_candidate_guard,
+            files_only_run_ids=files_only_run_ids,
         )
         if model is not None and context_builder is None:
             assert model_profile is not None
@@ -1173,6 +1244,7 @@ class EmbeddedAgent:
             client_factory=resolved_mcp_client_factory,
             secrets=secret_provider,
             clock=clock,
+            files_only_run_ids=files_only_run_ids,
         )
         domains = (
             data_domain,
@@ -1184,23 +1256,46 @@ class EmbeddedAgent:
             *((artifact_domain,) if artifact_domain is not None else ()),
             *((mcp_domain,) if mcp_domain is not None else ()),
         )
+        registered_executors = (
+            *catalog.executors,
+            *sqlite.executors,
+            *postgresql.executors,
+            *postgresql_preview.executors,
+            *postgresql_update.executors,
+            *(local_files.executors if local_files is not None else ()),
+            *memory.executors,
+            *skills.executors,
+            *semantics.executors,
+            *job_lifecycle.executors,
+            *data_profile_jobs.executors,
+            *(artifacts.executors if artifacts is not None else ()),
+            *mcp_executors,
+        )
+        if hosted:
+            declared_capability_ids = {
+                capability.id
+                for domain in domains
+                for capability in domain.declarations.capabilities
+            }
+            declared_view_ids = {
+                view.capability_id
+                for domain in domains
+                for view in domain.declarations.tool_views
+            }
+            registered_executor_ids = {
+                executor.executor_id for executor in registered_executors
+            }
+            if (
+                declared_capability_ids & LOCAL_FILE_CAPABILITY_IDS
+                or declared_view_ids & LOCAL_FILE_CAPABILITY_IDS
+                or registered_executor_ids & LOCAL_FILE_EXECUTOR_IDS
+            ):
+                raise AgentHomeError(
+                    "hosted composition contains local workspace authority"
+                )
         capabilities = CapabilityRegistry(
             declarations=tuple(domain.declarations for domain in domains),
-            executors=(
-                *catalog.executors,
-                *sqlite.executors,
-                *postgresql.executors,
-                *postgresql_preview.executors,
-                *postgresql_update.executors,
-                *local_files.executors,
-                *memory.executors,
-                *skills.executors,
-                *semantics.executors,
-                *job_lifecycle.executors,
-                *data_profile_jobs.executors,
-                *(artifacts.executors if artifacts is not None else ()),
-                *mcp_executors,
-            ),
+            executors=registered_executors,
         )
         capability_runtime = CapabilityRuntime(
             capabilities,
@@ -1242,6 +1337,15 @@ class EmbeddedAgent:
                 artifact_destinations=(
                     artifact_delivery if artifacts is not None else None
                 ),
+                workspace_id=(
+                    None
+                    if workspace_backend is None
+                    else workspace_backend.workspace_id
+                ),
+                workspace_sensitivity=(
+                    None if workspace_backend is None else workspace_backend.sensitivity
+                ),
+                files_only_run_ids=files_only_run_ids,
                 max_context_evidence_bytes=limits.max_context_evidence_bytes,
             )
             resolved_tools = capability_runtime
@@ -1267,6 +1371,8 @@ class EmbeddedAgent:
         embedded = cls(
             identity=identity,
             home=home,
+            workspace=workspace,
+            workspace_backend=workspace_backend,
             writer_lock=writer_lock,
             store=store,
             loop=loop,
@@ -1292,6 +1398,7 @@ class EmbeddedAgent:
                 if isinstance(resolved_context, DataContextBuilder)
                 else None
             ),
+            files_only_run_ids=files_only_run_ids,
             artifact_store=artifact_store,
             artifact_delivery=artifact_delivery,
             candidate_acceptance_supported=(
@@ -1478,12 +1585,14 @@ class EmbeddedAgent:
         *,
         conversation_id: str | None = None,
         source_id: str | None = None,
+        files_only: bool = False,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._run(
             message,
             conversation_id=conversation_id,
             source_id=source_id,
+            files_only=files_only,
             job_executor_profile_id=job_executor_profile_id,
         )
 
@@ -1513,6 +1622,7 @@ class EmbeddedAgent:
         learning_candidate_text: str | None = None,
         learning_candidate: LearningCandidate | None = None,
         explicit_learning: bool = False,
+        files_only: bool = False,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
@@ -1521,6 +1631,14 @@ class EmbeddedAgent:
             not isinstance(source_id, str) or not source_id.strip()
         ):
             raise ValueError("source_id must be a non-empty string or None")
+        if not isinstance(files_only, bool):
+            raise TypeError("files_only must be bool")
+        if files_only and source_id is not None:
+            raise ValueError("files_only and source_id are mutually exclusive")
+        if files_only and job_executor_profile_id is not None:
+            raise ValueError(
+                "files_only and job_executor_profile_id are mutually exclusive"
+            )
         if job_executor_profile_id is not None and (
             not isinstance(job_executor_profile_id, str)
             or not job_executor_profile_id.strip()
@@ -1552,6 +1670,7 @@ class EmbeddedAgent:
                 message,
                 conversation_id=conversation_id,
                 source_id=source_id,
+                files_only=files_only,
                 learning_candidate_id=learning_candidate_id,
                 learning_candidate_text=learning_candidate_text,
                 learning_candidate=learning_candidate,
@@ -1570,6 +1689,7 @@ class EmbeddedAgent:
         learning_candidate_text: str | None,
         learning_candidate: LearningCandidate | None,
         explicit_learning: bool = False,
+        files_only: bool = False,
         run_id: str | None = None,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
@@ -1619,9 +1739,13 @@ class EmbeddedAgent:
         if conversation_source_id is None and len(active_sources) == 1:
             conversation_source_id = active_sources[0].id
         effective_source_id = (
-            source_id.strip() if source_id is not None else conversation_source_id
+            None
+            if files_only
+            else (
+                source_id.strip() if source_id is not None else conversation_source_id
+            )
         )
-        if active_sources and effective_source_id is None:
+        if not files_only and active_sources and effective_source_id is None:
             raise SourceSelectionError(
                 "Multiple data sources are attached. Select one with /source "
                 "before asking a question."
@@ -1673,13 +1797,18 @@ class EmbeddedAgent:
             )
         if explicit_learning:
             self._semantic_domain.select_explicit_learning_run(run_input.id)
+        if files_only:
+            if self._workspace_backend is None:
+                raise AgentHomeError("files_only requires an admitted local workspace")
+            self._files_only_run_ids.add(run_input.id)
         try:
             return await loop.run(
                 run_input,
                 prior_messages=prior_messages,
             )
         finally:
-            self._artifact_delivery.end_run(run_input.id)
+            if self._artifact_delivery is not None:
+                self._artifact_delivery.end_run(run_input.id)
             if learning_candidate_id is not None:
                 assert self._data_context_builder is not None
                 self._data_context_builder.clear_learning_candidate(run_input.id)
@@ -1688,6 +1817,8 @@ class EmbeddedAgent:
                 self._semantic_domain.clear_explicit_learning_run(run_input.id)
             if job_executor_profile_id is not None:
                 self._data_profile_job_domain.clear_connected_executor(run_input.id)
+            if files_only:
+                self._files_only_run_ids.discard(run_input.id)
 
     async def transcript(self, run_id: str) -> Transcript:
         self._require_open()
@@ -1953,7 +2084,8 @@ class EmbeddedAgent:
                     finalized_at=self._clock(),
                 )
             finally:
-                self._artifact_delivery.end_run(run_input.id)
+                if self._artifact_delivery is not None:
+                    self._artifact_delivery.end_run(run_input.id)
 
     async def _revalidate_followup(self, followup):
         if await self._store.load_identity() != self.identity:
@@ -2126,7 +2258,7 @@ class EmbeddedAgent:
     ) -> ArtifactDeliveryReceipt:
         async with self._mutation_lock:
             self._require_open()
-            return await self._artifact_delivery.save_public(
+            return await self._require_artifact_delivery().save_public(
                 artifact_id,
                 destination=destination,
                 filename=filename,
@@ -2135,7 +2267,7 @@ class EmbeddedAgent:
     async def export_destination(self) -> ArtifactDestination:
         async with self._mutation_lock:
             self._require_open()
-            return await self._artifact_delivery.export_destination()
+            return await self._require_artifact_delivery().export_destination()
 
     async def set_export_destination(
         self,
@@ -2143,12 +2275,14 @@ class EmbeddedAgent:
     ) -> ArtifactDestination:
         async with self._mutation_lock:
             self._require_open()
-            return await self._artifact_delivery.set_export_destination(directory)
+            return await self._require_artifact_delivery().set_export_destination(
+                directory
+            )
 
     async def reset_export_destination(self) -> ArtifactDestination:
         async with self._mutation_lock:
             self._require_open()
-            return await self._artifact_delivery.reset_export_destination()
+            return await self._require_artifact_delivery().reset_export_destination()
 
     async def active_source(
         self,
@@ -2899,53 +3033,6 @@ class EmbeddedAgent:
             confirmation_handler=confirmation_handler,
         )
 
-    async def attach_local_directory(
-        self,
-        root: str | Path,
-        *,
-        name: str | None = None,
-    ) -> SourceRegistration:
-        """Attach one ordinary bounded CSV/JSON directory source."""
-
-        return await self.attach(LocalDirectorySource(root=root, name=name))
-
-    async def edit_local_directory_source(
-        self,
-        source_id: str,
-        root: str | Path,
-        *,
-        confirmation_handler: SourceEditConfirmationHandler,
-        name: str | None = None,
-        max_depth: int = 8,
-        max_files: int = 1_000,
-        max_file_bytes: int = 2 * 1024 * 1024,
-        max_columns: int = 512,
-        max_rows: int = 100_000,
-        max_json_nodes: int = 500_000,
-        max_json_depth: int = 32,
-        max_key_bytes: int = 1_024,
-        max_string_bytes: int = 256 * 1024,
-        max_cell_bytes: int = 1024 * 1024,
-    ) -> SourceEditResult | None:
-        return await self.edit_source(
-            source_id,
-            LocalDirectorySource(
-                root=root,
-                name=name,
-                max_depth=max_depth,
-                max_files=max_files,
-                max_file_bytes=max_file_bytes,
-                max_columns=max_columns,
-                max_rows=max_rows,
-                max_json_nodes=max_json_nodes,
-                max_json_depth=max_json_depth,
-                max_key_bytes=max_key_bytes,
-                max_string_bytes=max_string_bytes,
-                max_cell_bytes=max_cell_bytes,
-            ),
-            confirmation_handler=confirmation_handler,
-        )
-
     async def store_postgresql_password(self, password: str) -> SecretReference:
         """Store one database password for an in-process onboarding attempt."""
 
@@ -3587,11 +3674,21 @@ class EmbeddedAgent:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        if self._workspace_backend is not None:
+            try:
+                await self._workspace_backend.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         for store in (
             self._candidate_reviewer,
             self._memory_store,
             self._skill_store,
-            self._artifact_delivery,
+            *(
+                (self._artifact_delivery,)
+                if self._artifact_delivery is not None
+                else ()
+            ),
             self._artifact_store,
             self._store,
         ):
@@ -3615,6 +3712,11 @@ class EmbeddedAgent:
         if self._loop is None:
             raise AgentNotConfiguredError("agent execution requires a model")
         return self._loop
+
+    def _require_artifact_delivery(self) -> LocalArtifactDelivery:
+        if self._artifact_delivery is None:
+            raise AgentHomeError("hosted composition has no local artifact delivery")
+        return self._artifact_delivery
 
     def _require_open(self) -> None:
         if self._closed:
@@ -3654,60 +3756,6 @@ def _source_from_registration(
         return SQLiteSource(
             path=_configuration_text(configuration, "path"),
             name=registration.display_name,
-        )
-    if adapter_id == "local-directory":
-        fields = {
-            "formats",
-            "max_cell_bytes",
-            "max_columns",
-            "max_depth",
-            "max_file_bytes",
-            "max_files",
-            "max_json_depth",
-            "max_json_nodes",
-            "max_key_bytes",
-            "max_rows",
-            "max_string_bytes",
-            "root",
-            "root_device",
-            "root_inode",
-        }
-        _require_configuration_fields(configuration, fields)
-        if configuration["formats"] != ("csv", "json"):
-            raise AgentHomeError("local-directory source configuration is invalid")
-        _configuration_integer(configuration, "root_device")
-        _configuration_integer(configuration, "root_inode")
-        return LocalDirectorySource(
-            root=_configuration_text(configuration, "root"),
-            name=registration.display_name,
-            max_depth=_configuration_integer(configuration, "max_depth"),
-            max_files=_configuration_integer(configuration, "max_files"),
-            max_file_bytes=_configuration_integer(
-                configuration,
-                "max_file_bytes",
-            ),
-            max_columns=_configuration_integer(configuration, "max_columns"),
-            max_rows=_configuration_integer(configuration, "max_rows"),
-            max_json_nodes=_configuration_integer(
-                configuration,
-                "max_json_nodes",
-            ),
-            max_json_depth=_configuration_integer(
-                configuration,
-                "max_json_depth",
-            ),
-            max_key_bytes=_configuration_integer(
-                configuration,
-                "max_key_bytes",
-            ),
-            max_string_bytes=_configuration_integer(
-                configuration,
-                "max_string_bytes",
-            ),
-            max_cell_bytes=_configuration_integer(
-                configuration,
-                "max_cell_bytes",
-            ),
         )
     if adapter_id == "postgresql":
         required = {
@@ -4745,6 +4793,39 @@ def _reject_legacy_state_root(state_root: Path) -> None:
         ),
         current_revision=SQLiteStateStore.current_revision,
         found_revision="pre-1.0-framework",
+    )
+
+
+def _validate_workspace_composition(
+    workspace: LocalWorkspace | None,
+    *,
+    hosted: bool,
+) -> None:
+    if not isinstance(hosted, bool):
+        raise TypeError("hosted must be bool")
+    if hosted:
+        if workspace is not None:
+            raise ValueError("hosted composition cannot admit a local workspace")
+        return
+    if not isinstance(workspace, LocalWorkspace):
+        raise TypeError("local agent composition requires LocalWorkspace")
+
+
+async def _open_workspace_backend(
+    workspace: LocalWorkspace | None,
+    *,
+    hosted: bool,
+    home: Path,
+    clock: Callable[[], datetime],
+) -> LocalWorkspaceBackend | None:
+    if hosted:
+        return None
+    assert workspace is not None
+    return await LocalWorkspaceBackend.open(
+        workspace,
+        agent_root=home.parent.parent,
+        agent_home=home,
+        clock=clock,
     )
 
 

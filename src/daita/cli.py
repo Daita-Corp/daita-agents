@@ -26,7 +26,7 @@ from . import (
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningCandidateView,
-    LocalDirectorySource,
+    LocalWorkspace,
     LoopExit,
     MCPAuthentication,
     MCPBindingStatus,
@@ -226,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="daita")
     parser.add_argument("--version", action="version", version=f"daita {__version__}")
     parser.add_argument("--root", type=Path)
+    parser.add_argument("--workspace", type=Path)
+    parser.add_argument(
+        "--workspace-sensitivity",
+        choices=("internal", "confidential", "restricted"),
+        default="internal",
+    )
     parser.add_argument("--agent", help="agent to open in terminal mode")
     commands = parser.add_subparsers(dest="command")
 
@@ -234,7 +240,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     attach = commands.add_parser("attach", help="attach a read-only source")
     attach.add_argument("name")
-    attach.add_argument("kind", choices=("sqlite", "files", "postgresql"))
+    attach.add_argument("kind", choices=("sqlite", "postgresql"))
     attach.add_argument("path", type=Path, nargs="?")
     attach.add_argument("--host")
     attach.add_argument("--port", type=int, default=5432)
@@ -390,6 +396,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--context-window", type=int)
     run.add_argument("--max-output", type=int)
     run.add_argument("--conversation-id")
+    run.add_argument("--files-only", action="store_true")
     run.add_argument("--events-jsonl", action="store_true")
 
     chat = commands.add_parser(
@@ -1168,23 +1175,58 @@ async def _prompt_for_exact_approval(
         print("Enter y to approve or n to deny.")
 
 
+def _paths_overlap(left: Path, right: Path) -> bool:
+    return left == right or left in right.parents or right in left.parents
+
+
+def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
+    sensitivity = ModelSensitivity(args.workspace_sensitivity)
+    explicit = args.workspace
+    if explicit is not None:
+        return LocalWorkspace(explicit, sensitivity=sensitivity)
+
+    state_root = (
+        (Path.home() / ".daita")
+        if args.root is None
+        else Path(os.path.abspath(os.fspath(args.root))).resolve(strict=False)
+    )
+    cwd = Path.cwd().resolve(strict=True)
+    user_home = Path.home().resolve(strict=True)
+    if (
+        cwd != user_home
+        and cwd != Path(cwd.anchor)
+        and not _paths_overlap(cwd, state_root)
+    ):
+        return LocalWorkspace(cwd, sensitivity=sensitivity)
+
+    fallback = user_home / "Daita Workspace"
+    if _paths_overlap(fallback, state_root):
+        raise ValueError(
+            "the default workspace overlaps agent state; pass --workspace explicitly"
+        )
+    fallback.mkdir(mode=0o700, parents=False, exist_ok=True)
+    return LocalWorkspace(fallback, sensitivity=sensitivity)
+
+
 async def _execute(args: argparse.Namespace) -> object:
-    if args.command == "create":
-        agent = await Agent.create(args.name, root=args.root)
-        try:
-            return {"agent_id": agent.id, "name": agent.name, "home": str(agent.home)}
-        finally:
-            await agent.close()
     if args.command == "delete":
         if not args.yes:
             raise ValueError("delete requires --yes")
         await Agent.delete(args.name, root=args.root)
         return {"name": args.name, "deleted": True}
+    workspace = _resolve_cli_workspace(args)
+    if args.command == "create":
+        agent = await Agent.create(args.name, workspace=workspace, root=args.root)
+        try:
+            return {"agent_id": agent.id, "name": agent.name, "home": str(agent.home)}
+        finally:
+            await agent.close()
     if args.command == "detach":
         if not args.yes:
             raise ValueError("detach requires --yes")
         agent = await Agent.open(
             args.name,
+            workspace=workspace,
             root=args.root,
             config=AgentConfig(),
         )
@@ -1202,6 +1244,7 @@ async def _execute(args: argparse.Namespace) -> object:
             raise ValueError("conversations clear requires --yes")
         agent = await Agent.open(
             args.name,
+            workspace=workspace,
             root=args.root,
             config=AgentConfig(),
         )
@@ -1223,6 +1266,7 @@ async def _execute(args: argparse.Namespace) -> object:
         if args.model is None:
             agent = await Agent.open(
                 args.name,
+                workspace=workspace,
                 root=args.root,
                 observer=_write_event_jsonl if args.events_jsonl else None,
             )
@@ -1235,15 +1279,24 @@ async def _execute(args: argparse.Namespace) -> object:
             )
             agent = await Agent.open(
                 args.name,
+                workspace=workspace,
                 root=args.root,
                 model=provider,
                 model_profile=profile,
                 observer=_write_event_jsonl if args.events_jsonl else None,
             )
         try:
-            result = await agent.run(
-                args.message,
-                conversation_id=args.conversation_id,
+            result = (
+                await agent.run(
+                    args.message,
+                    conversation_id=args.conversation_id,
+                    files_only=True,
+                )
+                if args.files_only
+                else await agent.run(
+                    args.message,
+                    conversation_id=args.conversation_id,
+                )
             )
             return {
                 "run_id": result.run_id,
@@ -1265,6 +1318,7 @@ async def _execute(args: argparse.Namespace) -> object:
     if args.command == "chat":
         return await run_terminal_application(
             root=args.root,
+            workspace=workspace,
             agent_name=args.name,
             reviewer_max_estimated_cost_usd=(
                 _candidate_review_cost_limit_from_environment()
@@ -1275,6 +1329,7 @@ async def _execute(args: argparse.Namespace) -> object:
         provider, profile = _reviewer_model_configuration(args.model)
         agent = await Agent.open(
             args.name,
+            workspace=workspace,
             root=args.root,
             reviewer_model=provider,
             reviewer_profile=profile,
@@ -1301,6 +1356,7 @@ async def _execute(args: argparse.Namespace) -> object:
         provider, profile = _model_configuration(args.model)
         agent = await Agent.open(
             args.name,
+            workspace=workspace,
             root=args.root,
             model=provider,
             model_profile=profile,
@@ -1317,7 +1373,7 @@ async def _execute(args: argparse.Namespace) -> object:
             }
         finally:
             await agent.close()
-    agent = await Agent.open(args.name, root=args.root)
+    agent = await Agent.open(args.name, workspace=workspace, root=args.root)
     try:
         if args.command == "artifacts":
             receipt = await agent.save_artifact(
@@ -1514,15 +1570,11 @@ async def _execute(args: argparse.Namespace) -> object:
 
 def _source_from_attach_args(
     args: argparse.Namespace,
-) -> SQLiteSource | LocalDirectorySource | PostgreSQLSource:
-    if args.kind in {"sqlite", "files"}:
+) -> SQLiteSource | PostgreSQLSource:
+    if args.kind == "sqlite":
         if args.path is None:
-            raise ValueError(f"attach {args.kind} requires a path")
-        return (
-            SQLiteSource(args.path)
-            if args.kind == "sqlite"
-            else LocalDirectorySource(args.path)
-        )
+            raise ValueError("attach sqlite requires a path")
+        return SQLiteSource(args.path)
     if args.path is not None:
         raise ValueError("attach postgresql does not accept a path")
     required = {
@@ -1559,6 +1611,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = asyncio.run(
                 run_terminal_application(
                     root=args.root,
+                    workspace=_resolve_cli_workspace(args),
                     agent_name=args.agent,
                     reviewer_max_estimated_cost_usd=(
                         _candidate_review_cost_limit_from_environment()

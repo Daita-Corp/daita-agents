@@ -16,6 +16,7 @@ from daita import (
     JobStatus,
     LoopExit,
     LoopExitKind,
+    LocalWorkspace,
 )
 from daita.observation import AgentEventKind
 from daita.security import KeychainStore
@@ -120,6 +121,7 @@ class DaitaApp(App[int]):
         self,
         *,
         root: str | Path | None = None,
+        workspace: LocalWorkspace,
         agent_name: str | None = None,
         keychain: KeychainStore | None = None,
         model_validator: Any = None,
@@ -134,6 +136,7 @@ class DaitaApp(App[int]):
         validate_candidate_review_cost_limit(reviewer_max_estimated_cost_usd)
         self.controller = PresentationController(
             root=root,
+            workspace=workspace,
             keychain=keychain,
             model_validator=model_validator,
             reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
@@ -299,24 +302,30 @@ class DaitaApp(App[int]):
         chat = self.chat()
         if chat is None or self.controller.agent is None:
             return
-        guidance: list[str] = []
+        setup_guidance: list[str] = []
         agent = self.controller.require_agent()
         if agent.model_profile is None:
-            guidance.append("no model · use /model")
+            setup_guidance.append("no model · use /model")
         sources = tuple(
             source for source in await self.controller.list_sources() if source.active
         )
+        workspace = self.controller.workspace
+        workspace_status = (
+            f"Files: {workspace.root.name} ({workspace.sensitivity.value})"
+        )
         if not sources:
-            guidance.append("no source · use /source add")
+            source_status = "Run source: none connected (a source is optional)"
         else:
-            if len(sources) > 1 and await self.controller.active_source() is None:
-                guidance.append("choose a source · use /source")
+            active_source = await self.controller.active_source()
+            if len(sources) > 1 and active_source is None:
+                source_status = "Run source: Files only or choose with @"
+            else:
+                selected = active_source or sources[0]
+                source_status = f"Run source: {selected.display_name}"
             if (await self.controller.catalog_summary()).is_empty:
-                guidance.append("catalog has 0 resources · use /source edit")
-        if guidance:
-            chat.show_notice("Setup  " + "  ·  ".join(guidance))
-        else:
-            chat.clear_notice()
+                setup_guidance.append("catalog has 0 resources · use /source edit")
+        status = "  ·  ".join((workspace_status, source_status, *setup_guidance))
+        chat.show_notice(status)
 
     async def _pick_source(self) -> None:
         sources = await self.controller.list_sources()
@@ -531,6 +540,17 @@ class DaitaApp(App[int]):
             return
         screen.composer().clear()
         screen.clear_notice()
+        if text == "/files" or text.startswith("/files "):
+            message = text.removeprefix("/files").strip()
+            if not message:
+                screen.show_notice("Usage: /files <question>")
+                return
+            await self._start_run(
+                message,
+                files_only=True,
+                display=text,
+            )
+            return
         if text.startswith("/"):
             await self._handle_command(text)
             return
@@ -979,6 +999,7 @@ class DaitaApp(App[int]):
         message: str,
         *,
         source_id: str | None = None,
+        files_only: bool = False,
         display: str | None = None,
     ) -> None:
         if self._run_task is not None and not self._run_task.done():
@@ -1006,19 +1027,30 @@ class DaitaApp(App[int]):
         screen.set_activity("Thinking", restart=True)
         self._partial_text = ""
         self._run_task = asyncio.create_task(
-            self._execute_run(message, source_id=source_id),
+            self._execute_run(
+                message,
+                source_id=source_id,
+                files_only=files_only,
+            ),
             name="daita-agent-run",
         )
         self._run_task.add_done_callback(self._on_run_done)
         await self._refresh_status(running=True, state="thinking")
 
-    async def _execute_run(self, message: str, *, source_id: str | None) -> None:
+    async def _execute_run(
+        self,
+        message: str,
+        *,
+        source_id: str | None,
+        files_only: bool = False,
+    ) -> None:
         agent = self.controller.require_agent()
         try:
             result = await agent.run(
                 message,
                 conversation_id=self.controller.conversation_id,
                 source_id=source_id,
+                files_only=files_only,
             )
             await self._settle_result(result)
         except asyncio.CancelledError:
@@ -1166,6 +1198,7 @@ class DaitaApp(App[int]):
 async def run_daita_app(
     *,
     root: str | Path | None = None,
+    workspace: LocalWorkspace,
     agent_name: str | None = None,
     keychain: KeychainStore | None = None,
     model_validator: Any = None,
@@ -1173,6 +1206,7 @@ async def run_daita_app(
 ) -> int:
     app = DaitaApp(
         root=root,
+        workspace=workspace,
         agent_name=agent_name,
         keychain=keychain,
         model_validator=model_validator,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import json
 import sqlite3
 from collections import defaultdict
@@ -445,6 +447,7 @@ async def test_catalog_derived_skill_keeps_binding_for_read_time_obsolescence(
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_sqlite(database, name="finance")
@@ -515,6 +518,7 @@ async def test_reviewer_discards_cross_source_semantic_delete_candidate(tmp_path
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first_source = await agent.attach_sqlite(first_database, name="first")
@@ -676,6 +680,7 @@ async def test_scoped_candidate_cannot_pool_grounding_from_another_source(tmp_pa
         model_profile=foreground.model_profile,
         reviewer_model=reviewer,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first_source = await agent.attach_sqlite(first_database, name="first")

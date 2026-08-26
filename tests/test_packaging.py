@@ -323,11 +323,22 @@ import daita
 import daita.cli
 
 raise SystemExit(
-    daita.cli.main(["--root", sys.argv[1], "create", "packaging-smoke"])
+    daita.cli.main(
+        [
+            "--root",
+            sys.argv[1],
+            "--workspace",
+            sys.argv[2],
+            "create",
+            "packaging-smoke",
+        ]
+    )
 )
 """
+    workspace = tmp_path.parent / f"{tmp_path.name}-packaging-workspace"
+    workspace.mkdir()
     completed = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path)],
+        [sys.executable, "-c", script, str(tmp_path), str(workspace)],
         check=False,
         capture_output=True,
         text=True,

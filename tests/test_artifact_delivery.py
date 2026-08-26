@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import sqlite3
 import threading
@@ -9,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import daita.artifacts.delivery as delivery_module
-from daita import Agent, ArtifactError, LocalDirectorySource
+from daita import Agent, ArtifactError
 from daita.artifacts.models import (
     SYSTEM_DOWNLOADS_DESTINATION_ID,
     DestinationAuthorization,
@@ -87,6 +89,7 @@ async def _agent_with_artifact(
         model_profile=_profile(selected),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     result = await agent.run("Create a TXT file.")
     return agent, result.artifacts[0].artifact_id, selected
@@ -188,7 +191,10 @@ async def test_persistent_destination_survives_restart_and_conversation_clear(
     finally:
         await agent.close()
     reopened = await Agent.open(
-        "persistent-restart", root=tmp_path, downloads_directory=downloads
+        "persistent-restart",
+        root=tmp_path,
+        downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert await reopened.export_destination() == selected
@@ -237,25 +243,21 @@ async def test_destination_config_is_operational_state_not_memory_skill_or_model
         await agent.close()
 
 
-async def test_destination_authorization_rejects_unknown_raw_path_source_root_agent_home_and_symlink_swap(
+async def test_destination_authorization_rejects_agent_home_and_symlink_swap(
     tmp_path: Path,
 ) -> None:
     downloads = tmp_path / "downloads"
-    source_root = tmp_path / "source"
     persistent = tmp_path / "persistent"
     replacement = tmp_path / "replacement"
-    for directory in (downloads, source_root, persistent, replacement):
+    for directory in (downloads, persistent, replacement):
         directory.mkdir()
-    (source_root / "rows.csv").write_text("id\n1\n", encoding="utf-8")
     agent, artifact_id, _ = await _agent_with_artifact(
         tmp_path, "destination-authorization", downloads
     )
     try:
-        await agent.attach(LocalDirectorySource(source_root))
-        for directory in (agent.home, source_root):
-            with pytest.raises(ArtifactError) as failure:
-                await agent.save_artifact(artifact_id, directory)
-            assert failure.value.code == "artifact_destination_unauthorized"
+        with pytest.raises(ArtifactError) as failure:
+            await agent.save_artifact(artifact_id, agent.home)
+        assert failure.value.code == "artifact_destination_unauthorized"
         selected = await agent.set_export_destination(persistent)
         moved = tmp_path / "moved-persistent"
         persistent.rename(moved)
@@ -282,6 +284,7 @@ async def test_revoked_unavailable_and_downloads_unavailable_errors_preserve_int
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=unavailable_downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Create a TXT file.")
@@ -467,6 +470,7 @@ async def test_verified_receipt_path_and_artifact_identity_are_not_projected_fro
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.run("Create and save a TXT file.")

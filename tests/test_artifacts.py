@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import threading
 from datetime import UTC, datetime
@@ -597,6 +599,7 @@ async def test_clear_conversations_removes_internal_artifacts_but_preserves_deli
         model_profile=_profile(provider),
         id_factory=_agent_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.set_export_destination(export)
@@ -627,6 +630,7 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
         model_profile=_profile(provider),
         id_factory=_agent_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Create a TXT file.")

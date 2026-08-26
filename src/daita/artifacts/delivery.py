@@ -281,7 +281,6 @@ class LocalArtifactDelivery:
             created = True
         else:
             self._verify_grant(existing)
-            await self._require_scope_eligible(existing)
         previous_default = self._default_id
         self._default_id = existing.destination_id
         try:
@@ -321,7 +320,6 @@ class LocalArtifactDelivery:
         try:
             grant = self._resolve(destination_id, run_id=run_id)
             self._verify_grant(grant)
-            await self._require_scope_eligible(grant)
         except ArtifactError as error:
             raise _retained_artifact_error(error, ref.artifact_id) from error
         return FrozenJsonObject.from_mapping(
@@ -352,7 +350,6 @@ class LocalArtifactDelivery:
         try:
             grant = self._resolve(destination_id, run_id=run_id)
             self._verify_grant(grant)
-            await self._require_scope_eligible(grant)
         except ArtifactError as error:
             raise _retained_artifact_error(error, ref.artifact_id) from error
         payload = await self.artifacts.read_ref(ref)
@@ -380,7 +377,6 @@ class LocalArtifactDelivery:
                     run_id=None,
                 )
             self._verify_grant(grant)
-            await self._require_scope_eligible(grant)
         except ArtifactError as error:
             raise _retained_artifact_error(error, ref.artifact_id) from error
         payload = await self.artifacts.read_ref(ref)
@@ -402,7 +398,6 @@ class LocalArtifactDelivery:
                 {"destination_id": destination_id, "display_name": grant.display_name},
             )
         self._verify_grant(grant)
-        await self._require_scope_eligible(grant)
         return FrozenJsonObject.from_mapping(
             {
                 "destination_id": grant.destination_id,
@@ -417,7 +412,6 @@ class LocalArtifactDelivery:
         self._require_config()
         grant = self._resolve(destination_id, run_id=None, permit_one_time=False)
         self._verify_grant(grant)
-        await self._require_scope_eligible(grant)
         previous_default = self._default_id
         if grant.authorization is DestinationAuthorization.SYSTEM:
             self._default_id = None
@@ -522,22 +516,6 @@ class LocalArtifactDelivery:
                 "The artifact destination is not eligible.",
                 {"destination_id": destination_id},
             )
-        for source in await self._sources.list_sources(self.agent_id):
-            if not source.active or source.adapter_id != "local-directory":
-                continue
-            raw_root = source.configuration.get("root")
-            if not isinstance(raw_root, str):
-                continue
-            try:
-                source_root = Path(raw_root).resolve(strict=True)
-            except OSError:
-                continue
-            if resolved == source_root or source_root in resolved.parents:
-                raise ArtifactError(
-                    "artifact_destination_unauthorized",
-                    "The artifact destination overlaps an attached source.",
-                    {"destination_id": destination_id},
-                )
         if not os.access(resolved, os.W_OK):
             raise ArtifactError(
                 (
@@ -627,20 +605,6 @@ class LocalArtifactDelivery:
         if cause is not None:
             error.__cause__ = cause
         raise error
-
-    async def _require_scope_eligible(self, grant: _DestinationGrant) -> None:
-        for source in await self._sources.list_sources(self.agent_id):
-            if not source.active or source.adapter_id != "local-directory":
-                continue
-            raw_root = source.configuration.get("root")
-            if not isinstance(raw_root, str):
-                continue
-            try:
-                source_root = Path(raw_root).resolve(strict=True)
-            except OSError:
-                continue
-            if grant.path == source_root or source_root in grant.path.parents:
-                self._destination_failure(grant, unavailable=False)
 
     def _filename_for_ref(self, ref: ArtifactRef, filename: str | None) -> str:
         requested = ref.filename if filename is None else filename

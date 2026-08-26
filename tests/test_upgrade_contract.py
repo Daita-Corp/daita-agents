@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import hashlib
 import io
@@ -269,7 +271,9 @@ async def test_pre_1_root_layout_is_rejected_without_mixing_state(
 
 
 def test_headless_cli_returns_descriptive_revision_diagnostic(tmp_path: Path) -> None:
-    created = asyncio.run(Agent.create("unsupported", root=tmp_path))
+    created = asyncio.run(
+        Agent.create("unsupported", root=tmp_path, workspace=workspace_for(tmp_path))
+    )
     path = created.home / "state.db"
     asyncio.run(created.close())
     with sqlite3.connect(path) as connection:
@@ -295,7 +299,9 @@ def test_headless_cli_returns_descriptive_revision_diagnostic(tmp_path: Path) ->
 def test_interactive_tui_renders_human_safe_upgrade_diagnostic(
     tmp_path: Path,
 ) -> None:
-    created = asyncio.run(Agent.create("unsupported", root=tmp_path))
+    created = asyncio.run(
+        Agent.create("unsupported", root=tmp_path, workspace=workspace_for(tmp_path))
+    )
     path = created.home / "state.db"
     asyncio.run(created.close())
     with sqlite3.connect(path) as connection:

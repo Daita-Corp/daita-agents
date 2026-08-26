@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import io
 from decimal import Decimal
 from pathlib import Path
@@ -71,6 +73,7 @@ async def test_embedded_reviewer_configuration_is_direct_and_token_bounded(
         root=tmp_path,
         config=AgentConfig(model_route=_route()),
         reviewer_max_estimated_cost_usd=Decimal("0.05"),
+        workspace=workspace_for(tmp_path),
     )
     try:
         reviewer = agent._embedded._candidate_reviewer
@@ -92,6 +95,7 @@ async def test_explicit_review_cost_authorization_uses_persisted_primary_route_o
         "on-demand-reviewer",
         root=tmp_path,
         config=AgentConfig(model_route=_route()),
+        workspace=workspace_for(tmp_path),
     )
     try:
         disabled = await agent.review_learning_candidates()
@@ -132,7 +136,7 @@ async def test_terminal_review_prompts_for_one_call_authorization() -> None:
     agent = ReviewAgent()
     output = io.StringIO()
 
-    controller = PresentationController(root=None)
+    controller = PresentationController(root=None, workspace=workspace_for(None))
     controller.agent = agent  # type: ignore[assignment]
     outcome = await controller.dispatch_command("/review")
     assert outcome.kind == "screen"
@@ -153,7 +157,7 @@ async def test_terminal_review_authorization_can_be_cancelled() -> None:
     agent = ReviewAgent()
     output = io.StringIO()
 
-    controller = PresentationController(root=None)
+    controller = PresentationController(root=None, workspace=workspace_for(None))
     controller.agent = agent  # type: ignore[assignment]
     outcome = await controller.dispatch_command("/review")
     assert outcome.kind == "screen"
@@ -177,7 +181,7 @@ async def test_terminal_review_accepts_inline_one_call_cost_limit() -> None:
     agent = ReviewAgent()
     output = io.StringIO()
 
-    controller = PresentationController(root=None)
+    controller = PresentationController(root=None, workspace=workspace_for(None))
     controller.agent = agent  # type: ignore[assignment]
     outcome = await controller.dispatch_command("/review 0.02")
     assert outcome.kind == "notice"
@@ -234,6 +238,7 @@ async def test_terminal_reopen_passes_explicit_reviewer_and_cost_ceiling(
     controller = PresentationController(
         root=Path("/tmp/daita-test-root"),
         reviewer_max_estimated_cost_usd=Decimal("0.05"),
+        workspace=workspace_for(Path("/tmp/daita-test-root")),
     )
     controller.agent = configured  # type: ignore[assignment]
     result = await controller.reopen_agent(observer=None, approval_handler=None)
@@ -329,7 +334,7 @@ async def test_candidate_acceptance_output_is_bounded_and_sanitized(
     assert "\x00" not in legacy_output
     assert len(legacy_output) <= 16_400
 
-    controller = PresentationController(root=None)
+    controller = PresentationController(root=None, workspace=workspace_for(None))
     controller.agent = Agent()  # type: ignore[assignment]
     rendered = (await controller.dispatch_command("/memory accept candidate-1")).message
     assert "\x1b" not in rendered

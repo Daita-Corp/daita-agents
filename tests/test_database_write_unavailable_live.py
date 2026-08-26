@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import os
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
@@ -229,6 +231,7 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
             max_wall_time_seconds=120,
             max_estimated_cost_usd=_cost_limit(),
         ),
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_postgresql(

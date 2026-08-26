@@ -19,10 +19,30 @@ from .common import (
     text,
 )
 
+_CURRENT_SOURCE_ADAPTER_IDS = frozenset({"sqlite", "postgresql"})
+_REMOVED_DEVELOPMENT_SOURCE_ADAPTER_IDS = frozenset({"local-directory"})
+
+
+class CurrentSourceAdapterError(ValueError):
+    """Reject source adapter state outside the one current pre-production shape."""
+
+
+def _require_current_adapter(adapter_id: str) -> None:
+    if adapter_id in _REMOVED_DEVELOPMENT_SOURCE_ADAPTER_IDS:
+        raise CurrentSourceAdapterError(
+            "agent home contains removed pre-production file-source state; "
+            "delete and recreate this disposable development agent"
+        )
+    if adapter_id not in _CURRENT_SOURCE_ADAPTER_IDS:
+        raise CurrentSourceAdapterError(
+            "stored source registration uses an unsupported current adapter"
+        )
+
 
 def _require_current_source(value: SourceRegistration) -> SourceRegistration:
     if not isinstance(value, SourceRegistration):
         raise TypeError("source codec requires SourceRegistration")
+    _require_current_adapter(value.adapter_id)
     if value.adapter_id == "postgresql" and "write_access" in value.configuration:
         raise ValueError("PostgreSQL source contains embedded write admission")
     return value
@@ -75,6 +95,7 @@ def _decode_source(value: JsonValue) -> SourceRegistration:
     if not isinstance(configuration, dict):
         raise ValueError("stored source configuration is invalid")
     adapter_id = text(fields["adapter_id"], "source adapter_id")
+    _require_current_adapter(adapter_id)
     if adapter_id == "postgresql" and "write_access" in configuration:
         raise ValueError("stored PostgreSQL source contains embedded write admission")
     return SourceRegistration(
@@ -87,3 +108,6 @@ def _decode_source(value: JsonValue) -> SourceRegistration:
         attached_at=datetime_decode(fields["attached_at"]),
         detached_at=optional_datetime_decode(fields["detached_at"]),
     )
+
+
+__all__ = ["CurrentSourceAdapterError", "decode_source", "encode_source"]

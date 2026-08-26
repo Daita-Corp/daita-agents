@@ -13,6 +13,8 @@ races, scope revocation, and malformed persisted state.
 
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import os
 import sqlite3
@@ -252,7 +254,7 @@ async def _create_home(tmp_path: Path, name: str) -> tuple[Path, str, str]:
     root = tmp_path / f"{name}-root"
     database = tmp_path / f"{name}.sqlite"
     _database(database)
-    agent = await Agent.create(name, root=root)
+    agent = await Agent.create(name, root=root, workspace=workspace_for(root))
     try:
         source = await agent.attach(SQLiteSource(database, name="Stage C live probe"))
         resources = await agent.list_catalog_resources(source_id=source.id)
@@ -389,6 +391,16 @@ async def _seed_terminal_job(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
                     ToolCall(
+                        id="seed-profile-load",
+                        name="toolbox_load",
+                        arguments={"tool_names": ["start_data_profile"]},
+                    ),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
                         id="seed-profile",
                         name="start_data_profile",
                         arguments={
@@ -407,6 +419,7 @@ async def _seed_terminal_job(
         model=provider,
         model_profile=provider.model_profile,
         limits=_SEED_LIMITS,
+        workspace=workspace_for(root),
     )
     try:
         started = await agent.run(
@@ -436,6 +449,16 @@ async def _seed_failed_terminal_job(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
                     ToolCall(
+                        id="seed-failed-profile-load",
+                        name="toolbox_load",
+                        arguments={"tool_names": ["start_data_profile"]},
+                    ),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
                         id="seed-failed-profile",
                         name="start_data_profile",
                         arguments={
@@ -454,6 +477,7 @@ async def _seed_failed_terminal_job(
         model=provider,
         model_profile=provider.model_profile,
         limits=_SEED_LIMITS,
+        workspace=workspace_for(root),
     )
     _, executor = agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID
@@ -493,6 +517,7 @@ async def test_live_model_runs_stage_b_start_through_stage_c_inbox(
         model=provider,
         model_profile=profile,
         limits=_limits(),
+        workspace=workspace_for(root),
     )
     try:
         started = await agent.run(
@@ -573,6 +598,7 @@ async def test_live_terminal_run_is_finalized_after_reopen_without_reasoning_aga
             model=provider,
             model_profile=profile,
             limits=_limits(),
+            workspace=workspace_for(root),
         )
         try:
             await asyncio.wait_for(finalizer_entered.wait(), timeout=180)
@@ -597,6 +623,7 @@ async def test_live_terminal_run_is_finalized_after_reopen_without_reasoning_aga
         model=recovery,
         model_profile=recovery.model_profile,
         limits=_limits(),
+        workspace=workspace_for(root),
     )
     try:
         item, _transcript, _result = await _assert_live_delivery(agent, job_id)
@@ -632,6 +659,7 @@ async def test_live_failed_terminal_job_is_reported_without_inventing_a_result(
         model=provider,
         model_profile=profile,
         limits=_limits(),
+        workspace=workspace_for(root),
     )
     try:
         items = await _wait_for_inbox(agent)
@@ -700,6 +728,7 @@ async def test_live_followup_uses_sticky_fallback_and_delivers_exactly_once(
         model=router,
         model_profile=router.model_profile,
         limits=_limits(),
+        workspace=workspace_for(root),
     )
     try:
         item, _transcript, _result = await _assert_live_delivery(agent, job_id)

@@ -14,6 +14,8 @@ model/tool loop progresses.
 
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import json
 import os
@@ -211,6 +213,7 @@ async def _new_agent(
         model=provider,
         model_profile=profile,
         limits=_limits(),
+        workspace=workspace_for(tmp_path / f"{name}-root"),
     )
     source = await agent.attach(SQLiteSource(database, name="Stage B live probes"))
     return agent, source.id

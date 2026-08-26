@@ -4,6 +4,8 @@ import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
+from _workspace_support import workspace_for
+
 import daita
 from daita.capabilities import AccessMode, OperationalEffect
 from daita.storage.sqlite import SQLiteStateStore
@@ -170,8 +172,7 @@ def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
     assert "capability_runtime" not in loop
 
 
-def test_phase0_local_file_backend_is_unconditionally_composed():
-    """Lock the legacy composition boundary before Phase 2 replaces it."""
+def test_phase2_local_workspace_backend_is_explicit_and_conditionally_composed():
 
     embedded_path = PACKAGE / "hosting" / "embedded.py"
     tree = ast.parse(embedded_path.read_text(encoding="utf-8"))
@@ -185,29 +186,16 @@ def test_phase0_local_file_backend_is_unconditionally_composed():
         for node in embedded_class.body
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "_compose"
     )
-    direct_assignments = {
-        target.id: ast.unparse(statement.value)
-        for statement in compose.body
-        if isinstance(statement, ast.Assign)
-        and len(statement.targets) == 1
-        and isinstance((target := statement.targets[0]), ast.Name)
-    }
-
-    assert direct_assignments["local_file_backend"] == (
-        "LocalDirectoryReadBackend(store, store, data_view)"
-    )
-    assert direct_assignments["local_files"] == (
-        "local_file_read_declarations(identity.id, local_file_backend)"
-    )
-
     compose_text = ast.get_source_segment(
         embedded_path.read_text(encoding="utf-8"), compose
     )
     assert compose_text is not None
-    assert "local_file_backend=local_file_backend" in compose_text
-    assert "*local_files.capabilities" in compose_text
-    assert "*local_files.tool_views" in compose_text
-    assert "*local_files.executors" in compose_text
+    assert "LocalDirectoryReadBackend" not in compose_text
+    assert "local_file_declarations(workspace_backend)" in compose_text
+    assert "if workspace_backend is None" in compose_text
+    assert "local_files.capabilities if local_files is not None else ()" in compose_text
+    assert "local_files.tool_views if local_files is not None else ()" in compose_text
+    assert "local_files.executors if local_files is not None else ()" in compose_text
 
 
 def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
@@ -271,7 +259,9 @@ def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
 async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
     tmp_path,
 ):
-    agent = await daita.Agent.create("stage-m1-owners", root=tmp_path)
+    agent = await daita.Agent.create(
+        "stage-m1-owners", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         registry = agent._embedded._capabilities
         runtime = agent._embedded._capability_runtime
@@ -298,7 +288,8 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["catalog_search"] == "data"
         assert resolved["data_query_sqlite"] == "data"
         assert resolved["data_query_postgresql"] == "data"
-        assert resolved["data_read_file"] == "data"
+        assert resolved["file_search"] == "data"
+        assert resolved["file_read"] == "data"
         assert resolved["data_update_postgresql"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
@@ -365,7 +356,7 @@ def test_public_surface_is_focused():
         "JobResultView",
         "JobStatus",
         "JobSummary",
-        "LocalDirectorySource",
+        "LocalWorkspace",
         "LoopExit",
         "LoopExitKind",
         "LoopLimits",
@@ -819,7 +810,9 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
 async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_branch(
     tmp_path,
 ):
-    agent = await daita.Agent.create("write-architecture", root=tmp_path)
+    agent = await daita.Agent.create(
+        "write-architecture", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         registry = agent._embedded._capabilities
         effect_tools = set()
@@ -849,7 +842,11 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
 async def test_database_write_phase_three_registers_only_the_postgresql_update_slice(
     tmp_path,
 ):
-    agent = await daita.Agent.create("database-write-phase-two", root=tmp_path)
+    agent = await daita.Agent.create(
+        "database-write-phase-two",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         registry = agent._embedded._capabilities
         capability_ids = {
@@ -1996,9 +1993,9 @@ def test_artifact_payloads_and_destination_grants_never_enter_sqlite_messages_or
     assert "saved_path" not in context_text
 
 
-def test_local_file_read_path_no_longer_imports_or_constructs_artifact_bytes():
+def test_local_workspace_read_path_never_imports_or_constructs_artifact_bytes():
     for relative in (
-        "adapters/local_files.py",
+        "adapters/local_workspace.py",
         "domains/data/file_capabilities.py",
     ):
         text = (PACKAGE / relative).read_text(encoding="utf-8")

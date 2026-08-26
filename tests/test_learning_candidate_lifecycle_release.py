@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import json
 import sqlite3
@@ -112,6 +114,7 @@ async def _memory_candidate_agent(
         reviewer_model=reviewer,
         approval_handler=approval_handler,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     await agent.run("Remember that booked revenue excludes completed refunds.")
     candidate_id = (await agent.review_learning_candidates()).candidates[0].candidate.id
@@ -254,6 +257,7 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
         "candidate-semantic-projection",
         root=tmp_path,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_sqlite(database, name="semantic")
@@ -343,6 +347,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
         limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first_source = await agent.attach_sqlite(first_database, name="first")
@@ -594,6 +599,7 @@ async def test_acceptance_fails_closed_when_loop_uses_a_different_runtime(tmp_pa
             tools=_NoTools(),
             reviewer_model=reviewer,
             id_factory=_ids(),
+            workspace=workspace_for(tmp_path),
         )
     )
     try:

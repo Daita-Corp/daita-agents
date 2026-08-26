@@ -34,7 +34,7 @@ from .source_permissions import (
     encode_postgresql_update_scope,
     encode_source_read_scope,
 )
-from .sources import decode_source, encode_source
+from .sources import CurrentSourceAdapterError, decode_source, encode_source
 from .transcripts import (
     decode_loop_exit,
     decode_message,
@@ -45,6 +45,7 @@ from .transcripts import (
 )
 
 __all__ = [
+    "CurrentSourceAdapterError",
     "decode_autonomous_followup",
     "decode_catalog_snapshot",
     "decode_catalog_sync",

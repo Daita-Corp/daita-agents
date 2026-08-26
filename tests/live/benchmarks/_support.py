@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import asyncio
 import json
 import os
@@ -246,7 +248,7 @@ async def create_probe_home(
     root = tmp_path / f"{name}-root"
     database = tmp_path / f"{name}.sqlite"
     create_probe_database(database, distractor_tables=distractor_tables)
-    agent = await Agent.create(name, root=root)
+    agent = await Agent.create(name, root=root, workspace=workspace_for(root))
     try:
         source = await agent.attach(SQLiteSource(database, name="Stage B benchmarks"))
         resources = await agent.list_catalog_resources(source_id=source.id)
@@ -281,6 +283,7 @@ async def create_live_agent(
         model=provider,
         model_profile=profile,
         limits=benchmark_limits(),
+        workspace=workspace_for(tmp_path / f"{name}-root"),
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Stage B benchmarks"))
@@ -306,6 +309,7 @@ async def open_live_home(home: ProbeHome, model_id: str) -> LiveAgentFixture:
         model=provider,
         model_profile=profile,
         limits=benchmark_limits(),
+        workspace=workspace_for(home.root),
     )
     return LiveAgentFixture(
         agent=agent,
@@ -344,6 +348,7 @@ async def seed_completed_profile_agent(
         model=provider,
         model_profile=provider.model_profile,
         limits=OFFLINE_EAGER_LIMITS,
+        workspace=workspace_for(home.root),
     )
     try:
         result = await agent.run(

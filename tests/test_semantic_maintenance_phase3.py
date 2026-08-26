@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _workspace_support import workspace_for
+
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
@@ -464,6 +466,7 @@ async def test_related_foreground_run_can_inspect_stale_record_without_using_it(
         model=seed_provider,
         model_profile=_profile(seed_provider),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_sqlite(database)
@@ -522,6 +525,7 @@ async def test_related_foreground_run_can_inspect_stale_record_without_using_it(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await reopened.run("What does invoices.booked_at mean?")
@@ -580,6 +584,7 @@ async def test_maximum_skill_index_stays_shallow_and_multiple_bodies_load_progre
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         for index in range(SKILL_MAX_COUNT):
@@ -623,6 +628,7 @@ async def test_identically_named_resources_remain_isolated_by_selected_source(
         model=provider,
         model_profile=_profile(provider),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         first_source = await agent.attach_sqlite(first_database, name="first")
