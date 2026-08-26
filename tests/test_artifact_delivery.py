@@ -23,7 +23,9 @@ from daita.llm.models import (
     TextBlock,
     ToolCall,
 )
-from daita.llm.providers.mock import MockModelProvider
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
 
 def _ids():

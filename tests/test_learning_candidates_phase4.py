@@ -51,11 +51,13 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, ToolProjectionMode
+from daita.loop.models import LoopLimits
 from daita.storage.sqlite import SQLiteStateStore
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 from daita.tui.controller import PresentationController
 
 
@@ -768,32 +770,34 @@ async def test_source_scoped_candidate_cannot_be_accepted_through_another_source
             "Run and retain a reusable monthly invoice procedure.",
             source_id=source_a.id,
         )
-        reviewer._script = (
-            _response(
-                json.dumps(
-                    {
-                        "candidates": [
-                            {
-                                "target": "skill",
-                                "source_ids": [source_a.id],
-                                "supporting_run_ids": ["run-1"],
-                                "content": {
-                                    "action": "save",
-                                    "name": "monthly-invoices",
-                                    "description": (
-                                        "Use for validated monthly invoice review."
-                                    ),
-                                    "instructions": (
-                                        "# Purpose\nReview monthly invoices.\n\n"
-                                        "# Procedure\nInspect current catalog first.\n\n"
-                                        "# Verification\nRequire a validated result."
-                                    ),
-                                },
-                            }
-                        ]
-                    }
-                )
-            ),
+        reviewer.replace_script(
+            (
+                _response(
+                    json.dumps(
+                        {
+                            "candidates": [
+                                {
+                                    "target": "skill",
+                                    "source_ids": [source_a.id],
+                                    "supporting_run_ids": ["run-1"],
+                                    "content": {
+                                        "action": "save",
+                                        "name": "monthly-invoices",
+                                        "description": (
+                                            "Use for validated monthly invoice review."
+                                        ),
+                                        "instructions": (
+                                            "# Purpose\nReview monthly invoices.\n\n"
+                                            "# Procedure\nInspect current catalog first.\n\n"
+                                            "# Verification\nRequire a validated result."
+                                        ),
+                                    },
+                                }
+                            ]
+                        }
+                    )
+                ),
+            )
         )
         candidate = (await agent.review_learning_candidates()).candidates[0]
         assert candidate.candidate.source_ids == (source_a.id,)
@@ -1196,21 +1200,23 @@ async def test_reviewer_redacts_secret_values_inside_bounded_tool_results(tmp_pa
     )
     try:
         source = await agent.attach_sqlite(database, name="credentials")
-        foreground._script = (
-            ModelResponse(
-                finish_reason=FinishReason.TOOL_CALLS,
-                tool_calls=(
-                    ToolCall(
-                        id="secret-row",
-                        name="data_query_sqlite",
-                        arguments={
-                            "source_id": source.id,
-                            "sql": "SELECT api_key FROM credentials",
-                        },
+        foreground.replace_script(
+            (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(
+                        ToolCall(
+                            id="secret-row",
+                            name="data_query_sqlite",
+                            arguments={
+                                "source_id": source.id,
+                                "sql": "SELECT api_key FROM credentials",
+                            },
+                        ),
                     ),
                 ),
-            ),
-            _response("The requested record was inspected."),
+                _response("The requested record was inspected."),
+            )
         )
         run = await agent.run(
             "Inspect the credential record without retaining its value.",

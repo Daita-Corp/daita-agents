@@ -17,8 +17,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, ToolProjectionMode
+from daita.loop.models import LoopLimits
 from daita.memory import (
     MEMORY_MAX_CHARACTERS,
     MEMORY_MAX_UTF8_BYTES,
@@ -29,9 +28,12 @@ from daita.memory import (
     MemoryValidationError,
 )
 from daita.storage.sqlite_migrations import migration_rows
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -315,8 +317,14 @@ async def test_injected_memory_cannot_create_a_tool_or_bypass_runtime_validation
         await agent.close()
 
     assert result.final_text == "runtime stayed authoritative"
-    tool_result = transcript.messages[2].content[0]
-    assert isinstance(tool_result, ToolResultBlock)
+    tool_result = next(
+        block
+        for message in transcript.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+        and block.output.get("kind")
+        not in {"toolbox_load_receipt", "toolbox_search_results"}
+    )
     assert tool_result.is_error is True
     error = tool_result.output["error"]
     assert isinstance(error, Mapping)

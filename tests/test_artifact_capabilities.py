@@ -8,8 +8,8 @@ from typing import cast
 
 import pytest
 from _capability_runtime_support import (
-    context_step_projection,
-    context_tool_catalog,
+    ContextToolProjectionAdapter,
+    execute_projected,
 )
 
 import daita.domains.data.controller as data_controller
@@ -38,7 +38,9 @@ from daita.llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 from daita.loop.models import RunInput
 
 
@@ -50,13 +52,14 @@ async def _prepared_request(
     *,
     step: int,
 ) -> ModelRequest:
-    catalog = context_tool_catalog(run, tools)
+    projection = ContextToolProjectionAdapter(tools)
+    catalog = await projection.prepare_run(run)
     snapshot = await builder.prepare(run, messages, catalog)
     return builder.project(
         snapshot,
         messages,
         step=step,
-        tool_context=context_step_projection(catalog),
+        tool_context=projection.project(catalog, messages),
     )
 
 
@@ -340,10 +343,9 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
             conversation_id=created.conversation_id,
         )
         runtime = agent._embedded._capability_runtime
-        catalog = await runtime.prepare_run(run)
-        projection = runtime.project(catalog, ())
         result = (
-            await runtime.execute_all(
+            await execute_projected(
+                runtime,
                 run,
                 (
                     ToolCall(
@@ -355,7 +357,6 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
                         },
                     ),
                 ),
-                projection=projection,
                 sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
@@ -545,7 +546,7 @@ async def test_context_does_not_create_artifacts_for_ordinary_analysis_or_reads(
         await agent.close()
 
 
-async def test_model_artifact_tools_are_projected_without_prompt_classification(
+async def test_model_artifact_tools_use_exact_pinned_surface_without_classification(
     tmp_path: Path,
 ) -> None:
     downloads = tmp_path / "downloads"
@@ -563,15 +564,16 @@ async def test_model_artifact_tools_are_projected_without_prompt_classification(
         assert result.artifacts == ()
         projected = {tool.name for tool in provider.requests[0].tools}
         assert {
-            DOCUMENT_CREATE_TOOL_NAME,
-            ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-        } <= projected
-        assert {
             ARTIFACT_LIST_TOOL_NAME,
             ARTIFACT_READ_TOOL_NAME,
+        } <= projected
+        assert {"toolbox_search", "toolbox_load"} <= projected
+        assert {
+            DOCUMENT_CREATE_TOOL_NAME,
+            ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
             ARTIFACT_CONVERT_TOOL_NAME,
             ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-        } <= projected
+        }.isdisjoint(projected)
         assert not tuple(downloads.iterdir())
     finally:
         await agent.close()
@@ -597,9 +599,12 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
         await agent.run("Make Downloads my default export location.")
         request = provider.requests[0]
         projected = {tool.name for tool in request.tools}
-        assert ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME in projected
-        assert ARTIFACT_SAVE_LOCAL_TOOL_NAME in projected
-        assert DOCUMENT_CREATE_TOOL_NAME in projected
+        assert {"toolbox_search", "toolbox_load"} <= projected
+        assert {
+            ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+            ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+            DOCUMENT_CREATE_TOOL_NAME,
+        }.isdisjoint(projected)
         system = "\n".join(
             block.text
             for message in request.messages

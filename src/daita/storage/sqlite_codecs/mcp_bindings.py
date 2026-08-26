@@ -10,7 +10,12 @@ from ...adapters.mcp import (
     MCPServerBinding,
     MCPToolBinding,
 )
-from ...capabilities import ToolDiscoveryMetadata, ToolExposureClass
+from ...capabilities import (
+    ToolboxId,
+    ToolLoadMode,
+    ToolPresentation,
+    ToolTextTrust,
+)
 from ...llm.models import ModelSensitivity
 from ...security import SecretReference
 from .common import (
@@ -147,11 +152,12 @@ def _encode_tool(value: MCPToolBinding):
             "local_name": value.local_name,
             "remote_name": value.remote_name,
             "description": value.description,
-            "discovery_summary": value.discovery.summary,
-            "discovery_when_to_use": value.discovery.when_to_use,
-            "discovery_keywords": list(value.discovery.keywords),
-            "discovery_exposure_class": value.discovery.exposure_class.value,
-            "discovery_eager_priority": value.discovery.eager_priority,
+            "presentation_toolbox_id": value.presentation.toolbox_id.value,
+            "presentation_load_mode": value.presentation.load_mode.value,
+            "presentation_text_trust": value.presentation.text_trust.value,
+            "presentation_summary": value.presentation.summary,
+            "presentation_when_to_use": value.presentation.when_to_use,
+            "presentation_keywords": list(value.presentation.keywords),
             "input_schema": plain_encode(value.input_schema),
             "input_schema_digest": value.input_schema_digest,
             "output_schema": (
@@ -175,11 +181,12 @@ def _decode_tool(value) -> MCPToolBinding:
             "local_name",
             "remote_name",
             "description",
-            "discovery_summary",
-            "discovery_when_to_use",
-            "discovery_keywords",
-            "discovery_exposure_class",
-            "discovery_eager_priority",
+            "presentation_toolbox_id",
+            "presentation_load_mode",
+            "presentation_text_trust",
+            "presentation_summary",
+            "presentation_when_to_use",
+            "presentation_keywords",
             "input_schema",
             "input_schema_digest",
             "output_schema",
@@ -198,8 +205,14 @@ def _decode_tool(value) -> MCPToolBinding:
         sensitivity = ModelSensitivity(
             text(fields["result_sensitivity"], "MCP result sensitivity")
         )
-        exposure_class = ToolExposureClass(
-            text(fields["discovery_exposure_class"], "MCP exposure class")
+        toolbox_id = ToolboxId(
+            text(fields["presentation_toolbox_id"], "MCP toolbox id")
+        )
+        load_mode = ToolLoadMode(
+            text(fields["presentation_load_mode"], "MCP load mode")
+        )
+        text_trust = ToolTextTrust(
+            text(fields["presentation_text_trust"], "MCP text trust")
         )
     except ValueError:
         raise ValueError("stored MCP tool enum is invalid") from None
@@ -209,23 +222,21 @@ def _decode_tool(value) -> MCPToolBinding:
         local_name=text(fields["local_name"], "MCP local name"),
         remote_name=text(fields["remote_name"], "MCP remote name"),
         description=text(fields["description"], "MCP tool description"),
-        discovery=ToolDiscoveryMetadata(
-            summary=text(fields["discovery_summary"], "MCP discovery summary"),
+        presentation=ToolPresentation(
+            toolbox_id=toolbox_id,
+            load_mode=load_mode,
+            text_trust=text_trust,
+            summary=text(fields["presentation_summary"], "MCP presentation summary"),
             when_to_use=text(
-                fields["discovery_when_to_use"],
-                "MCP discovery when_to_use",
+                fields["presentation_when_to_use"],
+                "MCP presentation when_to_use",
             ),
             keywords=tuple(
-                text(item, "MCP discovery keyword")
+                text(item, "MCP presentation keyword")
                 for item in sequence(
-                    fields["discovery_keywords"],
-                    "MCP discovery keywords",
+                    fields["presentation_keywords"],
+                    "MCP presentation keywords",
                 )
-            ),
-            exposure_class=exposure_class,
-            eager_priority=integer(
-                fields["discovery_eager_priority"],
-                "MCP discovery eager priority",
             ),
         ),
         input_schema=FrozenJsonObject.from_mapping(input_schema),

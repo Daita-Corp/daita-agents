@@ -5,10 +5,7 @@ from hashlib import sha256
 from typing import cast
 
 import pytest
-from _capability_runtime_support import (
-    context_step_projection,
-    context_tool_catalog,
-)
+from _capability_runtime_support import ContextToolProjectionAdapter
 
 from daita._json import canonical_json
 from daita.agent import Agent
@@ -18,7 +15,6 @@ from daita.llm.errors import (
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
-    ToolSurfaceLimitExceeded,
 )
 from daita.llm.models import (
     FinishReason,
@@ -55,7 +51,7 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 class TranscriptContext:
     async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tool_context.provider_definitions
+        return messages[:-1], tool_context.initial_provider_definitions
 
     def project(
         self,
@@ -89,67 +85,44 @@ class ScriptedTools:
     def __init__(self, outputs):
         self.outputs = outputs
         self.calls = []
-
-    async def prepare_run(self, run):
-        return context_tool_catalog(
-            run,
+        self._projection = ContextToolProjectionAdapter(
             (
                 ToolDefinition(
                     name="lookup",
                     description="look something up",
                     input_schema={"type": "object", "properties": {}},
                 ),
-            ),
+            )
         )
 
-    def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+    async def prepare_run(self, run):
+        return await self._projection.prepare_run(run)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    def project(self, catalog, messages):
+        return self._projection.project(catalog, messages)
+
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         self.calls.extend(calls)
         return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
 
 
 class StaticDefinitionTools:
     def __init__(self, definitions, limits=LoopLimits()):
-        self._definitions = tuple(definitions)
-        self._limits = limits
+        definitions = tuple(definitions)
+        self._projection = ContextToolProjectionAdapter(
+            definitions,
+            limits=limits,
+        )
 
     async def prepare_run(self, run):
-        definition_bytes = len(
-            canonical_json(
-                [
-                    {
-                        "name": item.name,
-                        "description": item.description,
-                        "input_schema": item.input_schema,
-                    }
-                    for item in self._definitions
-                ]
-            ).encode("utf-8")
-        )
-        if (
-            len(self._definitions) > self._limits.max_direct_tools
-            or definition_bytes > self._limits.max_direct_tool_definition_bytes
-        ):
-            raise ToolSurfaceLimitExceeded(
-                observed_tools=len(self._definitions),
-                maximum_tools=self._limits.max_direct_tools,
-                observed_definition_bytes=definition_bytes,
-                maximum_definition_bytes=(
-                    self._limits.max_direct_tool_definition_bytes
-                ),
-            )
-        return context_tool_catalog(run, self._definitions)
+        return await self._projection.prepare_run(run)
 
     def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+        return self._projection.project(catalog, messages)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, calls, projection, sensitivity
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, calls, projection, messages, sensitivity
         raise AssertionError("an over-limit tool surface must never execute")
 
 
@@ -252,11 +225,10 @@ async def test_projected_tool_surface_limits_fail_before_context_or_model(limit_
             raise AssertionError("tool bounds must precede context preparation")
 
     limits = (
-        LoopLimits(max_direct_tools=1, max_eager_tools=1)
+        LoopLimits(max_pinned_tools=1)
         if limit_kind == "count"
         else LoopLimits(
-            max_direct_tool_definition_bytes=64,
-            max_eager_tool_definition_bytes=64,
+            max_pinned_tool_definition_bytes=64,
         )
     )
     provider = MockModelProvider(
@@ -314,17 +286,13 @@ async def test_projected_tool_surface_limits_are_inclusive():
         tools=StaticDefinitionTools(
             definitions,
             LoopLimits(
-                max_direct_tools=len(definitions),
-                max_direct_tool_definition_bytes=definition_bytes,
-                max_eager_tools=len(definitions),
-                max_eager_tool_definition_bytes=definition_bytes,
+                max_pinned_tools=len(definitions),
+                max_pinned_tool_definition_bytes=definition_bytes,
             ),
         ),
         limits=LoopLimits(
-            max_direct_tools=len(definitions),
-            max_direct_tool_definition_bytes=definition_bytes,
-            max_eager_tools=len(definitions),
-            max_eager_tool_definition_bytes=definition_bytes,
+            max_pinned_tools=len(definitions),
+            max_pinned_tool_definition_bytes=definition_bytes,
         ),
         clock=lambda: NOW,
     )
@@ -345,14 +313,14 @@ async def test_projected_tool_surface_limits_are_inclusive():
 def test_projected_tool_surface_limits_must_be_positive():
     with pytest.raises(
         ValueError,
-        match="max_direct_tools must be a positive integer",
+        match="max_pinned_tools must be a positive integer",
     ):
-        LoopLimits(max_direct_tools=0)
+        LoopLimits(max_pinned_tools=0)
     with pytest.raises(
         ValueError,
-        match="max_direct_tool_definition_bytes must be a positive integer",
+        match="max_pinned_tool_definition_bytes must be a positive integer",
     ):
-        LoopLimits(max_direct_tool_definition_bytes=0)
+        LoopLimits(max_pinned_tool_definition_bytes=0)
 
 
 async def test_direct_loop_records_every_parallel_result_in_order():
@@ -537,13 +505,14 @@ async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
             return await super().prepare(run, messages, tool_context)
 
     class BrokenTools(ScriptedTools):
-        async def execute_all(self, run, calls, *, projection, sensitivity):
+        async def execute_all(self, run, calls, *, projection, messages, sensitivity):
             if failure_site == "tool_contract":
                 return ()
             return await super().execute_all(
                 run,
                 calls,
                 projection=projection,
+                messages=messages,
                 sensitivity=sensitivity,
             )
 

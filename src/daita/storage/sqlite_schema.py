@@ -248,7 +248,7 @@ MCP_SERVER_BINDING_TABLE_SQL = """
 CREATE TABLE mcp_server_bindings (
     agent_id TEXT NOT NULL,
     binding_id TEXT NOT NULL,
-    data TEXT NOT NULL,
+    data TEXT NOT NULL CHECK (json_valid(data)),
     PRIMARY KEY (agent_id, binding_id)
 )
 """

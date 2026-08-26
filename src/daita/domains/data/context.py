@@ -12,8 +12,8 @@ from ...artifacts.models import ArtifactDestination, artifact_destination_to_map
 from ...capability_runtime import (
     RunToolCatalog,
     StepToolProjection,
-    ToolInvocationMode,
 )
+from ...capabilities import ToolLoadMode
 from ...catalog.capabilities import (
     CATALOG_INSPECT_EVIDENCE_KIND,
     CATALOG_SCHEMA_EVIDENCE_KIND,
@@ -215,8 +215,8 @@ class RunContextSnapshot:
     run_id: str
     start_message: CanonicalMessage
     profile: ModelProfile
+    registry_digest: str
     catalog_digest: str
-    provider_definitions: tuple[ToolDefinition, ...]
     static_messages: tuple[CanonicalMessage, ...]
     final_static_messages: tuple[CanonicalMessage, ...]
     initial_sensitivity: ModelSensitivity
@@ -233,17 +233,18 @@ class RunContextSnapshot:
             raise ValueError("run context snapshot start role is invalid")
         if not isinstance(self.profile, ModelProfile):
             raise TypeError("run context snapshot requires a model profile")
-        provider_definitions = tuple(self.provider_definitions)
         static_messages = tuple(self.static_messages)
         final_static_messages = tuple(self.final_static_messages)
-        if any(not isinstance(item, ToolDefinition) for item in provider_definitions):
-            raise TypeError("run context provider definitions are invalid")
-        if (
-            not isinstance(self.catalog_digest, str)
-            or not self.catalog_digest.startswith("sha256:")
-            or len(self.catalog_digest) != 71
+        for value, name in (
+            (self.registry_digest, "registry"),
+            (self.catalog_digest, "catalog"),
         ):
-            raise ValueError("run context snapshot requires a catalog digest")
+            if (
+                not isinstance(value, str)
+                or not value.startswith("sha256:")
+                or len(value) != 71
+            ):
+                raise ValueError(f"run context snapshot requires a {name} digest")
         if any(
             not isinstance(item, CanonicalMessage)
             for item in (*static_messages, *final_static_messages)
@@ -267,7 +268,6 @@ class RunContextSnapshot:
             or self.max_context_evidence_bytes < 1
         ):
             raise ValueError("run context evidence bound must be positive")
-        object.__setattr__(self, "provider_definitions", provider_definitions)
         object.__setattr__(self, "static_messages", static_messages)
         object.__setattr__(self, "final_static_messages", final_static_messages)
 
@@ -278,6 +278,7 @@ class RunContextSnapshot:
             {
                 "run_id": self.run_id,
                 "model_profile_id": self.profile.id,
+                "registry_digest": self.registry_digest,
                 "catalog_digest": self.catalog_digest,
                 "static_context_sha256": self.static_context_sha256,
                 "initial_sensitivity": self.initial_sensitivity.value,
@@ -288,14 +289,6 @@ class RunContextSnapshot:
                 ],
                 "final_static_messages": [
                     _neutral_message(message) for message in self.final_static_messages
-                ],
-                "provider_definitions": [
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "input_schema": tool.input_schema,
-                    }
-                    for tool in self.provider_definitions
                 ],
             }
         )
@@ -418,7 +411,7 @@ class DataContextBuilder:
         messages = tuple(messages)
         if not isinstance(tool_context, RunToolCatalog):
             raise TypeError("tool_context must be RunToolCatalog")
-        tools = tool_context.provider_definitions
+        tools = tool_context.initial_provider_definitions
         capability_ids = tool_context.capability_ids
         manifest_payload = tool_context.manifest_payload
         manifest_bytes = len(canonical_json(manifest_payload).encode("utf-8"))
@@ -428,9 +421,8 @@ class DataContextBuilder:
             max(1, self._profile.maximum_input_tokens // 20),
         ):
             raise ToolManifestLimitExceeded()
-        has_deferred_tools = any(
-            entry.invocation_mode is ToolInvocationMode.DEFERRED
-            for entry in tool_context.entries
+        has_on_demand_tools = any(
+            entry.load_mode is ToolLoadMode.ON_DEMAND for entry in tool_context.entries
         )
         if any(not isinstance(message, CanonicalMessage) for message in messages):
             raise TypeError("messages must contain CanonicalMessage records")
@@ -554,7 +546,7 @@ class DataContextBuilder:
             tools,
             capability_ids=capability_ids,
             tool_manifest=manifest_payload,
-            has_deferred_tools=has_deferred_tools,
+            has_on_demand_tools=has_on_demand_tools,
             memory_text=memory_text,
             user_profile=user_profile,
             skill_index=skill_index,
@@ -596,7 +588,7 @@ class DataContextBuilder:
                 tools,
                 capability_ids=capability_ids,
                 tool_manifest=manifest_payload,
-                has_deferred_tools=has_deferred_tools,
+                has_on_demand_tools=has_on_demand_tools,
                 memory_text=memory_text,
                 user_profile=user_profile,
                 skill_index=skill_index,
@@ -634,7 +626,7 @@ class DataContextBuilder:
                 tools,
                 capability_ids=capability_ids,
                 tool_manifest=manifest_payload,
-                has_deferred_tools=has_deferred_tools,
+                has_on_demand_tools=has_on_demand_tools,
                 memory_text=memory_text,
                 user_profile=user_profile,
                 skill_index=skill_index,
@@ -667,7 +659,7 @@ class DataContextBuilder:
             tools,
             capability_ids=capability_ids,
             tool_manifest=manifest_payload,
-            has_deferred_tools=has_deferred_tools,
+            has_on_demand_tools=has_on_demand_tools,
             memory_text=memory_text,
             user_profile=user_profile,
             skill_index=skill_index,
@@ -685,7 +677,7 @@ class DataContextBuilder:
             (),
             capability_ids=capability_ids,
             tool_manifest=manifest_payload,
-            has_deferred_tools=has_deferred_tools,
+            has_on_demand_tools=has_on_demand_tools,
             memory_text=memory_text,
             user_profile=user_profile,
             skill_index=skill_index,
@@ -715,19 +707,12 @@ class DataContextBuilder:
                 None if execution_scope is None else execution_scope.digest
             ),
             "profile_id": self._profile.id,
+            "tool_registry_digest": tool_context.registry_digest,
             "tool_catalog_digest": tool_context.catalog_digest,
-            "tool_domain_manifest": manifest_payload,
+            "toolbox_manifest": manifest_payload,
             "messages": [_neutral_message(item) for item in static_messages],
             "final_messages": [
                 _neutral_message(item) for item in final_static_messages
-            ],
-            "provider_definitions": [
-                {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "input_schema": tool.input_schema,
-                }
-                for tool in tools
             ],
             "sensitivity": sensitivity.value,
         }
@@ -751,8 +736,8 @@ class DataContextBuilder:
             run_id=run.id,
             start_message=current_start,
             profile=self._profile,
+            registry_digest=tool_context.registry_digest,
             catalog_digest=tool_context.catalog_digest,
-            provider_definitions=tools,
             static_messages=static_messages,
             final_static_messages=final_static_messages,
             initial_sensitivity=sensitivity,
@@ -777,12 +762,12 @@ class DataContextBuilder:
             raise TypeError("snapshot must be RunContextSnapshot")
         if not isinstance(tool_context, StepToolProjection):
             raise TypeError("tool_context must be StepToolProjection")
-        if (
-            tool_context.run_id != snapshot.run_id
-            or tool_context.catalog_digest != snapshot.catalog_digest
-            or tool_context.provider_definitions != snapshot.provider_definitions
-        ):
-            raise ValueError("step tool projection differs from the prepared run")
+        tool_context = tool_context.require_current(
+            run_id=snapshot.run_id,
+            registry_digest=snapshot.registry_digest,
+            catalog_digest=snapshot.catalog_digest,
+            messages=messages,
+        )
         if not isinstance(step, int) or isinstance(step, bool) or step < 1:
             raise ValueError("step must be positive")
         messages = tuple(messages)
@@ -862,7 +847,7 @@ class DataContextBuilder:
         *,
         capability_ids: frozenset[str],
         tool_manifest: tuple[FrozenJsonObject, ...],
-        has_deferred_tools: bool,
+        has_on_demand_tools: bool,
         memory_text: str,
         user_profile: str,
         skill_index: str | None,
@@ -929,7 +914,7 @@ class DataContextBuilder:
                 tools,
                 capability_ids=capability_ids,
                 tool_manifest=tool_manifest,
-                has_deferred_tools=has_deferred_tools,
+                has_on_demand_tools=has_on_demand_tools,
                 memory_text=memory_text,
                 user_profile=user_profile,
                 skill_index=skill_index,
@@ -1760,7 +1745,7 @@ def _request(
     *,
     capability_ids: frozenset[str],
     tool_manifest: tuple[FrozenJsonObject, ...],
-    has_deferred_tools: bool,
+    has_on_demand_tools: bool,
     memory_text: str,
     user_profile: str,
     skill_index: str | None,
@@ -1780,7 +1765,7 @@ def _request(
                     catalog,
                     capability_ids=capability_ids,
                     tool_manifest=tool_manifest,
-                    has_deferred_tools=has_deferred_tools,
+                    has_on_demand_tools=has_on_demand_tools,
                     memory_text=memory_text,
                     user_profile=user_profile,
                     skill_index=skill_index,
@@ -1817,7 +1802,7 @@ def _system_prompt(
     *,
     capability_ids: frozenset[str],
     tool_manifest: tuple[FrozenJsonObject, ...],
-    has_deferred_tools: bool,
+    has_on_demand_tools: bool,
     memory_text: str,
     user_profile: str,
     skill_index: str | None,
@@ -1944,17 +1929,18 @@ def _system_prompt(
             "and ask if evidence remains ambiguous."
         ),
     ]
-    if not final and has_deferred_tools:
+    if not final and has_on_demand_tools:
         instructions.extend(
             (
-                "Tool availability has two presentation modes. Call a direct tool by "
-                "its exact provider-visible name. For a deferred tool, use tool_search "
-                "when needed, call tool_describe for the exact name, then on a later "
-                "assistant step pass the returned run-bound tool_ref and arguments to "
-                "tool_call. Search, description, and references grant no authority; "
-                "ordinary current validation and governance still apply.",
-                "Trusted applicable tool-domain manifest (counts and summaries only; "
-                "deferred schemas are intentionally omitted):\n"
+                "Pinned tools may be called immediately by their exact names. To use "
+                "an on-demand tool, call toolbox_search when needed, then call "
+                "toolbox_load with the exact names for the next model step. A successful "
+                "load replaces the prior on-demand working set; call each loaded tool "
+                "normally by its exact provider-visible name and schema. Search and load "
+                "grant no authority; ordinary current validation and governance still "
+                "apply.",
+                "Trusted applicable toolbox manifest (counts and summaries only; "
+                "on-demand schemas are intentionally omitted):\n"
                 + canonical_json(tool_manifest),
             )
         )

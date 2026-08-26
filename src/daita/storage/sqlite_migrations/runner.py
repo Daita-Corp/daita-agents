@@ -11,6 +11,7 @@ from .models import SQLiteMigration
 DEVELOPMENT_BASELINE_ID = "development_baseline"
 DEVELOPMENT_BASELINE_DEFINITION = """development_baseline
 current pre-production SQLite state shape;
+MCPToolBinding codec-v1 uses exact toolbox presentation fields;
 mutable until the first production state baseline is explicitly frozen
 """
 

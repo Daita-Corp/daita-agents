@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from _capability_runtime_support import execute_projected
 from daita import (
     Agent,
     ApprovalDecision,
@@ -22,8 +23,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
+from daita.loop.models import LoopLimits, RunInput
 from daita.semantics import (
     SEMANTIC_DELETE_CAPABILITY_ID,
     SEMANTIC_DELETE_TOOL_NAME,
@@ -38,9 +38,12 @@ from daita.semantics import (
 from daita.tui.commands import (
     learning_invocation_message as _learning_invocation_message,
 )
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
 NOW = datetime(2026, 7, 28, 14, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -138,6 +141,8 @@ def _tool_results(provider: MockModelProvider) -> tuple[ToolResultBlock, ...]:
         for message in request.messages
         for block in message.content
         if isinstance(block, ToolResultBlock)
+        and block.output.get("kind")
+        not in {"toolbox_load_receipt", "toolbox_search_results"}
     )
 
 
@@ -498,9 +503,9 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         runtime = agent._embedded._capability_runtime
         semantic_domain = agent._embedded._semantic_domain
         semantic_domain.select_explicit_learning_run(delete_run.id)
-        catalog = await runtime.prepare_run(delete_run)
         deleted = (
-            await runtime.execute_all(
+            await execute_projected(
+                runtime,
                 delete_run,
                 (
                     ToolCall(
@@ -512,7 +517,6 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                         },
                     ),
                 ),
-                projection=runtime.project(catalog, ()),
                 sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]

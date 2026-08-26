@@ -204,12 +204,6 @@ class RunInput:
         return self.start.canonical_message()
 
 
-class ToolProjectionMode(str, Enum):
-    AUTO = "auto"
-    EAGER = "eager"
-    DEFERRED = "deferred"
-
-
 @dataclass(frozen=True, slots=True)
 class LoopLimits:
     """Outer safety limits; normal tool recovery uses ordinary loop steps."""
@@ -220,22 +214,21 @@ class LoopLimits:
     max_estimated_cost_usd: Decimal | None = None
     max_tool_calls_per_response: int = 16
     max_tool_calls_per_run: int = 64
-    tool_projection_mode: ToolProjectionMode = ToolProjectionMode.AUTO
     max_run_tool_catalog_entries: int = 512
     max_run_tool_catalog_bytes: int = 2 * 1_024 * 1_024
-    max_domain_manifest_entries: int = 64
-    max_domain_manifest_bytes: int = 16 * 1_024
-    max_domain_manifest_tokens: int = 4_000
-    max_direct_tools: int = 64
-    max_direct_tool_definition_bytes: int = 128 * 1_024
-    max_eager_tools: int = 48
-    max_eager_tool_definition_bytes: int = 96 * 1_024
-    max_tool_search_query_characters: int = 512
-    max_tool_search_results: int = 20
-    max_tool_search_result_bytes: int = 32 * 1_024
-    max_tool_description_bytes: int = 128 * 1_024
-    max_tool_description_bytes_per_run: int = 512 * 1_024
-    max_tool_references_per_run: int = 64
+    max_toolbox_manifest_entries: int = 5
+    max_toolbox_manifest_bytes: int = 8 * 1_024
+    max_toolbox_manifest_tokens: int = 2_000
+    max_pinned_tools: int = 32
+    max_pinned_tool_definition_bytes: int = 96 * 1_024
+    max_loaded_tools: int = 16
+    max_loaded_tool_definition_bytes: int = 96 * 1_024
+    max_step_tools: int = 50
+    max_step_tool_definition_bytes: int = 128 * 1_024
+    max_toolbox_search_query_characters: int = 512
+    max_toolbox_search_results: int = 20
+    max_toolbox_search_result_bytes: int = 32 * 1_024
+    max_toolbox_load_result_bytes: int = 64 * 1_024
     max_tool_result_bytes: int = 256 * 1_024
     max_tool_result_depth: int = 16
     max_parallel_reads: int = 8
@@ -254,31 +247,34 @@ class LoopLimits:
                 self.max_run_tool_catalog_bytes,
                 "max_run_tool_catalog_bytes",
             ),
-            (self.max_domain_manifest_entries, "max_domain_manifest_entries"),
-            (self.max_domain_manifest_bytes, "max_domain_manifest_bytes"),
-            (self.max_domain_manifest_tokens, "max_domain_manifest_tokens"),
-            (self.max_direct_tools, "max_direct_tools"),
+            (self.max_toolbox_manifest_entries, "max_toolbox_manifest_entries"),
+            (self.max_toolbox_manifest_bytes, "max_toolbox_manifest_bytes"),
+            (self.max_toolbox_manifest_tokens, "max_toolbox_manifest_tokens"),
+            (self.max_pinned_tools, "max_pinned_tools"),
             (
-                self.max_direct_tool_definition_bytes,
-                "max_direct_tool_definition_bytes",
+                self.max_pinned_tool_definition_bytes,
+                "max_pinned_tool_definition_bytes",
             ),
-            (self.max_eager_tools, "max_eager_tools"),
+            (self.max_loaded_tools, "max_loaded_tools"),
             (
-                self.max_eager_tool_definition_bytes,
-                "max_eager_tool_definition_bytes",
+                self.max_loaded_tool_definition_bytes,
+                "max_loaded_tool_definition_bytes",
+            ),
+            (self.max_step_tools, "max_step_tools"),
+            (
+                self.max_step_tool_definition_bytes,
+                "max_step_tool_definition_bytes",
             ),
             (
-                self.max_tool_search_query_characters,
-                "max_tool_search_query_characters",
+                self.max_toolbox_search_query_characters,
+                "max_toolbox_search_query_characters",
             ),
-            (self.max_tool_search_results, "max_tool_search_results"),
-            (self.max_tool_search_result_bytes, "max_tool_search_result_bytes"),
-            (self.max_tool_description_bytes, "max_tool_description_bytes"),
+            (self.max_toolbox_search_results, "max_toolbox_search_results"),
             (
-                self.max_tool_description_bytes_per_run,
-                "max_tool_description_bytes_per_run",
+                self.max_toolbox_search_result_bytes,
+                "max_toolbox_search_result_bytes",
             ),
-            (self.max_tool_references_per_run, "max_tool_references_per_run"),
+            (self.max_toolbox_load_result_bytes, "max_toolbox_load_result_bytes"),
             (self.max_tool_result_bytes, "max_tool_result_bytes"),
             (self.max_tool_result_depth, "max_tool_result_depth"),
             (self.max_parallel_reads, "max_parallel_reads"),
@@ -287,20 +283,18 @@ class LoopLimits:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{field_name} must be a positive integer")
-        if not isinstance(self.tool_projection_mode, ToolProjectionMode):
-            raise TypeError("tool_projection_mode must be ToolProjectionMode")
-        if self.max_eager_tools > self.max_direct_tools:
-            raise ValueError("max_eager_tools cannot exceed max_direct_tools")
-        if self.max_eager_tool_definition_bytes > self.max_direct_tool_definition_bytes:
+        if self.max_toolbox_manifest_entries > 5:
+            raise ValueError("max_toolbox_manifest_entries cannot exceed 5")
+        if self.max_pinned_tools + self.max_loaded_tools + 2 > self.max_step_tools:
             raise ValueError(
-                "max_eager_tool_definition_bytes cannot exceed the direct bound"
+                "pinned, loaded, and toolbox controls cannot exceed max_step_tools"
             )
-        if self.max_tool_search_results > 20:
-            raise ValueError("max_tool_search_results cannot exceed 20")
-        if self.max_tool_description_bytes > self.max_tool_description_bytes_per_run:
-            raise ValueError(
-                "one tool description cannot exceed the cumulative run bound"
-            )
+        if self.max_pinned_tool_definition_bytes > self.max_step_tool_definition_bytes:
+            raise ValueError("pinned definition bytes cannot exceed the step bound")
+        if self.max_loaded_tool_definition_bytes > self.max_step_tool_definition_bytes:
+            raise ValueError("loaded definition bytes cannot exceed the step bound")
+        if self.max_toolbox_search_results > 20:
+            raise ValueError("max_toolbox_search_results cannot exceed 20")
         if (
             not isinstance(self.max_wall_time_seconds, (int, float))
             or isinstance(self.max_wall_time_seconds, bool)

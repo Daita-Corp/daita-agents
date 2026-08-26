@@ -50,17 +50,18 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
-from daita.llm.providers.mock import MockModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
-from daita.loop.models import LoopLimits, RunOrigin, ToolProjectionMode
+from daita.loop.models import LoopLimits, RunOrigin
 from daita.storage.sqlite import SQLiteStateStore
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
 LIMITS = LoopLimits(
     max_estimated_cost_usd=Decimal("0.05"),
     max_total_tokens=10_000,
-    tool_projection_mode=ToolProjectionMode.EAGER,
 )
-SEED_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+SEED_LIMITS = LoopLimits()
 ALLOWED_CAPABILITIES = (
     "catalog.inspect",
     "catalog.schema",
@@ -194,9 +195,11 @@ def test_followup_instruction_requires_both_exact_job_evidence_calls() -> None:
 def _job_id_from_request(provider: MockModelProvider, request_index: int) -> str:
     results = tuple(
         block
-        for message in provider.requests[request_index].messages
+        for message in provider.logical_requests[request_index].messages
         for block in message.content
         if isinstance(block, ToolResultBlock)
+        and block.output.get("kind")
+        not in {"toolbox_load_receipt", "toolbox_search_results"}
     )
     assert len(results) == 1
     data = results[0].output["data"]
@@ -259,14 +262,16 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
         limits=LIMITS,
         id_factory=ids,
     )
-    provider._script = (
-        _start_profile(resource.id),
-        _stop("Job accepted."),
-        _inspect_and_read_job(
-            "job-stage-c-1",
-            resource_id_for_disallowed_calls=resource.id,
-        ),
-        _stop("The durable profile completed and its result is available."),
+    provider.replace_script(
+        (
+            _start_profile(resource.id),
+            _stop("Job accepted."),
+            _inspect_and_read_job(
+                "job-stage-c-1",
+                resource_id_for_disallowed_calls=resource.id,
+            ),
+            _stop("The durable profile completed and its result is available."),
+        )
     )
     try:
         origin = await agent.run("Profile the customer data.")
@@ -304,14 +309,14 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
                 "skill_create",
                 "postgresql_update",
             }
-            for tool in provider.requests[2].tools
+            for tool in provider.logical_requests[2].tools
         )
         assert "<untrusted_job_event_payload>" in str(
-            provider.requests[2].messages[-1].content[0]
+            provider.logical_requests[2].messages[-1].content[0]
         )
         rejected = tuple(
             block
-            for message in provider.requests[3].messages
+            for message in provider.logical_requests[3].messages
             for block in message.content
             if isinstance(block, ToolResultBlock)
             and block.call_id.startswith("disallowed-")
@@ -865,11 +870,13 @@ async def test_host_loss_after_terminal_commit_retries_delivery_not_reasoning(
 
     provider = MockModelProvider((), complete_pricing=True)
     ids = _IdFactory("post-run-loss")
-    provider._script = (
-        _start_profile(resource.id),
-        _stop("accepted"),
-        _inspect_and_read_job("job-post-run-loss-1"),
-        _stop("The terminal job result was inspected exactly once."),
+    provider.replace_script(
+        (
+            _start_profile(resource.id),
+            _stop("accepted"),
+            _inspect_and_read_job("job-post-run-loss-1"),
+            _stop("The terminal job result was inspected exactly once."),
+        )
     )
     agent = await Agent.open(
         "stage-c-post-run-loss",
@@ -904,7 +911,7 @@ async def test_host_loss_after_terminal_commit_retries_delivery_not_reasoning(
         )
         assert followup.reserved_run_id is not None
         assert await agent._embedded._store.result(followup.reserved_run_id) is not None
-        original_request_count = len(provider.requests)
+        original_request_count = len(provider.logical_requests)
         assert original_request_count == 4
     finally:
         await agent.close()
@@ -922,7 +929,7 @@ async def test_host_loss_after_terminal_commit_retries_delivery_not_reasoning(
         assert len(items) == 1
         assert items[0].payload["job_id"] == job_id
         assert recovery.requests == ()
-        assert len(provider.requests) == original_request_count
+        assert len(provider.logical_requests) == original_request_count
         finalized = await agent._embedded._store.finalize_autonomous_followup(
             agent.id,
             items[0].subject.subject_id,
@@ -1028,7 +1035,7 @@ async def test_one_delivery_failure_does_not_block_a_sibling_followup(
             is FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
         )
         assert by_job[second_job_id].disposition is FollowupDisposition.COMPLETED
-        assert len(provider.requests) == 4
+        assert len(provider.logical_requests) == 4
         driver = agent._embedded._followup_driver
         assert driver is not None and not driver.done()
     finally:
@@ -1146,10 +1153,12 @@ async def test_completed_model_text_without_all_job_evidence_fails_closed(
             _stop("I read the result without inspecting the job lifecycle."),
         ),
     }[evidence_kind]
-    provider._script = (
-        _start_profile(resource.id),
-        _stop("accepted"),
-        *followup_script,
+    provider.replace_script(
+        (
+            _start_profile(resource.id),
+            _stop("accepted"),
+            *followup_script,
+        )
     )
     agent = await Agent.open(
         "stage-c-evidence",
@@ -1228,7 +1237,7 @@ async def test_cleared_origin_conversation_does_not_revoke_followup(
             "Recovered from durable job truth with empty prior history."
         )
         assert "origin text must not be required after clearing" not in repr(
-            provider.requests[0].messages
+            provider.logical_requests[0].messages
         )
     finally:
         await agent.close()
@@ -1250,12 +1259,14 @@ async def test_followup_history_excludes_other_conversation_sources(
 
     provider = MockModelProvider((), complete_pricing=True)
     ids = _IdFactory("cross-source")
-    provider._script = (
-        _stop("other-source-history-secret-sentinel"),
-        _start_profile(first_resource.id),
-        _stop("accepted"),
-        _inspect_and_read_job("job-cross-source-1"),
-        _stop("Scoped report."),
+    provider.replace_script(
+        (
+            _stop("other-source-history-secret-sentinel"),
+            _start_profile(first_resource.id),
+            _stop("accepted"),
+            _inspect_and_read_job("job-cross-source-1"),
+            _stop("Scoped report."),
+        )
     )
     agent = await Agent.open(
         "stage-c-cross-source",
@@ -1325,7 +1336,7 @@ async def test_followup_history_excludes_other_conversation_sources(
         items = await _inbox(agent)
 
         assert items[0].payload["outcome"] == "completed"
-        followup_requests = provider.requests[3:]
+        followup_requests = provider.logical_requests[3:]
         assert len(followup_requests) == 2
         assert all(
             "other-source-history-secret-sentinel" not in repr(request.messages)
@@ -1482,11 +1493,13 @@ async def test_inbox_uses_bounded_report_preview_and_run_reference(
     report = "report-start-" + ("z" * 80_000) + "-report-end"
     provider = MockModelProvider((), complete_pricing=True)
     ids = _IdFactory("report-bound")
-    provider._script = (
-        _start_profile(resource.id),
-        _stop("accepted"),
-        _inspect_and_read_job("job-report-bound-1"),
-        _stop(report),
+    provider.replace_script(
+        (
+            _start_profile(resource.id),
+            _stop("accepted"),
+            _inspect_and_read_job("job-report-bound-1"),
+            _stop(report),
+        )
     )
     agent = await Agent.open(
         "stage-c-report-bound",

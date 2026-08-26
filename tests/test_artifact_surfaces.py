@@ -23,7 +23,9 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
 from daita.tui.projection import artifact_delivery_messages, completed_tool_pairs
 

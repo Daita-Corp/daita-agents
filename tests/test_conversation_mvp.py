@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _capability_runtime_support import context_step_projection, context_tool_catalog
+from _capability_runtime_support import ContextToolProjectionAdapter
 
 import daita
 from daita import Agent
@@ -63,7 +63,8 @@ async def _prepared_request(
         for index, message in enumerate(messages)
         if message.role is MessageRole.USER
     )
-    catalog = context_tool_catalog(run, tools)
+    projection = ContextToolProjectionAdapter(tools)
+    catalog = await projection.prepare_run(run)
     snapshot = await builder.prepare(
         run,
         messages[: current_start + 1],
@@ -73,7 +74,7 @@ async def _prepared_request(
         snapshot,
         messages[current_start:],
         step=step,
-        tool_context=context_step_projection(catalog),
+        tool_context=projection.project(catalog, messages[current_start:]),
         final=final,
     )
 
@@ -85,7 +86,7 @@ def test_context_builder_exposes_only_fixed_absolute_history_bounds():
 class TranscriptContext:
     async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tool_context.provider_definitions
+        return messages[:-1], tool_context.initial_provider_definitions
 
     def project(
         self,
@@ -106,23 +107,24 @@ class TranscriptContext:
 
 
 class NoTools:
+    def __init__(self) -> None:
+        self._projection = ContextToolProjectionAdapter(())
+
     async def prepare_run(self, run):
-        return context_tool_catalog(run, ())
+        return await self._projection.prepare_run(run)
 
     def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+        return self._projection.project(catalog, messages)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         assert calls == ()
         return ToolBatchOutcome(())
 
 
 class ReplayTools:
-    async def prepare_run(self, run):
-        return context_tool_catalog(
-            run,
+    def __init__(self) -> None:
+        self._projection = ContextToolProjectionAdapter(
             tuple(
                 ToolDefinition(
                     name=name,
@@ -130,15 +132,17 @@ class ReplayTools:
                     input_schema={"type": "object"},
                 )
                 for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
-            ),
+            )
         )
 
-    def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+    async def prepare_run(self, run):
+        return await self._projection.prepare_run(run)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    def project(self, catalog, messages):
+        return self._projection.project(catalog, messages)
+
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         return ToolBatchOutcome(
             tuple(
                 ToolResultBlock(
@@ -170,25 +174,24 @@ class ReplayTools:
 class FreshQueryTools:
     def __init__(self):
         self.calls = []
-
-    async def prepare_run(self, run):
-        return context_tool_catalog(
-            run,
+        self._projection = ContextToolProjectionAdapter(
             (
                 ToolDefinition(
                     name="data_query_postgresql",
                     description="Run a fresh read-only PostgreSQL query.",
                     input_schema={"type": "object"},
                 ),
-            ),
+            )
         )
 
-    def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+    async def prepare_run(self, run):
+        return await self._projection.prepare_run(run)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    def project(self, catalog, messages):
+        return self._projection.project(catalog, messages)
+
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         self.calls.extend(calls)
         return ToolBatchOutcome(
             tuple(

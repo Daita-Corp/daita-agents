@@ -103,18 +103,23 @@ def test_stage_m1_has_one_common_runtime_and_no_legacy_compatibility_surface():
         assert not any(value.startswith(prefix) for value in string_literals)
 
 
-def test_stage_m3_has_one_run_catalog_and_deletes_complete_surface_recomputation():
+def test_phase1_has_one_toolbox_catalog_and_no_legacy_discovery_path():
     runtime_path = PACKAGE / "capability_runtime.py"
     loop_path = PACKAGE / "loop" / "driver.py"
     runtime = runtime_path.read_text(encoding="utf-8")
     loop = loop_path.read_text(encoding="utf-8")
     production = _python_text(PACKAGE)
 
-    assert _class_owners("ToolDiscoveryMetadata") == {"capabilities.py"}
-    assert _class_owners("ToolExposureClass") == {"capabilities.py"}
+    assert _class_owners("ToolboxId") == {"capabilities.py"}
+    assert _class_owners("ToolLoadMode") == {"capabilities.py"}
+    assert _class_owners("ToolTextTrust") == {"capabilities.py"}
+    assert _class_owners("ToolboxDefinition") == {"capabilities.py"}
+    assert _class_owners("ToolPresentation") == {"capabilities.py"}
+    assert _class_owners("ToolDiscoveryMetadata") == set()
+    assert _class_owners("ToolExposureClass") == set()
     assert _class_owners("RunToolCatalog") == {"capability_runtime.py"}
     assert _class_owners("StepToolProjection") == {"capability_runtime.py"}
-    assert _class_owners("ToolProjectionMode") == {"loop/models.py"}
+    assert _class_owners("ToolProjectionMode") == set()
     assert "definitions" not in _class_methods(loop_path, "ToolRuntime")
     assert "definitions" not in _class_methods(runtime_path, "CapabilityRuntime")
     assert "await domain.project(run)" in runtime
@@ -122,7 +127,16 @@ def test_stage_m3_has_one_run_catalog_and_deletes_complete_surface_recomputation
     assert "definitions(run)" not in production
     assert "max_projected_tools" not in production
     assert "max_projected_tool_definition_bytes" not in production
-    assert "tool_search" not in _python_text(PACKAGE / "llm" / "providers")
+    assert "toolbox_search" not in _python_text(PACKAGE / "llm" / "providers")
+    for obsolete in (
+        '"tool_search"',
+        '"tool_describe"',
+        '"tool_call"',
+        "eager_priority",
+        "ToolInvocationMode",
+        "DomainToolManifestEntry",
+    ):
+        assert obsolete not in production
     assert "RunToolCatalog" not in _python_text(PACKAGE / "storage")
     assert "StepToolProjection" not in _python_text(PACKAGE / "storage")
 
@@ -154,6 +168,46 @@ def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
     assert "_capability_runtime" in embedded
     assert "CapabilityRuntime(" in embedded
     assert "capability_runtime" not in loop
+
+
+def test_phase0_local_file_backend_is_unconditionally_composed():
+    """Lock the legacy composition boundary before Phase 2 replaces it."""
+
+    embedded_path = PACKAGE / "hosting" / "embedded.py"
+    tree = ast.parse(embedded_path.read_text(encoding="utf-8"))
+    embedded_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EmbeddedAgent"
+    )
+    compose = next(
+        node
+        for node in embedded_class.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_compose"
+    )
+    direct_assignments = {
+        target.id: ast.unparse(statement.value)
+        for statement in compose.body
+        if isinstance(statement, ast.Assign)
+        and len(statement.targets) == 1
+        and isinstance((target := statement.targets[0]), ast.Name)
+    }
+
+    assert direct_assignments["local_file_backend"] == (
+        "LocalDirectoryReadBackend(store, store, data_view)"
+    )
+    assert direct_assignments["local_files"] == (
+        "local_file_read_declarations(identity.id, local_file_backend)"
+    )
+
+    compose_text = ast.get_source_segment(
+        embedded_path.read_text(encoding="utf-8"), compose
+    )
+    assert compose_text is not None
+    assert "local_file_backend=local_file_backend" in compose_text
+    assert "*local_files.capabilities" in compose_text
+    assert "*local_files.tool_views" in compose_text
+    assert "*local_files.executors" in compose_text
 
 
 def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
@@ -315,7 +369,12 @@ def test_public_surface_is_focused():
         "LoopExit",
         "LoopExitKind",
         "LoopLimits",
-        "ToolProjectionMode",
+        "TOOLBOX_DEFINITIONS",
+        "ToolLoadMode",
+        "ToolPresentation",
+        "ToolboxDefinition",
+        "ToolboxId",
+        "ToolTextTrust",
         "MCPAdmissionError",
         "MCPAuthentication",
         "MCPAuthenticationMode",
@@ -1015,7 +1074,8 @@ def test_stage_b_job_scope_has_one_agent_owner_and_no_conversation_gate():
         not in owner.split("async def inspect", 1)[1]
     )
     assert "JobCapabilityDomain(job_declaration_bundle, job_owner)" in embedded
-    assert "ToolExposureClass.CORE" in capabilities
+    assert "ToolLoadMode.PINNED" in capabilities
+    assert "ToolLoadMode.ON_DEMAND" in capabilities
     assert "item.id == JOB_CANCEL_CAPABILITY_ID" in capabilities
 
 

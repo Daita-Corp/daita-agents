@@ -52,7 +52,7 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
             }
         ),
         tool_manifest=(),
-        has_deferred_tools=False,
+        has_on_demand_tools=True,
         memory_text="",
         user_profile="",
         skill_index=None,

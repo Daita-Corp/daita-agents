@@ -24,12 +24,10 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import (
     LoopLimits,
     RunInput,
     ToolBatchOutcome,
-    ToolProjectionMode,
 )
 from daita.skills import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
@@ -52,9 +50,12 @@ from daita.skills.capabilities import (
     SKILL_VIEW_TOOL_NAME,
 )
 from daita.storage.sqlite_migrations import migration_rows
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 def _profile(provider: MockModelProvider, *, context: int = 20_000) -> ModelProfile:
@@ -92,6 +93,8 @@ def _tool_results(request: ModelRequest) -> tuple[ToolResultBlock, ...]:
         if message.role is MessageRole.TOOL
         for block in message.content
         if isinstance(block, ToolResultBlock)
+        and block.output.get("kind")
+        not in {"toolbox_load_receipt", "toolbox_search_results"}
     )
 
 
@@ -503,17 +506,12 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
         assert resolved == capability
         await agent.run("What can you do?")
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
-            "artifact_convert",
-            "artifact_create_document",
             "artifact_list",
             "artifact_read",
-            "artifact_save_local",
-            "artifact_set_export_location",
             "job_list",
-            "memory_set",
-            "skill_delete",
-            "skill_save",
             SKILL_VIEW_TOOL_NAME,
+            "toolbox_load",
+            "toolbox_search",
         )
     finally:
         await agent.close()
@@ -625,6 +623,7 @@ async def test_missing_invalid_and_malformed_skill_views_are_bounded_errors(tmp_
             run,
             (ToolCall(id="bad", name="skill_view", arguments={"name": "broken"}),),
             projection=runtime.project(catalog, ()),
+            messages=(),
             sensitivity=ModelSensitivity.INTERNAL,
         )
         error = outcome.ordered_results[0].output["error"]
@@ -721,17 +720,12 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         result = await agent.run("Do not mutate anything")
         transcript = await agent.transcript(result.run_id)
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
-            "artifact_convert",
-            "artifact_create_document",
             "artifact_list",
             "artifact_read",
-            "artifact_save_local",
-            "artifact_set_export_location",
             "job_list",
-            "memory_set",
-            "skill_delete",
-            "skill_save",
             "skill_view",
+            "toolbox_load",
+            "toolbox_search",
         )
         write_result = next(
             block
@@ -920,8 +914,8 @@ async def test_custom_context_builder_remains_unwrapped(tmp_path):
             del messages
             return catalog
 
-        async def execute_all(self, run, calls, *, projection, sensitivity):
-            del run, projection, sensitivity
+        async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+            del run, projection, messages, sensitivity
             assert calls == ()
             return ToolBatchOutcome(())
 

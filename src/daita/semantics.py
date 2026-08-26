@@ -21,10 +21,12 @@ from .capabilities import (
     Executor,
     OperationalEffect,
     SideEffectExecutor,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from .capability_runtime import CapabilityFailure, SideEffectPlan
@@ -1488,9 +1490,9 @@ def semantic_declarations(
                 name=name,
                 capability_id=capability.id,
                 description=capability.description,
-                discovery=discovery,
+                presentation=presentation,
             )
-            for name, capability, discovery in zip(
+            for name, capability, presentation in zip(
                 (
                     SEMANTIC_LIST_TOOL_NAME,
                     SEMANTIC_VIEW_TOOL_NAME,
@@ -1499,33 +1501,37 @@ def semantic_declarations(
                 ),
                 capabilities,
                 (
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="List bounded active semantic annotations.",
                         when_to_use="Use to inspect current stored business meaning.",
                         keywords=("semantic", "meaning", "annotation", "list"),
-                        exposure_class=ToolExposureClass.STANDARD,
-                        eager_priority=620,
                     ),
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="View one exact semantic annotation and its evidence.",
                         when_to_use="Use before correcting or deleting an exact annotation.",
                         keywords=("semantic", "meaning", "annotation", "view"),
-                        exposure_class=ToolExposureClass.STANDARD,
-                        eager_priority=610,
                     ),
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="Create or supersede one evidence-bound semantic annotation.",
                         when_to_use="Use only for validated current resource or field meaning.",
                         keywords=("semantic", "meaning", "annotation", "save"),
-                        exposure_class=ToolExposureClass.DEFERRED,
-                        eager_priority=160,
                     ),
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="Delete one exact semantic annotation after validation.",
                         when_to_use="Use only for an explicit exact semantic deletion.",
                         keywords=("semantic", "meaning", "annotation", "delete"),
-                        exposure_class=ToolExposureClass.DEFERRED,
-                        eager_priority=150,
                     ),
                 ),
                 strict=True,

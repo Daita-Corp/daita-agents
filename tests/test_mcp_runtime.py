@@ -17,6 +17,7 @@ from _mcp_fixtures import (
     conformance_identities,
     mock_transport,
 )
+from _toolbox_model_support import ToolboxAwareMockModelProvider
 from textual.widgets import Button, Input, OptionList, Static
 
 from daita import (
@@ -34,7 +35,12 @@ from daita.adapters.mcp import (
     MCPToolBinding,
     StreamableHTTPMCPClientFactory,
 )
-from daita.capabilities import ToolDiscoveryMetadata, ToolExposureClass
+from daita.capabilities import (
+    ToolLoadMode,
+    ToolPresentation,
+    ToolboxId,
+    ToolTextTrust,
+)
 from daita.errors import StateCompatibilityCode, StateCompatibilityError
 from daita.llm.models import (
     FinishReason,
@@ -46,7 +52,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.loop.models import LoopLimits, ToolProjectionMode
+from daita.loop.models import LoopLimits
 from daita.security import SecretReference
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_codecs import encode_mcp_binding
@@ -65,7 +71,7 @@ from daita.tui.screens.selection import SelectionScreen
 from daita.tui.widgets.composer import Composer
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 class _MCPBatchProvider:
@@ -77,7 +83,7 @@ class _MCPBatchProvider:
         *,
         block_first_response: bool = False,
     ) -> None:
-        self.model_profile = ModelProfile(
+        profile = ModelProfile(
             id=self.provider_id,
             context_window_tokens=128_000,
             max_output_tokens=8_192,
@@ -85,33 +91,49 @@ class _MCPBatchProvider:
             supports_parallel_tools=True,
         )
         self.calls = calls
-        self.requests: list[ModelRequest] = []
+        self._provider = ToolboxAwareMockModelProvider(
+            (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=calls,
+                ),
+                ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+            ),
+            provider_id=self.provider_id,
+            model_profile=profile,
+        )
+        self.model_profile = profile
+        self._batch_started = False
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         if not block_first_response:
             self.release.set()
 
     def supports_request_policy(self, request: ModelRequest) -> bool:
-        del request
-        return True
+        return self._provider.supports_request_policy(request)
+
+    @property
+    def requests(self) -> tuple[ModelRequest, ...]:
+        return self._provider.requests
+
+    @property
+    def logical_requests(self) -> tuple[ModelRequest, ...]:
+        return self._provider.logical_requests
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
-        self.requests.append(request)
-        if len(self.requests) == 1:
+        response = await self._provider.generate(request)
+        if not self._batch_started and response.tool_calls == self.calls:
+            self._batch_started = True
             self.started.set()
             await self.release.wait()
-            return ModelResponse(
-                finish_reason=FinishReason.TOOL_CALLS,
-                tool_calls=self.calls,
-            )
-        return ModelResponse(finish_reason=FinishReason.STOP, text="done")
+        return response
 
 
 class _MCPSequenceProvider:
     provider_id = "mock:mcp-sequence"
 
     def __init__(self, calls: tuple[tuple[ToolCall, ...], ...]) -> None:
-        self.model_profile = ModelProfile(
+        profile = ModelProfile(
             id=self.provider_id,
             context_window_tokens=128_000,
             max_output_tokens=8_192,
@@ -119,21 +141,35 @@ class _MCPSequenceProvider:
             supports_parallel_tools=True,
         )
         self.calls = calls
-        self.requests: list[ModelRequest] = []
+        self._provider = ToolboxAwareMockModelProvider(
+            (
+                *(
+                    ModelResponse(
+                        finish_reason=FinishReason.TOOL_CALLS,
+                        tool_calls=response_calls,
+                    )
+                    for response_calls in calls
+                ),
+                ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+            ),
+            provider_id=self.provider_id,
+            model_profile=profile,
+        )
+        self.model_profile = profile
 
     def supports_request_policy(self, request: ModelRequest) -> bool:
-        del request
-        return True
+        return self._provider.supports_request_policy(request)
+
+    @property
+    def requests(self) -> tuple[ModelRequest, ...]:
+        return self._provider.requests
+
+    @property
+    def logical_requests(self) -> tuple[ModelRequest, ...]:
+        return self._provider.logical_requests
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
-        self.requests.append(request)
-        index = len(self.requests) - 1
-        if index < len(self.calls):
-            return ModelResponse(
-                finish_reason=FinishReason.TOOL_CALLS,
-                tool_calls=self.calls[index],
-            )
-        return ModelResponse(finish_reason=FinishReason.STOP, text="done")
+        return await self._provider.generate(request)
 
 
 class _BlockingCallTimeInspection:
@@ -317,6 +353,7 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
         assert [block.call_id for block in blocks] == ["alpha-call", "beta-call"]
         assert all(not block.is_error for block in blocks)
@@ -328,10 +365,13 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
         assert alpha.calls == [("lookup", {"query": "x"})]
         assert beta.calls == [("lookup", {"id": 7})]
 
-        first_request = provider.requests[0]
+        assert len(provider.requests) == 3
+        assert len(provider.logical_requests) == 2
+        assert alpha_name not in {tool.name for tool in provider.requests[0].tools}
+        first_request = provider.logical_requests[0]
         assert {tool.name for tool in first_request.tools} >= {alpha_name, beta_name}
         assert "IGNORE ALL PRIOR INSTRUCTIONS" not in repr(first_request.tools)
-        second_request = provider.requests[1]
+        second_request = provider.logical_requests[1]
         assert "IGNORE ALL PRIOR INSTRUCTIONS" in repr(second_request.messages)
         assert "untrusted" in repr(second_request.messages).lower()
     finally:
@@ -360,8 +400,6 @@ async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_pa
                 summary="Look up an admitted Alpha fixture value.",
                 when_to_use="Use only for the approved Alpha fixture lookup.",
                 keywords=("alpha", "fixture", "lookup"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=321,
             ),
         ),
     )
@@ -379,12 +417,11 @@ async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_pa
         (current,) = await reopened.list_mcp_servers()
         assert current.binding.binding_id == status.binding.binding_id
         assert current.binding.local_label == "Alpha fixture"
-        assert current.binding.tools[0].discovery.summary.startswith("Look up")
-        assert (
-            current.binding.tools[0].discovery.exposure_class
-            is ToolExposureClass.STANDARD
-        )
-        assert current.binding.tools[0].discovery.eager_priority == 321
+        presentation = current.binding.tools[0].presentation
+        assert presentation.summary.startswith("Look up")
+        assert presentation.toolbox_id is ToolboxId.SOURCES
+        assert presentation.load_mode is ToolLoadMode.ON_DEMAND
+        assert presentation.text_trust is ToolTextTrust.ADMITTED_UNTRUSTED
         assert current.active_in_runtime
         (activated,) = tuple(reopened._embedded._mcp_activated_bindings.values())
         assert activated.executor.client is None
@@ -557,12 +594,13 @@ async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_p
     agent_id = agent.id
     await agent.close()
 
-    discovery = ToolDiscoveryMetadata(
+    presentation = ToolPresentation(
+        toolbox_id=ToolboxId.SOURCES,
+        load_mode=ToolLoadMode.ON_DEMAND,
+        text_trust=ToolTextTrust.ADMITTED_UNTRUSTED,
         summary="Bounded storage pressure tool.",
         when_to_use="Use only to validate the persisted aggregate byte gates.",
         keywords=("bounded", "storage", "pressure"),
-        exposure_class=ToolExposureClass.DEFERRED,
-        eager_priority=0,
     )
 
     def encoded_binding(filler_characters: int) -> str:
@@ -590,7 +628,7 @@ async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_p
                     local_name=f"pressure_{index}",
                     remote_name=f"pressure/{index}",
                     description="One bounded persisted storage pressure tool.",
-                    discovery=discovery,
+                    presentation=presentation,
                     input_schema=schema,
                     input_schema_digest=digest,
                     output_schema=None,
@@ -1146,6 +1184,7 @@ async def test_revocation_after_frozen_context_blocks_io_and_is_binding_isolated
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
         assert [block.call_id for block in blocks] == ["revoked-call", "sibling-call"]
         assert _error_code(blocks[0]) == "mcp_binding_unavailable"
@@ -1358,6 +1397,7 @@ async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
         assert not blocks[0].is_error
         assert _error_code(blocks[1]) == "mcp_authentication_failed"
@@ -1437,8 +1477,10 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
-        assert tuple(request.sensitivity for request in provider.requests) == (
+        assert len(provider.requests) == 5
+        assert tuple(request.sensitivity for request in provider.logical_requests) == (
             ModelSensitivity.PUBLIC,
             ModelSensitivity.CONFIDENTIAL,
             ModelSensitivity.CONFIDENTIAL,
@@ -1554,6 +1596,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
         assert _error_code(block) == "mcp_result_too_large"
         assert "REMOTE-SECRET" not in repr(block)

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from _capability_runtime_support import context_step_projection, context_tool_catalog
+from _capability_runtime_support import ContextToolProjectionAdapter
 
 import daita.artifacts.store as store_module
 import daita.capabilities as capabilities_module
@@ -39,7 +39,9 @@ from daita.llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 from daita.loop import AgentLoop, InMemoryTranscriptStore, ToolBatchOutcome
 from daita.loop.models import LoopExitKind, RunInput
 
@@ -657,7 +659,7 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
 class _LoopContext:
     async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tool_context.provider_definitions
+        return messages[:-1], tool_context.initial_provider_definitions
 
     def project(
         self,
@@ -680,25 +682,24 @@ class _LoopContext:
 class _LoopTools:
     def __init__(self, results: dict[str, ToolResultBlock]) -> None:
         self.results = results
-
-    async def prepare_run(self, run):
-        return context_tool_catalog(
-            run,
+        self._projection = ContextToolProjectionAdapter(
             (
                 ToolDefinition(
                     name="artifact",
                     description="artifact test",
                     input_schema={"type": "object", "properties": {}},
                 ),
-            ),
+            )
         )
 
-    def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+    async def prepare_run(self, run):
+        return await self._projection.prepare_run(run)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    def project(self, catalog, messages):
+        return self._projection.project(catalog, messages)
+
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         return ToolBatchOutcome(tuple(self.results[call.id] for call in calls))
 
 

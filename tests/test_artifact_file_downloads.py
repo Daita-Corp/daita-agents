@@ -35,7 +35,9 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
 _ARTIFACT_ID = "artifact-00000000000000000000000000000001"
 
@@ -137,8 +139,7 @@ def _copy_script(
 
 
 def _set_script(provider: MockModelProvider, script: tuple[ModelResponse, ...]) -> None:
-    provider._script = script
-    provider._cursor = 0
+    provider.replace_script(script)
 
 
 async def _tool_result(agent: Agent, run_id: str, call_id: str) -> ToolResultBlock:

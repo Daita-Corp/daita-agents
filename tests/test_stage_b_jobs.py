@@ -34,6 +34,7 @@ from daita.capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     CapabilityRegistry,
+    ToolLoadMode,
     ToolExecution,
     ToolOutput,
     ToolOutputValidationError,
@@ -42,7 +43,6 @@ from daita.capabilities import (
 from daita.capability_runtime import (
     CapabilityRuntime,
     InternalCapabilityRequest,
-    ToolInvocationMode,
 )
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
 from daita.jobs.capabilities import (
@@ -91,12 +91,14 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
+from daita.loop.models import LoopLimits, RunInput
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 class _OversizedInternalExecutor:
@@ -169,9 +171,10 @@ def _job_id(provider: MockModelProvider) -> str:
 def _job_id_at(provider: MockModelProvider, request_index: int) -> str:
     results = tuple(
         block
-        for message in provider.requests[request_index].messages
+        for message in provider.logical_requests[request_index].messages
         for block in message.content
         if isinstance(block, ToolResultBlock)
+        and block.output.get("kind") != "toolbox_load_receipt"
     )
     assert len(results) == 1
     assert results[0].is_error is False
@@ -253,9 +256,9 @@ def _job_runtime(
     )
 
 
-def _job_catalog_modes(catalog) -> dict[str, ToolInvocationMode]:
+def _job_catalog_modes(catalog) -> dict[str, ToolLoadMode]:
     return {
-        entry.view.name: entry.invocation_mode
+        entry.view.name: entry.load_mode
         for entry in catalog.entries
         if entry.domain_owner_id == JOB_DOMAIN_OWNER_ID
     }
@@ -373,9 +376,7 @@ async def test_job_projection_is_bounded_direct_and_frozen_per_run(
     now = datetime.now(UTC)
     try:
         empty = await runtime.prepare_run(_job_run_input("run-empty"))
-        assert _job_catalog_modes(empty) == {
-            JOB_LIST_TOOL_NAME: ToolInvocationMode.DIRECT
-        }
+        assert _job_catalog_modes(empty) == {JOB_LIST_TOOL_NAME: ToolLoadMode.PINNED}
 
         await store.admit_job(
             _stored_job(
@@ -386,27 +387,25 @@ async def test_job_projection_is_bounded_direct_and_frozen_per_run(
         )
         active = await runtime.prepare_run(_job_run_input("run-active"))
         assert _job_catalog_modes(active) == {
-            JOB_CANCEL_TOOL_NAME: ToolInvocationMode.DEFERRED,
-            JOB_INSPECT_TOOL_NAME: ToolInvocationMode.DIRECT,
-            JOB_LIST_TOOL_NAME: ToolInvocationMode.DIRECT,
-            JOB_READ_RESULTS_TOOL_NAME: ToolInvocationMode.DIRECT,
+            JOB_CANCEL_TOOL_NAME: ToolLoadMode.ON_DEMAND,
+            JOB_INSPECT_TOOL_NAME: ToolLoadMode.PINNED,
+            JOB_LIST_TOOL_NAME: ToolLoadMode.PINNED,
+            JOB_READ_RESULTS_TOOL_NAME: ToolLoadMode.PINNED,
         }
         foreign = await runtime.prepare_run(
             _job_run_input("run-foreign", agent_id="agent-2")
         )
         assert _job_catalog_modes(foreign) == {}
-        assert _job_catalog_modes(empty) == {
-            JOB_LIST_TOOL_NAME: ToolInvocationMode.DIRECT
-        }
+        assert _job_catalog_modes(empty) == {JOB_LIST_TOOL_NAME: ToolLoadMode.PINNED}
 
         cancelled = await owner.cancel("job-projection")
         assert cancelled is not None
         assert cancelled.summary.status is JobStatus.CANCELLED
         terminal = await runtime.prepare_run(_job_run_input("run-terminal"))
         assert _job_catalog_modes(terminal) == {
-            JOB_INSPECT_TOOL_NAME: ToolInvocationMode.DIRECT,
-            JOB_LIST_TOOL_NAME: ToolInvocationMode.DIRECT,
-            JOB_READ_RESULTS_TOOL_NAME: ToolInvocationMode.DIRECT,
+            JOB_INSPECT_TOOL_NAME: ToolLoadMode.PINNED,
+            JOB_LIST_TOOL_NAME: ToolLoadMode.PINNED,
+            JOB_READ_RESULTS_TOOL_NAME: ToolLoadMode.PINNED,
         }
     finally:
         await store.close()
@@ -513,7 +512,7 @@ async def test_job_context_is_agent_scoped_and_result_first(tmp_path: Path) -> N
         assert "known job ID, call job_read_results first" in system.text
         assert "Use job_inspect only" in system.text
         search = next(
-            item for item in provider.requests[0].tools if item.name == "tool_search"
+            item for item in provider.requests[0].tools if item.name == "toolbox_search"
         )
         properties = search.input_schema["properties"]
         assert isinstance(properties, Mapping)
@@ -765,9 +764,10 @@ async def test_invalid_external_selection_fails_before_admission_or_io(
         )
         results = tuple(
             block
-            for message in provider.requests[1].messages
+            for message in provider.logical_requests[1].messages
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
         assert len(results) == 1 and results[0].is_error is True
         error = results[0].output["error"]

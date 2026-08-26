@@ -21,7 +21,7 @@ from ._support import (
     PROFILE_SAMPLE_ROWS,
     TARGET_PROFILE_TABLE,
     assert_completed,
-    assert_deferred_invocation,
+    assert_on_demand_invocation,
     assert_profile_result,
     benchmark_marks,
     capture_run,
@@ -95,7 +95,7 @@ async def test_profile_target_survives_catalog_distractors(
         )
         assert_completed(capture)
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
-        assert_deferred_invocation(capture, "start_data_profile")
+        assert_on_demand_invocation(capture, "start_data_profile")
         job_id = job_id_from_start(capture.transcript)
         terminal = await wait_for_terminal(fixture.agent, job_id)
         assert terminal.summary.status is JobStatus.SUCCEEDED

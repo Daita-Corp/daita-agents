@@ -25,7 +25,7 @@ from ._support import (
     PROFILE_SAMPLE_ROWS,
     TARGET_PROFILE_TABLE,
     assert_completed,
-    assert_deferred_invocation,
+    assert_on_demand_invocation,
     assert_profile_result,
     benchmark_marks,
     capture_run,
@@ -102,7 +102,8 @@ async def test_model_certification_cross_conversation_result(
         assert "job_read_results" in names
         assert "artifact_read" in names
         assert "data_query_sqlite" not in names
-        assert "tool_search" not in names
+        assert "toolbox_search" not in names
+        assert "toolbox_load" not in names
         result_reads = results_for(capture.transcript, "job_read_results")
         assert result_reads and job_id in canonical_json(result_reads[-1].output)
         await assert_profile_result(fixture.agent, job_id)
@@ -142,7 +143,7 @@ async def test_model_certification_start_and_cancel(
             source_id=fixture.source_id,
         )
         assert_completed(started)
-        assert_deferred_invocation(started, "start_data_profile")
+        assert_on_demand_invocation(started, "start_data_profile")
         job_id = job_id_from_start(started.transcript)
         inspection = await fixture.agent.inspect_job(job_id)
         assert inspection is not None
@@ -159,7 +160,7 @@ async def test_model_certification_start_and_cancel(
         assert_completed(cancelled)
         record_metrics(record_property, model_id, started)
         record_metrics(record_property, model_id, cancelled)
-        assert_deferred_invocation(cancelled, "job_cancel")
+        assert_on_demand_invocation(cancelled, "job_cancel")
         cancel_results = results_for(cancelled.transcript, "job_cancel")
         assert len(cancel_results) == 1
         assert job_id in canonical_json(cancel_results[0].output)

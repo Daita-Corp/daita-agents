@@ -11,10 +11,12 @@ from ...capabilities import (
     Capability,
     CapabilityDeclarations,
     Executor,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from .results import BoundedResultProjection
@@ -240,12 +242,13 @@ def local_file_read_capability_declarations() -> CapabilityDeclarations:
         name=LOCAL_FILE_READ_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
-        discovery=ToolDiscoveryMetadata(
+        presentation=ToolPresentation(
+            toolbox_id=ToolboxId.SOURCES,
+            load_mode=ToolLoadMode.PINNED,
+            text_trust=ToolTextTrust.CODE,
             summary="Read bounded rows from one attached CSV or JSON resource.",
             when_to_use="Use for validated values from an attached local data file.",
             keywords=("data", "file", "csv", "json", "read"),
-            exposure_class=ToolExposureClass.CORE,
-            eager_priority=900,
         ),
     )
     return CapabilityDeclarations(

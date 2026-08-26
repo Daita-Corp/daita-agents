@@ -28,7 +28,7 @@ from ._support import (
     TARGET_IMMEDIATE_TABLE,
     TARGET_PROFILE_TABLE,
     assert_completed,
-    assert_deferred_invocation,
+    assert_on_demand_invocation,
     assert_profile_result,
     benchmark_marks,
     capture_run,
@@ -189,7 +189,7 @@ async def test_paraphrased_background_requests_admit_one_exact_job(
         )
         assert_completed(capture)
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
-        assert_deferred_invocation(capture, "start_data_profile")
+        assert_on_demand_invocation(capture, "start_data_profile")
         names = logical_names(capture.transcript)
         assert not (LIFECYCLE_TOOLS & set(names))
         assert "data_query_sqlite" not in names
@@ -228,9 +228,8 @@ async def test_paraphrased_status_questions_are_agent_scoped_and_direct(
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
         names = logical_names(capture.transcript)
         assert "job_list" in names
-        assert "tool_search" not in names
-        assert "tool_describe" not in names
-        assert "tool_call" not in names
+        assert "toolbox_search" not in names
+        assert "toolbox_load" not in names
         list_results = results_for(capture.transcript, "job_list")
         assert list_results and job_id in canonical_json(list_results[-1].output)
         direct_names = {tool.name for tool in capture.requests[0].tools}
@@ -264,7 +263,8 @@ async def test_paraphrased_result_questions_recover_exact_artifacts(
         assert "job_read_results" in names
         assert "artifact_read" in names
         assert "data_query_sqlite" not in names
-        assert "tool_search" not in names
+        assert "toolbox_search" not in names
+        assert "toolbox_load" not in names
         result_reads = results_for(capture.transcript, "job_read_results")
         assert result_reads and job_id in canonical_json(result_reads[-1].output)
         result = await fixture.agent.read_job_result(job_id)
@@ -319,7 +319,7 @@ async def test_paraphrased_cancellation_targets_one_running_job(
             source_id=fixture.source_id,
         )
         assert_completed(started)
-        assert_deferred_invocation(started, "start_data_profile")
+        assert_on_demand_invocation(started, "start_data_profile")
         job_id = job_id_from_start(started.transcript)
         await asyncio.wait_for(execution_started.wait(), timeout=5)
         await wait_for_running(fixture.agent, job_id)
@@ -330,7 +330,7 @@ async def test_paraphrased_cancellation_targets_one_running_job(
         )
         assert_completed(cancelled)
         record_metrics(record_property, DEFAULT_MODEL_ID, cancelled)
-        assert_deferred_invocation(cancelled, "job_cancel")
+        assert_on_demand_invocation(cancelled, "job_cancel")
         names = logical_names(cancelled.transcript)
         assert "start_data_profile" not in names
         cancel_results = results_for(cancelled.transcript, "job_cancel")
@@ -361,9 +361,8 @@ def test_paraphrase_case_inventory_is_bounded_and_nonduplicative() -> None:
         forbidden not in prompt
         for prompt in prompts
         for forbidden in (
-            "tool_search",
-            "tool_describe",
-            "tool_call",
+            "toolbox_search",
+            "toolbox_load",
             "start_data_profile",
             "job_list",
             "job_read_results",

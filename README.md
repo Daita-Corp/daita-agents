@@ -152,9 +152,9 @@ call-time identity/schema rechecks, and per-binding revocation; remote metadata
 never authorizes or instructs the agent. Agent open is network-free: accepted
 metadata composes immutable declarations locally, while clients initialize and
 recheck exact remote identity only at an admitted call. Large surfaces use a
-bounded per-run catalog with stable direct definitions and transcript-bound
-`tool_search` → `tool_describe` → `tool_call` deferred invocation. In the TUI,
-`/mcp` opens a grouped
+bounded per-run catalog with pinned definitions and transcript-bound
+`toolbox_search` → atomic `toolbox_load` → ordinary tool invocation. In the
+TUI, `/mcp` opens a grouped
 server manager and `/mcp add` guides endpoint inspection, multi-tool selection,
 read-only attestation, and controlled activation. See
 [Remote MCP read connectivity](docs/MCP_CONNECTIVITY.md).

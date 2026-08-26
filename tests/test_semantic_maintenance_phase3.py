@@ -26,8 +26,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, ToolProjectionMode
+from daita.loop.models import LoopLimits
 from daita.semantics import (
     SEMANTIC_MAINTENANCE_MAX_NOTICES,
     SEMANTIC_MAX_ANNOTATIONS,
@@ -40,9 +39,13 @@ from daita.semantics import (
     semantic_duplicate_identity,
 )
 
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
 from daita.skills import SKILL_MAX_COUNT
 from daita.storage.sqlite import SQLiteStateStore
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+
+EAGER_LIMITS = LoopLimits()
 
 NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
 
@@ -119,7 +122,7 @@ def _profile(provider: MockModelProvider) -> ModelProfile:
 def _request_text(provider: MockModelProvider, index: int) -> str:
     return "\n".join(
         block.text
-        for message in provider.requests[index].messages
+        for message in provider.logical_requests[index].messages
         for block in message.content
         if isinstance(block, TextBlock)
     )
@@ -525,9 +528,9 @@ async def test_related_foreground_run_can_inspect_stale_record_without_using_it(
         initial_prompt = _request_text(provider, 0)
         assert "STALE_STATEMENT_SENTINEL" not in initial_prompt
         assert '<semantic-maintenance reason="stale"' in initial_prompt
-        assert {"semantic_view", "semantic_save"} <= {
-            tool.name for tool in provider.requests[0].tools
-        }
+        working_names = {tool.name for tool in provider.logical_requests[0].tools}
+        assert "semantic_view" in working_names
+        assert "semantic_save" not in working_names
         transcript = await reopened.transcript(result.run_id)
         viewed = next(
             block
@@ -590,7 +593,7 @@ async def test_maximum_skill_index_stays_shallow_and_multiple_bodies_load_progre
         initial = _request_text(provider, 0)
         assert initial.count("- skill-") == SKILL_MAX_COUNT
         assert "FULL_SKILL_BODY" not in initial
-        continued = repr(provider.requests[1].messages)
+        continued = repr(provider.logical_requests[1].messages)
         assert "FULL_SKILL_BODY_00" in continued
         assert f"FULL_SKILL_BODY_{SKILL_MAX_COUNT - 1:02d}" in continued
         assert "FULL_SKILL_BODY_01" not in continued

@@ -68,7 +68,6 @@ from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolic
 from daita.loop.models import (
     LoopExitKind,
     RunOrigin,
-    ToolProjectionMode,
     Transcript,
     validate_completed_transcript,
 )
@@ -91,7 +90,7 @@ _TERMINAL_STATUSES = frozenset(
         JobStatus.NEEDS_ATTENTION,
     }
 )
-_SEED_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+_SEED_LIMITS = LoopLimits()
 
 pytestmark = [
     pytest.mark.acceptance,

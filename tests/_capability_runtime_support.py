@@ -11,27 +11,29 @@ from daita.capabilities import (
     Capability,
     CapabilityDeclarations,
     Executor,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from daita.capability_runtime import (
     CapabilityFailure,
-    DomainToolManifestEntry,
+    CapabilityRuntime,
     RunToolCatalog,
-    RunToolCatalogEntry,
     SideEffectPlan,
     StepToolProjection,
-    ToolInvocationMode,
 )
 from daita.llm.models import (
+    CanonicalMessage,
+    MessageRole,
     ModelSensitivity,
     ToolCall,
     ToolDefinition,
 )
-from daita.loop.models import RunInput
+from daita.loop.models import LoopLimits, RunInput
 
 
 class StaticTestDomain:
@@ -132,17 +134,18 @@ def static_registry(
     )
 
 
-def discovery_metadata(
+def presentation_metadata(
     *,
-    exposure_class: ToolExposureClass = ToolExposureClass.CORE,
-    priority: int = 500,
-) -> ToolDiscoveryMetadata:
-    return ToolDiscoveryMetadata(
+    toolbox_id: ToolboxId = ToolboxId.SOURCES,
+    load_mode: ToolLoadMode = ToolLoadMode.PINNED,
+) -> ToolPresentation:
+    return ToolPresentation(
+        toolbox_id=toolbox_id,
+        load_mode=load_mode,
+        text_trust=ToolTextTrust.CODE,
         summary="Trusted test capability.",
         when_to_use="Use to exercise the declared test contract.",
         keywords=("test",),
-        exposure_class=exposure_class,
-        eager_priority=priority,
     )
 
 
@@ -155,33 +158,77 @@ async def execute_projected(
 ):
     catalog = await runtime.prepare_run(run)
     projection = runtime.project(catalog, ())
+    on_demand_names = tuple(
+        sorted(
+            {
+                call.name
+                for call in calls
+                for entry in catalog.entries
+                if entry.view.name == call.name
+                and entry.load_mode is ToolLoadMode.ON_DEMAND
+            }
+        )
+    )
+    messages: tuple[CanonicalMessage, ...]
+    if on_demand_names:
+        load = ToolCall(
+            id="test-toolbox-load",
+            name="toolbox_load",
+            arguments={"tool_names": on_demand_names},
+        )
+        load_outcome = await runtime.execute_all(
+            run,
+            (load,),
+            projection=projection,
+            messages=(),
+            sensitivity=sensitivity,
+        )
+        messages = (
+            CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(load,)),
+            CanonicalMessage(
+                MessageRole.TOOL,
+                content=(load_outcome.ordered_results[0],),
+            ),
+        )
+        projection = runtime.project(catalog, messages)
+    else:
+        messages = ()
     return await runtime.execute_all(
         run,
         calls,
         projection=projection,
+        messages=messages,
         sensitivity=sensitivity,
     )
 
 
-def context_tool_catalog(
-    run: RunInput,
-    definitions: tuple[ToolDefinition, ...],
-    *,
-    capability_ids: tuple[str, ...] | None = None,
-) -> RunToolCatalog:
-    definitions = tuple(definitions)
-    ids = capability_ids or tuple(f"test.{item.name}" for item in definitions)
-    if len(ids) != len(definitions):
-        raise ValueError("capability_ids must match definitions")
-    entries = tuple(
-        RunToolCatalogEntry(
-            view=ToolView(
-                name=definition.name,
-                capability_id=capability_id,
-                description=definition.description,
-                discovery=discovery_metadata(),
-            ),
-            capability=Capability(
+class _ContextExecutor:
+    def __init__(self, executor_id: str) -> None:
+        self.executor_id = executor_id
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        del request
+        raise AssertionError("context-only test tools must never execute")
+
+
+class ContextToolProjectionAdapter:
+    """Construct context-test catalogs through the real registry/runtime path."""
+
+    def __init__(
+        self,
+        definitions: tuple[ToolDefinition, ...],
+        *,
+        capability_ids: tuple[str, ...] | None = None,
+        limits: LoopLimits = LoopLimits(),
+    ) -> None:
+        definitions = tuple(definitions)
+        ids = capability_ids or tuple(
+            f"test.{definition.name}" for definition in definitions
+        )
+        if len(ids) != len(definitions):
+            raise ValueError("capability_ids must match definitions")
+        capabilities = tuple(
+            Capability(
                 id=capability_id,
                 description=definition.description,
                 input_schema=definition.input_schema,
@@ -189,52 +236,43 @@ def context_tool_catalog(
                 output_schema={"type": "object", "properties": {}},
                 executor_id=f"{capability_id}.executor",
                 access_mode=AccessMode.READ,
-            ),
-            domain_owner_id="test",
-            executor_id=f"{capability_id}.executor",
-            input_schema_digest="sha256:" + "1" * 64,
-            origin_revision_digest="sha256:" + "2" * 64,
-            invocation_mode=ToolInvocationMode.DIRECT,
+            )
+            for definition, capability_id in zip(definitions, ids, strict=True)
         )
-        for definition, capability_id in zip(definitions, ids, strict=True)
-    )
-    manifest = (
-        ()
-        if not entries
-        else (
-            DomainToolManifestEntry(
-                domain_owner_id="test",
-                summary="Applicable trusted test capabilities.",
-                direct_count=len(entries),
-                deferred_count=0,
-            ),
+        views = tuple(
+            ToolView(
+                name=definition.name,
+                capability_id=capability_id,
+                description=definition.description,
+                presentation=presentation_metadata(),
+            )
+            for definition, capability_id in zip(definitions, ids, strict=True)
         )
-    )
-    return RunToolCatalog(
-        run_id=run.id,
-        agent_id=run.agent_id,
-        execution_scope_digest="sha256:" + "3" * 64,
-        registry_digest="sha256:" + "4" * 64,
-        catalog_digest="sha256:" + "5" * 64,
-        entries=entries,
-        domain_manifest=manifest,
-        provider_definitions=definitions,
-        aggregate_bytes=1,
-        manifest_bytes=1,
-        manifest_token_limit=4_000,
-    )
+        executors = tuple(
+            _ContextExecutor(capability.executor_id) for capability in capabilities
+        )
+        domain = StaticTestDomain(capabilities, views)
+        self._runtime = CapabilityRuntime(
+            static_registry(domain, executors),
+            (domain,),
+            limits=limits,
+        )
+
+    async def prepare_run(self, run: RunInput) -> RunToolCatalog:
+        return await self._runtime.prepare_run(run)
+
+    def project(
+        self,
+        catalog: RunToolCatalog,
+        messages: tuple[CanonicalMessage, ...],
+    ) -> StepToolProjection:
+        return self._runtime.project(catalog, messages)
 
 
-def context_step_projection(
-    catalog: RunToolCatalog,
-) -> StepToolProjection:
-    return StepToolProjection(
-        run_id=catalog.run_id,
-        catalog_digest=catalog.catalog_digest,
-        projection_digest="sha256:" + "6" * 64,
-        provider_definitions=catalog.provider_definitions,
-        catalog_entries=catalog.entries,
-        direct_resolution_entries=catalog.entries,
-        described_deferred_references=(),
-        described_schema_bytes=0,
-    )
+__all__ = [
+    "ContextToolProjectionAdapter",
+    "StaticTestDomain",
+    "execute_projected",
+    "presentation_metadata",
+    "static_registry",
+]

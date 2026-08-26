@@ -30,12 +30,14 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, ToolProjectionMode
+from daita.loop.models import LoopLimits
 from daita.observation import AgentEvent, AgentEventKind
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
 
 NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,26 +326,28 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         "products",
         "regions",
     }
-    baseline_provider._script = (
-        ModelResponse(
-            finish_reason=FinishReason.TOOL_CALLS,
-            tool_calls=(
-                ToolCall(
-                    id="baseline-query",
-                    name="data_query_sqlite",
-                    arguments={
-                        "source_id": source.id,
-                        "sql": "SELECT SUM(total_amount) AS margin FROM orders",
-                    },
+    baseline_provider.replace_script(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="baseline-query",
+                        name="data_query_sqlite",
+                        arguments={
+                            "source_id": source.id,
+                            "sql": "SELECT SUM(total_amount) AS margin FROM orders",
+                        },
+                    ),
                 ),
+                usage=_usage(120, 20),
             ),
-            usage=_usage(120, 20),
-        ),
-        ModelResponse(
-            finish_reason=FinishReason.STOP,
-            text="The unqualified total is 1299.",
-            usage=_usage(80, 12),
-        ),
+            ModelResponse(
+                finish_reason=FinishReason.STOP,
+                text="The unqualified total is 1299.",
+                usage=_usage(80, 12),
+            ),
+        )
     )
     baseline_start = len(events)
     baseline_exit = await baseline_agent.run(
@@ -413,11 +417,13 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     assert teaching_exit.final_text == (
         "The paid contribution margin definition is saved."
     )
-    assert tuple(tool.name for tool in teaching_provider.requests[0].tools) == tuple(
-        sorted(tool.name for tool in teaching_provider.requests[0].tools)
+    assert tuple(
+        tool.name for tool in teaching_provider.logical_requests[0].tools
+    ) == tuple(
+        sorted(tool.name for tool in teaching_provider.logical_requests[0].tools)
     )
     assert "semantic_save" in {
-        tool.name for tool in teaching_provider.requests[0].tools
+        tool.name for tool in teaching_provider.logical_requests[0].tools
     }
     views = await teaching_agent.list_semantic_annotations()
     assert len(views) == 1
@@ -494,7 +500,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         (row["region_code"], row["currency_code"], row["margin"])
         for row in learned_rows
     ) == (("AMER", "USD", 40), ("EMEA", "EUR", 100))
-    first_learned_request = learned_provider.requests[0]
+    first_learned_request = learned_provider.logical_requests[0]
     learned_prompt = "\n".join(
         block.text
         for message in first_learned_request.messages
@@ -526,30 +532,32 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         resource.name: resource
         for resource in await denied_agent.list_catalog_resources()
     }
-    denied_provider._script = (
-        ModelResponse(
-            finish_reason=FinishReason.STOP,
-            text="No durable definition is available.",
-            usage=_usage(60, 10),
-        ),
-        ModelResponse(
-            finish_reason=FinishReason.TOOL_CALLS,
-            tool_calls=(
-                _semantic_save_call(
-                    call_id="denied-teaching",
-                    annotation_id="denied-margin",
-                    source_id=denied_source.id,
-                    resources=denied_resources,
-                    statement=statement,
-                ),
+    denied_provider.replace_script(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.STOP,
+                text="No durable definition is available.",
+                usage=_usage(60, 10),
             ),
-            usage=_usage(100, 20),
-        ),
-        ModelResponse(
-            finish_reason=FinishReason.STOP,
-            text="The proposed definition was not saved.",
-            usage=_usage(50, 10),
-        ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    _semantic_save_call(
+                        call_id="denied-teaching",
+                        annotation_id="denied-margin",
+                        source_id=denied_source.id,
+                        resources=denied_resources,
+                        statement=statement,
+                    ),
+                ),
+                usage=_usage(100, 20),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.STOP,
+                text="The proposed definition was not saved.",
+                usage=_usage(50, 10),
+            ),
+        )
     )
     denied_baseline_start = len(events)
     denied_baseline = await denied_agent.run(
@@ -593,7 +601,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     assert denied_follow_up.final_text == denied_baseline.final_text
     denied_prompt = "\n".join(
         block.text
-        for message in denied_reopen_provider.requests[0].messages
+        for message in denied_reopen_provider.logical_requests[0].messages
         for block in message.content
         if isinstance(block, TextBlock)
     )

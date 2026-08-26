@@ -49,11 +49,13 @@ from ...capabilities import (
     CapabilityInputError,
     Executor,
     OperationalEffect,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
     ToolOutputValidationError,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
@@ -1159,111 +1161,120 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
             name=DOCUMENT_CREATE_TOOL_NAME,
             capability_id=document.id,
             description=document.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Create a bounded Markdown or text document artifact.",
                 when_to_use="Use when the requested deliverable is a document.",
                 keywords=("artifact", "document", "markdown", "text"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=800,
             ),
         ),
         ToolView(
             name=LOCAL_FILE_COPY_TOOL_NAME,
             capability_id=local_file_copy.id,
             description=local_file_copy.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Copy one attached CSV or JSON file into an artifact.",
                 when_to_use="Use for byte-identical export of an attached data file.",
                 keywords=("artifact", "export", "file", "copy"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=770,
             ),
         ),
         ToolView(
             name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
             capability_id=sqlite_tabular.id,
             description=sqlite_tabular.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Export an exact SQLite query result as CSV or XLSX.",
                 when_to_use="Use for a downloadable tabular SQLite result.",
                 keywords=("artifact", "export", "sqlite", "csv", "xlsx"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=790,
             ),
         ),
         ToolView(
             name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
             capability_id=postgresql_tabular.id,
             description=postgresql_tabular.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Export an exact PostgreSQL query result as CSV or XLSX.",
                 when_to_use="Use for a downloadable tabular PostgreSQL result.",
                 keywords=("artifact", "export", "postgresql", "csv", "xlsx"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=790,
             ),
         ),
         ToolView(
             name=ARTIFACT_LIST_TOOL_NAME,
             capability_id=artifact_list.id,
             description=artifact_list.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.PINNED,
+                text_trust=ToolTextTrust.CODE,
                 summary="List bounded safe metadata for current-conversation artifacts.",
                 when_to_use="Use to identify an artifact created earlier in the conversation.",
                 keywords=("artifact", "list", "conversation", "file"),
-                exposure_class=ToolExposureClass.CORE,
-                eager_priority=920,
             ),
         ),
         ToolView(
             name=ARTIFACT_READ_TOOL_NAME,
             capability_id=artifact_read.id,
             description=artifact_read.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.PINNED,
+                text_trust=ToolTextTrust.CODE,
                 summary="Read a bounded safe preview of one exact agent-owned artifact.",
                 when_to_use=(
                     "Use with an exact known artifact ID, including one returned by "
                     "job_read_results."
                 ),
                 keywords=("artifact", "read", "preview", "file"),
-                exposure_class=ToolExposureClass.CORE,
-                eager_priority=910,
             ),
         ),
         ToolView(
             name=ARTIFACT_CONVERT_TOOL_NAME,
             capability_id=artifact_convert.id,
             description=artifact_convert.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Convert a verified Daita XLSX Data snapshot to CSV.",
                 when_to_use="Use for exact supported conversion of an existing artifact.",
                 keywords=("artifact", "convert", "xlsx", "csv"),
-                exposure_class=ToolExposureClass.CORE,
-                eager_priority=900,
             ),
         ),
         ToolView(
             name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
             capability_id=save.id,
             description=save.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Deliver one committed artifact to an authorized local destination.",
                 when_to_use="Use after artifact creation when local delivery is required.",
                 keywords=("artifact", "save", "deliver", "local"),
-                exposure_class=ToolExposureClass.CORE,
-                eager_priority=890,
             ),
         ),
         ToolView(
             name=ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
             capability_id=set_location.id,
             description=set_location.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Set an authorized destination as the future export default.",
                 when_to_use="Use only when the user explicitly changes the persistent default.",
                 keywords=("artifact", "destination", "export", "default"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=500,
             ),
         ),
     )

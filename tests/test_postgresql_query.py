@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 import pytest
 from _capability_runtime_support import (
     StaticTestDomain,
-    discovery_metadata,
+    presentation_metadata,
     execute_projected,
     static_registry,
 )
@@ -217,7 +217,7 @@ async def _failure_result(error: BaseException):
         name="test_postgresql_failure",
         capability_id=capability.id,
         description=capability.description,
-        discovery=discovery_metadata(),
+        presentation=presentation_metadata(),
     )
     domain = StaticTestDomain((capability,), (view,))
     runtime = CapabilityRuntime(

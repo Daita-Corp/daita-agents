@@ -1,7 +1,7 @@
 """Authorized live-model acceptance coverage for Stage B durable jobs.
 
 These tests ask a real model to choose between immediate and durable work,
-discover the deferred start/cancel tools, detach after admission, recover a later
+discover the on-demand start/cancel tools, detach after admission, recover a later
 result through direct agent-scoped lifecycle reads, and request cancellation from
 a new conversation. Supervisor fencing, crash recovery, storage failures,
 concurrency limits, and uncertain external outcomes remain deterministic tests.
@@ -241,7 +241,7 @@ def _successful_logical_results(
 
 
 def _all_logical_names(transcript: Transcript) -> tuple[str, ...]:
-    """Return resolved tool identities, including failed deferred invocations."""
+    """Return resolved tool identities, including failed on-demand invocations."""
 
     outer_names = {
         call.id: call.name
@@ -262,6 +262,18 @@ def _all_logical_names(transcript: Transcript) -> tuple[str, ...]:
             if name is not None:
                 names.append(name)
     return tuple(names)
+
+
+def _requests_for_transcript(
+    requests: Sequence[ModelRequest],
+    transcript: Transcript,
+) -> tuple[ModelRequest, ...]:
+    """Select physical requests belonging to one exact run transcript."""
+
+    start = transcript.messages[0]
+    selected = tuple(request for request in requests if start in request.messages)
+    assert selected
+    return selected
 
 
 def _results_for(
@@ -308,19 +320,18 @@ def _assert_completed(
     validate_completed_transcript(transcript, result)
 
 
-def _assert_deferred_invocation(
+def _assert_on_demand_invocation(
     transcript: Transcript,
     requests: Sequence[ModelRequest],
     tool_name: str,
 ) -> None:
     assert requests
     visible_names = {tool.name for tool in requests[0].tools}
-    assert {"tool_search", "tool_describe", "tool_call"} <= visible_names
+    assert {"toolbox_search", "toolbox_load"} <= visible_names
     assert tool_name not in visible_names
-    assert all(request.tools == requests[0].tools for request in requests)
     logical_names = _all_logical_names(transcript)
-    assert "tool_search" in logical_names
-    assert "tool_describe" in logical_names
+    assert "toolbox_search" in logical_names
+    assert "toolbox_load" in logical_names
     assert tool_name in logical_names
     assert _results_for(transcript, tool_name)
 
@@ -373,7 +384,10 @@ async def test_live_model_chooses_direct_query_instead_of_durable_job(
             source_id=source_id,
         )
         transcript = await agent.transcript(result.run_id)
-        requests = provider.requests[request_start:]
+        requests = _requests_for_transcript(
+            provider.requests[request_start:],
+            transcript,
+        )
 
         _assert_completed(result, transcript, requests)
         assert result.final_text is not None
@@ -389,7 +403,7 @@ async def test_live_model_chooses_direct_query_instead_of_durable_job(
 async def test_live_model_starts_detaches_and_later_reads_profile_result(
     tmp_path: Path,
 ) -> None:
-    """Exercise deferred admission and later agent-scoped result recovery."""
+    """Exercise on-demand admission and later agent-scoped result recovery."""
 
     profile, provider = _live_provider()
     agent, source_id = await _new_agent(
@@ -403,17 +417,20 @@ async def test_live_model_starts_detaches_and_later_reads_profile_result(
         started = await agent.run(
             "This is an authorized Stage B live acceptance check. Start exactly "
             "one durable background data profile for stage_b_profile_probe using a "
-            "sample bound of exactly 5 rows. Use the deferred-tool discovery controls. "
+            "sample bound of exactly 5 rows. Use toolbox search and load. "
             "Do not use a synchronous SQL query, and do not list, inspect, poll, cancel, "
             "or read the job in this interaction. Once the durable start receipt is "
             "returned, end with: STAGE_B_JOB_STARTED <actual job id>.",
             source_id=source_id,
         )
         start_transcript = await agent.transcript(started.run_id)
-        start_requests = provider.requests[start_request:]
+        start_requests = _requests_for_transcript(
+            provider.requests[start_request:],
+            start_transcript,
+        )
 
         _assert_completed(started, start_transcript, start_requests)
-        _assert_deferred_invocation(
+        _assert_on_demand_invocation(
             start_transcript,
             start_requests,
             "start_data_profile",
@@ -438,13 +455,16 @@ async def test_live_model_starts_detaches_and_later_reads_profile_result(
             "jobs owned by this agent to identify its completed data-profile job, "
             "read that job's validated result directly without inspecting it first, "
             "then read the exact referenced JSON artifact. Do not query the source "
-            "again and do not use deferred discovery for lifecycle reads. From that "
+            "again and do not load lifecycle reads. From that "
             "artifact, end with exactly: "
             "STAGE_B_PROFILE_CHECK sampled_rows=<resource sampled_rows> "
             "nullable_code_nulls=<nullable_code null_values>.",
         )
         recovered_transcript = await agent.transcript(recovered.run_id)
-        recovered_requests = provider.requests[result_request:]
+        recovered_requests = _requests_for_transcript(
+            provider.requests[result_request:],
+            recovered_transcript,
+        )
 
         _assert_completed(recovered, recovered_transcript, recovered_requests)
         assert recovered.conversation_id != started.conversation_id
@@ -454,9 +474,8 @@ async def test_live_model_starts_detaches_and_later_reads_profile_result(
         assert "job_read_results" in recovered_names
         assert "artifact_read" in recovered_names
         assert "job_inspect" not in recovered_names
-        assert "tool_search" not in recovered_names
-        assert "tool_describe" not in recovered_names
-        assert "tool_call" not in recovered_names
+        assert "toolbox_search" not in recovered_names
+        assert "toolbox_load" not in recovered_names
         assert "data_query_sqlite" not in recovered_names
         assert (
             recovered_names.index("job_list")
@@ -525,14 +544,17 @@ async def test_live_model_requests_cancellation_of_running_profile_job(
         started = await agent.run(
             "This is an authorized Stage B cancellation acceptance check. Start "
             "exactly one durable background profile for stage_b_profile_probe with "
-            "a sample bound of 5 rows. Use deferred-tool discovery. Once the start "
+            "a sample bound of 5 rows. Use toolbox search and load. Once the start "
             "receipt is returned, end with: STAGE_B_JOB_STARTED <actual job id>.",
             source_id=source_id,
         )
         start_transcript = await agent.transcript(started.run_id)
-        start_requests = provider.requests[start_request:]
+        start_requests = _requests_for_transcript(
+            provider.requests[start_request:],
+            start_transcript,
+        )
         _assert_completed(started, start_transcript, start_requests)
-        _assert_deferred_invocation(
+        _assert_on_demand_invocation(
             start_transcript,
             start_requests,
             "start_data_profile",
@@ -551,11 +573,14 @@ async def test_live_model_requests_cancellation_of_running_profile_job(
             "STAGE_B_CANCEL_REQUESTED <actual job id>.",
         )
         cancel_transcript = await agent.transcript(cancelled.run_id)
-        cancel_requests = provider.requests[cancel_request:]
+        cancel_requests = _requests_for_transcript(
+            provider.requests[cancel_request:],
+            cancel_transcript,
+        )
 
         _assert_completed(cancelled, cancel_transcript, cancel_requests)
         assert cancelled.conversation_id != started.conversation_id
-        _assert_deferred_invocation(
+        _assert_on_demand_invocation(
             cancel_transcript,
             cancel_requests,
             "job_cancel",

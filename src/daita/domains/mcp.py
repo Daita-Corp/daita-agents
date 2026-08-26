@@ -446,7 +446,7 @@ async def activate_mcp_domain(
                 name=tool.local_name,
                 capability_id=tool.capability_id,
                 description=tool.description,
-                discovery=tool.discovery,
+                presentation=tool.presentation,
                 origin_revision_digest="sha256:"
                 + sha256(
                     canonical_json(
@@ -457,12 +457,13 @@ async def activate_mcp_domain(
                             "executor_id": tool.executor_id,
                             "input_schema_digest": tool.input_schema_digest,
                             "output_schema_digest": tool.output_schema_digest,
-                            "discovery": {
-                                "summary": tool.discovery.summary,
-                                "when_to_use": tool.discovery.when_to_use,
-                                "keywords": tool.discovery.keywords,
-                                "exposure_class": tool.discovery.exposure_class.value,
-                                "eager_priority": tool.discovery.eager_priority,
+                            "presentation": {
+                                "toolbox_id": tool.presentation.toolbox_id.value,
+                                "load_mode": tool.presentation.load_mode.value,
+                                "text_trust": tool.presentation.text_trust.value,
+                                "summary": tool.presentation.summary,
+                                "when_to_use": tool.presentation.when_to_use,
+                                "keywords": tool.presentation.keywords,
                             },
                         }
                     ).encode("utf-8")

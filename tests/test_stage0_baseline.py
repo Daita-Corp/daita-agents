@@ -5,10 +5,9 @@ from datetime import UTC, datetime
 
 import pytest
 from _capability_runtime_support import (
+    ContextToolProjectionAdapter,
     StaticTestDomain,
-    context_step_projection,
-    context_tool_catalog,
-    discovery_metadata,
+    presentation_metadata,
     execute_projected,
     static_registry,
 )
@@ -53,13 +52,14 @@ async def _prepared_request(
     *,
     step: int,
 ) -> ModelRequest:
-    catalog = context_tool_catalog(run, tools)
+    projection = ContextToolProjectionAdapter(tools)
+    catalog = await projection.prepare_run(run)
     snapshot = await builder.prepare(run, messages, catalog)
     return builder.project(
         snapshot,
         messages,
         step=step,
-        tool_context=context_step_projection(catalog),
+        tool_context=projection.project(catalog, messages),
     )
 
 
@@ -275,7 +275,7 @@ async def test_validated_capability_classification_reaches_result_envelope():
         name="stage0_classified",
         capability_id=capability.id,
         description="Return one classified value.",
-        discovery=discovery_metadata(),
+        presentation=presentation_metadata(),
     )
     domain = StaticTestDomain((capability,), (view,))
     runtime = CapabilityRuntime(
