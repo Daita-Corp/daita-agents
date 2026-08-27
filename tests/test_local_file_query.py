@@ -556,7 +556,11 @@ def test_worker_pipe_connection_reset_is_a_closed_stream() -> None:
             del maxlength
             raise ConnectionResetError
 
-    final = {"kind": "final", "status": "success", "data": {}}
+    final: dict[str, object] = {
+        "kind": "final",
+        "status": "success",
+        "data": {},
+    }
     connection = cast(Connection, ResetConnection())
     assert query_module._receive_messages(connection, final) is final
 
