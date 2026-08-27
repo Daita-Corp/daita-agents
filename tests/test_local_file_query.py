@@ -10,7 +10,9 @@ import os
 import subprocess
 import sys
 from collections.abc import Mapping
+from multiprocessing.connection import Connection
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -460,7 +462,9 @@ def test_security_profile_is_ordered_locked_local_only_and_httpfs_free(
         assert observed_paths is not None
         assert isinstance(observed_paths[0], list)
         assert len(observed_paths[0]) == 1
-        assert observed_paths[0][0].startswith("/dev/fd/")
+        assert query_module._allowed_path_matches_descriptor(observed_paths[0][0], path)
+        assert query_module._allowed_path_matches_descriptor(str(allowed), path)
+        assert not query_module._allowed_path_matches_descriptor(str(blocked), path)
         assert connection.execute("SELECT * FROM read_csv(?)", [path]).fetchall() == [
             (1,)
         ]
@@ -541,6 +545,20 @@ def test_security_profile_rejects_any_extra_retained_allowed_path(
     finally:
         connection.close()
         os.close(descriptor)
+
+
+def test_worker_pipe_connection_reset_is_a_closed_stream() -> None:
+    class ResetConnection:
+        def poll(self, _timeout: float) -> bool:
+            return True
+
+        def recv_bytes(self, *, maxlength: int) -> bytes:
+            del maxlength
+            raise ConnectionResetError
+
+    final = {"kind": "final", "status": "success", "data": {}}
+    connection = cast(Connection, ResetConnection())
+    assert query_module._receive_messages(connection, final) is final
 
 
 @pytest.mark.parametrize(

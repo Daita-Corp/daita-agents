@@ -771,10 +771,9 @@ def _apply_security_profile(
         configured_paths is None
         or not isinstance(configured_paths[0], list)
         or len(configured_paths[0]) != len(descriptor_paths)
-        or any(
-            not isinstance(item, str)
-            or not item.startswith(("/dev/fd/", "/proc/self/fd/"))
-            for item in configured_paths[0]
+        or not all(isinstance(item, str) for item in configured_paths[0])
+        or not _allowed_paths_match_descriptors(
+            tuple(configured_paths[0]), descriptor_paths
         )
     ):
         raise _WorkerFailure(
@@ -890,6 +889,50 @@ def _apply_security_profile(
             "dependency_unavailable",
             "DuckDB did not retain the exact file-query path restrictions.",
         )
+
+
+def _allowed_path_matches_descriptor(
+    configured_path: str,
+    descriptor_path: str,
+) -> bool:
+    descriptor_roots = ("/dev/fd/", "/proc/self/fd/")
+    if not descriptor_path.startswith(descriptor_roots):
+        return False
+    if configured_path.startswith(descriptor_roots):
+        return True
+    descriptor_name = descriptor_path.rsplit("/", 1)[-1]
+    if not descriptor_name.isdecimal():
+        return False
+    try:
+        descriptor_facts = os.fstat(int(descriptor_name))
+        configured_facts = os.stat(configured_path)
+    except (OSError, ValueError):
+        return False
+    return (
+        stat.S_ISREG(descriptor_facts.st_mode)
+        and stat.S_ISREG(configured_facts.st_mode)
+        and int(configured_facts.st_dev) == int(descriptor_facts.st_dev)
+        and int(configured_facts.st_ino) == int(descriptor_facts.st_ino)
+    )
+
+
+def _allowed_paths_match_descriptors(
+    configured_paths: tuple[str, ...],
+    descriptor_paths: tuple[str, ...],
+) -> bool:
+    if len(configured_paths) != len(descriptor_paths) or len(
+        set(configured_paths)
+    ) != len(configured_paths):
+        return False
+    remaining = list(descriptor_paths)
+    for configured_path in configured_paths:
+        for index, descriptor_path in enumerate(remaining):
+            if _allowed_path_matches_descriptor(configured_path, descriptor_path):
+                del remaining[index]
+                break
+        else:
+            return False
+    return not remaining
 
 
 def _set(connection: Any, name: str, value: str) -> None:
@@ -1218,7 +1261,7 @@ def _receive_messages(
     while connection.poll(0):
         try:
             raw = connection.recv_bytes(maxlength=_MAX_RESPONSE_BYTES)
-        except EOFError:
+        except (EOFError, ConnectionResetError):
             break
         try:
             message = json.loads(raw)
