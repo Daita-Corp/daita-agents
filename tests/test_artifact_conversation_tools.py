@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.domains.data.export_capabilities as artifact_capabilities
 from daita import Agent, SQLiteSource
@@ -40,7 +44,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 
 
 def _ids():
@@ -157,100 +160,104 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     xlsx_id = "artifact-00000000000000000000000000000001"
     other_id = "artifact-00000000000000000000000000000002"
     csv_id = "artifact-00000000000000000000000000000003"
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="xlsx-export",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source.id,
-                    "sql": "SELECT label, number FROM records ORDER BY number",
-                    "format": "xlsx",
-                    "filename": "records.xlsx",
-                },
-            )
-        ),
-        _tools(
-            ToolCall(
-                id="xlsx-save",
-                name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                arguments={
-                    "artifact_id": xlsx_id,
-                    "destination_id": "default",
-                },
-            )
-        ),
-        _stop("saved workbook"),
-        _tools(
-            ToolCall(
-                id="other-document",
-                name=DOCUMENT_CREATE_TOOL_NAME,
-                arguments={
-                    "format": "txt",
-                    "filename": "other.txt",
-                    "content": "not part of the first conversation",
-                },
-            )
-        ),
-        _stop("created other artifact"),
-        _tools(ToolCall(id="list", name=ARTIFACT_LIST_TOOL_NAME, arguments={})),
-        _tools(
-            ToolCall(
-                id="read",
-                name=ARTIFACT_READ_TOOL_NAME,
-                arguments={"artifact_id": xlsx_id},
-            )
-        ),
-        _tools(
-            ToolCall(
-                id="convert",
-                name=ARTIFACT_CONVERT_TOOL_NAME,
-                arguments={
-                    "artifact_id": xlsx_id,
-                    "format": "csv",
-                    "filename": "records-converted.csv",
-                },
-            )
-        ),
-        _tools(
-            ToolCall(
-                id="csv-save",
-                name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                arguments={
-                    "artifact_id": csv_id,
-                    "destination_id": "default",
-                },
-            )
-        ),
-        _stop("converted and saved"),
-        _tools(
-            ToolCall(
-                id="cross-list",
-                name=ARTIFACT_LIST_TOOL_NAME,
-                arguments={},
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="xlsx-export",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source.id,
+                        "sql": "SELECT label, number FROM records ORDER BY number",
+                        "format": "xlsx",
+                        "filename": "records.xlsx",
+                    },
+                )
             ),
-            ToolCall(
-                id="cross-read",
-                name=ARTIFACT_READ_TOOL_NAME,
-                arguments={"artifact_id": xlsx_id},
+            _tools(
+                ToolCall(
+                    id="xlsx-save",
+                    name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+                    arguments={
+                        "artifact_id": xlsx_id,
+                        "mode": "create_new",
+                        "destination_id": "default",
+                    },
+                )
             ),
-        ),
-        _stop("read exact prior artifact"),
-        _tools(
-            ToolCall(
-                id="cross-convert",
-                name=ARTIFACT_CONVERT_TOOL_NAME,
-                arguments={"artifact_id": xlsx_id, "format": "csv"},
-            )
-        ),
-        _stop("conversion remained conversation scoped"),
+            _stop("saved workbook"),
+            _tools(
+                ToolCall(
+                    id="other-document",
+                    name=DOCUMENT_CREATE_TOOL_NAME,
+                    arguments={
+                        "format": "txt",
+                        "filename": "other.txt",
+                        "content": "not part of the first conversation",
+                    },
+                )
+            ),
+            _stop("created other artifact"),
+            _tools(ToolCall(id="list", name=ARTIFACT_LIST_TOOL_NAME, arguments={})),
+            _tools(
+                ToolCall(
+                    id="read",
+                    name=ARTIFACT_READ_TOOL_NAME,
+                    arguments={"artifact_id": xlsx_id},
+                )
+            ),
+            _tools(
+                ToolCall(
+                    id="convert",
+                    name=ARTIFACT_CONVERT_TOOL_NAME,
+                    arguments={
+                        "artifact_id": xlsx_id,
+                        "format": "csv",
+                        "filename": "records-converted.csv",
+                    },
+                )
+            ),
+            _tools(
+                ToolCall(
+                    id="csv-save",
+                    name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+                    arguments={
+                        "artifact_id": csv_id,
+                        "mode": "create_new",
+                        "destination_id": "default",
+                    },
+                )
+            ),
+            _stop("converted and saved"),
+            _tools(
+                ToolCall(
+                    id="cross-list",
+                    name=ARTIFACT_LIST_TOOL_NAME,
+                    arguments={},
+                ),
+                ToolCall(
+                    id="cross-read",
+                    name=ARTIFACT_READ_TOOL_NAME,
+                    arguments={"artifact_id": xlsx_id},
+                ),
+            ),
+            _stop("read exact prior artifact"),
+            _tools(
+                ToolCall(
+                    id="cross-convert",
+                    name=ARTIFACT_CONVERT_TOOL_NAME,
+                    arguments={"artifact_id": xlsx_id, "format": "csv"},
+                )
+            ),
+            _stop("conversion remained conversation scoped"),
+        )
     )
-    provider._cursor = 0
     try:
         first = await agent.run("Export the current records as XLSX.")
         assert first.artifacts[0].artifact_id == xlsx_id
@@ -348,8 +355,11 @@ async def test_exact_artifact_read_does_not_cross_agent_homes(tmp_path: Path) ->
         model=provider,
         model_profile=_profile(provider),
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
-    second = await Agent.create("artifact-agent-two", root=tmp_path)
+    second = await Agent.create(
+        "artifact-agent-two", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         created = await first.run("Create a private artifact.")
         artifact_id = created.artifacts[0].artifact_id
@@ -383,27 +393,29 @@ async def test_artifact_convert_rejects_non_xlsx_without_creating_a_child(
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     text_id = "artifact-00000000000000000000000000000001"
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="create",
-                name=DOCUMENT_CREATE_TOOL_NAME,
-                arguments={"format": "txt", "content": "hello"},
-            )
-        ),
-        _stop("created"),
-        _tools(
-            ToolCall(
-                id="convert",
-                name=ARTIFACT_CONVERT_TOOL_NAME,
-                arguments={"artifact_id": text_id, "format": "csv"},
-            )
-        ),
-        _stop("not converted"),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="create",
+                    name=DOCUMENT_CREATE_TOOL_NAME,
+                    arguments={"format": "txt", "content": "hello"},
+                )
+            ),
+            _stop("created"),
+            _tools(
+                ToolCall(
+                    id="convert",
+                    name=ARTIFACT_CONVERT_TOOL_NAME,
+                    arguments={"artifact_id": text_id, "format": "csv"},
+                )
+            ),
+            _stop("not converted"),
+        )
     )
-    provider._cursor = 0
     try:
         first = await agent.run("Create a text file.")
         second = await agent.run(
@@ -441,31 +453,33 @@ async def test_artifact_conversion_cancellation_leaves_no_child_or_staging(
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     xlsx_id = "artifact-00000000000000000000000000000001"
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="export",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source.id,
-                    "sql": "SELECT label FROM records",
-                    "format": "xlsx",
-                },
-            )
-        ),
-        _stop("created"),
-        _tools(
-            ToolCall(
-                id="convert",
-                name=ARTIFACT_CONVERT_TOOL_NAME,
-                arguments={"artifact_id": xlsx_id, "format": "csv"},
-            )
-        ),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="export",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source.id,
+                        "sql": "SELECT label FROM records",
+                        "format": "xlsx",
+                    },
+                )
+            ),
+            _stop("created"),
+            _tools(
+                ToolCall(
+                    id="convert",
+                    name=ARTIFACT_CONVERT_TOOL_NAME,
+                    arguments={"artifact_id": xlsx_id, "format": "csv"},
+                )
+            ),
+        )
     )
-    provider._cursor = 0
     started = threading.Event()
     release = threading.Event()
     original = artifact_capabilities.read_exact_xlsx_data

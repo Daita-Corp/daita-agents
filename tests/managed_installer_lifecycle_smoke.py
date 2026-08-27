@@ -173,6 +173,8 @@ def main() -> int:
         workspace = Path(temporary).resolve()
         home = workspace / "home"
         home.mkdir()
+        local_workspace = workspace / "local-workspace"
+        local_workspace.mkdir()
         managed_root = home / ".local" / "share" / "daita"
         agent_root = home / ".daita"
         outside = workspace / "outside-sentinel"
@@ -205,6 +207,8 @@ def main() -> int:
                 str(launcher),
                 "--root",
                 str(agent_root),
+                "--workspace",
+                str(local_workspace),
                 "create",
                 "preservation-agent",
             ],
@@ -219,13 +223,14 @@ from datetime import UTC, datetime
 from pathlib import Path
 import sys
 
-from daita import Agent
+from daita import Agent, LocalWorkspace
 from daita.adapters.models import SourceRegistration
 
 
 async def main():
     root = Path(sys.argv[1])
-    agent = await Agent.open("preservation-agent", root=root)
+    workspace = LocalWorkspace(Path(sys.argv[2]))
+    agent = await Agent.open("preservation-agent", root=root, workspace=workspace)
     source = SourceRegistration.build(
         agent_id=agent.id,
         adapter_id="postgresql",
@@ -255,6 +260,7 @@ asyncio.run(main())
                 "-c",
                 seed_write_admission,
                 str(agent_root),
+                str(local_workspace),
             ],
             env=environment,
         )
@@ -274,6 +280,8 @@ asyncio.run(main())
                 str(launcher),
                 "--root",
                 str(agent_root),
+                "--workspace",
+                str(local_workspace),
                 "sources",
                 "preservation-agent",
             ],
@@ -293,12 +301,14 @@ import asyncio
 from pathlib import Path
 import sys
 
-from daita import Agent
+from daita import Agent, LocalWorkspace
 from daita.adapters.models import source_registration_id
 
 
 async def main():
-    agent = await Agent.open("preservation-agent", root=Path(sys.argv[1]))
+    root = Path(sys.argv[1])
+    workspace = LocalWorkspace(Path(sys.argv[2]))
+    agent = await Agent.open("preservation-agent", root=root, workspace=workspace)
     sources = await agent.list_sources()
     admitted = [
         source
@@ -339,6 +349,7 @@ asyncio.run(main())
                 "-c",
                 inspect_write_admission,
                 str(agent_root),
+                str(local_workspace),
             ],
             env=environment,
         )

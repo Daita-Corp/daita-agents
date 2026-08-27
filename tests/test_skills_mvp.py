@@ -9,6 +9,10 @@ from pathlib import Path
 
 import pytest
 from _capability_runtime_support import execute_projected
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.skills.store as skill_module
 from daita import Agent, SQLiteSource
@@ -24,12 +28,10 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import (
     LoopLimits,
     RunInput,
     ToolBatchOutcome,
-    ToolProjectionMode,
 )
 from daita.skills import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
@@ -54,7 +56,7 @@ from daita.skills.capabilities import (
 from daita.storage.sqlite_migrations import migration_rows
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 def _profile(provider: MockModelProvider, *, context: int = 20_000) -> ModelProfile:
@@ -92,6 +94,8 @@ def _tool_results(request: ModelRequest) -> tuple[ToolResultBlock, ...]:
         if message.role is MessageRole.TOOL
         for block in message.content
         if isinstance(block, ToolResultBlock)
+        and block.output.get("kind")
+        not in {"toolbox_load_receipt", "toolbox_search_results"}
     )
 
 
@@ -104,7 +108,9 @@ def _error_code(block: ToolResultBlock) -> str:
 
 
 async def test_fresh_agent_empty_and_public_crud_survives_cold_reopen(tmp_path):
-    agent = await Agent.create("skills-crud", root=tmp_path)
+    agent = await Agent.create(
+        "skills-crud", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         assert await agent.list_skills() == ()
         assert await agent.read_skill("monthly-revenue") is None
@@ -138,7 +144,9 @@ async def test_fresh_agent_empty_and_public_crud_survives_cold_reopen(tmp_path):
     finally:
         await agent.close()
 
-    reopened = await Agent.open("skills-crud", root=tmp_path)
+    reopened = await Agent.open(
+        "skills-crud", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         assert await reopened.read_skill("monthly-revenue") == Skill(
             "monthly-revenue",
@@ -169,7 +177,9 @@ async def test_fresh_agent_empty_and_public_crud_survives_cold_reopen(tmp_path):
     ),
 )
 async def test_invalid_names_and_traversal_fail_without_creating_paths(tmp_path, name):
-    agent = await Agent.create("invalid-names", root=tmp_path)
+    agent = await Agent.create(
+        "invalid-names", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         with pytest.raises(SkillValidationError):
             await agent.save_skill(name, "description", "instructions")
@@ -203,7 +213,9 @@ async def test_invalid_names_and_traversal_fail_without_creating_paths(tmp_path,
 async def test_description_and_instruction_grammar_fails_closed(
     tmp_path, description, instructions
 ):
-    agent = await Agent.create("invalid-content", root=tmp_path)
+    agent = await Agent.create(
+        "invalid-content", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         with pytest.raises(SkillValidationError):
             await agent.save_skill("valid-name", description, instructions)
@@ -228,7 +240,9 @@ async def test_description_and_instruction_grammar_fails_closed(
     ),
 )
 async def test_malformed_on_disk_documents_fail_closed(tmp_path, document):
-    agent = await Agent.create("malformed", root=tmp_path)
+    agent = await Agent.create(
+        "malformed", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         path = agent.home / "skills/monthly-revenue"
         path.mkdir(parents=True)
@@ -245,7 +259,9 @@ async def test_malformed_on_disk_documents_fail_closed(tmp_path, document):
 
 
 async def test_invalid_utf8_fails_closed(tmp_path):
-    agent = await Agent.create("invalid-utf8-skill", root=tmp_path)
+    agent = await Agent.create(
+        "invalid-utf8-skill", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         path = agent.home / "skills/monthly-revenue"
         path.mkdir(parents=True)
@@ -257,7 +273,9 @@ async def test_invalid_utf8_fails_closed(tmp_path):
 
 
 async def test_symlinked_skills_root_fails_closed(tmp_path):
-    agent = await Agent.create("symlink-root", root=tmp_path)
+    agent = await Agent.create(
+        "symlink-root", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         outside = tmp_path / "outside-skills"
         outside.mkdir()
@@ -272,7 +290,9 @@ async def test_symlinked_skills_root_fails_closed(tmp_path):
 
 
 async def test_symlinked_skill_directory_fails_closed(tmp_path):
-    agent = await Agent.create("symlink-directory", root=tmp_path)
+    agent = await Agent.create(
+        "symlink-directory", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         outside = tmp_path / "outside-skill"
         outside.mkdir()
@@ -291,7 +311,9 @@ async def test_symlinked_skill_directory_fails_closed(tmp_path):
 async def test_owned_skill_files_reject_aliases_links_and_non_regular_types(
     tmp_path, kind
 ):
-    agent = await Agent.create(f"bad-skill-{kind}", root=tmp_path)
+    agent = await Agent.create(
+        f"bad-skill-{kind}", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         directory = agent.home / "skills/safe-name"
         directory.mkdir(parents=True)
@@ -319,7 +341,9 @@ async def test_owned_skill_files_reject_aliases_links_and_non_regular_types(
 
 
 async def test_unexpected_root_and_directory_types_fail_closed(tmp_path):
-    agent = await Agent.create("unexpected-paths", root=tmp_path)
+    agent = await Agent.create(
+        "unexpected-paths", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         root = agent.home / "skills"
         root.write_text("not a directory", encoding="utf-8")
@@ -356,7 +380,9 @@ async def test_fixed_home_containment_and_exact_layout(tmp_path):
 
 
 async def test_character_document_count_and_index_limits_are_atomic(tmp_path):
-    agent = await Agent.create("skill-limits", root=tmp_path)
+    agent = await Agent.create(
+        "skill-limits", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.save_skill("prior", "Prior", "prior body")
         with pytest.raises(SkillValidationError, match="240 character"):
@@ -384,7 +410,9 @@ async def test_character_document_count_and_index_limits_are_atomic(tmp_path):
 
 
 async def test_aggregate_index_character_overflow_preserves_all_prior_state(tmp_path):
-    agent = await Agent.create("index-characters", root=tmp_path)
+    agent = await Agent.create(
+        "index-characters", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         for index in range(16):
             assert await agent.save_skill(
@@ -405,7 +433,9 @@ async def test_aggregate_index_utf8_byte_overflow_is_independently_atomic(
     tmp_path, monkeypatch
 ):
     monkeypatch.setattr(skill_module, "SKILL_INDEX_MAX_CHARACTERS", 100_000)
-    agent = await Agent.create("index-bytes", root=tmp_path)
+    agent = await Agent.create(
+        "index-bytes", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         for index in range(16):
             await agent.save_skill(
@@ -425,7 +455,9 @@ async def test_aggregate_index_utf8_byte_overflow_is_independently_atomic(
 async def test_rendered_document_byte_limit_fails_before_partial_write(
     tmp_path, monkeypatch
 ):
-    agent = await Agent.create("rendered-limit", root=tmp_path)
+    agent = await Agent.create(
+        "rendered-limit", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.save_skill("prior", "Prior", "prior body")
         monkeypatch.setattr(skill_module, "SKILL_RENDERED_MAX_UTF8_BYTES", 40)
@@ -442,7 +474,9 @@ async def test_rendered_document_byte_limit_fails_before_partial_write(
 async def test_failed_atomic_replacement_preserves_prior_valid_skill(
     tmp_path, monkeypatch
 ):
-    agent = await Agent.create("replace-skill-failure", root=tmp_path)
+    agent = await Agent.create(
+        "replace-skill-failure", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.save_skill("safe-name", "Prior", "prior body")
 
@@ -484,6 +518,7 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         registry = agent._embedded._capabilities
@@ -503,17 +538,14 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
         assert resolved == capability
         await agent.run("What can you do?")
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
-            "artifact_convert",
-            "artifact_create_document",
             "artifact_list",
             "artifact_read",
-            "artifact_save_local",
-            "artifact_set_export_location",
+            "file_read",
+            "file_search",
             "job_list",
-            "memory_set",
-            "skill_delete",
-            "skill_save",
             SKILL_VIEW_TOOL_NAME,
+            "toolbox_load",
+            "toolbox_search",
         )
     finally:
         await agent.close()
@@ -540,6 +572,7 @@ async def test_progressive_view_returns_full_skill_but_initial_prompt_is_shallow
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.save_skill(
@@ -587,7 +620,11 @@ async def test_missing_invalid_and_malformed_skill_views_are_bounded_errors(tmp_
         )
     )
     agent = await Agent.create(
-        "skill-errors", root=tmp_path, model=provider, model_profile=_profile(provider)
+        "skill-errors",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Load skills")
@@ -606,6 +643,7 @@ async def test_missing_invalid_and_malformed_skill_views_are_bounded_errors(tmp_
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         directory = agent.home / "skills/broken"
@@ -625,6 +663,7 @@ async def test_missing_invalid_and_malformed_skill_views_are_bounded_errors(tmp_
             run,
             (ToolCall(id="bad", name="skill_view", arguments={"name": "broken"}),),
             projection=runtime.project(catalog, ()),
+            messages=(),
             sensitivity=ModelSensitivity.INTERNAL,
         )
         error = outcome.ordered_results[0].output["error"]
@@ -651,7 +690,11 @@ async def test_historical_skill_bodies_are_redacted_without_changing_storage(tmp
         )
     )
     agent = await Agent.create(
-        "skill-history", root=tmp_path, model=provider, model_profile=_profile(provider)
+        "skill-history",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.save_skill("procedure", "Procedure", instructions)
@@ -667,7 +710,9 @@ async def test_historical_skill_bodies_are_redacted_without_changing_storage(tmp
 
 
 async def test_save_delete_never_mutate_fixed_declarations(tmp_path):
-    agent = await Agent.create("fixed-declarations", root=tmp_path)
+    agent = await Agent.create(
+        "fixed-declarations", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         registry = agent._embedded._capabilities
         before = tuple(
@@ -708,6 +753,7 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.save_skill(
@@ -721,17 +767,14 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         result = await agent.run("Do not mutate anything")
         transcript = await agent.transcript(result.run_id)
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
-            "artifact_convert",
-            "artifact_create_document",
             "artifact_list",
             "artifact_read",
-            "artifact_save_local",
-            "artifact_set_export_location",
+            "file_read",
+            "file_search",
             "job_list",
-            "memory_set",
-            "skill_delete",
-            "skill_save",
             "skill_view",
+            "toolbox_load",
+            "toolbox_search",
         )
         write_result = next(
             block
@@ -754,6 +797,7 @@ async def test_prompt_has_skill_specific_trust_and_authority_labels(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.save_skill(
@@ -789,7 +833,9 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE facts (value INTEGER)")
         connection.execute("INSERT INTO facts VALUES (1)")
-    agent = await Agent.create("parallel-skills", root=tmp_path)
+    agent = await Agent.create(
+        "parallel-skills", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.save_skill("procedure", "Procedure", "Body")
         await agent.attach(SQLiteSource(database))
@@ -802,6 +848,7 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         loop = agent._embedded._loop
@@ -873,6 +920,7 @@ async def test_direct_operations_emit_no_model_calls_or_observer_events(tmp_path
         model=provider,
         model_profile=_profile(provider),
         observer=events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.save_skill("procedure", "Procedure", "Body")
@@ -920,8 +968,8 @@ async def test_custom_context_builder_remains_unwrapped(tmp_path):
             del messages
             return catalog
 
-        async def execute_all(self, run, calls, *, projection, sensitivity):
-            del run, projection, sensitivity
+        async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+            del run, projection, messages, sensitivity
             assert calls == ()
             return ToolBatchOutcome(())
 
@@ -936,6 +984,7 @@ async def test_custom_context_builder_remains_unwrapped(tmp_path):
             model_profile=_profile(provider),
             context_builder=context,
             tools=tools,
+            workspace=workspace_for(tmp_path),
         )
     )
     try:
@@ -955,6 +1004,7 @@ async def test_skill_index_is_mandatory_for_default_request_budget(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider, context=5_000),
+        workspace=workspace_for(tmp_path),
     )
     try:
         for index in range(12):
@@ -967,7 +1017,9 @@ async def test_skill_index_is_mandatory_for_default_request_budget(tmp_path):
 
 
 async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
-    agent = await Agent.create("skill-files-only", root=tmp_path)
+    agent = await Agent.create(
+        "skill-files-only", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.save_skill("procedure", "Procedure", "Body")
         assert await agent.list_sources() == ()

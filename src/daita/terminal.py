@@ -10,6 +10,7 @@ from typing import Any
 from ._installation import repair_guidance
 from .security import KeychainStore
 from .tui.models import validate_candidate_review_cost_limit
+from .workspace import LocalWorkspace
 
 
 def _load_textual_app() -> Callable[..., Any]:
@@ -28,6 +29,7 @@ def _load_textual_app() -> Callable[..., Any]:
 async def run_terminal_application(
     *,
     root: str | Path | None = None,
+    workspace: LocalWorkspace,
     agent_name: str | None = None,
     reviewer_max_estimated_cost_usd: Decimal | None = None,
     keychain: KeychainStore | None = None,
@@ -46,6 +48,7 @@ async def run_terminal_application(
     run_app = _load_textual_app()
     return await run_app(
         root=root,
+        workspace=workspace,
         agent_name=agent_name,
         keychain=keychain,
         model_validator=model_validator,

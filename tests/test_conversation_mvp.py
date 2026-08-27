@@ -6,11 +6,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from _capability_runtime_support import context_step_projection, context_tool_catalog
+from _capability_runtime_support import ContextToolProjectionAdapter
+from _workspace_support import workspace_for
 
 import daita
 from daita import Agent
-from daita._json import FrozenJsonObject, canonical_json
+from daita._json import canonical_json
 from daita.domains.data.context import (
     _HISTORY_OMISSION_MARKER,
     _MAXIMUM_PRIOR_UTF8_BYTES,
@@ -63,7 +64,8 @@ async def _prepared_request(
         for index, message in enumerate(messages)
         if message.role is MessageRole.USER
     )
-    catalog = context_tool_catalog(run, tools)
+    projection = ContextToolProjectionAdapter(tools)
+    catalog = await projection.prepare_run(run)
     snapshot = await builder.prepare(
         run,
         messages[: current_start + 1],
@@ -73,7 +75,7 @@ async def _prepared_request(
         snapshot,
         messages[current_start:],
         step=step,
-        tool_context=context_step_projection(catalog),
+        tool_context=projection.project(catalog, messages[current_start:]),
         final=final,
     )
 
@@ -85,7 +87,7 @@ def test_context_builder_exposes_only_fixed_absolute_history_bounds():
 class TranscriptContext:
     async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tool_context.provider_definitions
+        return messages[:-1], tool_context.initial_provider_definitions
 
     def project(
         self,
@@ -106,23 +108,24 @@ class TranscriptContext:
 
 
 class NoTools:
+    def __init__(self) -> None:
+        self._projection = ContextToolProjectionAdapter(())
+
     async def prepare_run(self, run):
-        return context_tool_catalog(run, ())
+        return await self._projection.prepare_run(run)
 
     def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+        return self._projection.project(catalog, messages)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         assert calls == ()
         return ToolBatchOutcome(())
 
 
 class ReplayTools:
-    async def prepare_run(self, run):
-        return context_tool_catalog(
-            run,
+    def __init__(self) -> None:
+        self._projection = ContextToolProjectionAdapter(
             tuple(
                 ToolDefinition(
                     name=name,
@@ -130,15 +133,17 @@ class ReplayTools:
                     input_schema={"type": "object"},
                 )
                 for name in ("memory_set", "skill_save", "skill_delete", "skill_view")
-            ),
+            )
         )
 
-    def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+    async def prepare_run(self, run):
+        return await self._projection.prepare_run(run)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    def project(self, catalog, messages):
+        return self._projection.project(catalog, messages)
+
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         return ToolBatchOutcome(
             tuple(
                 ToolResultBlock(
@@ -170,25 +175,24 @@ class ReplayTools:
 class FreshQueryTools:
     def __init__(self):
         self.calls = []
-
-    async def prepare_run(self, run):
-        return context_tool_catalog(
-            run,
+        self._projection = ContextToolProjectionAdapter(
             (
                 ToolDefinition(
                     name="data_query_postgresql",
                     description="Run a fresh read-only PostgreSQL query.",
                     input_schema={"type": "object"},
                 ),
-            ),
+            )
         )
 
-    def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+    async def prepare_run(self, run):
+        return await self._projection.prepare_run(run)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    def project(self, catalog, messages):
+        return self._projection.project(catalog, messages)
+
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         self.calls.extend(calls)
         return ToolBatchOutcome(
             tuple(
@@ -531,6 +535,7 @@ async def test_conversation_identity_is_agent_scoped(tmp_path):
         root=tmp_path,
         model=first_provider,
         model_profile=_profile(first_provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await first_agent.run("first agent sentinel")
@@ -543,6 +548,7 @@ async def test_conversation_identity_is_agent_scoped(tmp_path):
         root=tmp_path,
         model=second_provider,
         model_profile=_profile(second_provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         with pytest.raises(ValueError):
@@ -562,6 +568,7 @@ async def test_follow_up_uses_history_without_copying_it_into_new_transcript(tmp
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.run("first user sentinel")
@@ -642,6 +649,7 @@ async def test_public_conversation_continuation_survives_cold_reopen(tmp_path):
         root=tmp_path,
         model=first_provider,
         model_profile=_profile(first_provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await first_agent.run("cold first sentinel")
@@ -655,6 +663,7 @@ async def test_public_conversation_continuation_survives_cold_reopen(tmp_path):
         root=tmp_path,
         model=second_provider,
         model_profile=_profile(second_provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         follow_up = await reopened.run(
@@ -684,6 +693,7 @@ async def test_only_completed_runs_are_eligible_for_follow_up_history(tmp_path):
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.run("eligible completed user")
@@ -714,6 +724,7 @@ async def test_public_ids_validate_and_omitted_ids_start_distinct_conversations(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.run("first")
@@ -757,6 +768,7 @@ async def test_historical_tools_are_rewritten_redacted_and_provider_neutral(
             model_profile=_profile(provider),
             tools=ReplayTools(),
             context_builder=TranscriptContext(),
+            workspace=workspace_for(tmp_path),
         )
     )
     try:
@@ -1074,8 +1086,8 @@ def test_compact_history_fails_closed_and_omits_approval_and_side_effects():
 def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
     file_call = ToolCall(
         id="file-call",
-        name="data_read_file",
-        arguments={"source_id": "files", "resource_id": "customers.csv"},
+        name="file_read",
+        arguments={"path": "customers.csv"},
     )
     query_call = ToolCall(
         id="query-error-call",
@@ -1100,32 +1112,20 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
                 ToolResultBlock(
                     call_id=file_call.id,
                     output={
-                        "kind": "data.file.read_result",
+                        "kind": "data.local_file.read_result",
                         "data": {
-                            "source_id": "files",
-                            "source_revision": "manifest:history",
-                            "resource_id": "customers.csv",
-                            "resource_revision": "sha256:" + ("c" * 64),
-                            "freshness": {"observed_at": "2026-07-20T00:00:00Z"},
-                            "format": "csv",
+                            "path": "customers.csv",
+                            "binding": "expired-binding-authority",
+                            "media_type": "text/csv",
                             "encoding": "utf-8",
-                            "columns": ["customer_id", "region"],
+                            "content": "raw-file-row-" + ("x" * 10_000),
+                            "start_offset": 0,
+                            "end_offset": 10_000,
+                            "cursor": None,
                             "complete": True,
-                            "rows": [
-                                {
-                                    "customer_id": index,
-                                    "region": "raw-file-row-" + ("x" * 1_000),
-                                }
-                                for index in range(10)
-                            ],
-                            "total_rows": 10,
-                            "returned_rows": 10,
-                            "row_limit": 100,
-                            "byte_limit": 65_536,
-                            "utf8_bytes": 12_000,
-                            "truncated": False,
-                            "truncation_reasons": [],
-                            "trust_classification": "untrusted_external_data",
+                            "physical_revision": "stat:history",
+                            "content_sha256": "sha256:" + ("c" * 64),
+                            "limitations": [],
                         },
                     },
                 ),
@@ -1167,7 +1167,7 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
         if isinstance(block, ToolResultBlock)
     ]
     assert [call.name for call in calls] == [
-        "data_read_file",
+        "file_read",
         "data_query_sqlite",
     ]
     assert [result.call_id for result in results] == [call.id for call in calls]
@@ -1176,13 +1176,12 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
     assert file_receipt["state"] == "success"
     file_data = file_receipt["data"]
     assert isinstance(file_data, Mapping)
-    assert file_data["resource_id"] == "customers.csv"
-    assert file_data["freshness"] == FrozenJsonObject.from_mapping(
-        {"observed_at": "2026-07-20T00:00:00Z"}
-    )
-    assert file_data["columns"] == ("customer_id", "region")
-    assert file_data["total_rows"] == 10
-    assert "rows" not in file_data
+    assert file_data["path"] == "customers.csv"
+    assert file_data["media_type"] == "text/csv"
+    assert file_data["complete"] is True
+    assert "content" not in file_data
+    assert "binding" not in file_data
+    assert "cursor" not in file_data
     error_receipt = results[1].output
     assert error_receipt["kind"] == "data.sqlite.query_result"
     assert error_receipt["state"] == "error"
@@ -1517,6 +1516,7 @@ async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_pa
         root=tmp_path,
         model=provider,
         model_profile=tiny_profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         failed = await agent.run("overflow sentinel " + ("x" * 80_000))
@@ -1534,6 +1534,7 @@ async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_pa
         root=tmp_path,
         model=resumed_provider,
         model_profile=_profile(resumed_provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await reopened.run("clean follow-up", conversation_id=failed.conversation_id)
@@ -1549,6 +1550,7 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
         root=tmp_path,
         model=initial_provider,
         model_profile=_profile(initial_provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.run("valid completed user")
@@ -1624,6 +1626,7 @@ async def test_inspection_keeps_nonreplayable_runs_but_history_excludes_them(tmp
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await reopened.run(

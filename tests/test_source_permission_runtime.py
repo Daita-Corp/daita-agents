@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 from _capability_runtime_support import execute_projected
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject
@@ -54,7 +55,11 @@ async def _agent_with_scope(
 ) -> tuple[Agent, Path, str, dict[str, CatalogResource]]:
     database = tmp_path / f"{mode.value}.sqlite"
     _database(database)
-    agent = await Agent.create(f"permission-runtime-{mode.value}", root=tmp_path)
+    agent = await Agent.create(
+        f"permission-runtime-{mode.value}",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     registration = await agent.attach(SQLiteSource(database))
     resources = {
         resource.name: resource

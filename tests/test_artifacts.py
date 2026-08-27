@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from _capability_runtime_support import context_step_projection, context_tool_catalog
+from _capability_runtime_support import ContextToolProjectionAdapter
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.artifacts.store as store_module
 import daita.capabilities as capabilities_module
@@ -39,7 +43,6 @@ from daita.llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop import AgentLoop, InMemoryTranscriptStore, ToolBatchOutcome
 from daita.loop.models import LoopExitKind, RunInput
 
@@ -320,7 +323,7 @@ async def test_artifact_draft_bytes_never_enter_tool_result_transcript_exit_or_j
     assert (await store.read(ref.artifact_id)).content == secret
 
 
-async def test_pre_lineage_artifact_reference_is_admitted_and_reserialized_canonically(
+async def test_unreleased_pre_lineage_artifact_reference_is_rejected_exactly(
     tmp_path: Path,
 ) -> None:
     store, _ = await _store(tmp_path)
@@ -355,13 +358,9 @@ async def test_pre_lineage_artifact_reference_is_admitted_and_reserialized_canon
         clock=lambda: NOW,
         id_factory=_artifact_ids(),
     )
-    assert reopened.available
-    payload = await reopened.read(ref.artifact_id)
-    assert payload.content == b"# Result\n"
-    assert payload.ref.provenance.derived_from_artifact_id is None
-    canonical = artifact_ref_to_mapping(payload.ref)
-    canonical_provenance = cast(dict[str, object], canonical["provenance"])
-    assert canonical_provenance["derived_from_artifact_id"] is None
+    assert not reopened.available
+    with pytest.raises(ValueError, match="invalid shape"):
+        artifact_ref_from_mapping(serialized)
 
     invalid = dict(serialized)
     invalid["provenance"] = {**provenance, "unexpected": True}
@@ -595,6 +594,7 @@ async def test_clear_conversations_removes_internal_artifacts_but_preserves_deli
         model_profile=_profile(provider),
         id_factory=_agent_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.set_export_destination(export)
@@ -625,6 +625,7 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
         model_profile=_profile(provider),
         id_factory=_agent_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Create a TXT file.")
@@ -657,7 +658,7 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
 class _LoopContext:
     async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tool_context.provider_definitions
+        return messages[:-1], tool_context.initial_provider_definitions
 
     def project(
         self,
@@ -680,25 +681,24 @@ class _LoopContext:
 class _LoopTools:
     def __init__(self, results: dict[str, ToolResultBlock]) -> None:
         self.results = results
-
-    async def prepare_run(self, run):
-        return context_tool_catalog(
-            run,
+        self._projection = ContextToolProjectionAdapter(
             (
                 ToolDefinition(
                     name="artifact",
                     description="artifact test",
                     input_schema={"type": "object", "properties": {}},
                 ),
-            ),
+            )
         )
 
-    def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+    async def prepare_run(self, run):
+        return await self._projection.prepare_run(run)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    def project(self, catalog, messages):
+        return self._projection.project(catalog, messages)
+
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         return ToolBatchOutcome(tuple(self.results[call.id] for call in calls))
 
 

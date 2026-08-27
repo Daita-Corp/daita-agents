@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.hosting.embedded as embedded
 from daita import Agent
@@ -276,6 +277,7 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
         root=tmp_path,
         keychain=keychain,
         model_validator=validator,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.configure_model(
@@ -301,6 +303,7 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
             "postgresql-fixture",
             root=tmp_path,
             keychain=keychain,
+            workspace=workspace_for(tmp_path),
         )
         result = await agent.run(
             "Which region has the most paid revenue and gross margin?"
@@ -517,6 +520,7 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
         "postgresql-fixture",
         root=tmp_path,
         keychain=keychain,
+        workspace=workspace_for(tmp_path),
     )
     try:
         sources = await reopened.list_sources()

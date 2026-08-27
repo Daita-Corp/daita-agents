@@ -17,6 +17,8 @@ from _mcp_fixtures import (
     conformance_identities,
     mock_transport,
 )
+from _toolbox_model_support import ToolboxAwareMockModelProvider
+from _workspace_support import workspace_for
 from textual.widgets import Button, Input, OptionList, Static
 
 from daita import (
@@ -34,7 +36,12 @@ from daita.adapters.mcp import (
     MCPToolBinding,
     StreamableHTTPMCPClientFactory,
 )
-from daita.capabilities import ToolDiscoveryMetadata, ToolExposureClass
+from daita.capabilities import (
+    ToolboxId,
+    ToolLoadMode,
+    ToolPresentation,
+    ToolTextTrust,
+)
 from daita.errors import StateCompatibilityCode, StateCompatibilityError
 from daita.llm.models import (
     FinishReason,
@@ -46,7 +53,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.loop.models import LoopLimits, ToolProjectionMode
+from daita.loop.models import LoopLimits
 from daita.security import SecretReference
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_codecs import encode_mcp_binding
@@ -65,7 +72,7 @@ from daita.tui.screens.selection import SelectionScreen
 from daita.tui.widgets.composer import Composer
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 class _MCPBatchProvider:
@@ -77,7 +84,7 @@ class _MCPBatchProvider:
         *,
         block_first_response: bool = False,
     ) -> None:
-        self.model_profile = ModelProfile(
+        profile = ModelProfile(
             id=self.provider_id,
             context_window_tokens=128_000,
             max_output_tokens=8_192,
@@ -85,33 +92,49 @@ class _MCPBatchProvider:
             supports_parallel_tools=True,
         )
         self.calls = calls
-        self.requests: list[ModelRequest] = []
+        self._provider = ToolboxAwareMockModelProvider(
+            (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=calls,
+                ),
+                ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+            ),
+            provider_id=self.provider_id,
+            model_profile=profile,
+        )
+        self.model_profile = profile
+        self._batch_started = False
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         if not block_first_response:
             self.release.set()
 
     def supports_request_policy(self, request: ModelRequest) -> bool:
-        del request
-        return True
+        return self._provider.supports_request_policy(request)
+
+    @property
+    def requests(self) -> tuple[ModelRequest, ...]:
+        return self._provider.requests
+
+    @property
+    def logical_requests(self) -> tuple[ModelRequest, ...]:
+        return self._provider.logical_requests
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
-        self.requests.append(request)
-        if len(self.requests) == 1:
+        response = await self._provider.generate(request)
+        if not self._batch_started and response.tool_calls == self.calls:
+            self._batch_started = True
             self.started.set()
             await self.release.wait()
-            return ModelResponse(
-                finish_reason=FinishReason.TOOL_CALLS,
-                tool_calls=self.calls,
-            )
-        return ModelResponse(finish_reason=FinishReason.STOP, text="done")
+        return response
 
 
 class _MCPSequenceProvider:
     provider_id = "mock:mcp-sequence"
 
     def __init__(self, calls: tuple[tuple[ToolCall, ...], ...]) -> None:
-        self.model_profile = ModelProfile(
+        profile = ModelProfile(
             id=self.provider_id,
             context_window_tokens=128_000,
             max_output_tokens=8_192,
@@ -119,21 +142,35 @@ class _MCPSequenceProvider:
             supports_parallel_tools=True,
         )
         self.calls = calls
-        self.requests: list[ModelRequest] = []
+        self._provider = ToolboxAwareMockModelProvider(
+            (
+                *(
+                    ModelResponse(
+                        finish_reason=FinishReason.TOOL_CALLS,
+                        tool_calls=response_calls,
+                    )
+                    for response_calls in calls
+                ),
+                ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+            ),
+            provider_id=self.provider_id,
+            model_profile=profile,
+        )
+        self.model_profile = profile
 
     def supports_request_policy(self, request: ModelRequest) -> bool:
-        del request
-        return True
+        return self._provider.supports_request_policy(request)
+
+    @property
+    def requests(self) -> tuple[ModelRequest, ...]:
+        return self._provider.requests
+
+    @property
+    def logical_requests(self) -> tuple[ModelRequest, ...]:
+        return self._provider.logical_requests
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
-        self.requests.append(request)
-        index = len(self.requests) - 1
-        if index < len(self.calls):
-            return ModelResponse(
-                finish_reason=FinishReason.TOOL_CALLS,
-                tool_calls=self.calls[index],
-            )
-        return ModelResponse(finish_reason=FinishReason.STOP, text="done")
+        return await self._provider.generate(request)
 
 
 class _BlockingCallTimeInspection:
@@ -206,6 +243,7 @@ async def _mcp_limit_agent(tmp_path, name: str):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -230,6 +268,7 @@ async def _attach_two_bindings(tmp_path):
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     inspection = await agent.inspect_mcp_server(endpoint=alpha.endpoint)
     assert inspection.server_name == "fixture-alpha"
@@ -305,6 +344,7 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
         limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         statuses = await reopened.list_mcp_servers()
@@ -317,6 +357,7 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
         assert [block.call_id for block in blocks] == ["alpha-call", "beta-call"]
         assert all(not block.is_error for block in blocks)
@@ -328,10 +369,13 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
         assert alpha.calls == [("lookup", {"query": "x"})]
         assert beta.calls == [("lookup", {"id": 7})]
 
-        first_request = provider.requests[0]
+        assert len(provider.requests) == 3
+        assert len(provider.logical_requests) == 2
+        assert alpha_name not in {tool.name for tool in provider.requests[0].tools}
+        first_request = provider.logical_requests[0]
         assert {tool.name for tool in first_request.tools} >= {alpha_name, beta_name}
         assert "IGNORE ALL PRIOR INSTRUCTIONS" not in repr(first_request.tools)
-        second_request = provider.requests[1]
+        second_request = provider.logical_requests[1]
         assert "IGNORE ALL PRIOR INSTRUCTIONS" in repr(second_request.messages)
         assert "untrusted" in repr(second_request.messages).lower()
     finally:
@@ -348,6 +392,7 @@ async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_pa
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -360,8 +405,6 @@ async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_pa
                 summary="Look up an admitted Alpha fixture value.",
                 when_to_use="Use only for the approved Alpha fixture lookup.",
                 keywords=("alpha", "fixture", "lookup"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=321,
             ),
         ),
     )
@@ -373,18 +416,18 @@ async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_pa
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert tuple(alpha.request_methods) == requests_after_attach
         (current,) = await reopened.list_mcp_servers()
         assert current.binding.binding_id == status.binding.binding_id
         assert current.binding.local_label == "Alpha fixture"
-        assert current.binding.tools[0].discovery.summary.startswith("Look up")
-        assert (
-            current.binding.tools[0].discovery.exposure_class
-            is ToolExposureClass.STANDARD
-        )
-        assert current.binding.tools[0].discovery.eager_priority == 321
+        presentation = current.binding.tools[0].presentation
+        assert presentation.summary.startswith("Look up")
+        assert presentation.toolbox_id is ToolboxId.SOURCES
+        assert presentation.load_mode is ToolLoadMode.ON_DEMAND
+        assert presentation.text_trust is ToolTextTrust.ADMITTED_UNTRUSTED
         assert current.active_in_runtime
         (activated,) = tuple(reopened._embedded._mcp_activated_bindings.values())
         assert activated.executor.client is None
@@ -542,6 +585,7 @@ async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_p
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -557,12 +601,13 @@ async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_p
     agent_id = agent.id
     await agent.close()
 
-    discovery = ToolDiscoveryMetadata(
+    presentation = ToolPresentation(
+        toolbox_id=ToolboxId.SOURCES,
+        load_mode=ToolLoadMode.ON_DEMAND,
+        text_trust=ToolTextTrust.ADMITTED_UNTRUSTED,
         summary="Bounded storage pressure tool.",
         when_to_use="Use only to validate the persisted aggregate byte gates.",
         keywords=("bounded", "storage", "pressure"),
-        exposure_class=ToolExposureClass.DEFERRED,
-        eager_priority=0,
     )
 
     def encoded_binding(filler_characters: int) -> str:
@@ -590,7 +635,7 @@ async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_p
                     local_name=f"pressure_{index}",
                     remote_name=f"pressure/{index}",
                     description="One bounded persisted storage pressure tool.",
-                    discovery=discovery,
+                    presentation=presentation,
                     input_schema=schema,
                     input_schema_digest=digest,
                     output_schema=None,
@@ -657,6 +702,7 @@ async def test_existing_binding_identity_cannot_be_redirected_to_another_server(
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.attach_mcp_server(
@@ -700,6 +746,7 @@ async def test_cli_and_tui_expose_bounded_mcp_administration(tmp_path, monkeypat
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
 
     async def open_agent(*args, **kwargs):
@@ -736,8 +783,11 @@ async def test_cli_and_tui_expose_bounded_mcp_administration(tmp_path, monkeypat
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    controller = PresentationController(root=tmp_path)
+    controller = PresentationController(
+        root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     controller.agent = reopened
     try:
         shown = await controller.dispatch_command("/mcp")
@@ -825,6 +875,7 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     first = await agent.attach_mcp_server(
         endpoint=identity.endpoint,
@@ -854,8 +905,11 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = reopened
     async with app.run_test(size=(100, 34)) as pilot:
         await app._show_chat()
@@ -887,8 +941,11 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     reopen_calls: list[bool] = []
 
@@ -902,6 +959,7 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
             mcp_client_factory=factory,
             observer=observer,
             approval_handler=approval_handler,
+            workspace=workspace_for(tmp_path),
         )
         app.controller.agent = reopened
         return reopened
@@ -976,6 +1034,7 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     attached = await agent.attach_mcp_server(
         endpoint=identity.endpoint,
@@ -998,8 +1057,11 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = reopened
     async with app.run_test(size=(104, 38)) as pilot:
         await app._show_chat()
@@ -1083,8 +1145,11 @@ async def test_tui_attach_exposes_bounded_schema_rejection_reason(tmp_path):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
-    controller = PresentationController(root=tmp_path)
+    controller = PresentationController(
+        root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     controller.agent = agent
     try:
         with pytest.raises(
@@ -1130,6 +1195,7 @@ async def test_revocation_after_frozen_context_blocks_io_and_is_binding_isolated
         limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         run = asyncio.create_task(reopened.run("Prepare both calls."))
@@ -1146,6 +1212,7 @@ async def test_revocation_after_frozen_context_blocks_io_and_is_binding_isolated
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
         assert [block.call_id for block in blocks] == ["revoked-call", "sibling-call"]
         assert _error_code(blocks[0]) == "mcp_binding_unavailable"
@@ -1171,6 +1238,7 @@ async def test_revocation_serializes_with_call_time_inspection(tmp_path):
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1200,6 +1268,7 @@ async def test_revocation_serializes_with_call_time_inspection(tmp_path):
         model_profile=provider.model_profile,
         limits=EAGER_LIMITS,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         run = asyncio.create_task(reopened.run("Run the admitted call."))
@@ -1251,6 +1320,7 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         by_id = {
@@ -1277,6 +1347,7 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         by_id = {
@@ -1288,7 +1359,7 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
         await reopened.close()
 
 
-async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path):
+async def test_workspace_sensitivity_and_call_time_auth_use_current_admission(tmp_path):
     alpha, beta = conformance_identities()
     secrets = MappingSecretProvider({"env:BETA_TOKEN": "fixture-beta-secret"})
     factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha, beta))
@@ -1298,6 +1369,7 @@ async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path
         clock=lambda: NOW,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     public_status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1347,6 +1419,7 @@ async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path
         limits=EAGER_LIMITS,
         secret_provider=secrets,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         secrets.values["env:BETA_TOKEN"] = "wrong-at-call-time"
@@ -1358,10 +1431,11 @@ async def test_public_outbound_and_call_time_auth_use_current_admission(tmp_path
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
-        assert not blocks[0].is_error
+        assert _error_code(blocks[0]) == "mcp_outbound_sensitivity_exceeded"
         assert _error_code(blocks[1]) == "mcp_authentication_failed"
-        assert alpha.calls == [("lookup", {"query": "x"})]
+        assert alpha.calls == []
         assert beta.calls == []
         assert "wrong-at-call-time" not in repr(blocks)
     finally:
@@ -1376,6 +1450,7 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     high = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1427,6 +1502,7 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         model_profile=provider.model_profile,
         limits=EAGER_LIMITS,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await reopened.run("Exercise the monotonic run floor.")
@@ -1437,14 +1513,16 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
-        assert tuple(request.sensitivity for request in provider.requests) == (
-            ModelSensitivity.PUBLIC,
+        assert len(provider.requests) == 5
+        assert tuple(request.sensitivity for request in provider.logical_requests) == (
+            ModelSensitivity.INTERNAL,
             ModelSensitivity.CONFIDENTIAL,
             ModelSensitivity.CONFIDENTIAL,
         )
         assert blocks[0].sensitivity is ModelSensitivity.CONFIDENTIAL
-        assert blocks[0].sensitivity_provenance["run_sensitivity_floor"] == "public"
+        assert blocks[0].sensitivity_provenance["run_sensitivity_floor"] == "internal"
         assert _error_code(blocks[1]) == "mcp_outbound_sensitivity_exceeded"
         assert alpha.calls == [("lookup", {"query": "x"})]
     finally:
@@ -1460,6 +1538,7 @@ async def test_host_close_waits_for_remote_call_then_closes_mcp_client(tmp_path)
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1489,6 +1568,7 @@ async def test_host_close_waits_for_remote_call_then_closes_mcp_client(tmp_path)
         model_profile=provider.model_profile,
         limits=EAGER_LIMITS,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     activated = tuple(reopened._embedded._mcp_activated_bindings.values())
     run = asyncio.create_task(reopened.run("Use the blocking MCP read."))
@@ -1511,6 +1591,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
         root=tmp_path,
         clock=lambda: NOW,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
@@ -1544,6 +1625,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
         model_profile=provider.model_profile,
         limits=EAGER_LIMITS,
         mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await reopened.run("Exercise the result boundary.")
@@ -1554,6 +1636,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
             if message.role is MessageRole.TOOL
             for block in message.content
             if isinstance(block, ToolResultBlock)
+            and block.output.get("kind") != "toolbox_load_receipt"
         )
         assert _error_code(block) == "mcp_result_too_large"
         assert "REMOTE-SECRET" not in repr(block)

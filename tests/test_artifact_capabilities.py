@@ -8,9 +8,13 @@ from typing import cast
 
 import pytest
 from _capability_runtime_support import (
-    context_step_projection,
-    context_tool_catalog,
+    ContextToolProjectionAdapter,
+    execute_projected,
 )
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
@@ -18,6 +22,7 @@ from daita._json import FrozenJsonObject
 from daita.domains.data.context import DataContextBuilder
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
+    ARTIFACT_EDIT_TEXT_TOOL_NAME,
     ARTIFACT_LIST_TOOL_NAME,
     ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
@@ -38,7 +43,6 @@ from daita.llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import RunInput
 
 
@@ -50,13 +54,14 @@ async def _prepared_request(
     *,
     step: int,
 ) -> ModelRequest:
-    catalog = context_tool_catalog(run, tools)
+    projection = ContextToolProjectionAdapter(tools)
+    catalog = await projection.prepare_run(run)
     snapshot = await builder.prepare(run, messages, catalog)
     return builder.project(
         snapshot,
         messages,
         step=step,
-        tool_context=context_step_projection(catalog),
+        tool_context=projection.project(catalog, messages),
     )
 
 
@@ -163,6 +168,10 @@ def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite()
                 "type": "string",
                 "pattern": "^artifact-[0-9a-f]{32}$",
             },
+            "mode": {
+                "type": "string",
+                "enum": ["create_new", "replace_bound_file"],
+            },
             "destination_id": {
                 "type": "string",
                 "minLength": 1,
@@ -170,16 +179,37 @@ def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite()
             },
             "filename": {"type": "string", "minLength": 1, "maxLength": 120},
         },
-        "required": ["artifact_id", "destination_id"],
+        "required": ["artifact_id", "mode"],
         "additionalProperties": False,
     }
     properties = schema["properties"]
     assert isinstance(properties, FrozenJsonObject)
     assert set(properties) == {
         "artifact_id",
+        "mode",
         "destination_id",
         "filename",
     }
+
+
+def test_artifact_edit_binding_contract_requires_verbatim_opaque_reuse() -> None:
+    declarations = artifact_capability_declarations(include_local_edit=True)
+    view = next(
+        item
+        for item in declarations.tool_views
+        if item.name == ARTIFACT_EDIT_TEXT_TOOL_NAME
+    )
+    capability = next(
+        item for item in declarations.capabilities if item.id == view.capability_id
+    )
+    properties = capability.input_schema.get("properties")
+    assert isinstance(properties, Mapping)
+    binding = properties.get("binding")
+    assert isinstance(binding, Mapping)
+    contract = f"{capability.description} {binding.get('description')}".casefold()
+    assert "verbatim" in contract
+    assert "opaque" in contract
+    assert "never be decoded" in contract
 
 
 def test_artifact_set_export_location_schema_accepts_only_one_destination_id() -> None:
@@ -221,6 +251,7 @@ async def test_artifact_save_local_uses_only_committed_current_agent_artifact(
         model_profile=_profile(first_provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         foreign_id = (await first.run("Create a file.")).artifacts[0].artifact_id
@@ -232,6 +263,7 @@ async def test_artifact_save_local_uses_only_committed_current_agent_artifact(
         "artifact-owner-two",
         root=tmp_path,
         downloads_directory=second_downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         with pytest.raises(ArtifactError) as failure:
@@ -257,13 +289,21 @@ async def test_system_and_persistent_save_preflight_are_preauthorized_for_explic
             _call(
                 "save-system",
                 ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                {"artifact_id": artifact_id, "destination_id": "default"},
+                {
+                    "artifact_id": artifact_id,
+                    "mode": "create_new",
+                    "destination_id": "default",
+                },
             ),
             _stop("saved system"),
             _call(
                 "save-persistent",
                 ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-                {"artifact_id": artifact_id, "destination_id": destination_id},
+                {
+                    "artifact_id": artifact_id,
+                    "mode": "create_new",
+                    "destination_id": destination_id,
+                },
             ),
             _stop("saved persistent"),
         ),
@@ -283,6 +323,7 @@ async def test_system_and_persistent_save_preflight_are_preauthorized_for_explic
         id_factory=_ids(),
         approval_handler=approve,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         first = await agent.run("Create and download a file.")
@@ -323,12 +364,15 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
         id_factory=_ids(),
         approval_handler=approve,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         created = await agent.run("Create a file.")
         artifact_id = created.artifacts[0].artifact_id
         run_id = "run-ffffffffffffffffffffffffffffffff"
-        destination = await agent._embedded._artifact_delivery.register_one_time(
+        delivery = agent._embedded._artifact_delivery
+        assert delivery is not None
+        destination = await delivery.register_one_time(
             one_time,
             run_id=run_id,
         )
@@ -340,10 +384,9 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
             conversation_id=created.conversation_id,
         )
         runtime = agent._embedded._capability_runtime
-        catalog = await runtime.prepare_run(run)
-        projection = runtime.project(catalog, ())
         result = (
-            await runtime.execute_all(
+            await execute_projected(
+                runtime,
                 run,
                 (
                     ToolCall(
@@ -351,11 +394,11 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
                         name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
                         arguments={
                             "artifact_id": artifact_id,
+                            "mode": "create_new",
                             "destination_id": destination.destination_id,
                         },
                     ),
                 ),
-                projection=projection,
                 sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
@@ -408,6 +451,7 @@ async def test_export_location_change_always_requires_exact_once_only_model_appr
         id_factory=_ids(),
         approval_handler=approve,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Use Downloads for future exports.")
@@ -461,17 +505,16 @@ async def test_export_location_rejects_one_time_grant_and_rechecks_config_under_
         id_factory=_ids(),
         approval_handler=change_then_approve,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.set_export_destination(persistent)
         run_id = "run-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
-        one_time_view = await agent._embedded._artifact_delivery.register_one_time(
-            one_time, run_id=run_id
-        )
+        delivery = agent._embedded._artifact_delivery
+        assert delivery is not None
+        one_time_view = await delivery.register_one_time(one_time, run_id=run_id)
         with pytest.raises(ArtifactError) as rejected:
-            await agent._embedded._artifact_delivery.preflight_set_default(
-                one_time_view.destination_id
-            )
+            await delivery.preflight_set_default(one_time_view.destination_id)
         assert rejected.value.code == "artifact_destination_unauthorized"
         result = await agent.run("Change the future export location to Downloads.")
         tool_results = tuple(
@@ -497,6 +540,7 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
         model=provider,
         model_profile=_profile(provider),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Create and download a Markdown file.")
@@ -509,7 +553,8 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
         )
         assert "artifact_create_document" in system
         assert (
-            'artifact_save_local with destination_id="default" before normal' in system
+            'artifact_save_local with mode="create_new" and '
+            'destination_id="default" before normal' in system
         )
         assert "Normal assistant text ends the run" in system
         assert "Ordinary user wording is not an exact stored value" in system
@@ -535,6 +580,7 @@ async def test_context_does_not_create_artifacts_for_ordinary_analysis_or_reads(
         model=provider,
         model_profile=_profile(provider),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Summarize the approach in chat.")
@@ -545,7 +591,7 @@ async def test_context_does_not_create_artifacts_for_ordinary_analysis_or_reads(
         await agent.close()
 
 
-async def test_model_artifact_tools_are_projected_without_prompt_classification(
+async def test_model_artifact_tools_use_exact_pinned_surface_without_classification(
     tmp_path: Path,
 ) -> None:
     downloads = tmp_path / "downloads"
@@ -557,21 +603,23 @@ async def test_model_artifact_tools_are_projected_without_prompt_classification(
         model=provider,
         model_profile=_profile(provider),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Show my user profile.")
         assert result.artifacts == ()
         projected = {tool.name for tool in provider.requests[0].tools}
         assert {
-            DOCUMENT_CREATE_TOOL_NAME,
-            ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-        } <= projected
-        assert {
             ARTIFACT_LIST_TOOL_NAME,
             ARTIFACT_READ_TOOL_NAME,
+        } <= projected
+        assert {"toolbox_search", "toolbox_load"} <= projected
+        assert {
+            DOCUMENT_CREATE_TOOL_NAME,
+            ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
             ARTIFACT_CONVERT_TOOL_NAME,
             ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-        } <= projected
+        }.isdisjoint(projected)
         assert not tuple(downloads.iterdir())
     finally:
         await agent.close()
@@ -592,14 +640,18 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
         model=provider,
         model_profile=_profile(provider),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("Make Downloads my default export location.")
         request = provider.requests[0]
         projected = {tool.name for tool in request.tools}
-        assert ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME in projected
-        assert ARTIFACT_SAVE_LOCAL_TOOL_NAME in projected
-        assert DOCUMENT_CREATE_TOOL_NAME in projected
+        assert {"toolbox_search", "toolbox_load"} <= projected
+        assert {
+            ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+            ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+            DOCUMENT_CREATE_TOOL_NAME,
+        }.isdisjoint(projected)
         system = "\n".join(
             block.text
             for message in request.messages

@@ -5,8 +5,9 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
-from daita import Agent, LocalDirectorySource, SQLiteSource
+from daita import Agent, SQLiteSource
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -57,7 +58,9 @@ async def test_selected_source_persists_and_detach_falls_back_to_the_only_source
     second_path = tmp_path / "second.sqlite"
     _database(first_path, "first_records")
     _database(second_path, "second_records")
-    agent = await Agent.create("source-persistence", root=tmp_path)
+    agent = await Agent.create(
+        "source-persistence", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     first = await agent.attach(SQLiteSource(first_path, name="First Source"))
     second = await agent.attach(SQLiteSource(second_path, name="Second Source"))
 
@@ -67,7 +70,9 @@ async def test_selected_source_persists_and_detach_falls_back_to_the_only_source
     assert await agent.active_source() == second
     await agent.close()
 
-    reopened = await Agent.open("source-persistence", root=tmp_path)
+    reopened = await Agent.open(
+        "source-persistence", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         assert await reopened.active_source() == second
         await reopened.detach(second.id)
@@ -79,7 +84,9 @@ async def test_selected_source_persists_and_detach_falls_back_to_the_only_source
 async def test_detached_source_can_be_attached_again(tmp_path: Path):
     database = tmp_path / "reattach.sqlite"
     _database(database, "records")
-    agent = await Agent.create("source-reattach", root=tmp_path)
+    agent = await Agent.create(
+        "source-reattach", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         original = await agent.attach(SQLiteSource(database, name="Original"))
         detached = await agent.detach(original.id)
@@ -106,7 +113,9 @@ async def test_source_edit_preserves_selected_reads_and_switches_atomically(
     edited_path = tmp_path / "edited.sqlite"
     _database(current_path, "records")
     _database(edited_path, "records")
-    agent = await Agent.create("source-edit", root=tmp_path)
+    agent = await Agent.create(
+        "source-edit", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     previews: list[object] = []
     try:
         current = await agent.attach(SQLiteSource(current_path, name="Warehouse"))
@@ -160,7 +169,9 @@ async def test_source_edit_rejection_leaves_current_source_untouched(
     edited_path = tmp_path / "edited.sqlite"
     _database(current_path, "current_records")
     _database(edited_path, "edited_records")
-    agent = await Agent.create("source-edit-rejected", root=tmp_path)
+    agent = await Agent.create(
+        "source-edit-rejected", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         current = await agent.attach(SQLiteSource(current_path, name="Current"))
 
@@ -204,6 +215,7 @@ async def test_one_run_override_keeps_conversation_source_and_history_isolated(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first_source = await agent.attach(SQLiteSource(first_path, name="First Source"))
@@ -261,6 +273,7 @@ async def test_runtime_injects_catalog_scope_and_rejects_cross_source_query(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     first_source = await agent.attach(SQLiteSource(first_path, name="First Source"))
     second_source = await agent.attach(SQLiteSource(second_path, name="Second Source"))
@@ -313,28 +326,29 @@ async def test_runtime_injects_catalog_scope_and_rejects_cross_source_query(
         await agent.close()
 
 
-async def test_selected_source_projects_only_its_data_adapter_tools(tmp_path: Path):
-    database = tmp_path / "records.sqlite"
-    files = tmp_path / "files"
-    files.mkdir()
-    _database(database, "database_records")
-    (files / "file_records.csv").write_text("id\n1\n", encoding="utf-8")
-    provider = MockModelProvider((_stop("file source selected"),))
+async def test_selected_source_still_projects_source_independent_file_tools(
+    tmp_path: Path,
+):
+    first_database = tmp_path / "first.sqlite"
+    second_database = tmp_path / "second.sqlite"
+    _database(first_database, "first_records")
+    _database(second_database, "second_records")
+    provider = MockModelProvider((_stop("second source selected"),))
     agent = await Agent.create(
         "source-tool-projection",
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.attach(SQLiteSource(database, name="SQLite Source"))
-        await agent.attach(LocalDirectorySource(files, name="File Source"))
-        await agent.select_source("file-source")
+        await agent.attach(SQLiteSource(first_database, name="First Source"))
+        await agent.attach(SQLiteSource(second_database, name="Second Source"))
+        await agent.select_source("second-source")
 
-        await agent.run("What file data is available?")
+        await agent.run("What data and workspace files are available?")
 
         tool_names = {tool.name for tool in provider.requests[0].tools}
-        assert "data_read_file" in tool_names
-        assert "data_query_sqlite" not in tool_names
+        assert {"file_search", "file_read", "data_query_sqlite"} <= tool_names
     finally:
         await agent.close()

@@ -27,11 +27,9 @@ BUILTIN_PROVIDER_IDS = frozenset(provider for provider, _ in PROVIDERS[:-1])
 SUBSCRIPTION_PROVIDER_IDS = frozenset({"codex", "claude-code", "grok-build"})
 SOURCE_TYPES = (
     ("sqlite", "SQLite file"),
-    ("directory", "Local CSV/JSON directory"),
     ("postgresql", "PostgreSQL"),
 )
 SOURCE_TYPE_LABELS = {
-    "local-directory": "CSV/JSON",
     "postgresql": "PostgreSQL",
     "sqlite": "SQLite",
 }

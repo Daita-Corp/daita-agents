@@ -14,10 +14,12 @@ from ..capabilities import (
     Executor,
     OperationalEffect,
     SideEffectExecutor,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
@@ -299,9 +301,9 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 name=name,
                 capability_id=capability.id,
                 description=capability.description,
-                discovery=discovery,
+                presentation=presentation,
             )
-            for name, capability, discovery in zip(
+            for name, capability, presentation in zip(
                 (
                     SKILL_VIEW_TOOL_NAME,
                     SKILL_SAVE_TOOL_NAME,
@@ -309,26 +311,29 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 ),
                 capabilities,
                 (
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.PINNED,
+                        text_trust=ToolTextTrust.CODE,
                         summary="Load one complete user-authorized procedural skill.",
                         when_to_use="Use when an indexed procedure is relevant to the request.",
                         keywords=("skill", "procedure", "guidance", "view"),
-                        exposure_class=ToolExposureClass.STANDARD,
-                        eager_priority=650,
                     ),
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="Create or replace one bounded procedural skill.",
                         when_to_use="Use only for an explicit validated reusable procedure.",
                         keywords=("skill", "procedure", "save", "learn"),
-                        exposure_class=ToolExposureClass.DEFERRED,
-                        eager_priority=180,
                     ),
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="Delete one exact existing procedural skill.",
                         when_to_use="Use only for an explicit exact skill deletion.",
                         keywords=("skill", "procedure", "delete"),
-                        exposure_class=ToolExposureClass.DEFERRED,
-                        eager_priority=170,
                     ),
                 ),
                 strict=True,

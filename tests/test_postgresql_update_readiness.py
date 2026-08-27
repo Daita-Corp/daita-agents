@@ -6,6 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, PostgreSQLSource, PostgreSQLUpdateReadiness
 from daita._json import canonical_json
@@ -608,7 +609,9 @@ async def test_public_agent_readiness_delegates_exact_scope_without_mutation(
         facts=_facts(),
     )
     calls: list[dict[str, object]] = []
-    agent = await Agent.create("public-readiness", root=tmp_path)
+    agent = await Agent.create(
+        "public-readiness", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
 
     async def readiness(**kwargs: object) -> PostgreSQLUpdateReadiness:
         calls.append(kwargs)

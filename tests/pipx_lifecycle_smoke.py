@@ -153,6 +153,7 @@ def main() -> int:
         pip_cache = workspace / "pip-cache"
         outside_checkout = workspace / "outside-checkout"
         separate_agent_home = workspace / "customer-agent-data"
+        customer_workspace = workspace / "customer-workspace"
         for directory in (
             distribution,
             pipx_home,
@@ -161,6 +162,7 @@ def main() -> int:
             pip_cache,
             outside_checkout,
             separate_agent_home,
+            customer_workspace,
         ):
             directory.mkdir()
 
@@ -225,6 +227,8 @@ def main() -> int:
                 str(command),
                 "--root",
                 str(separate_agent_home),
+                "--workspace",
+                str(customer_workspace),
                 "create",
                 "preservation-agent",
             ],
@@ -279,6 +283,7 @@ import sys
 
 from daita import (
     Agent,
+    LocalWorkspace,
     ResourceRevisionBinding,
     SemanticAnnotation,
     SemanticEvidence,
@@ -321,6 +326,7 @@ def ids():
 
 async def main():
     root = Path(sys.argv[1])
+    workspace = LocalWorkspace(Path(sys.argv[2]))
     export_directory = root / "upgrade-exports"
     export_directory.mkdir()
     source_path = root / "upgrade-source.sqlite"
@@ -334,6 +340,16 @@ async def main():
 
     provider = MockModelProvider(
         (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="upgrade-artifact-create-load",
+                        name="toolbox_load",
+                        arguments={"tool_names": ["artifact_create_document"]},
+                    ),
+                ),
+            ),
             ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
@@ -352,12 +368,23 @@ async def main():
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
                     ToolCall(
+                        id="upgrade-artifact-save-load",
+                        name="toolbox_load",
+                        arguments={"tool_names": ["artifact_save_local"]},
+                    ),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
                         id="upgrade-artifact-save",
                         name="artifact_save_local",
                         arguments={
                             "artifact_id": (
                                 "artifact-00000000000000000000000000000001"
                             ),
+                            "mode": "create_new",
                             "destination_id": "default",
                         },
                     ),
@@ -376,6 +403,7 @@ async def main():
     agent = await Agent.open(
         "preservation-agent",
         root=root,
+        workspace=workspace,
         model=provider,
         model_profile=profile,
         id_factory=ids(),
@@ -521,6 +549,7 @@ async def main():
     agent = await Agent.open(
         "preservation-agent",
         root=root,
+        workspace=workspace,
         model_validator=validator,
     )
     await agent.configure_model(
@@ -545,6 +574,7 @@ asyncio.run(main())
                 "-c",
                 seed_state,
                 str(separate_agent_home),
+                str(customer_workspace),
             ],
             cwd=outside_checkout,
             env=environment,
@@ -573,15 +603,16 @@ import json
 from pathlib import Path
 import sys
 
-from daita import Agent
+from daita import Agent, LocalWorkspace
 
 
 async def main():
     root = Path(sys.argv[1])
+    workspace = LocalWorkspace(Path(sys.argv[2]))
     expected = json.loads(
         (root / "upgrade-expectations.json").read_text(encoding="utf-8")
     )
-    agent = await Agent.open("preservation-agent", root=root)
+    agent = await Agent.open("preservation-agent", root=root, workspace=workspace)
     sources = await agent.list_sources()
     summary = await agent.catalog_summary()
     transcript = await agent.transcript(expected["run_id"])
@@ -687,6 +718,7 @@ asyncio.run(main())
                 "-c",
                 inspect_state,
                 str(separate_agent_home),
+                str(customer_workspace),
             ],
             cwd=outside_checkout,
             env=environment,
@@ -776,6 +808,8 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
                 str(command),
                 "--root",
                 str(separate_agent_home),
+                "--workspace",
+                str(customer_workspace),
                 "sources",
                 "preservation-agent",
             ],
@@ -800,6 +834,7 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
                 "-c",
                 inspect_state,
                 str(separate_agent_home),
+                str(customer_workspace),
             ],
             cwd=outside_checkout,
             env=environment,
@@ -861,13 +896,14 @@ import json
 from pathlib import Path
 import sys
 
-from daita import Agent
+from daita import Agent, LocalWorkspace
 from daita.llm.models import FinishReason, ModelProfile, ModelResponse
 from daita.llm.providers.mock import MockModelProvider
 
 
 async def main():
     root = Path(sys.argv[1])
+    workspace = LocalWorkspace(Path(sys.argv[2]))
     expected = json.loads(
         (root / "upgrade-expectations.json").read_text(encoding="utf-8")
     )
@@ -884,6 +920,7 @@ async def main():
     agent = await Agent.open(
         "preservation-agent",
         root=root,
+        workspace=workspace,
         model=provider,
         model_profile=profile,
     )
@@ -906,6 +943,7 @@ asyncio.run(main())
                 "-c",
                 append_state,
                 str(separate_agent_home),
+                str(customer_workspace),
             ],
             cwd=outside_checkout,
             env=environment,

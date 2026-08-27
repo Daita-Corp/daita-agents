@@ -18,6 +18,10 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import openpyxl
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita._json import canonical_json
@@ -56,7 +60,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExitKind
 
 _CREATED_AT = datetime(2026, 8, 1, 12, 30, 45, tzinfo=UTC)
@@ -98,6 +101,15 @@ def _error_code(block: ToolResultBlock) -> str:
     code = error.get("code")
     assert isinstance(code, str)
     return code
+
+
+def _result_for_call(transcript, call_id: str) -> ToolResultBlock:
+    return next(
+        block
+        for message in transcript.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.call_id == call_id
+    )
 
 
 def _provenance() -> ExactXlsxProvenance:
@@ -497,6 +509,7 @@ async def _sqlite_export_agent(
         id_factory=_ids(),
         downloads_directory=downloads,
         clock=lambda: _CREATED_AT,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     return agent, provider, source.id, database
@@ -514,30 +527,33 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
         downloads=downloads,
         rows=((secret, 1), ("=formula", 2)),
     )
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="export",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label, number FROM records ORDER BY number",
-                    "format": "xlsx",
-                    "filename": "records.xlsx",
-                },
-            )
-        ),
-        _tools(
-            ToolCall(
-                id="save",
-                name="artifact_save_local",
-                arguments={
-                    "artifact_id": "artifact-00000000000000000000000000000001",
-                    "destination_id": "default",
-                },
-            )
-        ),
-        _stop("saved"),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="export",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label, number FROM records ORDER BY number",
+                        "format": "xlsx",
+                        "filename": "records.xlsx",
+                    },
+                )
+            ),
+            _tools(
+                ToolCall(
+                    id="save",
+                    name="artifact_save_local",
+                    arguments={
+                        "artifact_id": "artifact-00000000000000000000000000000001",
+                        "mode": "create_new",
+                        "destination_id": "default",
+                    },
+                )
+            ),
+            _stop("saved"),
+        )
     )
     try:
         result = await agent.run("Export every record as an exact XLSX workbook.")
@@ -608,6 +624,7 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
         root=tmp_path,
         downloads_directory=downloads,
         clock=lambda: _CREATED_AT,
+        workspace=workspace_for(tmp_path),
     )
     try:
         ref = result.artifacts[0]
@@ -742,40 +759,42 @@ async def test_concurrent_csv_xlsx_exports_keep_order_and_failed_siblings(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(sqlite_query_module, "_run_exact_tabular_sync", delayed)
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="first-xlsx",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
-                    "format": "xlsx",
-                    "filename": "first.xlsx",
-                },
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="first-xlsx",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
+                        "format": "xlsx",
+                        "filename": "first.xlsx",
+                    },
+                ),
+                ToolCall(
+                    id="failed",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
+                        "format": "xlsx",
+                        "filename": "failed.xlsx",
+                    },
+                ),
+                ToolCall(
+                    id="third-csv",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT number FROM records ORDER BY number",
+                        "format": "csv",
+                        "filename": "third.csv",
+                    },
+                ),
             ),
-            ToolCall(
-                id="failed",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
-                    "format": "xlsx",
-                    "filename": "failed.xlsx",
-                },
-            ),
-            ToolCall(
-                id="third-csv",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT number FROM records ORDER BY number",
-                    "format": "csv",
-                    "filename": "third.csv",
-                },
-            ),
-        ),
-        _stop(),
+            _stop(),
+        )
     )
     try:
         result = await agent.run("Export these CSV and XLSX files.")
@@ -785,6 +804,7 @@ async def test_concurrent_csv_xlsx_exports_keep_order_and_failed_siblings(
             for message in transcript.messages
             if message.role is MessageRole.TOOL
             and isinstance(message.content[0], ToolResultBlock)
+            and message.content[0].output.get("kind") != "toolbox_load_receipt"
         )
         assert tuple(block.call_id for block in blocks) == (
             "first-xlsx",
@@ -815,30 +835,33 @@ async def test_delivery_failure_after_xlsx_commit_retains_verified_artifact(
         downloads=downloads,
         rows=(("retained", 1),),
     )
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="export",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label, number FROM records",
-                    "format": "xlsx",
-                    "filename": "retained.xlsx",
-                },
-            )
-        ),
-        _tools(
-            ToolCall(
-                id="delivery",
-                name="artifact_save_local",
-                arguments={
-                    "artifact_id": "artifact-00000000000000000000000000000001",
-                    "destination_id": "default",
-                },
-            )
-        ),
-        _stop("delivery failed"),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="export",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label, number FROM records",
+                        "format": "xlsx",
+                        "filename": "retained.xlsx",
+                    },
+                )
+            ),
+            _tools(
+                ToolCall(
+                    id="delivery",
+                    name="artifact_save_local",
+                    arguments={
+                        "artifact_id": "artifact-00000000000000000000000000000001",
+                        "mode": "create_new",
+                        "destination_id": "default",
+                    },
+                )
+            ),
+            _stop("delivery failed"),
+        )
     )
     downloads.rmdir()
     try:
@@ -846,8 +869,7 @@ async def test_delivery_failure_after_xlsx_commit_retains_verified_artifact(
         assert len(result.artifacts) == 1
         assert result.artifact_deliveries == ()
         transcript = await agent.transcript(result.run_id)
-        delivery = transcript.messages[4].content[0]
-        assert isinstance(delivery, ToolResultBlock)
+        delivery = _result_for_call(transcript, "delivery")
         assert _error_code(delivery) == "artifact_downloads_unavailable"
         error = delivery.output["error"]
         assert isinstance(error, Mapping)
@@ -881,18 +903,20 @@ async def test_xlsx_cancellation_emits_no_artifact_bytes_reference_or_delivery(
         return b"unused", ("label",), 0, f"schema_version:{args[5]}"
 
     monkeypatch.setattr(sqlite_query_module, "_run_exact_tabular_sync", blocked)
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="cancelled-export",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label FROM records",
-                    "format": "xlsx",
-                },
-            )
-        ),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="cancelled-export",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label FROM records",
+                        "format": "xlsx",
+                    },
+                )
+            ),
+        )
     )
     try:
         running = asyncio.create_task(agent.run("Export this XLSX workbook."))

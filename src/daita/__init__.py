@@ -1,7 +1,6 @@
 """Export the public APIs for configuring and running a Daita agent."""
 
 from .adapters import (
-    LocalDirectorySource,
     MCPAdmissionError,
     MCPAuthentication,
     MCPAuthenticationMode,
@@ -31,7 +30,17 @@ from .autonomy import (
     DeliverySubjectKind,
     InboxItem,
 )
-from .capabilities import ApprovalDecision, ApprovalHandler, ApprovalRequest
+from .capabilities import (
+    TOOLBOX_DEFINITIONS,
+    ApprovalDecision,
+    ApprovalHandler,
+    ApprovalRequest,
+    ToolboxDefinition,
+    ToolboxId,
+    ToolLoadMode,
+    ToolPresentation,
+    ToolTextTrust,
+)
 from .catalog import CatalogSummary
 from .config import AgentConfig
 from .jobs import (
@@ -66,7 +75,6 @@ from .loop import (
     LoopExit,
     LoopExitKind,
     LoopLimits,
-    ToolProjectionMode,
     Transcript,
 )
 from .observation import AgentEvent, AgentEventKind, AgentObserver
@@ -84,6 +92,7 @@ from .semantics import (
     SemanticValidationError,
 )
 from .skills import Skill, SkillSummary
+from .workspace import LocalWorkspace
 
 __version__ = "1.0.0"
 
@@ -103,7 +112,7 @@ __all__ = [
     "ApprovalRequest",
     "ConversationRun",
     "CatalogSummary",
-    "LocalDirectorySource",
+    "LocalWorkspace",
     "DocumentCandidateContent",
     "DeliveryState",
     "DeliverySubject",
@@ -126,7 +135,12 @@ __all__ = [
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",
-    "ToolProjectionMode",
+    "TOOLBOX_DEFINITIONS",
+    "ToolboxDefinition",
+    "ToolboxId",
+    "ToolLoadMode",
+    "ToolPresentation",
+    "ToolTextTrust",
     "MCPAdmissionError",
     "MCPAuthentication",
     "MCPAuthenticationMode",

@@ -46,10 +46,12 @@ step. Normal text from the model completes the run; there is no second
 readiness, repair, verification, or synthesis pass.
 
 The loop has only outer step, wall-time, token, and estimated-cost limits. The
-MVP supports catalog-backed reads from SQLite, PostgreSQL, CSV, and JSON, plus
-explicitly admitted server-neutral remote MCP read tools. SQL and file access
-are validated against the current catalog before source I/O; each MCP call is
-revalidated against its exact binding revision and remote identity.
+MVP supports catalog-backed reads from SQLite and PostgreSQL, bounded reads
+from one explicitly admitted local workspace, plus explicitly admitted
+server-neutral remote MCP read tools. SQL access is validated against the
+current catalog before source I/O; workspace file access is
+descriptor-contained and revision-bound; each MCP call is revalidated against
+its exact binding revision and remote identity.
 
 Agent identity, source registrations, current catalog snapshots, exact run
 transcripts, and terminal run results are persisted in a small SQLite state
@@ -76,6 +78,7 @@ src/daita/
   storage/sqlite_migrations/   # development baseline and migration engine
   security/            # secret references and lazy secret resolution
   config.py            # immutable runtime/model configuration records
+  workspace.py         # runtime-only local workspace admission record
   cli.py               # thin local CLI over the public embedded API
 tests/                 # deterministic product tests
 examples/              # offline examples
@@ -229,11 +232,12 @@ and traversal. Data-domain code consumes catalog contracts rather than building
 a second schema graph or querying source clients for planning facts.
 
 `daita.adapters` owns source-specific admission, containment, discovery,
-freshness checks, and I/O, plus the single bounded server-neutral Streamable
-HTTP MCP protocol client. SQLite and local-file paths must be absolute,
-bounded, and resistant to symlink/path escape. PostgreSQL and MCP credentials
-remain secret references and integration SDK use stays behind the execution
-boundary.
+freshness checks, and I/O, the descriptor-contained local-workspace backend,
+plus the single bounded server-neutral Streamable HTTP MCP protocol client.
+SQLite paths must be absolute and bounded; workspace access uses only admitted
+workspace-relative logical paths and resists symlink/path escape. PostgreSQL
+and MCP credentials remain secret references and integration SDK use stays
+behind the execution boundary.
 
 SQL validation belongs in `daita.domains.data.sql`; connector guardrails still
 apply at execution. Do not duplicate either system in a generic policy layer.
@@ -433,13 +437,14 @@ daita
 ```
 
 `openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `httpx`, `keyring`,
-`textual`, `rich`, and `XlsxWriter` are default production dependencies.
+`textual`, `rich`, `XlsxWriter`, and exact `duckdb==1.5.5` are default
+production dependencies.
 `dev` is the only optional dependency group; do not restore provider, keychain,
 database, parser, CLI, recommended, complete, aggregate, or other customer
 extras.
 
 Default installation does not authorize eager imports. Import provider SDKs,
-`asyncpg`, `sqlglot`, `httpx`, `keyring`, `textual`, and Rich only inside the
+`asyncpg`, `sqlglot`, `httpx`, `keyring`, `textual`, Rich, and DuckDB only inside the
 provider/client or terminal-selection boundary that first needs them, and
 XlsxWriter only inside the XLSX renderer boundary—never at module import time.
 Importing `daita` or `daita.cli`, and running headless commands, must not load
@@ -520,6 +525,8 @@ specific agent loop.
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | capability declarations and registry |
 | `src/daita/capability_runtime.py` | sole common model-to-execution runtime |
+| `src/daita/workspace.py` | explicit runtime-only local workspace admission |
+| `src/daita/adapters/local_workspace.py` | descriptor-contained bounded workspace search/read backend |
 | `src/daita/adapters/mcp.py` | bounded server-neutral Streamable HTTP MCP protocol client and records |
 | `src/daita/domains/mcp.py` | static MCP capability owner and call-time binding rechecks |
 | `src/daita/domains/learning.py` | transient learning mutation guard |

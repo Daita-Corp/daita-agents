@@ -4,6 +4,8 @@ import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
+from _workspace_support import workspace_for
+
 import daita
 from daita.capabilities import AccessMode, OperationalEffect
 from daita.storage.sqlite import SQLiteStateStore
@@ -103,18 +105,23 @@ def test_stage_m1_has_one_common_runtime_and_no_legacy_compatibility_surface():
         assert not any(value.startswith(prefix) for value in string_literals)
 
 
-def test_stage_m3_has_one_run_catalog_and_deletes_complete_surface_recomputation():
+def test_phase1_has_one_toolbox_catalog_and_no_legacy_discovery_path():
     runtime_path = PACKAGE / "capability_runtime.py"
     loop_path = PACKAGE / "loop" / "driver.py"
     runtime = runtime_path.read_text(encoding="utf-8")
     loop = loop_path.read_text(encoding="utf-8")
     production = _python_text(PACKAGE)
 
-    assert _class_owners("ToolDiscoveryMetadata") == {"capabilities.py"}
-    assert _class_owners("ToolExposureClass") == {"capabilities.py"}
+    assert _class_owners("ToolboxId") == {"capabilities.py"}
+    assert _class_owners("ToolLoadMode") == {"capabilities.py"}
+    assert _class_owners("ToolTextTrust") == {"capabilities.py"}
+    assert _class_owners("ToolboxDefinition") == {"capabilities.py"}
+    assert _class_owners("ToolPresentation") == {"capabilities.py"}
+    assert _class_owners("ToolDiscoveryMetadata") == set()
+    assert _class_owners("ToolExposureClass") == set()
     assert _class_owners("RunToolCatalog") == {"capability_runtime.py"}
     assert _class_owners("StepToolProjection") == {"capability_runtime.py"}
-    assert _class_owners("ToolProjectionMode") == {"loop/models.py"}
+    assert _class_owners("ToolProjectionMode") == set()
     assert "definitions" not in _class_methods(loop_path, "ToolRuntime")
     assert "definitions" not in _class_methods(runtime_path, "CapabilityRuntime")
     assert "await domain.project(run)" in runtime
@@ -122,7 +129,16 @@ def test_stage_m3_has_one_run_catalog_and_deletes_complete_surface_recomputation
     assert "definitions(run)" not in production
     assert "max_projected_tools" not in production
     assert "max_projected_tool_definition_bytes" not in production
-    assert "tool_search" not in _python_text(PACKAGE / "llm" / "providers")
+    assert "toolbox_search" not in _python_text(PACKAGE / "llm" / "providers")
+    for obsolete in (
+        '"tool_search"',
+        '"tool_describe"',
+        '"tool_call"',
+        "eager_priority",
+        "ToolInvocationMode",
+        "DomainToolManifestEntry",
+    ):
+        assert obsolete not in production
     assert "RunToolCatalog" not in _python_text(PACKAGE / "storage")
     assert "StepToolProjection" not in _python_text(PACKAGE / "storage")
 
@@ -154,6 +170,103 @@ def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
     assert "_capability_runtime" in embedded
     assert "CapabilityRuntime(" in embedded
     assert "capability_runtime" not in loop
+
+
+def test_phase2_local_workspace_backend_is_explicit_and_conditionally_composed():
+
+    embedded_path = PACKAGE / "hosting" / "embedded.py"
+    tree = ast.parse(embedded_path.read_text(encoding="utf-8"))
+    embedded_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EmbeddedAgent"
+    )
+    compose = next(
+        node
+        for node in embedded_class.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_compose"
+    )
+    compose_text = ast.get_source_segment(
+        embedded_path.read_text(encoding="utf-8"), compose
+    )
+    assert compose_text is not None
+    assert "LocalDirectoryReadBackend" not in compose_text
+    assert "local_file_declarations(workspace_backend)" in compose_text
+    assert "if workspace_backend is None" in compose_text
+    assert "local_files.capabilities if local_files is not None else ()" in compose_text
+    assert "local_files.tool_views if local_files is not None else ()" in compose_text
+    assert "local_files.executors if local_files is not None else ()" in compose_text
+
+
+def test_phase3_bound_text_edit_has_one_artifact_producer_and_one_publication_owner():
+    from daita.domains.data.export_capabilities import (
+        ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
+        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+        artifact_capability_declarations,
+    )
+
+    declarations = artifact_capability_declarations()
+    capabilities = {item.id: item for item in declarations.capabilities}
+    edit_schema = capabilities[ARTIFACT_EDIT_TEXT_CAPABILITY_ID].input_schema
+    save_schema = capabilities[ARTIFACT_SAVE_LOCAL_CAPABILITY_ID].input_schema
+    edit_properties = edit_schema.get("properties")
+    edit_required = edit_schema.get("required")
+    save_properties = save_schema.get("properties")
+    save_required = save_schema.get("required")
+    assert isinstance(edit_properties, Mapping)
+    assert isinstance(edit_required, (tuple, list))
+    assert isinstance(save_properties, Mapping)
+    assert isinstance(save_required, (tuple, list))
+    assert set(edit_properties) == {"binding", "replacements"}
+    assert set(edit_required) == {"binding", "replacements"}
+    assert set(save_properties) == {
+        "artifact_id",
+        "mode",
+        "destination_id",
+        "filename",
+    }
+    assert set(save_required) == {"artifact_id", "mode"}
+    assert not {
+        "path",
+        "relative_path",
+        "revision",
+        "physical_revision",
+        "content",
+        "bytes",
+    } & set(edit_properties)
+    assert not {
+        "path",
+        "relative_path",
+        "revision",
+        "physical_revision",
+        "content",
+        "bytes",
+    } & set(save_properties)
+
+    workspace = (PACKAGE / "adapters" / "local_workspace.py").read_text(
+        encoding="utf-8"
+    )
+    artifact_domain = (
+        PACKAGE / "domains" / "data" / "export_capabilities.py"
+    ).read_text(encoding="utf-8")
+    delivery = (PACKAGE / "artifacts" / "delivery.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    production = _python_text(PACKAGE)
+    assert _class_owners("ArtifactEditTextExecutor") == {
+        "domains/data/export_capabilities.py"
+    }
+    assert _class_owners("LocalArtifactDelivery") == {"artifacts/delivery.py"}
+    assert "os.replace(" not in workspace
+    assert "os.replace(" not in artifact_domain
+    assert "os.replace(" in delivery
+    assert "subprocess" not in _imports(PACKAGE / "artifacts" / "delivery.py")
+    assert "subprocess" not in _imports(
+        PACKAGE / "domains" / "data" / "export_capabilities.py"
+    )
+    assert "file_write" not in production
+    assert "exact_target_resolver=workspace_backend" in embedded
+    assert "LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS" in embedded
+    assert "LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS" in embedded
 
 
 def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
@@ -214,10 +327,59 @@ def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
     )
 
 
+def test_phase4_file_query_stays_lazy_private_and_inside_existing_owners():
+    adapter_path = PACKAGE / "adapters" / "local_file_query.py"
+    workspace_path = PACKAGE / "adapters" / "local_workspace.py"
+    capability_path = PACKAGE / "domains" / "data" / "file_capabilities.py"
+    controller_path = PACKAGE / "domains" / "data" / "controller.py"
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    adapter = adapter_path.read_text(encoding="utf-8")
+    workspace = workspace_path.read_text(encoding="utf-8")
+    capabilities = capability_path.read_text(encoding="utf-8")
+    controller = controller_path.read_text(encoding="utf-8")
+    tree = ast.parse(adapter)
+    top_level_imports = {
+        alias.name.split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        (node.module or "").split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+    }
+    assert "duckdb" not in top_level_imports
+    assert "subprocess" not in _imports(adapter_path)
+    assert "subprocess" not in _imports(workspace_path)
+    assert "shell=True" not in adapter + workspace
+    assert "os.system" not in adapter + workspace
+    assert _class_owners("LocalFileQueryBackend") == {"adapters/local_file_query.py"}
+    assert _class_owners("LocalFileQueryExecutor") == {
+        "domains/data/file_capabilities.py"
+    }
+    assert "CapabilityRuntime(" not in adapter + workspace + capabilities + controller
+    assert "CapabilityRegistry(" not in adapter + workspace + capabilities + controller
+    assert "ToolLoadMode.ON_DEMAND" in capabilities
+    assert 'LOCAL_FILE_QUERY_TOOL_NAME = "file_query"' in capabilities
+    assert "local_file_declarations(workspace_backend)" in embedded
+    assert "call.name == LOCAL_FILE_QUERY_TOOL_NAME" not in controller
+    for prohibited in (
+        "DuckDBRuntime",
+        "FileQueryRuntime",
+        "FileQueryRegistry",
+        "FileQueryPolicy",
+        "persistent_duckdb",
+        "prepared_parquet_cache",
+    ):
+        assert prohibited not in adapter + workspace + capabilities + controller
+
+
 async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
     tmp_path,
 ):
-    agent = await daita.Agent.create("stage-m1-owners", root=tmp_path)
+    agent = await daita.Agent.create(
+        "stage-m1-owners", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         registry = agent._embedded._capabilities
         runtime = agent._embedded._capability_runtime
@@ -244,7 +406,9 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["catalog_search"] == "data"
         assert resolved["data_query_sqlite"] == "data"
         assert resolved["data_query_postgresql"] == "data"
-        assert resolved["data_read_file"] == "data"
+        assert resolved["file_search"] == "data"
+        assert resolved["file_read"] == "data"
+        assert resolved["file_query"] == "data"
         assert resolved["data_update_postgresql"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
@@ -311,11 +475,16 @@ def test_public_surface_is_focused():
         "JobResultView",
         "JobStatus",
         "JobSummary",
-        "LocalDirectorySource",
+        "LocalWorkspace",
         "LoopExit",
         "LoopExitKind",
         "LoopLimits",
-        "ToolProjectionMode",
+        "TOOLBOX_DEFINITIONS",
+        "ToolLoadMode",
+        "ToolPresentation",
+        "ToolboxDefinition",
+        "ToolboxId",
+        "ToolTextTrust",
         "MCPAdmissionError",
         "MCPAuthentication",
         "MCPAuthenticationMode",
@@ -760,7 +929,9 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
 async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_branch(
     tmp_path,
 ):
-    agent = await daita.Agent.create("write-architecture", root=tmp_path)
+    agent = await daita.Agent.create(
+        "write-architecture", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         registry = agent._embedded._capabilities
         effect_tools = set()
@@ -790,7 +961,11 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
 async def test_database_write_phase_three_registers_only_the_postgresql_update_slice(
     tmp_path,
 ):
-    agent = await daita.Agent.create("database-write-phase-two", root=tmp_path)
+    agent = await daita.Agent.create(
+        "database-write-phase-two",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         registry = agent._embedded._capabilities
         capability_ids = {
@@ -1015,7 +1190,8 @@ def test_stage_b_job_scope_has_one_agent_owner_and_no_conversation_gate():
         not in owner.split("async def inspect", 1)[1]
     )
     assert "JobCapabilityDomain(job_declaration_bundle, job_owner)" in embedded
-    assert "ToolExposureClass.CORE" in capabilities
+    assert "ToolLoadMode.PINNED" in capabilities
+    assert "ToolLoadMode.ON_DEMAND" in capabilities
     assert "item.id == JOB_CANCEL_CAPABILITY_ID" in capabilities
 
 
@@ -1936,9 +2112,9 @@ def test_artifact_payloads_and_destination_grants_never_enter_sqlite_messages_or
     assert "saved_path" not in context_text
 
 
-def test_local_file_read_path_no_longer_imports_or_constructs_artifact_bytes():
+def test_local_workspace_read_path_never_imports_or_constructs_artifact_bytes():
     for relative in (
-        "adapters/local_files.py",
+        "adapters/local_workspace.py",
         "domains/data/file_capabilities.py",
     ):
         text = (PACKAGE / relative).read_text(encoding="utf-8")

@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita.adapters import (
@@ -244,6 +245,7 @@ async def test_agent_postgresql_probe_persists_no_source_or_catalog_snapshot(
         "probe-only",
         root=tmp_path,
         secret_provider=secrets,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.probe_postgresql(

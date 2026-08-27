@@ -21,10 +21,12 @@ from .capabilities import (
     Executor,
     OperationalEffect,
     SideEffectExecutor,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from .capability_runtime import CapabilityFailure, SideEffectPlan
@@ -1488,9 +1490,9 @@ def semantic_declarations(
                 name=name,
                 capability_id=capability.id,
                 description=capability.description,
-                discovery=discovery,
+                presentation=presentation,
             )
-            for name, capability, discovery in zip(
+            for name, capability, presentation in zip(
                 (
                     SEMANTIC_LIST_TOOL_NAME,
                     SEMANTIC_VIEW_TOOL_NAME,
@@ -1499,33 +1501,37 @@ def semantic_declarations(
                 ),
                 capabilities,
                 (
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="List bounded active semantic annotations.",
                         when_to_use="Use to inspect current stored business meaning.",
                         keywords=("semantic", "meaning", "annotation", "list"),
-                        exposure_class=ToolExposureClass.STANDARD,
-                        eager_priority=620,
                     ),
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="View one exact semantic annotation and its evidence.",
                         when_to_use="Use before correcting or deleting an exact annotation.",
                         keywords=("semantic", "meaning", "annotation", "view"),
-                        exposure_class=ToolExposureClass.STANDARD,
-                        eager_priority=610,
                     ),
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="Create or supersede one evidence-bound semantic annotation.",
                         when_to_use="Use only for validated current resource or field meaning.",
                         keywords=("semantic", "meaning", "annotation", "save"),
-                        exposure_class=ToolExposureClass.DEFERRED,
-                        eager_priority=160,
                     ),
-                    ToolDiscoveryMetadata(
+                    ToolPresentation(
+                        toolbox_id=ToolboxId.KNOWLEDGE,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
                         summary="Delete one exact semantic annotation after validation.",
                         when_to_use="Use only for an explicit exact semantic deletion.",
                         keywords=("semantic", "meaning", "annotation", "delete"),
-                        exposure_class=ToolExposureClass.DEFERRED,
-                        eager_priority=150,
                     ),
                 ),
                 strict=True,
@@ -1581,6 +1587,8 @@ class SemanticCapabilityDomain:
         catalog: SemanticDomainCatalog,
         store: SemanticStore,
         learning: LearningCandidateGuard,
+        *,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("semantic declarations have the wrong domain owner")
@@ -1597,6 +1605,9 @@ class SemanticCapabilityDomain:
         self._catalog = catalog
         self._store = store
         self._learning = learning
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
         self._explicit_learning_runs: set[str] = set()
@@ -1627,6 +1638,8 @@ class SemanticCapabilityDomain:
             raise SemanticValidationError(issue[1])
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
+        if run.id in self._files_only_run_ids:
+            return ()
         facts = await self._catalog.source_routing_facts(
             run.agent_id,
             (() if run.source_id is None else (run.source_id,)),
@@ -2118,7 +2131,6 @@ class SemanticCapabilityDomain:
                 not in {
                     "data.sqlite.query_result",
                     "data.postgresql.query_result",
-                    "data.file.read_result",
                 }
             ):
                 return (

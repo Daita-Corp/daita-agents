@@ -10,19 +10,22 @@ from hashlib import sha256
 from typing import Protocol
 
 from ..._json import FrozenJsonObject, canonical_json
+from ...adapters.local_workspace import LocalWorkspaceBackend, LocalWorkspaceError
 from ...artifacts.delivery import LocalArtifactDelivery
 from ...artifacts.models import (
-    MAX_ARTIFACT_BYTES,
     MAX_DOCUMENT_BYTES,
+    MAX_TEXT_EDIT_OPERATIONS,
     ArtifactAuthorship,
     ArtifactDraft,
     ArtifactError,
+    ArtifactLocalFileBinding,
     ArtifactPayload,
     ArtifactProvenance,
     ArtifactRef,
     ArtifactResourceBinding,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
+    artifact_text_change_summary_to_mapping,
     canonical_artifact_filename,
 )
 from ...artifacts.renderers import (
@@ -32,13 +35,21 @@ from ...artifacts.renderers import (
     MAX_CSV_COLUMNS,
     MAX_CSV_ROWS,
     MAX_CSV_SECONDS,
+    MAX_TEXT_EDIT_ANCHOR_BYTES,
+    MAX_TEXT_EDIT_BYTES,
+    MAX_TEXT_EDIT_OCCURRENCES,
+    MAX_TEXT_EDIT_REPLACEMENT_BYTES,
     MAX_XLSX_BYTES,
     MAX_XLSX_SECONDS,
+    TEXT_EDIT_ALLOWED_EXTENSIONS,
+    TEXT_EDIT_MEDIA_TYPES,
     XLSX_ALLOWED_EXTENSIONS,
     XLSX_MEDIA_TYPE,
+    apply_bounded_text_edits,
     read_exact_xlsx_data,
     render_exact_csv,
     render_model_document,
+    text_edit_media_type,
 )
 from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
@@ -49,17 +60,19 @@ from ...capabilities import (
     CapabilityInputError,
     Executor,
     OperationalEffect,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
     ToolOutputValidationError,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
 from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
-from ...loop.models import RunInput, Transcript
+from ...loop.models import RunInput, RunOrigin, Transcript
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .sql import (
@@ -83,16 +96,6 @@ POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID = "data.postgresql.export_tabular.executor
 POSTGRESQL_TABULAR_EXPORT_TOOL_NAME = "data_export_postgresql"
 TABULAR_EXPORT_OUTPUT_KIND = "artifact.tabular_export"
 
-LOCAL_FILE_COPY_CAPABILITY_ID = "data.file.export_copy"
-LOCAL_FILE_COPY_EXECUTOR_ID = "data.file.export_copy.executor"
-LOCAL_FILE_COPY_TOOL_NAME = "data_export_file"
-LOCAL_FILE_COPY_OUTPUT_KIND = "artifact.file_copy"
-LOCAL_FILE_COPY_ALLOWED_EXTENSIONS = (
-    ("text/csv", (".csv",)),
-    ("application/json", (".json",)),
-)
-MAX_LOCAL_FILE_COPY_SECONDS = 60.0
-
 ARTIFACT_LIST_CAPABILITY_ID = "artifact.list"
 ARTIFACT_LIST_EXECUTOR_ID = "artifact.list.executor"
 ARTIFACT_LIST_TOOL_NAME = "artifact_list"
@@ -110,6 +113,11 @@ ARTIFACT_CONVERT_CAPABILITY_ID = "artifact.convert"
 ARTIFACT_CONVERT_EXECUTOR_ID = "artifact.convert.executor"
 ARTIFACT_CONVERT_TOOL_NAME = "artifact_convert"
 ARTIFACT_CONVERT_OUTPUT_KIND = "artifact.conversion"
+
+ARTIFACT_EDIT_TEXT_CAPABILITY_ID = "artifact.edit_text"
+ARTIFACT_EDIT_TEXT_EXECUTOR_ID = "artifact.edit_text.executor"
+ARTIFACT_EDIT_TEXT_TOOL_NAME = "artifact_edit_text"
+ARTIFACT_EDIT_TEXT_OUTPUT_KIND = "artifact.text_edit"
 
 ARTIFACT_SAVE_LOCAL_CAPABILITY_ID = "artifact.save_local"
 ARTIFACT_SAVE_LOCAL_EXECUTOR_ID = "artifact.save_local.executor"
@@ -215,79 +223,6 @@ class ExactTabularExportBackend(Protocol):
         timeout_seconds: float,
         progress: ExactTabularProgress | None = None,
     ) -> ExactTabularExportResult: ...
-
-
-@dataclass(frozen=True, slots=True)
-class LocalFileCopyResult:
-    """One byte-preserving read of an exact current cataloged local resource."""
-
-    source_id: str
-    source_revision: str
-    resource_id: str
-    resource_revision: str
-    filename: str
-    format: str
-    media_type: str
-    content: bytes
-    sensitivity: Sensitivity
-
-    def __post_init__(self) -> None:
-        for value, name, maximum in (
-            (self.source_id, "source_id", 512),
-            (self.source_revision, "source_revision", 1_024),
-            (self.resource_id, "resource_id", 512),
-            (self.resource_revision, "resource_revision", 1_024),
-            (self.filename, "filename", 2_048),
-            (self.media_type, "media_type", 128),
-        ):
-            if (
-                not isinstance(value, str)
-                or not value.strip()
-                or value != value.strip()
-                or len(value) > maximum
-            ):
-                raise ValueError(f"local-file copy {name} is invalid")
-        if self.format not in {"csv", "json"}:
-            raise ValueError("local-file copy format is invalid")
-        expected_media_type = "text/csv" if self.format == "csv" else "application/json"
-        if self.media_type != expected_media_type:
-            raise ValueError("local-file copy media type does not match its format")
-        if (
-            not isinstance(self.content, bytes)
-            or not self.content
-            or len(self.content) > MAX_ARTIFACT_BYTES
-        ):
-            raise ValueError("local-file copy content is outside its byte bound")
-        if not isinstance(self.sensitivity, Sensitivity):
-            raise TypeError("local-file copy sensitivity must be Sensitivity")
-
-
-class LocalFileCopyBackend(Protocol):
-    async def execute_copy(
-        self,
-        *,
-        agent_id: str,
-        source_id: str,
-        resource_id: str,
-        max_bytes: int,
-    ) -> LocalFileCopyResult: ...
-
-
-class LocalFileCopyIncompleteError(RuntimeError):
-    """Bounded source-copy failure translated at the artifact runtime boundary."""
-
-    def __init__(self, reason: str, *, completed_bytes: int = 0) -> None:
-        if reason not in {"byte_limit", "source_changed"}:
-            raise ValueError("local-file copy failure reason is invalid")
-        if (
-            not isinstance(completed_bytes, int)
-            or isinstance(completed_bytes, bool)
-            or completed_bytes < 0
-        ):
-            raise ValueError("completed_bytes must be non-negative")
-        self.reason = reason
-        self.completed_bytes = completed_bytes
-        super().__init__(reason)
 
 
 def resolved_exact_export_sensitivity(
@@ -455,115 +390,6 @@ class PostgreSQLTabularExportExecutor(_TabularExportExecutor):
     executor_id = POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID
 
 
-class LocalFileCopyExecutor:
-    executor_id = LOCAL_FILE_COPY_EXECUTOR_ID
-
-    def __init__(
-        self,
-        agent_id: str,
-        backend: LocalFileCopyBackend,
-        *,
-        max_bytes: int = MAX_ARTIFACT_BYTES,
-        max_seconds: float = MAX_LOCAL_FILE_COPY_SECONDS,
-    ) -> None:
-        if not isinstance(agent_id, str) or not agent_id.strip():
-            raise ValueError("agent_id must be non-empty text")
-        if not callable(getattr(backend, "execute_copy", None)):
-            raise TypeError("backend must provide execute_copy")
-        if (
-            not isinstance(max_bytes, int)
-            or isinstance(max_bytes, bool)
-            or not 1 <= max_bytes <= MAX_ARTIFACT_BYTES
-        ):
-            raise ValueError("max_bytes is outside the artifact byte bound")
-        if (
-            not isinstance(max_seconds, (int, float))
-            or isinstance(max_seconds, bool)
-            or max_seconds <= 0
-        ):
-            raise ValueError("max_seconds must be positive")
-        self._agent_id = agent_id
-        self._backend = backend
-        self._max_bytes = max_bytes
-        self._max_seconds = float(max_seconds)
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        source_id = request.arguments["source_id"]
-        resource_id = request.arguments["resource_id"]
-        filename = request.arguments.get("filename")
-        assert isinstance(source_id, str)
-        assert isinstance(resource_id, str)
-        assert filename is None or isinstance(filename, str)
-        try:
-            async with asyncio.timeout(self._max_seconds):
-                result = await self._backend.execute_copy(
-                    agent_id=self._agent_id,
-                    source_id=source_id,
-                    resource_id=resource_id,
-                    max_bytes=self._max_bytes,
-                )
-        except LocalFileCopyIncompleteError as error:
-            message = (
-                "The local-file copy exceeds its byte limit."
-                if error.reason == "byte_limit"
-                else "The local file changed after its catalog snapshot."
-            )
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                message,
-                {
-                    "reason": error.reason,
-                    "completed_rows": 0,
-                    "completed_columns": 0,
-                    "completed_bytes": error.completed_bytes,
-                },
-            ) from error
-        except TimeoutError as error:
-            raise ArtifactError(
-                "artifact_incomplete_export",
-                "The local-file copy exceeded its execution-time limit.",
-                {
-                    "reason": "time_limit",
-                    "completed_rows": 0,
-                    "completed_columns": 0,
-                    "completed_bytes": 0,
-                },
-            ) from error
-        if result.source_id != source_id or result.resource_id != resource_id:
-            raise ValueError("local-file backend returned different resource scope")
-        safe_filename = canonical_artifact_filename(
-            filename or result.filename,
-            result.media_type,
-            LOCAL_FILE_COPY_ALLOWED_EXTENSIONS,
-        )
-        draft = ArtifactDraft(
-            content=result.content,
-            suggested_filename=safe_filename,
-            media_type=result.media_type,
-            sensitivity=resolved_exact_export_sensitivity((result.sensitivity,)),
-            provenance=ArtifactProvenance(
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                resource_bindings=(
-                    ArtifactResourceBinding(
-                        source_id=result.source_id,
-                        source_revision=result.source_revision,
-                        resource_id=result.resource_id,
-                        resource_revision=result.resource_revision,
-                    ),
-                ),
-            ),
-        )
-        return ToolOutput(
-            kind=LOCAL_FILE_COPY_OUTPUT_KIND,
-            data={
-                "format": result.format,
-                "filename": safe_filename,
-                "byte_size": len(result.content),
-            },
-            artifact=draft,
-        )
-
-
 class ArtifactListExecutor:
     executor_id = ARTIFACT_LIST_EXECUTOR_ID
 
@@ -612,12 +438,7 @@ class ArtifactReadExecutor:
                     "truncated": len(rows) < len(data.rows),
                 },
             )
-        if payload.ref.media_type not in {
-            "application/json",
-            "text/csv",
-            "text/markdown",
-            "text/plain",
-        }:
+        if payload.ref.media_type not in TEXT_EDIT_MEDIA_TYPES:
             raise ArtifactError(
                 "artifact_invalid_format",
                 "This artifact format does not support a model preview.",
@@ -740,6 +561,72 @@ class ArtifactConvertExecutor:
         )
 
 
+class ArtifactEditTextExecutor:
+    executor_id = ARTIFACT_EDIT_TEXT_EXECUTOR_ID
+
+    def __init__(self, workspace: LocalWorkspaceBackend) -> None:
+        self._workspace = workspace
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        token = request.arguments["binding"]
+        replacements = request.arguments["replacements"]
+        assert isinstance(token, str)
+        assert isinstance(replacements, tuple)
+        observation = await self._workspace.observe_bound_text(
+            run_id=request.run_id,
+            token=token,
+        )
+        transformed = await asyncio.to_thread(
+            apply_bounded_text_edits,
+            source=observation.content,
+            relative_path=observation.binding.relative_path,
+            replacements=tuple(
+                item for item in replacements if isinstance(item, Mapping)
+            ),
+        )
+        summary = transformed.summary
+        binding = ArtifactLocalFileBinding(
+            workspace_id=observation.binding.workspace_id,
+            relative_path=observation.binding.relative_path,
+            original_physical_revision=observation.binding.physical_revision,
+            observed_content_sha256=observation.content_sha256,
+            source_byte_size=len(observation.content),
+            change_summary=summary,
+        )
+        filename = observation.binding.relative_path.rsplit("/", 1)[-1]
+        sensitivity = Sensitivity(self._workspace.sensitivity.value)
+        draft = ArtifactDraft(
+            content=transformed.content,
+            suggested_filename=filename,
+            media_type=transformed.media_type,
+            sensitivity=sensitivity,
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+                local_file_binding=binding,
+            ),
+        )
+        return ToolOutput(
+            kind=ARTIFACT_EDIT_TEXT_OUTPUT_KIND,
+            data={
+                "relative_path": binding.relative_path,
+                "filename": filename,
+                "original_physical_revision": binding.original_physical_revision,
+                "observed_content_sha256": binding.observed_content_sha256,
+                "source_byte_size": binding.source_byte_size,
+                "result_byte_size": len(transformed.content),
+                "change_summary": artifact_text_change_summary_to_mapping(summary),
+            },
+            artifact=draft,
+            sensitivity=ModelSensitivity(self._workspace.sensitivity.value),
+            sensitivity_provenance={
+                "authority": "local_workspace_binding",
+                "workspace_id": self._workspace.workspace_id,
+                "relative_paths": (binding.relative_path,),
+                "physical_revisions": (binding.original_physical_revision,),
+            },
+        )
+
+
 async def _read_conversation_artifact(
     artifacts: AgentHomeArtifactStore,
     conversation_id: str,
@@ -790,28 +677,34 @@ class ArtifactSaveLocalExecutor:
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
         artifact_id = request.arguments["artifact_id"]
-        destination_id = request.arguments["destination_id"]
+        mode = request.arguments["mode"]
+        destination_id = request.arguments.get("destination_id")
         filename = request.arguments.get("filename")
         assert isinstance(artifact_id, str)
-        assert isinstance(destination_id, str)
+        assert isinstance(mode, str)
+        assert destination_id is None or isinstance(destination_id, str)
         assert filename is None or isinstance(filename, str)
         return await self._delivery.preflight_save(
             run_id=request.run_id,
             artifact_id=artifact_id,
+            mode=mode,
             destination_id=destination_id,
             filename=filename,
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         artifact_id = request.arguments["artifact_id"]
-        destination_id = request.arguments["destination_id"]
+        mode = request.arguments["mode"]
+        destination_id = request.arguments.get("destination_id")
         filename = request.arguments.get("filename")
         assert isinstance(artifact_id, str)
-        assert isinstance(destination_id, str)
+        assert isinstance(mode, str)
+        assert destination_id is None or isinstance(destination_id, str)
         assert filename is None or isinstance(filename, str)
         receipt = await self._delivery.save_committed(
             run_id=request.run_id,
             artifact_id=artifact_id,
+            mode=mode,
             destination_id=destination_id,
             filename=filename,
         )
@@ -843,34 +736,47 @@ class ArtifactSetExportLocationExecutor:
 
 
 def artifact_declarations(
-    delivery: LocalArtifactDelivery,
+    delivery: LocalArtifactDelivery | None,
     artifacts: AgentHomeArtifactStore,
     *,
+    workspace: LocalWorkspaceBackend | None,
     agent_id: str,
-    local_file_backend: LocalFileCopyBackend,
     sqlite_backend: ExactTabularExportBackend,
     postgresql_backend: ExactTabularExportBackend,
     clock: Callable[[], datetime],
 ) -> ArtifactCapabilityDeclarations:
-    declarations = artifact_capability_declarations()
+    include_local_delivery = delivery is not None
+    declarations = artifact_capability_declarations(
+        include_local_delivery=include_local_delivery,
+        include_local_edit=workspace is not None,
+    )
+    delivery_executors: tuple[Executor, ...] = ()
+    if delivery is not None:
+        delivery_executors = (
+            ArtifactSaveLocalExecutor(delivery),
+            ArtifactSetExportLocationExecutor(delivery),
+        )
     return ArtifactCapabilityDeclarations(
         capabilities=declarations.capabilities,
         executors=(
             DocumentArtifactExecutor(),
-            LocalFileCopyExecutor(agent_id, local_file_backend),
             SQLiteTabularExportExecutor(agent_id, sqlite_backend, clock=clock),
             PostgreSQLTabularExportExecutor(agent_id, postgresql_backend, clock=clock),
             ArtifactListExecutor(artifacts),
             ArtifactReadExecutor(artifacts),
             ArtifactConvertExecutor(artifacts),
-            ArtifactSaveLocalExecutor(delivery),
-            ArtifactSetExportLocationExecutor(delivery),
+            *((ArtifactEditTextExecutor(workspace),) if workspace is not None else ()),
+            *delivery_executors,
         ),
         tool_views=declarations.tool_views,
     )
 
 
-def artifact_capability_declarations() -> CapabilityDeclarations:
+def artifact_capability_declarations(
+    *,
+    include_local_delivery: bool = True,
+    include_local_edit: bool = True,
+) -> CapabilityDeclarations:
     document = Capability(
         id=DOCUMENT_CREATE_CAPABILITY_ID,
         description=(
@@ -922,47 +828,6 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
         capability_id=POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         executor_id=POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID,
         adapter_name="PostgreSQL",
-    )
-    local_file_copy = Capability(
-        id=LOCAL_FILE_COPY_CAPABILITY_ID,
-        description=(
-            "Create one byte-identical artifact from a current attached cataloged "
-            "CSV or JSON resource without conversion or preview serialization."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "source_id": {"type": "string", "minLength": 1, "maxLength": 512},
-                "resource_id": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 512,
-                },
-                "filename": {"type": "string", "minLength": 1, "maxLength": 120},
-            },
-            "required": ["source_id", "resource_id"],
-            "additionalProperties": False,
-        },
-        output_kind=LOCAL_FILE_COPY_OUTPUT_KIND,
-        output_schema={
-            "type": "object",
-            "properties": {
-                "format": {"type": "string", "enum": ["csv", "json"]},
-                "filename": {"type": "string"},
-                "byte_size": {"type": "integer", "minimum": 1},
-            },
-            "required": ["format", "filename", "byte_size"],
-            "additionalProperties": False,
-        },
-        executor_id=LOCAL_FILE_COPY_EXECUTOR_ID,
-        artifact_policy=ArtifactPolicy(
-            allowed_media_types=frozenset({"text/csv", "application/json"}),
-            allowed_extensions=LOCAL_FILE_COPY_ALLOWED_EXTENSIONS,
-            artifact_required=True,
-            max_artifact_count=1,
-            max_bytes_per_artifact=MAX_ARTIFACT_BYTES,
-            max_total_bytes_per_call=MAX_ARTIFACT_BYTES,
-        ),
     )
     artifact_list = Capability(
         id=ARTIFACT_LIST_CAPABILITY_ID,
@@ -1085,12 +950,101 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
             max_total_bytes_per_call=MAX_CSV_BYTES,
         ),
     )
+    artifact_edit_text = Capability(
+        id=ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
+        description=(
+            "Apply one bounded ordered exact UTF-8 text replacement family to an "
+            "authenticated current-run file_read binding and commit the complete "
+            "result as an internal artifact without changing the workspace file. "
+            "Copy file_read data.binding verbatim; it is opaque and must never be "
+            "decoded, normalized, or reconstructed."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "binding": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8 * 1024,
+                    "description": (
+                        "The exact opaque file_read data.binding string copied "
+                        "verbatim without decoding, normalization, or reconstruction."
+                    ),
+                },
+                "replacements": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_TEXT_EDIT_OPERATIONS,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "old_text": {
+                                "type": "string",
+                                "minLength": 1,
+                                "maxLength": MAX_TEXT_EDIT_ANCHOR_BYTES,
+                            },
+                            "new_text": {
+                                "type": "string",
+                                "maxLength": MAX_TEXT_EDIT_REPLACEMENT_BYTES,
+                            },
+                            "expected_occurrences": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": MAX_TEXT_EDIT_OCCURRENCES,
+                            },
+                        },
+                        "required": [
+                            "old_text",
+                            "new_text",
+                            "expected_occurrences",
+                        ],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["binding", "replacements"],
+            "additionalProperties": False,
+        },
+        output_kind=ARTIFACT_EDIT_TEXT_OUTPUT_KIND,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "relative_path": {"type": "string"},
+                "filename": {"type": "string"},
+                "original_physical_revision": {"type": "string"},
+                "observed_content_sha256": {"type": "string"},
+                "source_byte_size": {"type": "integer", "minimum": 0},
+                "result_byte_size": {"type": "integer", "minimum": 0},
+                "change_summary": _change_summary_schema(),
+            },
+            "required": [
+                "relative_path",
+                "filename",
+                "original_physical_revision",
+                "observed_content_sha256",
+                "source_byte_size",
+                "result_byte_size",
+                "change_summary",
+            ],
+            "additionalProperties": False,
+        },
+        executor_id=ARTIFACT_EDIT_TEXT_EXECUTOR_ID,
+        artifact_policy=ArtifactPolicy(
+            allowed_media_types=TEXT_EDIT_MEDIA_TYPES,
+            allowed_extensions=TEXT_EDIT_ALLOWED_EXTENSIONS,
+            artifact_required=True,
+            max_artifact_count=1,
+            max_bytes_per_artifact=MAX_TEXT_EDIT_BYTES,
+            max_total_bytes_per_call=MAX_TEXT_EDIT_BYTES,
+        ),
+        access_mode=AccessMode.READ,
+    )
     save = Capability(
         id=ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
         description=(
-            "Complete local delivery of one committed internal artifact to the "
-            "effective default or an exact authorized destination without overwrite; "
-            "only this tool's successful receipt proves the local file exists."
+            "Publish one committed artifact either as a collision-safe new file in "
+            "an authorized destination or as an atomic replacement of only the exact "
+            "unchanged workspace file bound into a text-edit artifact."
         ),
         input_schema={
             "type": "object",
@@ -1098,6 +1052,10 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
                 "artifact_id": {
                     "type": "string",
                     "pattern": "^artifact-[0-9a-f]{32}$",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["create_new", "replace_bound_file"],
                 },
                 "destination_id": {
                     "type": "string",
@@ -1110,7 +1068,7 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
                     "maxLength": 120,
                 },
             },
-            "required": ["artifact_id", "destination_id"],
+            "required": ["artifact_id", "mode"],
             "additionalProperties": False,
         },
         output_kind=ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
@@ -1145,126 +1103,149 @@ def artifact_capability_declarations() -> CapabilityDeclarations:
     )
     capabilities = (
         document,
-        local_file_copy,
         sqlite_tabular,
         postgresql_tabular,
         artifact_list,
         artifact_read,
         artifact_convert,
-        save,
-        set_location,
+        *((artifact_edit_text,) if include_local_edit else ()),
+        *((save, set_location) if include_local_delivery else ()),
     )
     views = (
         ToolView(
             name=DOCUMENT_CREATE_TOOL_NAME,
             capability_id=document.id,
             description=document.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Create a bounded Markdown or text document artifact.",
                 when_to_use="Use when the requested deliverable is a document.",
                 keywords=("artifact", "document", "markdown", "text"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=800,
-            ),
-        ),
-        ToolView(
-            name=LOCAL_FILE_COPY_TOOL_NAME,
-            capability_id=local_file_copy.id,
-            description=local_file_copy.description,
-            discovery=ToolDiscoveryMetadata(
-                summary="Copy one attached CSV or JSON file into an artifact.",
-                when_to_use="Use for byte-identical export of an attached data file.",
-                keywords=("artifact", "export", "file", "copy"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=770,
             ),
         ),
         ToolView(
             name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
             capability_id=sqlite_tabular.id,
             description=sqlite_tabular.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Export an exact SQLite query result as CSV or XLSX.",
                 when_to_use="Use for a downloadable tabular SQLite result.",
                 keywords=("artifact", "export", "sqlite", "csv", "xlsx"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=790,
             ),
         ),
         ToolView(
             name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
             capability_id=postgresql_tabular.id,
             description=postgresql_tabular.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Export an exact PostgreSQL query result as CSV or XLSX.",
                 when_to_use="Use for a downloadable tabular PostgreSQL result.",
                 keywords=("artifact", "export", "postgresql", "csv", "xlsx"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=790,
             ),
         ),
         ToolView(
             name=ARTIFACT_LIST_TOOL_NAME,
             capability_id=artifact_list.id,
             description=artifact_list.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.PINNED,
+                text_trust=ToolTextTrust.CODE,
                 summary="List bounded safe metadata for current-conversation artifacts.",
                 when_to_use="Use to identify an artifact created earlier in the conversation.",
                 keywords=("artifact", "list", "conversation", "file"),
-                exposure_class=ToolExposureClass.CORE,
-                eager_priority=920,
             ),
         ),
         ToolView(
             name=ARTIFACT_READ_TOOL_NAME,
             capability_id=artifact_read.id,
             description=artifact_read.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.PINNED,
+                text_trust=ToolTextTrust.CODE,
                 summary="Read a bounded safe preview of one exact agent-owned artifact.",
                 when_to_use=(
                     "Use with an exact known artifact ID, including one returned by "
                     "job_read_results."
                 ),
                 keywords=("artifact", "read", "preview", "file"),
-                exposure_class=ToolExposureClass.CORE,
-                eager_priority=910,
             ),
         ),
         ToolView(
             name=ARTIFACT_CONVERT_TOOL_NAME,
             capability_id=artifact_convert.id,
             description=artifact_convert.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
                 summary="Convert a verified Daita XLSX Data snapshot to CSV.",
                 when_to_use="Use for exact supported conversion of an existing artifact.",
                 keywords=("artifact", "convert", "xlsx", "csv"),
-                exposure_class=ToolExposureClass.CORE,
-                eager_priority=900,
             ),
         ),
-        ToolView(
-            name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
-            capability_id=save.id,
-            description=save.description,
-            discovery=ToolDiscoveryMetadata(
-                summary="Deliver one committed artifact to an authorized local destination.",
-                when_to_use="Use after artifact creation when local delivery is required.",
-                keywords=("artifact", "save", "deliver", "local"),
-                exposure_class=ToolExposureClass.CORE,
-                eager_priority=890,
-            ),
+        *(
+            (
+                ToolView(
+                    name=ARTIFACT_EDIT_TEXT_TOOL_NAME,
+                    capability_id=artifact_edit_text.id,
+                    description=artifact_edit_text.description,
+                    presentation=ToolPresentation(
+                        toolbox_id=ToolboxId.ARTIFACTS,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
+                        summary="Prepare a bounded exact UTF-8 workspace-file edit artifact.",
+                        when_to_use=(
+                            "Use only with an authenticated binding returned by file_read; "
+                            "then use artifact_save_local in replace_bound_file mode."
+                        ),
+                        keywords=("artifact", "edit", "text", "replace", "workspace"),
+                    ),
+                ),
+            )
+            if include_local_edit
+            else ()
         ),
-        ToolView(
-            name=ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-            capability_id=set_location.id,
-            description=set_location.description,
-            discovery=ToolDiscoveryMetadata(
-                summary="Set an authorized destination as the future export default.",
-                when_to_use="Use only when the user explicitly changes the persistent default.",
-                keywords=("artifact", "destination", "export", "default"),
-                exposure_class=ToolExposureClass.STANDARD,
-                eager_priority=500,
-            ),
+        *(
+            (
+                ToolView(
+                    name=ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+                    capability_id=save.id,
+                    description=save.description,
+                    presentation=ToolPresentation(
+                        toolbox_id=ToolboxId.ARTIFACTS,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
+                        summary="Deliver one committed artifact to an authorized local destination.",
+                        when_to_use="Use after artifact creation when local delivery is required.",
+                        keywords=("artifact", "save", "deliver", "local"),
+                    ),
+                ),
+                ToolView(
+                    name=ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+                    capability_id=set_location.id,
+                    description=set_location.description,
+                    presentation=ToolPresentation(
+                        toolbox_id=ToolboxId.ARTIFACTS,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
+                        summary="Set an authorized destination as the future export default.",
+                        when_to_use="Use only when the user explicitly changes the persistent default.",
+                        keywords=("artifact", "destination", "export", "default"),
+                    ),
+                ),
+            )
+            if include_local_delivery
+            else ()
         ),
     )
     return CapabilityDeclarations(
@@ -1287,30 +1268,31 @@ _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
 _ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
-        LOCAL_FILE_COPY_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
+        ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
     }
 )
 _ARTIFACT_ADAPTER_CAPABILITIES = {
-    "local-directory": frozenset({LOCAL_FILE_COPY_CAPABILITY_ID}),
     "sqlite": frozenset({SQLITE_TABULAR_EXPORT_CAPABILITY_ID}),
     "postgresql": frozenset({POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}),
 }
-_ARTIFACT_CAPABILITIES = frozenset(
+_BASE_ARTIFACT_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
-        LOCAL_FILE_COPY_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_LIST_CAPABILITY_ID,
         ARTIFACT_READ_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
-        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
-        ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     }
 )
+_LOCAL_DELIVERY_CAPABILITIES = frozenset(
+    {ARTIFACT_SAVE_LOCAL_CAPABILITY_ID, ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID}
+)
+LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS = frozenset({ARTIFACT_EDIT_TEXT_CAPABILITY_ID})
+LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS = frozenset({ARTIFACT_EDIT_TEXT_EXECUTOR_ID})
 
 
 class ArtifactDomainCatalog(Protocol):
@@ -1369,19 +1351,38 @@ class ArtifactCapabilityDomain:
         catalog: ArtifactDomainCatalog,
         transcripts: ArtifactTranscriptReader,
         artifacts: AgentHomeArtifactStore,
-        delivery: LocalArtifactDelivery,
+        delivery: LocalArtifactDelivery | None,
+        workspace: LocalWorkspaceBackend | None,
         learning: LearningCandidateGuard,
+        *,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("artifact declarations have the wrong domain owner")
-        if {item.id for item in declarations.capabilities} != _ARTIFACT_CAPABILITIES:
+        declared_ids = {item.id for item in declarations.capabilities}
+        expected_ids = _BASE_ARTIFACT_CAPABILITIES
+        if delivery is not None:
+            expected_ids |= _LOCAL_DELIVERY_CAPABILITIES
+        if workspace is not None:
+            expected_ids |= LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
+        if declared_ids != expected_ids:
             raise ValueError("artifact domain requires its exact capabilities")
+        if bool(declared_ids & _LOCAL_DELIVERY_CAPABILITIES) != (delivery is not None):
+            raise ValueError("artifact local delivery composition is inconsistent")
+        if bool(declared_ids & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS) != (
+            workspace is not None
+        ):
+            raise ValueError("artifact local edit composition is inconsistent")
         self._declarations = declarations
         self._catalog = catalog
         self._transcripts = transcripts
         self._artifacts = artifacts
         self._delivery = delivery
+        self._workspace = workspace
         self._learning = learning
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -1390,9 +1391,13 @@ class ArtifactCapabilityDomain:
         return self._declarations
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
-        facts = await self._catalog.source_routing_facts(
-            run.agent_id,
-            (() if run.source_id is None else (run.source_id,)),
+        facts = (
+            ()
+            if run.id in self._files_only_run_ids
+            else await self._catalog.source_routing_facts(
+                run.agent_id,
+                (() if run.source_id is None else (run.source_id,)),
+            )
         )
         adapters = {
             adapter_id
@@ -1439,6 +1444,16 @@ class ArtifactCapabilityDomain:
         names: list[str] = []
         for view in candidates:
             capability = self._capabilities[view.capability_id]
+            if capability.id in LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS and (
+                self._workspace is None
+                or run.origin is not RunOrigin.USER
+                or run.execution_scope is not None
+            ):
+                continue
+            if capability.id in _LOCAL_DELIVERY_CAPABILITIES and (
+                run.origin is not RunOrigin.USER or run.execution_scope is not None
+            ):
+                continue
             if (
                 capability.id in _CONVERSATION_ARTIFACT_CAPABILITIES
                 and not may_have_current_artifact
@@ -1462,6 +1477,7 @@ class ArtifactCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> Mapping[str, object]:
+        del capability
         return arguments
 
     async def prepare_call(
@@ -1474,6 +1490,38 @@ class ArtifactCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
+        if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
+            if (
+                self._workspace is None
+                or run.origin is not RunOrigin.USER
+                or run.execution_scope is not None
+            ):
+                raise CapabilityInputError(
+                    "workspace_unavailable",
+                    "Workspace text editing is unavailable for this run.",
+                )
+            token = arguments.get("binding")
+            if not isinstance(token, str):
+                raise CapabilityInputError(
+                    "artifact_edit_binding_invalid",
+                    "Text editing requires an authenticated current-run file binding.",
+                )
+            try:
+                binding = self._workspace.authenticate_file_binding(
+                    run_id=run.id,
+                    token=token,
+                )
+                text_edit_media_type(binding.relative_path)
+            except LocalWorkspaceError as error:
+                raise CapabilityInputError(
+                    "artifact_edit_binding_invalid",
+                    "The file binding is invalid or no longer available.",
+                ) from error
+            except ArtifactError as error:
+                raise CapabilityInputError(
+                    error.code, error.message, error.details
+                ) from error
+            return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
         supplied_source_id = arguments.get("source_id")
@@ -1513,10 +1561,7 @@ class ArtifactCapabilityDomain:
                     {"artifact_id": artifact_id},
                 )
             if capability.id == ARTIFACT_READ_CAPABILITY_ID and ref.media_type not in {
-                "application/json",
-                "text/csv",
-                "text/markdown",
-                "text/plain",
+                *TEXT_EDIT_MEDIA_TYPES,
                 XLSX_MEDIA_TYPE,
             }:
                 raise CapabilityInputError(
@@ -1535,26 +1580,47 @@ class ArtifactCapabilityDomain:
                     "to CSV.",
                     {"media_type": ref.media_type, "allowed_extensions": (".xlsx",)},
                 )
+        if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID:
+            mode = arguments.get("mode")
+            names = set(arguments)
+            if mode == "create_new":
+                if "destination_id" not in names or names - {
+                    "artifact_id",
+                    "mode",
+                    "destination_id",
+                    "filename",
+                }:
+                    raise CapabilityInputError(
+                        "artifact_delivery_invalid",
+                        "create_new requires one authorized destination and optional filename.",
+                    )
+            elif mode == "replace_bound_file":
+                if names != {"artifact_id", "mode"}:
+                    raise CapabilityInputError(
+                        "artifact_edit_binding_invalid",
+                        "replace_bound_file accepts only the committed artifact ID.",
+                    )
+                artifact_id = arguments.get("artifact_id")
+                ref = (
+                    await self._artifacts.find_ref(artifact_id)
+                    if isinstance(artifact_id, str)
+                    else None
+                )
+                if (
+                    ref is None
+                    or ref.capability_id != ARTIFACT_EDIT_TEXT_CAPABILITY_ID
+                    or ref.provenance.local_file_binding is None
+                ):
+                    raise CapabilityInputError(
+                        "artifact_edit_binding_invalid",
+                        "replace_bound_file requires one committed bound edit artifact.",
+                    )
+            else:
+                raise CapabilityInputError(
+                    "artifact_delivery_invalid", "Artifact delivery mode is invalid."
+                )
         if capability.id in _EXACT_TABULAR_CAPABILITIES:
             await self._validate_sql(run, capability, arguments)
-        if capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
-            source_id = arguments.get("source_id")
-            resource_id = arguments.get("resource_id")
-            if (
-                not isinstance(source_id, str)
-                or not isinstance(resource_id, str)
-                or not await self._catalog.is_current_tabular_file(
-                    run.agent_id,
-                    source_id,
-                    resource_id,
-                )
-            ):
-                raise CapabilityInputError(
-                    "file_not_current_or_tabular",
-                    "The selected file is not a current tabular catalog resource.",
-                    {"source_id": source_id, "resource_id": resource_id},
-                )
-            await self._require_readable(run, source_id, (resource_id,))
         return arguments
 
     async def side_effect_plan(
@@ -1566,11 +1632,21 @@ class ArtifactCapabilityDomain:
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
         if capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID:
+            if fingerprint.get("mode") == "replace_bound_file":
+                assert self._delivery is not None
+                return SideEffectPlan(
+                    approval_required=True,
+                    approval_arguments=fingerprint,
+                    approval_reason=self._delivery.approval_prompt_for_bound_replacement(
+                        fingerprint
+                    ),
+                )
             return SideEffectPlan(
                 approval_required=fingerprint.get("requires_approval") is not False,
                 approval_arguments=fingerprint,
             )
         if capability.id == ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID:
+            assert self._delivery is not None
             return SideEffectPlan(
                 approval_arguments=fingerprint,
                 approval_reason=self._delivery.approval_prompt_for_default(fingerprint),
@@ -1599,7 +1675,10 @@ class ArtifactCapabilityDomain:
                     output.artifact,
                 ),
             )
-        if capability.operational_effect is not OperationalEffect.NONE:
+        if capability.operational_effect is not OperationalEffect.NONE and not (
+            capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
+            and output.data.get("outcome") == "failed"
+        ):
             self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
@@ -1639,6 +1718,13 @@ class ArtifactCapabilityDomain:
         call: ToolCall,
         error: BaseException,
     ) -> CapabilityFailure | None:
+        if isinstance(error, LocalWorkspaceError):
+            code = error.code
+            if code in {"file_binding_invalid", "file_binding_expired"}:
+                code = "artifact_edit_binding_invalid"
+            elif code in {"file_too_large", "file_edit_timeout"}:
+                code = "artifact_edit_limited"
+            return CapabilityFailure(code, error.message, error.details)
         return None
 
     def _validate_artifact_summary(
@@ -1649,6 +1735,27 @@ class ArtifactCapabilityDomain:
         draft = output.artifact
         assert draft is not None
         if draft.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA:
+            if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
+                binding = draft.provenance.local_file_binding
+                valid = (
+                    binding is not None
+                    and output.data.get("relative_path") == binding.relative_path
+                    and output.data.get("filename") == draft.suggested_filename
+                    and output.data.get("original_physical_revision")
+                    == binding.original_physical_revision
+                    and output.data.get("observed_content_sha256")
+                    == binding.observed_content_sha256
+                    and output.data.get("source_byte_size") == binding.source_byte_size
+                    and output.data.get("result_byte_size") == len(draft.content)
+                    and output.data.get("change_summary")
+                    == FrozenJsonObject.from_mapping(
+                        artifact_text_change_summary_to_mapping(binding.change_summary)
+                    )
+                )
+                if not valid:
+                    raise ToolOutputValidationError(
+                        "artifact edit summary differs from its execution provenance"
+                    )
             return
         if capability.id in _EXACT_TABULAR_CAPABILITIES:
             valid = (
@@ -1656,12 +1763,6 @@ class ArtifactCapabilityDomain:
                 and output.data.get("filename") == draft.suggested_filename
                 and output.data.get("row_count") == draft.provenance.row_count
                 and output.data.get("column_count") == len(draft.provenance.columns)
-            )
-        elif capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
-            valid = (
-                output.data.get("format") in {"csv", "json"}
-                and output.data.get("filename") == draft.suggested_filename
-                and output.data.get("byte_size") == len(draft.content)
             )
         elif capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
             valid = (
@@ -1689,6 +1790,8 @@ class ArtifactCapabilityDomain:
         draft: ArtifactDraft,
     ) -> ArtifactDraft:
         provenance = draft.provenance
+        if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
+            return self._bind_local_edit(run, arguments, draft)
         if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
             if capability.id in _EXACT_TABULAR_CAPABILITIES:
                 return await self._bind_exact_export(
@@ -1697,8 +1800,6 @@ class ArtifactCapabilityDomain:
                     arguments,
                     draft,
                 )
-            if capability.id == LOCAL_FILE_COPY_CAPABILITY_ID:
-                return await self._bind_file_copy(run, arguments, draft)
             if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
                 return await self._bind_conversion(run, arguments, draft)
             raise ToolOutputValidationError(
@@ -1755,7 +1856,7 @@ class ArtifactCapabilityDomain:
             if block.output.get("kind") not in {
                 "data.sqlite.query_result",
                 "data.postgresql.query_result",
-                "data.file.read_result",
+                "data.local_file.read_result",
             }:
                 raise CapabilityInputError(
                     "invalid_argument_value",
@@ -1769,6 +1870,10 @@ class ArtifactCapabilityDomain:
                     "Artifact evidence result data is unavailable.",
                     {"name": "evidence_call_ids", "call_id": call_id},
                 )
+            if block.sensitivity is not None:
+                sensitivities.append(Sensitivity(block.sensitivity.value))
+            if block.output.get("kind") == "data.local_file.read_result":
+                continue
             source_id = data.get("source_id")
             source_revision = data.get("source_revision")
             if not isinstance(source_id, str) or not isinstance(source_revision, str):
@@ -1777,27 +1882,14 @@ class ArtifactCapabilityDomain:
                     "Artifact evidence source identity is unavailable.",
                     {"name": "evidence_call_ids", "call_id": call_id},
                 )
-            resources: tuple[tuple[str, str], ...]
-            if block.output.get("kind") == "data.file.read_result":
-                resource_id = data.get("resource_id")
-                resource_revision = data.get("resource_revision")
-                resources = (
-                    ((resource_id, resource_revision),)
-                    if isinstance(resource_id, str)
-                    and isinstance(resource_revision, str)
-                    else ()
-                )
-            else:
-                raw_revisions = data.get("resource_revisions")
-                resources = tuple(
-                    (resource_id, revision)
-                    for item in (
-                        raw_revisions if isinstance(raw_revisions, tuple) else ()
-                    )
-                    if isinstance(item, Mapping)
-                    and isinstance((resource_id := item.get("resource_id")), str)
-                    and isinstance((revision := item.get("revision")), str)
-                )
+            raw_revisions = data.get("resource_revisions")
+            resources = tuple(
+                (resource_id, revision)
+                for item in (raw_revisions if isinstance(raw_revisions, tuple) else ())
+                if isinstance(item, Mapping)
+                and isinstance((resource_id := item.get("resource_id")), str)
+                and isinstance((revision := item.get("revision")), str)
+            )
             schemas = schema_cache.get(source_id)
             if schemas is None:
                 schemas = {
@@ -1847,6 +1939,46 @@ class ArtifactCapabilityDomain:
                 resource_bindings=tuple(bindings[key] for key in sorted(bindings)),
             ),
         )
+
+    def _bind_local_edit(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        if (
+            self._workspace is None
+            or run.origin is not RunOrigin.USER
+            or run.execution_scope is not None
+        ):
+            raise ToolOutputValidationError(
+                "artifact local edit lacks workspace authority"
+            )
+        token = arguments.get("binding")
+        if not isinstance(token, str):
+            raise ToolOutputValidationError(
+                "artifact local edit binding is unavailable"
+            )
+        authenticated = self._workspace.authenticate_file_binding(
+            run_id=run.id,
+            token=token,
+        )
+        binding = draft.provenance.local_file_binding
+        if (
+            binding is None
+            or binding.workspace_id != self._workspace.workspace_id
+            or binding.workspace_id != authenticated.workspace_id
+            or binding.relative_path != authenticated.relative_path
+            or binding.original_physical_revision != authenticated.physical_revision
+            or binding.source_byte_size != authenticated.size_bytes
+            or draft.suggested_filename
+            != authenticated.relative_path.rsplit("/", 1)[-1]
+            or draft.sensitivity is not Sensitivity(self._workspace.sensitivity.value)
+        ):
+            raise ToolOutputValidationError(
+                "artifact local edit differs from its authenticated source binding"
+            )
+        return draft
 
     async def _bind_exact_export(
         self,
@@ -1945,78 +2077,6 @@ class ArtifactCapabilityDomain:
         return replace(
             draft,
             provenance=replace(provenance, resource_bindings=bindings),
-        )
-
-    async def _bind_file_copy(
-        self,
-        run: RunInput,
-        arguments: Mapping[str, object],
-        draft: ArtifactDraft,
-    ) -> ArtifactDraft:
-        source_id = arguments.get("source_id")
-        resource_id = arguments.get("resource_id")
-        if not isinstance(source_id, str) or not isinstance(resource_id, str):
-            raise ToolOutputValidationError(
-                "local-file copy execution arguments are unavailable"
-            )
-        provenance = draft.provenance
-        if len(provenance.resource_bindings) != 1:
-            raise ToolOutputValidationError(
-                "local-file copy provenance differs from byte-copy facts"
-            )
-        binding = provenance.resource_bindings[0]
-        identity = await self._catalog.resource_identity(run.agent_id, resource_id)
-        if (
-            await self._catalog.source_adapter_id(run.agent_id, source_id)
-            != "local-directory"
-            or identity != (source_id, "file", binding.resource_revision)
-            or not await self._catalog.is_current_tabular_file(
-                run.agent_id,
-                source_id,
-                resource_id,
-            )
-        ):
-            raise _incomplete_export(draft, "catalog_changed")
-        schema = next(
-            (
-                item
-                for item in await self._catalog.resource_schemas(
-                    run.agent_id,
-                    source_id,
-                )
-                if item.resource_id == resource_id
-            ),
-            None,
-        )
-        if (
-            schema is None
-            or schema.revision is None
-            or schema.source_revision is None
-            or schema.revision != binding.resource_revision
-            or schema.source_revision != binding.source_revision
-            or binding.source_id != source_id
-            or binding.resource_id != resource_id
-        ):
-            raise _incomplete_export(draft, "catalog_changed")
-        try:
-            sensitivity = Sensitivity(schema.sensitivity_class)
-        except ValueError:
-            sensitivity = Sensitivity.RESTRICTED
-        if draft.sensitivity is not _resolved_sensitivity((sensitivity,)):
-            raise _incomplete_export(draft, "catalog_changed")
-        return replace(
-            draft,
-            provenance=ArtifactProvenance(
-                authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                resource_bindings=(
-                    ArtifactResourceBinding(
-                        source_id=source_id,
-                        source_revision=schema.source_revision,
-                        resource_id=resource_id,
-                        resource_revision=schema.revision,
-                    ),
-                ),
-            ),
         )
 
     async def _bind_conversion(
@@ -2265,11 +2325,43 @@ def _receipt_schema() -> dict[str, object]:
         "sha256": "string",
         "renamed_for_collision": "boolean",
         "delivered_at": "string",
+        "mode": "string",
+        "outcome": "string",
+    }
+    optional_types = {
+        "workspace_id": "string",
+        "relative_path": "string",
+        "prior_physical_revision": "string",
+        "result_physical_revision": "string",
+        "failure_code": "string",
     }
     return {
         "type": "object",
-        "properties": {name: {"type": kind} for name, kind in types.items()},
+        "properties": {
+            name: {"type": kind} for name, kind in {**types, **optional_types}.items()
+        },
         "required": list(types),
+        "additionalProperties": False,
+    }
+
+
+def _change_summary_schema() -> dict[str, object]:
+    integer_names = (
+        "operation_count",
+        "replacement_count",
+        "insertion_count",
+        "deletion_count",
+        "occurrence_count",
+        "bytes_removed",
+        "bytes_added",
+    )
+    return {
+        "type": "object",
+        "properties": {
+            **{name: {"type": "integer", "minimum": 0} for name in integer_names},
+            "description": {"type": "string"},
+        },
+        "required": [*integer_names, "description"],
         "additionalProperties": False,
     }
 
@@ -2281,7 +2373,7 @@ def _artifact_summary_schema() -> dict[str, object]:
             "artifact_id": {"type": "string"},
             "filename": {"type": "string"},
             "media_type": {"type": "string"},
-            "byte_size": {"type": "integer", "minimum": 1},
+            "byte_size": {"type": "integer", "minimum": 0},
             "sha256": {"type": "string"},
             "created_at": {"type": "string"},
             "derived_from_artifact_id": {"type": "string"},
@@ -2347,15 +2439,6 @@ __all__ = [
     "ExactTabularExportBackend",
     "ExactTabularProgress",
     "ExactTabularExportResult",
-    "LOCAL_FILE_COPY_CAPABILITY_ID",
-    "LOCAL_FILE_COPY_EXECUTOR_ID",
-    "LOCAL_FILE_COPY_OUTPUT_KIND",
-    "LOCAL_FILE_COPY_TOOL_NAME",
-    "LocalFileCopyBackend",
-    "LocalFileCopyExecutor",
-    "LocalFileCopyIncompleteError",
-    "LocalFileCopyResult",
-    "MAX_LOCAL_FILE_COPY_SECONDS",
     "POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID",
     "POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID",
     "POSTGRESQL_TABULAR_EXPORT_TOOL_NAME",

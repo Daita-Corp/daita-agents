@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita._json import canonical_json
@@ -457,7 +458,9 @@ def test_external_request_response_byte_and_depth_bounds_are_inclusive() -> None
 
 
 async def test_profile_artifact_byte_bound_is_inclusive(tmp_path: Path) -> None:
-    agent = await Agent.create("stage-b-artifact-pressure", root=tmp_path)
+    agent = await Agent.create(
+        "stage-b-artifact-pressure", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     capability, _ = agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID
     )

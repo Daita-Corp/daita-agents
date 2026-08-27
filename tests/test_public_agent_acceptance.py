@@ -2,6 +2,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
+
 from daita import (
     Agent,
     AgentEvent,
@@ -22,10 +27,9 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, ToolProjectionMode
+from daita.loop.models import LoopLimits
 
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -66,6 +70,8 @@ def _tool_results(request: ModelRequest) -> tuple[ToolResultBlock, ...]:
         for message in request.messages
         for block in message.content
         if isinstance(block, ToolResultBlock)
+        and block.output.get("kind")
+        not in {"toolbox_load_receipt", "toolbox_search_results"}
     )
 
 
@@ -111,6 +117,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         limits=EAGER_LIMITS,
         approval_handler=approve,
         observer=events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.set_memory(initial_memory)
@@ -128,12 +135,12 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         assert conversation_id
         assert first.final_text == first_answer
 
-        first_request = provider.requests[0]
+        first_request = provider.logical_requests[0]
         first_system = "\n".join(_texts(first_request, roles=(MessageRole.SYSTEM,)))
         assert initial_memory in first_system
         assert skill_description in first_system
         assert skill_instructions not in first_system
-        viewed = _tool_results(provider.requests[1])
+        viewed = _tool_results(provider.logical_requests[1])
         assert len(viewed) == 1
         viewed_data = viewed[0].output["data"]
         assert isinstance(viewed_data, Mapping)
@@ -145,7 +152,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         )
         assert follow.final_text == follow_answer
         follow_context = _texts(
-            provider.requests[2],
+            provider.logical_requests[2],
             roles=(MessageRole.USER, MessageRole.ASSISTANT),
         )
         assert first_question in follow_context
@@ -174,7 +181,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         }
         replacement_results = tuple(
             result
-            for result in _tool_results(provider.requests[4])
+            for result in _tool_results(provider.logical_requests[4])
             if result.call_id == "replace-memory"
         )
         assert len(replacement_results) == 1
@@ -196,6 +203,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         model_profile=_profile(reopened_provider),
         approval_handler=approve,
         observer=events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert await reopened.read_memory() == updated_memory
@@ -211,7 +219,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         )
         assert cold.final_text == cold_answer
         cold_context = _texts(
-            reopened_provider.requests[0],
+            reopened_provider.logical_requests[0],
             roles=(MessageRole.USER, MessageRole.ASSISTANT),
         )
         expected_order = (
@@ -227,7 +235,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
             expected_order
         )
         cold_system = "\n".join(
-            _texts(reopened_provider.requests[0], roles=(MessageRole.SYSTEM,))
+            _texts(reopened_provider.logical_requests[0], roles=(MessageRole.SYSTEM,))
         )
         assert updated_memory in cold_system
         assert skill_description in cold_system
@@ -243,7 +251,7 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
             cold.run_id,
         )
         assert all(run.result is not None for run in runs)
-        assert tuple(len(run.transcript.messages) for run in runs) == (4, 2, 4, 2)
+        assert tuple(len(run.transcript.messages) for run in runs) == (4, 2, 6, 2)
         assert all(
             run.transcript.run.conversation_id == conversation_id for run in runs
         )
@@ -262,6 +270,9 @@ async def test_completed_mvp_public_agent_journey_survives_cold_reopen(tmp_path)
         AgentEventKind.MODEL_COMPLETED,
         AgentEventKind.RUN_COMPLETED,
         AgentEventKind.RUN_STARTED,
+        AgentEventKind.MODEL_COMPLETED,
+        AgentEventKind.TOOL_STARTED,
+        AgentEventKind.TOOL_COMPLETED,
         AgentEventKind.MODEL_COMPLETED,
         AgentEventKind.TOOL_STARTED,
         AgentEventKind.APPROVAL_REQUESTED,

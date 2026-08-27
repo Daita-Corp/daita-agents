@@ -5,13 +5,13 @@ from datetime import UTC, datetime
 
 import pytest
 from _capability_runtime_support import (
+    ContextToolProjectionAdapter,
     StaticTestDomain,
-    context_step_projection,
-    context_tool_catalog,
-    discovery_metadata,
     execute_projected,
+    presentation_metadata,
     static_registry,
 )
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject
@@ -53,13 +53,14 @@ async def _prepared_request(
     *,
     step: int,
 ) -> ModelRequest:
-    catalog = context_tool_catalog(run, tools)
+    projection = ContextToolProjectionAdapter(tools)
+    catalog = await projection.prepare_run(run)
     snapshot = await builder.prepare(run, messages, catalog)
     return builder.project(
         snapshot,
         messages,
         step=step,
-        tool_context=context_step_projection(catalog),
+        tool_context=projection.project(catalog, messages),
     )
 
 
@@ -239,6 +240,7 @@ async def test_sensitive_admitted_source_excludes_route_before_provider_io(tmp_p
         root=tmp_path,
         model=router,
         model_profile=router.model_profile,
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach(SQLiteSource(database))
@@ -275,7 +277,7 @@ async def test_validated_capability_classification_reaches_result_envelope():
         name="stage0_classified",
         capability_id=capability.id,
         description="Return one classified value.",
-        discovery=discovery_metadata(),
+        presentation=presentation_metadata(),
     )
     domain = StaticTestDomain((capability,), (view,))
     runtime = CapabilityRuntime(

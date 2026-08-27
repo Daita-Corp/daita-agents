@@ -6,6 +6,11 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
+from _capability_runtime_support import execute_projected
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita._json import FrozenJsonObject
@@ -30,12 +35,10 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import (
     LoopLimits,
     RunInput,
     ToolBatchInterruption,
-    ToolProjectionMode,
 )
 from daita.memory import MEMORY_MAX_CHARACTERS, USER_MAX_CHARACTERS
 from daita.memory.capabilities import (
@@ -57,7 +60,7 @@ from daita.skills.capabilities import (
 )
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -144,11 +147,10 @@ def _runtime(agent: Agent) -> CapabilityRuntime:
 async def _execute(agent: Agent, *calls: ToolCall):
     runtime = _runtime(agent)
     run = _run(agent)
-    catalog = await runtime.prepare_run(run)
-    return await runtime.execute_all(
+    return await execute_projected(
+        runtime,
         run,
         calls,
-        projection=runtime.project(catalog, ()),
         sensitivity=ModelSensitivity.INTERNAL,
     )
 
@@ -174,6 +176,8 @@ def _tool_results(provider: MockModelProvider) -> tuple[ToolResultBlock, ...]:
         for message in request.messages
         for block in message.content
         if isinstance(block, ToolResultBlock)
+        and block.output.get("kind")
+        not in {"toolbox_load_receipt", "toolbox_search_results"}
     )
 
 
@@ -191,7 +195,8 @@ def _tool_event_kinds(events: list[AgentEvent]) -> tuple[AgentEventKind, ...]:
     return tuple(
         event.kind
         for event in events
-        if event.kind
+        if event.data.get("tool_name") not in {"toolbox_search", "toolbox_load"}
+        and event.kind
         in {
             AgentEventKind.TOOL_STARTED,
             AgentEventKind.APPROVAL_REQUESTED,
@@ -219,6 +224,7 @@ async def _agent(
         approval_handler=approval_handler,
         observer=observer,
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
 
 
@@ -417,6 +423,7 @@ async def test_callback_exception_is_an_ordinary_tool_error_and_loop_continues(
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=broken,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("try learning")
@@ -490,25 +497,36 @@ async def test_tool_and_approval_event_sequences_are_exact_and_content_free(tmp_
         AgentEventKind.TOOL_COMPLETED,
     )
     assert sentinel not in repr([event.data for event in events])
-    assert dict(events[0].data) == {
+    tool_events = [
+        event
+        for event in events
+        if event.data.get("tool_name") not in {"toolbox_search", "toolbox_load"}
+    ]
+    assert dict(tool_events[0].data) == {
         "call_id": "write",
         "tool_name": MEMORY_SET_TOOL_NAME,
         "capability_id": MEMORY_SET_CAPABILITY_ID,
-        "invocation_mode": "direct",
+        "toolbox_id": "knowledge",
+        "load_mode": "on_demand",
+        "provider_state": "loaded",
     }
-    assert events[1].data == events[0].data
-    assert dict(events[2].data) == {
+    assert tool_events[1].data == tool_events[0].data
+    assert dict(tool_events[2].data) == {
         "call_id": "write",
         "tool_name": MEMORY_SET_TOOL_NAME,
         "capability_id": MEMORY_SET_CAPABILITY_ID,
-        "invocation_mode": "direct",
+        "toolbox_id": "knowledge",
+        "load_mode": "on_demand",
+        "provider_state": "loaded",
         "outcome": "approved",
     }
-    completed = events[3].data
+    completed = tool_events[3].data
     assert completed["call_id"] == "write"
     assert completed["tool_name"] == MEMORY_SET_TOOL_NAME
     assert completed["capability_id"] == MEMORY_SET_CAPABILITY_ID
-    assert completed["invocation_mode"] == "direct"
+    assert completed["toolbox_id"] == "knowledge"
+    assert completed["load_mode"] == "on_demand"
+    assert completed["provider_state"] == "loaded"
     assert completed["success"] is True
     assert completed["error_code"] is None
     duration_ms = completed["duration_ms"]
@@ -586,7 +604,14 @@ async def test_error_event_subsequences_and_one_completion(tmp_path, case, expec
     if case == "unavailable":
         assert "capability_id" not in events[0].data
     if case in {"denied", "failed"}:
-        assert events[2].data["outcome"] == ("denied" if case == "denied" else "failed")
+        tool_events = [
+            event
+            for event in events
+            if event.data.get("tool_name") not in {"toolbox_search", "toolbox_load"}
+        ]
+        assert tool_events[2].data["outcome"] == (
+            "denied" if case == "denied" else "failed"
+        )
 
 
 async def test_read_groups_are_parallel_and_side_effects_are_ordered_barriers(
@@ -876,6 +901,7 @@ async def test_approval_state_is_not_persisted_across_restart(tmp_path):
         model=provider,
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = (await _execute(reopened, _memory_call(content="not-approved")))[0]
@@ -903,6 +929,7 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run(
@@ -912,14 +939,17 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         assert await agent.read_memory() == content
         assert len(approvals) == 1
         assert approvals[0].arguments["content"] == content
-        assert len(provider.requests) == 2
-        assert content not in _system_text(provider.requests[1])
-        assert provider.requests[0].messages[0] == provider.requests[1].messages[0]
+        assert len(provider.logical_requests) == 2
+        assert content not in _system_text(provider.logical_requests[1])
+        assert (
+            provider.logical_requests[0].messages[0]
+            == provider.logical_requests[1].messages[0]
+        )
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"target": "memory", "replaced": True}
         )
-        prompt = _system_text(provider.requests[0])
+        prompt = _system_text(provider.logical_requests[0])
         assert "explicit durable definitions/preferences/corrections" in prompt
         assert "ordinary text ends run" in prompt
         assert "Approval card alone confirms" in prompt
@@ -948,6 +978,7 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Save this as a reusable workflow for future runs.")
@@ -957,16 +988,19 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         assert skill.instructions == "Use paid invoice date. Exclude voided invoices."
         assert len(approvals) == 1
         assert dict(approvals[0].arguments) == dict(call.arguments)
-        assert len(provider.requests) == 2
+        assert len(provider.logical_requests) == 2
         assert "- monthly-revenue: Calculate monthly revenue consistently.\n" not in (
-            _system_text(provider.requests[1])
+            _system_text(provider.logical_requests[1])
         )
-        assert provider.requests[0].messages[0] == provider.requests[1].messages[0]
+        assert (
+            provider.logical_requests[0].messages[0]
+            == provider.logical_requests[1].messages[0]
+        )
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"name": "monthly-revenue", "changed": True}
         )
-        prompt = _system_text(provider.requests[0])
+        prompt = _system_text(provider.logical_requests[0])
         assert "SKILL.md=procedures" in prompt
         assert "Replace, do not duplicate" in prompt
     finally:
@@ -988,6 +1022,7 @@ async def test_weak_learning_signal_stays_in_transcript_without_a_write(tmp_path
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Revenue happened to be 42 in this one result.")
@@ -1038,7 +1073,9 @@ async def test_learning_tool_descriptions_route_documents_and_require_write_firs
 
 
 async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
-    bootstrap = await Agent.create("replace-not-duplicate", root=tmp_path)
+    bootstrap = await Agent.create(
+        "replace-not-duplicate", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await bootstrap.save_skill(
             "monthly-revenue",
@@ -1086,6 +1123,7 @@ async def test_loaded_skill_is_replaced_instead_of_duplicated(tmp_path):
         model_profile=_profile(provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run(
@@ -1712,6 +1750,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
         model_profile=_profile(first_provider),
         limits=EAGER_LIMITS,
         approval_handler=approve,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = (await _execute(agent, _skill_save_call(name="persisted")))[0]
@@ -1728,6 +1767,7 @@ async def test_reopen_starts_no_learning_work_and_persists_no_skill_approval(tmp
         model=reopened_provider,
         model_profile=_profile(reopened_provider),
         limits=EAGER_LIMITS,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert reopened_provider.requests == ()

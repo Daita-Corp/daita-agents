@@ -14,10 +14,12 @@ from ..capabilities import (
     CapabilityInputError,
     Executor,
     OperationalEffect,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
@@ -395,24 +397,17 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
             name=names[item.id],
             capability_id=item.id,
             description=item.description,
-            discovery=ToolDiscoveryMetadata(
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.JOBS,
+                load_mode=(
+                    ToolLoadMode.ON_DEMAND
+                    if item.id == JOB_CANCEL_CAPABILITY_ID
+                    else ToolLoadMode.PINNED
+                ),
+                text_trust=ToolTextTrust.CODE,
                 summary=summaries[item.id][0],
                 when_to_use=summaries[item.id][1],
                 keywords=summaries[item.id][2],
-                exposure_class=(
-                    ToolExposureClass.DEFERRED
-                    if item.id == JOB_CANCEL_CAPABILITY_ID
-                    else ToolExposureClass.CORE
-                ),
-                eager_priority=(
-                    0
-                    if item.id == JOB_CANCEL_CAPABILITY_ID
-                    else {
-                        JOB_LIST_CAPABILITY_ID: 980,
-                        JOB_READ_RESULTS_CAPABILITY_ID: 970,
-                        JOB_INSPECT_CAPABILITY_ID: 960,
-                    }[item.id]
-                ),
             ),
         )
         for item in capabilities

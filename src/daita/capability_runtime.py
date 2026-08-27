@@ -7,7 +7,6 @@ import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from enum import Enum
 from hashlib import sha256
 from typing import Protocol, cast
 
@@ -20,6 +19,7 @@ from .artifacts.models import (
 )
 from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
+    TOOLBOX_DEFINITIONS,
     AccessMode,
     ApprovalDecision,
     ApprovalHandler,
@@ -31,8 +31,9 @@ from .capabilities import (
     Executor,
     OperationalEffect,
     SideEffectExecutor,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
     ToolOutputValidationError,
     ToolView,
@@ -58,7 +59,6 @@ from .loop.models import (
     ToolBatchCertainty,
     ToolBatchInterruption,
     ToolBatchOutcome,
-    ToolProjectionMode,
 )
 from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 
@@ -211,17 +211,13 @@ class CapabilityDomain(Protocol):
     ) -> CapabilityFailure | None: ...
 
 
-class ToolInvocationMode(str, Enum):
-    DIRECT = "direct"
-    DEFERRED = "deferred"
-
-
 @dataclass(frozen=True, slots=True)
-class DomainToolManifestEntry:
-    domain_owner_id: str
+class ToolboxManifestEntry:
+    toolbox_id: ToolboxId
+    label: str
     summary: str
-    direct_count: int
-    deferred_count: int
+    pinned_count: int
+    on_demand_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,7 +228,8 @@ class RunToolCatalogEntry:
     executor_id: str
     input_schema_digest: str
     origin_revision_digest: str
-    invocation_mode: ToolInvocationMode
+    toolbox_id: ToolboxId
+    load_mode: ToolLoadMode
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
@@ -250,8 +247,9 @@ class RunToolCatalog:
     registry_digest: str
     catalog_digest: str
     entries: tuple[RunToolCatalogEntry, ...]
-    domain_manifest: tuple[DomainToolManifestEntry, ...]
-    provider_definitions: tuple[ToolDefinition, ...]
+    toolbox_manifest: tuple[ToolboxManifestEntry, ...]
+    pinned_provider_definitions: tuple[ToolDefinition, ...]
+    control_definitions: tuple[ToolDefinition, ...]
     aggregate_bytes: int
     manifest_bytes: int
     manifest_token_limit: int
@@ -261,36 +259,57 @@ class RunToolCatalog:
         return frozenset(entry.capability.id for entry in self.entries)
 
     @property
+    def initial_provider_definitions(self) -> tuple[ToolDefinition, ...]:
+        return tuple(
+            sorted(
+                (*self.pinned_provider_definitions, *self.control_definitions),
+                key=lambda item: item.name,
+            )
+        )
+
+    @property
     def manifest_payload(self) -> tuple[FrozenJsonObject, ...]:
         return tuple(
             FrozenJsonObject.from_mapping(item)
-            for item in _manifest_material(self.domain_manifest)
+            for item in _manifest_material(self.toolbox_manifest)
         )
-
-
-@dataclass(frozen=True, slots=True)
-class DeferredToolReference:
-    tool_ref: str
-    tool_name: str
-    capability_id: str
-    domain_owner_id: str
-    executor_id: str
-    input_schema_digest: str
-    origin_revision_digest: str
-    catalog_digest: str
-    description_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
 class StepToolProjection:
     run_id: str
+    registry_digest: str
     catalog_digest: str
+    transcript_digest: str
     projection_digest: str
+    activation_digest: str
     provider_definitions: tuple[ToolDefinition, ...]
     catalog_entries: tuple[RunToolCatalogEntry, ...]
-    direct_resolution_entries: tuple[RunToolCatalogEntry, ...]
-    described_deferred_references: tuple[DeferredToolReference, ...]
-    described_schema_bytes: int
+    callable_entries: tuple[RunToolCatalogEntry, ...]
+    loaded_entries: tuple[RunToolCatalogEntry, ...]
+    loaded_definition_bytes: int
+
+    def require_current(
+        self,
+        *,
+        run_id: str,
+        registry_digest: str,
+        catalog_digest: str,
+        messages: tuple[object, ...],
+    ) -> StepToolProjection:
+        """Return this projection only when it matches the exact current step."""
+
+        if (
+            self.run_id != run_id
+            or self.registry_digest != registry_digest
+            or self.catalog_digest != catalog_digest
+            or self.transcript_digest != _toolbox_transcript_digest(messages)
+            or self.projection_digest != _step_projection_digest(self)
+        ):
+            raise ValueError(
+                "step tool projection differs from the current toolbox transcript"
+            )
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -321,17 +340,17 @@ class _ToolOutcomeUnknown(RuntimeError):
     pass
 
 
-_CONTROL_TOOL_NAMES = frozenset({"tool_search", "tool_describe", "tool_call"})
+_CONTROL_TOOL_NAMES = frozenset({"toolbox_search", "toolbox_load"})
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 
 def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
     return (
         ToolDefinition(
-            name="tool_search",
+            name="toolbox_search",
             description=(
-                "Search trusted metadata for applicable direct and deferred tools. "
-                "Search does not grant execution authority."
+                "Search bounded metadata for applicable tools. Search does not load "
+                "a tool or grant execution authority."
             ),
             input_schema={
                 "type": "object",
@@ -339,13 +358,16 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
                     "query": {
                         "type": "string",
                         "minLength": 1,
-                        "maxLength": limits.max_tool_search_query_characters,
+                        "maxLength": limits.max_toolbox_search_query_characters,
                     },
-                    "domains": {
+                    "toolboxes": {
                         "type": "array",
-                        "description": "Optional owner filter; omit when uncertain.",
-                        "items": {"type": "string", "minLength": 1, "maxLength": 128},
-                        "maxItems": limits.max_domain_manifest_entries,
+                        "description": "Optional canonical toolbox filter.",
+                        "items": {
+                            "type": "string",
+                            "enum": [item.value for item in ToolboxId],
+                        },
+                        "maxItems": limits.max_toolbox_manifest_entries,
                         "uniqueItems": True,
                     },
                     "data_access": {
@@ -363,8 +385,8 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": limits.max_tool_search_results,
-                        "default": min(5, limits.max_tool_search_results),
+                        "maximum": limits.max_toolbox_search_results,
+                        "default": min(5, limits.max_toolbox_search_results),
                     },
                 },
                 "required": ["query"],
@@ -372,40 +394,24 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
             },
         ),
         ToolDefinition(
-            name="tool_describe",
+            name="toolbox_load",
             description=(
-                "Describe one exact applicable tool. Deferred descriptions return a "
-                "run-bound reference for a later tool_call step."
+                "Atomically load an exact on-demand working set. A successful load "
+                "replaces the prior set on the next model step; ordinary validation "
+                "and governance still apply."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
-                    "tool_name": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 128,
+                    "tool_names": {
+                        "type": "array",
+                        "items": {"type": "string", "minLength": 1, "maxLength": 128},
+                        "minItems": 1,
+                        "maxItems": limits.max_loaded_tools,
+                        "uniqueItems": True,
                     }
                 },
-                "required": ["tool_name"],
-                "additionalProperties": False,
-            },
-        ),
-        ToolDefinition(
-            name="tool_call",
-            description=(
-                "Invoke one deferred tool using an exact reference returned by "
-                "tool_describe on an earlier completed step."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "tool_ref": {
-                        "type": "string",
-                        "pattern": r"^toolref:sha256:[0-9a-f]{64}$",
-                    },
-                    "arguments": {"type": "object"},
-                },
-                "required": ["tool_ref", "arguments"],
+                "required": ["tool_names"],
                 "additionalProperties": False,
             },
         ),
@@ -508,7 +514,7 @@ class CapabilityRuntime:
             request.run,
             call,
             capability,
-            invocation_mode=None,
+            catalog_entry=None,
         )
         try:
             normalized = domain.normalize_arguments(capability, request.arguments)
@@ -565,7 +571,7 @@ class CapabilityRuntime:
                 result,
                 started,
                 capability=capability,
-                invocation_mode=None,
+                catalog_entry=None,
             )
             raise
         self._emit_tool_completed(
@@ -574,7 +580,7 @@ class CapabilityRuntime:
             result,
             started,
             capability=capability,
-            invocation_mode=None,
+            catalog_entry=None,
         )
         return InternalCapabilityOutcome(output=output, artifact_ref=artifact_ref)
 
@@ -614,19 +620,16 @@ class CapabilityRuntime:
                     executor_id=capability.executor_id,
                     input_schema_digest=schema_digest,
                     origin_revision_digest=origin_digest,
-                    invocation_mode=ToolInvocationMode.DIRECT,
+                    toolbox_id=view.presentation.toolbox_id,
+                    load_mode=view.presentation.load_mode,
                 )
-        entries = _select_invocation_modes(
-            tuple(projected[name] for name in sorted(projected)),
-            self._registry,
-            self._limits,
-        )
-        manifest = _domain_manifest(entries)
+        entries = tuple(projected[name] for name in sorted(projected))
+        manifest = _toolbox_manifest(entries)
         manifest_bytes = len(canonical_json(_manifest_material(manifest)).encode())
         if (
-            len(manifest) > self._limits.max_domain_manifest_entries
-            or manifest_bytes > self._limits.max_domain_manifest_bytes
-            or (manifest_bytes + 3) // 4 > self._limits.max_domain_manifest_tokens
+            len(manifest) > self._limits.max_toolbox_manifest_entries
+            or manifest_bytes > self._limits.max_toolbox_manifest_bytes
+            or (manifest_bytes + 3) // 4 > self._limits.max_toolbox_manifest_tokens
         ):
             raise ToolManifestLimitExceeded()
         execution_scope_digest = (
@@ -647,7 +650,7 @@ class CapabilityRuntime:
             "execution_scope_digest": execution_scope_digest,
             "registry_digest": self._registry.digest,
             "entries": [_catalog_entry_material(entry) for entry in entries],
-            "domain_manifest": _manifest_material(manifest),
+            "toolbox_manifest": _manifest_material(manifest),
         }
         aggregate_bytes = len(canonical_json(catalog_material).encode("utf-8"))
         if (
@@ -661,27 +664,28 @@ class CapabilityRuntime:
                 maximum_catalog_bytes=self._limits.max_run_tool_catalog_bytes,
             )
         catalog_digest = _sha256_digest(catalog_material)
-        definitions = tuple(
+        pinned_entries = tuple(
+            entry for entry in entries if entry.load_mode is ToolLoadMode.PINNED
+        )
+        pinned_definitions = tuple(
             sorted(
                 (
-                    *(
-                        self._registry.tool_definition(entry.view.name)
-                        for entry in entries
-                        if entry.invocation_mode is ToolInvocationMode.DIRECT
-                    ),
-                    *(
-                        _control_definitions(self._limits)
-                        if any(
-                            entry.invocation_mode is ToolInvocationMode.DEFERRED
-                            for entry in entries
-                        )
-                        else ()
-                    ),
+                    self._registry.tool_definition(entry.view.name)
+                    for entry in pinned_entries
                 ),
                 key=lambda item: item.name,
             )
         )
-        _validate_direct_surface(definitions, self._limits)
+        _validate_pinned_surface(pinned_definitions, self._limits)
+        controls = (
+            _control_definitions(self._limits)
+            if any(entry.load_mode is ToolLoadMode.ON_DEMAND for entry in entries)
+            else ()
+        )
+        _validate_step_surface(
+            tuple(sorted((*pinned_definitions, *controls), key=lambda item: item.name)),
+            self._limits,
+        )
         return RunToolCatalog(
             run_id=run.id,
             agent_id=run.agent_id,
@@ -689,11 +693,12 @@ class CapabilityRuntime:
             registry_digest=self._registry.digest,
             catalog_digest=catalog_digest,
             entries=entries,
-            domain_manifest=manifest,
-            provider_definitions=definitions,
+            toolbox_manifest=manifest,
+            pinned_provider_definitions=pinned_definitions,
+            control_definitions=controls,
             aggregate_bytes=aggregate_bytes,
             manifest_bytes=manifest_bytes,
-            manifest_token_limit=self._limits.max_domain_manifest_tokens,
+            manifest_token_limit=self._limits.max_toolbox_manifest_tokens,
         )
 
     def project(
@@ -705,34 +710,59 @@ class CapabilityRuntime:
 
         if not isinstance(catalog, RunToolCatalog):
             raise TypeError("catalog must be RunToolCatalog")
-        references, described_bytes = _descriptor_receipts(
-            catalog,
-            messages,
-            self._limits,
-        )
-        direct = tuple(
-            entry
-            for entry in catalog.entries
-            if entry.invocation_mode is ToolInvocationMode.DIRECT
-        )
-        projection_material = {
-            "run_id": catalog.run_id,
-            "catalog_digest": catalog.catalog_digest,
-            "provider_definitions": [
-                _definition_material(item) for item in catalog.provider_definitions
-            ],
-            "direct_tools": [entry.view.name for entry in direct],
-            "described_references": [item.tool_ref for item in references],
-        }
-        return StepToolProjection(
+        if catalog.registry_digest != self._registry.digest:
+            raise ValueError("run tool catalog registry identity changed")
+        loaded, activation_digest, transcript_digest = _loaded_tool_receipt(
             run_id=catalog.run_id,
             catalog_digest=catalog.catalog_digest,
-            projection_digest=_sha256_digest(projection_material),
-            provider_definitions=catalog.provider_definitions,
             catalog_entries=catalog.entries,
-            direct_resolution_entries=direct,
-            described_deferred_references=references,
-            described_schema_bytes=described_bytes,
+            messages=messages,
+            limits=self._limits,
+            registry=self._registry,
+        )
+        pinned = tuple(
+            entry for entry in catalog.entries if entry.load_mode is ToolLoadMode.PINNED
+        )
+        callable_entries = tuple(
+            sorted((*pinned, *loaded), key=lambda item: item.view.name)
+        )
+        provider_definitions = tuple(
+            sorted(
+                (
+                    *(
+                        self._registry.tool_definition(entry.view.name)
+                        for entry in callable_entries
+                    ),
+                    *catalog.control_definitions,
+                ),
+                key=lambda item: item.name,
+            )
+        )
+        _validate_step_surface(provider_definitions, self._limits)
+        loaded_definition_bytes = _definition_bytes(
+            tuple(self._registry.tool_definition(entry.view.name) for entry in loaded)
+        )
+        return StepToolProjection(
+            run_id=catalog.run_id,
+            registry_digest=catalog.registry_digest,
+            catalog_digest=catalog.catalog_digest,
+            transcript_digest=transcript_digest,
+            projection_digest=_projection_digest(
+                run_id=catalog.run_id,
+                registry_digest=catalog.registry_digest,
+                catalog_digest=catalog.catalog_digest,
+                transcript_digest=transcript_digest,
+                provider_definitions=provider_definitions,
+                callable_entries=callable_entries,
+                loaded_entries=loaded,
+                activation_digest=activation_digest,
+            ),
+            activation_digest=activation_digest,
+            provider_definitions=provider_definitions,
+            catalog_entries=catalog.entries,
+            callable_entries=callable_entries,
+            loaded_entries=loaded,
+            loaded_definition_bytes=loaded_definition_bytes,
         )
 
     async def execute_all(
@@ -741,6 +771,7 @@ class CapabilityRuntime:
         calls: tuple[ToolCall, ...],
         *,
         projection: object,
+        messages: tuple[CanonicalMessage, ...],
         sensitivity: ModelSensitivity,
     ) -> ToolBatchOutcome:
         if not isinstance(run, RunInput):
@@ -749,8 +780,29 @@ class CapabilityRuntime:
             raise TypeError("tool batch sensitivity must be ModelSensitivity")
         if not isinstance(projection, StepToolProjection):
             raise TypeError("projection must be StepToolProjection")
-        if projection.run_id != run.id:
-            raise ValueError("step projection belongs to another run")
+        projection = projection.require_current(
+            run_id=run.id,
+            registry_digest=self._registry.digest,
+            catalog_digest=projection.catalog_digest,
+            messages=messages,
+        )
+        loaded, activation_digest, transcript_digest = _loaded_tool_receipt(
+            run_id=projection.run_id,
+            catalog_digest=projection.catalog_digest,
+            catalog_entries=projection.catalog_entries,
+            messages=messages,
+            limits=self._limits,
+            registry=self._registry,
+        )
+        if (
+            projection.loaded_entries != loaded
+            or projection.activation_digest != activation_digest
+            or projection.transcript_digest != transcript_digest
+        ):
+            raise ValueError(
+                "step projection differs from the current toolbox transcript"
+            )
+        _validate_step_projection(projection, self._registry, self._limits)
         calls = tuple(calls)
         if any(not isinstance(call, ToolCall) for call in calls):
             raise TypeError("calls must contain ToolCall records")
@@ -896,7 +948,7 @@ class CapabilityRuntime:
             tuple(
                 _bounded_tool_result(
                     resolved.outer_call,
-                    _with_invocation_audit(result, resolved),
+                    result,
                     self._limits,
                 )
                 for resolved, result in zip(resolved_calls, ordered, strict=True)
@@ -910,26 +962,26 @@ class CapabilityRuntime:
         *,
         sensitivity: ModelSensitivity,
     ) -> tuple[_ResolvedCall, ...]:
-        described_bytes = projection.described_schema_bytes
-        references = {
-            item.tool_ref for item in projection.described_deferred_references
-        }
         resolved_calls: list[_ResolvedCall] = []
+        load_succeeded = False
         for call in calls:
             resolved = self._resolve_call(call, projection)
-            if resolved.control_name == "tool_describe":
-                result, admitted_bytes, reference = self._tool_describe(
-                    resolved.target_call,
-                    projection,
-                    sensitivity=sensitivity,
-                    described_bytes=described_bytes,
-                    described_references=frozenset(references),
-                )
+            if resolved.control_name == "toolbox_load":
+                if load_succeeded:
+                    result = _error(
+                        resolved.target_call,
+                        "toolbox_load_invalid",
+                        "Only the first valid toolbox load in one response may succeed.",
+                    )
+                else:
+                    result = self._toolbox_load(
+                        resolved.target_call,
+                        projection,
+                        sensitivity=sensitivity,
+                    )
                 resolved = replace(resolved, control_result=result)
                 if not result.is_error:
-                    described_bytes += admitted_bytes
-                    if reference is not None:
-                        references.add(reference)
+                    load_succeeded = True
             resolved_calls.append(resolved)
         return tuple(resolved_calls)
 
@@ -938,10 +990,10 @@ class CapabilityRuntime:
         call: ToolCall,
         projection: StepToolProjection,
     ) -> _ResolvedCall:
-        direct = {
-            entry.view.name: entry for entry in projection.direct_resolution_entries
+        callable_entries = {
+            entry.view.name: entry for entry in projection.callable_entries
         }
-        entry = direct.get(call.name)
+        entry = callable_entries.get(call.name)
         if entry is not None:
             return _ResolvedCall(call, call, entry=entry)
         control_names = {item.name for item in projection.provider_definitions}
@@ -959,6 +1011,21 @@ class CapabilityRuntime:
         definition = next(
             item for item in projection.provider_definitions if item.name == call.name
         )
+        if call.name == "toolbox_load":
+            requested_names = call.arguments.get("tool_names")
+            if (
+                isinstance(requested_names, (tuple, list))
+                and len(requested_names) > self._limits.max_loaded_tools
+            ):
+                return _ResolvedCall(
+                    call,
+                    call,
+                    failure=_error(
+                        call,
+                        "toolbox_load_limit_exceeded",
+                        "The requested on-demand working set exceeds its count bound.",
+                    ),
+                )
         try:
             arguments = validate_tool_schema_value(
                 definition.input_schema,
@@ -966,9 +1033,9 @@ class CapabilityRuntime:
             )
         except (TypeError, ValueError, RuntimeError):
             code = (
-                "tool_reference_invalid"
-                if call.name == "tool_call"
-                else "invalid_tool_control_arguments"
+                "toolbox_load_invalid"
+                if call.name == "toolbox_load"
+                else "toolbox_search_invalid"
             )
             return _ResolvedCall(
                 call,
@@ -976,112 +1043,13 @@ class CapabilityRuntime:
                 failure=_error(
                     call,
                     code,
-                    "The discovery control arguments are invalid.",
+                    "The toolbox control arguments are invalid.",
                 ),
             )
-        if call.name != "tool_call":
-            return _ResolvedCall(
-                call, replace(call, arguments=arguments), control_name=call.name
-            )
-        reference_value = arguments.get("tool_ref")
-        nested = arguments.get("arguments")
-        reference = next(
-            (
-                item
-                for item in projection.described_deferred_references
-                if item.tool_ref == reference_value
-            ),
-            None,
-        )
-        if reference is None or not isinstance(nested, Mapping):
-            return _ResolvedCall(
-                call,
-                call,
-                failure=_error(
-                    call,
-                    "tool_reference_invalid",
-                    "The deferred tool reference is not valid for this run and step.",
-                ),
-            )
-        view: ToolView | None
-        capability: Capability | None
-        owner_id: str | None
-        try:
-            resolved_view, resolved_capability, resolved_owner_id = (
-                self._registry.resolve_tool_owner(reference.tool_name)
-            )
-            view = resolved_view
-            capability = resolved_capability
-            owner_id = resolved_owner_id
-        except KeyError:
-            view = capability = owner_id = None
-        if (
-            view is None
-            or capability is None
-            or owner_id is None
-            or capability.id != reference.capability_id
-            or capability.executor_id != reference.executor_id
-            or owner_id != reference.domain_owner_id
-            or _sha256_digest(capability.input_schema) != reference.input_schema_digest
-        ):
-            return _ResolvedCall(
-                call,
-                call,
-                failure=_error(
-                    call,
-                    "tool_reference_invalid",
-                    "The deferred tool reference no longer resolves exactly.",
-                ),
-            )
-        deferred_entry = next(
-            (
-                item
-                for item in projection.catalog_entries
-                if item.view.name == reference.tool_name
-                and item.invocation_mode is ToolInvocationMode.DEFERRED
-                and item.view == view
-                and item.capability == capability
-                and item.domain_owner_id == reference.domain_owner_id
-                and item.executor_id == reference.executor_id
-                and item.input_schema_digest == reference.input_schema_digest
-                and item.origin_revision_digest == reference.origin_revision_digest
-            ),
-            None,
-        )
-        if deferred_entry is None:
-            return _ResolvedCall(
-                call,
-                call,
-                failure=_error(
-                    call,
-                    "tool_reference_invalid",
-                    "The deferred tool reference is not an exact catalog entry.",
-                ),
-            )
-        target = ToolCall(id=call.id, name=view.name, arguments=nested)
-        domain = self._domains[owner_id]
-        try:
-            normalized = domain.normalize_arguments(
-                capability,
-                nested,
-            )
-            validated = self._registry.validate_arguments(
-                capability.id,
-                normalized,
-            )
-        except Exception as error:
-            return _ResolvedCall(
-                call,
-                target,
-                entry=deferred_entry,
-                failure=self._exception_result(target, error, domain),
-            )
-        target = replace(target, arguments=validated)
         return _ResolvedCall(
             call,
-            target,
-            entry=deferred_entry,
-            validated_arguments=validated,
+            replace(call, arguments=arguments),
+            control_name=call.name,
         )
 
     async def _execute_resolved(
@@ -1101,9 +1069,6 @@ class CapabilityRuntime:
             capability = (
                 resolved.entry.capability if resolved.entry is not None else None
             )
-            invocation_mode = (
-                resolved.entry.invocation_mode if resolved.entry is not None else None
-            )
             started = (
                 asyncio.get_running_loop().time()
                 if self._observer is not None
@@ -1113,7 +1078,7 @@ class CapabilityRuntime:
                 run,
                 call,
                 capability,
-                invocation_mode=invocation_mode,
+                catalog_entry=resolved.entry,
             )
             result = _bounded_tool_result(
                 resolved.outer_call,
@@ -1126,7 +1091,7 @@ class CapabilityRuntime:
                 result,
                 started,
                 capability=capability,
-                invocation_mode=invocation_mode,
+                catalog_entry=resolved.entry,
             )
             return result
         if resolved.control_name is not None:
@@ -1161,11 +1126,11 @@ class CapabilityRuntime:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
         )
-        self._emit_tool_started(run, call, None, invocation_mode=None)
+        self._emit_tool_started(run, call, None, catalog_entry=None)
         if prepared_result is not None:
             result = prepared_result
-        elif control_name == "tool_search":
-            result = self._tool_search(call, projection, sensitivity=sensitivity)
+        elif control_name == "toolbox_search":
+            result = self._toolbox_search(call, projection, sensitivity=sensitivity)
         else:
             result = _error(
                 call,
@@ -1179,11 +1144,11 @@ class CapabilityRuntime:
             result,
             started,
             capability=None,
-            invocation_mode=None,
+            catalog_entry=None,
         )
         return result
 
-    def _tool_search(
+    def _toolbox_search(
         self,
         call: ToolCall,
         projection: StepToolProjection,
@@ -1191,27 +1156,28 @@ class CapabilityRuntime:
         sensitivity: ModelSensitivity,
     ) -> ToolResultBlock:
         query = call.arguments.get("query")
-        domains_value = call.arguments.get("domains", ())
+        toolboxes_value = call.arguments.get("toolboxes", ())
         access_value = call.arguments.get("data_access")
         operational_effect = call.arguments.get("operational_effect")
         limit_value = call.arguments.get(
-            "limit", min(5, self._limits.max_tool_search_results)
+            "limit", min(5, self._limits.max_toolbox_search_results)
         )
         if (
             not isinstance(query, str)
-            or not isinstance(domains_value, (tuple, list))
+            or not isinstance(toolboxes_value, (tuple, list))
             or not isinstance(limit_value, int)
             or isinstance(limit_value, bool)
         ):
             return _error(
                 call,
-                "invalid_tool_control_arguments",
-                "The tool search arguments are invalid.",
+                "toolbox_search_invalid",
+                "The toolbox search arguments are invalid.",
             )
-        domains = frozenset(item for item in domains_value if isinstance(item, str))
+        toolboxes = frozenset(item for item in toolboxes_value if isinstance(item, str))
+        loaded_names = {entry.view.name for entry in projection.loaded_entries}
         scored: list[tuple[int, str, str, RunToolCatalogEntry]] = []
         for entry in projection.catalog_entries:
-            if domains and entry.domain_owner_id not in domains:
+            if toolboxes and entry.toolbox_id.value not in toolboxes:
                 continue
             if (
                 access_value is not None
@@ -1223,13 +1189,16 @@ class CapabilityRuntime:
                 and entry.capability.operational_effect.value != operational_effect
             ):
                 continue
-            score = _tool_search_score(query, entry)
+            score = _toolbox_search_score(query, entry)
             if score > 0:
-                scored.append((score, entry.domain_owner_id, entry.view.name, entry))
+                scored.append((score, entry.toolbox_id.value, entry.view.name, entry))
         scored.sort(key=lambda item: (-item[0], item[1], item[2]))
         total = len(scored)
         selected = scored[:limit_value]
-        matches = [_tool_search_match(score, entry) for score, _, _, entry in selected]
+        matches = [
+            _toolbox_search_match(score, entry, loaded_names=loaded_names)
+            for score, _, _, entry in selected
+        ]
         while True:
             data = {
                 "catalog_digest": projection.catalog_digest,
@@ -1240,11 +1209,11 @@ class CapabilityRuntime:
             }
             if (
                 len(canonical_json(data).encode("utf-8"))
-                <= self._limits.max_tool_search_result_bytes
+                <= self._limits.max_toolbox_search_result_bytes
             ):
                 return _control_success(
                     call,
-                    "tool_search_result",
+                    "toolbox_search_result",
                     data,
                     sensitivity=sensitivity,
                     run_id=projection.run_id,
@@ -1253,99 +1222,132 @@ class CapabilityRuntime:
             if not matches:
                 return _error(
                     call,
-                    "tool_search_limit_exceeded",
-                    "The bounded tool search result cannot fit its byte limit.",
+                    "toolbox_search_limited",
+                    "The bounded toolbox search result cannot fit its byte limit.",
                 )
             matches.pop()
 
-    def _tool_describe(
+    def _toolbox_load(
         self,
         call: ToolCall,
         projection: StepToolProjection,
         *,
         sensitivity: ModelSensitivity,
-        described_bytes: int,
-        described_references: frozenset[str],
-    ) -> tuple[ToolResultBlock, int, str | None]:
-        tool_name = call.arguments.get("tool_name")
-        entry = next(
-            (
-                item
-                for item in projection.catalog_entries
-                if item.view.name == tool_name
-            ),
-            None,
-        )
-        if entry is None:
-            return (
-                _error(
-                    call,
-                    "tool_not_available",
-                    "The requested tool is not in this run catalog.",
-                    {"tool_name": tool_name if isinstance(tool_name, str) else ""},
-                ),
-                0,
-                None,
-            )
-        data: dict[str, object] = {
-            "tool_name": entry.view.name,
-            "capability_id": entry.capability.id,
-            "domain_owner_id": entry.domain_owner_id,
-            "executor_id": entry.executor_id,
-            "description": entry.view.description,
-            "summary": entry.view.discovery.summary,
-            "when_to_use": entry.view.discovery.when_to_use,
-            "keywords": entry.view.discovery.keywords,
-            "input_schema": entry.capability.input_schema,
-            "output_kind": entry.capability.output_kind,
-            "data_access": entry.capability.access_mode.value,
-            "operational_effect": entry.capability.operational_effect.value,
-            "invocation_mode": entry.invocation_mode.value,
-            "input_schema_digest": entry.input_schema_digest,
-            "origin_revision_digest": entry.origin_revision_digest,
-            "catalog_digest": projection.catalog_digest,
-        }
-        reference: str | None = None
-        if entry.invocation_mode is ToolInvocationMode.DEFERRED:
-            reference = _tool_reference(
-                projection.run_id,
-                projection.catalog_digest,
-                entry,
-            )
-            data["tool_ref"] = reference
-        description_bytes = len(canonical_json(data).encode("utf-8"))
-        if (
-            description_bytes > self._limits.max_tool_description_bytes
-            or described_bytes + description_bytes
-            > self._limits.max_tool_description_bytes_per_run
-            or (
-                entry.invocation_mode is ToolInvocationMode.DEFERRED
-                and reference not in described_references
-                and len(described_references)
-                >= self._limits.max_tool_references_per_run
-            )
+    ) -> ToolResultBlock:
+        names_value = call.arguments.get("tool_names")
+        if not isinstance(names_value, (tuple, list)) or any(
+            not isinstance(name, str) for name in names_value
         ):
-            return (
-                _error(
-                    call,
-                    "tool_description_limit_exceeded",
-                    "The exact tool description exceeds its individual or cumulative bound.",
-                ),
-                0,
-                None,
-            )
-        data["description_bytes"] = description_bytes
-        return (
-            _control_success(
+            return _error(
                 call,
-                "tool_description",
-                data,
-                sensitivity=sensitivity,
-                run_id=projection.run_id,
-                catalog_digest=projection.catalog_digest,
-            ),
-            description_bytes,
-            reference,
+                "toolbox_load_invalid",
+                "The toolbox load requires a bounded distinct list of exact names.",
+            )
+        names = tuple(names_value)
+        entries_by_name = {
+            entry.view.name: entry for entry in projection.catalog_entries
+        }
+        requested: list[RunToolCatalogEntry] = []
+        for name in names:
+            entry = entries_by_name.get(name)
+            if entry is None:
+                return _error(
+                    call,
+                    "toolbox_tool_not_available",
+                    "A requested tool is not applicable in this run.",
+                    {"tool_name": name},
+                )
+            if entry.load_mode is not ToolLoadMode.ON_DEMAND:
+                return _error(
+                    call,
+                    "toolbox_load_invalid",
+                    "Pinned tools cannot be loaded into the on-demand working set.",
+                    {"tool_name": name},
+                )
+            if not _entry_resolves_exactly(entry, self._registry):
+                return _error(
+                    call,
+                    "toolbox_load_stale",
+                    "A requested tool no longer resolves to its frozen run contract.",
+                    {"tool_name": name},
+                )
+            requested.append(entry)
+        loaded = tuple(sorted(requested, key=lambda item: item.view.name))
+        definitions = tuple(
+            self._registry.tool_definition(entry.view.name) for entry in loaded
+        )
+        definition_bytes = _definition_bytes(definitions)
+        if (
+            len(loaded) > self._limits.max_loaded_tools
+            or definition_bytes > self._limits.max_loaded_tool_definition_bytes
+        ):
+            return _error(
+                call,
+                "toolbox_load_limit_exceeded",
+                "The requested on-demand working set exceeds its count or byte bound.",
+            )
+        pinned = tuple(
+            entry
+            for entry in projection.catalog_entries
+            if entry.load_mode is ToolLoadMode.PINNED
+        )
+        controls = (
+            _control_definitions(self._limits)
+            if any(
+                entry.load_mode is ToolLoadMode.ON_DEMAND
+                for entry in projection.catalog_entries
+            )
+            else ()
+        )
+        next_definitions = tuple(
+            sorted(
+                (
+                    *(
+                        self._registry.tool_definition(item.view.name)
+                        for item in pinned
+                    ),
+                    *definitions,
+                    *controls,
+                ),
+                key=lambda item: item.name,
+            )
+        )
+        try:
+            _validate_step_surface(next_definitions, self._limits)
+        except ToolSurfaceLimitExceeded:
+            return _error(
+                call,
+                "toolbox_load_limit_exceeded",
+                "The complete next-step provider surface exceeds its bound.",
+            )
+        activation_digest = _activation_digest(
+            projection.run_id,
+            projection.catalog_digest,
+            loaded,
+        )
+        data = {
+            "run_id": projection.run_id,
+            "catalog_digest": projection.catalog_digest,
+            "loaded_names": [entry.view.name for entry in loaded],
+            "definition_bytes": definition_bytes,
+            "activation_digest": activation_digest,
+        }
+        if (
+            len(canonical_json(data).encode("utf-8"))
+            > self._limits.max_toolbox_load_result_bytes
+        ):
+            return _error(
+                call,
+                "toolbox_load_limit_exceeded",
+                "The exact toolbox load receipt exceeds its byte bound.",
+            )
+        return _control_success(
+            call,
+            "toolbox_load_receipt",
+            data,
+            sensitivity=sensitivity,
+            run_id=projection.run_id,
+            catalog_digest=projection.catalog_digest,
         )
 
     async def _execute_one(
@@ -1365,7 +1367,7 @@ class CapabilityRuntime:
             run,
             call,
             capability,
-            invocation_mode=entry.invocation_mode,
+            catalog_entry=entry,
         )
         interruption_kind: ToolBatchInterruption | None = None
         outcome_certainty = ToolBatchCertainty.DEFINITE
@@ -1428,7 +1430,7 @@ class CapabilityRuntime:
                     arguments,
                     domain,
                     sensitivity=sensitivity,
-                    invocation_mode=entry.invocation_mode,
+                    catalog_entry=entry,
                 )
             else:
                 output, artifact_ref = await self._execute_no_effect(
@@ -1455,7 +1457,7 @@ class CapabilityRuntime:
             result,
             started,
             capability=capability,
-            invocation_mode=entry.invocation_mode,
+            catalog_entry=entry,
         )
         if interruption_kind is not None:
             raise _ToolExecutionInterrupted(
@@ -1519,7 +1521,7 @@ class CapabilityRuntime:
         domain: CapabilityDomain,
         *,
         sensitivity: ModelSensitivity,
-        invocation_mode: ToolInvocationMode,
+        catalog_entry: RunToolCatalogEntry,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
@@ -1565,7 +1567,7 @@ class CapabilityRuntime:
                 run,
                 call,
                 capability,
-                invocation_mode=invocation_mode,
+                catalog_entry=catalog_entry,
             )
             try:
                 decision = await self._approval_handler(request)
@@ -1577,7 +1579,7 @@ class CapabilityRuntime:
                     call,
                     capability,
                     "failed",
-                    invocation_mode=invocation_mode,
+                    catalog_entry=catalog_entry,
                 )
                 return (
                     _error(
@@ -1595,7 +1597,7 @@ class CapabilityRuntime:
                     call,
                     capability,
                     "failed",
-                    invocation_mode=invocation_mode,
+                    catalog_entry=catalog_entry,
                 )
                 return (
                     _error(
@@ -1613,7 +1615,7 @@ class CapabilityRuntime:
                     call,
                     capability,
                     "denied",
-                    invocation_mode=invocation_mode,
+                    catalog_entry=catalog_entry,
                 )
                 return (
                     _error(
@@ -1630,7 +1632,7 @@ class CapabilityRuntime:
                 call,
                 capability,
                 "approved",
-                invocation_mode=invocation_mode,
+                catalog_entry=catalog_entry,
             )
         return await self._execute_preflighted_side_effect(
             run,
@@ -1871,13 +1873,13 @@ class CapabilityRuntime:
         call: ToolCall,
         capability: Capability | None,
         *,
-        invocation_mode: ToolInvocationMode | None,
+        catalog_entry: RunToolCatalogEntry | None,
     ) -> None:
         data: dict[str, object] = {"call_id": call.id, "tool_name": call.name}
         if capability is not None:
             data["capability_id"] = capability.id
-        if invocation_mode is not None:
-            data["invocation_mode"] = invocation_mode.value
+        if catalog_entry is not None:
+            data.update(_toolbox_observation(catalog_entry))
         self._emit(AgentEventKind.TOOL_STARTED, run, data)
 
     def _emit_approval_requested(
@@ -1886,7 +1888,7 @@ class CapabilityRuntime:
         call: ToolCall,
         capability: Capability,
         *,
-        invocation_mode: ToolInvocationMode,
+        catalog_entry: RunToolCatalogEntry,
     ) -> None:
         self._emit(
             AgentEventKind.APPROVAL_REQUESTED,
@@ -1895,7 +1897,7 @@ class CapabilityRuntime:
                 "call_id": call.id,
                 "tool_name": call.name,
                 "capability_id": capability.id,
-                "invocation_mode": invocation_mode.value,
+                **_toolbox_observation(catalog_entry),
             },
         )
 
@@ -1906,7 +1908,7 @@ class CapabilityRuntime:
         capability: Capability,
         outcome: str,
         *,
-        invocation_mode: ToolInvocationMode,
+        catalog_entry: RunToolCatalogEntry,
     ) -> None:
         self._emit(
             AgentEventKind.APPROVAL_DECIDED,
@@ -1915,7 +1917,7 @@ class CapabilityRuntime:
                 "call_id": call.id,
                 "tool_name": call.name,
                 "capability_id": capability.id,
-                "invocation_mode": invocation_mode.value,
+                **_toolbox_observation(catalog_entry),
                 "outcome": outcome,
             },
         )
@@ -1928,7 +1930,7 @@ class CapabilityRuntime:
         started: float | None,
         *,
         capability: Capability | None,
-        invocation_mode: ToolInvocationMode | None,
+        catalog_entry: RunToolCatalogEntry | None,
     ) -> None:
         if self._observer is None:
             return
@@ -1942,8 +1944,8 @@ class CapabilityRuntime:
         }
         if capability is not None:
             data["capability_id"] = capability.id
-        if invocation_mode is not None:
-            data["invocation_mode"] = invocation_mode.value
+        if catalog_entry is not None:
+            data.update(_toolbox_observation(catalog_entry))
         self._emit(
             AgentEventKind.TOOL_COMPLETED,
             run,
@@ -1992,72 +1994,58 @@ def _definition_bytes(definitions: tuple[ToolDefinition, ...]) -> int:
     )
 
 
-def _validate_direct_surface(
+def _validate_pinned_surface(
     definitions: tuple[ToolDefinition, ...],
     limits: LoopLimits,
 ) -> None:
     definition_bytes = _definition_bytes(definitions)
     if (
-        len(definitions) > limits.max_direct_tools
-        or definition_bytes > limits.max_direct_tool_definition_bytes
+        len(definitions) > limits.max_pinned_tools
+        or definition_bytes > limits.max_pinned_tool_definition_bytes
     ):
         raise ToolSurfaceLimitExceeded(
             observed_tools=len(definitions),
-            maximum_tools=limits.max_direct_tools,
+            maximum_tools=limits.max_pinned_tools,
             observed_definition_bytes=definition_bytes,
-            maximum_definition_bytes=limits.max_direct_tool_definition_bytes,
+            maximum_definition_bytes=limits.max_pinned_tool_definition_bytes,
         )
 
 
-def _select_invocation_modes(
-    entries: tuple[RunToolCatalogEntry, ...],
-    registry: CapabilityRegistry,
+def _validate_step_surface(
+    definitions: tuple[ToolDefinition, ...],
     limits: LoopLimits,
-) -> tuple[RunToolCatalogEntry, ...]:
-    if limits.tool_projection_mode is ToolProjectionMode.EAGER:
-        return tuple(
-            replace(entry, invocation_mode=ToolInvocationMode.DIRECT)
-            for entry in entries
+) -> None:
+    definition_bytes = _definition_bytes(definitions)
+    if (
+        len(definitions) > limits.max_step_tools
+        or definition_bytes > limits.max_step_tool_definition_bytes
+    ):
+        raise ToolSurfaceLimitExceeded(
+            observed_tools=len(definitions),
+            maximum_tools=limits.max_step_tools,
+            observed_definition_bytes=definition_bytes,
+            maximum_definition_bytes=limits.max_step_tool_definition_bytes,
         )
-    selected = {
-        entry.view.name
-        for entry in entries
-        if entry.view.discovery.exposure_class is ToolExposureClass.CORE
-    }
-    if limits.tool_projection_mode is ToolProjectionMode.AUTO:
-        candidates = sorted(
-            (
-                entry
-                for entry in entries
-                if entry.view.discovery.exposure_class is ToolExposureClass.STANDARD
-            ),
-            key=lambda item: (
-                -item.view.discovery.eager_priority,
-                item.domain_owner_id,
-                item.view.name,
-            ),
+
+
+def _entry_resolves_exactly(
+    entry: RunToolCatalogEntry,
+    registry: CapabilityRegistry,
+) -> bool:
+    try:
+        view, capability, owner_id = registry.resolve_tool_owner(entry.view.name)
+    except KeyError:
+        return False
+    return all(
+        (
+            view == entry.view,
+            capability == entry.capability,
+            owner_id == entry.domain_owner_id,
+            capability.executor_id == entry.executor_id,
+            _sha256_digest(capability.input_schema) == entry.input_schema_digest,
+            view.presentation.toolbox_id is entry.toolbox_id,
+            view.presentation.load_mode is entry.load_mode,
         )
-        for candidate in candidates:
-            proposed = (*selected, candidate.view.name)
-            definitions = tuple(
-                registry.tool_definition(name) for name in sorted(proposed)
-            )
-            if (
-                len(definitions) <= limits.max_eager_tools
-                and _definition_bytes(definitions)
-                <= limits.max_eager_tool_definition_bytes
-            ):
-                selected.add(candidate.view.name)
-    return tuple(
-        replace(
-            entry,
-            invocation_mode=(
-                ToolInvocationMode.DIRECT
-                if entry.view.name in selected
-                else ToolInvocationMode.DEFERRED
-            ),
-        )
-        for entry in entries
     )
 
 
@@ -2073,182 +2061,259 @@ def _catalog_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
         "output_kind": entry.capability.output_kind,
         "data_access": entry.capability.access_mode.value,
         "operational_effect": entry.capability.operational_effect.value,
-        "discovery": {
-            "summary": entry.view.discovery.summary,
-            "when_to_use": entry.view.discovery.when_to_use,
-            "keywords": entry.view.discovery.keywords,
-            "exposure_class": entry.view.discovery.exposure_class.value,
-            "eager_priority": entry.view.discovery.eager_priority,
+        "presentation": {
+            "toolbox_id": entry.toolbox_id.value,
+            "load_mode": entry.load_mode.value,
+            "text_trust": entry.view.presentation.text_trust.value,
+            "summary": entry.view.presentation.summary,
+            "when_to_use": entry.view.presentation.when_to_use,
+            "keywords": entry.view.presentation.keywords,
         },
         "origin_revision_digest": entry.origin_revision_digest,
-        "invocation_mode": entry.invocation_mode.value,
     }
 
 
-def _domain_manifest(
+def _toolbox_manifest(
     entries: tuple[RunToolCatalogEntry, ...],
-) -> tuple[DomainToolManifestEntry, ...]:
-    owners = sorted({entry.domain_owner_id for entry in entries})
+) -> tuple[ToolboxManifestEntry, ...]:
+    available = {entry.toolbox_id for entry in entries}
     return tuple(
-        DomainToolManifestEntry(
-            domain_owner_id=owner,
-            summary=f"Trusted {owner} capability counts.",
-            direct_count=sum(
-                entry.domain_owner_id == owner
-                and entry.invocation_mode is ToolInvocationMode.DIRECT
+        ToolboxManifestEntry(
+            toolbox_id=definition.id,
+            label=definition.label,
+            summary=definition.summary,
+            pinned_count=sum(
+                entry.toolbox_id is definition.id
+                and entry.load_mode is ToolLoadMode.PINNED
                 for entry in entries
             ),
-            deferred_count=sum(
-                entry.domain_owner_id == owner
-                and entry.invocation_mode is ToolInvocationMode.DEFERRED
+            on_demand_count=sum(
+                entry.toolbox_id is definition.id
+                and entry.load_mode is ToolLoadMode.ON_DEMAND
                 for entry in entries
             ),
         )
-        for owner in owners
+        for definition in TOOLBOX_DEFINITIONS
+        if definition.id in available
     )
 
 
 def _manifest_material(
-    manifest: tuple[DomainToolManifestEntry, ...],
+    manifest: tuple[ToolboxManifestEntry, ...],
 ) -> list[dict[str, object]]:
     return [
         {
-            "domain_owner_id": item.domain_owner_id,
+            "toolbox_id": item.toolbox_id.value,
+            "label": item.label,
             "summary": item.summary,
-            "direct_count": item.direct_count,
-            "deferred_count": item.deferred_count,
+            "pinned_count": item.pinned_count,
+            "on_demand_count": item.on_demand_count,
         }
         for item in manifest
     ]
 
 
-def _tool_reference(
+def _loaded_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
+    return {
+        "tool_name": entry.view.name,
+        "capability_id": entry.capability.id,
+        "domain_owner_id": entry.domain_owner_id,
+        "executor_id": entry.executor_id,
+        "input_schema_digest": entry.input_schema_digest,
+        "origin_revision_digest": entry.origin_revision_digest,
+        "toolbox_id": entry.toolbox_id.value,
+        "load_mode": entry.load_mode.value,
+        "text_trust": entry.view.presentation.text_trust.value,
+    }
+
+
+def _activation_digest(
     run_id: str,
     catalog_digest: str,
-    entry: RunToolCatalogEntry,
+    entries: tuple[RunToolCatalogEntry, ...],
 ) -> str:
-    digest = _sha256_digest(
+    return _sha256_digest(
         {
             "run_id": run_id,
             "catalog_digest": catalog_digest,
-            "tool_name": entry.view.name,
-            "capability_id": entry.capability.id,
-            "domain_owner_id": entry.domain_owner_id,
-            "executor_id": entry.executor_id,
-            "input_schema_digest": entry.input_schema_digest,
-            "origin_revision_digest": entry.origin_revision_digest,
-            "invocation_mode": entry.invocation_mode.value,
+            "loaded_tools": [_loaded_entry_material(entry) for entry in entries],
         }
     )
-    return "toolref:" + digest
 
 
-def _descriptor_receipts(
-    catalog: RunToolCatalog,
+def _loaded_tool_receipt(
+    *,
+    run_id: str,
+    catalog_digest: str,
+    catalog_entries: tuple[RunToolCatalogEntry, ...],
     messages: tuple[object, ...],
     limits: LoopLimits,
-) -> tuple[tuple[DeferredToolReference, ...], int]:
-    calls: dict[str, str] = {}
-    seen_results: set[str] = set()
-    references: dict[str, DeferredToolReference] = {}
-    described_bytes = 0
-    entries = {entry.view.name: entry for entry in catalog.entries}
+    registry: CapabilityRegistry,
+) -> tuple[tuple[RunToolCatalogEntry, ...], str, str]:
+    exchanges = _ordered_tool_exchanges(messages)
+    loaded: tuple[RunToolCatalogEntry, ...] = ()
+    activation_digest = _activation_digest(run_id, catalog_digest, ())
+    for call, block in exchanges:
+        if call.name != "toolbox_load" or block.is_error:
+            continue
+        names = call.arguments.get("tool_names")
+        if not isinstance(names, (tuple, list)) or not all(
+            isinstance(name, str) for name in names
+        ):
+            continue
+        if block.output.get("kind") != "toolbox_load_receipt":
+            continue
+        data = block.output.get("data")
+        provenance = block.sensitivity_provenance
+        if not isinstance(data, Mapping) or (
+            provenance.get("authority") != "tool_catalog_control"
+            or provenance.get("run_id") != run_id
+            or provenance.get("catalog_digest") != catalog_digest
+            or provenance.get("control_name") != "toolbox_load"
+        ):
+            continue
+        candidate = _verified_loaded_entries(
+            data,
+            requested_names=tuple(names),
+            run_id=run_id,
+            catalog_digest=catalog_digest,
+            catalog_entries=catalog_entries,
+            limits=limits,
+            registry=registry,
+        )
+        if candidate is None:
+            continue
+        loaded = candidate
+        activation_digest = _activation_digest(run_id, catalog_digest, loaded)
+    return loaded, activation_digest, _toolbox_exchanges_digest(exchanges)
+
+
+def _ordered_tool_exchanges(
+    messages: tuple[object, ...],
+) -> tuple[tuple[ToolCall, ToolResultBlock], ...]:
+    pending: list[ToolCall] = []
+    exchanges: list[tuple[ToolCall, ToolResultBlock]] = []
     for message in messages:
         if not isinstance(message, CanonicalMessage):
             raise TypeError("step transcript must contain CanonicalMessage records")
         if message.role is MessageRole.ASSISTANT:
-            for call in message.tool_calls:
-                if call.name == "tool_describe":
-                    tool_name = call.arguments.get("tool_name")
-                    if isinstance(tool_name, str):
-                        calls[call.id] = tool_name
+            if pending:
+                raise ValueError("step transcript has incomplete ordered tool results")
+            pending = list(message.tool_calls)
             continue
-        if message.role is not MessageRole.TOOL:
+        if message.role is MessageRole.TOOL:
+            for block in message.content:
+                if not isinstance(block, ToolResultBlock):
+                    raise TypeError("tool message must contain ToolResultBlock records")
+                if not pending:
+                    raise ValueError(
+                        "step transcript contains an unexpected tool result"
+                    )
+                call = pending.pop(0)
+                if block.call_id != call.id:
+                    raise ValueError("step transcript tool results are out of order")
+                exchanges.append((call, block))
             continue
-        for block in message.content:
-            if not isinstance(block, ToolResultBlock) or block.call_id in seen_results:
-                continue
-            if block.call_id not in calls or block.is_error:
-                continue
-            if block.output.get("kind") != "tool_description":
-                continue
-            data = block.output.get("data")
-            provenance = block.sensitivity_provenance
-            if not isinstance(data, Mapping) or (
-                provenance.get("authority") != "tool_catalog_control"
-                or provenance.get("run_id") != catalog.run_id
-                or provenance.get("catalog_digest") != catalog.catalog_digest
-            ):
-                continue
-            entry = entries.get(calls[block.call_id])
-            if entry is None or not _descriptor_matches(data, catalog, entry):
-                continue
-            declared_bytes = data.get("description_bytes")
-            without_bytes = {
-                key: value for key, value in data.items() if key != "description_bytes"
+        if pending:
+            raise ValueError("step transcript has incomplete ordered tool results")
+    if pending:
+        raise ValueError("step transcript has incomplete ordered tool results")
+    return tuple(exchanges)
+
+
+def _toolbox_transcript_digest(messages: tuple[object, ...]) -> str:
+    """Digest ordered toolbox-load exchanges without treating call IDs as global."""
+
+    return _toolbox_exchanges_digest(_ordered_tool_exchanges(messages))
+
+
+def _toolbox_exchanges_digest(
+    exchanges: tuple[tuple[ToolCall, ToolResultBlock], ...],
+) -> str:
+    return _sha256_digest(
+        [
+            {
+                "call": {
+                    "id": call.id,
+                    "provider_call_id": call.provider_call_id,
+                    "name": call.name,
+                    "arguments": call.arguments,
+                },
+                "result": {
+                    "call_id": result.call_id,
+                    "output": result.output,
+                    "is_error": result.is_error,
+                    "sensitivity": (
+                        None if result.sensitivity is None else result.sensitivity.value
+                    ),
+                    "sensitivity_provenance": result.sensitivity_provenance,
+                    "capability_id": result.capability_id,
+                    "executor_id": result.executor_id,
+                },
             }
-            actual_bytes = len(canonical_json(without_bytes).encode("utf-8"))
-            if declared_bytes != actual_bytes:
-                continue
-            seen_results.add(block.call_id)
-            described_bytes += actual_bytes
-            if described_bytes > limits.max_tool_description_bytes_per_run:
-                raise ValueError("descriptor transcript exceeds its cumulative bound")
-            if entry.invocation_mode is ToolInvocationMode.DIRECT:
-                continue
-            tool_ref = data.get("tool_ref")
-            expected_ref = _tool_reference(
-                catalog.run_id, catalog.catalog_digest, entry
-            )
-            if tool_ref != expected_ref:
-                continue
-            references[expected_ref] = DeferredToolReference(
-                tool_ref=expected_ref,
-                tool_name=entry.view.name,
-                capability_id=entry.capability.id,
-                domain_owner_id=entry.domain_owner_id,
-                executor_id=entry.executor_id,
-                input_schema_digest=entry.input_schema_digest,
-                origin_revision_digest=entry.origin_revision_digest,
-                catalog_digest=catalog.catalog_digest,
-                description_bytes=actual_bytes,
-            )
-    if len(references) > limits.max_tool_references_per_run:
-        raise ValueError("descriptor transcript exceeds its reference bound")
-    return tuple(references[key] for key in sorted(references)), described_bytes
-
-
-def _descriptor_matches(
-    data: Mapping[str, object],
-    catalog: RunToolCatalog,
-    entry: RunToolCatalogEntry,
-) -> bool:
-    keywords = data.get("keywords")
-    if not isinstance(keywords, (tuple, list)):
-        return False
-    return all(
-        (
-            data.get("tool_name") == entry.view.name,
-            data.get("capability_id") == entry.capability.id,
-            data.get("domain_owner_id") == entry.domain_owner_id,
-            data.get("executor_id") == entry.executor_id,
-            data.get("description") == entry.view.description,
-            data.get("summary") == entry.view.discovery.summary,
-            data.get("when_to_use") == entry.view.discovery.when_to_use,
-            tuple(keywords) == entry.view.discovery.keywords,
-            data.get("input_schema") == entry.capability.input_schema,
-            data.get("output_kind") == entry.capability.output_kind,
-            data.get("data_access") == entry.capability.access_mode.value,
-            data.get("operational_effect") == entry.capability.operational_effect.value,
-            data.get("invocation_mode") == entry.invocation_mode.value,
-            data.get("input_schema_digest") == entry.input_schema_digest,
-            data.get("origin_revision_digest") == entry.origin_revision_digest,
-            data.get("catalog_digest") == catalog.catalog_digest,
-        )
+            for call, result in exchanges
+            if call.name == "toolbox_load"
+        ]
     )
 
 
-def _tool_search_score(query: str, entry: RunToolCatalogEntry) -> int:
+def _verified_loaded_entries(
+    data: Mapping[str, object],
+    *,
+    requested_names: tuple[str, ...],
+    run_id: str,
+    catalog_digest: str,
+    catalog_entries: tuple[RunToolCatalogEntry, ...],
+    limits: LoopLimits,
+    registry: CapabilityRegistry,
+) -> tuple[RunToolCatalogEntry, ...] | None:
+    if set(data) != {
+        "run_id",
+        "catalog_digest",
+        "loaded_names",
+        "definition_bytes",
+        "activation_digest",
+    }:
+        return None
+    names_value = data.get("loaded_names")
+    if not isinstance(names_value, (tuple, list)):
+        return None
+    names = tuple(name for name in names_value if isinstance(name, str))
+    if (
+        len(names) != len(names_value)
+        or names != tuple(sorted(requested_names))
+        or len(names) != len(set(names))
+        or len(names) > limits.max_loaded_tools
+        or data.get("run_id") != run_id
+        or data.get("catalog_digest") != catalog_digest
+    ):
+        return None
+    by_name = {entry.view.name: entry for entry in catalog_entries}
+    try:
+        entries = tuple(by_name[name] for name in names)
+    except KeyError:
+        return None
+    if any(
+        entry.load_mode is not ToolLoadMode.ON_DEMAND
+        or not _entry_resolves_exactly(entry, registry)
+        for entry in entries
+    ):
+        return None
+    definitions = tuple(registry.tool_definition(entry.view.name) for entry in entries)
+    definition_bytes = _definition_bytes(definitions)
+    expected_activation = _activation_digest(run_id, catalog_digest, entries)
+    if (
+        data.get("definition_bytes") != definition_bytes
+        or definition_bytes > limits.max_loaded_tool_definition_bytes
+        or data.get("activation_digest") != expected_activation
+        or len(canonical_json(data).encode("utf-8"))
+        > limits.max_toolbox_load_result_bytes
+    ):
+        return None
+    return entries
+
+
+def _toolbox_search_score(query: str, entry: RunToolCatalogEntry) -> int:
     normalized = query.strip().lower()
     terms = tuple(_TOKEN.findall(normalized))
     if not terms:
@@ -2256,14 +2321,20 @@ def _tool_search_score(query: str, entry: RunToolCatalogEntry) -> int:
     score = 0
     if normalized == entry.view.name:
         score += 10_000
-    if normalized == entry.domain_owner_id:
-        score += 5_000
+    phrases = (
+        entry.view.name.replace("_", " "),
+        entry.view.presentation.summary.lower(),
+        entry.view.presentation.when_to_use.lower(),
+        *entry.view.presentation.keywords,
+    )
+    if normalized in phrases:
+        score += 8_000
     weighted_fields = (
         (entry.view.name, 100),
-        (entry.domain_owner_id, 50),
-        (entry.view.discovery.summary, 20),
-        (entry.view.discovery.when_to_use, 10),
-        (" ".join(entry.view.discovery.keywords), 30),
+        (entry.capability.id, 50),
+        (entry.view.presentation.summary, 20),
+        (entry.view.presentation.when_to_use, 10),
+        (" ".join(entry.view.presentation.keywords), 30),
         (" ".join(entry.parameter_names), 15),
     )
     for text, weight in weighted_fields:
@@ -2272,20 +2343,161 @@ def _tool_search_score(query: str, entry: RunToolCatalogEntry) -> int:
     return score
 
 
-def _tool_search_match(
+def _toolbox_search_match(
     score: int,
     entry: RunToolCatalogEntry,
+    *,
+    loaded_names: set[str],
 ) -> dict[str, object]:
+    definition = next(
+        item for item in TOOLBOX_DEFINITIONS if item.id is entry.toolbox_id
+    )
+    load_state = (
+        ToolLoadMode.PINNED.value
+        if entry.load_mode is ToolLoadMode.PINNED
+        else ("loaded" if entry.view.name in loaded_names else "on_demand")
+    )
     return {
         "tool_name": entry.view.name,
-        "domain_owner_id": entry.domain_owner_id,
-        "summary": entry.view.discovery.summary,
-        "invocation_mode": entry.invocation_mode.value,
+        "toolbox_id": entry.toolbox_id.value,
+        "toolbox_label": definition.label,
+        "summary": entry.view.presentation.summary,
+        "when_to_use": entry.view.presentation.when_to_use,
+        "text_trust": entry.view.presentation.text_trust.value,
+        "load_state": load_state,
         "data_access": entry.capability.access_mode.value,
         "operational_effect": entry.capability.operational_effect.value,
         "parameter_names": entry.parameter_names,
-        "input_schema_digest": entry.input_schema_digest,
         "score": score,
+    }
+
+
+def _projection_digest(
+    *,
+    run_id: str,
+    registry_digest: str,
+    catalog_digest: str,
+    transcript_digest: str,
+    provider_definitions: tuple[ToolDefinition, ...],
+    callable_entries: tuple[RunToolCatalogEntry, ...],
+    loaded_entries: tuple[RunToolCatalogEntry, ...],
+    activation_digest: str,
+) -> str:
+    return _sha256_digest(
+        {
+            "run_id": run_id,
+            "registry_digest": registry_digest,
+            "catalog_digest": catalog_digest,
+            "transcript_digest": transcript_digest,
+            "provider_definitions": [
+                _definition_material(item) for item in provider_definitions
+            ],
+            "callable_tools": [entry.view.name for entry in callable_entries],
+            "loaded_tools": [entry.view.name for entry in loaded_entries],
+            "activation_digest": activation_digest,
+        }
+    )
+
+
+def _step_projection_digest(projection: StepToolProjection) -> str:
+    """Recompute one projection digest from its exact runtime-owned material."""
+
+    if not isinstance(projection, StepToolProjection):
+        raise TypeError("projection must be StepToolProjection")
+    return _projection_digest(
+        run_id=projection.run_id,
+        registry_digest=projection.registry_digest,
+        catalog_digest=projection.catalog_digest,
+        transcript_digest=projection.transcript_digest,
+        provider_definitions=projection.provider_definitions,
+        callable_entries=projection.callable_entries,
+        loaded_entries=projection.loaded_entries,
+        activation_digest=projection.activation_digest,
+    )
+
+
+def _validate_step_projection(
+    projection: StepToolProjection,
+    registry: CapabilityRegistry,
+    limits: LoopLimits,
+) -> None:
+    if projection.registry_digest != registry.digest:
+        raise ValueError("step projection registry identity changed")
+    catalog_names = [entry.view.name for entry in projection.catalog_entries]
+    if len(catalog_names) != len(set(catalog_names)) or any(
+        not _entry_resolves_exactly(entry, registry)
+        for entry in projection.catalog_entries
+    ):
+        raise ValueError("step projection catalog entries do not resolve exactly")
+    pinned = tuple(
+        entry
+        for entry in projection.catalog_entries
+        if entry.load_mode is ToolLoadMode.PINNED
+    )
+    loaded = tuple(projection.loaded_entries)
+    if any(
+        entry not in projection.catalog_entries
+        or entry.load_mode is not ToolLoadMode.ON_DEMAND
+        for entry in loaded
+    ) or len({entry.view.name for entry in loaded}) != len(loaded):
+        raise ValueError("step projection loaded set is invalid")
+    expected_callable = tuple(
+        sorted((*pinned, *loaded), key=lambda item: item.view.name)
+    )
+    if projection.callable_entries != expected_callable:
+        raise ValueError("step projection callable set is invalid")
+    loaded_definitions = tuple(
+        registry.tool_definition(entry.view.name) for entry in loaded
+    )
+    if (
+        len(loaded) > limits.max_loaded_tools
+        or (
+            loaded
+            and _definition_bytes(loaded_definitions)
+            > limits.max_loaded_tool_definition_bytes
+        )
+        or projection.loaded_definition_bytes != _definition_bytes(loaded_definitions)
+    ):
+        raise ValueError("step projection loaded definitions exceed their bounds")
+    controls = (
+        _control_definitions(limits)
+        if any(
+            entry.load_mode is ToolLoadMode.ON_DEMAND
+            for entry in projection.catalog_entries
+        )
+        else ()
+    )
+    expected_definitions = tuple(
+        sorted(
+            (
+                *(
+                    registry.tool_definition(entry.view.name)
+                    for entry in expected_callable
+                ),
+                *controls,
+            ),
+            key=lambda item: item.name,
+        )
+    )
+    if projection.provider_definitions != expected_definitions:
+        raise ValueError("step projection provider definitions are invalid")
+    _validate_step_surface(expected_definitions, limits)
+    expected_activation = _activation_digest(
+        projection.run_id, projection.catalog_digest, loaded
+    )
+    if projection.activation_digest != expected_activation:
+        raise ValueError("step projection activation digest is invalid")
+    if projection.projection_digest != _step_projection_digest(projection):
+        raise ValueError("step projection digest is invalid")
+
+
+def _toolbox_observation(entry: RunToolCatalogEntry) -> dict[str, object]:
+    return {
+        "toolbox_id": entry.toolbox_id.value,
+        "load_mode": entry.load_mode.value,
+        "provider_state": (
+            "pinned" if entry.load_mode is ToolLoadMode.PINNED else "loaded"
+        ),
     }
 
 
@@ -2474,7 +2686,7 @@ def _interrupted_batch(
     bounded = tuple(
         _bounded_tool_result(
             resolved.outer_call,
-            _with_invocation_audit(result, resolved),
+            result,
             limits,
         )
         for resolved, result in zip(resolved_calls, ordered, strict=True)
@@ -2484,23 +2696,6 @@ def _interrupted_batch(
         interruption_kind=interruption,
         outcome_certainty=certainty,
     )
-
-
-def _with_invocation_audit(
-    result: ToolResultBlock,
-    resolved: _ResolvedCall,
-) -> ToolResultBlock:
-    entry = resolved.entry
-    if entry is None or entry.invocation_mode is not ToolInvocationMode.DEFERRED:
-        return result
-    output = dict(result.output)
-    output["invocation"] = {
-        "authority": "capability_runtime",
-        "tool_name": entry.view.name,
-        "capability_id": entry.capability.id,
-        "invocation_mode": entry.invocation_mode.value,
-    }
-    return replace(result, output=output)
 
 
 def _result_error_code(result: ToolResultBlock) -> str | None:
@@ -2683,13 +2878,11 @@ __all__ = [
     "CapabilityDomain",
     "CapabilityFailure",
     "CapabilityRuntime",
-    "DeferredToolReference",
-    "DomainToolManifestEntry",
     "InternalCapabilityOutcome",
     "InternalCapabilityRequest",
     "RunToolCatalog",
     "RunToolCatalogEntry",
     "SideEffectPlan",
     "StepToolProjection",
-    "ToolInvocationMode",
+    "ToolboxManifestEntry",
 ]

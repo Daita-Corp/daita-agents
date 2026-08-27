@@ -229,12 +229,16 @@ class MCPCapabilityDomain:
         agent_id: str,
         bindings: tuple[MCPActivatedBinding, ...],
         store: MCPBindingStore,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("MCP declarations belong to another domain")
         self._declarations = declarations
         self._agent_id = agent_id
         self._store = store
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._binding_by_capability = {
             tool.capability_id: (activated.binding, tool)
             for activated in bindings
@@ -251,7 +255,7 @@ class MCPCapabilityDomain:
         return self._declarations
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
-        if run.agent_id != self._agent_id:
+        if run.agent_id != self._agent_id or run.id in self._files_only_run_ids:
             return ()
         projected: list[str] = []
         bindings: dict[str, MCPServerBinding] = {}
@@ -394,6 +398,7 @@ async def activate_mcp_domain(
     client_factory: MCPClientFactory,
     secrets: SecretProvider,
     clock: Callable[[], datetime],
+    files_only_run_ids: set[str] | None = None,
 ) -> tuple[
     MCPCapabilityDomain | None,
     tuple[MCPActivatedBinding, ...],
@@ -446,7 +451,7 @@ async def activate_mcp_domain(
                 name=tool.local_name,
                 capability_id=tool.capability_id,
                 description=tool.description,
-                discovery=tool.discovery,
+                presentation=tool.presentation,
                 origin_revision_digest="sha256:"
                 + sha256(
                     canonical_json(
@@ -457,12 +462,13 @@ async def activate_mcp_domain(
                             "executor_id": tool.executor_id,
                             "input_schema_digest": tool.input_schema_digest,
                             "output_schema_digest": tool.output_schema_digest,
-                            "discovery": {
-                                "summary": tool.discovery.summary,
-                                "when_to_use": tool.discovery.when_to_use,
-                                "keywords": tool.discovery.keywords,
-                                "exposure_class": tool.discovery.exposure_class.value,
-                                "eager_priority": tool.discovery.eager_priority,
+                            "presentation": {
+                                "toolbox_id": tool.presentation.toolbox_id.value,
+                                "load_mode": tool.presentation.load_mode.value,
+                                "text_trust": tool.presentation.text_trust.value,
+                                "summary": tool.presentation.summary,
+                                "when_to_use": tool.presentation.when_to_use,
+                                "keywords": tool.presentation.keywords,
                             },
                         }
                     ).encode("utf-8")
@@ -477,6 +483,7 @@ async def activate_mcp_domain(
         agent_id=agent_id,
         bindings=tuple(activated),
         store=store,
+        files_only_run_ids=files_only_run_ids,
     )
     return domain, tuple(activated), tuple(item.executor for item in activated)
 

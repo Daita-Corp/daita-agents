@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.llm.providers.subscription_cli as subscription_cli
 from daita import Agent
@@ -742,7 +743,9 @@ async def test_subscription_route_persists_without_credentials(
 ):
     provider = "grok-build"
     model = "grok-4.5"
-    created = await Agent.create("atlas", root=tmp_path)
+    created = await Agent.create(
+        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     await created.close()
     provider_id = f"{provider}:{model}"
     validator = MockModelProvider(
@@ -761,7 +764,12 @@ async def test_subscription_route_persists_without_credentials(
         ),
         provider_id=provider_id,
     )
-    agent = await Agent.open("atlas", root=tmp_path, model_validator=validator)
+    agent = await Agent.open(
+        "atlas",
+        root=tmp_path,
+        model_validator=validator,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         route = await agent.configure_model(
             provider=provider,
@@ -778,7 +786,9 @@ async def test_subscription_route_persists_without_credentials(
     )
     stored = json.loads(persisted)
     assert stored["model_route"]["candidates"][0]["secret_reference"] is None
-    reopened = await Agent.open("atlas", root=tmp_path)
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         assert reopened.model_route is not None
         assert reopened.model_route.candidates[0].provider_id == provider_id

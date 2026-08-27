@@ -8,6 +8,7 @@ from typing import cast
 
 import openai
 import pytest
+from _workspace_support import workspace_for
 
 import daita.llm.providers.codex as codex_provider
 import daita.llm.providers.subscription_cli as claude_cli
@@ -554,7 +555,9 @@ class _FakeKeychain:
 
 
 async def test_codex_route_persists_only_a_keychain_reference(tmp_path):
-    created = await Agent.create("atlas", root=tmp_path)
+    created = await Agent.create(
+        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     await created.close()
     keychain = _FakeKeychain()
     validator = MockModelProvider(
@@ -579,6 +582,7 @@ async def test_codex_route_persists_only_a_keychain_reference(tmp_path):
         root=tmp_path,
         keychain=keychain,
         model_validator=validator,
+        workspace=workspace_for(tmp_path),
     )
     try:
         route = await agent.configure_model(

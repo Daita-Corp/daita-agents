@@ -39,6 +39,11 @@ async def test_fresh_state_uses_one_current_development_baseline(
 
     with sqlite3.connect(path) as connection:
         assert table_names(connection) == set(CURRENT_TABLES)
+        mcp_table_sql = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("mcp_server_bindings",),
+        ).fetchone()[0]
+        assert "data TEXT NOT NULL CHECK (json_valid(data))" in mcp_table_sql
     assert migration_rows() == (
         (
             1,

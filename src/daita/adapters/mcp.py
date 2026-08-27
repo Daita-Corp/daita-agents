@@ -16,8 +16,10 @@ from urllib.parse import urlsplit, urlunsplit
 from .._installation import repair_guidance
 from .._json import FrozenJsonObject, canonical_json
 from ..capabilities import (
-    ToolDiscoveryMetadata,
-    ToolExposureClass,
+    ToolboxId,
+    ToolLoadMode,
+    ToolPresentation,
+    ToolTextTrust,
 )
 from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
@@ -165,8 +167,6 @@ class MCPToolSelection:
     summary: str | None = None
     when_to_use: str | None = None
     keywords: tuple[str, ...] = ()
-    exposure_class: ToolExposureClass = ToolExposureClass.DEFERRED
-    eager_priority: int = 0
     result_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
     read_only: bool = True
 
@@ -182,16 +182,17 @@ class MCPToolSelection:
         _bounded_text(self.description, "MCP tool description", maximum=1_024)
         summary = self.description if self.summary is None else self.summary
         when_to_use = self.description if self.when_to_use is None else self.when_to_use
-        discovery = ToolDiscoveryMetadata(
+        presentation = ToolPresentation(
+            toolbox_id=ToolboxId.SOURCES,
+            load_mode=ToolLoadMode.ON_DEMAND,
+            text_trust=ToolTextTrust.ADMITTED_UNTRUSTED,
             summary=summary,
             when_to_use=when_to_use,
             keywords=self.keywords,
-            exposure_class=self.exposure_class,
-            eager_priority=self.eager_priority,
         )
-        object.__setattr__(self, "summary", discovery.summary)
-        object.__setattr__(self, "when_to_use", discovery.when_to_use)
-        object.__setattr__(self, "keywords", discovery.keywords)
+        object.__setattr__(self, "summary", presentation.summary)
+        object.__setattr__(self, "when_to_use", presentation.when_to_use)
+        object.__setattr__(self, "keywords", presentation.keywords)
         if not isinstance(self.result_sensitivity, ModelSensitivity):
             raise TypeError("MCP result_sensitivity is invalid")
         if self.read_only is not True:
@@ -280,7 +281,7 @@ class MCPToolBinding:
     local_name: str
     remote_name: str
     description: str
-    discovery: ToolDiscoveryMetadata
+    presentation: ToolPresentation
     input_schema: FrozenJsonObject
     input_schema_digest: str
     output_schema: FrozenJsonObject | None
@@ -297,8 +298,16 @@ class MCPToolBinding:
             _bounded_text(value, label, maximum=maximum)
         if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", self.local_name) is None:
             raise ValueError("MCP local tool name is not provider-safe")
-        if not isinstance(self.discovery, ToolDiscoveryMetadata):
-            raise TypeError("MCP tool discovery metadata is required")
+        if not isinstance(self.presentation, ToolPresentation):
+            raise TypeError("MCP tool presentation metadata is required")
+        if (
+            self.presentation.toolbox_id is not ToolboxId.SOURCES
+            or self.presentation.load_mode is not ToolLoadMode.ON_DEMAND
+            or self.presentation.text_trust is not ToolTextTrust.ADMITTED_UNTRUSTED
+        ):
+            raise ValueError(
+                "MCP tools must use Sources/on-demand/admitted-untrusted presentation"
+            )
         _remote_tool_name(self.remote_name)
         if not isinstance(self.input_schema, FrozenJsonObject):
             object.__setattr__(
@@ -1119,12 +1128,13 @@ def mcp_binding_from_inspection(
                 local_name=local_name,
                 remote_name=selection.remote_name,
                 description=selection.description,
-                discovery=ToolDiscoveryMetadata(
+                presentation=ToolPresentation(
+                    toolbox_id=ToolboxId.SOURCES,
+                    load_mode=ToolLoadMode.ON_DEMAND,
+                    text_trust=ToolTextTrust.ADMITTED_UNTRUSTED,
                     summary=cast(str, selection.summary),
                     when_to_use=cast(str, selection.when_to_use),
                     keywords=selection.keywords,
-                    exposure_class=selection.exposure_class,
-                    eager_priority=selection.eager_priority,
                 ),
                 input_schema=inspected.input_schema,
                 input_schema_digest=inspected.input_schema_digest,

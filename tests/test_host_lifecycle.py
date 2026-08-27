@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita.hosting.embedded import AgentHomeError, HostActiveError
@@ -49,6 +50,7 @@ async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path
         root=tmp_path,
         model=provider,
         model_profile=provider.model_profile,
+        workspace=workspace_for(tmp_path),
     )
     run = asyncio.create_task(agent.run("answer without tools"))
     started = asyncio.create_task(provider.started.wait())
@@ -75,6 +77,7 @@ async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path
                 root=tmp_path,
                 model=_BlockingProvider(),
                 model_profile=provider.model_profile,
+                workspace=workspace_for(tmp_path),
             ),
             timeout=1,
         )
@@ -91,6 +94,7 @@ async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path
             root=tmp_path,
             model=reopened_provider,
             model_profile=reopened_provider.model_profile,
+            workspace=workspace_for(tmp_path),
         ),
         timeout=1,
     )
@@ -108,6 +112,7 @@ async def test_close_rejects_a_queued_run_before_releasing_writer_ownership(tmp_
         root=tmp_path,
         model=provider,
         model_profile=provider.model_profile,
+        workspace=workspace_for(tmp_path),
     )
     active = asyncio.create_task(agent.run("active run"))
     await asyncio.wait_for(provider.started.wait(), timeout=1)
@@ -128,6 +133,7 @@ async def test_close_rejects_a_queued_run_before_releasing_writer_ownership(tmp_
         root=tmp_path,
         model=reopened_provider,
         model_profile=reopened_provider.model_profile,
+        workspace=workspace_for(tmp_path),
     )
     await reopened.close()
 
@@ -148,6 +154,7 @@ async def test_foreground_run_serializes_owned_host_mutations_but_not_inspection
         root=tmp_path,
         model=provider,
         model_profile=provider.model_profile,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach_sqlite(database)
     permission_preview = None

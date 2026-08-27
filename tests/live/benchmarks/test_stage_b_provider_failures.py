@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, JobStatus
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
@@ -30,6 +31,7 @@ from ._support import (
     logical_names,
     start_profile_response,
     stop_response,
+    toolbox_load_response,
     transcript_text,
     wait_for_terminal,
 )
@@ -55,6 +57,7 @@ async def _open(
         model=provider,
         model_profile=profile,
         limits=OFFLINE_EAGER_LIMITS,
+        workspace=workspace_for(home.root),
     )
 
 
@@ -76,6 +79,7 @@ async def test_transient_retry_after_start_receipt_does_not_reexecute_job_start(
     home = await create_probe_home(tmp_path, "provider-transient-retry")
     scripted = MockModelProvider(
         (
+            toolbox_load_response("start_data_profile"),
             start_profile_response(home.resource_ids[TARGET_PROFILE_TABLE]),
             ModelProviderError(ProviderErrorCode.TIMEOUT),
             stop_response("The independently admitted job is still running."),
@@ -93,7 +97,7 @@ async def test_transient_retry_after_start_receipt_does_not_reexecute_job_start(
             source_id=home.source_id,
         )
         assert result.kind is LoopExitKind.COMPLETED
-        assert len(scripted.requests) == 3
+        assert len(scripted.requests) == 4
         transcript = await agent.transcript(result.run_id)
         assert logical_names(transcript).count("start_data_profile") == 1
         await _assert_one_independent_success(agent, result.run_id)
@@ -107,6 +111,7 @@ async def test_permanent_provider_failure_after_receipt_leaves_one_durable_job(
     home = await create_probe_home(tmp_path, "provider-permanent-failure")
     scripted = MockModelProvider(
         (
+            toolbox_load_response("start_data_profile"),
             start_profile_response(home.resource_ids[TARGET_PROFILE_TABLE]),
             ModelProviderError(ProviderErrorCode.INVALID_REQUEST),
         ),
@@ -124,7 +129,7 @@ async def test_permanent_provider_failure_after_receipt_leaves_one_durable_job(
         )
         assert result.kind is LoopExitKind.FAILED
         assert result.reason == ProviderErrorCode.INVALID_REQUEST.value
-        assert len(scripted.requests) == 2
+        assert len(scripted.requests) == 3
         transcript = await agent.transcript(result.run_id)
         assert logical_names(transcript).count("start_data_profile") == 1
         await _assert_one_independent_success(agent, result.run_id)
@@ -139,6 +144,7 @@ async def test_visible_stream_failure_after_receipt_never_persists_partial_text(
     partial = "EPHEMERAL_STAGE_B_TEXT_MUST_NOT_PERSIST"
     scripted = MockStreamingModelProvider(
         (
+            (ModelStreamCompleted(toolbox_load_response("start_data_profile")),),
             (
                 ModelStreamCompleted(
                     start_profile_response(home.resource_ids[TARGET_PROFILE_TABLE])
@@ -174,6 +180,7 @@ async def test_malformed_terminal_stream_after_receipt_preserves_job_truth(
     partial = "MALFORMED_EPHEMERAL_STAGE_B_TEXT"
     scripted = MockStreamingModelProvider(
         (
+            (ModelStreamCompleted(toolbox_load_response("start_data_profile")),),
             (
                 ModelStreamCompleted(
                     start_profile_response(home.resource_ids[TARGET_PROFILE_TABLE])

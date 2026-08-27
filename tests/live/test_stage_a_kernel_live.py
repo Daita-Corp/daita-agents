@@ -15,6 +15,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
@@ -27,9 +28,11 @@ from daita.llm.models import (
     ModelSensitivity,
     ModelStreamCompleted,
     ModelStreamEvent,
+    ModelUsage,
     ToolCall,
     ToolResultBlock,
 )
+from daita.llm.pricing import CostEstimate
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ModelProvider,
@@ -132,6 +135,9 @@ class _UnavailableStreamingProvider:
             ProviderErrorCode.PROVIDER_UNAVAILABLE,
             "injected failure before the live fallback",
             provider_id=self.provider_id,
+            usage=ModelUsage(
+                cost_estimate=CostEstimate.complete(Decimal("0")),
+            ),
         )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -140,6 +146,9 @@ class _UnavailableStreamingProvider:
             ProviderErrorCode.PROVIDER_UNAVAILABLE,
             "injected failure before the live fallback",
             provider_id=self.provider_id,
+            usage=ModelUsage(
+                cost_estimate=CostEstimate.complete(Decimal("0")),
+            ),
         )
         yield  # pragma: no cover - makes this an async iterator
 
@@ -246,6 +255,7 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
         model=provider,
         model_profile=profile,
         limits=limits,
+        workspace=workspace_for(root),
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Stage A probe"))
@@ -305,6 +315,7 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
         model=provider,
         model_profile=profile,
         limits=limits,
+        workspace=workspace_for(root),
     )
     try:
         reopened_transcript = await reopened.transcript(result.run_id)
@@ -333,6 +344,7 @@ async def test_live_output_exhaustion_never_becomes_normal_completion(
         model=provider,
         model_profile=profile,
         limits=_limits(),
+        workspace=workspace_for(tmp_path / "output-limit-root"),
     )
     try:
         result = await agent.run(
@@ -402,6 +414,7 @@ async def test_live_fallback_provider_stays_sticky_through_tool_completion(
         model=router,
         model_profile=router.model_profile,
         limits=_limits(),
+        workspace=workspace_for(tmp_path / "fallback-root"),
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Fallback probe"))

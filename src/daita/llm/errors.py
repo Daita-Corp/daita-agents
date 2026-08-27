@@ -87,11 +87,11 @@ class ToolCatalogLimitExceeded(LLMError):
 
 
 class ToolManifestLimitExceeded(LLMError):
-    """The trusted compact domain manifest exceeds its independent bound."""
+    """The trusted compact toolbox manifest exceeds its independent bound."""
 
     def __init__(self) -> None:
         super().__init__(
-            "The tool domain manifest exceeds its configured count, byte, or token bound.",
+            "The toolbox manifest exceeds its configured count, byte, or token bound.",
             error_code="tool_manifest_limit_exceeded",
             retryability=ErrorRetryability.PERMANENT,
         )

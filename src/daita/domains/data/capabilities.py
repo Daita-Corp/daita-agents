@@ -13,10 +13,12 @@ from ...capabilities import (
     CapabilityInputError,
     Executor,
     OperationalEffect,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from .controller import (
@@ -626,12 +628,13 @@ def sqlite_query_capability_declarations() -> CapabilityDeclarations:
         SQLITE_QUERY_EXECUTOR_ID,
         "SQLite",
         "data_query_sqlite",
-        ToolDiscoveryMetadata(
+        ToolPresentation(
+            toolbox_id=ToolboxId.SOURCES,
+            load_mode=ToolLoadMode.PINNED,
+            text_trust=ToolTextTrust.CODE,
             summary="Run one bounded validated read-only SQLite query.",
             when_to_use="Use after catalog_schema provides the exact SQLite structure.",
             keywords=("data", "query", "sqlite", "sql"),
-            exposure_class=ToolExposureClass.CORE,
-            eager_priority=950,
         ),
     )
 
@@ -643,12 +646,13 @@ def postgresql_query_capability_declarations() -> CapabilityDeclarations:
         POSTGRESQL_QUERY_EXECUTOR_ID,
         "PostgreSQL",
         "data_query_postgresql",
-        ToolDiscoveryMetadata(
+        ToolPresentation(
+            toolbox_id=ToolboxId.SOURCES,
+            load_mode=ToolLoadMode.PINNED,
+            text_trust=ToolTextTrust.CODE,
             summary="Run one bounded validated read-only PostgreSQL query.",
             when_to_use="Use after catalog_schema provides the exact PostgreSQL structure.",
             keywords=("data", "query", "postgresql", "sql"),
-            exposure_class=ToolExposureClass.CORE,
-            eager_priority=950,
         ),
     )
 
@@ -730,12 +734,13 @@ def postgresql_update_preview_capability_declarations() -> CapabilityDeclaration
         name=POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
-        discovery=ToolDiscoveryMetadata(
+        presentation=ToolPresentation(
+            toolbox_id=ToolboxId.SOURCES,
+            load_mode=ToolLoadMode.ON_DEMAND,
+            text_trust=ToolTextTrust.CODE,
             summary="Preview the exact target set for a structured PostgreSQL update.",
             when_to_use="Use before requesting approval for any supported PostgreSQL update.",
             keywords=("data", "postgresql", "update", "preview"),
-            exposure_class=ToolExposureClass.CORE,
-            eager_priority=940,
         ),
     )
     return CapabilityDeclarations(
@@ -837,12 +842,13 @@ def postgresql_update_capability_declarations() -> CapabilityDeclarations:
         name=POSTGRESQL_UPDATE_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
-        discovery=ToolDiscoveryMetadata(
+        presentation=ToolPresentation(
+            toolbox_id=ToolboxId.SOURCES,
+            load_mode=ToolLoadMode.ON_DEMAND,
+            text_trust=ToolTextTrust.CODE,
             summary="Request approval and execute one exact previewed PostgreSQL update.",
             when_to_use="Use only after a successful exact update preview.",
             keywords=("data", "postgresql", "update", "approval"),
-            exposure_class=ToolExposureClass.CORE,
-            eager_priority=930,
         ),
     )
     return CapabilityDeclarations(
@@ -859,7 +865,7 @@ def _query_declarations(
     executor_id: str,
     adapter_name: str,
     tool_name: str,
-    discovery: ToolDiscoveryMetadata,
+    presentation: ToolPresentation,
 ) -> CapabilityDeclarations:
     capability = Capability(
         id=capability_id,
@@ -890,7 +896,7 @@ def _query_declarations(
         name=tool_name,
         capability_id=capability.id,
         description=capability.description,
-        discovery=discovery,
+        presentation=presentation,
     )
     return CapabilityDeclarations(
         domain_owner_id="data",

@@ -12,6 +12,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, JobStatus, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
@@ -36,7 +37,6 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import (
     LoopExit,
     LoopExitKind,
-    ToolProjectionMode,
     Transcript,
     validate_completed_transcript,
 )
@@ -65,7 +65,7 @@ TERMINAL_STATUSES = frozenset(
     }
 )
 
-OFFLINE_EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+OFFLINE_EAGER_LIMITS = LoopLimits()
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,7 +247,7 @@ async def create_probe_home(
     root = tmp_path / f"{name}-root"
     database = tmp_path / f"{name}.sqlite"
     create_probe_database(database, distractor_tables=distractor_tables)
-    agent = await Agent.create(name, root=root)
+    agent = await Agent.create(name, root=root, workspace=workspace_for(root))
     try:
         source = await agent.attach(SQLiteSource(database, name="Stage B benchmarks"))
         resources = await agent.list_catalog_resources(source_id=source.id)
@@ -282,6 +282,7 @@ async def create_live_agent(
         model=provider,
         model_profile=profile,
         limits=benchmark_limits(),
+        workspace=workspace_for(tmp_path / f"{name}-root"),
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Stage B benchmarks"))
@@ -307,6 +308,7 @@ async def open_live_home(home: ProbeHome, model_id: str) -> LiveAgentFixture:
         model=provider,
         model_profile=profile,
         limits=benchmark_limits(),
+        workspace=workspace_for(home.root),
     )
     return LiveAgentFixture(
         agent=agent,
@@ -345,6 +347,7 @@ async def seed_completed_profile_agent(
         model=provider,
         model_profile=provider.model_profile,
         limits=OFFLINE_EAGER_LIMITS,
+        workspace=workspace_for(home.root),
     )
     try:
         result = await agent.run(
@@ -398,14 +401,14 @@ def assert_completed(capture: RunCapture) -> None:
     validate_completed_transcript(capture.transcript, result)
 
 
-def assert_deferred_invocation(capture: RunCapture, tool_name: str) -> None:
+def assert_on_demand_invocation(capture: RunCapture, tool_name: str) -> None:
     assert capture.requests
     visible_names = {tool.name for tool in capture.requests[0].tools}
-    assert {"tool_search", "tool_describe", "tool_call"} <= visible_names
+    assert {"toolbox_search", "toolbox_load"} <= visible_names
     assert tool_name not in visible_names
     names = logical_names(capture.transcript)
-    assert "tool_search" in names
-    assert "tool_describe" in names
+    assert "toolbox_search" in names
+    assert "toolbox_load" in names
     assert tool_name in names
     assert results_for(capture.transcript, tool_name)
 
@@ -422,11 +425,6 @@ def logical_names(transcript: Transcript) -> tuple[str, ...]:
             if not isinstance(block, ToolResultBlock):
                 continue
             name = outer_names.get(block.call_id)
-            invocation = block.output.get("invocation")
-            if isinstance(invocation, Mapping):
-                invoked_name = invocation.get("tool_name")
-                if isinstance(invoked_name, str):
-                    name = invoked_name
             if name is not None:
                 names.append(name)
     return tuple(names)
@@ -447,11 +445,6 @@ def results_for(
             if not isinstance(block, ToolResultBlock) or block.is_error:
                 continue
             name = outer_names.get(block.call_id)
-            invocation = block.output.get("invocation")
-            if isinstance(invocation, Mapping):
-                invoked_name = invocation.get("tool_name")
-                if isinstance(invoked_name, str):
-                    name = invoked_name
             if name == tool_name:
                 selected.append(block)
     return tuple(selected)
@@ -538,6 +531,19 @@ def start_profile_response(
     )
 
 
+def toolbox_load_response(*tool_names: str) -> ModelResponse:
+    return ModelResponse(
+        finish_reason=FinishReason.TOOL_CALLS,
+        tool_calls=(
+            ToolCall(
+                id="benchmark-toolbox-load",
+                name="toolbox_load",
+                arguments={"tool_names": list(tool_names)},
+            ),
+        ),
+    )
+
+
 def stop_response(text: str = "Done.") -> ModelResponse:
     return ModelResponse(finish_reason=FinishReason.STOP, text=text)
 
@@ -616,7 +622,7 @@ __all__ = [
     "TARGET_IMMEDIATE_TABLE",
     "TARGET_PROFILE_TABLE",
     "assert_completed",
-    "assert_deferred_invocation",
+    "assert_on_demand_invocation",
     "assert_profile_result",
     "benchmark_limits",
     "benchmark_marks",
@@ -633,6 +639,7 @@ __all__ = [
     "results_for",
     "seed_completed_profile_agent",
     "start_profile_response",
+    "toolbox_load_response",
     "stop_response",
     "transcript_text",
     "wait_for_running",

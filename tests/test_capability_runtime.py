@@ -7,8 +7,8 @@ from typing import cast
 import pytest
 from _capability_runtime_support import (
     StaticTestDomain,
-    discovery_metadata,
     execute_projected,
+    presentation_metadata,
     static_registry,
 )
 
@@ -105,7 +105,7 @@ def _declaration() -> tuple[Capability, ToolView]:
         name="test_stage_m1",
         capability_id=capability.id,
         description=capability.description,
-        discovery=discovery_metadata(),
+        presentation=presentation_metadata(),
     )
 
 

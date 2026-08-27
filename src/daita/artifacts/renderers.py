@@ -7,7 +7,7 @@ import math
 import re
 import stat
 import time as time_module
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
@@ -26,10 +26,12 @@ from .models import (
     MAX_ARTIFACT_BYTES,
     MAX_DOCUMENT_BYTES,
     MAX_DOCUMENT_CHARACTERS,
+    MAX_TEXT_EDIT_OPERATIONS,
     ArtifactAuthorship,
     ArtifactDraft,
     ArtifactError,
     ArtifactProvenance,
+    ArtifactTextChangeSummary,
     canonical_artifact_filename,
 )
 
@@ -40,6 +42,50 @@ DOCUMENT_ALLOWED_EXTENSIONS = (
 CSV_ALLOWED_EXTENSIONS = (("text/csv", (".csv",)),)
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 XLSX_ALLOWED_EXTENSIONS = ((XLSX_MEDIA_TYPE, (".xlsx",)),)
+TEXT_EDIT_ALLOWED_EXTENSIONS = (
+    (
+        "text/plain",
+        (
+            ".c",
+            ".cfg",
+            ".conf",
+            ".cpp",
+            ".css",
+            ".go",
+            ".h",
+            ".hpp",
+            ".html",
+            ".ini",
+            ".java",
+            ".js",
+            ".jsx",
+            ".log",
+            ".py",
+            ".rs",
+            ".sh",
+            ".sql",
+            ".toml",
+            ".ts",
+            ".tsx",
+            ".txt",
+            ".xml",
+            ".yaml",
+            ".yml",
+        ),
+    ),
+    ("text/markdown", (".md",)),
+    ("text/csv", (".csv",)),
+    ("text/tab-separated-values", (".tsv",)),
+    ("application/json", (".json", ".jsonl", ".ndjson")),
+)
+TEXT_EDIT_MEDIA_TYPES = frozenset(
+    media_type for media_type, _extensions in TEXT_EDIT_ALLOWED_EXTENSIONS
+)
+MAX_TEXT_EDIT_BYTES = 4 * 1024 * 1024
+MAX_TEXT_EDIT_ANCHOR_BYTES = 16 * 1024
+MAX_TEXT_EDIT_REPLACEMENT_BYTES = 64 * 1024
+MAX_TEXT_EDIT_OCCURRENCES = 100
+MAX_TEXT_EDIT_SECONDS = 10.0
 MAX_CSV_ROWS = 100_000
 MAX_CSV_COLUMNS = 256
 MAX_CSV_BYTES = MAX_ARTIFACT_BYTES
@@ -129,6 +175,243 @@ _XLSX_RELATIONSHIPS = {
         ),
     ),
 }
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedTextEditResult:
+    content: bytes
+    media_type: str
+    summary: ArtifactTextChangeSummary
+
+
+def apply_bounded_text_edits(
+    *,
+    source: bytes,
+    relative_path: str,
+    replacements: Sequence[Mapping[str, object]],
+    clock: Callable[[], float] = time_module.monotonic,
+) -> BoundedTextEditResult:
+    """Apply one atomic ordered exact-replacement family to bounded UTF-8 bytes."""
+
+    if not isinstance(source, bytes) or len(source) > MAX_TEXT_EDIT_BYTES:
+        raise ArtifactError(
+            "artifact_edit_limited",
+            "The workspace text file exceeds the edit byte limit.",
+            {"limit": MAX_TEXT_EDIT_BYTES, "observed": len(source)},
+        )
+    media_type = text_edit_media_type(relative_path)
+    try:
+        current = source.decode("utf-8", errors="strict")
+    except UnicodeError as error:
+        raise ArtifactError(
+            "encoding_unsupported", "The bound file is not valid UTF-8 text."
+        ) from error
+    edits = tuple(replacements)
+    if not 1 <= len(edits) <= MAX_TEXT_EDIT_OPERATIONS:
+        raise ArtifactError(
+            "artifact_edit_limited",
+            "The ordered text edit count is outside its bound.",
+            {"limit": MAX_TEXT_EDIT_OPERATIONS, "observed": len(edits)},
+        )
+    deadline = clock() + MAX_TEXT_EDIT_SECONDS
+    newline = _newline_convention(current)
+    normalized_edits: list[tuple[str, str, int]] = []
+    for index, edit in enumerate(edits):
+        if clock() >= deadline:
+            raise ArtifactError(
+                "artifact_edit_limited",
+                "The text transformation exceeded its time limit.",
+            )
+        if not isinstance(edit, Mapping) or set(edit) != {
+            "old_text",
+            "new_text",
+            "expected_occurrences",
+        }:
+            raise ArtifactError(
+                "artifact_edit_invalid",
+                "Each ordered edit must contain only old_text, new_text, and expected_occurrences.",
+                {"operation_index": index},
+            )
+        old_text = edit.get("old_text")
+        new_text = edit.get("new_text")
+        expected = edit.get("expected_occurrences")
+        if (
+            not isinstance(old_text, str)
+            or not old_text
+            or not isinstance(new_text, str)
+            or not isinstance(expected, int)
+            or isinstance(expected, bool)
+            or not 1 <= expected <= MAX_TEXT_EDIT_OCCURRENCES
+        ):
+            raise ArtifactError(
+                "artifact_edit_invalid",
+                "One ordered text edit has invalid bounded values.",
+                {"operation_index": index},
+            )
+        old_text = _normalize_edit_newlines(old_text, newline)
+        new_text = _normalize_edit_newlines(new_text, newline)
+        try:
+            old_bytes = old_text.encode("utf-8", errors="strict")
+            new_bytes = new_text.encode("utf-8", errors="strict")
+        except UnicodeError as error:
+            raise ArtifactError(
+                "artifact_edit_invalid",
+                "One ordered text edit is not valid UTF-8 text.",
+                {"operation_index": index},
+            ) from error
+        if (
+            len(old_bytes) > MAX_TEXT_EDIT_ANCHOR_BYTES
+            or len(new_bytes) > MAX_TEXT_EDIT_REPLACEMENT_BYTES
+        ):
+            raise ArtifactError(
+                "artifact_edit_limited",
+                "One ordered text edit exceeds its anchor or replacement byte limit.",
+                {"operation_index": index},
+            )
+        if old_text == new_text:
+            raise ArtifactError(
+                "artifact_edit_invalid",
+                "An ordered text edit cannot be a no-op.",
+                {"operation_index": index},
+            )
+        for prior_old, _prior_new, _prior_expected in normalized_edits:
+            if old_text == prior_old or old_text in prior_old or prior_old in old_text:
+                raise ArtifactError(
+                    "artifact_edit_invalid",
+                    "Ordered text edits contain conflicting anchors.",
+                    {"operation_index": index},
+                )
+        normalized_edits.append((old_text, new_text, expected))
+
+    replacement_count = insertion_count = deletion_count = occurrence_count = 0
+    bytes_removed = bytes_added = 0
+    for index, (old_text, new_text, expected) in enumerate(normalized_edits):
+        if clock() >= deadline:
+            raise ArtifactError(
+                "artifact_edit_limited",
+                "The text transformation exceeded its time limit.",
+            )
+        observed = current.count(old_text)
+        if observed == 0:
+            raise ArtifactError(
+                "artifact_edit_anchor_missing",
+                "An exact text-edit anchor is missing.",
+                {"operation_index": index, "expected_occurrences": expected},
+            )
+        if observed != expected:
+            raise ArtifactError(
+                "artifact_edit_anchor_ambiguous",
+                "An exact text-edit anchor has an unexpected occurrence count.",
+                {
+                    "operation_index": index,
+                    "expected_occurrences": expected,
+                    "observed_occurrences": observed,
+                },
+            )
+        current = current.replace(old_text, new_text)
+        if clock() >= deadline:
+            raise ArtifactError(
+                "artifact_edit_limited",
+                "The text transformation exceeded its time limit.",
+            )
+        occurrence_count += observed
+        bytes_removed += len(old_text.encode("utf-8")) * observed
+        bytes_added += len(new_text.encode("utf-8")) * observed
+        if not new_text:
+            deletion_count += 1
+        elif (
+            new_text.startswith(old_text)
+            and (
+                old_text.endswith(("\n", "\r\n"))
+                or new_text[len(old_text) :].startswith(("\n", "\r\n"))
+            )
+        ) or (
+            new_text.endswith(old_text)
+            and (
+                old_text.startswith(("\n", "\r\n"))
+                or new_text[: -len(old_text)].endswith(("\n", "\r\n"))
+            )
+        ):
+            insertion_count += 1
+        else:
+            replacement_count += 1
+        encoded_size = len(current.encode("utf-8"))
+        if encoded_size > MAX_TEXT_EDIT_BYTES:
+            raise ArtifactError(
+                "artifact_edit_limited",
+                "The edited text exceeds the output byte limit.",
+                {"limit": MAX_TEXT_EDIT_BYTES, "observed": encoded_size},
+            )
+    encoded = current.encode("utf-8")
+    if clock() >= deadline:
+        raise ArtifactError(
+            "artifact_edit_limited",
+            "The text transformation exceeded its time limit.",
+        )
+    if encoded == source:
+        raise ArtifactError(
+            "artifact_edit_invalid", "The ordered text edits produced no change."
+        )
+    summary = ArtifactTextChangeSummary(
+        operation_count=len(normalized_edits),
+        replacement_count=replacement_count,
+        insertion_count=insertion_count,
+        deletion_count=deletion_count,
+        occurrence_count=occurrence_count,
+        bytes_removed=bytes_removed,
+        bytes_added=bytes_added,
+        description=(
+            f"{len(normalized_edits)} ordered edit"
+            f"{'s' if len(normalized_edits) != 1 else ''}: "
+            f"{replacement_count} replacement, {insertion_count} insertion, "
+            f"{deletion_count} deletion; +{bytes_added}/-{bytes_removed} UTF-8 bytes"
+        ),
+    )
+    return BoundedTextEditResult(
+        content=encoded,
+        media_type=media_type,
+        summary=summary,
+    )
+
+
+def text_edit_media_type(relative_path: str) -> str:
+    folded = relative_path.casefold()
+    extension = "." + folded.rsplit(".", 1)[-1] if "." in folded else ""
+    for media_type, extensions in TEXT_EDIT_ALLOWED_EXTENSIONS:
+        if extension in extensions:
+            return media_type
+    raise ArtifactError(
+        "artifact_edit_invalid",
+        "This file format does not support bounded text editing.",
+        {
+            "reason": "format_unsupported",
+            "allowed_extensions": tuple(
+                extension
+                for _media_type, extensions in TEXT_EDIT_ALLOWED_EXTENSIONS
+                for extension in extensions
+            ),
+        },
+    )
+
+
+def _newline_convention(value: str) -> str:
+    without_crlf = value.replace("\r\n", "")
+    if "\r" in without_crlf:
+        raise ArtifactError(
+            "artifact_edit_invalid",
+            "The file uses an unsupported or mixed newline convention.",
+        )
+    if "\r\n" in value and "\n" in without_crlf:
+        raise ArtifactError(
+            "artifact_edit_invalid",
+            "The file uses an unsupported or mixed newline convention.",
+        )
+    return "\r\n" if "\r\n" in value else "\n"
+
+
+def _normalize_edit_newlines(value: str, newline: str) -> str:
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n")
+    return normalized if newline == "\n" else normalized.replace("\n", "\r\n")
 
 
 def render_model_document(

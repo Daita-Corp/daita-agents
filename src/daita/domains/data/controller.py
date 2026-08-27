@@ -7,6 +7,8 @@ from dataclasses import replace
 from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject
+from ...adapters.local_file_query import LocalFileQueryError
+from ...adapters.local_workspace import LocalWorkspaceError
 from ...capabilities import (
     AccessMode,
     Capability,
@@ -24,14 +26,20 @@ from ...catalog.capabilities import (
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
 from ...llm.models import ModelSensitivity, ToolCall
-from ...loop.models import RunInput
+from ...loop.models import RunInput, RunOrigin
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
-from .file_capabilities import LOCAL_FILE_READ_CAPABILITY_ID
+from .file_capabilities import (
+    LOCAL_FILE_CAPABILITY_IDS,
+    LOCAL_FILE_QUERY_CAPABILITY_ID,
+    LOCAL_FILE_READ_CAPABILITY_ID,
+)
 from .sql import (
+    DuckDBReadValidationError,
     PostgreSQLUpdateCommand,
     PostgreSQLUpdateIntent,
     ResourceSchema,
+    validate_duckdb_read,
     validate_postgresql_read,
     validate_postgresql_update_intent,
     validate_sqlite_read,
@@ -64,7 +72,6 @@ _UPDATE_CAPABILITIES = frozenset(
 _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
     {
         CATALOG_INSPECT_CAPABILITY_ID,
-        LOCAL_FILE_READ_CAPABILITY_ID,
         POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
         POSTGRESQL_UPDATE_CAPABILITY_ID,
     }
@@ -78,12 +85,12 @@ _ADAPTER_CAPABILITIES = {
             POSTGRESQL_UPDATE_CAPABILITY_ID,
         }
     ),
-    "local-directory": frozenset({LOCAL_FILE_READ_CAPABILITY_ID}),
 }
-_OWNED_CAPABILITIES = frozenset().union(
+_SOURCE_CAPABILITIES = frozenset().union(
     _CATALOG_CAPABILITIES,
     *_ADAPTER_CAPABILITIES.values(),
 )
+_OWNED_CAPABILITIES = _SOURCE_CAPABILITIES | LOCAL_FILE_CAPABILITY_IDS
 
 
 class CatalogSchemaReader(Protocol):
@@ -159,14 +166,34 @@ class DataCapabilityDomain:
         declarations: CapabilityDeclarations,
         catalog: DataDomainCatalog,
         learning: LearningCandidateGuard,
+        *,
+        workspace_id: str | None = None,
+        workspace_sensitivity: ModelSensitivity | None = None,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data declarations have the wrong domain owner")
         declared_ids = {item.id for item in declarations.capabilities}
-        if declared_ids != _OWNED_CAPABILITIES:
+        expected_ids = (
+            _SOURCE_CAPABILITIES if workspace_id is None else _OWNED_CAPABILITIES
+        )
+        if declared_ids != expected_ids:
             raise ValueError(
                 "data declarations must exactly match supported native capabilities"
             )
+        if (workspace_id is None) != (workspace_sensitivity is None):
+            raise ValueError(
+                "workspace identity and sensitivity must be present together"
+            )
+        if workspace_id is not None and (
+            not isinstance(workspace_id, str)
+            or not workspace_id.startswith("workspace:sha256:")
+        ):
+            raise ValueError("workspace_id must be one admitted workspace identity")
+        if workspace_sensitivity is not None and not isinstance(
+            workspace_sensitivity, ModelSensitivity
+        ):
+            raise TypeError("workspace_sensitivity must be ModelSensitivity")
         for adapter_id, capability_ids in _ADAPTER_CAPABILITIES.items():
             if not capability_ids <= declared_ids:
                 raise ValueError(
@@ -185,6 +212,11 @@ class DataCapabilityDomain:
         self._declarations = declarations
         self._catalog = catalog
         self._learning = learning
+        self._workspace_id = workspace_id
+        self._workspace_sensitivity = workspace_sensitivity
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = {item.name: item for item in declarations.tool_views}
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -193,19 +225,28 @@ class DataCapabilityDomain:
         return self._declarations
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
-        facts = await self._catalog.source_routing_facts(
-            run.agent_id,
-            (() if run.source_id is None else (run.source_id,)),
-        )
-        active_adapter_ids = {
-            adapter_id
-            for fact in facts
-            if isinstance((adapter_id := fact.get("adapter_id")), str)
-        }
-        update_source_ids = await self._catalog.postgresql_update_applicable_source_ids(
-            run.agent_id,
-            (() if run.source_id is None else (run.source_id,)),
-        )
+        files_only = run.id in self._files_only_run_ids
+        facts: tuple[Mapping[str, object], ...]
+        update_source_ids: frozenset[str]
+        if files_only:
+            facts = ()
+            update_source_ids = frozenset()
+        else:
+            facts = await self._catalog.source_routing_facts(
+                run.agent_id,
+                (() if run.source_id is None else (run.source_id,)),
+            )
+            update_source_ids = (
+                await self._catalog.postgresql_update_applicable_source_ids(
+                    run.agent_id,
+                    (() if run.source_id is None else (run.source_id,)),
+                )
+            )
+        active_adapter_ids: set[str] = set()
+        for fact in facts:
+            adapter_id = fact.get("adapter_id")
+            if isinstance(adapter_id, str):
+                active_adapter_ids.add(adapter_id)
         names: list[str] = []
         for name in sorted(self._views):
             view = self._views[name]
@@ -218,6 +259,10 @@ class DataCapabilityDomain:
                 continue
             if capability.id in _CATALOG_CAPABILITIES:
                 if facts:
+                    names.append(name)
+                continue
+            if capability.id in LOCAL_FILE_CAPABILITY_IDS:
+                if self._workspace_id is not None and run.origin is RunOrigin.USER:
                     names.append(name)
                 continue
             required_adapter = next(
@@ -252,6 +297,49 @@ class DataCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
+        if capability.id in LOCAL_FILE_CAPABILITY_IDS:
+            if (
+                self._workspace_id is None
+                or self._workspace_sensitivity is None
+                or run.origin is not RunOrigin.USER
+                or run.execution_scope is not None
+            ):
+                raise CapabilityInputError(
+                    "workspace_unavailable",
+                    "Workspace file access is unavailable for this run.",
+                )
+            if "source_id" in arguments or "resource_id" in arguments:
+                raise CapabilityInputError(
+                    "source_scope_violation",
+                    "Workspace file tools do not accept source authority.",
+                )
+            if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
+                has_path = "path" in arguments
+                has_cursor = "cursor" in arguments
+                if has_path == has_cursor:
+                    raise CapabilityInputError(
+                        "path_invalid",
+                        "File read requires exactly one path or cursor.",
+                    )
+                if has_cursor and "position" in arguments:
+                    raise CapabilityInputError(
+                        "cursor_invalid",
+                        "A file cursor cannot be combined with a position.",
+                    )
+            if capability.id == LOCAL_FILE_QUERY_CAPABILITY_ID:
+                try:
+                    validated = validate_duckdb_read(cast(str, arguments["sql"]))
+                except DuckDBReadValidationError as error:
+                    raise CapabilityInputError(
+                        "file_query_invalid",
+                        error.message,
+                        {"reason": error.reason},
+                    ) from error
+                prepared = arguments.to_dict()
+                prepared["sql"] = validated.canonical_sql
+                prepared["sql_fingerprint"] = validated.sql_fingerprint
+                return FrozenJsonObject.from_mapping(prepared)
+            return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
         arguments = self._apply_source_scope(run, capability, arguments)
@@ -304,26 +392,6 @@ class DataCapabilityDomain:
                 arguments,
                 execution=capability.id == POSTGRESQL_UPDATE_CAPABILITY_ID,
             )
-        if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
-            file_source_id = arguments.get("source_id")
-            file_resource_id = arguments.get("resource_id")
-            if (
-                not isinstance(file_source_id, str)
-                or not isinstance(file_resource_id, str)
-                or not await self._catalog.is_current_tabular_file(
-                    run.agent_id,
-                    file_source_id,
-                    file_resource_id,
-                )
-            ):
-                raise CapabilityInputError(
-                    "file_not_current_or_tabular",
-                    "The selected file is not a current tabular catalog resource.",
-                    {
-                        "resource_id": file_resource_id,
-                        "source_id": file_source_id,
-                    },
-                )
         return arguments
 
     async def side_effect_plan(
@@ -361,6 +429,11 @@ class DataCapabilityDomain:
         call: ToolCall,
         error: BaseException,
     ) -> CapabilityFailure | None:
+        del call
+        if isinstance(error, LocalWorkspaceError):
+            return CapabilityFailure(error.code, error.message, error.details)
+        if isinstance(error, LocalFileQueryError):
+            return CapabilityFailure(error.code, error.message, error.details)
         return None
 
     def _apply_source_scope(
@@ -671,6 +744,40 @@ class DataCapabilityDomain:
     ) -> ToolOutput:
         if output.sensitivity is not None:
             return output
+        if capability.id in LOCAL_FILE_CAPABILITY_IDS:
+            if self._workspace_id is None or self._workspace_sensitivity is None:
+                raise CapabilityInputError(
+                    "result_classification_unavailable",
+                    "The workspace result cannot be classified safely.",
+                )
+            relative_paths: list[str] = []
+            physical_revisions: list[str] = []
+            path = output.data.get("path")
+            revision = output.data.get("physical_revision")
+            if isinstance(path, str) and isinstance(revision, str):
+                relative_paths.append(path)
+                physical_revisions.append(revision)
+            matches = output.data.get("matches")
+            if isinstance(matches, tuple):
+                for match in matches:
+                    if not isinstance(match, Mapping):
+                        continue
+                    match_path = match.get("path")
+                    match_revision = match.get("physical_revision")
+                    if isinstance(match_path, str) and isinstance(match_revision, str):
+                        relative_paths.append(match_path)
+                        physical_revisions.append(match_revision)
+            return replace(
+                output,
+                sensitivity=self._workspace_sensitivity,
+                sensitivity_provenance={
+                    "authority": "local_workspace_binding",
+                    "workspace_id": self._workspace_id,
+                    "capability_id": capability.id,
+                    "relative_paths": tuple(relative_paths),
+                    "physical_revisions": tuple(physical_revisions),
+                },
+            )
         source_id = call.arguments.get("source_id")
         source_ids = (
             (source_id,)

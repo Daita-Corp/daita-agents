@@ -5,7 +5,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
-from _capability_runtime_support import context_step_projection, context_tool_catalog
+from _capability_runtime_support import ContextToolProjectionAdapter
+from _workspace_support import workspace_for
 
 from daita._json import FrozenJsonObject
 from daita.agent import Agent
@@ -49,7 +50,7 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 class TranscriptContext:
     async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tool_context.provider_definitions
+        return messages[:-1], tool_context.initial_provider_definitions
 
     def project(
         self,
@@ -81,25 +82,24 @@ class OverflowContext:
 class ScriptedTools:
     def __init__(self, outputs=None):
         self.outputs = outputs or {}
-
-    async def prepare_run(self, run):
-        return context_tool_catalog(
-            run,
+        self._projection = ContextToolProjectionAdapter(
             (
                 ToolDefinition(
                     name="lookup",
                     description="read data",
                     input_schema={"type": "object", "properties": {}},
                 ),
-            ),
+            )
         )
 
-    def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+    async def prepare_run(self, run):
+        return await self._projection.prepare_run(run)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    def project(self, catalog, messages):
+        return self._projection.project(catalog, messages)
+
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         return ToolBatchOutcome(tuple(self.outputs[call.id] for call in calls))
 
 
@@ -723,6 +723,7 @@ async def test_public_create_and_open_inject_the_observer(tmp_path):
         model=first_provider,
         model_profile=profile,
         observer=created_events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.run("create path")
@@ -737,6 +738,7 @@ async def test_public_create_and_open_inject_the_observer(tmp_path):
         model=second_provider,
         model_profile=profile,
         observer=opened_events.append,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await reopened.run("open path")

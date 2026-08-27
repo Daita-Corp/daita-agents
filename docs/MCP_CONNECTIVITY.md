@@ -27,15 +27,16 @@ results are untrusted data and never create authorization.
   aggregates per agent, and fixed request, response, nesting, and result limits
   remain independently enforced.
 - One run catalog admits at most 512 applicable tools and 2 MiB of canonical
-  catalog material. Its compact domain manifest is separately bounded to 64
-  entries, 16 KiB, 4,000 estimated tokens, and five percent of the model's
-  maximum input.
-- One provider request admits at most 64 direct/control definitions and 128
-  KiB of canonical definition material. `AUTO` is the default: core tools are
-  direct, standard tools fill a 48-tool/96-KiB soft budget, and deferred tools
-  are reached through fixed `tool_search`, `tool_describe`, and `tool_call`
-  controls. Every applicable tool remains present exactly once in the run
-  catalog.
+  catalog material. Its canonical toolbox manifest is separately bounded to
+  five entries, 8 KiB, and 2,000 estimated tokens.
+- Pinned tools are selected exactly, never by priority: at most 32 pinned
+  definitions and 96 KiB of pinned definition material may enter the initial
+  provider surface. A step may contain at most 16 loaded tools, 96 KiB of
+  loaded definition material, and 50 definitions or 128 KiB overall.
+- On-demand tools are reached through fixed `toolbox_search` and
+  `toolbox_load` controls, followed on the next model step by ordinary exact
+  tool invocation. Every applicable tool remains present exactly once in the
+  frozen run catalog; a verified load receipt replaces the prior loaded set.
 
 Stdio, OAuth, dynamic client registration, sampling, roots, prompts,
 resources, subscriptions, server-initiated requests, binary content, arbitrary

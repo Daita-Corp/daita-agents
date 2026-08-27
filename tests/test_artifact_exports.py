@@ -15,6 +15,10 @@ from typing import Any, cast
 from uuid import UUID
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita._json import canonical_json
@@ -54,7 +58,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExitKind
 from daita.security import EmptySecretProvider
 
@@ -95,6 +98,15 @@ def _error_code(block: ToolResultBlock) -> str:
     code = error.get("code")
     assert isinstance(code, str)
     return code
+
+
+def _result_for_call(transcript, call_id: str) -> ToolResultBlock:
+    return next(
+        block
+        for message in transcript.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.call_id == call_id
+    )
 
 
 def test_exact_csv_frozen_scalar_escaping_and_dialect_contract() -> None:
@@ -670,6 +682,7 @@ async def _sqlite_export_agent(
         id_factory=_ids(),
         downloads_directory=downloads,
         observer=observer,
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
     return agent, provider, source.id, database
@@ -690,34 +703,37 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         downloads=downloads,
         observer=events.append,
     )
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="export",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": (
-                        "SELECT label, number FROM records "
-                        "WHERE number >= ? ORDER BY number"
-                    ),
-                    "parameters": [1],
-                    "format": "csv",
-                    "filename": "records.csv",
-                },
-            )
-        ),
-        _tools(
-            ToolCall(
-                id="save",
-                name="artifact_save_local",
-                arguments={
-                    "artifact_id": "artifact-00000000000000000000000000000001",
-                    "destination_id": "default",
-                },
-            )
-        ),
-        _stop("saved"),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="export",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": (
+                            "SELECT label, number FROM records "
+                            "WHERE number >= ? ORDER BY number"
+                        ),
+                        "parameters": [1],
+                        "format": "csv",
+                        "filename": "records.csv",
+                    },
+                )
+            ),
+            _tools(
+                ToolCall(
+                    id="save",
+                    name="artifact_save_local",
+                    arguments={
+                        "artifact_id": "artifact-00000000000000000000000000000001",
+                        "mode": "create_new",
+                        "destination_id": "default",
+                    },
+                )
+            ),
+            _stop("saved"),
+        )
     )
     expected = (
         b'"label","number"\r\n'
@@ -748,8 +764,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         receipt = result.artifact_deliveries[0]
         assert Path(receipt.saved_path).read_bytes() == expected
 
-        export_result = transcript.messages[2].content[0]
-        assert isinstance(export_result, ToolResultBlock)
+        export_result = _result_for_call(transcript, "export")
         assert export_result.output["delivery_status"] == "not_delivered"
         export_data = export_result.output["data"]
         assert isinstance(export_data, Mapping)
@@ -800,7 +815,10 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         await agent.close()
 
     reopened = await Agent.open(
-        "csv-public", root=tmp_path, downloads_directory=downloads
+        "csv-public",
+        root=tmp_path,
+        downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         ref = result.artifacts[0]
@@ -843,26 +861,27 @@ async def test_csv_export_reuses_current_sql_and_catalog_validation(
         rows=(("row", 1),),
         downloads=downloads,
     )
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="invalid",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": sql,
-                    "parameters": list(parameters),
-                    "format": "csv",
-                },
-            )
-        ),
-        _stop(),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="invalid",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": sql,
+                        "parameters": list(parameters),
+                        "format": "csv",
+                    },
+                )
+            ),
+            _stop(),
+        )
     )
     try:
         result = await agent.run("Export this as CSV.")
         transcript = await agent.transcript(result.run_id)
-        block = transcript.messages[2].content[0]
-        assert isinstance(block, ToolResultBlock)
+        block = _result_for_call(transcript, "invalid")
         assert _error_code(block) == expected
         assert result.artifacts == ()
     finally:
@@ -881,71 +900,72 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         downloads=downloads,
     )
     try:
-        provider._script = (
-            _tools(
-                ToolCall(
-                    id="mismatch",
-                    name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-                    arguments={
-                        "source_id": source_id,
-                        "sql": "SELECT label FROM records",
-                        "format": "csv",
-                    },
-                )
-            ),
-            _stop(),
+        provider.replace_script(
+            (
+                _tools(
+                    ToolCall(
+                        id="mismatch",
+                        name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+                        arguments={
+                            "source_id": source_id,
+                            "sql": "SELECT label FROM records",
+                            "format": "csv",
+                        },
+                    )
+                ),
+                _stop(),
+            )
         )
         mismatch = await agent.run("Export this as CSV.")
-        mismatch_block = (
-            (await agent.transcript(mismatch.run_id)).messages[2].content[0]
+        mismatch_block = _result_for_call(
+            await agent.transcript(mismatch.run_id), "mismatch"
         )
-        assert isinstance(mismatch_block, ToolResultBlock)
         assert _error_code(mismatch_block) == "tool_not_available"
 
-        provider._script = (
-            _tools(
-                ToolCall(
-                    id="stale",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                    arguments={
-                        "source_id": source_id,
-                        "sql": "SELECT label FROM records",
-                        "format": "csv",
-                    },
-                )
-            ),
-            _stop(),
+        provider.replace_script(
+            (
+                _tools(
+                    ToolCall(
+                        id="stale",
+                        name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                        arguments={
+                            "source_id": source_id,
+                            "sql": "SELECT label FROM records",
+                            "format": "csv",
+                        },
+                    )
+                ),
+                _stop(),
+            )
         )
-        provider._cursor = 0
         with sqlite3.connect(database) as connection:
             connection.execute("ALTER TABLE records ADD COLUMN changed TEXT")
         stale = await agent.run("Export this as CSV.")
-        stale_block = (await agent.transcript(stale.run_id)).messages[2].content[0]
-        assert isinstance(stale_block, ToolResultBlock)
+        stale_block = _result_for_call(await agent.transcript(stale.run_id), "stale")
         assert _error_code(stale_block) == "catalog_source_stale"
         assert stale.artifacts == ()
 
         await agent.detach(source_id)
-        provider._script = (
-            _tools(
-                ToolCall(
-                    id="detached",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                    arguments={
-                        "source_id": source_id,
-                        "sql": "SELECT label FROM records",
-                        "format": "csv",
-                    },
-                )
-            ),
-            _stop(),
+        provider.replace_script(
+            (
+                _tools(
+                    ToolCall(
+                        id="detached",
+                        name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                        arguments={
+                            "source_id": source_id,
+                            "sql": "SELECT label FROM records",
+                            "format": "csv",
+                        },
+                    )
+                ),
+                _stop(),
+            )
         )
-        provider._cursor = 0
         detached = await agent.run("Export this as CSV.")
-        detached_block = (
-            (await agent.transcript(detached.run_id)).messages[2].content[0]
+        detached_block = _result_for_call(
+            await agent.transcript(detached.run_id), "detached"
         )
-        assert isinstance(detached_block, ToolResultBlock)
         assert _error_code(detached_block) == "tool_not_available"
     finally:
         await agent.close()
@@ -971,40 +991,42 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
         return original(*args, **kwargs)
 
     monkeypatch.setattr(sqlite_query_module, "_run_exact_tabular_sync", delayed)
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="first",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
-                    "format": "csv",
-                    "filename": "first.csv",
-                },
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="first",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
+                        "format": "csv",
+                        "filename": "first.csv",
+                    },
+                ),
+                ToolCall(
+                    id="failed",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
+                        "format": "csv",
+                        "filename": "failed.csv",
+                    },
+                ),
+                ToolCall(
+                    id="third",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT number FROM records ORDER BY number",
+                        "format": "csv",
+                        "filename": "third.csv",
+                    },
+                ),
             ),
-            ToolCall(
-                id="failed",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
-                    "format": "csv",
-                    "filename": "failed.csv",
-                },
-            ),
-            ToolCall(
-                id="third",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT number FROM records ORDER BY number",
-                    "format": "csv",
-                    "filename": "third.csv",
-                },
-            ),
-        ),
-        _stop(),
+            _stop(),
+        )
     )
     try:
         result = await agent.run("Export these CSV files.")
@@ -1014,6 +1036,7 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
             for message in transcript.messages
             if message.role is MessageRole.TOOL
             and isinstance(message.content[0], ToolResultBlock)
+            and message.content[0].output.get("kind") != "toolbox_load_receipt"
         )
         assert tuple(block.call_id for block in blocks) == ("first", "failed", "third")
         assert isinstance(blocks[1], ToolResultBlock)
@@ -1052,18 +1075,20 @@ async def test_exact_csv_cancellation_emits_no_artifact_or_partial_reference(
         )
 
     monkeypatch.setattr(sqlite_query_module, "_run_exact_tabular_sync", blocked)
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="cancelled-export",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label FROM records",
-                    "format": "csv",
-                },
-            )
-        ),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="cancelled-export",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label FROM records",
+                        "format": "csv",
+                    },
+                )
+            ),
+        )
     )
     try:
         running = asyncio.create_task(agent.run("Export this CSV file."))
@@ -1090,30 +1115,33 @@ async def test_delivery_failure_after_csv_commit_retains_valid_internal_artifact
         rows=(("retained", 1),),
         downloads=downloads,
     )
-    provider._script = (
-        _tools(
-            ToolCall(
-                id="export",
-                name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-                arguments={
-                    "source_id": source_id,
-                    "sql": "SELECT label, number FROM records",
-                    "format": "csv",
-                    "filename": "retained.csv",
-                },
-            )
-        ),
-        _tools(
-            ToolCall(
-                id="delivery",
-                name="artifact_save_local",
-                arguments={
-                    "artifact_id": "artifact-00000000000000000000000000000001",
-                    "destination_id": "default",
-                },
-            )
-        ),
-        _stop("delivery failed"),
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="export",
+                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    arguments={
+                        "source_id": source_id,
+                        "sql": "SELECT label, number FROM records",
+                        "format": "csv",
+                        "filename": "retained.csv",
+                    },
+                )
+            ),
+            _tools(
+                ToolCall(
+                    id="delivery",
+                    name="artifact_save_local",
+                    arguments={
+                        "artifact_id": "artifact-00000000000000000000000000000001",
+                        "mode": "create_new",
+                        "destination_id": "default",
+                    },
+                )
+            ),
+            _stop("delivery failed"),
+        )
     )
     downloads.rmdir()
     try:
@@ -1121,8 +1149,7 @@ async def test_delivery_failure_after_csv_commit_retains_valid_internal_artifact
         transcript = await agent.transcript(result.run_id)
         assert len(result.artifacts) == 1
         assert result.artifact_deliveries == ()
-        delivery = transcript.messages[4].content[0]
-        assert isinstance(delivery, ToolResultBlock)
+        delivery = _result_for_call(transcript, "delivery")
         assert delivery.is_error
         assert _error_code(delivery) == "artifact_downloads_unavailable"
         error = delivery.output["error"]

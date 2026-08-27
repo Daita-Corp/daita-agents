@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
 from daita.catalog.models import Sensitivity
@@ -169,6 +170,7 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
         model=eligible_route,
         model_profile=eligible_route.model_profile,
         limits=limits,
+        workspace=workspace_for(tmp_path / "eligible-agent-home"),
     )
     try:
         source = await eligible.attach(
@@ -213,6 +215,7 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
         model=ineligible_route,
         model_profile=ineligible_route.model_profile,
         limits=limits,
+        workspace=workspace_for(tmp_path / "ineligible-agent-home"),
     )
     try:
         blocked_source = await ineligible.attach(

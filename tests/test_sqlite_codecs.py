@@ -11,9 +11,13 @@ import pytest
 from daita.adapters.models import SourceRegistration
 from daita.artifacts.models import (
     ArtifactAuthorship,
+    ArtifactDeliveryMode,
+    ArtifactDeliveryOutcome,
     ArtifactDeliveryReceipt,
+    ArtifactLocalFileBinding,
     ArtifactProvenance,
     ArtifactRef,
+    ArtifactTextChangeSummary,
 )
 from daita.catalog.models import (
     CatalogSync,
@@ -117,6 +121,36 @@ def _source() -> SourceRegistration:
         },
         attached_at=NOW,
     )
+
+
+@pytest.mark.parametrize(
+    ("adapter_id", "message"),
+    (
+        ("local-directory", "removed pre-production file-source state"),
+        ("future-adapter", "unsupported current adapter"),
+    ),
+)
+def test_source_codec_rejects_adapters_outside_the_current_state_shape(
+    adapter_id: str,
+    message: str,
+) -> None:
+    source = _source()
+    payload = json.loads(encode_source(source))
+    payload["fields"]["adapter_id"] = adapter_id
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+    with pytest.raises(ValueError, match=message):
+        decode_source(encoded)
+    unsupported = SourceRegistration.build(
+        agent_id=source.agent_id,
+        adapter_id=adapter_id,
+        native_identity=source.native_identity,
+        display_name=source.display_name,
+        configuration=source.configuration,
+        attached_at=source.attached_at,
+    )
+    with pytest.raises(ValueError, match=message):
+        encode_source(unsupported)
 
 
 def _receipt() -> DatabaseWriteReceipt:
@@ -344,6 +378,78 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         == update_scope
     )
     assert encode_postgresql_update_scope(update_scope) == encoded_update_scope
+
+
+def test_bound_edit_provenance_and_exact_outcome_receipt_round_trip_in_codec_v1() -> (
+    None
+):
+    summary = ArtifactTextChangeSummary(
+        operation_count=1,
+        replacement_count=1,
+        insertion_count=0,
+        deletion_count=0,
+        occurrence_count=1,
+        bytes_removed=11,
+        bytes_added=11,
+        description="1 ordered edit: 1 replacement, 0 insertion, 0 deletion; +11/-11 UTF-8 bytes",
+    )
+    binding = ArtifactLocalFileBinding(
+        workspace_id="workspace:sha256:" + "1" * 64,
+        relative_path="config.yaml",
+        original_physical_revision="sha256:" + "2" * 64,
+        observed_content_sha256="sha256:" + "3" * 64,
+        source_byte_size=12,
+        change_summary=summary,
+    )
+    artifact = ArtifactRef(
+        artifact_id="artifact-00000000000000000000000000000002",
+        run_id="run-bound-edit-codec",
+        conversation_id="conversation-bound-edit-codec",
+        call_id="edit-codec",
+        capability_id="artifact.edit_text",
+        filename="config.yaml",
+        media_type="text/plain",
+        byte_size=12,
+        sha256="sha256:" + "4" * 64,
+        sensitivity=Sensitivity.INTERNAL,
+        provenance=ArtifactProvenance(
+            authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+            local_file_binding=binding,
+        ),
+        created_at=NOW,
+    )
+    receipt = ArtifactDeliveryReceipt(
+        artifact_id=artifact.artifact_id,
+        destination_id="destination-bound-workspace-file",
+        filename=artifact.filename,
+        saved_path=binding.relative_path,
+        byte_size=artifact.byte_size,
+        sha256=artifact.sha256,
+        renamed_for_collision=False,
+        delivered_at=NOW,
+        mode=ArtifactDeliveryMode.REPLACE_BOUND_FILE,
+        outcome=ArtifactDeliveryOutcome.UNCERTAIN,
+        workspace_id=binding.workspace_id,
+        relative_path=binding.relative_path,
+        prior_physical_revision=binding.original_physical_revision,
+        result_physical_revision=None,
+        failure_code="artifact_replacement_uncertain",
+    )
+    value = LoopExit(
+        run_id=artifact.run_id,
+        conversation_id=artifact.conversation_id,
+        kind=LoopExitKind.COMPLETED,
+        reason="completed",
+        created_at=NOW,
+        final_text="The edit publication outcome is uncertain.",
+        artifacts=(artifact,),
+        artifact_deliveries=(receipt,),
+    )
+
+    encoded = encode_loop_exit(value)
+    assert "/Users/" not in encoded
+    assert decode_loop_exit(encoded) == value
+    assert encode_loop_exit(decode_loop_exit(encoded)) == encoded
 
 
 def test_failed_loop_exit_round_trips_bounded_provider_diagnostic() -> None:

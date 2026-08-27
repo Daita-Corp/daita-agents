@@ -14,10 +14,12 @@ from ..capabilities import (
     Executor,
     OperationalEffect,
     SideEffectExecutor,
-    ToolDiscoveryMetadata,
+    ToolboxId,
     ToolExecution,
-    ToolExposureClass,
+    ToolLoadMode,
     ToolOutput,
+    ToolPresentation,
+    ToolTextTrust,
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
@@ -140,12 +142,13 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
                 name=MEMORY_SET_TOOL_NAME,
                 capability_id=capability.id,
                 description=capability.description,
-                discovery=ToolDiscoveryMetadata(
+                presentation=ToolPresentation(
+                    toolbox_id=ToolboxId.KNOWLEDGE,
+                    load_mode=ToolLoadMode.ON_DEMAND,
+                    text_trust=ToolTextTrust.CODE,
                     summary="Replace one bounded advisory memory or user-profile document.",
                     when_to_use="Use only for explicit durable definitions or preferences.",
                     keywords=("memory", "user", "preference", "remember"),
-                    exposure_class=ToolExposureClass.DEFERRED,
-                    eager_priority=200,
                 ),
             ),
         ),

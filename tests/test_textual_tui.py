@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
+from _workspace_support import workspace_for
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.geometry import Offset
@@ -80,6 +81,7 @@ from daita.tui.models import (
 )
 from daita.tui.observer import ObserverEvent
 from daita.tui.projection import (
+    CAPABILITY_LABELS,
     approval_review_document,
     project_tool_details,
     redact_presentation_value,
@@ -175,6 +177,13 @@ def test_postgresql_url_and_redaction():
 
 
 def test_tool_projection_and_approval_document():
+    assert CAPABILITY_LABELS["toolbox_search"] == "Search toolboxes"
+    assert CAPABILITY_LABELS["toolbox_load"] == "Load selected tools"
+    assert CAPABILITY_LABELS["file_search"] == "Search workspace files"
+    assert CAPABILITY_LABELS["file_read"] == "Read workspace file"
+    assert CAPABILITY_LABELS["file_query"] == "Query workspace data"
+    assert CAPABILITY_LABELS["artifact_edit_text"] == "Prepare workspace edit"
+    assert CAPABILITY_LABELS["artifact_save_local"] == "Save artifact locally"
     details = project_tool_details(
         ToolCall(id="c1", name="data_query_sqlite", arguments={"sql": "SELECT 1"}),
         ToolResultBlock(
@@ -195,8 +204,10 @@ def test_tool_projection_and_approval_document():
         tool_name="tool",
         capability_id="cap",
         arguments_text='{\n  "name": "safe"\n}',
+        reason="Replace the exact unchanged workspace file config.yaml?",
     )
     assert reviewable and document is not None
+    assert "Change: Replace the exact unchanged workspace file config.yaml?" in document
     _secret_doc, secret_ok = approval_review_document(
         tool_name="tool",
         capability_id="cap",
@@ -239,7 +250,7 @@ async def test_clipboard_reports_empty_and_oversize_truthfully():
 
 
 async def test_app_mounts_create_screen_and_exits_on_cancel(tmp_path: Path):
-    app = DaitaApp(root=tmp_path)
+    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
     async with app.run_test() as pilot:
         await pilot.pause(0.3)
         assert isinstance(app.screen, AgentCreateScreen)
@@ -251,12 +262,16 @@ async def test_app_mounts_create_screen_and_exits_on_cancel(tmp_path: Path):
 async def test_agent_picker_create_button_routes_to_existing_creation_flow(
     tmp_path: Path,
 ):
-    first = await Agent.create("existing-one", root=tmp_path)
+    first = await Agent.create(
+        "existing-one", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     await first.close()
-    second = await Agent.create("existing-two", root=tmp_path)
+    second = await Agent.create(
+        "existing-two", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     await second.close()
 
-    app = DaitaApp(root=tmp_path)
+    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
     async with app.run_test(size=(90, 28)) as pilot:
         for _ in range(20):
             await pilot.pause(0.05)
@@ -307,7 +322,7 @@ async def test_agent_picker_create_button_routes_to_existing_creation_flow(
 
 
 async def test_app_resize_and_too_small_screen(tmp_path: Path):
-    app = DaitaApp(root=tmp_path)
+    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
     async with app.run_test(size=(80, 24)) as pilot:
         await pilot.pause()
         await pilot.resize_terminal(MIN_USABLE_COLUMNS - 1, MIN_READY_ROWS - 1)
@@ -317,8 +332,12 @@ async def test_app_resize_and_too_small_screen(tmp_path: Path):
 
 
 async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path: Path):
-    opened = await Agent.create("home-without-setup", root=tmp_path)
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    opened = await Agent.create(
+        "home-without-setup", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(100, 30)) as pilot:
@@ -327,7 +346,9 @@ async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path:
             assert isinstance(app.screen, ChatScreen)
             notice = str(app.screen.query_one("#notice-bar", Static).content)
             assert "no model · use /model" in notice
-            assert "no source · use /source add" in notice
+            assert "Files:" in notice
+            assert "Run source: none connected (a source is optional)" in notice
+            assert "no source · use /source add" not in notice
             assert app.screen.query_one(Composer).disabled is False
             app.exit(0)
     finally:
@@ -335,7 +356,7 @@ async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path:
 
 
 def test_daita_theme_uses_the_official_terminal_palette():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     theme = app.get_theme("daita")
     assert app.theme == "daita"
     assert theme is not None
@@ -367,7 +388,7 @@ def test_context_window_copy_is_compact_exact_and_warns_near_capacity():
 
 
 async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: Path):
-    boot = DaitaApp(start_bootstrap=False)
+    boot = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with boot.run_test(size=(80, 24)):
         welcome = boot.query_one("#boot", WelcomeView)
         assert "DAITA  1.0.0" in str(welcome.content)
@@ -377,8 +398,12 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
         assert "Starting your workspace" in str(welcome.content)
         boot.exit(0)
 
-    opened = await Agent.create("welcome-agent", root=tmp_path)
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    opened = await Agent.create(
+        "welcome-agent", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(110, 28)) as pilot:
@@ -426,8 +451,11 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(100, 30)) as pilot:
@@ -476,6 +504,27 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             await pilot.pause()
             assert "ctx 8.5K / 32K" in str(context.content)
 
+            for tool_name, expected in (
+                ("toolbox_search", "Searching toolboxes"),
+                ("toolbox_load", "Loading selected tools"),
+                ("file_search", "Searching workspace files"),
+                ("file_read", "Reading workspace file"),
+                ("file_query", "Querying workspace data"),
+                ("artifact_edit_text", "Preparing workspace file edit"),
+                ("artifact_save_local", "Publishing local artifact"),
+            ):
+                started = AgentEvent(
+                    kind=AgentEventKind.TOOL_STARTED,
+                    occurred_at=datetime.now(UTC),
+                    run_id="run-live",
+                    conversation_id="conversation-live",
+                    data=FrozenJsonObject.from_mapping(
+                        {"tool_name": tool_name, "call_id": f"call-{tool_name}"}
+                    ),
+                )
+                await app.on_observer_event(ObserverEvent(started))
+                assert expected in str(activity.content)
+
             tool_completed = AgentEvent(
                 kind=AgentEventKind.TOOL_COMPLETED,
                 occurred_at=datetime.now(UTC),
@@ -512,8 +561,12 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
 async def test_typed_command_palette_navigates_and_inserts_without_submitting(
     tmp_path: Path,
 ):
-    opened = await Agent.create("palette-agent", root=tmp_path)
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    opened = await Agent.create(
+        "palette-agent", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(90, 28)) as pilot:
@@ -584,14 +637,18 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
 async def test_skill_and_source_completions_are_plain_and_selectable(tmp_path: Path):
     database = tmp_path / "completion.sqlite"
     _create_sqlite_source(database, "records")
-    opened = await Agent.create("completion-agent", root=tmp_path)
+    opened = await Agent.create(
+        "completion-agent", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     await opened.attach(SQLiteSource(database, name="North [bold]"))
     await opened.save_skill(
         "audit",
         "Review [bold red]recorded totals[/]",
         "Check each recorded total against its source.",
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(90, 28)) as pilot:
@@ -844,7 +901,7 @@ def _tui_job_inspection(summary: SimpleNamespace) -> SimpleNamespace:
 
 
 async def test_jobs_commands_route_without_model_calls(monkeypatch):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     running = _tui_job_summary("job-running", JobStatus.RUNNING, result_available=False)
     succeeded = _tui_job_summary(
         "job-succeeded", JobStatus.SUCCEEDED, result_available=True
@@ -896,7 +953,7 @@ async def test_jobs_commands_route_without_model_calls(monkeypatch):
 
 
 async def test_inbox_command_routes_without_a_model_call():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
     assert (
         "/inbox",
@@ -912,7 +969,7 @@ async def test_inbox_command_routes_without_a_model_call():
 
 
 async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     item = _tui_inbox_item(report="Ready\x1b[31m @everyone")
     items = [item]
     acknowledgments: list[str] = []
@@ -987,8 +1044,12 @@ async def test_background_status_notifies_once_and_remains_outside_transcript(
     tmp_path: Path,
     monkeypatch,
 ):
-    opened = await Agent.create("inbox-status-agent", root=tmp_path)
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    opened = await Agent.create(
+        "inbox-status-agent", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     running = _tui_job_summary(
         "job-running-status", JobStatus.RUNNING, result_available=False
@@ -1035,8 +1096,12 @@ async def test_background_status_notifies_once_and_remains_outside_transcript(
 async def test_machine_origin_observations_do_not_project_into_foreground_chat(
     tmp_path: Path,
 ):
-    opened = await Agent.create("origin-isolation-agent", root=tmp_path)
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    opened = await Agent.create(
+        "origin-isolation-agent", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     observed = datetime.now(UTC)
     try:
@@ -1122,7 +1187,7 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
 
 
 async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypatch):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     running = _tui_job_summary(
         "job-running-0123456789", JobStatus.RUNNING, result_available=False
     )
@@ -1243,7 +1308,7 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
 async def test_direct_jobs_cancel_command_confirms_and_opens_updated_manager(
     monkeypatch,
 ):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     running = _tui_job_summary(
         "job-direct-cancel", JobStatus.RUNNING, result_available=False
     )
@@ -1306,9 +1371,13 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
 ):
     database = tmp_path / "permissions.sqlite"
     _create_sqlite_source(database, "records")
-    opened = await Agent.create("permissions-picker", root=tmp_path)
+    opened = await Agent.create(
+        "permissions-picker", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await opened.attach(SQLiteSource(database, name="Records"))
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(90, 28)) as pilot:
@@ -1435,7 +1504,7 @@ async def test_source_permissions_configures_exact_postgresql_update_scope():
         picker.action_toggle_selected()
         picker.action_confirm()
 
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     app.controller.inspect_source_permissions = inspect_source_permissions  # type: ignore[method-assign]
     app.controller.preview_source_permissions = preview_source_permissions  # type: ignore[method-assign]
     app.controller.apply_source_permissions = apply_source_permissions  # type: ignore[method-assign]
@@ -1507,7 +1576,7 @@ async def test_approval_approve_deny_cancel_and_unreviewable():
         reason="too big",
     )
 
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=(80, 24)) as pilot:
         await app.push_screen(ChatScreen())
         chat = app.screen
@@ -1555,7 +1624,7 @@ async def test_approval_approve_deny_cancel_and_unreviewable():
             await hidden_oversize
         app.exit(0)
 
-    too_small = DaitaApp(start_bootstrap=False)
+    too_small = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with too_small.run_test(size=(40, 10)):
         await too_small.push_screen(ChatScreen())
         with pytest.raises(RuntimeError, match="too small"):
@@ -1607,7 +1676,9 @@ async def test_composer_submit_runs_agent_once(tmp_path: Path):
     from daita import LoopExit, LoopExitKind
     from daita.tui.screens.chat import ChatScreen
 
-    opened = await Agent.create("ready", root=tmp_path)
+    opened = await Agent.create(
+        "ready", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     calls: list[str] = []
 
     async def fake_run(message: str, **_kwargs: object) -> LoopExit:
@@ -1622,7 +1693,9 @@ async def test_composer_submit_runs_agent_once(tmp_path: Path):
         )
 
     opened.run = fake_run  # type: ignore[method-assign]
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(80, 24)) as pilot:
@@ -1654,8 +1727,11 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
         root=tmp_path,
         model=provider,
         model_profile=_mock_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(80, 18)) as pilot:
@@ -1695,7 +1771,7 @@ async def test_chat_accumulates_and_resumes_the_full_conversation_transcript(
 
 
 async def test_transcript_history_supports_review_and_latest_navigation():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=(60, 14)) as pilot:
         await app.push_screen(ChatScreen())
         chat = app.chat()
@@ -1735,7 +1811,7 @@ async def test_transcript_history_supports_review_and_latest_navigation():
 
 
 async def test_ctrl_o_toggles_tool_calls_without_exiting_chat():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=(80, 24)) as pilot:
         await app.push_screen(ChatScreen())
         chat = app.screen
@@ -1816,7 +1892,12 @@ async def test_tui_credential_session_survives_internal_agent_reopen(tmp_path: P
     keychain = _Keychain()
     reference = SecretReference.keychain("agent:postgresql:session-test")
     keychain.values[reference.name] = "session-secret"
-    app = DaitaApp(root=tmp_path, keychain=keychain, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path,
+        keychain=keychain,
+        start_bootstrap=False,
+        workspace=workspace_for(tmp_path),
+    )
     session = app.controller.keychain
     assert isinstance(session, CredentialSession)
     assert await session.resolve(reference) == "session-secret"
@@ -1898,7 +1979,12 @@ async def test_tui_preloads_active_credentials_before_accepting_queries(
         return opened
 
     monkeypatch.setattr("daita.tui.controller.Agent.open", open_agent)
-    app = DaitaApp(root=tmp_path, keychain=keychain, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path,
+        keychain=keychain,
+        start_bootstrap=False,
+        workspace=workspace_for(tmp_path),
+    )
 
     assert (
         await app.controller.open_agent(
@@ -1955,7 +2041,7 @@ async def test_review_cost_modal_validates_before_dismissal():
 
 
 def test_external_editor_runs_only_inside_textual_suspend():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     events: list[str] = []
 
     @contextmanager
@@ -1980,8 +2066,12 @@ def test_external_editor_runs_only_inside_textual_suspend():
 async def test_skill_memory_and_candidate_editor_flows_use_public_controller(
     tmp_path: Path,
 ):
-    opened = await Agent.create("editors", root=tmp_path)
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    opened = await Agent.create(
+        "editors", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         app._edit_document = lambda seed: (  # type: ignore[method-assign]
@@ -2029,9 +2119,13 @@ async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path
     edited_path = tmp_path / "edited.sqlite"
     _create_sqlite_source(current_path, "records")
     _create_sqlite_source(edited_path, "records")
-    opened = await Agent.create("source-editor", root=tmp_path)
+    opened = await Agent.create(
+        "source-editor", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     await opened.attach(SQLiteSource(current_path, name="Warehouse"))
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(100, 34)) as pilot:
@@ -2063,7 +2157,7 @@ async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path
 
 
 async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     source = SimpleNamespace(
         id="source-postgresql",
         adapter_id="postgresql",
@@ -2135,7 +2229,7 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
 async def test_source_edit_rejects_a_zero_resource_preview_without_confirmation(
     monkeypatch,
 ):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
     async def active_source() -> None:
         return None
@@ -2165,11 +2259,15 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
     second_path = tmp_path / "second.sqlite"
     _create_sqlite_source(first_path, "orders")
     _create_sqlite_source(second_path, "tickets")
-    opened = await Agent.create("catalog-browser", root=tmp_path)
+    opened = await Agent.create(
+        "catalog-browser", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     first = await opened.attach(SQLiteSource(first_path, name="Sales"))
     await opened.attach(SQLiteSource(second_path, name="Support"))
     await opened.select_source(first.id)
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(100, 34)) as pilot:
@@ -2257,9 +2355,13 @@ async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
 ):
     database = tmp_path / "empty.sqlite"
     sqlite3.connect(database).close()
-    opened = await Agent.create("empty-catalog-browser", root=tmp_path)
+    opened = await Agent.create(
+        "empty-catalog-browser", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await opened.attach(SQLiteSource(database, name="Empty source"))
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(100, 34)) as pilot:
@@ -2296,7 +2398,7 @@ async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
 
 
 async def test_model_setup_uses_codex_device_login_without_api_key():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     configured: dict[str, object] = {}
     verification: list[tuple[str, str]] = []
     authentication_started = asyncio.Event()
@@ -2369,7 +2471,7 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
 
 
 async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
     async with app.run_test(size=(90, 30)) as pilot:
         await app.push_screen(ModelSetupScreen())
@@ -2400,7 +2502,7 @@ async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
 
 
 async def test_source_setup_matches_the_muted_onboarding_treatment():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
     async with app.run_test(size=(100, 32)) as pilot:
         await app.push_screen(SourceSetupScreen())
@@ -2446,7 +2548,7 @@ async def test_source_setup_matches_the_muted_onboarding_treatment():
 
 
 async def test_remaining_control_screens_share_the_muted_minimal_treatment():
-    create_app = DaitaApp(start_bootstrap=False)
+    create_app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with create_app.run_test(size=(100, 32)) as pilot:
         await create_app.push_screen(AgentCreateScreen())
         await pilot.pause()
@@ -2461,7 +2563,7 @@ async def test_remaining_control_screens_share_the_muted_minimal_treatment():
         assert create.styles.background.hex in {"#181818", "#303030"}
         create_app.exit(0)
 
-    permissions_app = DaitaApp(start_bootstrap=False)
+    permissions_app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with permissions_app.run_test(size=(100, 32)) as pilot:
         await permissions_app.push_screen(PermissionsScreen())
         await pilot.pause()
@@ -2476,7 +2578,7 @@ async def test_remaining_control_screens_share_the_muted_minimal_treatment():
         assert apply.styles.background.hex in {"#181818", "#303030"}
         permissions_app.exit(0)
 
-    confirm_app = DaitaApp(start_bootstrap=False)
+    confirm_app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with confirm_app.run_test(size=(100, 32)) as pilot:
         await confirm_app.push_screen(ConfirmScreen("Apply this change?"))
         await pilot.pause()
@@ -2491,7 +2593,7 @@ async def test_remaining_control_screens_share_the_muted_minimal_treatment():
 
 
 async def test_source_setup_accepts_a_successfully_attached_empty_catalog(monkeypatch):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     attach_count = 0
 
     async def attach_sqlite(_path: Path, *, name: str | None) -> object:
@@ -2523,7 +2625,7 @@ async def test_source_setup_accepts_a_successfully_attached_empty_catalog(monkey
 
 
 async def test_postgresql_setup_probes_and_preselects_schemas_with_tables(monkeypatch):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     credential = SecretReference.keychain("test-postgresql-probe")
     attached: dict[str, object] = {}
     deleted: list[SecretReference] = []
@@ -2587,7 +2689,7 @@ async def test_postgresql_setup_probes_and_preselects_schemas_with_tables(monkey
 
 
 async def test_copy_uses_native_wrap_independent_text_selection(monkeypatch):
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     copied: list[str] = []
 
     async def deliver(text: str) -> ClipboardResult:
@@ -2609,7 +2711,9 @@ async def test_copy_uses_native_wrap_independent_text_selection(monkeypatch):
 
 
 async def test_active_run_cancellation_does_not_retry_agent(tmp_path: Path):
-    opened = await Agent.create("cancel-once", root=tmp_path)
+    opened = await Agent.create(
+        "cancel-once", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     calls: list[str] = []
     started = asyncio.Event()
 
@@ -2619,7 +2723,9 @@ async def test_active_run_cancellation_does_not_retry_agent(tmp_path: Path):
         await asyncio.Event().wait()
 
     opened.run = wait_forever  # type: ignore[method-assign]
-    app = DaitaApp(root=tmp_path, start_bootstrap=False)
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
     app.controller.agent = opened
     try:
         async with app.run_test(size=(80, 24)) as pilot:
@@ -2640,7 +2746,7 @@ async def test_active_run_cancellation_does_not_retry_agent(tmp_path: Path):
 
 
 async def test_approval_presentation_failure_is_not_converted_to_denial():
-    app = DaitaApp(start_bootstrap=False)
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     request = ApprovalRequest(
         run_id="run-failure",
         call_id="call-failure",

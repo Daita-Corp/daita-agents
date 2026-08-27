@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.hosting.embedded as embedded
 from daita import Agent, SQLiteSource, cli
@@ -99,7 +100,7 @@ async def test_agent_state_root_and_database_are_owner_only(tmp_path: Path) -> N
     root = tmp_path / "state-root"
     root.mkdir(mode=0o755)
 
-    agent = await Agent.create("atlas", root=root)
+    agent = await Agent.create("atlas", root=root, workspace=workspace_for(root))
     try:
         assert stat.S_IMODE(root.stat().st_mode) == 0o700
         assert stat.S_IMODE(agent.home.stat().st_mode) == 0o700
@@ -117,6 +118,7 @@ async def test_clear_conversations_removes_transcript_derived_state_only(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.set_memory("Approved durable memory.")
@@ -167,7 +169,9 @@ async def test_detach_deletes_only_an_owned_postgresql_credential(
     tmp_path: Path,
 ) -> None:
     keychain = _Keychain()
-    agent = await Agent.create("atlas", root=tmp_path, keychain=keychain)
+    agent = await Agent.create(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
     try:
         reference = SecretReference.keychain(
             embedded._credential_account(agent.id, "postgresql", "credential-fixed")
@@ -196,7 +200,9 @@ async def test_agent_delete_removes_home_and_all_owned_credentials(
     tmp_path: Path,
 ) -> None:
     keychain = _Keychain()
-    agent = await Agent.create("atlas", root=tmp_path, keychain=keychain)
+    agent = await Agent.create(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
     await agent.close()
     validator = MockModelProvider(
         (_validation_response("openai:test-model"),),
@@ -207,6 +213,7 @@ async def test_agent_delete_removes_home_and_all_owned_credentials(
         root=tmp_path,
         keychain=keychain,
         model_validator=validator,
+        workspace=workspace_for(tmp_path),
     )
     route = await configured.configure_model(
         provider="openai",
@@ -236,7 +243,9 @@ async def test_agent_delete_preserves_home_when_credential_cleanup_fails(
     tmp_path: Path,
 ) -> None:
     keychain = _Keychain()
-    agent = await Agent.create("atlas", root=tmp_path, keychain=keychain)
+    agent = await Agent.create(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
     await agent.close()
     validator = MockModelProvider(
         (_validation_response("openai:test-model"),),
@@ -247,6 +256,7 @@ async def test_agent_delete_preserves_home_when_credential_cleanup_fails(
         root=tmp_path,
         keychain=keychain,
         model_validator=validator,
+        workspace=workspace_for(tmp_path),
     )
     await configured.configure_model(
         provider="openai",
@@ -267,7 +277,9 @@ async def test_agent_delete_preserves_home_when_credential_cleanup_fails(
 
 
 async def test_agent_delete_respects_the_active_writer_lock(tmp_path: Path) -> None:
-    agent = await Agent.create("atlas", root=tmp_path)
+    agent = await Agent.create(
+        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         with pytest.raises(AgentHomeError, match="host_active"):
             await Agent.delete("atlas", root=tmp_path)
@@ -293,10 +305,13 @@ async def test_terminal_lifecycle_commands_require_confirmation(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     result = await agent.run("Create history.")
-    controller = PresentationController(root=tmp_path)
+    controller = PresentationController(
+        root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     controller.agent = agent
     controller.conversation_id = result.conversation_id
 
@@ -325,10 +340,13 @@ async def test_terminal_can_clear_history_detach_source_and_delete_agent(
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     result = await agent.run("Create history.")
-    controller = PresentationController(root=tmp_path)
+    controller = PresentationController(
+        root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     controller.agent = agent
     controller.conversation_id = result.conversation_id
 
@@ -350,7 +368,9 @@ async def test_headless_lifecycle_commands_require_and_honor_yes(
 ) -> None:
     database = tmp_path / "data.sqlite"
     _database(database)
-    agent = await Agent.create("atlas", root=tmp_path)
+    agent = await Agent.create(
+        "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
     await agent.close()
     parser = cli.build_parser()

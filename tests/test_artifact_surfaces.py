@@ -5,6 +5,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.artifacts.delivery as delivery_module
 from daita import Agent, ArtifactDeliveryReceipt, cli
@@ -23,7 +27,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
 from daita.tui.projection import artifact_delivery_messages, completed_tool_pairs
 
@@ -82,6 +85,7 @@ async def _create_artifact_agent(
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     result = await agent.run("Create a TXT file.")
     return agent, result.artifacts[0]
@@ -98,7 +102,10 @@ async def test_public_known_id_read_and_save_work_after_restart_without_rerunnin
     finally:
         await agent.close()
     reopened = await Agent.open(
-        "public-restart", root=tmp_path, downloads_directory=downloads
+        "public-restart",
+        root=tmp_path,
+        downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert (await reopened.read_artifact(ref.artifact_id)).content == (
@@ -127,7 +134,10 @@ async def test_public_save_path_is_one_time_and_public_set_location_is_persisten
     finally:
         await agent.close()
     reopened = await Agent.open(
-        "public-paths", root=tmp_path, downloads_directory=downloads
+        "public-paths",
+        root=tmp_path,
+        downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert (await reopened.export_destination()).destination_id == (
@@ -307,6 +317,7 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
                         name="artifact_save_local",
                         arguments={
                             "artifact_id": ref.artifact_id,
+                            "mode": "create_new",
                             "destination_id": "default",
                         },
                     ),
@@ -332,6 +343,49 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
     failed_messages = artifact_delivery_messages(completed_tool_pairs(failed))
     assert any(
         "remains available; local delivery failed" in text for text in failed_messages
+    )
+
+    uncertain_edit = Transcript(
+        run=run,
+        messages=(
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=(
+                    ToolCall(
+                        id="replace",
+                        name="artifact_save_local",
+                        arguments={
+                            "artifact_id": ref.artifact_id,
+                            "mode": "replace_bound_file",
+                        },
+                    ),
+                ),
+            ),
+            CanonicalMessage(
+                role=MessageRole.TOOL,
+                content=(
+                    ToolResultBlock(
+                        call_id="replace",
+                        output={
+                            "kind": "artifact.delivery_receipt",
+                            "data": {
+                                "artifact_id": ref.artifact_id,
+                                "mode": "replace_bound_file",
+                                "outcome": "uncertain",
+                                "relative_path": "config.yaml",
+                            },
+                        },
+                    ),
+                ),
+            ),
+        ),
+    )
+    uncertain_messages = artifact_delivery_messages(
+        completed_tool_pairs(uncertain_edit)
+    )
+    assert any(
+        "update outcome for workspace file config.yaml is uncertain" in text
+        for text in uncertain_messages
     )
 
     not_delivered = Transcript(
@@ -420,6 +474,7 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
                 "artifact_save_local",
                 {
                     "artifact_id": artifact_id,
+                    "mode": "create_new",
                     "destination_id": "default",
                 },
             ),
@@ -436,6 +491,7 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
         model_profile=_profile(provider),
         id_factory=_ids(),
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.run("Create and download a Markdown report.")
@@ -460,6 +516,7 @@ async def test_fake_provider_markdown_vertical_slice_commits_delivers_restarts_a
         "artifact-vertical",
         root=tmp_path,
         downloads_directory=downloads,
+        workspace=workspace_for(tmp_path),
     )
     try:
         assert (await reopened.read_artifact(artifact_id)).content == (

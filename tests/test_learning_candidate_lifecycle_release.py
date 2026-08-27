@@ -9,7 +9,11 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
-from _capability_runtime_support import context_step_projection, context_tool_catalog
+from _capability_runtime_support import ContextToolProjectionAdapter
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -32,8 +36,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
+from daita.loop.models import LoopLimits, RunInput
 from daita.semantics import (
     ResourceRevisionBinding,
     SemanticAnnotation,
@@ -43,7 +46,7 @@ from daita.semantics import (
     SemanticSubject,
 )
 
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 def _ids():
@@ -110,6 +113,7 @@ async def _memory_candidate_agent(
         reviewer_model=reviewer,
         approval_handler=approval_handler,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     await agent.run("Remember that booked revenue excludes completed refunds.")
     candidate_id = (await agent.review_learning_candidates()).candidates[0].candidate.id
@@ -252,6 +256,7 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
         "candidate-semantic-projection",
         root=tmp_path,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_sqlite(database, name="semantic")
@@ -341,6 +346,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
         limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
     )
     try:
         first_source = await agent.attach_sqlite(first_database, name="first")
@@ -434,68 +440,69 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
                 "revision": second_resource.current_revision,
             }
         ]
-        foreground._script = (
-            ModelResponse(
-                finish_reason=FinishReason.TOOL_CALLS,
-                tool_calls=(
-                    ToolCall("list", "semantic_list", {}),
-                    ToolCall(
-                        "view-cross-source",
-                        "semantic_view",
-                        {"id": "second-definition"},
-                    ),
-                    ToolCall(
-                        "delete-cross-source",
-                        "semantic_delete",
-                        {
-                            "id": "second-definition",
-                            "expected_sha256": second_view.sha256,
-                        },
-                    ),
-                    ToolCall(
-                        "update-cross-source",
-                        "semantic_save",
-                        {
-                            "id": "second-definition",
-                            "subject": first_subject,
-                            "kind": "glossary",
-                            "statement": "Cross-source overwrite.",
-                            "evidence": [{"kind": "user_assertion"}],
-                            "catalog_revisions": first_revisions,
-                            "expected_sha256": second_view.sha256,
-                        },
-                    ),
-                    ToolCall(
-                        "supersede-cross-source",
-                        "semantic_save",
-                        {
-                            "id": "first-superseding-second",
-                            "subject": first_subject,
-                            "kind": "glossary",
-                            "statement": "Cross-source supersession.",
-                            "evidence": [{"kind": "user_assertion"}],
-                            "catalog_revisions": first_revisions,
-                            "supersedes_id": "second-definition",
-                            "expected_sha256": second_view.sha256,
-                        },
-                    ),
-                    ToolCall(
-                        "create-cross-source",
-                        "semantic_save",
-                        {
-                            "id": "second-created-from-first",
-                            "subject": second_subject,
-                            "kind": "glossary",
-                            "statement": "Cross-source creation.",
-                            "evidence": [{"kind": "user_assertion"}],
-                            "catalog_revisions": second_revisions,
-                        },
+        foreground.replace_script(
+            (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(
+                        ToolCall("list", "semantic_list", {}),
+                        ToolCall(
+                            "view-cross-source",
+                            "semantic_view",
+                            {"id": "second-definition"},
+                        ),
+                        ToolCall(
+                            "delete-cross-source",
+                            "semantic_delete",
+                            {
+                                "id": "second-definition",
+                                "expected_sha256": second_view.sha256,
+                            },
+                        ),
+                        ToolCall(
+                            "update-cross-source",
+                            "semantic_save",
+                            {
+                                "id": "second-definition",
+                                "subject": first_subject,
+                                "kind": "glossary",
+                                "statement": "Cross-source overwrite.",
+                                "evidence": [{"kind": "user_assertion"}],
+                                "catalog_revisions": first_revisions,
+                                "expected_sha256": second_view.sha256,
+                            },
+                        ),
+                        ToolCall(
+                            "supersede-cross-source",
+                            "semantic_save",
+                            {
+                                "id": "first-superseding-second",
+                                "subject": first_subject,
+                                "kind": "glossary",
+                                "statement": "Cross-source supersession.",
+                                "evidence": [{"kind": "user_assertion"}],
+                                "catalog_revisions": first_revisions,
+                                "supersedes_id": "second-definition",
+                                "expected_sha256": second_view.sha256,
+                            },
+                        ),
+                        ToolCall(
+                            "create-cross-source",
+                            "semantic_save",
+                            {
+                                "id": "second-created-from-first",
+                                "subject": second_subject,
+                                "kind": "glossary",
+                                "statement": "Cross-source creation.",
+                                "evidence": [{"kind": "user_assertion"}],
+                                "catalog_revisions": second_revisions,
+                            },
+                        ),
                     ),
                 ),
-            ),
-            _response("All cross-source requests were blocked."),
+                _response("All cross-source requests were blocked."),
+            )
         )
-        foreground._cursor = 0
 
         result = await agent.learn(
             "Review, replace, and delete semantic definitions.",
@@ -541,7 +548,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
 class _TranscriptContext:
     async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tool_context.provider_definitions
+        return messages[:-1], tool_context.initial_provider_definitions
 
     def project(
         self,
@@ -562,15 +569,17 @@ class _TranscriptContext:
 
 
 class _NoTools:
+    def __init__(self) -> None:
+        self._projection = ContextToolProjectionAdapter(())
+
     async def prepare_run(self, run):
-        return context_tool_catalog(run, ())
+        return await self._projection.prepare_run(run)
 
     def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+        return self._projection.project(catalog, messages)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, calls, projection, sensitivity
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, calls, projection, messages, sensitivity
         raise AssertionError("the custom tool runtime must not execute")
 
 
@@ -589,6 +598,7 @@ async def test_acceptance_fails_closed_when_loop_uses_a_different_runtime(tmp_pa
             tools=_NoTools(),
             reviewer_model=reviewer,
             id_factory=_ids(),
+            workspace=workspace_for(tmp_path),
         )
     )
     try:

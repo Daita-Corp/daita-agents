@@ -7,6 +7,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, create_llm_provider
 from daita.capabilities import ApprovalDecision, ApprovalRequest
@@ -229,6 +230,7 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
             max_wall_time_seconds=120,
             max_estimated_cost_usd=_cost_limit(),
         ),
+        workspace=workspace_for(tmp_path),
     )
     try:
         source = await agent.attach_postgresql(

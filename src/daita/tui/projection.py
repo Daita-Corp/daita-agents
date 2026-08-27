@@ -31,19 +31,25 @@ SENSITIVE_KEY_PARTS = (
     "token",
 )
 CAPABILITY_LABELS = {
-    "catalog.search": "Search catalog",
-    "catalog.inspect": "Inspect schema",
-    "catalog.traverse": "Follow relationships",
-    "data.sqlite.query": "Query SQLite",
-    "data.postgresql.query": "Query PostgreSQL",
-    "data.file.read": "Read data file",
-    "artifact.create_document": "Create document",
-    "artifact.save_local": "Save artifact",
-    "artifact.set_export_location": "Set export location",
-    "memory.set": "Update memory",
-    "skill.view": "Read skill",
-    "skill.save": "Save skill",
-    "skill.delete": "Delete skill",
+    "toolbox_search": "Search toolboxes",
+    "toolbox_load": "Load selected tools",
+    "catalog_search": "Search catalog",
+    "catalog_schema": "Read catalog schema",
+    "catalog_inspect": "Inspect catalog resource",
+    "catalog_traverse": "Follow relationships",
+    "data_query_sqlite": "Query SQLite",
+    "data_query_postgresql": "Query PostgreSQL",
+    "file_search": "Search workspace files",
+    "file_read": "Read workspace file",
+    "file_query": "Query workspace data",
+    "artifact_create_document": "Create document",
+    "artifact_edit_text": "Prepare workspace edit",
+    "artifact_save_local": "Save artifact locally",
+    "artifact_set_export_location": "Set export location",
+    "memory_set": "Update memory",
+    "skill_view": "Read skill",
+    "skill_save": "Save skill",
+    "skill_delete": "Delete skill",
 }
 _TOOL_ERROR_HEADINGS = {
     "postgresql_connect_failed": "Connection unavailable",
@@ -378,6 +384,26 @@ def artifact_delivery_messages(
         if isinstance(artifact_id, str):
             delivery_attempts.add(artifact_id)
         if not result.is_error:
+            data = result.output.get("data")
+            if not isinstance(data, Mapping):
+                continue
+            if data.get("mode") != "replace_bound_file":
+                continue
+            outcome = data.get("outcome")
+            relative_path = sanitize_terminal_text(
+                data.get("relative_path"),
+                maximum=512,
+                preserve_lines=False,
+                fallback="the bound workspace file",
+            )
+            if outcome == "failed":
+                messages.append(
+                    f"Workspace file {relative_path} was not updated; the committed edit artifact remains available."
+                )
+            elif outcome == "uncertain":
+                messages.append(
+                    f"The update outcome for workspace file {relative_path} is uncertain; re-read the target before any further edit."
+                )
             continue
         error = result.output.get("error")
         if not isinstance(artifact_id, str) or not isinstance(error, Mapping):
@@ -545,6 +571,7 @@ def approval_review_document(
     tool_name: str,
     capability_id: str,
     arguments_text: str | None,
+    reason: str | None = None,
 ) -> tuple[str | None, bool]:
     """Return the review document and whether it is reviewable."""
 
@@ -553,7 +580,19 @@ def approval_review_document(
     header = (
         f"Tool: {sanitize_terminal_text(tool_name, maximum=128, preserve_lines=False, fallback='tool')}\n"
         f"Capability: {sanitize_terminal_text(capability_id, maximum=128, preserve_lines=False, fallback='capability')}\n"
-        "Arguments:\n"
+        + (
+            "Change: "
+            + sanitize_terminal_text(
+                reason,
+                maximum=768,
+                preserve_lines=False,
+                fallback="Review this exact change once.",
+            )
+            + "\n"
+            if reason is not None
+            else ""
+        )
+        + "Arguments:\n"
     )
     document = header + arguments_text
     if looks_secret_shaped(arguments_text):

@@ -24,6 +24,7 @@ from daita import (
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
+    LocalWorkspace,
     LoopExit,
     MCPAdmissionError,
     MCPBindingState,
@@ -163,14 +164,6 @@ SOURCE_REFRESH_ERRORS = {
         "The saved SQLite file is unavailable or its path is no longer safe. "
         "Check that the source is available at its original path, then retry."
     ),
-    "local_root_invalid": (
-        "The saved local source directory is unavailable or its path is no longer "
-        "safe. Check that the source is available at its original path, then retry."
-    ),
-    "local_discovery_failed": (
-        "The saved local source could not be cataloged. "
-        "Check its read permissions and supported files, then retry."
-    ),
 }
 
 
@@ -181,11 +174,15 @@ class PresentationController:
         self,
         *,
         root: str | Path | None,
+        workspace: LocalWorkspace,
         keychain: KeychainStore | None = None,
         model_validator: Any = None,
         reviewer_max_estimated_cost_usd: Decimal | None = None,
     ) -> None:
         self.root = root
+        if not isinstance(workspace, LocalWorkspace):
+            raise TypeError("workspace must be LocalWorkspace")
+        self.workspace = workspace
         if isinstance(keychain, CredentialSession):
             self.keychain = keychain
             self._owns_credential_session = False
@@ -229,6 +226,7 @@ class PresentationController:
         await self.close_agent()
         opened = await Agent.open(
             name,
+            workspace=self.workspace,
             root=self.root,
             model=self.model,
             model_profile=self.model_profile,
@@ -280,6 +278,7 @@ class PresentationController:
         try:
             created = await Agent.create(
                 name,
+                workspace=self.workspace,
                 root=self.root,
                 model=self.model,
                 model_profile=self.model_profile,
@@ -429,9 +428,6 @@ class PresentationController:
     async def attach_sqlite(self, path: Path, *, name: str | None) -> Any:
         return await self.require_agent().attach_sqlite(path, name=name)
 
-    async def attach_directory(self, path: Path, *, name: str | None) -> Any:
-        return await self.require_agent().attach_local_directory(path, name=name)
-
     async def store_postgresql_password(self, password: str) -> SecretReference:
         return await self.require_agent().store_postgresql_password(password)
 
@@ -504,8 +500,6 @@ class PresentationController:
         }
         if source.adapter_id == "sqlite":
             defaults["path"] = _configuration_text(configuration, "path")
-        elif source.adapter_id == "local-directory":
-            defaults["path"] = _configuration_text(configuration, "root")
         elif source.adapter_id == "postgresql":
             defaults.update(
                 host=_configuration_text(configuration, "host"),
@@ -547,30 +541,6 @@ class PresentationController:
                 path,
                 name=name,
                 confirmation_handler=confirmation_handler,
-            )
-        if source.adapter_id == "local-directory":
-            if path is None:
-                raise UserInputError(
-                    "A local source requires an absolute directory path."
-                )
-            configuration = source.configuration
-            return await agent.edit_local_directory_source(
-                source.id,
-                path,
-                name=name,
-                confirmation_handler=confirmation_handler,
-                max_depth=_configuration_integer(configuration, "max_depth"),
-                max_files=_configuration_integer(configuration, "max_files"),
-                max_file_bytes=_configuration_integer(configuration, "max_file_bytes"),
-                max_columns=_configuration_integer(configuration, "max_columns"),
-                max_rows=_configuration_integer(configuration, "max_rows"),
-                max_json_nodes=_configuration_integer(configuration, "max_json_nodes"),
-                max_json_depth=_configuration_integer(configuration, "max_json_depth"),
-                max_key_bytes=_configuration_integer(configuration, "max_key_bytes"),
-                max_string_bytes=_configuration_integer(
-                    configuration, "max_string_bytes"
-                ),
-                max_cell_bytes=_configuration_integer(configuration, "max_cell_bytes"),
             )
         if source.adapter_id != "postgresql":
             raise UserInputError(
@@ -808,6 +778,20 @@ class PresentationController:
             return CommandOutcome(
                 "notice",
                 await self._status_text(),
+                conversation_id=conversation_id,
+            )
+        if name == "/workspace" and len(parts) == 1:
+            return CommandOutcome(
+                "notice",
+                "Workspace  "
+                + safe_display(str(self.workspace.root), fallback="admitted")
+                + f" [{self.workspace.sensitivity.value}]",
+                conversation_id=conversation_id,
+            )
+        if name == "/files":
+            return CommandOutcome(
+                "notice",
+                "Usage: /files <question>",
                 conversation_id=conversation_id,
             )
         if name == "/conversation" and len(parts) == 1:
@@ -1553,6 +1537,8 @@ class PresentationController:
             f"Agent      {safe_display(agent.name, fallback='agent')}\n"
             f"Model      {safe_display(self.model_label(), fallback='model')}\n"
             f"Source     {source}\n"
+            f"Workspace  {safe_display(str(self.workspace.root), fallback='admitted')} "
+            f"[{self.workspace.sensitivity.value}]\n"
             "Conversation  " + safe_display(self.conversation_id, fallback="new")
         )
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.catalog.service as catalog_service
 import daita.storage.sqlite as sqlite_store
@@ -70,7 +71,9 @@ async def test_catalog_summary_aggregates_current_active_snapshots_and_latest_sy
     second_database = tmp_path / "second.sqlite"
     _database(first_database)
     _database(second_database)
-    agent = await Agent.create("summary", root=tmp_path, clock=clock)
+    agent = await Agent.create(
+        "summary", root=tmp_path, clock=clock, workspace=workspace_for(tmp_path)
+    )
     try:
         assert await agent.catalog_summary() == CatalogSummary(
             active_source_count=0,
@@ -125,7 +128,12 @@ async def test_empty_successful_snapshot_is_not_ready_but_retains_sync_time(
     completed_at = datetime(2026, 7, 22, 13, 0, tzinfo=UTC)
     database = tmp_path / "empty.sqlite"
     _database(database, with_tables=False)
-    agent = await Agent.create("empty", root=tmp_path, clock=lambda: completed_at)
+    agent = await Agent.create(
+        "empty",
+        root=tmp_path,
+        clock=lambda: completed_at,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         await agent.attach(SQLiteSource(database))
         summary = await agent.catalog_summary()
@@ -147,7 +155,9 @@ async def test_catalog_preview_contains_only_active_current_snapshot_truth(
         connection.execute("CREATE TABLE first_only (id INTEGER PRIMARY KEY)")
     with sqlite3.connect(second_database) as connection:
         connection.execute("CREATE TABLE second_only (id INTEGER PRIMARY KEY)")
-    agent = await Agent.create("preview-active", root=tmp_path)
+    agent = await Agent.create(
+        "preview-active", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         first = await agent.attach(SQLiteSource(first_database, name="First"))
         second = await agent.attach(SQLiteSource(second_database, name="Second"))
@@ -189,7 +199,9 @@ async def test_broad_catalog_discovery_matches_any_term_and_resource_kind(
 ):
     database = tmp_path / "search.sqlite"
     _database(database)
-    agent = await Agent.create("search", root=tmp_path)
+    agent = await Agent.create(
+        "search", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.attach(SQLiteSource(database))
         result = await agent.search_catalog(
@@ -215,7 +227,9 @@ async def test_catalog_search_compiles_one_generation_once_for_concurrent_cold_q
 ):
     database = tmp_path / "compile-once.sqlite"
     _database(database)
-    agent = await Agent.create("catalog-index-compile-once", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-index-compile-once", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.attach(SQLiteSource(database))
         original_compile = catalog_service._compile_source_index
@@ -258,7 +272,9 @@ async def test_non_empty_catalog_search_ranks_only_posting_candidates(
                 f"CREATE TABLE resource_{index:03d} "
                 f"(id INTEGER PRIMARY KEY{signal})"
             )
-    agent = await Agent.create("catalog-index-posting-work", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-index-posting-work", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         await agent.attach(SQLiteSource(database))
         original_rank = catalog_service._rank_index_candidate
@@ -297,7 +313,9 @@ async def test_catalog_index_refresh_evicts_stale_postings_and_inactive_sources(
         connection.execute(
             "CREATE TABLE old_table " "(id INTEGER PRIMARY KEY, legacyonly TEXT)"
         )
-    agent = await Agent.create("catalog-index-refresh", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-index-refresh", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         original_compile = catalog_service._compile_source_index
@@ -363,7 +381,11 @@ async def test_failed_catalog_index_compilation_is_not_published_and_can_retry(
 ):
     database = tmp_path / "index-compile-failure.sqlite"
     _database(database)
-    agent = await Agent.create("catalog-index-compile-failure", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-index-compile-failure",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         original_compile = catalog_service._compile_source_index
@@ -430,7 +452,9 @@ async def test_indexed_search_normalizes_ranks_diversifies_and_exposes_evidence(
             );
             CREATE VIEW customer_view AS SELECT id FROM customer_profiles;
             """)
-    agent = await Agent.create("catalog-index-ranking", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-index-ranking", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         outside_database = tmp_path / "indexed-ranking-outside.sqlite"
@@ -549,7 +573,11 @@ async def test_embedded_exact_name_anchor_outranks_128_lookalikes_and_has_bounda
                 f"CREATE TABLE stage_b_profile_probe_{suffix}_{index:03d} "
                 "(id INTEGER PRIMARY KEY)"
             )
-    agent = await Agent.create("catalog-embedded-exact-anchor", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-embedded-exact-anchor",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         await agent.attach(SQLiteSource(database))
         query = (
@@ -615,7 +643,11 @@ async def test_embedded_exact_duplicate_names_remain_source_scoped(
     for database in (first_database, second_database):
         with sqlite3.connect(database) as connection:
             connection.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY)")
-    agent = await Agent.create("catalog-embedded-exact-duplicates", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-embedded-exact-duplicates",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         first_source = await agent.attach(SQLiteSource(first_database))
         second_source = await agent.attach(SQLiteSource(second_database))
@@ -650,7 +682,9 @@ async def test_catalog_context_merges_current_and_prior_queries_by_contract_prio
             CREATE TABLE current_target (id INTEGER PRIMARY KEY);
             CREATE TABLE profile_metrics (id INTEGER PRIMARY KEY);
             """)
-    agent = await Agent.create("catalog-context-priority", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-context-priority", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         view = agent._embedded._data_view
@@ -713,7 +747,9 @@ async def test_catalog_context_merges_current_and_prior_queries_by_contract_prio
 async def test_catalog_search_merges_true_global_top_k_across_more_than_64_sources(
     tmp_path: Path,
 ):
-    agent = await Agent.create("catalog-index-global-top-k", root=tmp_path)
+    agent = await Agent.create(
+        "catalog-index-global-top-k", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         for index in range(65):
             database = tmp_path / f"global-{index:03d}.sqlite"
@@ -747,7 +783,9 @@ async def test_current_snapshot_refs_are_agent_and_source_isolated(tmp_path: Pat
     second_database = tmp_path / "refs-second.sqlite"
     _database(first_database)
     _database(second_database)
-    agent = await Agent.create("snapshot-refs", root=tmp_path)
+    agent = await Agent.create(
+        "snapshot-refs", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         first = await agent.attach(SQLiteSource(first_database))
         second = await agent.attach(SQLiteSource(second_database))
@@ -787,7 +825,9 @@ async def test_current_snapshot_load_requires_the_exact_current_reference(
 ):
     database = tmp_path / "exact-ref.sqlite"
     _database(database)
-    agent = await Agent.create("snapshot-exact-ref", root=tmp_path)
+    agent = await Agent.create(
+        "snapshot-exact-ref", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         store = agent._embedded._store
@@ -837,7 +877,9 @@ async def test_catalog_reads_decode_one_generation_once_and_share_concurrent_loa
 ):
     database = tmp_path / "decode-once.sqlite"
     _database(database)
-    agent = await Agent.create("snapshot-decode-once", root=tmp_path)
+    agent = await Agent.create(
+        "snapshot-decode-once", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         reader = SQLiteStateStore(agent.home / "state.db")
@@ -876,7 +918,9 @@ async def test_failed_snapshot_decode_does_not_publish_a_cache_entry(
 ):
     database = tmp_path / "failed-decode.sqlite"
     _database(database)
-    agent = await Agent.create("failed-snapshot-decode", root=tmp_path)
+    agent = await Agent.create(
+        "failed-snapshot-decode", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         reader = SQLiteStateStore(agent.home / "state.db")
@@ -912,7 +956,9 @@ async def test_refresh_invalidates_stale_ref_and_decodes_the_new_generation_once
     database = tmp_path / "generation-refresh.sqlite"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE old_table (id INTEGER PRIMARY KEY)")
-    agent = await Agent.create("snapshot-generation-refresh", root=tmp_path)
+    agent = await Agent.create(
+        "snapshot-generation-refresh", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         reader = SQLiteStateStore(agent.home / "state.db")
@@ -947,7 +993,9 @@ async def test_failed_snapshot_commit_does_not_publish_candidate_cache(
 ):
     database = tmp_path / "failed-cache-publication.sqlite"
     _database(database)
-    agent = await Agent.create("failed-cache-publication", root=tmp_path)
+    agent = await Agent.create(
+        "failed-cache-publication", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach(SQLiteSource(database))
         store = agent._embedded._store
@@ -975,15 +1023,20 @@ async def test_running_partial_and_failed_syncs_never_contribute_or_replace_trut
     tmp_path: Path,
 ):
     started_at = datetime(2026, 7, 22, 14, 0, tzinfo=UTC)
-    agent = await Agent.create("sync-state", root=tmp_path, clock=lambda: started_at)
+    agent = await Agent.create(
+        "sync-state",
+        root=tmp_path,
+        clock=lambda: started_at,
+        workspace=workspace_for(tmp_path),
+    )
     store = SQLiteStateStore(agent.home / "state.db")
     try:
         registration = SourceRegistration.build(
             agent_id=agent.id,
-            adapter_id="test.adapter",
+            adapter_id="sqlite",
             native_identity="partial-only",
             display_name="Partial only",
-            configuration={},
+            configuration={"path": str(tmp_path / "partial-only.sqlite")},
             attached_at=started_at,
         )
         await store.register_source(registration)
@@ -1050,7 +1103,9 @@ async def test_refresh_cancellation_before_transaction_keeps_old_snapshot(
 ):
     database = tmp_path / "pre-commit.sqlite"
     _database(database)
-    agent = await Agent.create("pre-commit", root=tmp_path)
+    agent = await Agent.create(
+        "pre-commit", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await agent.attach(SQLiteSource(database))
     old_resources = await agent.list_catalog_resources(source_id=source.id)
     cache_before = dict(agent._embedded._store._decoded_catalog_snapshots)
@@ -1114,7 +1169,9 @@ async def test_refresh_cancellation_after_transaction_start_commits_success(
 ):
     database = tmp_path / "commit-wins.sqlite"
     _database(database)
-    agent = await Agent.create("commit-wins", root=tmp_path)
+    agent = await Agent.create(
+        "commit-wins", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     source = await agent.attach(SQLiteSource(database))
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE later (id INTEGER PRIMARY KEY)")
@@ -1160,7 +1217,9 @@ async def test_first_attach_cancellation_before_commit_publishes_no_source(
 ):
     database = tmp_path / "cancel-first.sqlite"
     _database(database)
-    agent = await Agent.create("cancel-first", root=tmp_path)
+    agent = await Agent.create(
+        "cancel-first", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
     before_start = threading.Event()
     release_start = threading.Event()
     original_start = sqlite_store._CatalogCommitGate.start
@@ -1205,6 +1264,7 @@ async def test_catalog_summary_is_not_persisted_or_added_to_model_state(tmp_path
         root=tmp_path,
         model=provider,
         model_profile=profile,
+        workspace=workspace_for(tmp_path),
     )
     state_path = agent.home / "state.db"
     try:

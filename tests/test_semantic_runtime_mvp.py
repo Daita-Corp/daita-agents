@@ -5,6 +5,11 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
+from _capability_runtime_support import execute_projected
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -22,8 +27,7 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider
-from daita.loop.models import LoopLimits, RunInput, ToolProjectionMode
+from daita.loop.models import LoopLimits, RunInput
 from daita.semantics import (
     SEMANTIC_DELETE_CAPABILITY_ID,
     SEMANTIC_DELETE_TOOL_NAME,
@@ -40,7 +44,7 @@ from daita.tui.commands import (
 )
 
 NOW = datetime(2026, 7, 28, 14, tzinfo=UTC)
-EAGER_LIMITS = LoopLimits(tool_projection_mode=ToolProjectionMode.EAGER)
+EAGER_LIMITS = LoopLimits()
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -86,7 +90,9 @@ async def _seed_source(tmp_path, name: str):
         connection.execute(
             "INSERT INTO invoices(booked_at, refund_state) VALUES ('2026-07-01', 'open')"
         )
-    agent = await Agent.create(name, root=tmp_path, clock=lambda: NOW)
+    agent = await Agent.create(
+        name, root=tmp_path, clock=lambda: NOW, workspace=workspace_for(tmp_path)
+    )
     try:
         source = await agent.attach_sqlite(database)
         resource = (await agent.list_catalog_resources())[0]
@@ -138,6 +144,8 @@ def _tool_results(provider: MockModelProvider) -> tuple[ToolResultBlock, ...]:
         for message in request.messages
         for block in message.content
         if isinstance(block, ToolResultBlock)
+        and block.output.get("kind")
+        not in {"toolbox_load_receipt", "toolbox_search_results"}
     )
 
 
@@ -162,6 +170,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
         limits=EAGER_LIMITS,
         id_factory=_ids(),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         runtime = agent._embedded._capability_runtime
@@ -268,6 +277,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
         limits=EAGER_LIMITS,
         id_factory=_ids(),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.learn("When we say booked revenue, use booked_at.")
@@ -310,6 +320,7 @@ async def test_missing_approval_and_denial_bind_current_evidence_without_state(
         approval_handler=deny,
         id_factory=_ids("denied"),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.learn("Booked revenue means booked_at.")
@@ -382,6 +393,7 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         for prompt in (
@@ -463,6 +475,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         for message in (
@@ -498,9 +511,9 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
         runtime = agent._embedded._capability_runtime
         semantic_domain = agent._embedded._semantic_domain
         semantic_domain.select_explicit_learning_run(delete_run.id)
-        catalog = await runtime.prepare_run(delete_run)
         deleted = (
-            await runtime.execute_all(
+            await execute_projected(
+                runtime,
                 delete_run,
                 (
                     ToolCall(
@@ -512,7 +525,6 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                         },
                     ),
                 ),
-                projection=runtime.project(catalog, ()),
                 sensitivity=ModelSensitivity.INTERNAL,
             )
         )[0]
@@ -555,6 +567,7 @@ async def test_state_change_during_semantic_approval_returns_state_changed(
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         semantic_domain = agent._embedded._semantic_domain
@@ -620,6 +633,7 @@ async def test_tool_result_evidence_is_valid_and_save_is_recalled_after_reopen(
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         result = await agent.learn(
@@ -651,6 +665,7 @@ async def test_tool_result_evidence_is_valid_and_save_is_recalled_after_reopen(
         model_profile=_profile(reopened_provider),
         id_factory=_ids("recall"),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await reopened.run("How should invoices booked revenue be interpreted?")
@@ -700,6 +715,7 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
         approval_handler=approve,
         id_factory=_ids(),
         clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
     )
     try:
         await agent.learn(

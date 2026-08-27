@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import errno
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import stat
 import sys
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -19,21 +20,31 @@ from typing import NoReturn, Protocol
 from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
+from ..adapters.local_workspace import (
+    LocalBoundFileTarget,
+    LocalWorkspaceError,
+    physical_revision_for_facts,
+)
 from ..adapters.models import SourceRegistration
 from .models import (
+    BOUND_FILE_DESTINATION_ID,
     DEFAULT_DESTINATION_SELECTOR,
     MAX_COLLISION_SUFFIX,
     MAX_ONE_TIME_DESTINATIONS,
     MAX_PERSISTENT_DESTINATIONS,
     SYSTEM_DOWNLOADS_DESTINATION_ID,
+    ArtifactDeliveryMode,
+    ArtifactDeliveryOutcome,
     ArtifactDeliveryReceipt,
     ArtifactDestination,
     ArtifactDestinationKind,
     ArtifactError,
+    ArtifactLocalFileBinding,
     ArtifactPayload,
     ArtifactRef,
     DestinationAuthorization,
     DestinationAvailability,
+    artifact_text_change_summary_to_mapping,
     canonical_artifact_filename,
 )
 from .store import AgentHomeArtifactStore
@@ -53,6 +64,19 @@ def _new_id(prefix: str) -> str:
 
 class DeliverySourceReader(Protocol):
     async def list_sources(self, agent_id: str) -> tuple[SourceRegistration, ...]: ...
+
+
+class ExactBoundFileResolver(Protocol):
+    workspace_id: str
+
+    async def resolve_bound_target(
+        self,
+        *,
+        workspace_id: str,
+        relative_path: str,
+        expected_physical_revision: str | None,
+        expected_content_sha256: str,
+    ) -> LocalBoundFileTarget: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +120,11 @@ class _DeliveryGate:
             action()
             self._published = True
 
+    @property
+    def published(self) -> bool:
+        with self._lock:
+            return self._published
+
 
 class LocalArtifactDelivery:
     """Resolve exact grants and copy only verified committed artifacts."""
@@ -107,6 +136,7 @@ class LocalArtifactDelivery:
         agent_home: Path,
         artifacts: AgentHomeArtifactStore,
         sources: DeliverySourceReader,
+        exact_target_resolver: ExactBoundFileResolver | None,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _new_id,
     ) -> None:
@@ -114,6 +144,7 @@ class LocalArtifactDelivery:
         self.agent_home = agent_home.resolve(strict=True)
         self.artifacts = artifacts
         self._sources = sources
+        self._exact_target_resolver = exact_target_resolver
         self._clock = clock
         self._id_factory = id_factory
         self._config_path = self.agent_home / "artifacts" / "delivery-config.json"
@@ -132,6 +163,7 @@ class LocalArtifactDelivery:
         agent_home: Path,
         artifacts: AgentHomeArtifactStore,
         sources: DeliverySourceReader,
+        exact_target_resolver: ExactBoundFileResolver | None = None,
         downloads_directory: Path | None,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _new_id,
@@ -141,6 +173,7 @@ class LocalArtifactDelivery:
             agent_home=agent_home,
             artifacts=artifacts,
             sources=sources,
+            exact_target_resolver=exact_target_resolver,
             clock=clock,
             id_factory=id_factory,
         )
@@ -281,7 +314,6 @@ class LocalArtifactDelivery:
             created = True
         else:
             self._verify_grant(existing)
-            await self._require_scope_eligible(existing)
         previous_default = self._default_id
         self._default_id = existing.destination_id
         try:
@@ -313,15 +345,26 @@ class LocalArtifactDelivery:
         *,
         run_id: str,
         artifact_id: str,
-        destination_id: str,
-        filename: str | None,
+        mode: str,
+        destination_id: str | None = None,
+        filename: str | None = None,
     ) -> FrozenJsonObject:
+        if mode == ArtifactDeliveryMode.REPLACE_BOUND_FILE.value:
+            if destination_id is not None or filename is not None:
+                raise ArtifactError(
+                    "artifact_edit_binding_invalid",
+                    "Bound replacement does not accept a destination or filename.",
+                )
+            return await self._preflight_bound_replacement(artifact_id)
+        if mode != ArtifactDeliveryMode.CREATE_NEW.value or destination_id is None:
+            raise ArtifactError(
+                "artifact_delivery_invalid", "Artifact delivery mode is invalid."
+            )
         ref = await self.artifacts.find_ref(artifact_id)
         requested = self._filename_for_ref(ref, filename)
         try:
             grant = self._resolve(destination_id, run_id=run_id)
             self._verify_grant(grant)
-            await self._require_scope_eligible(grant)
         except ArtifactError as error:
             raise _retained_artifact_error(error, ref.artifact_id) from error
         return FrozenJsonObject.from_mapping(
@@ -333,6 +376,7 @@ class LocalArtifactDelivery:
                 "grant_digest": grant.grant_digest,
                 "requested_filename": requested,
                 "authorization": grant.authorization.value,
+                "mode": ArtifactDeliveryMode.CREATE_NEW.value,
                 "requires_approval": (
                     grant.authorization is DestinationAuthorization.ONE_TIME
                 ),
@@ -344,19 +388,157 @@ class LocalArtifactDelivery:
         *,
         run_id: str,
         artifact_id: str,
-        destination_id: str,
-        filename: str | None,
+        mode: str,
+        destination_id: str | None = None,
+        filename: str | None = None,
     ) -> ArtifactDeliveryReceipt:
+        if mode == ArtifactDeliveryMode.REPLACE_BOUND_FILE.value:
+            if destination_id is not None or filename is not None:
+                raise ArtifactError(
+                    "artifact_edit_binding_invalid",
+                    "Bound replacement does not accept a destination or filename.",
+                )
+            return await self._replace_committed_bound_artifact(artifact_id)
+        if mode != ArtifactDeliveryMode.CREATE_NEW.value or destination_id is None:
+            raise ArtifactError(
+                "artifact_delivery_invalid", "Artifact delivery mode is invalid."
+            )
         ref = await self.artifacts.find_ref(artifact_id)
         requested = self._filename_for_ref(ref, filename)
         try:
             grant = self._resolve(destination_id, run_id=run_id)
             self._verify_grant(grant)
-            await self._require_scope_eligible(grant)
         except ArtifactError as error:
             raise _retained_artifact_error(error, ref.artifact_id) from error
         payload = await self.artifacts.read_ref(ref)
         return await self._deliver(payload, grant, requested)
+
+    async def _preflight_bound_replacement(
+        self,
+        artifact_id: str,
+    ) -> FrozenJsonObject:
+        payload, binding = await self._bound_edit_payload(artifact_id)
+        target = await self._resolve_bound_target(binding)
+        try:
+            _validate_bound_target(target)
+            return FrozenJsonObject.from_mapping(
+                {
+                    "artifact_id": payload.ref.artifact_id,
+                    "artifact_sha256": payload.ref.sha256,
+                    "artifact_byte_size": payload.ref.byte_size,
+                    "sensitivity": payload.ref.sensitivity.value,
+                    "mode": ArtifactDeliveryMode.REPLACE_BOUND_FILE.value,
+                    "workspace_id": binding.workspace_id,
+                    "relative_path": binding.relative_path,
+                    "original_physical_revision": (binding.original_physical_revision),
+                    "observed_content_sha256": (binding.observed_content_sha256),
+                    "source_byte_size": binding.source_byte_size,
+                    "target_device": target.device,
+                    "target_inode": target.inode,
+                    "target_mode": stat.S_IMODE(target.mode),
+                    "target_uid": target.uid,
+                    "target_gid": target.gid,
+                    "target_link_count": target.link_count,
+                    "parent_device": target.parent_device,
+                    "parent_inode": target.parent_inode,
+                    "parent_mode": stat.S_IMODE(target.parent_mode),
+                    "parent_uid": target.parent_uid,
+                    "parent_gid": target.parent_gid,
+                    "change_summary": artifact_text_change_summary_to_mapping(
+                        binding.change_summary
+                    ),
+                    "requires_approval": True,
+                }
+            )
+        finally:
+            target.close()
+
+    async def _replace_committed_bound_artifact(
+        self,
+        artifact_id: str,
+    ) -> ArtifactDeliveryReceipt:
+        payload, binding = await self._bound_edit_payload(artifact_id)
+        target = await self._resolve_bound_target(binding)
+        try:
+            _validate_bound_target(target)
+        except BaseException:
+            target.close()
+            raise
+        return await self._replace_bound(payload, binding, target)
+
+    async def _bound_edit_payload(
+        self,
+        artifact_id: str,
+    ) -> tuple[ArtifactPayload, ArtifactLocalFileBinding]:
+        ref = await self.artifacts.find_ref(artifact_id)
+        binding = ref.provenance.local_file_binding
+        if binding is None or ref.filename != binding.relative_path.rsplit("/", 1)[-1]:
+            raise ArtifactError(
+                "artifact_edit_binding_invalid",
+                "The committed artifact has no exact local-file edit binding.",
+                {"artifact_id": ref.artifact_id, "artifact_retained": True},
+            )
+        payload = await self.artifacts.read_ref(ref)
+        return payload, binding
+
+    async def _resolve_bound_target(
+        self,
+        binding: ArtifactLocalFileBinding,
+    ) -> LocalBoundFileTarget:
+        resolver = self._exact_target_resolver
+        if resolver is None:
+            raise ArtifactError(
+                "artifact_edit_binding_invalid",
+                "Exact workspace-file replacement is unavailable.",
+            )
+        try:
+            return await resolver.resolve_bound_target(
+                workspace_id=binding.workspace_id,
+                relative_path=binding.relative_path,
+                expected_physical_revision=binding.original_physical_revision,
+                expected_content_sha256=binding.observed_content_sha256,
+            )
+        except LocalWorkspaceError as error:
+            code = (
+                "artifact_replacement_drift"
+                if error.code
+                in {
+                    "file_changed",
+                    "file_not_found",
+                    "not_regular_file",
+                    "path_invalid",
+                    "symlink_not_allowed",
+                }
+                else "artifact_edit_binding_invalid"
+            )
+            message = (
+                "The bound workspace file changed; read it again before editing."
+                if code == "artifact_replacement_drift"
+                else "The exact bound workspace target is unavailable."
+            )
+            raise ArtifactError(code, message, error.details) from error
+
+    def approval_prompt_for_bound_replacement(
+        self,
+        fingerprint: Mapping[str, object],
+    ) -> str:
+        relative_path = fingerprint.get("relative_path")
+        summary = fingerprint.get("change_summary")
+        if not isinstance(relative_path, str) or not isinstance(summary, Mapping):
+            raise ArtifactError(
+                "artifact_edit_binding_invalid",
+                "The bound edit approval summary is unavailable.",
+            )
+        description = summary.get("description")
+        if not isinstance(description, str):
+            raise ArtifactError(
+                "artifact_edit_binding_invalid",
+                "The bound edit approval summary is unavailable.",
+            )
+        return (
+            f"Replace the exact unchanged workspace file “{_safe_relative_display(relative_path)}” "
+            f"with the committed edit ({description})?"
+        )
 
     async def save_public(
         self,
@@ -380,7 +562,6 @@ class LocalArtifactDelivery:
                     run_id=None,
                 )
             self._verify_grant(grant)
-            await self._require_scope_eligible(grant)
         except ArtifactError as error:
             raise _retained_artifact_error(error, ref.artifact_id) from error
         payload = await self.artifacts.read_ref(ref)
@@ -402,7 +583,6 @@ class LocalArtifactDelivery:
                 {"destination_id": destination_id, "display_name": grant.display_name},
             )
         self._verify_grant(grant)
-        await self._require_scope_eligible(grant)
         return FrozenJsonObject.from_mapping(
             {
                 "destination_id": grant.destination_id,
@@ -417,7 +597,6 @@ class LocalArtifactDelivery:
         self._require_config()
         grant = self._resolve(destination_id, run_id=None, permit_one_time=False)
         self._verify_grant(grant)
-        await self._require_scope_eligible(grant)
         previous_default = self._default_id
         if grant.authorization is DestinationAuthorization.SYSTEM:
             self._default_id = None
@@ -522,22 +701,6 @@ class LocalArtifactDelivery:
                 "The artifact destination is not eligible.",
                 {"destination_id": destination_id},
             )
-        for source in await self._sources.list_sources(self.agent_id):
-            if not source.active or source.adapter_id != "local-directory":
-                continue
-            raw_root = source.configuration.get("root")
-            if not isinstance(raw_root, str):
-                continue
-            try:
-                source_root = Path(raw_root).resolve(strict=True)
-            except OSError:
-                continue
-            if resolved == source_root or source_root in resolved.parents:
-                raise ArtifactError(
-                    "artifact_destination_unauthorized",
-                    "The artifact destination overlaps an attached source.",
-                    {"destination_id": destination_id},
-                )
         if not os.access(resolved, os.W_OK):
             raise ArtifactError(
                 (
@@ -628,20 +791,6 @@ class LocalArtifactDelivery:
             error.__cause__ = cause
         raise error
 
-    async def _require_scope_eligible(self, grant: _DestinationGrant) -> None:
-        for source in await self._sources.list_sources(self.agent_id):
-            if not source.active or source.adapter_id != "local-directory":
-                continue
-            raw_root = source.configuration.get("root")
-            if not isinstance(raw_root, str):
-                continue
-            try:
-                source_root = Path(raw_root).resolve(strict=True)
-            except OSError:
-                continue
-            if grant.path == source_root or source_root in grant.path.parents:
-                self._destination_failure(grant, unavailable=False)
-
     def _filename_for_ref(self, ref: ArtifactRef, filename: str | None) -> str:
         requested = ref.filename if filename is None else filename
         extension = "." + ref.filename.rsplit(".", 1)[1].casefold()
@@ -670,6 +819,8 @@ class LocalArtifactDelivery:
                     except asyncio.CancelledError:
                         cancelled = True
                         gate.cancel()
+                    except BaseException:
+                        break
         except TimeoutError:
             gate.cancel()
             while not worker.done():
@@ -677,6 +828,8 @@ class LocalArtifactDelivery:
                     await asyncio.shield(worker)
                 except asyncio.CancelledError:
                     cancelled = True
+                except BaseException:
+                    break
             if cancelled:
                 raise asyncio.CancelledError
             raise ArtifactError(
@@ -698,6 +851,194 @@ class LocalArtifactDelivery:
         if cancelled:
             raise asyncio.CancelledError
         return receipt
+
+    async def _replace_bound(
+        self,
+        payload: ArtifactPayload,
+        binding: ArtifactLocalFileBinding,
+        target: LocalBoundFileTarget,
+    ) -> ArtifactDeliveryReceipt:
+        gate = _DeliveryGate()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._replace_bound_sync,
+                payload,
+                binding,
+                target,
+                gate,
+            )
+        )
+        cancelled = False
+        timed_out = False
+        try:
+            async with asyncio.timeout(_DELIVERY_TIMEOUT_SECONDS):
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        gate.cancel()
+                    except BaseException:
+                        break
+        except TimeoutError:
+            timed_out = True
+            gate.cancel()
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    cancelled = True
+                except BaseException:
+                    break
+        try:
+            receipt = worker.result()
+        except _CancelledBeforePublication:
+            if cancelled:
+                raise asyncio.CancelledError from None
+            raise ArtifactError(
+                "artifact_delivery_failed",
+                "The bound replacement was cancelled before publication.",
+                {"artifact_id": payload.ref.artifact_id, "artifact_retained": True},
+            ) from None
+        except ArtifactError as error:
+            raise _retained_artifact_error(error, payload.ref.artifact_id) from error
+        if cancelled or timed_out:
+            if not gate.published:
+                if cancelled:
+                    raise asyncio.CancelledError
+                raise ArtifactError(
+                    "artifact_delivery_failed",
+                    "Bound replacement exceeded its I/O limit before publication.",
+                    {"artifact_id": payload.ref.artifact_id, "artifact_retained": True},
+                )
+            return replace(
+                receipt,
+                outcome=ArtifactDeliveryOutcome.UNCERTAIN,
+                failure_code="artifact_replacement_uncertain",
+            )
+        return receipt
+
+    def _replace_bound_sync(
+        self,
+        payload: ArtifactPayload,
+        binding: ArtifactLocalFileBinding,
+        target: LocalBoundFileTarget,
+        gate: _DeliveryGate,
+    ) -> ArtifactDeliveryReceipt:
+        temp_name: str | None = None
+        publication_attempted = False
+        published = False
+        result_revision: str | None = None
+        try:
+            _validate_bound_target(target)
+            target.revalidate_namespace()
+            gate.require_active()
+            temp_name = f".daita-edit-{uuid4().hex}.tmp"
+            temp_flags = (
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+            )
+            staged = os.open(
+                temp_name,
+                temp_flags,
+                0o600,
+                dir_fd=target.parent_descriptor,
+            )
+            try:
+                digest = sha256()
+                total = 0
+                view = memoryview(payload.content)
+                while view:
+                    gate.require_active()
+                    written = os.write(staged, view[: 1024 * 1024])
+                    if written <= 0:
+                        raise OSError("bound replacement staging made no progress")
+                    digest.update(view[:written])
+                    total += written
+                    view = view[written:]
+                if total != payload.ref.byte_size or (
+                    "sha256:" + digest.hexdigest() != payload.ref.sha256
+                ):
+                    raise OSError("bound replacement staging verification mismatch")
+                if hasattr(os, "fchown"):
+                    os.fchown(staged, target.uid, target.gid)
+                os.fchmod(staged, stat.S_IMODE(target.mode))
+                _fsync_descriptor(staged)
+            finally:
+                os.close(staged)
+            assert temp_name is not None
+            _verify_staged_bound_file(
+                target.parent_descriptor,
+                temp_name,
+                payload,
+                target,
+            )
+            target.revalidate_namespace()
+
+            def publish() -> None:
+                nonlocal publication_attempted, published
+                assert temp_name is not None
+                publication_attempted = True
+                os.replace(
+                    temp_name,
+                    target.filename,
+                    src_dir_fd=target.parent_descriptor,
+                    dst_dir_fd=target.parent_descriptor,
+                )
+                published = True
+
+            gate.publish(publish)
+            temp_name = None
+            _fsync_descriptor(target.parent_descriptor)
+            result_revision = _verify_published_bound_file(target, payload)
+            return _bound_receipt(
+                payload,
+                binding,
+                outcome=ArtifactDeliveryOutcome.SUCCEEDED,
+                result_revision=result_revision,
+                failure_code=None,
+                clock=self._clock,
+            )
+        except _CancelledBeforePublication:
+            raise
+        except Exception:
+            uncertain = published
+            if publication_attempted:
+                try:
+                    result_revision = _verify_published_bound_file(target, payload)
+                except Exception:
+                    try:
+                        target.revalidate_namespace()
+                    except Exception:
+                        uncertain = True
+                else:
+                    uncertain = True
+            return _bound_receipt(
+                payload,
+                binding,
+                outcome=(
+                    ArtifactDeliveryOutcome.UNCERTAIN
+                    if uncertain
+                    else ArtifactDeliveryOutcome.FAILED
+                ),
+                result_revision=result_revision,
+                failure_code=(
+                    "artifact_replacement_uncertain"
+                    if uncertain
+                    else "artifact_delivery_failed"
+                ),
+                clock=self._clock,
+            )
+        finally:
+            if temp_name is not None:
+                try:
+                    os.unlink(temp_name, dir_fd=target.parent_descriptor)
+                except OSError:
+                    pass
+            target.close()
 
     def _deliver_sync(
         self,
@@ -1049,6 +1390,168 @@ def _grant_to_mapping(grant: _DestinationGrant) -> dict[str, object]:
         "grant_digest": grant.grant_digest,
         "authorized_at": grant.authorized_at.isoformat().replace("+00:00", "Z"),
     }
+
+
+def _validate_bound_target(target: LocalBoundFileTarget) -> None:
+    target_facts = os.fstat(target.target_descriptor)
+    parent_facts = os.fstat(target.parent_descriptor)
+    unsafe_special_bits = stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX
+    eligible_groups = (
+        {os.getegid(), *os.getgroups()} if hasattr(os, "getgroups") else {os.getegid()}
+    )
+    if (
+        not stat.S_ISREG(target_facts.st_mode)
+        or not stat.S_ISDIR(parent_facts.st_mode)
+        or int(target_facts.st_dev) != target.device
+        or int(target_facts.st_ino) != target.inode
+        or int(parent_facts.st_dev) != target.parent_device
+        or int(parent_facts.st_ino) != target.parent_inode
+        or target.device != target.parent_device
+        or int(target_facts.st_nlink) != 1
+        or int(target_facts.st_uid) != os.geteuid()
+        or int(target_facts.st_gid) not in eligible_groups
+        or stat.S_IMODE(target_facts.st_mode) & unsafe_special_bits
+        or target.flags != 0
+        or not _mode_permits_directory_write(parent_facts)
+    ):
+        raise ArtifactError(
+            "artifact_edit_binding_invalid",
+            "The bound workspace target has unsafe identity, ownership, links, or metadata.",
+        )
+    list_extended_attributes = getattr(os, "listxattr", None)
+    if list_extended_attributes is not None:
+        try:
+            attributes = list_extended_attributes(target.target_descriptor)
+        except OSError as error:
+            if error.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise ArtifactError(
+                    "artifact_edit_binding_invalid",
+                    "The bound workspace target metadata could not be verified.",
+                ) from error
+        else:
+            if attributes:
+                raise ArtifactError(
+                    "artifact_edit_binding_invalid",
+                    "The bound workspace target has unsupported extended metadata.",
+                )
+
+
+def _mode_permits_directory_write(facts: os.stat_result) -> bool:
+    if os.geteuid() == 0:
+        return True
+    mode = stat.S_IMODE(facts.st_mode)
+    if int(facts.st_uid) == os.geteuid():
+        return bool(mode & stat.S_IWUSR and mode & stat.S_IXUSR)
+    groups = (
+        {os.getegid(), *os.getgroups()} if hasattr(os, "getgroups") else {os.getegid()}
+    )
+    if int(facts.st_gid) in groups:
+        return bool(mode & stat.S_IWGRP and mode & stat.S_IXGRP)
+    return bool(mode & stat.S_IWOTH and mode & stat.S_IXOTH)
+
+
+def _verify_staged_bound_file(
+    parent_descriptor: int,
+    staged_name: str,
+    payload: ArtifactPayload,
+    target: LocalBoundFileTarget,
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(staged_name, flags, dir_fd=parent_descriptor)
+    try:
+        facts = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(facts.st_mode)
+            or int(facts.st_nlink) != 1
+            or int(facts.st_uid) != target.uid
+            or int(facts.st_gid) != target.gid
+            or stat.S_IMODE(facts.st_mode) != stat.S_IMODE(target.mode)
+        ):
+            raise OSError("staged bound replacement metadata mismatch")
+        total, digest = _descriptor_content_facts(descriptor)
+        if total != payload.ref.byte_size or digest != payload.ref.sha256:
+            raise OSError("staged bound replacement content mismatch")
+    finally:
+        os.close(descriptor)
+
+
+def _verify_published_bound_file(
+    target: LocalBoundFileTarget,
+    payload: ArtifactPayload,
+) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(target.filename, flags, dir_fd=target.parent_descriptor)
+    try:
+        facts = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(facts.st_mode)
+            or int(facts.st_nlink) != 1
+            or int(facts.st_uid) != target.uid
+            or int(facts.st_gid) != target.gid
+            or stat.S_IMODE(facts.st_mode) != stat.S_IMODE(target.mode)
+        ):
+            raise OSError("published bound replacement metadata mismatch")
+        total, digest = _descriptor_content_facts(descriptor)
+        if total != payload.ref.byte_size or digest != payload.ref.sha256:
+            raise OSError("published bound replacement content mismatch")
+        return physical_revision_for_facts(facts)
+    finally:
+        os.close(descriptor)
+
+
+def _descriptor_content_facts(descriptor: int) -> tuple[int, str]:
+    digest = sha256()
+    total = 0
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 1024 * 1024, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        total += len(chunk)
+        offset += len(chunk)
+    return total, "sha256:" + digest.hexdigest()
+
+
+def _bound_receipt(
+    payload: ArtifactPayload,
+    binding: ArtifactLocalFileBinding,
+    *,
+    outcome: ArtifactDeliveryOutcome,
+    result_revision: str | None,
+    failure_code: str | None,
+    clock: Callable[[], datetime],
+) -> ArtifactDeliveryReceipt:
+    filename = binding.relative_path.rsplit("/", 1)[-1]
+    return ArtifactDeliveryReceipt(
+        artifact_id=payload.ref.artifact_id,
+        destination_id=BOUND_FILE_DESTINATION_ID,
+        filename=filename,
+        saved_path=binding.relative_path,
+        byte_size=payload.ref.byte_size,
+        sha256=payload.ref.sha256,
+        renamed_for_collision=False,
+        delivered_at=clock(),
+        mode=ArtifactDeliveryMode.REPLACE_BOUND_FILE,
+        outcome=outcome,
+        workspace_id=binding.workspace_id,
+        relative_path=binding.relative_path,
+        prior_physical_revision=binding.original_physical_revision,
+        result_physical_revision=result_revision,
+        failure_code=failure_code,
+    )
+
+
+def _safe_relative_display(value: str) -> str:
+    import unicodedata
+
+    projected = "".join(
+        character
+        for character in value
+        if character.isprintable()
+        and unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+    )
+    return projected[:512] or "workspace file"
 
 
 def _grant_from_mapping(value: Mapping[str, object]) -> _DestinationGrant:

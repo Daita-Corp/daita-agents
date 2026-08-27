@@ -123,6 +123,7 @@ class ToolRuntime(Protocol):
         calls: tuple[ToolCall, ...],
         *,
         projection: object,
+        messages: tuple[CanonicalMessage, ...],
         sensitivity: ModelSensitivity,
     ) -> ToolBatchOutcome:
         """Return one ordered, cancellation-safe outcome for the whole batch."""
@@ -388,13 +389,14 @@ class AgentLoop:
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
                     )
+                step_messages = messages[current_start:]
                 step_tool_projection = self._tools.project(
                     tool_catalog,
-                    messages[current_start:],
+                    step_messages,
                 )
                 request = self._context_builder.project(
                     context_snapshot,
-                    messages[current_start:],
+                    step_messages,
                     step=step,
                     tool_context=step_tool_projection,
                     previous_request_input_tokens=previous_request_input_tokens,
@@ -531,6 +533,7 @@ class AgentLoop:
                         run,
                         response.tool_calls,
                         projection=step_tool_projection,
+                        messages=step_messages,
                         sensitivity=request.sensitivity,
                     ),
                     response.tool_calls,
@@ -612,7 +615,7 @@ class AgentLoop:
                         deadline,
                         run_started,
                         context_snapshot,
-                        step_tool_projection,
+                        tool_catalog,
                         previous_request_input_tokens,
                         run_route,
                         limits,
@@ -629,7 +632,7 @@ class AgentLoop:
                 deadline,
                 run_started,
                 context_snapshot,
-                step_tool_projection,
+                tool_catalog,
                 previous_request_input_tokens,
                 run_route,
                 limits,
@@ -714,7 +717,7 @@ class AgentLoop:
         deadline: float,
         run_started: float,
         context_snapshot: object,
-        tool_context: object,
+        tool_catalog: object,
         previous_request_input_tokens: int | None,
         run_route: object | None,
         limits: LoopLimits,
@@ -733,6 +736,7 @@ class AgentLoop:
                 artifacts=artifacts,
                 artifact_deliveries=artifact_deliveries,
             )
+        tool_context = self._tools.project(tool_catalog, messages)
         request = self._context_builder.project(
             context_snapshot,
             messages,

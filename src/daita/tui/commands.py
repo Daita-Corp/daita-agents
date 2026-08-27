@@ -79,6 +79,8 @@ SLASH_COMMAND_COMPLETIONS = (
         "Invoke a skill by name",
     ),
     ("/status", "/status", "Show current agent status"),
+    ("/workspace", "/workspace", "Show the admitted local workspace"),
+    ("/files ", "/files <question>", "Run using workspace files only"),
     ("/conversation", "/conversation", "Show the current conversation ID"),
     ("/agent delete", "/agent delete", "Permanently delete this agent"),
     ("/help", "/help", "Show controls and usage help"),
@@ -94,6 +96,7 @@ BUILTIN_SLASH_COMMANDS = frozenset(
         "/catalog",
         "/conversation",
         "/exit",
+        "/files",
         "/help",
         "/inbox",
         "/jobs",
@@ -110,6 +113,7 @@ BUILTIN_SLASH_COMMANDS = frozenset(
         "/skills",
         "/status",
         "/user",
+        "/workspace",
     }
 )
 HELP_TEXT = (

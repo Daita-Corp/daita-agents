@@ -4,6 +4,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita.adapters.models import SourceRegistration
@@ -136,7 +137,12 @@ def _snapshot(
 
 
 async def _agent_with_catalog(tmp_path, tables=("orders", "customers")):
-    agent = await Agent.create("permission-control", root=tmp_path, clock=lambda: NOW)
+    agent = await Agent.create(
+        "permission-control",
+        root=tmp_path,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
     registration = _registration(agent.id)
     snapshot, resources = _snapshot(
         registration,
@@ -281,7 +287,12 @@ async def test_write_selected_many_all_current_and_future_table_exclusion(tmp_pa
 
 
 async def test_advanced_columns_support_wide_exact_binding_and_stale_preview(tmp_path):
-    agent = await Agent.create("permission-bound", root=tmp_path, clock=lambda: NOW)
+    agent = await Agent.create(
+        "permission-bound",
+        root=tmp_path,
+        clock=lambda: NOW,
+        workspace=workspace_for(tmp_path),
+    )
     source = _registration(agent.id)
     snapshot, resources = _snapshot(
         source,

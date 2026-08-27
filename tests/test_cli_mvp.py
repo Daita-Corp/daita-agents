@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shlex
+import stat
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -15,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -116,17 +118,17 @@ def _request_text(request: ModelRequest) -> tuple[str, ...]:
 
 
 async def _create_agent(root: Path, name: str) -> None:
-    agent = await Agent.create(name, root=root)
+    agent = await Agent.create(name, root=root, workspace=workspace_for(root))
     await agent.close()
 
 
 async def _open_and_close_agent(root: Path, name: str) -> None:
-    agent = await Agent.open(name, root=root)
+    agent = await Agent.open(name, root=root, workspace=workspace_for(root))
     await agent.close()
 
 
 async def _knowledge(root: Path, name: str) -> tuple[str, Skill | None]:
-    agent = await Agent.open(name, root=root)
+    agent = await Agent.open(name, root=root, workspace=workspace_for(root))
     try:
         return await agent.read_memory(), await agent.read_skill("monthly-revenue")
     finally:
@@ -137,7 +139,7 @@ async def _complete_knowledge(
     root: Path,
     name: str,
 ) -> tuple[str, str, tuple[object, ...]]:
-    agent = await Agent.open(name, root=root)
+    agent = await Agent.open(name, root=root, workspace=workspace_for(root))
     try:
         return (
             await agent.read_memory(),
@@ -149,7 +151,7 @@ async def _complete_knowledge(
 
 
 async def _seed_knowledge(root: Path, name: str) -> None:
-    agent = await Agent.open(name, root=root)
+    agent = await Agent.open(name, root=root, workspace=workspace_for(root))
     try:
         await agent.set_memory("Initial memory")
         await agent.set_user_profile("Initial user profile")
@@ -188,7 +190,17 @@ def test_current_parser_keeps_the_existing_one_shot_surface_green():
 
     assert _surface(parser) == (
         (),
-        frozenset({"-h", "--help", "--version", "--root", "--agent"}),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--version",
+                "--root",
+                "--agent",
+                "--workspace",
+                "--workspace-sensitivity",
+            }
+        ),
     )
     assert {"create", "attach", "sources", "run"} <= set(commands)
     assert _surface(commands["create"]) == (
@@ -216,6 +228,76 @@ def test_current_parser_keeps_the_existing_one_shot_surface_green():
         ("name",),
         frozenset({"-h", "--help"}),
     )
+
+
+def test_workspace_resolution_prefers_explicit_then_safe_cwd_and_preserves_sensitivity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    explicit_root = tmp_path / "explicit"
+    explicit_root.mkdir()
+    safe_cwd = tmp_path / "project"
+    safe_cwd.mkdir()
+
+    explicit_args = cli.build_parser().parse_args(
+        [
+            "--root",
+            str(state_root),
+            "--workspace",
+            str(explicit_root),
+            "--workspace-sensitivity",
+            "confidential",
+            "run",
+            "agent",
+            "question",
+        ]
+    )
+    explicit = cli._resolve_cli_workspace(explicit_args)
+    assert explicit.root == explicit_root.resolve()
+    assert explicit.sensitivity.value == "confidential"
+
+    monkeypatch.chdir(safe_cwd)
+    cwd_args = cli.build_parser().parse_args(
+        ["--root", str(state_root), "run", "agent", "question"]
+    )
+    inferred = cli._resolve_cli_workspace(cwd_args)
+    assert inferred.root == safe_cwd.resolve()
+    assert inferred.sensitivity.value == "internal"
+
+
+def test_workspace_resolution_creates_user_only_conventional_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_home = tmp_path / "home"
+    user_home.mkdir()
+    monkeypatch.chdir(user_home)
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: user_home))
+    args = cli.build_parser().parse_args(["run", "agent", "question"])
+
+    workspace = cli._resolve_cli_workspace(args)
+
+    assert workspace.root == user_home / "Daita Workspace"
+    assert workspace.root.is_dir()
+    assert stat.S_IMODE(workspace.root.stat().st_mode) == 0o700
+
+
+def test_delete_is_state_only_and_does_not_resolve_a_workspace() -> None:
+    args = cli.build_parser().parse_args(["delete", "gone", "--yes"])
+    with (
+        patch.object(
+            cli,
+            "_resolve_cli_workspace",
+            side_effect=AssertionError("delete must not resolve workspace authority"),
+        ),
+        patch.object(Agent, "delete", new=AsyncMock()) as deleted,
+    ):
+        result = asyncio.run(cli._execute(args))
+
+    assert result == {"name": "gone", "deleted": True}
+    deleted.assert_awaited_once_with("gone", root=None)
 
 
 def test_zero_argument_cli_dispatches_to_the_terminal_application():
@@ -450,7 +532,12 @@ def test_run_without_model_opens_the_persisted_route_without_injection():
 
     assert isinstance(record, dict)
     assert record["text"] == "persisted answer"
-    opened.assert_awaited_once_with("runner", root=None, observer=None)
+    opened.assert_awaited_once_with(
+        "runner",
+        workspace=cli._resolve_cli_workspace(arguments),
+        root=None,
+        observer=None,
+    )
     agent.run.assert_awaited_once_with(
         "use persisted route",
         conversation_id=None,
@@ -588,6 +675,7 @@ def test_future_cli_1_parser_adds_only_explicit_run_continuation_flags():
                 "--max-output",
                 "--conversation-id",
                 "--events-jsonl",
+                "--files-only",
             }
         ),
     )

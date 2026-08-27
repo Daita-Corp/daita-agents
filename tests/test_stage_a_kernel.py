@@ -7,11 +7,10 @@ from typing import cast
 
 import pytest
 from _capability_runtime_support import (
+    ContextToolProjectionAdapter,
     StaticTestDomain,
-    context_step_projection,
-    context_tool_catalog,
-    discovery_metadata,
     execute_projected,
+    presentation_metadata,
     static_registry,
 )
 
@@ -22,6 +21,7 @@ from daita.capabilities import (
     Capability,
     OperationalEffect,
     ToolExecution,
+    ToolLoadMode,
     ToolOutput,
     ToolView,
 )
@@ -71,7 +71,7 @@ def _error(result: ToolResultBlock) -> Mapping[str, object]:
 class _Context:
     async def prepare(self, run, messages, tool_context):
         del run
-        return messages[:-1], tool_context.provider_definitions
+        return messages[:-1], tool_context.initial_provider_definitions
 
     def project(
         self,
@@ -92,15 +92,17 @@ class _Context:
 
 
 class _NoTools:
+    def __init__(self) -> None:
+        self._projection = ContextToolProjectionAdapter(())
+
     async def prepare_run(self, run):
-        return context_tool_catalog(run, ())
+        return await self._projection.prepare_run(run)
 
     def project(self, catalog, messages):
-        del messages
-        return context_step_projection(catalog)
+        return self._projection.project(catalog, messages)
 
-    async def execute_all(self, run, calls, *, projection, sensitivity):
-        del run, projection, sensitivity
+    async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+        del run, projection, messages, sensitivity
         assert calls == ()
         return ToolBatchOutcome(())
 
@@ -288,13 +290,13 @@ def _runtime(
             name="stage_a_read",
             capability_id=read.id,
             description=read.description,
-            discovery=discovery_metadata(),
+            presentation=presentation_metadata(),
         ),
         ToolView(
             name="stage_a_write",
             capability_id=write.id,
             description=write.description,
-            discovery=discovery_metadata(),
+            presentation=presentation_metadata(load_mode=ToolLoadMode.ON_DEMAND),
         ),
     )
     domain = StaticTestDomain((read, write), views)
@@ -554,6 +556,16 @@ async def test_loop_persists_complete_interrupted_batch_before_cancellation_esca
             (
                 ModelResponse(
                     finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(
+                        ToolCall(
+                            id="load-write",
+                            name="toolbox_load",
+                            arguments={"tool_names": ["stage_a_write"]},
+                        ),
+                    ),
+                ),
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
                     tool_calls=calls,
                 ),
             )
@@ -577,6 +589,8 @@ async def test_loop_persists_complete_interrupted_batch_before_cancellation_esca
         MessageRole.USER,
         MessageRole.ASSISTANT,
         MessageRole.TOOL,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
         MessageRole.TOOL,
     )
     tool_results = tuple(
@@ -585,6 +599,7 @@ async def test_loop_persists_complete_interrupted_batch_before_cancellation_esca
         if message.role is MessageRole.TOOL
     )
     assert tuple(result.call_id for result in tool_results) == (
+        "load-write",
         "write",
         "later-read",
     )
@@ -617,8 +632,9 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         input_schema={"type": "object", "properties": {}},
     )
 
-    tool_catalog = context_tool_catalog(run, (tool,))
-    step_projection = context_step_projection(tool_catalog)
+    projection = ContextToolProjectionAdapter((tool,))
+    tool_catalog = await projection.prepare_run(run)
+    step_projection = projection.project(tool_catalog, (user,))
     snapshot = await builder.prepare(run, (user,), tool_catalog)
     assert not hasattr(builder, "build")
     first = builder.project(
@@ -717,16 +733,16 @@ async def test_context_owns_durable_job_handoff_guidance() -> None:
         description="Start one durable data profile.",
         input_schema={"type": "object", "properties": {}},
     )
-    catalog = context_tool_catalog(
-        run,
+    projection = ContextToolProjectionAdapter(
         (start_tool,),
         capability_ids=(START_DATA_PROFILE_CAPABILITY_ID,),
     )
+    catalog = await projection.prepare_run(run)
     request = builder.project(
         await builder.prepare(run, (user,), catalog),
         (user,),
         step=1,
-        tool_context=context_step_projection(catalog),
+        tool_context=projection.project(catalog, (user,)),
     )
 
     system = request.messages[0].content[0]
@@ -749,8 +765,9 @@ async def test_context_owner_rejects_cumulative_evidence_pressure_explicitly():
     )
     run = _run("run-context-pressure")
     user = CanonicalMessage(role=MessageRole.USER, content=(TextBlock("question"),))
-    tool_catalog = context_tool_catalog(run, ())
-    step_projection = context_step_projection(tool_catalog)
+    projection = ContextToolProjectionAdapter(())
+    tool_catalog = await projection.prepare_run(run)
+    step_projection = projection.project(tool_catalog, (user,))
     snapshot = await builder.prepare(run, (user,), tool_catalog)
     result = ToolResultBlock(
         call_id="large",
@@ -923,25 +940,24 @@ async def test_tool_call_run_bound_counts_across_responses():
     class _CountingTools:
         def __init__(self) -> None:
             self.calls: list[ToolCall] = []
-
-        async def prepare_run(self, run):
-            return context_tool_catalog(
-                run,
+            self._projection = ContextToolProjectionAdapter(
                 (
                     ToolDefinition(
                         name="lookup",
                         description="Lookup.",
                         input_schema={"type": "object", "properties": {}},
                     ),
-                ),
+                )
             )
 
-        def project(self, catalog, messages):
-            del messages
-            return context_step_projection(catalog)
+        async def prepare_run(self, run):
+            return await self._projection.prepare_run(run)
 
-        async def execute_all(self, run, calls, *, projection, sensitivity):
-            del run, projection, sensitivity
+        def project(self, catalog, messages):
+            return self._projection.project(catalog, messages)
+
+        async def execute_all(self, run, calls, *, projection, messages, sensitivity):
+            del run, projection, messages, sensitivity
             self.calls.extend(calls)
             return ToolBatchOutcome(
                 tuple(

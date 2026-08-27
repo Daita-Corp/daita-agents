@@ -6,8 +6,8 @@ from datetime import UTC, datetime
 import pytest
 from _capability_runtime_support import (
     StaticTestDomain,
-    discovery_metadata,
     execute_projected,
+    presentation_metadata,
     static_registry,
 )
 
@@ -24,6 +24,7 @@ from daita.capabilities import (
     Capability,
     OperationalEffect,
     ToolExecution,
+    ToolLoadMode,
     ToolOutput,
     ToolView,
 )
@@ -508,7 +509,7 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         name="test_update",
         capability_id=capability.id,
         description=capability.description,
-        discovery=discovery_metadata(),
+        presentation=presentation_metadata(load_mode=ToolLoadMode.ON_DEMAND),
     )
     domain = StaticTestDomain(
         (capability,),
