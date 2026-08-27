@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita.llm.models import (

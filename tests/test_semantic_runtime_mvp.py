@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from collections.abc import Mapping
 from datetime import UTC, datetime
 
 import pytest
-
 from _capability_runtime_support import execute_projected
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
+
 from daita import (
     Agent,
     ApprovalDecision,
@@ -39,9 +41,6 @@ from daita.semantics import (
 )
 from daita.tui.commands import (
     learning_invocation_message as _learning_invocation_message,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 
 NOW = datetime(2026, 7, 28, 14, tzinfo=UTC)

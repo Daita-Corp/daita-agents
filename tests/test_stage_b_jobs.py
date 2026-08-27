@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import json
 import sqlite3
@@ -13,6 +11,10 @@ from pathlib import Path
 
 import pytest
 from _capability_runtime_support import StaticTestDomain, static_registry
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -35,8 +37,8 @@ from daita.capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     CapabilityRegistry,
-    ToolLoadMode,
     ToolExecution,
+    ToolLoadMode,
     ToolOutput,
     ToolOutputValidationError,
     capability_contract_digest,
@@ -95,9 +97,6 @@ from daita.llm.models import (
 from daita.loop.models import LoopLimits, RunInput
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
-)
 
 EAGER_LIMITS = LoopLimits()
 

@@ -11,9 +11,9 @@ import pytest
 from daita.adapters.models import SourceRegistration
 from daita.artifacts.models import (
     ArtifactAuthorship,
-    ArtifactDeliveryReceipt,
     ArtifactDeliveryMode,
     ArtifactDeliveryOutcome,
+    ArtifactDeliveryReceipt,
     ArtifactLocalFileBinding,
     ArtifactProvenance,
     ArtifactRef,

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import hashlib
 import io
@@ -15,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, cli
 from daita.errors import StateCompatibilityCode, StateCompatibilityError

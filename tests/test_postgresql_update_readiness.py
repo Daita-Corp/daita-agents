@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from dataclasses import fields
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, PostgreSQLSource, PostgreSQLUpdateReadiness
 from daita._json import canonical_json

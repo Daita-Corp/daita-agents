@@ -1,4 +1,3 @@
-from _workspace_support import workspace_for
 import asyncio
 import threading
 from collections.abc import Mapping
@@ -7,8 +6,12 @@ from datetime import UTC, datetime
 from typing import cast
 
 import pytest
-
 from _capability_runtime_support import execute_projected
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
+
 from daita import Agent
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
@@ -54,9 +57,6 @@ from daita.skills.capabilities import (
     SKILL_SAVE_EXECUTOR_ID,
     SKILL_SAVE_OUTPUT_KIND,
     SKILL_SAVE_TOOL_NAME,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)

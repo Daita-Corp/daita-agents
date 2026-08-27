@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import json
 import sqlite3
 import stat
@@ -9,6 +7,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.hosting.embedded as embedded
 from daita import Agent, SQLiteSource, cli

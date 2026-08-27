@@ -9,14 +9,13 @@ revision, cursor, and byte-limit mechanics remain deterministic contracts.
 
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import os
 from collections.abc import AsyncIterator
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, create_llm_provider
 from daita._json import canonical_json

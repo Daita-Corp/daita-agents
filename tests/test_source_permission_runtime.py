@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -9,6 +7,7 @@ from typing import cast
 
 import pytest
 from _capability_runtime_support import execute_projected
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject

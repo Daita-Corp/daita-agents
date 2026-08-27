@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import io
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +8,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, AgentConfig, cli
 from daita.cli_text import _write_learning_review_result

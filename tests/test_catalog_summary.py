@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import sqlite3
 import threading
@@ -11,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.catalog.service as catalog_service
 import daita.storage.sqlite as sqlite_store

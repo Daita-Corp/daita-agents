@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import io
 import json
@@ -12,6 +10,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -55,9 +57,6 @@ from daita.llm.models import (
 )
 from daita.loop.models import LoopLimits
 from daita.storage.sqlite import SQLiteStateStore
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
-)
 
 EAGER_LIMITS = LoopLimits()
 from daita.tui.controller import PresentationController

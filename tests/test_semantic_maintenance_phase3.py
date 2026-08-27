@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -40,12 +42,8 @@ from daita.semantics import (
     render_semantic_recall,
     semantic_duplicate_identity,
 )
-
 from daita.skills import SKILL_MAX_COUNT
 from daita.storage.sqlite import SQLiteStateStore
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
-)
 
 EAGER_LIMITS = LoopLimits()
 

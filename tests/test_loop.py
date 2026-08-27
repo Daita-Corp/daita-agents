@@ -1,4 +1,3 @@
-from _workspace_support import workspace_for
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -7,6 +6,7 @@ from typing import cast
 
 import pytest
 from _capability_runtime_support import ContextToolProjectionAdapter
+from _workspace_support import workspace_for
 
 from daita._json import canonical_json
 from daita.agent import Agent

@@ -1,10 +1,10 @@
-from _workspace_support import workspace_for
 import asyncio
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita.hosting.embedded import AgentHomeError, HostActiveError

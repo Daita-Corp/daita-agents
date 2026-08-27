@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -10,6 +8,10 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import Agent, ApprovalDecision, ApprovalRequest
 from daita._json import FrozenJsonObject
@@ -34,9 +36,6 @@ from daita.llm.models import (
 )
 from daita.loop.models import LoopLimits
 from daita.observation import AgentEvent, AgentEventKind
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
-)
 
 NOW = datetime(2026, 7, 28, 12, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits()

@@ -12,8 +12,8 @@ import pytest
 
 import daita
 from daita import Agent, LocalWorkspace, SQLiteSource
+from daita.adapters.local_workspace import LocalWorkspaceBackend
 from daita.adapters.models import SourceRegistration
-from daita.hosting.embedded import EmbeddedAgent
 from daita.domains.data import LOCAL_FILE_CAPABILITY_IDS, LOCAL_FILE_EXECUTOR_IDS
 from daita.domains.data.export_capabilities import (
     ARTIFACT_EDIT_TEXT_TOOL_NAME,
@@ -22,13 +22,14 @@ from daita.domains.data.export_capabilities import (
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
 )
-from daita.adapters.local_workspace import LocalWorkspaceBackend
+from daita.hosting.embedded import EmbeddedAgent
 from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelProfile,
     ModelResponse,
     ModelSensitivity,
+    TextBlock,
     ToolCall,
     ToolResultBlock,
 )
@@ -167,7 +168,7 @@ async def test_files_only_omits_all_source_tools_with_multiple_sources(
             block.text
             for message in provider.requests[0].messages
             for block in message.content
-            if hasattr(block, "text")
+            if isinstance(block, TextBlock)
         )
         assert '"sources":[]' in prompt
     finally:

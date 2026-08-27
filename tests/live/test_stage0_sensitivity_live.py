@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import os
 import sqlite3
 from collections.abc import AsyncIterator
@@ -11,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
 from daita.catalog.models import Sensitivity

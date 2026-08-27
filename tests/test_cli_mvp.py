@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import argparse
 import asyncio
 import io
@@ -18,6 +16,7 @@ from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,

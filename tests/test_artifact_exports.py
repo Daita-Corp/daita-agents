@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import sqlite3
 import threading
@@ -17,6 +15,10 @@ from typing import Any, cast
 from uuid import UUID
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita._json import canonical_json
@@ -55,9 +57,6 @@ from daita.llm.models import (
     TextBlock,
     ToolCall,
     ToolResultBlock,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 from daita.loop.models import LoopExitKind
 from daita.security import EmptySecretProvider

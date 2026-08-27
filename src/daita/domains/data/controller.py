@@ -39,10 +39,10 @@ from .sql import (
     PostgreSQLUpdateCommand,
     PostgreSQLUpdateIntent,
     ResourceSchema,
+    validate_duckdb_read,
     validate_postgresql_read,
     validate_postgresql_update_intent,
     validate_sqlite_read,
-    validate_duckdb_read,
 )
 
 DATA_DOMAIN_OWNER_ID = "data"

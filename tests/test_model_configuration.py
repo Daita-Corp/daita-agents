@@ -1,4 +1,3 @@
-from _workspace_support import workspace_for
 import asyncio
 import json
 import subprocess
@@ -8,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.hosting.embedded as embedded
 from daita import Agent, LoopLimits

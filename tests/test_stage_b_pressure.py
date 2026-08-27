@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -10,6 +8,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita._json import canonical_json

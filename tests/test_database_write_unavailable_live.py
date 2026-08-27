@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import os
 from collections.abc import Sequence
 from decimal import Decimal, InvalidOperation
@@ -9,6 +7,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, create_llm_provider
 from daita.capabilities import ApprovalDecision, ApprovalRequest

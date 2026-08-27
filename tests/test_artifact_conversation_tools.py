@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import sqlite3
 import threading
@@ -12,6 +10,10 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.domains.data.export_capabilities as artifact_capabilities
 from daita import Agent, SQLiteSource
@@ -41,9 +43,6 @@ from daita.llm.models import (
     ModelResponse,
     ToolCall,
     ToolResultBlock,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 
 

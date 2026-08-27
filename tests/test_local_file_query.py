@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from daita import Agent, LocalWorkspace
+from daita._json import FrozenJsonObject
 from daita.adapters import local_file_query as query_module
 from daita.adapters.local_file_query import (
     LocalFileQueryError,
@@ -330,13 +331,21 @@ async def test_csv_tsv_json_ndjson_and_parquet_aggregate_in_private_workers(
             result = await _query(backend, f"orders.{suffix}")
             rows = result.data["rows"]
             assert isinstance(rows, tuple)
-            assert [row["region"] for row in rows] == ["north", "south"]
-            assert [row["total"] for row in rows] == [10, 20]
+            regions: list[object] = []
+            totals: list[object] = []
+            for row in rows:
+                assert isinstance(row, FrozenJsonObject)
+                regions.append(row["region"])
+                totals.append(row["total"])
+            assert regions == ["north", "south"]
+            assert totals == [10, 20]
             assert result.data["input_file_count"] == 1
             assert result.data["truncated"] is False
             provenance = result.sensitivity_provenance
             assert provenance["authority"] == "local_workspace_binding"
-            assert len(provenance["bindings"]) == 1
+            bindings = provenance["bindings"]
+            assert isinstance(bindings, tuple)
+            assert len(bindings) == 1
     finally:
         await backend.close()
 
@@ -392,9 +401,15 @@ async def test_result_row_byte_and_column_bounds_are_enforced(tmp_path: Path) ->
             "SELECT id, payload FROM data ORDER BY id",
         )
         assert limited.data["truncated"] is True
-        assert "byte_limit" in limited.data["truncation_reasons"]
-        assert limited.data["returned_rows"] < 100
-        assert limited.data["utf8_bytes"] <= 48 * 1_024
+        truncation_reasons = limited.data["truncation_reasons"]
+        returned_rows = limited.data["returned_rows"]
+        utf8_bytes = limited.data["utf8_bytes"]
+        assert isinstance(truncation_reasons, tuple)
+        assert isinstance(returned_rows, int)
+        assert isinstance(utf8_bytes, int)
+        assert "byte_limit" in truncation_reasons
+        assert returned_rows < 100
+        assert utf8_bytes <= 48 * 1_024
         with pytest.raises(LocalFileQueryError) as columns:
             await _query(backend, "wide.csv", "SELECT * FROM data")
         assert columns.value.code == "file_query_limited"
@@ -562,8 +577,10 @@ async def test_rss_and_spill_overruns_reap_worker_clean_scratch_and_allow_reuse(
         recovered_rows = recovered.data["rows"]
         assert isinstance(recovered_rows, tuple)
         assert len(recovered_rows) == 1
-        assert recovered_rows[0]["region"] == "north"
-        assert recovered_rows[0]["total"] == 1
+        recovered_row = recovered_rows[0]
+        assert isinstance(recovered_row, FrozenJsonObject)
+        assert recovered_row["region"] == "north"
+        assert recovered_row["total"] == 1
     finally:
         await backend.close()
     assert {child.pid for child in multiprocessing.active_children()} <= before

@@ -10,8 +10,6 @@ contracts in ``tests/test_local_file_query.py``.
 
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import multiprocessing
 import os
 from collections.abc import AsyncIterator, Mapping
@@ -20,6 +18,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, LocalWorkspace, LoopLimits, create_llm_provider
 from daita.llm.models import (

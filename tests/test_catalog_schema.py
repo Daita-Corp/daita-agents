@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -11,6 +9,7 @@ from typing import cast
 
 import pytest
 from _capability_runtime_support import execute_projected
+from _workspace_support import workspace_for
 
 import daita.catalog.service as catalog_service
 import daita.storage.sqlite as sqlite_store

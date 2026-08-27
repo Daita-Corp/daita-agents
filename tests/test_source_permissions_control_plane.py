@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from dataclasses import asdict
 from datetime import UTC, datetime
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita.adapters.models import SourceRegistration

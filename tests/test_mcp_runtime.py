@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import json
 import sqlite3
@@ -20,6 +18,7 @@ from _mcp_fixtures import (
     mock_transport,
 )
 from _toolbox_model_support import ToolboxAwareMockModelProvider
+from _workspace_support import workspace_for
 from textual.widgets import Button, Input, OptionList, Static
 
 from daita import (
@@ -38,9 +37,9 @@ from daita.adapters.mcp import (
     StreamableHTTPMCPClientFactory,
 )
 from daita.capabilities import (
+    ToolboxId,
     ToolLoadMode,
     ToolPresentation,
-    ToolboxId,
     ToolTextTrust,
 )
 from daita.errors import StateCompatibilityCode, StateCompatibilityError

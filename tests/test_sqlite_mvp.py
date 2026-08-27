@@ -1,9 +1,9 @@
-from _workspace_support import workspace_for
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita.adapters import sqlite_query as sqlite_query_module

@@ -9,11 +9,11 @@ from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...artifacts.models import ArtifactDestination, artifact_destination_to_mapping
+from ...capabilities import ToolLoadMode
 from ...capability_runtime import (
     RunToolCatalog,
     StepToolProjection,
 )
-from ...capabilities import ToolLoadMode
 from ...catalog.capabilities import (
     CATALOG_INSPECT_EVIDENCE_KIND,
     CATALOG_SCHEMA_EVIDENCE_KIND,

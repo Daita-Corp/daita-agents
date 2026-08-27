@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 
 from _capability_runtime_support import execute_projected
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -35,9 +37,6 @@ from daita.loop.models import LoopLimits, RunInput
 from daita.semantics import semantic_annotation_sha256
 from daita.tui.commands import SLASH_COMMAND_COMPLETIONS, learning_invocation_message
 from daita.tui.controller import PresentationController
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
-)
 
 NOW = datetime(2026, 7, 28, 16, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits()

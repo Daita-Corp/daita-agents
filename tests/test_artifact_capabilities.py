@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from collections import defaultdict
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -13,6 +11,10 @@ from _capability_runtime_support import (
     ContextToolProjectionAdapter,
     execute_projected,
 )
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
@@ -40,9 +42,6 @@ from daita.llm.models import (
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 from daita.loop.models import RunInput
 

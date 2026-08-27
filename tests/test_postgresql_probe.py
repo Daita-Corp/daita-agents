@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 from collections.abc import Mapping, Sequence
 from typing import Any
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita.adapters import (

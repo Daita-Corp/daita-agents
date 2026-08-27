@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import inspect
 from collections.abc import Mapping
 from dataclasses import replace
@@ -10,6 +8,7 @@ from datetime import UTC, datetime
 import pytest
 from _capability_runtime_support import StaticTestDomain
 from _toolbox_model_support import ToolboxAwareMockModelProvider
+from _workspace_support import workspace_for
 
 from daita import Agent
 from daita._json import FrozenJsonObject, canonical_json
@@ -505,7 +504,6 @@ async def test_catalog_manifest_and_initial_projection_are_exact_and_bounded() -
     runtime, _, domain, _ = _runtime()
     run = _run()
     catalog = await runtime.prepare_run(run)
-    assert domain.project_calls if hasattr(domain, "project_calls") else True
     assert tuple(item.toolbox_id for item in catalog.toolbox_manifest) == (
         ToolboxId.SOURCES,
         ToolboxId.ARTIFACTS,

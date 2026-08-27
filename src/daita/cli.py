@@ -72,6 +72,7 @@ from .terminal import run_terminal_application
 from .tui.models import (
     validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
 )
+from .workspace import paths_overlap
 
 _SKILL_DESCRIPTION_PLACEHOLDER = "Describe when the agent should use this skill."
 _SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
@@ -1176,10 +1177,6 @@ async def _prompt_for_exact_approval(
         print("Enter y to approve or n to deny.")
 
 
-def _paths_overlap(left: Path, right: Path) -> bool:
-    return left == right or left in right.parents or right in left.parents
-
-
 def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
     sensitivity = ModelSensitivity(args.workspace_sensitivity)
     explicit = args.workspace
@@ -1196,12 +1193,12 @@ def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
     if (
         cwd != user_home
         and cwd != Path(cwd.anchor)
-        and not _paths_overlap(cwd, state_root)
+        and not paths_overlap(cwd, state_root)
     ):
         return LocalWorkspace(cwd, sensitivity=sensitivity)
 
     fallback = user_home / "Daita Workspace"
-    if _paths_overlap(fallback, state_root):
+    if paths_overlap(fallback, state_root):
         raise ValueError(
             "the default workspace overlaps agent state; pass --workspace explicitly"
         )

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import threading
 from datetime import UTC, datetime
@@ -10,6 +8,10 @@ from typing import cast
 
 import pytest
 from _capability_runtime_support import ContextToolProjectionAdapter
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.artifacts.store as store_module
 import daita.capabilities as capabilities_module
@@ -40,9 +42,6 @@ from daita.llm.models import (
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 from daita.loop import AgentLoop, InMemoryTranscriptStore, ToolBatchOutcome
 from daita.loop.models import LoopExitKind, RunInput

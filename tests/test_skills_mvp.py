@@ -1,4 +1,3 @@
-from _workspace_support import workspace_for
 import asyncio
 import os
 import sqlite3
@@ -10,6 +9,10 @@ from pathlib import Path
 
 import pytest
 from _capability_runtime_support import execute_projected
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.skills.store as skill_module
 from daita import Agent, SQLiteSource
@@ -51,9 +54,6 @@ from daita.skills.capabilities import (
     SKILL_VIEW_TOOL_NAME,
 )
 from daita.storage.sqlite_migrations import migration_rows
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
-)
 
 NOW = datetime(2026, 7, 22, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits()

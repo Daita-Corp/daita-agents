@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from pathlib import Path
+
+from _workspace_support import workspace_for
 
 from daita.tui.app import DaitaApp
 from daita.tui.screens.onboarding import AgentCreateScreen

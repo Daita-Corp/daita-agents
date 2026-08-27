@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import sqlite3
 from collections.abc import Mapping
@@ -12,6 +10,10 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -55,9 +57,6 @@ from daita.llm.pricing import CostEstimate
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop.models import LoopLimits, RunOrigin
 from daita.storage.sqlite import SQLiteStateStore
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
-)
 
 LIMITS = LoopLimits(
     max_estimated_cost_usd=Decimal("0.05"),

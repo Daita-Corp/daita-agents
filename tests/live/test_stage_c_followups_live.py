@@ -13,8 +13,6 @@ races, scope revocation, and malformed persisted state.
 
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import os
 import sqlite3
@@ -25,6 +23,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,

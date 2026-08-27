@@ -14,9 +14,9 @@ from daita import (
     ApprovalDecision,
     ApprovalRequest,
     JobStatus,
+    LocalWorkspace,
     LoopExit,
     LoopExitKind,
-    LocalWorkspace,
 )
 from daita.observation import AgentEventKind
 from daita.security import KeychainStore
@@ -41,7 +41,7 @@ from .models import (
     validate_candidate_review_cost_limit,
 )
 from .observer import ObserverEvent, RunObserver
-from .projection import project_conversation
+from .projection import CAPABILITY_LABELS, project_conversation
 from .sanitization import render_model_answer, sanitize_terminal_text
 from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
@@ -320,7 +320,7 @@ class DaitaApp(App[int]):
             if len(sources) > 1 and active_source is None:
                 source_status = "Run source: Files only or choose with @"
             else:
-                selected = active_source or sources[0]
+                selected = active_source or next(iter(sources))
                 source_status = f"Run source: {selected.display_name}"
             if (await self.controller.catalog_summary()).is_empty:
                 setup_guidance.append("catalog has 0 resources · use /source edit")
@@ -1149,17 +1149,26 @@ class DaitaApp(App[int]):
             await self._refresh_status(running=True, state="working")
             return
         if event.kind is AgentEventKind.TOOL_STARTED:
-            label = (
+            raw_tool_name = (
                 event.data.get("tool_name") or event.data.get("capability_id") or "tool"
             )
-            activity = (
-                "Preparing workspace file edit"
-                if label == "artifact_edit_text"
-                else (
-                    "Publishing local artifact"
-                    if label == "artifact_save_local"
-                    else f"Using {label}"
-                )
+            tool_name = raw_tool_name if isinstance(raw_tool_name, str) else "tool"
+            activity = {
+                "toolbox_search": "Searching toolboxes",
+                "toolbox_load": "Loading selected tools",
+                "file_search": "Searching workspace files",
+                "file_read": "Reading workspace file",
+                "file_query": "Querying workspace data",
+                "catalog_search": "Searching catalog",
+                "catalog_schema": "Reading catalog schema",
+                "data_query_sqlite": "Querying SQLite source",
+                "data_query_postgresql": "Querying PostgreSQL source",
+                "artifact_create_document": "Creating document",
+                "artifact_edit_text": "Preparing workspace file edit",
+                "artifact_save_local": "Publishing local artifact",
+            }.get(
+                tool_name,
+                f"Using {CAPABILITY_LABELS.get(tool_name, tool_name)}",
             )
             screen.set_activity(activity)
             await self._refresh_status(running=True, state=activity.casefold())

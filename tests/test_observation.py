@@ -1,4 +1,3 @@
-from _workspace_support import workspace_for
 import asyncio
 from collections.abc import Callable
 from dataclasses import FrozenInstanceError, replace
@@ -7,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 from _capability_runtime_support import ContextToolProjectionAdapter
+from _workspace_support import workspace_for
 
 from daita._json import FrozenJsonObject
 from daita.agent import Agent

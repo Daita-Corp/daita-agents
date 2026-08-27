@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from collections import defaultdict
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.artifacts.delivery as delivery_module
 from daita import Agent, ArtifactDeliveryReceipt, cli
@@ -24,9 +26,6 @@ from daita.llm.models import (
     ModelResponse,
     ToolCall,
     ToolResultBlock,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
 from daita.tui.projection import artifact_delivery_messages, completed_tool_pairs

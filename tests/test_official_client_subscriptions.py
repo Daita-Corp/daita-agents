@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import json
 import os
@@ -10,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.llm.providers.subscription_cli as subscription_cli
 from daita import Agent

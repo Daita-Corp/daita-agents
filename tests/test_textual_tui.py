@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import os
 import sqlite3
@@ -15,6 +13,7 @@ from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
+from _workspace_support import workspace_for
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.geometry import Offset
@@ -82,6 +81,7 @@ from daita.tui.models import (
 )
 from daita.tui.observer import ObserverEvent
 from daita.tui.projection import (
+    CAPABILITY_LABELS,
     approval_review_document,
     project_tool_details,
     redact_presentation_value,
@@ -177,6 +177,13 @@ def test_postgresql_url_and_redaction():
 
 
 def test_tool_projection_and_approval_document():
+    assert CAPABILITY_LABELS["toolbox_search"] == "Search toolboxes"
+    assert CAPABILITY_LABELS["toolbox_load"] == "Load selected tools"
+    assert CAPABILITY_LABELS["file_search"] == "Search workspace files"
+    assert CAPABILITY_LABELS["file_read"] == "Read workspace file"
+    assert CAPABILITY_LABELS["file_query"] == "Query workspace data"
+    assert CAPABILITY_LABELS["artifact_edit_text"] == "Prepare workspace edit"
+    assert CAPABILITY_LABELS["artifact_save_local"] == "Save artifact locally"
     details = project_tool_details(
         ToolCall(id="c1", name="data_query_sqlite", arguments={"sql": "SELECT 1"}),
         ToolResultBlock(
@@ -496,6 +503,27 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             await app.on_observer_event(ObserverEvent(completed))
             await pilot.pause()
             assert "ctx 8.5K / 32K" in str(context.content)
+
+            for tool_name, expected in (
+                ("toolbox_search", "Searching toolboxes"),
+                ("toolbox_load", "Loading selected tools"),
+                ("file_search", "Searching workspace files"),
+                ("file_read", "Reading workspace file"),
+                ("file_query", "Querying workspace data"),
+                ("artifact_edit_text", "Preparing workspace file edit"),
+                ("artifact_save_local", "Publishing local artifact"),
+            ):
+                started = AgentEvent(
+                    kind=AgentEventKind.TOOL_STARTED,
+                    occurred_at=datetime.now(UTC),
+                    run_id="run-live",
+                    conversation_id="conversation-live",
+                    data=FrozenJsonObject.from_mapping(
+                        {"tool_name": tool_name, "call_id": f"call-{tool_name}"}
+                    ),
+                )
+                await app.on_observer_event(ObserverEvent(started))
+                assert expected in str(activity.content)
 
             tool_completed = AgentEvent(
                 kind=AgentEventKind.TOOL_COMPLETED,

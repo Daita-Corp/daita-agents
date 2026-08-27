@@ -14,8 +14,6 @@ model/tool loop progresses.
 
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import json
 import os
@@ -25,6 +23,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, JobStatus, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json

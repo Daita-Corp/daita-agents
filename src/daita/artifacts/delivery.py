@@ -20,28 +20,28 @@ from typing import NoReturn, Protocol
 from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
-from ..adapters.models import SourceRegistration
 from ..adapters.local_workspace import (
     LocalBoundFileTarget,
     LocalWorkspaceError,
     physical_revision_for_facts,
 )
+from ..adapters.models import SourceRegistration
 from .models import (
-    DEFAULT_DESTINATION_SELECTOR,
     BOUND_FILE_DESTINATION_ID,
+    DEFAULT_DESTINATION_SELECTOR,
     MAX_COLLISION_SUFFIX,
     MAX_ONE_TIME_DESTINATIONS,
     MAX_PERSISTENT_DESTINATIONS,
     SYSTEM_DOWNLOADS_DESTINATION_ID,
-    ArtifactDeliveryReceipt,
     ArtifactDeliveryMode,
     ArtifactDeliveryOutcome,
+    ArtifactDeliveryReceipt,
     ArtifactDestination,
     ArtifactDestinationKind,
     ArtifactError,
+    ArtifactLocalFileBinding,
     ArtifactPayload,
     ArtifactRef,
-    ArtifactLocalFileBinding,
     DestinationAuthorization,
     DestinationAvailability,
     artifact_text_change_summary_to_mapping,
@@ -1418,9 +1418,10 @@ def _validate_bound_target(target: LocalBoundFileTarget) -> None:
             "artifact_edit_binding_invalid",
             "The bound workspace target has unsafe identity, ownership, links, or metadata.",
         )
-    if hasattr(os, "listxattr"):
+    list_extended_attributes = getattr(os, "listxattr", None)
+    if list_extended_attributes is not None:
         try:
-            attributes = os.listxattr(target.target_descriptor)
+            attributes = list_extended_attributes(target.target_descriptor)
         except OSError as error:
             if error.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
                 raise ArtifactError(

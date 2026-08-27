@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TypedDict, cast
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.catalog.service as catalog_service
 from daita import Agent, SQLiteSource

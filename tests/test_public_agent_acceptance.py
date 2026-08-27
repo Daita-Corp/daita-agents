@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from collections.abc import Iterable, Mapping
+
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -25,9 +28,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopLimits
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
-)
 
 EAGER_LIMITS = LoopLimits()
 

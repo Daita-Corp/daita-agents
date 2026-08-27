@@ -13,7 +13,6 @@ from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_workspace import LocalWorkspaceBackend, LocalWorkspaceError
 from ...artifacts.delivery import LocalArtifactDelivery
 from ...artifacts.models import (
-    MAX_ARTIFACT_BYTES,
     MAX_DOCUMENT_BYTES,
     MAX_TEXT_EDIT_OPERATIONS,
     ArtifactAuthorship,
@@ -24,9 +23,9 @@ from ...artifacts.models import (
     ArtifactProvenance,
     ArtifactRef,
     ArtifactResourceBinding,
-    artifact_text_change_summary_to_mapping,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
+    artifact_text_change_summary_to_mapping,
     canonical_artifact_filename,
 )
 from ...artifacts.renderers import (
@@ -36,20 +35,20 @@ from ...artifacts.renderers import (
     MAX_CSV_COLUMNS,
     MAX_CSV_ROWS,
     MAX_CSV_SECONDS,
-    MAX_XLSX_BYTES,
-    MAX_XLSX_SECONDS,
     MAX_TEXT_EDIT_ANCHOR_BYTES,
     MAX_TEXT_EDIT_BYTES,
     MAX_TEXT_EDIT_OCCURRENCES,
     MAX_TEXT_EDIT_REPLACEMENT_BYTES,
+    MAX_XLSX_BYTES,
+    MAX_XLSX_SECONDS,
     TEXT_EDIT_ALLOWED_EXTENSIONS,
     TEXT_EDIT_MEDIA_TYPES,
     XLSX_ALLOWED_EXTENSIONS,
     XLSX_MEDIA_TYPE,
+    apply_bounded_text_edits,
     read_exact_xlsx_data,
     render_exact_csv,
     render_model_document,
-    apply_bounded_text_edits,
     text_edit_media_type,
 )
 from ...artifacts.store import AgentHomeArtifactStore

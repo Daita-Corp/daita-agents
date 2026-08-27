@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import json
 import sqlite3
@@ -12,6 +10,10 @@ from datetime import UTC, datetime
 
 import pytest
 from _capability_runtime_support import ContextToolProjectionAdapter
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,
@@ -42,9 +44,6 @@ from daita.semantics import (
     SemanticEvidenceKind,
     SemanticKind,
     SemanticSubject,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 
 EAGER_LIMITS = LoopLimits()

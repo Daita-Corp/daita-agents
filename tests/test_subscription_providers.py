@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import base64
 import json
@@ -10,6 +8,7 @@ from typing import cast
 
 import openai
 import pytest
+from _workspace_support import workspace_for
 
 import daita.llm.providers.codex as codex_provider
 import daita.llm.providers.subscription_cli as claude_cli

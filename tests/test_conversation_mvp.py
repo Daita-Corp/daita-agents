@@ -1,4 +1,3 @@
-from _workspace_support import workspace_for
 import inspect
 import sqlite3
 from collections.abc import Mapping
@@ -8,10 +7,11 @@ from pathlib import Path
 
 import pytest
 from _capability_runtime_support import ContextToolProjectionAdapter
+from _workspace_support import workspace_for
 
 import daita
 from daita import Agent
-from daita._json import FrozenJsonObject, canonical_json
+from daita._json import canonical_json
 from daita.domains.data.context import (
     _HISTORY_OMISSION_MARKER,
     _MAXIMUM_PRIOR_UTF8_BYTES,

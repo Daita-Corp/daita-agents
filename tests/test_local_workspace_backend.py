@@ -95,8 +95,14 @@ async def test_search_is_deterministic_bounded_and_supports_latest_metadata(
         older.parent.mkdir()
         older.write_text("alpha\nneedle across chunks\n", encoding="utf-8")
         newer.write_text("newest needle\n", encoding="utf-8")
-        os.utime(older, ns=(1_700_000_000_000_000_000,) * 2)
-        os.utime(newer, ns=(1_800_000_000_000_000_000,) * 2)
+        os.utime(
+            older,
+            ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000),
+        )
+        os.utime(
+            newer,
+            ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_000),
+        )
 
         paths = await backend.search(
             run_id="run-search",

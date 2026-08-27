@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from datetime import UTC, datetime
 
@@ -9,10 +7,11 @@ import pytest
 from _capability_runtime_support import (
     ContextToolProjectionAdapter,
     StaticTestDomain,
-    presentation_metadata,
     execute_projected,
+    presentation_metadata,
     static_registry,
 )
+from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
 from daita._json import FrozenJsonObject

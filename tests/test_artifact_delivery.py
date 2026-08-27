@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import asyncio
 import inspect
 import sqlite3
@@ -10,6 +8,10 @@ from collections import defaultdict
 from pathlib import Path
 
 import pytest
+from _toolbox_model_support import (
+    ToolboxAwareMockModelProvider as MockModelProvider,
+)
+from _workspace_support import workspace_for
 
 import daita.artifacts.delivery as delivery_module
 from daita import Agent, ArtifactError
@@ -26,9 +28,6 @@ from daita.llm.models import (
     ModelResponse,
     TextBlock,
     ToolCall,
-)
-from _toolbox_model_support import (
-    ToolboxAwareMockModelProvider as MockModelProvider,
 )
 
 

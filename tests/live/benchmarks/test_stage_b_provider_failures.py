@@ -8,11 +8,10 @@ cancel, or corrupt the independently admitted job.
 
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import Agent, JobStatus
 from daita.llm.errors import ModelProviderError, ProviderErrorCode

@@ -9,8 +9,8 @@ import pytest
 from _capability_runtime_support import (
     ContextToolProjectionAdapter,
     StaticTestDomain,
-    presentation_metadata,
     execute_projected,
+    presentation_metadata,
     static_registry,
 )
 
@@ -20,8 +20,8 @@ from daita.capabilities import (
     ApprovalDecision,
     Capability,
     OperationalEffect,
-    ToolLoadMode,
     ToolExecution,
+    ToolLoadMode,
     ToolOutput,
     ToolView,
 )

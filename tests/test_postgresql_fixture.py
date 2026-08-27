@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import os
 from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from _workspace_support import workspace_for
 
 import daita.hosting.embedded as embedded
 from daita import Agent

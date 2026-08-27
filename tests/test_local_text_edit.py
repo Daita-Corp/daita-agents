@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import asyncio
+import os
 import threading
-import stat
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -22,18 +21,18 @@ from daita.artifacts.models import (
     ArtifactDeliveryMode,
     ArtifactDeliveryOutcome,
 )
+from daita.artifacts.renderers import apply_bounded_text_edits
 from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import AccessMode, ExecutionScope, OperationalEffect
-from daita.artifacts.renderers import apply_bounded_text_edits
 from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelProfile,
     ModelRequest,
     ModelResponse,
+    ModelSensitivity,
     ToolCall,
     ToolResultBlock,
-    ModelSensitivity,
 )
 from daita.loop.models import RunInput, RunOrigin, RunStartEnvelope
 
@@ -1134,9 +1133,10 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
         )
         assert len(outcome) == 2
         assert all(item.is_error for item in outcome)
-        assert all(
-            item.output["error"]["code"] == "tool_not_available" for item in outcome
-        )
+        for item in outcome:
+            error = item.output.get("error")
+            assert isinstance(error, Mapping)
+            assert error.get("code") == "tool_not_available"
     finally:
         await agent.close()
 

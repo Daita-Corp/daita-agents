@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from _workspace_support import workspace_for
-
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from _workspace_support import workspace_for
 
 from daita import (
     Agent,

@@ -7,8 +7,8 @@ from datetime import UTC, datetime
 import pytest
 from _capability_runtime_support import (
     StaticTestDomain,
-    presentation_metadata,
     execute_projected,
+    presentation_metadata,
     static_registry,
 )
 

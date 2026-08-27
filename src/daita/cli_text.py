@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import TextIO
 
 from daita import Agent, LearningCandidateStatus, LoopExit
+from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
 from daita.learning_candidates import (
     LearningCandidateView,
     LearningReviewResult,
     learning_candidate_content_from_mapping,
     learning_candidate_content_to_mapping,
 )
-from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
 from daita.semantics import SemanticAnnotationState, SemanticAnnotationView
 
 from .tui.projection import artifact_delivery_messages, completed_tool_pairs
