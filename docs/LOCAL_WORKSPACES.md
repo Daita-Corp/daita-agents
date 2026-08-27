@@ -68,6 +68,31 @@ They cannot authorize tool loading, source access, writes, memory changes, or
 skill changes. Absolute workspace paths are never placed in model requests,
 tool results, transcripts, artifact provenance, or durable state.
 
+## Structured file queries
+
+`file_query` is an on-demand Files tool for direct analysis of one homogeneous
+CSV, TSV, JSON-records/NDJSON, or Parquet dataset. Its `path_pattern` is always
+workspace-relative and is expanded by Daita without a shell. Daita opens and
+revision-binds every exact regular file before execution, rejects mixed formats
+or incompatible schemas, and records every input path and physical revision
+without persisting a workspace inventory.
+
+The SQL contract is one canonical read-only `SELECT` over exactly one relation
+named `data`. It cannot introduce another table, raw path, table/filesystem
+function, URL, setting, secret, extension operation, DDL, or DML. DuckDB 1.5.5
+runs only in a fresh private one-call worker with extension installation and
+autoload, community extensions, persistent secrets, external access, and
+network filesystems disabled before configuration is locked. Local file
+queries need no S3 configuration.
+
+One call admits at most 1,000 files and 256 MiB of physical input, with a
+complete encoded manifest capped at 256 KiB. Results expose at most 100 rows
+within a bounded JSON projection; query time is 30 seconds and private spill is
+monitored at 2 GiB. The selected 256 MiB DuckDB `memory_limit` is a
+buffer-manager target, not a hard process-memory ceiling. Parent-side RSS,
+spill, timeout, and cancellation monitoring terminates and reaps the isolated
+worker and removes its private scratch state.
+
 ## Targeted text edits
 
 For one bounded UTF-8 text file, Daita can perform the cohesive sequence

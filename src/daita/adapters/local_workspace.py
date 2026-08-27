@@ -23,6 +23,11 @@ from typing import Callable, Literal, TypeVar
 
 from .._json import FrozenJsonObject, canonical_json
 from ..workspace import LocalWorkspace, paths_overlap
+from .local_file_query import (
+    LocalFileQueryBackend,
+    LocalFileQueryLimits,
+    LocalFileQueryResult,
+)
 
 _READ_CHUNK_BYTES = 64 * 1_024
 _MAX_LOGICAL_PATH_CHARACTERS = 2_048
@@ -30,6 +35,15 @@ _MAX_TOKEN_BYTES = 8 * 1_024
 _MAX_QUERY_CHARACTERS = 512
 _MAX_GLOB_CHARACTERS = 256
 _MAX_EXCERPT_CHARACTERS = 320
+_MAX_QUERY_PATTERN_CHARACTERS = 2_048
+_LOCAL_QUERY_FORMATS = {
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".json": "json_records",
+    ".jsonl": "ndjson",
+    ".ndjson": "ndjson",
+    ".parquet": "parquet",
+}
 _SEARCH_NOISE_DIRECTORIES = frozenset(
     {
         ".git",
@@ -94,6 +108,10 @@ class LocalWorkspaceLimits:
     max_read_seconds: float = 5.0
     max_edit_source_bytes: int = 4 * 1_024 * 1_024
     max_edit_seconds: float = 10.0
+    max_query_files: int = 1_000
+    max_query_input_bytes: int = 256 * 1_024 * 1_024
+    max_query_manifest_bytes: int = 256 * 1_024
+    max_query_binding_seconds: float = 5.0
 
     def __post_init__(self) -> None:
         integer_limits = (
@@ -124,6 +142,19 @@ class LocalWorkspaceLimits:
                 1,
                 64 * 1_024 * 1_024,
             ),
+            (self.max_query_files, "max_query_files", 1, 1_000),
+            (
+                self.max_query_input_bytes,
+                "max_query_input_bytes",
+                1,
+                256 * 1_024 * 1_024,
+            ),
+            (
+                self.max_query_manifest_bytes,
+                "max_query_manifest_bytes",
+                1_024,
+                256 * 1_024,
+            ),
         )
         for value, name, minimum, maximum in integer_limits:
             if (
@@ -138,6 +169,7 @@ class LocalWorkspaceLimits:
             (self.max_search_seconds, "max_search_seconds"),
             (self.max_read_seconds, "max_read_seconds"),
             (self.max_edit_seconds, "max_edit_seconds"),
+            (self.max_query_binding_seconds, "max_query_binding_seconds"),
         ):
             if (
                 not isinstance(seconds, (int, float))
@@ -164,6 +196,108 @@ class LocalFileBinding:
     modified_ns: int
     changed_ns: int
     observed_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class LocalFileQueryBinding:
+    """One exact open regular file retained for a single structured query."""
+
+    workspace_id: str
+    relative_path: str
+    format: str
+    physical_revision: str
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    link_count: int
+    size_bytes: int
+    modified_ns: int
+    changed_ns: int
+    observed_at: str
+    descriptor: int = field(repr=False, compare=False)
+
+    def provenance_mapping(self) -> dict[str, object]:
+        return {
+            "path": self.relative_path,
+            "format": self.format,
+            "physical_revision": self.physical_revision,
+            "device": self.device,
+            "inode": self.inode,
+            "mode": self.mode,
+            "uid": self.uid,
+            "gid": self.gid,
+            "link_count": self.link_count,
+            "size_bytes": self.size_bytes,
+            "modified_ns": self.modified_ns,
+            "changed_ns": self.changed_ns,
+            "observed_at": self.observed_at,
+        }
+
+    def result_mapping(self) -> dict[str, object]:
+        return {
+            "path": self.relative_path,
+            "physical_revision": self.physical_revision,
+        }
+
+    def revalidate(self) -> None:
+        try:
+            current = os.fstat(self.descriptor)
+        except OSError as error:
+            raise LocalWorkspaceError(
+                "file_changed",
+                "A bound workspace file became unavailable during the query.",
+            ) from error
+        if _physical_revision(current) != self.physical_revision:
+            raise LocalWorkspaceError(
+                "file_changed",
+                "A bound workspace file changed during the query.",
+            )
+
+
+@dataclass(slots=True)
+class LocalFileQueryManifest:
+    """One immutable, complete, descriptor-backed input manifest."""
+
+    workspace_id: str
+    path_pattern: str
+    format: str
+    bindings: tuple[LocalFileQueryBinding, ...]
+    input_bytes: int
+    encoded_bytes: int
+    manifest_sha256: str
+    _closed: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def revalidate(self) -> None:
+        if self._closed:
+            raise LocalWorkspaceError(
+                "workspace_unavailable", "The file-query manifest is closed."
+            )
+        for binding in self.bindings:
+            binding.revalidate()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for binding in self.bindings:
+            try:
+                os.close(binding.descriptor)
+            except OSError:
+                pass
+
+    def provenance_mapping(self) -> dict[str, object]:
+        return {
+            "authority": "local_workspace_binding",
+            "workspace_id": self.workspace_id,
+            "path_pattern": self.path_pattern,
+            "format": self.format,
+            "manifest_sha256": self.manifest_sha256,
+            "manifest_bytes": self.encoded_bytes,
+            "input_bytes": self.input_bytes,
+            "bindings": tuple(item.provenance_mapping() for item in self.bindings),
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,6 +468,37 @@ class _WorkerCancelled(RuntimeError):
     pass
 
 
+@dataclass(slots=True)
+class _QueryPatternState:
+    root: _RootDescriptor
+    workspace_id: str
+    pattern: str
+    limits: LocalWorkspaceLimits
+    observed_at: str
+    cancellation: threading.Event
+    deadline: float
+    bindings: dict[str, LocalFileQueryBinding]
+    scanned_entries: int = 0
+    input_bytes: int = 0
+
+    def check(self) -> None:
+        _check_cancelled(self.cancellation)
+        if time.monotonic() >= self.deadline:
+            raise LocalWorkspaceError(
+                "file_query_timeout",
+                "File-query pattern binding exceeded its bounded worker time.",
+            )
+
+    def count_entry(self) -> None:
+        self.scanned_entries += 1
+        if self.scanned_entries > self.limits.max_search_entries:
+            raise LocalWorkspaceError(
+                "file_pattern_too_broad",
+                "The file pattern traversed too many workspace entries.",
+                {"limit": self.limits.max_search_entries},
+            )
+
+
 class LocalWorkspaceBackend:
     """One agent-owned descriptor, token secret, and worker lifecycle."""
 
@@ -344,12 +509,14 @@ class LocalWorkspaceBackend:
         root: _RootDescriptor,
         limits: LocalWorkspaceLimits,
         clock: Callable[[], datetime],
+        query_backend: LocalFileQueryBackend,
     ) -> None:
         self.workspace_id = _workspace_id(root)
         self.sensitivity = workspace.sensitivity
         self._root = root
         self._limits = limits
         self._clock = clock
+        self._query_backend = query_backend
         self._secret = secrets.token_bytes(32)
         self._session_id = secrets.token_urlsafe(18)
         self._active: dict[asyncio.Task[object], threading.Event] = {}
@@ -364,6 +531,7 @@ class LocalWorkspaceBackend:
         agent_root: Path,
         agent_home: Path,
         limits: LocalWorkspaceLimits | None = None,
+        query_limits: LocalFileQueryLimits | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> "LocalWorkspaceBackend":
         if not isinstance(workspace, LocalWorkspace):
@@ -398,6 +566,10 @@ class LocalWorkspaceBackend:
             root=root,
             limits=resolved_limits,
             clock=resolved_clock,
+            query_backend=LocalFileQueryBackend(
+                scratch_parent=agent_home / "file-query-scratch",
+                limits=query_limits,
+            ),
         )
 
     @property
@@ -563,6 +735,77 @@ class LocalWorkspaceBackend:
             limitations=(() if complete else ("model_visible_byte_limit",)),
         )
 
+    async def bind_query_manifest(
+        self,
+        *,
+        run_id: str,
+        path_pattern: str,
+    ) -> LocalFileQueryManifest:
+        """Expand and retain one exact workspace-relative structured dataset."""
+
+        _required_run_id(run_id)
+        pattern_parts = _query_pattern(path_pattern)
+        descriptor = self._duplicate_root()
+        cancellation = threading.Event()
+        worker: asyncio.Task[LocalFileQueryManifest] = asyncio.create_task(
+            asyncio.to_thread(
+                _bind_query_manifest_sync,
+                descriptor,
+                self._root,
+                self.workspace_id,
+                path_pattern,
+                pattern_parts,
+                self._limits,
+                _utc_iso(self._clock()),
+                cancellation,
+            )
+        )
+        self._active[worker] = cancellation
+        try:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(worker),
+                    timeout=self._limits.max_query_binding_seconds + 1.0,
+                )
+            except TimeoutError as error:
+                cancellation.set()
+                await _settle_worker(worker)
+                _close_query_manifest_result(worker)
+                raise LocalWorkspaceError(
+                    "file_query_timeout",
+                    "File-query pattern binding exceeded its bounded worker time.",
+                ) from error
+            except asyncio.CancelledError:
+                cancellation.set()
+                await _settle_worker(worker)
+                _close_query_manifest_result(worker)
+                raise
+        finally:
+            self._active.pop(worker, None)
+
+    async def query(
+        self,
+        *,
+        run_id: str,
+        path_pattern: str,
+        canonical_sql: str,
+        sql_fingerprint: str,
+    ) -> LocalFileQueryResult:
+        """Bind one exact manifest and execute it through the private backend."""
+
+        manifest = await self.bind_query_manifest(
+            run_id=run_id,
+            path_pattern=path_pattern,
+        )
+        try:
+            return await self._query_backend.query(
+                manifest=manifest,
+                canonical_sql=canonical_sql,
+                sql_fingerprint=sql_fingerprint,
+            )
+        finally:
+            manifest.close()
+
     def authenticate_file_binding(
         self,
         *,
@@ -683,6 +926,7 @@ class LocalWorkspaceBackend:
         if self._closed:
             return
         self._closed = True
+        await self._query_backend.close()
         for cancellation in tuple(self._active.values()):
             cancellation.set()
         for worker in tuple(self._active):
@@ -899,6 +1143,18 @@ def _close_bound_target_result(
     target.close()
 
 
+def _close_query_manifest_result(
+    worker: asyncio.Task[LocalFileQueryManifest],
+) -> None:
+    if worker.cancelled():
+        return
+    try:
+        manifest = worker.result()
+    except BaseException:
+        return
+    manifest.close()
+
+
 def _admit_root(
     workspace: LocalWorkspace,
     agent_root: Path,
@@ -1030,6 +1286,315 @@ def physical_revision_for_facts(value: os.stat_result) -> str:
     """Return the canonical physical revision for a code-observed regular file."""
 
     return _physical_revision(value)
+
+
+def _bind_query_manifest_sync(
+    root_descriptor: int,
+    root: _RootDescriptor,
+    workspace_id: str,
+    pattern: str,
+    pattern_parts: tuple[str, ...],
+    limits: LocalWorkspaceLimits,
+    observed_at: str,
+    cancellation: threading.Event,
+) -> LocalFileQueryManifest:
+    state = _QueryPatternState(
+        root=root,
+        workspace_id=workspace_id,
+        pattern=pattern,
+        limits=limits,
+        observed_at=observed_at,
+        cancellation=cancellation,
+        deadline=time.monotonic() + limits.max_query_binding_seconds,
+        bindings={},
+    )
+    completed = False
+    try:
+        _verify_root_path(root)
+        opened = os.fstat(root_descriptor)
+        if (int(opened.st_dev), int(opened.st_ino)) != (root.device, root.inode):
+            raise LocalWorkspaceError(
+                "workspace_identity_changed",
+                "The local workspace identity changed after admission.",
+            )
+        _expand_query_pattern(
+            root_descriptor,
+            (),
+            pattern_parts,
+            0,
+            depth=0,
+            state=state,
+        )
+        state.check()
+        if not state.bindings:
+            raise LocalWorkspaceError(
+                "file_pattern_empty",
+                "The workspace file pattern matched no supported regular files.",
+            )
+        bindings = tuple(
+            state.bindings[path]
+            for path in sorted(state.bindings, key=lambda item: item.encode("utf-8"))
+        )
+        formats = {item.format for item in bindings}
+        if len(formats) != 1:
+            raise LocalWorkspaceError(
+                "format_unsupported",
+                "A file query requires one homogeneous structured-file format.",
+                {"formats": tuple(sorted(formats))},
+            )
+        format_name = next(iter(formats))
+        manifest_material = {
+            "protocol": "daita.local_file_query_manifest.v1",
+            "workspace_id": workspace_id,
+            "path_pattern": pattern,
+            "format": format_name,
+            "bindings": [item.provenance_mapping() for item in bindings],
+        }
+        encoded = canonical_json(manifest_material).encode("utf-8")
+        if len(encoded) > limits.max_query_manifest_bytes:
+            raise LocalWorkspaceError(
+                "file_pattern_too_broad",
+                "The complete file-query binding manifest exceeds its byte bound.",
+                {
+                    "limit": limits.max_query_manifest_bytes,
+                    "observed": len(encoded),
+                },
+            )
+        for binding in bindings:
+            binding.revalidate()
+        _verify_root_path(root)
+        result = LocalFileQueryManifest(
+            workspace_id=workspace_id,
+            path_pattern=pattern,
+            format=format_name,
+            bindings=bindings,
+            input_bytes=state.input_bytes,
+            encoded_bytes=len(encoded),
+            manifest_sha256="sha256:" + sha256(encoded).hexdigest(),
+        )
+        completed = True
+        return result
+    except _WorkerCancelled:
+        raise
+    except LocalWorkspaceError:
+        raise
+    except OSError as error:
+        raise LocalWorkspaceError(
+            "workspace_unavailable",
+            "The workspace file pattern could not be bound safely.",
+        ) from error
+    finally:
+        os.close(root_descriptor)
+        if not completed:
+            for binding in state.bindings.values():
+                try:
+                    os.close(binding.descriptor)
+                except OSError:
+                    pass
+
+
+def _expand_query_pattern(
+    directory_descriptor: int,
+    parents: tuple[str, ...],
+    pattern_parts: tuple[str, ...],
+    index: int,
+    *,
+    depth: int,
+    state: _QueryPatternState,
+) -> None:
+    state.check()
+    if index >= len(pattern_parts):
+        return
+    segment = pattern_parts[index]
+    if segment == "**":
+        _expand_query_pattern(
+            directory_descriptor,
+            parents,
+            pattern_parts,
+            index + 1,
+            depth=depth,
+            state=state,
+        )
+        if depth >= state.limits.max_search_depth:
+            raise LocalWorkspaceError(
+                "file_pattern_too_broad",
+                "The file pattern exceeded the workspace recursion bound.",
+                {"limit": state.limits.max_search_depth},
+            )
+        for name in _query_directory_names(directory_descriptor, state):
+            if _restricted_component(name):
+                continue
+            try:
+                before = os.stat(
+                    name,
+                    dir_fd=directory_descriptor,
+                    follow_symlinks=False,
+                )
+            except OSError as error:
+                raise LocalWorkspaceError(
+                    "workspace_unavailable",
+                    "The workspace changed during file-pattern expansion.",
+                ) from error
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                continue
+            child = _open_checked_directory(directory_descriptor, name, before)
+            try:
+                _expand_query_pattern(
+                    child,
+                    (*parents, name),
+                    pattern_parts,
+                    index,
+                    depth=depth + 1,
+                    state=state,
+                )
+            finally:
+                os.close(child)
+        return
+
+    last = index == len(pattern_parts) - 1
+    for name in _query_directory_names(directory_descriptor, state):
+        if not fnmatch.fnmatchcase(name, segment):
+            continue
+        if _restricted_component(name):
+            continue
+        try:
+            before = os.stat(
+                name,
+                dir_fd=directory_descriptor,
+                follow_symlinks=False,
+            )
+        except OSError as error:
+            raise LocalWorkspaceError(
+                "workspace_unavailable",
+                "The workspace changed during file-pattern expansion.",
+            ) from error
+        if stat.S_ISLNK(before.st_mode):
+            raise LocalWorkspaceError(
+                "symlink_not_allowed",
+                "Workspace file patterns cannot traverse or select symlinks.",
+            )
+        if last:
+            if not stat.S_ISREG(before.st_mode):
+                if not _pattern_has_magic(segment):
+                    raise LocalWorkspaceError(
+                        "not_regular_file",
+                        "The workspace file pattern selected a non-regular file.",
+                    )
+                continue
+            _bind_query_file(directory_descriptor, parents, name, before, state)
+            continue
+        if not stat.S_ISDIR(before.st_mode):
+            if not _pattern_has_magic(segment):
+                raise LocalWorkspaceError(
+                    "path_invalid",
+                    "A workspace file-pattern component is not a directory.",
+                )
+            continue
+        if depth >= state.limits.max_search_depth:
+            raise LocalWorkspaceError(
+                "file_pattern_too_broad",
+                "The file pattern exceeded the workspace recursion bound.",
+                {"limit": state.limits.max_search_depth},
+            )
+        child = _open_checked_directory(directory_descriptor, name, before)
+        try:
+            _expand_query_pattern(
+                child,
+                (*parents, name),
+                pattern_parts,
+                index + 1,
+                depth=depth + 1,
+                state=state,
+            )
+        finally:
+            os.close(child)
+
+
+def _query_directory_names(
+    directory_descriptor: int,
+    state: _QueryPatternState,
+) -> tuple[str, ...]:
+    state.check()
+    try:
+        names = tuple(
+            sorted(
+                (
+                    name
+                    for name in os.listdir(directory_descriptor)
+                    if _safe_segment(name)
+                ),
+                key=lambda name: name.encode("utf-8"),
+            )
+        )
+    except OSError as error:
+        raise LocalWorkspaceError(
+            "workspace_unavailable",
+            "A workspace directory became unavailable during file-pattern expansion.",
+        ) from error
+    for _name in names:
+        state.count_entry()
+    return names
+
+
+def _bind_query_file(
+    directory_descriptor: int,
+    parents: tuple[str, ...],
+    name: str,
+    before: os.stat_result,
+    state: _QueryPatternState,
+) -> None:
+    relative_path = PurePosixPath(*parents, name).as_posix()
+    if relative_path in state.bindings:
+        return
+    format_name = _LOCAL_QUERY_FORMATS.get(PurePosixPath(name).suffix.casefold())
+    if format_name is None:
+        raise LocalWorkspaceError(
+            "format_unsupported",
+            "The file pattern matched an unsupported structured-file format.",
+            {"path": relative_path},
+        )
+    if len(state.bindings) >= state.limits.max_query_files:
+        raise LocalWorkspaceError(
+            "file_pattern_too_broad",
+            "The file pattern matched too many files.",
+            {"limit": state.limits.max_query_files},
+        )
+    descriptor = _open_checked_file(directory_descriptor, name, before)
+    try:
+        facts = os.fstat(descriptor)
+        size_bytes = int(facts.st_size)
+        if state.input_bytes + size_bytes > state.limits.max_query_input_bytes:
+            raise LocalWorkspaceError(
+                "file_pattern_too_broad",
+                "The file pattern exceeds the total physical input-byte bound.",
+                {
+                    "limit": state.limits.max_query_input_bytes,
+                    "observed": state.input_bytes + size_bytes,
+                },
+            )
+        binding = LocalFileQueryBinding(
+            workspace_id=state.workspace_id,
+            relative_path=relative_path,
+            format=format_name,
+            physical_revision=_physical_revision(facts),
+            device=int(facts.st_dev),
+            inode=int(facts.st_ino),
+            mode=int(facts.st_mode),
+            uid=int(facts.st_uid),
+            gid=int(facts.st_gid),
+            link_count=int(facts.st_nlink),
+            size_bytes=size_bytes,
+            modified_ns=int(facts.st_mtime_ns),
+            changed_ns=int(facts.st_ctime_ns),
+            observed_at=state.observed_at,
+            descriptor=descriptor,
+        )
+        state.bindings[relative_path] = binding
+        state.input_bytes += size_bytes
+        descriptor = -1
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _search_sync(
@@ -1889,6 +2454,52 @@ def _logical_path(value: str, *, allow_root: bool = False) -> str:
     return value
 
 
+def _query_pattern(value: str) -> tuple[str, ...]:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > _MAX_QUERY_PATTERN_CHARACTERS
+        or "\x00" in value
+        or "\\" in value
+    ):
+        raise LocalWorkspaceError(
+            "path_invalid", "The workspace file pattern is invalid."
+        )
+    path = PurePosixPath(value)
+    if (
+        path.is_absolute()
+        or path.as_posix() != value
+        or not path.parts
+        or any(not _safe_pattern_segment(item) for item in path.parts)
+        or sum(item == "**" for item in path.parts) > 1
+    ):
+        raise LocalWorkspaceError(
+            "path_invalid", "The workspace file pattern is invalid."
+        )
+    for component in path.parts:
+        if not _pattern_has_magic(component):
+            _deny_restricted_component(component)
+    return tuple(path.parts)
+
+
+def _safe_pattern_segment(value: object) -> bool:
+    if not isinstance(value, str) or not value or value in {".", ".."}:
+        return False
+    if any(character in value for character in ("/", "\\", "\x00")):
+        return False
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return False
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return False
+    return True
+
+
+def _pattern_has_magic(value: str) -> bool:
+    return any(character in value for character in ("*", "?", "["))
+
+
 def _safe_segment(value: object) -> bool:
     if not isinstance(value, str) or not value or value in {".", ".."}:
         return False
@@ -2053,6 +2664,8 @@ __all__ = [
     "LocalBoundFileObservation",
     "LocalBoundFileTarget",
     "LocalFileBinding",
+    "LocalFileQueryBinding",
+    "LocalFileQueryManifest",
     "LocalFileReadResult",
     "LocalFileSearchMatch",
     "LocalFileSearchResult",

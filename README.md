@@ -181,7 +181,12 @@ acceptance.
 
 File requests use the same direct loop. The pinned `file_search` and
 `file_read` tools expose only bounded workspace-relative results and never add
-a Files-domain writer. For bounded UTF-8 text, a current-run `file_read`
+a Files-domain writer. The on-demand `file_query` tool filters or aggregates
+one homogeneous CSV, TSV, JSON-records/NDJSON, or Parquet dataset through a
+private one-call DuckDB worker. Daita expands and revision-binds the relative
+pattern itself; validated SQL can see only the relation `data`, and every
+result retains the complete exact input manifest. For bounded UTF-8 text, a
+current-run `file_read`
 binding can feed `artifact_edit_text`, which commits a complete replacement
 artifact without changing the workspace. `artifact_save_local` then requests
 one approval and atomically replaces only that exact unchanged bound file;

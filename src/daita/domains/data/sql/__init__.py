@@ -19,6 +19,12 @@ from .contracts import (
     sqlite_declared_type_affinity,
     sqlite_identifier_key,
 )
+from .duckdb_read import (
+    MAX_FILE_QUERY_SQL_CHARACTERS,
+    DuckDBReadValidationError,
+    ValidatedDuckDBRead,
+    validate_duckdb_read,
+)
 from .postgresql_update import (
     POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES,
     PostgreSQLUpdateCell,
@@ -39,6 +45,7 @@ from .read_validation import validate_postgresql_read, validate_sqlite_read
 __all__ = [
     "MAX_SQL_CHARACTERS",
     "MAX_SQL_PARAMETERS",
+    "MAX_FILE_QUERY_SQL_CHARACTERS",
     "POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES",
     "PostgreSQLUpdateCell",
     "PostgreSQLUpdateCommand",
@@ -47,6 +54,7 @@ __all__ = [
     "PostgreSQLUpdateScopeValidationResult",
     "PostgreSQLUpdateStatement",
     "PostgreSQLUpdateValidationResult",
+    "DuckDBReadValidationError",
     "ResourceSchema",
     "SqlAnalysis",
     "SqlAnalysisError",
@@ -56,6 +64,7 @@ __all__ = [
     "SqlValidationResult",
     "ValidatedPostgreSQLUpdate",
     "ValidatedPostgreSQLUpdateScope",
+    "ValidatedDuckDBRead",
     "analyze_postgresql_sql",
     "analyze_sqlite_sql",
     "normalize_sql",
@@ -66,4 +75,5 @@ __all__ = [
     "validate_postgresql_update_intent",
     "validate_postgresql_update_scope",
     "validate_sqlite_read",
+    "validate_duckdb_read",
 ]

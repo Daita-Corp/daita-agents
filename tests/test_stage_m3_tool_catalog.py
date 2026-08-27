@@ -493,7 +493,7 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
             name
             for name in registry.tool_names
             if registry.resolve_tool(name)[0].presentation.toolbox_id is ToolboxId.FILES
-        } == {"file_read", "file_search"}
+        } == {"file_query", "file_read", "file_search"}
         assert registry.resolve_tool("start_data_profile")[
             0
         ].presentation.toolbox_id is (ToolboxId.JOBS)

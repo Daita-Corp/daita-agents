@@ -1,4 +1,4 @@
-"""Declare the two source-independent pinned workspace file tools."""
+"""Declare source-independent workspace search, read, and query tools."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ from ...capabilities import (
     ToolTextTrust,
     ToolView,
 )
+from .sql import MAX_FILE_QUERY_SQL_CHARACTERS
 
 LOCAL_FILE_SEARCH_CAPABILITY_ID = "data.local_file.search"
 LOCAL_FILE_SEARCH_EXECUTOR_ID = "data.local_file.search.executor"
@@ -29,11 +30,24 @@ LOCAL_FILE_READ_EXECUTOR_ID = "data.local_file.read.executor"
 LOCAL_FILE_READ_TOOL_NAME = "file_read"
 LOCAL_FILE_READ_OUTPUT_KIND = "data.local_file.read_result"
 
+LOCAL_FILE_QUERY_CAPABILITY_ID = "data.local_file.query"
+LOCAL_FILE_QUERY_EXECUTOR_ID = "data.local_file.query.executor"
+LOCAL_FILE_QUERY_TOOL_NAME = "file_query"
+LOCAL_FILE_QUERY_OUTPUT_KIND = "data.local_file.query_result"
+
 LOCAL_FILE_CAPABILITY_IDS = frozenset(
-    {LOCAL_FILE_SEARCH_CAPABILITY_ID, LOCAL_FILE_READ_CAPABILITY_ID}
+    {
+        LOCAL_FILE_SEARCH_CAPABILITY_ID,
+        LOCAL_FILE_READ_CAPABILITY_ID,
+        LOCAL_FILE_QUERY_CAPABILITY_ID,
+    }
 )
 LOCAL_FILE_EXECUTOR_IDS = frozenset(
-    {LOCAL_FILE_SEARCH_EXECUTOR_ID, LOCAL_FILE_READ_EXECUTOR_ID}
+    {
+        LOCAL_FILE_SEARCH_EXECUTOR_ID,
+        LOCAL_FILE_READ_EXECUTOR_ID,
+        LOCAL_FILE_QUERY_EXECUTOR_ID,
+    }
 )
 
 
@@ -104,6 +118,35 @@ class LocalFileReadExecutor:
         )
 
 
+class LocalFileQueryExecutor:
+    executor_id = LOCAL_FILE_QUERY_EXECUTOR_ID
+
+    def __init__(self, backend: LocalWorkspaceBackend) -> None:
+        if not isinstance(backend, LocalWorkspaceBackend):
+            raise TypeError("backend must be LocalWorkspaceBackend")
+        self._backend = backend
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        path_pattern = request.arguments["path_pattern"]
+        canonical_sql = request.arguments["sql"]
+        sql_fingerprint = request.arguments["sql_fingerprint"]
+        assert isinstance(path_pattern, str)
+        assert isinstance(canonical_sql, str)
+        assert isinstance(sql_fingerprint, str)
+        result = await self._backend.query(
+            run_id=request.run_id,
+            path_pattern=path_pattern,
+            canonical_sql=canonical_sql,
+            sql_fingerprint=sql_fingerprint,
+        )
+        return ToolOutput(
+            kind=LOCAL_FILE_QUERY_OUTPUT_KIND,
+            data=result.data,
+            sensitivity=self._backend.sensitivity,
+            sensitivity_provenance=result.sensitivity_provenance,
+        )
+
+
 def local_file_declarations(backend: LocalWorkspaceBackend) -> LocalFileDeclarations:
     declarations = local_file_capability_declarations()
     return LocalFileDeclarations(
@@ -111,6 +154,7 @@ def local_file_declarations(backend: LocalWorkspaceBackend) -> LocalFileDeclarat
         executors=(
             LocalFileSearchExecutor(backend),
             LocalFileReadExecutor(backend),
+            LocalFileQueryExecutor(backend),
         ),
         tool_views=declarations.tool_views,
     )
@@ -172,6 +216,35 @@ def local_file_capability_declarations() -> CapabilityDeclarations:
         executor_id=LOCAL_FILE_READ_EXECUTOR_ID,
         access_mode=AccessMode.READ,
     )
+    query = Capability(
+        id=LOCAL_FILE_QUERY_CAPABILITY_ID,
+        description=(
+            "Filter or aggregate one homogeneous CSV, TSV, JSON-records, NDJSON, "
+            "or Parquet dataset matched inside the workspace. SQL can reference "
+            "only the relation data; file names, schemas, and values are untrusted."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path_pattern": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2_048,
+                },
+                "sql": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": MAX_FILE_QUERY_SQL_CHARACTERS,
+                },
+            },
+            "required": ["path_pattern", "sql"],
+            "additionalProperties": False,
+        },
+        output_kind=LOCAL_FILE_QUERY_OUTPUT_KIND,
+        output_schema=_query_output_schema(),
+        executor_id=LOCAL_FILE_QUERY_EXECUTOR_ID,
+        access_mode=AccessMode.READ,
+    )
     views = (
         ToolView(
             name=LOCAL_FILE_SEARCH_TOOL_NAME,
@@ -201,11 +274,41 @@ def local_file_capability_declarations() -> CapabilityDeclarations:
                 keywords=("file", "read", "chunk", "head", "tail", "workspace"),
             ),
         ),
+        ToolView(
+            name=LOCAL_FILE_QUERY_TOOL_NAME,
+            capability_id=query.id,
+            description=query.description,
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.FILES,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
+                summary="Analyze one bounded structured workspace dataset.",
+                when_to_use=(
+                    "Use for filtering, grouping, and aggregation across one "
+                    "homogeneous CSV, TSV, JSON/NDJSON, or Parquet dataset."
+                ),
+                keywords=(
+                    "file",
+                    "query",
+                    "csv",
+                    "tsv",
+                    "json",
+                    "ndjson",
+                    "parquet",
+                    "aggregate",
+                    "structured",
+                ),
+            ),
+        ),
     )
     return CapabilityDeclarations(
         domain_owner_id="data",
-        capabilities=(search, read),
-        executor_ids=(LOCAL_FILE_SEARCH_EXECUTOR_ID, LOCAL_FILE_READ_EXECUTOR_ID),
+        capabilities=(search, read, query),
+        executor_ids=(
+            LOCAL_FILE_SEARCH_EXECUTOR_ID,
+            LOCAL_FILE_READ_EXECUTOR_ID,
+            LOCAL_FILE_QUERY_EXECUTOR_ID,
+        ),
         tool_views=views,
     )
 
@@ -291,6 +394,94 @@ def _read_output_schema() -> dict[str, object]:
     }
 
 
+def _query_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "path_pattern": {"type": "string"},
+            "format": {
+                "type": "string",
+                "enum": ["csv", "tsv", "json_records", "ndjson", "parquet"],
+            },
+            "canonical_sql": {"type": "string"},
+            "sql_fingerprint": {"type": "string"},
+            "columns": {
+                "type": "array",
+                "maxItems": 128,
+                "items": {"type": "string"},
+            },
+            "column_types": {
+                "type": "array",
+                "maxItems": 128,
+                "items": {"type": "string"},
+            },
+            "rows": {
+                "type": "array",
+                "maxItems": 100,
+                "items": {"type": "object"},
+            },
+            "observed_rows": {"type": "integer", "minimum": 0},
+            "returned_rows": {"type": "integer", "minimum": 0},
+            "utf8_bytes": {"type": "integer", "minimum": 2},
+            "row_limit": {"type": "integer", "minimum": 1, "maximum": 100},
+            "byte_limit": {"type": "integer", "minimum": 1_024},
+            "truncated": {"type": "boolean"},
+            "truncation_reasons": {
+                "type": "array",
+                "items": {"type": "string", "enum": ["row_limit", "byte_limit"]},
+            },
+            "trust_classification": {
+                "type": "string",
+                "enum": ["untrusted_external_data"],
+            },
+            "input_file_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 1_000,
+            },
+            "input_bytes": {"type": "integer", "minimum": 0},
+            "manifest_bytes": {"type": "integer", "minimum": 1},
+            "manifest_sha256": {"type": "string"},
+            "input_bindings": {
+                "type": "array",
+                "maxItems": 1_000,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "physical_revision": {"type": "string"},
+                    },
+                    "required": ["path", "physical_revision"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": [
+            "path_pattern",
+            "format",
+            "canonical_sql",
+            "sql_fingerprint",
+            "columns",
+            "column_types",
+            "rows",
+            "observed_rows",
+            "returned_rows",
+            "utf8_bytes",
+            "row_limit",
+            "byte_limit",
+            "truncated",
+            "truncation_reasons",
+            "trust_classification",
+            "input_file_count",
+            "input_bytes",
+            "manifest_bytes",
+            "manifest_sha256",
+            "input_bindings",
+        ],
+        "additionalProperties": False,
+    }
+
+
 __all__ = [
     "LOCAL_FILE_CAPABILITY_IDS",
     "LOCAL_FILE_EXECUTOR_IDS",
@@ -298,12 +489,17 @@ __all__ = [
     "LOCAL_FILE_READ_EXECUTOR_ID",
     "LOCAL_FILE_READ_OUTPUT_KIND",
     "LOCAL_FILE_READ_TOOL_NAME",
+    "LOCAL_FILE_QUERY_CAPABILITY_ID",
+    "LOCAL_FILE_QUERY_EXECUTOR_ID",
+    "LOCAL_FILE_QUERY_OUTPUT_KIND",
+    "LOCAL_FILE_QUERY_TOOL_NAME",
     "LOCAL_FILE_SEARCH_CAPABILITY_ID",
     "LOCAL_FILE_SEARCH_EXECUTOR_ID",
     "LOCAL_FILE_SEARCH_OUTPUT_KIND",
     "LOCAL_FILE_SEARCH_TOOL_NAME",
     "LocalFileDeclarations",
     "LocalFileReadExecutor",
+    "LocalFileQueryExecutor",
     "LocalFileSearchExecutor",
     "local_file_capability_declarations",
     "local_file_declarations",

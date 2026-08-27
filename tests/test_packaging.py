@@ -51,6 +51,7 @@ def test_default_distribution_contains_every_supported_production_dependency():
         "sqlglot>=30.14.0,<30.15.0",
         "XlsxWriter>=3.2.5,<4.0.0",
         "httpx>=0.28.1,<1.0.0",
+        "duckdb==1.5.5",
     }
     assert set(project["optional-dependencies"]) == {"dev"}
     assert project["scripts"] == {"daita": "daita.cli:main"}

@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject
+from ...adapters.local_file_query import LocalFileQueryError
 from ...adapters.local_workspace import LocalWorkspaceError
 from ...capabilities import (
     AccessMode,
@@ -30,15 +31,18 @@ from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .file_capabilities import (
     LOCAL_FILE_CAPABILITY_IDS,
+    LOCAL_FILE_QUERY_CAPABILITY_ID,
     LOCAL_FILE_READ_CAPABILITY_ID,
 )
 from .sql import (
+    DuckDBReadValidationError,
     PostgreSQLUpdateCommand,
     PostgreSQLUpdateIntent,
     ResourceSchema,
     validate_postgresql_read,
     validate_postgresql_update_intent,
     validate_sqlite_read,
+    validate_duckdb_read,
 )
 
 DATA_DOMAIN_OWNER_ID = "data"
@@ -322,6 +326,19 @@ class DataCapabilityDomain:
                         "cursor_invalid",
                         "A file cursor cannot be combined with a position.",
                     )
+            if capability.id == LOCAL_FILE_QUERY_CAPABILITY_ID:
+                try:
+                    validated = validate_duckdb_read(cast(str, arguments["sql"]))
+                except DuckDBReadValidationError as error:
+                    raise CapabilityInputError(
+                        "file_query_invalid",
+                        error.message,
+                        {"reason": error.reason},
+                    ) from error
+                prepared = arguments.to_dict()
+                prepared["sql"] = validated.canonical_sql
+                prepared["sql_fingerprint"] = validated.sql_fingerprint
+                return FrozenJsonObject.from_mapping(prepared)
             return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
@@ -412,7 +429,10 @@ class DataCapabilityDomain:
         call: ToolCall,
         error: BaseException,
     ) -> CapabilityFailure | None:
+        del call
         if isinstance(error, LocalWorkspaceError):
+            return CapabilityFailure(error.code, error.message, error.details)
+        if isinstance(error, LocalFileQueryError):
             return CapabilityFailure(error.code, error.message, error.details)
         return None
 

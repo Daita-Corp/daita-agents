@@ -437,13 +437,14 @@ daita
 ```
 
 `openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `httpx`, `keyring`,
-`textual`, `rich`, and `XlsxWriter` are default production dependencies.
+`textual`, `rich`, `XlsxWriter`, and exact `duckdb==1.5.5` are default
+production dependencies.
 `dev` is the only optional dependency group; do not restore provider, keychain,
 database, parser, CLI, recommended, complete, aggregate, or other customer
 extras.
 
 Default installation does not authorize eager imports. Import provider SDKs,
-`asyncpg`, `sqlglot`, `httpx`, `keyring`, `textual`, and Rich only inside the
+`asyncpg`, `sqlglot`, `httpx`, `keyring`, `textual`, Rich, and DuckDB only inside the
 provider/client or terminal-selection boundary that first needs them, and
 XlsxWriter only inside the XLSX renderer boundary—never at module import time.
 Importing `daita` or `daita.cli`, and running headless commands, must not load

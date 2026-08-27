@@ -29,6 +29,7 @@ dependencies = [
     "textual>=8.2.8,<9.0.0",
     "XlsxWriter>=3.2.5,<4.0.0",
     "httpx>=0.28.1,<1.0.0",
+    "duckdb==1.5.5",
 ]
 
 [project.scripts]

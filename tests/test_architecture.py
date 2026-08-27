@@ -327,6 +327,53 @@ def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
     )
 
 
+def test_phase4_file_query_stays_lazy_private_and_inside_existing_owners():
+    adapter_path = PACKAGE / "adapters" / "local_file_query.py"
+    workspace_path = PACKAGE / "adapters" / "local_workspace.py"
+    capability_path = PACKAGE / "domains" / "data" / "file_capabilities.py"
+    controller_path = PACKAGE / "domains" / "data" / "controller.py"
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    adapter = adapter_path.read_text(encoding="utf-8")
+    workspace = workspace_path.read_text(encoding="utf-8")
+    capabilities = capability_path.read_text(encoding="utf-8")
+    controller = controller_path.read_text(encoding="utf-8")
+    tree = ast.parse(adapter)
+    top_level_imports = {
+        alias.name.split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        (node.module or "").split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+    }
+    assert "duckdb" not in top_level_imports
+    assert "subprocess" not in _imports(adapter_path)
+    assert "subprocess" not in _imports(workspace_path)
+    assert "shell=True" not in adapter + workspace
+    assert "os.system" not in adapter + workspace
+    assert _class_owners("LocalFileQueryBackend") == {"adapters/local_file_query.py"}
+    assert _class_owners("LocalFileQueryExecutor") == {
+        "domains/data/file_capabilities.py"
+    }
+    assert "CapabilityRuntime(" not in adapter + workspace + capabilities + controller
+    assert "CapabilityRegistry(" not in adapter + workspace + capabilities + controller
+    assert "ToolLoadMode.ON_DEMAND" in capabilities
+    assert 'LOCAL_FILE_QUERY_TOOL_NAME = "file_query"' in capabilities
+    assert "local_file_declarations(workspace_backend)" in embedded
+    assert "call.name == LOCAL_FILE_QUERY_TOOL_NAME" not in controller
+    for prohibited in (
+        "DuckDBRuntime",
+        "FileQueryRuntime",
+        "FileQueryRegistry",
+        "FileQueryPolicy",
+        "persistent_duckdb",
+        "prepared_parquet_cache",
+    ):
+        assert prohibited not in adapter + workspace + capabilities + controller
+
+
 async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
     tmp_path,
 ):
@@ -361,6 +408,7 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["data_query_postgresql"] == "data"
         assert resolved["file_search"] == "data"
         assert resolved["file_read"] == "data"
+        assert resolved["file_query"] == "data"
         assert resolved["data_update_postgresql"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
