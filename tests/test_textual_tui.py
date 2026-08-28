@@ -8,9 +8,10 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
+from typing import Iterator, cast
 
 import pytest
 from _workspace_support import workspace_for
@@ -40,8 +41,14 @@ from daita import (
     DeliverySubjectKind,
     InboxItem,
     JobStatus,
+    IntervalSchedule,
     LoopExit,
     LoopExitKind,
+    MisfirePolicy,
+    ReportingMode,
+    RoutineState,
+    ScheduledRoutineInspection,
+    ScheduledRoutineSummary,
     SQLiteSource,
 )
 from daita._json import FrozenJsonObject
@@ -54,6 +61,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.routines.models import ScheduleKind
 from daita.security import CredentialSession, SecretReference, SecretResolutionError
 from daita.tui.app import DaitaApp, _run_failure_notice
 from daita.tui.clipboard import (
@@ -93,6 +101,7 @@ from daita.tui.screens.confirm import ConfirmScreen
 from daita.tui.screens.editing import ReviewCostScreen
 from daita.tui.screens.inbox import InboxScreen, render_inbox_item
 from daita.tui.screens.jobs import JobsScreen
+from daita.tui.screens.routines import RoutinesScreen
 from daita.tui.screens.onboarding import (
     AgentCreateScreen,
     ModelSetupScreen,
@@ -135,6 +144,124 @@ def test_source_override_and_learning_parse():
     assert parse_source_override("hello") is None
     assert parse_source_override("@sales how many") == ("sales", "how many")
     assert parse_source_override('@"north west" total') == ("north west", "total")
+
+
+async def test_routines_command_opens_records_and_routes_create_through_agent_loop():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    listing = await app.controller.dispatch_command("/routines")
+    assert listing.kind == "screen"
+    assert listing.screen == "routines"
+    create = await app.controller.dispatch_command(
+        "/routines create report the current invoice count every morning"
+    )
+    assert create.kind == "run"
+    assert create.run_message is not None
+    assert "routine management tools" in create.run_message
+    update = await app.controller.dispatch_command(
+        "/routines update routine-1 report the current invoice count every afternoon"
+    )
+    assert update.kind == "run"
+    assert update.run_message is not None
+    assert "exact current revision" in update.run_message
+
+
+async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatch):
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    observed = datetime(2026, 8, 28, 12, tzinfo=UTC)
+    summary = ScheduledRoutineSummary(
+        routine_id="routine-ui",
+        title="Invoice count",
+        state=RoutineState.ACTIVE,
+        schedule_kind=ScheduleKind.INTERVAL,
+        next_due_at=observed,
+        revision=1,
+        occurrence_count=0,
+        consecutive_failures=0,
+    )
+    current = summary
+    controls: list[tuple[str, int, str]] = []
+
+    def inspection() -> ScheduledRoutineInspection:
+        routine = SimpleNamespace(
+            routine_id=current.routine_id,
+            title=current.title,
+            state=current.state,
+            revision=current.revision,
+            schedule=IntervalSchedule(3600, observed),
+            next_due_at=current.next_due_at,
+            reporting_mode=ReportingMode.ALWAYS,
+            misfire_policy=MisfirePolicy.LATEST_ONLY,
+            instruction_digest="sha256:" + "1" * 64,
+            authorized_instruction="Read and report the exact invoice count.",
+            allowed_source_ids=("source-1",),
+            allowed_connector_binding_ids=(),
+            allowed_resource_ids=("resource-1",),
+            allowed_capability_ids=("catalog.inspect",),
+            skill_bindings=(),
+            charged_tokens=0,
+            cumulative_max_tokens=1000,
+            charged_cost_usd=Decimal("0"),
+            cumulative_max_cost_usd=Decimal("1"),
+            occurrence_count=0,
+            consecutive_failures=0,
+            expires_at=observed,
+        )
+        return cast(
+            ScheduledRoutineInspection,
+            SimpleNamespace(routine=routine, recent_occurrences=()),
+        )
+
+    async def list_routines() -> tuple[ScheduledRoutineSummary, ...]:
+        return (current,)
+
+    async def inspect_routine(routine_id: str) -> ScheduledRoutineInspection | None:
+        return inspection() if routine_id == current.routine_id else None
+
+    async def control_routine(
+        routine_id: str, *, expected_revision: int, action: str
+    ) -> object:
+        nonlocal current
+        controls.append((routine_id, expected_revision, action))
+        current = replace(
+            current,
+            state=RoutineState.PAUSED,
+            revision=current.revision + 1,
+            next_due_at=None,
+        )
+        return inspection().routine
+
+    monkeypatch.setattr(app.controller, "list_routines", list_routines)
+    monkeypatch.setattr(app.controller, "inspect_routine", inspect_routine)
+    monkeypatch.setattr(app.controller, "control_routine", control_routine)
+
+    async with app.run_test(size=(110, 36)) as pilot:
+        await app.push_screen(RoutinesScreen())
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if "1 routine" in str(
+                app.screen.query_one("#routines-summary", Static).content
+            ):
+                break
+        manager = app.screen
+        assert isinstance(manager, RoutinesScreen)
+        assert manager.query_one("#routines-list", OptionList).option_count == 1
+        assert "Instruction digest" in str(
+            manager.query_one("#routines-detail", Static).content
+        )
+        assert await pilot.click("#routines-pause") is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, ConfirmScreen):
+                break
+        assert isinstance(app.screen, ConfirmScreen)
+        await pilot.press("y")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if app.screen is manager and controls:
+                break
+        assert controls == [("routine-ui", 1, "pause")]
+        assert manager.query_one("#routines-resume", Button).disabled is False
+        app.exit(0)
 
 
 def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
@@ -1038,6 +1165,37 @@ def test_inbox_rendering_withholds_blocked_reports_and_marks_bounded_previews():
     assert "bounded preview" not in rendered
     assert "Preview withheld" in rendered
     assert "delivery_sensitivity_ineligible" in rendered
+
+    routine_escalation = replace(
+        available,
+        subject=DeliverySubject(
+            DeliverySubjectKind.ROUTINE_OCCURRENCE,
+            "occurrence-pre-run-failure",
+        ),
+        resulting_run_id=None,
+        logical_key="routine_occurrence:occurrence-pre-run-failure:conclusion",
+        payload={
+            "subject": {
+                "kind": "routine_occurrence",
+                "subject_id": "occurrence-pre-run-failure",
+            },
+            "routine_id": "routine-daily-report",
+            "run_id": None,
+            "outcome": "failed",
+            "reason": "routine_precheck_unavailable",
+            "escalation": True,
+            "routine_state": "needs_attention",
+            "report_digest": None,
+            "report_preview": None,
+            "report_truncated": False,
+        },
+        terminal_error="routine_precheck_unavailable",
+    )
+    escalation = render_inbox_item(routine_escalation)
+    assert "Routine: routine-daily-report" in escalation
+    assert "Result run: No model run started" in escalation
+    assert "Escalation" in escalation
+    assert "failed before a model run could start" in escalation
 
 
 async def test_background_status_notifies_once_and_remains_outside_transcript(

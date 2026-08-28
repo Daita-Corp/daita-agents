@@ -36,6 +36,7 @@ from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolic
 from daita.loop import (
     AgentLoop,
     InMemoryTranscriptStore,
+    InstructionAuthority,
     LoopExitKind,
     LoopLimits,
     RunInput,
@@ -167,6 +168,7 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
         source_id="source-1",
         start=RunStartEnvelope(
             origin=RunOrigin.JOB_EVENT,
+            instruction_authority=InstructionAuthority.CODE_OWNED,
             trusted_instruction_id="followup-v1",
             trusted_instruction=instruction,
             instruction_digest=(

@@ -55,6 +55,7 @@ from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -810,6 +811,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=DOCUMENT_CREATE_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/markdown", "text/plain"}),
             allowed_extensions=DOCUMENT_ALLOWED_EXTENSIONS,
@@ -856,6 +858,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_LIST_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     artifact_read = Capability(
         id=ARTIFACT_READ_CAPABILITY_ID,
@@ -897,6 +900,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_READ_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     artifact_convert = Capability(
         id=ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -941,6 +945,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_CONVERT_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/csv"}),
             allowed_extensions=CSV_ALLOWED_EXTENSIONS,
@@ -1029,6 +1034,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_EDIT_TEXT_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=TEXT_EDIT_MEDIA_TYPES,
             allowed_extensions=TEXT_EDIT_ALLOWED_EXTENSIONS,
@@ -1076,6 +1082,7 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     set_location = Capability(
         id=ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
@@ -1100,6 +1107,7 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     capabilities = (
         document,
@@ -2304,6 +2312,7 @@ def _tabular_export_capability(
             "additionalProperties": False,
         },
         executor_id=executor_id,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/csv", XLSX_MEDIA_TYPE}),
             allowed_extensions=CSV_ALLOWED_EXTENSIONS + XLSX_ALLOWED_EXTENSIONS,

@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -25,7 +26,7 @@ from ..capabilities import (
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..domains.learning import LearningCandidateGuard
 from ..llm.models import ModelSensitivity, ToolCall
-from ..loop.models import RunInput
+from ..loop.models import RunInput, RunOrigin
 from .store import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
     SKILL_INSTRUCTIONS_MAX_CHARACTERS,
@@ -73,18 +74,24 @@ class SkillViewExecutor:
     async def execute(self, request: ToolExecution) -> ToolOutput:
         name = request.arguments["name"]
         assert isinstance(name, str)
-        skill, current_sha256 = await self._store.read_skill_with_digest(name)
+        content_digest = request.arguments.get("content_digest")
+        assert content_digest is None or isinstance(content_digest, str)
+        if content_digest is None:
+            skill, current_sha256 = await self._store.read_skill_with_digest(name)
+        else:
+            skill = await self._store.read_retained_skill(name, content_digest)
+            current_sha256 = content_digest.removeprefix("sha256:")
         if skill is None:
             raise SkillNotFoundError(name)
-        return ToolOutput(
-            kind=SKILL_VIEW_OUTPUT_KIND,
-            data={
-                "name": skill.name,
-                "description": skill.description,
-                "instructions": skill.instructions,
-                "current_sha256": current_sha256,
-            },
-        )
+        data = {
+            "name": skill.name,
+            "description": skill.description,
+            "instructions": skill.instructions,
+            "current_sha256": current_sha256,
+        }
+        if content_digest is not None:
+            data["content_digest"] = content_digest
+        return ToolOutput(kind=SKILL_VIEW_OUTPUT_KIND, data=data)
 
 
 class SkillSaveExecutor:
@@ -198,7 +205,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                 "Load one complete procedural skill and current_sha256; use that digest "
                 "as skill_save.expected_sha256 when replacing it."
             ),
-            input_schema=_name_input_schema(),
+            input_schema=_view_input_schema(),
             output_kind=SKILL_VIEW_OUTPUT_KIND,
             output_schema={
                 "type": "object",
@@ -210,6 +217,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
                         "type": "string",
                         "pattern": "^[0-9a-f]{64}$",
                     },
+                    "content_digest": {},
                 },
                 "required": [
                     "name",
@@ -221,6 +229,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             },
             executor_id=view.executor_id,
             access_mode=AccessMode.NONE,
+            automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
         ),
         Capability(
             id=SKILL_SAVE_CAPABILITY_ID,
@@ -273,6 +282,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             executor_id=save.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
+            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SKILL_DELETE_CAPABILITY_ID,
@@ -291,6 +301,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             executor_id=delete.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
+            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
     )
     return SkillDeclarations(
@@ -364,6 +375,22 @@ class SkillCapabilityDomain:
         self._learning = learning
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
+        self._scheduled_bindings: dict[str, dict[str, str]] = {}
+
+    def select_scheduled_bindings(
+        self,
+        run_id: str,
+        bindings: tuple[tuple[str, str], ...],
+    ) -> None:
+        if run_id in self._scheduled_bindings:
+            raise RuntimeError("scheduled skill bindings are already selected")
+        selected = dict(bindings)
+        if len(selected) != len(bindings):
+            raise ValueError("scheduled skill bindings cannot duplicate a name")
+        self._scheduled_bindings[run_id] = selected
+
+    def clear_scheduled_bindings(self, run_id: str) -> None:
+        self._scheduled_bindings.pop(run_id, None)
 
     @property
     def declarations(self) -> CapabilityDeclarations:
@@ -413,6 +440,23 @@ class SkillCapabilityDomain:
                     "skill_invalid_name",
                     "Skill names must match [a-z][a-z0-9-]{0,63}.",
                 ) from error
+            content_digest = arguments.get("content_digest")
+            if run.origin is RunOrigin.SCHEDULED_ROUTINE:
+                selected = self._scheduled_bindings.get(run.id)
+                if (
+                    selected is None
+                    or selected.get(name) != content_digest
+                    or not isinstance(content_digest, str)
+                ):
+                    raise CapabilityInputError(
+                        "scheduled_skill_binding_violation",
+                        "A scheduled run may load only its exact pinned skill digest.",
+                    )
+            elif content_digest is not None:
+                raise CapabilityInputError(
+                    "retained_skill_interactive_forbidden",
+                    "Foreground skill reads use the current named skill.",
+                )
         return arguments
 
     async def side_effect_plan(
@@ -485,6 +529,27 @@ def _name_input_schema() -> dict[str, object]:
                 "pattern": _SKILL_NAME_PATTERN,
                 "maxLength": 64,
             }
+        },
+        "required": ["name"],
+        "additionalProperties": False,
+    }
+
+
+def _view_input_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "pattern": _SKILL_NAME_PATTERN,
+                "maxLength": 64,
+            },
+            "content_digest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "minLength": 71,
+                "maxLength": 71,
+            },
         },
         "required": ["name"],
         "additionalProperties": False,

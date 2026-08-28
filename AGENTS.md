@@ -327,12 +327,92 @@ result bounds, and no fallback. Production exposes no placeholder external
 profile and does not claim support for a real external executor until a later
 separately accepted connector slice is certified.
 
-Phase B does not authorize a generic scheduler, arbitrary job dispatcher,
-workflow or execution graph, universal task/work abstraction, job-kind switch
-or handler registry, dynamic registration, plugin executor, completion router,
-recovery service, event bus, resident daemon, client/server split, competing
-writer, multi-host queue, resumable model state, or Phase C/D/E scaffolding.
-Work pauses whenever no admitted `EmbeddedAgent` host is open.
+Phase B by itself does not authorize a generic scheduler, arbitrary job
+dispatcher, workflow or execution graph, universal task/work abstraction,
+job-kind switch or handler registry, dynamic registration, plugin executor,
+completion router, recovery service, event bus, resident daemon, client/server
+split, competing writer, multi-host queue, resumable model state, or later-stage
+scaffolding. The accepted Stage D1 slice below is the sole exception for its
+exact scheduled-routine owner and resident single-writer host. Work still
+pauses whenever no admitted `EmbeddedAgent` host is open; D1 may keep that same
+host open in a dedicated headless process but may not create another execution
+or state owner.
+
+### Accepted Stage D1 general scheduled-read slice
+
+North Star Stage D1 is accepted for implementation, but only as the first
+general scheduled-read vertical slice. It extends the implemented Stage C
+invocation, immutable scope, bounded run, terminal convergence, and
+conversation-inbox contracts. It does not authorize D2 external channel
+delivery, D3 recurring ingestion or any other scheduled effect, Stage E graphs,
+or a generic scheduler framework.
+
+The accepted D1 physical shape is:
+
+- one feature-owned `ScheduledRoutine` codec-v1 aggregate and one
+  `RoutineOccurrence` codec-v1 aggregate, persisted only in
+  `scheduled_routines` and `routine_occurrences` under `SQLiteStateStore` and
+  the single mutable development baseline;
+- one `RoutineOwner` that admits exact foreground-authorized, self-contained
+  instructions and owns bounded create, list, inspect, update, pause, resume,
+  run-now, disable, expiry, budget, and lifecycle transitions;
+- one bounded `RoutineSupervisor` under the existing `EmbeddedAgent` and
+  single-writer boundary that computes due slots, conditionally claims one
+  occurrence, fences stale claims, reserves one run, invokes the ordinary
+  `AgentLoop`, and idempotently finalizes the occurrence and one existing
+  conversation-inbox delivery;
+- typed `once`, anchored `interval`, and calendar schedules with exact IANA
+  timezone, explicit daylight-saving gap/overlap behavior, and bounded `skip`
+  or `latest_only` misfire handling; raw prompt text is never evaluated to
+  decide that a slot is due;
+- one `scheduled_routine` run origin and schedule identity fields added to the
+  existing `RunStartEnvelope` and `ExecutionScope`; the user-authorized
+  instruction is projected as instruction content, never as a new user turn or
+  as authority;
+- one orthogonal registry-owned `AutomationEligibility` value. Its safe
+  default is `interactive_only`; D1 may explicitly mark an existing
+  effect-free capability `scheduled_direct` only at its static declaration and
+  only after deterministic unattended tests. No tool name, access mode, MCP
+  annotation, prompt, or remote schema may infer eligibility;
+- foreground routine-management capabilities owned by one static
+  `RoutineCapabilityDomain`. They use the existing effect-governance and exact
+  approval branch under one fixed `manage_scheduled_routine` operational
+  effect, are themselves `interactive_only`, and are never included in a
+  scheduled run's capability ceiling;
+- `always` reporting plus, for the second D1 proof, one exact internal
+  data-domain resource-revision observation precheck. It executes through the
+  existing trusted runtime request, compares a bounded canonical observation,
+  and can finalize a no-change occurrence with zero model call. D1 does not add
+  a condition DSL, precheck registry, or model-authored executable predicate;
+- optional exact skill binding only after `SkillStore` can retain and reload
+  the bounded pinned content by digest. A routine without that retained-content
+  contract cannot claim a skill binding, and no second skill lifecycle or
+  executable plugin path is allowed; and
+- one headless resident-host entry point that keeps the same `EmbeddedAgent`
+  composition open for an exact agent home. It may be supervised by the local
+  operating environment, but D1 adds no remote API, IPC framework, generic
+  daemon manager, multi-host queue, or competing writer. A foreground TUI/CLI
+  process and the headless host must hand off the same writer admission rather
+  than opening the home concurrently.
+
+D1 scheduled execution is read-only: the routine's frozen scope permits only
+explicit `scheduled_direct` capabilities with `OperationalEffect.NONE`, uses
+the current conversation inbox as its only delivery destination, and cannot
+start or cancel a Stage B job, create another routine, invoke an external
+delivery adapter, write data, call an MCP write tool, or submit a graph. Routine
+creation or revision may reference a prior successful run as evidence, but it
+must persist one explicit self-contained instruction and exact current
+resource/capability envelope; hidden chat references and a run-bound
+`tool_ref` are invalid durable identity.
+
+D1 adds no `Schedule`, `Trigger`, `Invocation`, `Grant`, `Claim`, `Budget`,
+`Audit`, or `Disposition` table. Those logical values remain embedded in the
+two routine-owned aggregates. It adds no generic cron command executor,
+monitor type hierarchy, workflow, event bus, completion router, recovery
+service, policy DSL, second model pass, second loop, second runtime, dynamic
+handler registry, or compatibility path. The North Star Stage D1 physical
+design ledger and implementation plan are normative for file ownership,
+atomic transitions, sequencing, and exit tests.
 
 Do not add or restore these mechanisms in order to implement an MVP feature:
 
@@ -348,7 +428,8 @@ Do not add or restore these mechanisms in order to implement an MVP feature:
 - middleware, interceptors, lifecycle-hook frameworks, extension scanning, or
   plugin auto-install;
 - background learning/review agents, memory provider registries, vector stores,
-  skill activation state machines, or monitor schedulers;
+  skill activation state machines, or any monitor/scheduler outside the exact
+  accepted Stage D1 routine owner;
 - trace trees, telemetry stores/exporters, or versioned telemetry payloads; or
 - interaction-protocol version frameworks, generic compatibility decoders,
   root-framework v1 fallbacks, or migration machinery outside the existing

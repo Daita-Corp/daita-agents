@@ -15,6 +15,7 @@ from typing import Protocol
 from ._json import FrozenJsonObject, canonical_json
 from .capabilities import (
     AccessMode,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -1357,6 +1358,7 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=listing.executor_id,
+            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SEMANTIC_VIEW_CAPABILITY_ID,
@@ -1421,6 +1423,7 @@ def semantic_declarations(
                 "additionalProperties": False,
             },
             executor_id=view.executor_id,
+            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SEMANTIC_SAVE_CAPABILITY_ID,
@@ -1451,6 +1454,7 @@ def semantic_declarations(
             executor_id=save.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
+            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
         Capability(
             id=SEMANTIC_DELETE_CAPABILITY_ID,
@@ -1480,6 +1484,7 @@ def semantic_declarations(
             executor_id=delete.executor_id,
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
+            automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         ),
     )
     return SemanticDeclarations(

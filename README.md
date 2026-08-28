@@ -146,8 +146,23 @@ provide bounded lifecycle access. The model-facing lifecycle tools use the same
 agent ownership boundary, so a new conversation can list the agent's jobs,
 inspect one, read its result, or cancel it. The originating conversation remains
 visible as provenance rather than acting as an access gate. Work pauses while no
-agent host is open and safe stale attempts are fenced on reopen; Daita does not
-run a resident daemon.
+agent host is open and safe stale attempts are fenced on reopen. Daita does not
+self-install or silently fork a daemon; the explicit resident host described
+below is the only way to keep an agent open after the foreground process exits.
+
+D1 scheduled routines freeze one self-contained foreground-authorized read
+instruction, canonical one-shot/interval/calendar schedule, exact source,
+resource, connector and capability ceilings, budgets, expiration, inbox
+destination, and optional skill content digests. Every due slot enters the same
+`AgentLoop` and `CapabilityRuntime` used by foreground work. `/routines` shows
+record-owned lifecycle truth and supports pause, resume, run-now, and disable.
+An optional exact resource-revision check can advance an unchanged occurrence
+without a model call. Scheduled execution is read-only: it cannot update data,
+start or cancel a job, manage another routine, deliver externally, or submit a
+graph. Repeated pre-run or execution failures move the routine to
+`needs_attention` at its configured threshold and create one conversation-inbox
+escalation; a pre-run escalation truthfully records that no model run started.
+See [Scheduled read routines](docs/SCHEDULED_ROUTINES.md).
 
 The external-executor contract currently has deterministic offline conformance
 coverage only. No real external job profile ships, and no connected service is
@@ -222,6 +237,7 @@ daita --root /private/tmp/daita --workspace /absolute/path/project attach atlas 
 daita --root /private/tmp/daita --workspace /absolute/path/project run atlas "Summarize sales" \
   --model openai:gpt-4.1-mini
 daita --root /private/tmp/daita --workspace /absolute/path/project run atlas "Summarize the notes" --files-only
+daita --root /private/tmp/daita --workspace /absolute/path/project host --agent atlas
 ```
 
 `run` writes one JSON record. Provider credentials and PostgreSQL passwords
@@ -234,6 +250,7 @@ Discover all commands and options with:
 daita --help
 daita memory --help
 daita skills --help
+daita routines --help
 ```
 
 ## Manage jobs and local data
@@ -245,6 +262,9 @@ The terminal provides confirmed lifecycle commands:
 /jobs inspect <id>
 /jobs results <id>
 /jobs cancel <id>
+/routines
+/routines create <self-contained instruction>
+/routines promote <basis-run-id> <self-contained instruction>
 /source edit
 /source permissions
 /source detach <source>
@@ -257,7 +277,17 @@ owned by the agent and provides direct refresh, lifecycle details, validated
 results, exact artifact references, and confirmed cancellation without using a
 model turn. The inspect, results, and cancel forms are equivalent power-user
 commands for a known job ID. Jobs still run only while that agent host is open;
-the manager does not add a daemon, scheduler, retry path, or generic job starter.
+the manager does not add another daemon, scheduler, retry path, or generic job
+starter.
+
+`/routines` opens the bounded routine manager. Direct headless lifecycle
+operations are available under `daita routines` for create/promote from an
+exact JSON specification, list, inspect, update, pause, resume, run-now, and
+disable. To continue due work after closing the TUI, run `daita host --agent
+atlas` with the same `--root` and `--workspace`. The resident process owns the
+ordinary agent-home writer lock, so it must be stopped before another TUI or
+CLI process opens that agent. No schedule progresses while no admitted host is
+open.
 
 `/source edit` changes the active source connection without dropping the
 working connection first. Daita validates and catalogs the edited connection,

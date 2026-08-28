@@ -296,9 +296,10 @@ def test_canonical_toolbox_records_are_closed_bounded_and_exact() -> None:
         "Artifacts",
         "Knowledge",
         "Jobs",
+        "Routines",
     )
-    assert len({item.id for item in TOOLBOX_DEFINITIONS}) == 5
-    assert len({item.label for item in TOOLBOX_DEFINITIONS}) == 5
+    assert len({item.id for item in TOOLBOX_DEFINITIONS}) == 6
+    assert len({item.label for item in TOOLBOX_DEFINITIONS}) == 6
     assert tuple(item.value for item in ToolLoadMode) == ("pinned", "on_demand")
     assert tuple(item.value for item in ToolTextTrust) == (
         "code",
@@ -459,6 +460,7 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
             "job_inspect",
             "job_list",
             "job_read_results",
+            "routine_list",
             "skill_view",
         }
         for name in registry.tool_names:

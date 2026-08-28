@@ -8,6 +8,7 @@ from typing import Protocol
 from ..._json import FrozenJsonObject, canonical_json
 from ...capabilities import (
     AccessMode,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -729,6 +730,7 @@ def postgresql_update_preview_capability_declarations() -> CapabilityDeclaration
         output_schema=_postgresql_update_preview_output_schema(),
         executor_id=POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID,
         access_mode=AccessMode.READ,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     view = ToolView(
         name=POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
@@ -837,6 +839,7 @@ def postgresql_update_capability_declarations() -> CapabilityDeclarations:
         executor_id=POSTGRESQL_UPDATE_EXECUTOR_ID,
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     view = ToolView(
         name=POSTGRESQL_UPDATE_TOOL_NAME,
@@ -891,6 +894,7 @@ def _query_declarations(
         output_schema=_query_output_schema(),
         executor_id=executor_id,
         access_mode=AccessMode.READ,
+        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
     )
     view = ToolView(
         name=tool_name,

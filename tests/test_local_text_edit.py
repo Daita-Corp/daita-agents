@@ -34,7 +34,12 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.loop.models import RunInput, RunOrigin, RunStartEnvelope
+from daita.loop.models import (
+    InstructionAuthority,
+    RunInput,
+    RunOrigin,
+    RunStartEnvelope,
+)
 
 
 class _EditWorkflowProvider:
@@ -1080,6 +1085,7 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
         created_at=datetime.now(UTC),
         start=RunStartEnvelope(
             origin=RunOrigin.JOB_EVENT,
+            instruction_authority=InstructionAuthority.CODE_OWNED,
             trusted_instruction_id="followup-local-edit-v1",
             trusted_instruction=instruction,
             instruction_digest=(

@@ -9,6 +9,7 @@ from .._json import FrozenJsonObject
 from ..artifacts.models import artifact_ref_to_mapping
 from ..capabilities import (
     AccessMode,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -323,6 +324,7 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
         output_schema=_list_schema(),
         executor_id=JOB_LIST_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     inspect_capability = Capability(
         id=JOB_INSPECT_CAPABILITY_ID,
@@ -332,6 +334,7 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
         output_schema=_object_output_schema(),
         executor_id=JOB_INSPECT_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     result_capability = Capability(
         id=JOB_READ_RESULTS_CAPABILITY_ID,
@@ -341,6 +344,7 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
         output_schema=_object_output_schema(),
         executor_id=JOB_READ_RESULTS_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     cancel_capability = Capability(
         id=JOB_CANCEL_CAPABILITY_ID,
@@ -351,6 +355,7 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
         executor_id=JOB_CANCEL_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CANCEL_JOB,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     capabilities = (
         list_capability,

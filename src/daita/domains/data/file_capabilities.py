@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from ...adapters.local_workspace import LocalWorkspaceBackend
 from ...capabilities import (
     AccessMode,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     Executor,
@@ -191,6 +192,7 @@ def local_file_capability_declarations() -> CapabilityDeclarations:
         output_schema=_search_output_schema(),
         executor_id=LOCAL_FILE_SEARCH_EXECUTOR_ID,
         access_mode=AccessMode.READ,
+        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
     )
     read = Capability(
         id=LOCAL_FILE_READ_CAPABILITY_ID,
@@ -215,6 +217,7 @@ def local_file_capability_declarations() -> CapabilityDeclarations:
         output_schema=_read_output_schema(),
         executor_id=LOCAL_FILE_READ_EXECUTOR_ID,
         access_mode=AccessMode.READ,
+        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
     )
     query = Capability(
         id=LOCAL_FILE_QUERY_CAPABILITY_ID,
@@ -244,6 +247,7 @@ def local_file_capability_declarations() -> CapabilityDeclarations:
         output_schema=_query_output_schema(),
         executor_id=LOCAL_FILE_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
+        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
     )
     views = (
         ToolView(

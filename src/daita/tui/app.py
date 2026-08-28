@@ -49,6 +49,7 @@ from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
 from .screens.inbox import InboxScreen
 from .screens.jobs import JobsScreen
+from .screens.routines import RoutinesScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
     AgentCreateScreen,
@@ -699,6 +700,10 @@ class DaitaApp(App[int]):
                     initial_view=str(payload.get("view", "details")),
                 )
             )
+            return
+        if screen_name == "routines":
+            await self._await_modal(RoutinesScreen())
+            await self.refresh_background_status(notify_new=False)
             return
         if screen_name == "inbox":
             await self._await_modal(InboxScreen())

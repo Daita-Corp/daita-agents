@@ -1,4 +1,4 @@
-"""Encode the current codec-v1 Stage C follow-up and inbox record families."""
+"""Encode the current codec-v1 Stage C follow-up and shared inbox families."""
 
 from __future__ import annotations
 
@@ -271,7 +271,7 @@ def decode_inbox_item(
         agent_id=agent_id,
         conversation_id=text(fields["conversation_id"], "inbox conversation id"),
         subject=_decode_delivery_subject(fields["subject"]),
-        resulting_run_id=text(fields["resulting_run_id"], "inbox run id"),
+        resulting_run_id=optional_text(fields["resulting_run_id"], "inbox run id"),
         grant_id=text(fields["grant_id"], "inbox grant id"),
         logical_key=text(fields["logical_key"], "inbox logical key"),
         conclusion_digest=text(

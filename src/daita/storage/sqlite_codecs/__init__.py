@@ -27,6 +27,12 @@ from .learning import (
 )
 from .mcp_bindings import decode_mcp_binding, encode_mcp_binding
 from .receipts import decode_receipt, encode_receipt
+from .routines import (
+    decode_routine_occurrence,
+    decode_scheduled_routine,
+    encode_routine_occurrence,
+    encode_scheduled_routine,
+)
 from .semantics import decode_semantic_annotation, encode_semantic_annotation
 from .source_permissions import (
     decode_postgresql_update_scope,
@@ -60,10 +66,12 @@ __all__ = [
     "decode_postgresql_update_scope",
     "decode_receipt",
     "decode_review_stamps",
+    "decode_routine_occurrence",
     "decode_run_input",
     "decode_semantic_annotation",
     "decode_source",
     "decode_source_read_scope",
+    "decode_scheduled_routine",
     "encode_autonomous_followup",
     "encode_catalog_snapshot",
     "encode_catalog_sync",
@@ -78,8 +86,10 @@ __all__ = [
     "encode_postgresql_update_scope",
     "encode_receipt",
     "encode_review_stamps",
+    "encode_routine_occurrence",
     "encode_run_input",
     "encode_semantic_annotation",
     "encode_source",
     "encode_source_read_scope",
+    "encode_scheduled_routine",
 ]

@@ -1,4 +1,4 @@
-"""Own the bounded Stage C terminal-job follow-up and conversation inbox values."""
+"""Own the bounded Stage C follow-up and shared conversation-inbox values."""
 
 from __future__ import annotations
 
@@ -150,6 +150,7 @@ class DeliveryState(str, Enum):
 
 class DeliverySubjectKind(str, Enum):
     STANDALONE_FOLLOWUP = "standalone_followup"
+    ROUTINE_OCCURRENCE = "routine_occurrence"
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,7 +516,7 @@ class InboxItem:
     agent_id: str
     conversation_id: str
     subject: DeliverySubject
-    resulting_run_id: str
+    resulting_run_id: str | None
     grant_id: str
     logical_key: str
     conclusion_digest: str
@@ -535,7 +536,6 @@ class InboxItem:
             (self.delivery_id, "inbox delivery_id"),
             (self.agent_id, "inbox agent_id"),
             (self.conversation_id, "inbox conversation_id"),
-            (self.resulting_run_id, "inbox resulting_run_id"),
             (self.grant_id, "inbox grant_id"),
             (self.logical_key, "inbox logical_key"),
             (self.destination, "inbox destination"),
@@ -543,6 +543,8 @@ class InboxItem:
             _text(value, name)
         if not isinstance(self.subject, DeliverySubject):
             raise TypeError("inbox subject is invalid")
+        if self.resulting_run_id is not None:
+            _text(self.resulting_run_id, "inbox resulting_run_id")
         if _DIGEST.fullmatch(self.conclusion_digest) is None:
             raise ValueError("inbox conclusion digest is invalid")
         payload = _bounded_mapping(
@@ -550,6 +552,17 @@ class InboxItem:
             "inbox payload",
             MAX_INBOX_PAYLOAD_BYTES,
         )
+        if (
+            self.subject.kind is DeliverySubjectKind.STANDALONE_FOLLOWUP
+            and self.resulting_run_id is None
+        ):
+            raise ValueError("follow-up inbox item requires a run")
+        if self.resulting_run_id is None and (
+            self.subject.kind is not DeliverySubjectKind.ROUTINE_OCCURRENCE
+            or payload.get("outcome") != "failed"
+            or payload.get("escalation") is not True
+        ):
+            raise ValueError("no-run inbox item must be a routine escalation")
         if not isinstance(self.sensitivity, ModelSensitivity) or not isinstance(
             self.destination_sensitivity_ceiling,
             ModelSensitivity,

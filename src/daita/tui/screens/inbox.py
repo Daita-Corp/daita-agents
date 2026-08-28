@@ -10,7 +10,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
-from daita import DeliveryState, InboxItem
+from daita import DeliveryState, DeliverySubjectKind, InboxItem
 
 from ..sanitization import safe_display, sanitize_terminal_text
 
@@ -260,22 +260,37 @@ def render_inbox_item(item: InboxItem) -> str:
 
     payload = item.payload
     outcome = safe_display(payload.get("outcome"), fallback="unknown", maximum=32)
-    job_id = safe_display(payload.get("job_id"), fallback="unknown", maximum=256)
     reason = safe_display(payload.get("reason"), fallback="unknown", maximum=256)
+    is_routine = item.subject.kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
+    subject_label = "Routine" if is_routine else "Job"
+    subject_identity = (
+        payload.get("routine_id") if is_routine else payload.get("job_id")
+    )
+    run_label = (
+        "No model run started"
+        if item.resulting_run_id is None
+        else safe_display(item.resulting_run_id, fallback="unknown", maximum=256)
+    )
+    detail_heading = (
+        "Escalation"
+        if item.resulting_run_id is None and payload.get("escalation") is True
+        else "Report"
+    )
     lines = [
         item.subject.kind.value.replace("_", " ").title(),
         f"State: {item.state.value} · Outcome: {outcome}",
         f"Created: {item.created_at.isoformat()}",
         "Origin conversation: "
         + safe_display(item.conversation_id, fallback="unknown", maximum=256),
-        "Job: " + job_id,
-        "Result run: "
-        + safe_display(item.resulting_run_id, fallback="unknown", maximum=256),
+        subject_label
+        + ": "
+        + safe_display(subject_identity, fallback="unknown", maximum=256),
+        "Result run: " + run_label,
         "Sensitivity: " + item.sensitivity.value,
         "Destination: " + safe_display(item.destination, fallback="inbox", maximum=256),
         "Reason: " + reason,
         "",
-        "Report",
+        detail_heading,
     ]
     report = payload.get("report_preview")
     if isinstance(report, str) and report:
@@ -296,6 +311,8 @@ def render_inbox_item(item: InboxItem) -> str:
             "Preview withheld because the result exceeds this destination's "
             "sensitivity eligibility."
         )
+    elif item.resulting_run_id is None:
+        lines.append("The occurrence failed before a model run could start.")
     else:
         lines.append("No report preview is available for this result.")
     if item.terminal_error is not None:

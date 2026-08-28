@@ -21,6 +21,7 @@ from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
     TOOLBOX_DEFINITIONS,
     AccessMode,
+    AutomationEligibility,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
@@ -56,6 +57,7 @@ from .llm.models import (
 from .loop.models import (
     LoopLimits,
     RunInput,
+    RunOrigin,
     ToolBatchCertainty,
     ToolBatchInterruption,
     ToolBatchOutcome,
@@ -602,6 +604,12 @@ class CapabilityRuntime:
                     raise ValueError(f"tool projected by the wrong domain: {name}")
                 if run.execution_scope is not None and not run.execution_scope.allows(
                     capability
+                ):
+                    continue
+                if (
+                    run.origin is RunOrigin.SCHEDULED_ROUTINE
+                    and capability.automation_eligibility
+                    is not AutomationEligibility.SCHEDULED_DIRECT
                 ):
                     continue
                 schema_digest = _sha256_digest(capability.input_schema)
@@ -2722,8 +2730,21 @@ def _validate_run_execution_scope(
     if scope is None:
         return
     if (
+        run.origin is RunOrigin.SCHEDULED_ROUTINE
+        and capability.automation_eligibility
+        is not AutomationEligibility.SCHEDULED_DIRECT
+    ):
+        raise CapabilityInputError(
+            "scheduled_capability_ineligible",
+            "The requested capability is not admitted for scheduled execution.",
+            {"capability_id": capability.id},
+        )
+    source_identity_allowed = run.source_id in scope.allowed_source_ids
+    if scope.routine_id is not None and run.source_id is None:
+        source_identity_allowed = True
+    if (
         scope.agent_id != run.agent_id
-        or run.source_id not in scope.allowed_source_ids
+        or not source_identity_allowed
         or not scope.allows(capability)
     ):
         raise CapabilityInputError(

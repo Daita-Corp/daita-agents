@@ -21,6 +21,7 @@ from ...llm.pricing import (
     PricingUsageRange,
 )
 from ...loop.models import (
+    InstructionAuthority,
     LoopExit,
     LoopExitKind,
     RunInput,
@@ -142,6 +143,11 @@ def _encode_run_start(value: RunStartEnvelope | None):
         "RunStartEnvelope",
         {
             "origin": value.origin.value,
+            "instruction_authority": (
+                None
+                if value.instruction_authority is None
+                else value.instruction_authority.value
+            ),
             "user_message": value.user_message,
             "trusted_instruction_id": value.trusted_instruction_id,
             "trusted_instruction": value.trusted_instruction,
@@ -163,6 +169,7 @@ def _decode_run_start(value) -> RunStartEnvelope:
         "RunStartEnvelope",
         (
             "origin",
+            "instruction_authority",
             "user_message",
             "trusted_instruction_id",
             "trusted_instruction",
@@ -174,6 +181,13 @@ def _decode_run_start(value) -> RunStartEnvelope:
     )
     try:
         origin = RunOrigin(text(fields["origin"], "run start origin"))
+        instruction_authority = (
+            None
+            if fields["instruction_authority"] is None
+            else InstructionAuthority(
+                text(fields["instruction_authority"], "run instruction authority")
+            )
+        )
     except ValueError:
         raise ValueError("stored run start origin is invalid") from None
     payload = plain_decode(fields["untrusted_payload"])
@@ -182,6 +196,7 @@ def _decode_run_start(value) -> RunStartEnvelope:
     scope = fields["execution_scope"]
     return RunStartEnvelope(
         origin=origin,
+        instruction_authority=instruction_authority,
         user_message=optional_text(fields["user_message"], "run start user message"),
         trusted_instruction_id=optional_text(
             fields["trusted_instruction_id"],

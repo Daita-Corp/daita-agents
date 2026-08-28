@@ -77,6 +77,13 @@ from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver
+from .routines import (
+    RoutineState,
+    ScheduledRoutineDraft,
+    ScheduledRoutineInspection,
+    ScheduledRoutineSummary,
+    ScheduledRoutineV1,
+)
 from .security import KeychainStore, SecretProvider, SecretReference
 from .semantics import (
     SemanticAnnotation,
@@ -383,6 +390,83 @@ class Agent:
 
     async def cancel_job(self, job_id: str) -> JobInspection | None:
         return await self._embedded.cancel_job(job_id)
+
+    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutineV1:
+        return await self._embedded.propose_routine(draft)
+
+    async def promote_routine(
+        self,
+        draft: ScheduledRoutineDraft,
+        *,
+        basis_run_id: str,
+    ) -> ScheduledRoutineV1:
+        return await self._embedded.promote_routine(
+            draft,
+            basis_run_id=basis_run_id,
+        )
+
+    async def create_routine(self, proposal: ScheduledRoutineV1) -> ScheduledRoutineV1:
+        return await self._embedded.create_routine(proposal)
+
+    async def list_routines(
+        self,
+        *,
+        states: frozenset[RoutineState] = frozenset(),
+        limit: int = 50,
+    ) -> tuple[ScheduledRoutineSummary, ...]:
+        return await self._embedded.list_routines(states=states, limit=limit)
+
+    async def inspect_routine(
+        self, routine_id: str
+    ) -> ScheduledRoutineInspection | None:
+        return await self._embedded.inspect_routine(routine_id)
+
+    async def update_routine(
+        self,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        draft: ScheduledRoutineDraft,
+        basis_run_id: str | None = None,
+    ) -> ScheduledRoutineV1:
+        return await self._embedded.update_routine(
+            routine_id,
+            expected_revision=expected_revision,
+            draft=draft,
+            basis_run_id=basis_run_id,
+        )
+
+    async def pause_routine(
+        self, routine_id: str, *, expected_revision: int
+    ) -> ScheduledRoutineV1:
+        return await self._embedded.pause_routine(
+            routine_id,
+            expected_revision=expected_revision,
+        )
+
+    async def resume_routine(
+        self, routine_id: str, *, expected_revision: int
+    ) -> ScheduledRoutineV1:
+        return await self._embedded.resume_routine(
+            routine_id,
+            expected_revision=expected_revision,
+        )
+
+    async def run_routine_now(
+        self, routine_id: str, *, expected_revision: int
+    ) -> ScheduledRoutineV1:
+        return await self._embedded.run_routine_now(
+            routine_id,
+            expected_revision=expected_revision,
+        )
+
+    async def disable_routine(
+        self, routine_id: str, *, expected_revision: int
+    ) -> ScheduledRoutineV1:
+        return await self._embedded.disable_routine(
+            routine_id,
+            expected_revision=expected_revision,
+        )
 
     async def clear_conversations(self) -> int:
         """Delete transcripts and candidate records, not approved knowledge."""

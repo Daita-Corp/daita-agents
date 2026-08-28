@@ -14,6 +14,8 @@ from ..sqlite_schema import (
     MCP_SERVER_BINDING_TABLE_SQL,
     POSTGRESQL_UPDATE_SCOPE_TABLE_SQL,
     RECEIPT_TABLE_SQL,
+    ROUTINE_OCCURRENCE_TABLE_SQL,
+    SCHEDULED_ROUTINE_TABLE_SQL,
     SOURCE_READ_SCOPE_TABLE_SQL,
     require_healthy,
     require_schema,
@@ -40,6 +42,10 @@ def create_current(connection: sqlite3.Connection) -> None:
         + AUTONOMOUS_FOLLOWUP_TABLE_SQL
         + ";\n"
         + CONVERSATION_INBOX_TABLE_SQL
+        + ";\n"
+        + SCHEDULED_ROUTINE_TABLE_SQL
+        + ";\n"
+        + ROUTINE_OCCURRENCE_TABLE_SQL
         + ";\n"
     )
     for migration in MIGRATIONS:
