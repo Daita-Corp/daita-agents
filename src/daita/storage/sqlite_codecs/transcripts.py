@@ -272,6 +272,7 @@ def _encode_tool_result(value: ToolResultBlock) -> dict[str, JsonValue]:
             "sensitivity_provenance": plain_encode(value.sensitivity_provenance),
             "capability_id": value.capability_id,
             "executor_id": value.executor_id,
+            "output_sha256": value.output_sha256,
         },
     )
 
@@ -288,6 +289,7 @@ def _decode_tool_result(value: JsonValue) -> ToolResultBlock:
             "sensitivity_provenance",
             "capability_id",
             "executor_id",
+            "output_sha256",
         ),
     )
     output = plain_decode(mapping(fields["output"], "tool-result output"))
@@ -317,6 +319,10 @@ def _decode_tool_result(value: JsonValue) -> ToolResultBlock:
         executor_id=optional_text(
             fields["executor_id"],
             "tool-result executor id",
+        ),
+        output_sha256=optional_text(
+            fields["output_sha256"],
+            "tool-result output digest",
         ),
     )
 

@@ -16,7 +16,9 @@ from daita import (
     Agent,
     ApprovalHandler,
     ConversationRun,
-    InboxItem,
+    DeliveryInspection,
+    DistributionDestination,
+    InboxView,
     JobInspection,
     JobResultView,
     JobStatus,
@@ -34,7 +36,7 @@ from daita import (
     RoutineState,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
     Transcript,
 )
 from daita.agent import (
@@ -48,6 +50,7 @@ from daita.learning_candidates import (
     learning_candidate_content_from_mapping,
     learning_candidate_content_to_mapping,
 )
+from daita.llm import ModelSensitivity
 from daita.observation import AgentObserver
 from daita.security import (
     CredentialSession,
@@ -621,10 +624,27 @@ class PresentationController:
     async def list_jobs(self) -> tuple[JobSummary, ...]:
         return await self.require_agent().list_jobs(limit=50)
 
-    async def list_inbox(self) -> tuple[InboxItem, ...]:
+    async def list_inbox(self) -> tuple[InboxView, ...]:
         return await self.require_agent().inbox(limit=50)
 
-    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+    async def list_distribution_destinations(
+        self,
+        conversation_id: str,
+        *,
+        sensitivity_ceiling: ModelSensitivity,
+    ) -> tuple[DistributionDestination, ...]:
+        return await self.require_agent().distribution_destinations(
+            conversation_id,
+            sensitivity_ceiling=sensitivity_ceiling,
+        )
+
+    async def inspect_delivery(
+        self,
+        delivery_id: str,
+    ) -> DeliveryInspection | None:
+        return await self.require_agent().inspect_delivery(delivery_id)
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxView | None:
         return await self.require_agent().acknowledge_inbox(delivery_id)
 
     async def inspect_job(self, job_id: str) -> JobInspection | None:
@@ -650,7 +670,7 @@ class PresentationController:
         *,
         expected_revision: int,
         action: str,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         operations = {
             "pause": self.require_agent().pause_routine,
             "resume": self.require_agent().resume_routine,

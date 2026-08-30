@@ -58,7 +58,6 @@ from ..autonomy import (
     FOLLOWUP_INSTRUCTION_ID,
     FOLLOWUP_LEASE_SECONDS,
     FollowupDisposition,
-    InboxItem,
     create_terminal_job_followup,
 )
 from ..capabilities import (
@@ -120,6 +119,16 @@ from ..domains.data.sql import (
 from ..domains.learning import LearningCandidateGuard
 from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
 from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
+from ..distribution import (
+    DISTRIBUTION_DOMAIN_OWNER_ID,
+    DeliveryInspection,
+    DistributionCapabilityDomain,
+    DistributionDestination,
+    DistributionOwner,
+    InboxView,
+    OutcomeContract,
+    distribution_capability_declarations,
+)
 from ..identity import AgentIdentity
 from ..jobs.capabilities import (
     JOB_DOMAIN_OWNER_ID,
@@ -198,13 +207,13 @@ from ..routines.models import (
     ResourceRevisionObservation,
     ResourceRevisionPrecheck,
     RoutineControlAction,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutineSchedule,
     RoutineState,
     ScheduledRoutineDraft,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
 )
 from ..routines.supervisor import RoutineSupervisor
 from ..memory import MemoryStore
@@ -265,6 +274,8 @@ class _RoutineDraftValues(TypedDict):
     allowed_resource_ids: tuple[str, ...]
     allowed_capability_ids: tuple[str, ...]
     sensitivity_ceiling: ModelSensitivity
+    outcome_contract: OutcomeContract
+    distribution_destination_id: str
     eligible_model_routes: tuple[str, ...]
     per_run_max_tokens: int
     per_run_max_cost_usd: Decimal
@@ -290,6 +301,8 @@ def _routine_draft_values(draft: ScheduledRoutineDraft) -> _RoutineDraftValues:
         "allowed_resource_ids": draft.allowed_resource_ids,
         "allowed_capability_ids": draft.allowed_capability_ids,
         "sensitivity_ceiling": draft.sensitivity_ceiling,
+        "outcome_contract": draft.outcome_contract,
+        "distribution_destination_id": draft.distribution_destination_id,
         "eligible_model_routes": draft.eligible_model_routes,
         "per_run_max_tokens": draft.per_run_max_tokens,
         "per_run_max_cost_usd": draft.per_run_max_cost_usd,
@@ -550,6 +563,7 @@ class EmbeddedAgent:
         workspace_backend: LocalWorkspaceBackend | None,
         writer_lock: _WriterLock,
         store: SQLiteStateStore,
+        distribution_owner: DistributionOwner,
         loop: AgentLoop | None,
         transcripts: SQLiteStateStore,
         capabilities: CapabilityRegistry,
@@ -606,6 +620,7 @@ class EmbeddedAgent:
         }
         self._writer_lock = writer_lock
         self._store = store
+        self._distribution_owner = distribution_owner
         self._loop = loop
         self._transcripts = transcripts
         self._capabilities = capabilities
@@ -1311,6 +1326,7 @@ class EmbeddedAgent:
                 artifact_delivery,
                 workspace_backend,
                 learning_candidate_guard,
+                clock=clock,
                 files_only_run_ids=files_only_run_ids,
             )
         )
@@ -1365,10 +1381,27 @@ class EmbeddedAgent:
             *(artifacts.executors if artifacts is not None else ()),
             *mcp_executors,
         )
+        distribution_owner = DistributionOwner(agent_id=identity.id, store=store)
+        distribution_lifecycle = distribution_capability_declarations(
+            distribution_owner
+        )
+        distribution_declaration_bundle = CapabilityDeclarations(
+            domain_owner_id=DISTRIBUTION_DOMAIN_OWNER_ID,
+            capabilities=distribution_lifecycle.capabilities,
+            executor_ids=tuple(
+                item.executor_id for item in distribution_lifecycle.capabilities
+            ),
+            tool_views=distribution_lifecycle.tool_views,
+        )
+        distribution_domain = DistributionCapabilityDomain(
+            distribution_declaration_bundle,
+            distribution_owner,
+        )
         routine_owner = RoutineOwner(
             agent_id=identity.id,
             store=store,
             catalog=data_view,
+            distribution=distribution_owner,
             skills=skill_store,
             eligible_model_routes=_stage_c_model_routes(model, model_route),
             maximum_per_run_tokens=limits.max_total_tokens,
@@ -1388,8 +1421,12 @@ class EmbeddedAgent:
             routine_declaration_bundle,
             routine_owner,
         )
-        domains = (*base_domains, routine_domain)
-        registered_executors = (*base_executors, *routine_lifecycle.executors)
+        domains = (*base_domains, distribution_domain, routine_domain)
+        registered_executors = (
+            *base_executors,
+            *distribution_lifecycle.executors,
+            *routine_lifecycle.executors,
+        )
         if hosted:
             declared_capability_ids = {
                 capability.id
@@ -1421,6 +1458,8 @@ class EmbeddedAgent:
             declarations=tuple(domain.declarations for domain in domains),
             executors=registered_executors,
         )
+        if artifact_domain is not None:
+            artifact_domain.bind_capability_registry(capabilities)
         routine_owner.bind_capability_registry(capabilities)
         capability_runtime = CapabilityRuntime(
             capabilities,
@@ -1495,7 +1534,7 @@ class EmbeddedAgent:
         )
 
         async def execute_routine_run(
-            occurrence: RoutineOccurrenceV1,
+            occurrence: RoutineOccurrence,
             run_input: RunInput,
             observation: ResourceRevisionObservation | None,
         ) -> LoopExit | None:
@@ -1560,6 +1599,8 @@ class EmbeddedAgent:
             store=store,
             owner=routine_owner,
             runtime=capability_runtime,
+            distribution=distribution_owner,
+            artifacts=artifact_store,
             execute_run=(execute_routine_run if loop is not None else None),
             clock=clock,
             id_factory=id_factory,
@@ -1572,6 +1613,7 @@ class EmbeddedAgent:
             workspace_backend=workspace_backend,
             writer_lock=writer_lock,
             store=store,
+            distribution_owner=distribution_owner,
             loop=loop,
             transcripts=transcripts,
             capabilities=capabilities,
@@ -2356,30 +2398,60 @@ class EmbeddedAgent:
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = 50,
-    ) -> tuple[InboxItem, ...]:
+    ) -> tuple[InboxView, ...]:
         """Inspect a bounded agent-owned durable conversation inbox."""
 
         self._require_open()
         if conversation_id is not None:
             _validate_conversation_id(conversation_id)
-        return await self._store.list_inbox(
-            self.identity.id,
+        return await self._distribution_owner.list(
             conversation_id=conversation_id,
             include_acknowledged=include_acknowledged,
             limit=limit,
         )
 
-    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+    async def distribution_destinations(
+        self,
+        conversation_id: str,
+        *,
+        sensitivity_ceiling: ModelSensitivity,
+    ) -> tuple[DistributionDestination, ...]:
+        """Discover exact current destinations for one owned conversation."""
+
+        self._require_open()
+        _validate_conversation_id(conversation_id)
+        if not isinstance(sensitivity_ceiling, ModelSensitivity):
+            raise TypeError("sensitivity_ceiling must be ModelSensitivity")
+        return await self._distribution_owner.discover_destinations(
+            conversation_id,
+            sensitivity_ceiling=sensitivity_ceiling,
+        )
+
+    async def inspect_delivery(
+        self,
+        delivery_id: str,
+    ) -> DeliveryInspection | None:
+        """Inspect one exact agent-owned logical delivery."""
+
+        self._require_open()
+        if not isinstance(delivery_id, str) or not delivery_id.strip():
+            raise ValueError("delivery_id must be non-empty text")
+        return await self._distribution_owner.inspect(delivery_id.strip())
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxView | None:
         """Idempotently acknowledge one exact agent-owned inbox result."""
 
         self._require_open()
         if not isinstance(delivery_id, str) or not delivery_id.strip():
             raise ValueError("delivery_id must be non-empty text")
-        return await self._store.acknowledge_inbox(
-            self.identity.id,
+        acknowledged = await self._distribution_owner.acknowledge(
             delivery_id.strip(),
             acknowledged_at=self._clock(),
         )
+        if acknowledged is not None:
+            self._followup_wake.set()
+            self._routine_supervisor.wake()
+        return acknowledged
 
     async def conversation_runs(
         self,
@@ -2428,7 +2500,7 @@ class EmbeddedAgent:
         self._require_open()
         return await self._job_owner.cancel(job_id)
 
-    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutineV1:
+    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
         """Build and revalidate one non-persisted exact routine proposal."""
 
         self._require_open()
@@ -2439,7 +2511,7 @@ class EmbeddedAgent:
         draft: ScheduledRoutineDraft,
         *,
         basis_run_id: str,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         """Build a proposal with exact evidence from one completed prior run."""
 
         self._require_open()
@@ -2448,7 +2520,7 @@ class EmbeddedAgent:
             basis_run_id=basis_run_id,
         )
 
-    async def create_routine(self, proposal: ScheduledRoutineV1) -> ScheduledRoutineV1:
+    async def create_routine(self, proposal: ScheduledRoutine) -> ScheduledRoutine:
         """Persist one previously inspected exact proposal."""
 
         async with self._mutation_lock:
@@ -2479,7 +2551,7 @@ class EmbeddedAgent:
         expected_revision: int,
         draft: ScheduledRoutineDraft,
         basis_run_id: str | None = None,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         """Conditionally replace one routine with a newly authorized definition."""
 
         async with self._mutation_lock:
@@ -2502,7 +2574,7 @@ class EmbeddedAgent:
 
     async def pause_routine(
         self, routine_id: str, *, expected_revision: int
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._control_routine(
             routine_id,
             expected_revision=expected_revision,
@@ -2511,7 +2583,7 @@ class EmbeddedAgent:
 
     async def resume_routine(
         self, routine_id: str, *, expected_revision: int
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._control_routine(
             routine_id,
             expected_revision=expected_revision,
@@ -2520,7 +2592,7 @@ class EmbeddedAgent:
 
     async def run_routine_now(
         self, routine_id: str, *, expected_revision: int
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._control_routine(
             routine_id,
             expected_revision=expected_revision,
@@ -2529,7 +2601,7 @@ class EmbeddedAgent:
 
     async def disable_routine(
         self, routine_id: str, *, expected_revision: int
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._control_routine(
             routine_id,
             expected_revision=expected_revision,
@@ -2541,12 +2613,16 @@ class EmbeddedAgent:
         draft: ScheduledRoutineDraft,
         *,
         basis_run_id: str | None,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         if not isinstance(draft, ScheduledRoutineDraft):
             raise TypeError("draft must be ScheduledRoutineDraft")
         transcript = await self._store.load(draft.origin_run_id)
         if transcript.run.conversation_id is None:
             raise ValueError("routine origin run has no conversation")
+        self._validate_routine_draft_distribution(
+            draft,
+            transcript.run.conversation_id,
+        )
         return await self._routine_owner.prepare_create(
             run_id=draft.origin_run_id,
             conversation_id=transcript.run.conversation_id,
@@ -2557,16 +2633,20 @@ class EmbeddedAgent:
 
     async def _prepare_routine_revision(
         self,
-        current: ScheduledRoutineV1,
+        current: ScheduledRoutine,
         draft: ScheduledRoutineDraft,
         *,
         basis_run_id: str | None,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         if not isinstance(draft, ScheduledRoutineDraft):
             raise TypeError("draft must be ScheduledRoutineDraft")
         transcript = await self._store.load(draft.origin_run_id)
         if transcript.run.conversation_id is None:
             raise ValueError("routine origin run has no conversation")
+        self._validate_routine_draft_distribution(
+            draft,
+            transcript.run.conversation_id,
+        )
         return await self._routine_owner.prepare_revision(
             current,
             run_id=draft.origin_run_id,
@@ -2575,13 +2655,29 @@ class EmbeddedAgent:
             **_routine_draft_values(draft),
         )
 
+    def _validate_routine_draft_distribution(
+        self,
+        draft: ScheduledRoutineDraft,
+        conversation_id: str,
+    ) -> None:
+        try:
+            self._distribution_owner.resolve_plan(
+                conversation_id,
+                destination_id=draft.distribution_destination_id,
+                sensitivity_ceiling=draft.sensitivity_ceiling,
+            )
+        except ValueError as error:
+            raise ValueError(
+                "routine distribution destination is not currently selectable"
+            ) from error
+
     async def _control_routine(
         self,
         routine_id: str,
         *,
         expected_revision: int,
         action: RoutineControlAction,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         async with self._mutation_lock:
             self._require_open()
             return await self._routine_owner.control(
@@ -2600,7 +2696,7 @@ class EmbeddedAgent:
             cancelled = False
             try:
                 _, cancelled = await _await_async_completion(
-                    self._artifact_store.remove_all_run_artifacts
+                    self._artifact_store.remove_unreferenced_run_artifacts
                 )
             except Exception:
                 # SQLite deletion is already authoritative. A private orphan is

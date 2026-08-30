@@ -7,13 +7,22 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import cast
 
+import pytest
+from _distribution_support import (
+    inbox_distribution_plan,
+    no_artifact_outcome_contract,
+)
+
+import daita.storage.sqlite as sqlite_module
 from daita._json import FrozenJsonObject
+from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import AccessMode, OperationalEffect, ToolOutput
 from daita.capability_runtime import (
     CapabilityRuntime,
     InternalCapabilityOutcome,
     InternalCapabilityRequest,
 )
+from daita.distribution import DistributionOwner, OutcomeState
 from daita.llm.models import CanonicalMessage, MessageRole, ModelSensitivity, TextBlock
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.routines.models import (
@@ -23,9 +32,9 @@ from daita.routines.models import (
     ResourceRevisionObservation,
     ResourceRevisionPrecheck,
     RoutineOccurrenceDisposition,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutineState,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
     text_digest,
 )
 from daita.routines.owner import RoutineOwner
@@ -36,7 +45,7 @@ NOW = datetime(2026, 8, 28, 12, tzinfo=UTC)
 
 
 class _Owner:
-    async def authority_snapshot(self, routine: ScheduledRoutineV1) -> FrozenJsonObject:
+    async def authority_snapshot(self, routine: ScheduledRoutine) -> FrozenJsonObject:
         return FrozenJsonObject.from_mapping({"routine_id": routine.routine_id})
 
 
@@ -78,9 +87,9 @@ def _routine(
     *,
     precheck: ResourceRevisionPrecheck | None = None,
     observation: ResourceRevisionObservation | None = None,
-) -> ScheduledRoutineV1:
+) -> ScheduledRoutine:
     instruction = "Read the exact resource and report its current value."
-    return ScheduledRoutineV1(
+    return ScheduledRoutine(
         routine_id="routine-supervisor",
         agent_id="agent-1",
         conversation_id="conversation-1",
@@ -105,7 +114,8 @@ def _routine(
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
         eligible_model_routes=("mock",),
         skill_bindings=(),
-        delivery_destination="conversation_inbox:conversation-1",
+        outcome_contract=no_artifact_outcome_contract(),
+        distribution_plan=inbox_distribution_plan("conversation-1"),
         per_run_max_tokens=1_000,
         per_run_max_cost_usd=Decimal("0.10"),
         cumulative_max_tokens=10_000,
@@ -124,7 +134,7 @@ def _routine(
         next_due_at=None,
         active_occurrence_id=None,
         last_occurrence_id=None,
-        last_delivery_id=None,
+        last_delivery_ids=(),
         promotion_evidence=None,
         state=RoutineState.ACTIVE,
         revision=1,
@@ -174,7 +184,7 @@ def _ids() -> Callable[[str], str]:
 
 async def _wait_for_terminal(
     store: SQLiteStateStore, occurrence_id: str
-) -> RoutineOccurrenceV1:
+) -> RoutineOccurrence:
     for _ in range(200):
         occurrence = await store.load_routine_occurrence("agent-1", occurrence_id)
         if occurrence is not None and occurrence.disposition in {
@@ -202,10 +212,16 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     await _seed_conversation(store)
     routine = await store.admit_scheduled_routine(_routine())
+    distribution = DistributionOwner(agent_id="agent-1", store=store)
+    artifacts = await AgentHomeArtifactStore.open(
+        agent_id="agent-1",
+        agent_home=tmp_path,
+        references=store,
+    )
     executed = 0
 
     async def execute(
-        occurrence: RoutineOccurrenceV1,
+        occurrence: RoutineOccurrence,
         run: RunInput,
         observation: ResourceRevisionObservation | None,
     ) -> LoopExit | None:
@@ -247,6 +263,8 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
         store=store,
         owner=cast(RoutineOwner, _Owner()),
         runtime=cast(CapabilityRuntime, _UnusedRuntime()),
+        distribution=distribution,
+        artifacts=artifacts,
         execute_run=execute,
         clock=lambda: NOW,
         id_factory=_ids(),
@@ -264,7 +282,131 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
             len(await store.list_routine_occurrences("agent-1", routine.routine_id))
             == 1
         )
-        assert len(await store.list_inbox("agent-1")) == 1
+        assert len(await store.list_deliveries("agent-1")) == 1
+    finally:
+        await supervisor.close()
+        await store.close()
+
+
+async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    monkeypatch.setattr(sqlite_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    await _seed_conversation(store)
+    full_routine = await store.admit_scheduled_routine(
+        replace(_routine(), routine_id="routine-capacity-first")
+    )
+    assert full_routine.next_due_at is not None
+    full_occurrence = await store.claim_due_routine_occurrence(
+        "agent-1",
+        full_routine.routine_id,
+        expected_revision=full_routine.revision,
+        expected_due_at=full_routine.next_due_at,
+        claimed_at=NOW,
+        claim_token="claim-capacity-first",
+    )
+    assert full_occurrence is not None
+    full_finalized = await store.finalize_routine_occurrence(
+        "agent-1",
+        full_occurrence.occurrence_id,
+        delivery_id="delivery-capacity-first",
+        finalized_at=NOW,
+        failure_code="routine_test_failure",
+    )
+    assert full_finalized is not None and full_finalized[1] is not None
+
+    waiting_routine = await store.admit_scheduled_routine(
+        replace(_routine(), routine_id="routine-capacity-second")
+    )
+    distribution = DistributionOwner(agent_id="agent-1", store=store)
+    artifacts = await AgentHomeArtifactStore.open(
+        agent_id="agent-1",
+        agent_home=tmp_path,
+        references=store,
+    )
+
+    async def execute(
+        occurrence: RoutineOccurrence,
+        run: RunInput,
+        observation: ResourceRevisionObservation | None,
+    ) -> LoopExit | None:
+        assert observation is None
+        assert run.execution_scope is not None
+        bound = await store.bind_routine_occurrence_run(
+            "agent-1",
+            occurrence.occurrence_id,
+            claim_token=cast(str, occurrence.claim_token),
+            run_id=run.id,
+            execution_scope=run.execution_scope,
+            bound_at=NOW,
+        )
+        assert bound is not None
+        await store.start(run)
+        await store.append(run.id, run.start_message())
+        result = LoopExit(
+            run_id=run.id,
+            conversation_id="conversation-1",
+            kind=LoopExitKind.COMPLETED,
+            reason="assistant_text",
+            created_at=NOW,
+            final_text="Capacity retry completed.",
+            steps=1,
+        )
+        await store.complete(
+            result,
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                content=(TextBlock("Capacity retry completed."),),
+            ),
+        )
+        return result
+
+    supervisor = RoutineSupervisor(
+        agent_id="agent-1",
+        store=store,
+        owner=cast(RoutineOwner, _Owner()),
+        runtime=cast(CapabilityRuntime, _UnusedRuntime()),
+        distribution=distribution,
+        artifacts=artifacts,
+        execute_run=execute,
+        clock=lambda: NOW,
+        id_factory=_ids(),
+        poll_seconds=30,
+    )
+    try:
+        await supervisor.start()
+        occurrence_id = await _wait_for_occurrence_id(
+            store,
+            waiting_routine.routine_id,
+        )
+        for _ in range(200):
+            pending = await store.load_routine_occurrence("agent-1", occurrence_id)
+            if (
+                pending is not None
+                and pending.disposition
+                is RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("routine did not reach pending finalization")
+
+        acknowledged = await store.acknowledge_delivery(
+            "agent-1",
+            "delivery-capacity-first",
+            acknowledged_at=NOW + timedelta(seconds=1),
+        )
+        assert acknowledged is not None
+        supervisor.wake()
+        terminal = await _wait_for_terminal(store, occurrence_id)
+        assert terminal.disposition is RoutineOccurrenceDisposition.COMPLETED
+        deliveries = await store.list_deliveries(
+            "agent-1",
+            include_acknowledged=True,
+        )
+        assert tuple(value.subject_id for value in deliveries) == (occurrence_id,)
     finally:
         await supervisor.close()
         await store.close()
@@ -290,10 +432,16 @@ async def test_unchanged_precheck_advances_with_zero_model_runs(tmp_path) -> Non
         _routine(precheck=precheck, observation=observation)
     )
     runtime = _ObservationRuntime(replace(observation, observed_at=NOW))
+    distribution = DistributionOwner(agent_id="agent-1", store=store)
+    artifacts = await AgentHomeArtifactStore.open(
+        agent_id="agent-1",
+        agent_home=tmp_path,
+        references=store,
+    )
     model_calls = 0
 
     async def execute(
-        occurrence: RoutineOccurrenceV1,
+        occurrence: RoutineOccurrence,
         run: RunInput,
         observed: ResourceRevisionObservation | None,
     ) -> LoopExit | None:
@@ -307,6 +455,8 @@ async def test_unchanged_precheck_advances_with_zero_model_runs(tmp_path) -> Non
         store=store,
         owner=cast(RoutineOwner, _Owner()),
         runtime=cast(CapabilityRuntime, runtime),
+        distribution=distribution,
+        artifacts=artifacts,
         execute_run=execute,
         clock=lambda: NOW,
         id_factory=_ids(),
@@ -319,7 +469,9 @@ async def test_unchanged_precheck_advances_with_zero_model_runs(tmp_path) -> Non
         assert terminal.disposition is RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
         assert runtime.calls == 1
         assert model_calls == 0
-        assert await store.list_inbox("agent-1") == ()
+        deliveries = await store.list_deliveries("agent-1")
+        assert len(deliveries) == 1
+        assert deliveries[0].outcome.conclusion_state is OutcomeState.SKIPPED_NO_CHANGE
     finally:
         await supervisor.close()
         await store.close()

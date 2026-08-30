@@ -726,6 +726,7 @@ def data_profile_declarations(
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"application/json"}),
+            allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),
             allowed_extensions=(("application/json", (".json",)),),
             artifact_required=True,
             max_artifact_count=1,

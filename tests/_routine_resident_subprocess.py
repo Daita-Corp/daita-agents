@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _distribution_support import no_artifact_outcome_contract
+
 import asyncio
 import json
 import sqlite3
@@ -17,6 +19,7 @@ from daita import (
     ScheduledRoutineDraft,
 )
 from daita.hosting.resident import run_resident_host
+from daita.distribution import conversation_inbox_destination_id
 from daita.llm.models import (
     FinishReason,
     ModelResponse,
@@ -42,7 +45,7 @@ def response() -> ModelResponse:
 def inbox_count(state_path: Path) -> int:
     connection = sqlite3.connect(f"file:{state_path}?mode=ro", uri=True)
     try:
-        row = connection.execute("SELECT COUNT(*) FROM conversation_inbox").fetchone()
+        row = connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()
         assert row is not None
         return int(row[0])
     finally:
@@ -89,6 +92,10 @@ async def main(root: Path) -> None:
         allowed_resource_ids=(resource.id,),
         allowed_capability_ids=("catalog.inspect",),
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        outcome_contract=no_artifact_outcome_contract(),
+        distribution_destination_id=conversation_inbox_destination_id(
+            origin.conversation_id
+        ),
         eligible_model_routes=(foreground.provider_id,),
         per_run_max_tokens=1_000,
         per_run_max_cost_usd=Decimal("0"),

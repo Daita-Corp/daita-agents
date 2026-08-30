@@ -191,7 +191,9 @@ observation. Its order is:
 
 Static owners are `DataCapabilityDomain` for catalog, query, update, and local
 file behavior; `MemoryCapabilityDomain`; `SkillCapabilityDomain`;
-`SemanticCapabilityDomain`; and `ArtifactCapabilityDomain`.
+`SemanticCapabilityDomain`; `ArtifactCapabilityDomain`;
+`RoutineCapabilityDomain`; and, only for accepted D2 management/inspection,
+`DistributionCapabilityDomain`.
 `LearningCandidateGuard` owns the bounded transient learning selection and
 mutation-success state shared by those owners. Applicability and current-state
 validation remain with these concrete owners, never the common runtime.
@@ -332,20 +334,21 @@ dispatcher, workflow or execution graph, universal task/work abstraction,
 job-kind switch or handler registry, dynamic registration, plugin executor,
 completion router, recovery service, event bus, resident daemon, client/server
 split, competing writer, multi-host queue, resumable model state, or later-stage
-scaffolding. The accepted Stage D1 slice below is the sole exception for its
-exact scheduled-routine owner and resident single-writer host. Work still
-pauses whenever no admitted `EmbeddedAgent` host is open; D1 may keep that same
-host open in a dedicated headless process but may not create another execution
-or state owner.
+scaffolding. The accepted Stage D1 and D2 slices below are the sole exceptions
+for the exact scheduled-routine owner, one channel-neutral distribution owner,
+and the resident single-writer host. Work still pauses whenever no admitted
+`EmbeddedAgent` host is open; Stage D may keep that same host open in a
+dedicated headless process but may not create another execution or state owner.
 
 ### Accepted Stage D1 general scheduled-read slice
 
-North Star Stage D1 is accepted for implementation, but only as the first
+North Star Stage D1 is implemented as the first
 general scheduled-read vertical slice. It extends the implemented Stage C
 invocation, immutable scope, bounded run, terminal convergence, and
-conversation-inbox contracts. It does not authorize D2 external channel
-delivery, D3 recurring ingestion or any other scheduled effect, Stage E graphs,
-or a generic scheduler framework.
+conversation-inbox contracts. Its own boundary remains read-only and inbox-
+only. The separately accepted D2 slice below may extend artifact and delivery
+owners but does not authorize D3 recurring ingestion or any other scheduled
+effect, Stage E graphs, or a generic scheduler framework.
 
 The accepted D1 physical shape is:
 
@@ -414,6 +417,74 @@ handler registry, or compatibility path. The North Star Stage D1 physical
 design ledger and implementation plan are normative for file ownership,
 atomic transitions, sequencing, and exit tests.
 
+### Accepted Stage D2 outcome and distribution foundation
+
+North Star Stage D2 is accepted for implementation only through Sections
+16.1.12-16.1.13 of the authoritative North Star document. This revised slice
+supersedes the earlier bundled MCP-to-CSV-to-SMTP design. D2 adds
+transport-neutral outcome and distribution contracts, one source-neutral
+canonical result-snapshot capability, a small certified scheduled-artifact
+surface, and one channel-neutral logical `Delivery` owner while retaining the
+conversation inbox as the only admitted destination. It does not authorize D3
+ingestion, any external delivery channel, or any other scheduled effect.
+
+The accepted D2 physical shape and ownership are:
+
+- use stable unsuffixed production class, function, protocol, and module names;
+  persisted codecs may retain only their internal discriminator `version = 1`;
+- cleanly rename the pre-production version-suffixed routine and occurrence
+  Python records with no alias, fallback, or dual supported name;
+- add bounded `OutcomeContract`, `ArtifactRequirement`, `DistributionPlan`,
+  `DistributionTargetBinding`, `OutcomeReference`,
+  `ConversationInboxTarget`, `Delivery`, Inbox projection, and inspection
+  records under `daita.distribution`;
+- cleanly replace durable `InboxItem` and `conversation_inbox` with one
+  `Delivery` aggregate in `deliveries`; Stage C follow-ups and D1 occurrences
+  are producers of the same atomic logical-delivery path, and Inbox remains
+  only a bounded product projection;
+- replace routine, occurrence, grant, and `ExecutionScope` destination strings
+  with the exact typed outcome/distribution contracts, ordered delivery IDs,
+  and immutable distribution-plan digest;
+- keep source discovery with the existing catalog, source-scope, MCP-binding,
+  run-tool-catalog, and concrete capability owners; add destination discovery,
+  delivery list/inspect, and acknowledgment through one static distribution
+  owner without creating a second source or destination registry;
+- add only `artifact.snapshot_result` / `artifact_snapshot_result` as the new
+  source-neutral artifact capability, producing one canonical bounded
+  `application/json` artifact from an exact earlier successful current-run
+  result without source I/O or format projection;
+- certify only `artifact.create_document`, `data.sqlite.export_tabular`,
+  `data.postgresql.export_tabular`, and `artifact.snapshot_result` as
+  `scheduled_direct`; every artifact inventory, read, conversion, edit,
+  local-publication, or export-location capability remains
+  `interactive_only`; and
+- preserve the ordinary `AgentLoop`, `CapabilityRuntime`, scheduler,
+  supervisor, artifact store, SQLite state owner, writer boundary, governance,
+  provenance, sensitivity, atomic finalization, and restart semantics.
+
+D2 scheduled execution remains read-only and effect-free. The only admissible
+distribution target is the routine's exact conversation inbox. Outcome
+requirements and target identity are frozen during foreground admission;
+scheduled model text, tool names, source data, and remote schemas cannot choose
+or enlarge them. The finalizer resolves committed artifacts through the
+artifact-store boundary, validates the exact outcome and current destination,
+constructs immutable references, and commits producer convergence plus the
+unique logical deliveries before any UI wake.
+
+Implementation must delete the obsolete table, codecs, durable model, direct
+SQL, destination strings, duplicate finalizers, tests, and architecture
+allowances in the same replacement. This is pre-production: there is no
+migration bridge, compatibility decoder, SQL view, trigger, dual write,
+fallback, alias field, or retained obsolete path.
+
+The North Star fixed bounds, exact table/index/codec shapes, seven ordered work
+packages, gates, live-test authorization, deletion audit, and D2 exit criteria
+are normative. D2 adds no SMTP, email, messaging, webhook, external transport
+adapter, database or MCP write, outbox, delivery-attempt framework,
+distribution supervisor, generic channel/plugin registry, completion router,
+workflow, event bus, second scheduler/runtime/loop/state owner/writer, new job
+type, D3 mechanism, or Stage E scaffolding.
+
 Do not add or restore these mechanisms in order to implement an MVP feature:
 
 - `Operation`, `Task`, `Workflow`, `Checkpoint`, `Lease`, or resume runtimes;
@@ -429,7 +500,7 @@ Do not add or restore these mechanisms in order to implement an MVP feature:
   plugin auto-install;
 - background learning/review agents, memory provider registries, vector stores,
   skill activation state machines, or any monitor/scheduler outside the exact
-  accepted Stage D1 routine owner;
+  accepted Stage D routine owner;
 - trace trees, telemetry stores/exporters, or versioned telemetry payloads; or
 - interaction-protocol version frameworks, generic compatibility decoders,
   root-framework v1 fallbacks, or migration machinery outside the existing

@@ -6,8 +6,13 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 import pytest
+from _distribution_support import (
+    inbox_distribution_plan,
+    no_artifact_outcome_contract,
+)
 
 from daita.capabilities import (
     AccessMode,
@@ -40,6 +45,8 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
+from daita.distribution import DistributionOwner, conversation_inbox_destination_id
+from daita.distribution.owner import DistributionStore
 from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
 from daita.routines.capabilities import (
     ROUTINE_CREATE_CAPABILITY_ID,
@@ -51,9 +58,9 @@ from daita.routines.models import (
     MisfirePolicy,
     ReportingMode,
     RoutineControlAction,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutineState,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
 )
 from daita.routines.owner import RoutineError, RoutineOwner
 from daita.routines.schedule import first_slot
@@ -96,7 +103,7 @@ class _Catalog:
 
 class _Store:
     def __init__(self) -> None:
-        self.routines: dict[str, ScheduledRoutineV1] = {}
+        self.routines: dict[str, ScheduledRoutine] = {}
         self.transcripts: dict[str, Transcript] = {
             "run-origin": Transcript(
                 RunInput(
@@ -111,8 +118,8 @@ class _Store:
         self.results: dict[str, LoopExit] = {}
 
     async def admit_scheduled_routine(
-        self, routine: ScheduledRoutineV1
-    ) -> ScheduledRoutineV1:
+        self, routine: ScheduledRoutine
+    ) -> ScheduledRoutine:
         if routine.routine_id in self.routines:
             raise ValueError("routine_identity_already_exists")
         stored = replace(
@@ -128,7 +135,7 @@ class _Store:
 
     async def load_scheduled_routine(
         self, agent_id: str, routine_id: str
-    ) -> ScheduledRoutineV1 | None:
+    ) -> ScheduledRoutine | None:
         routine = self.routines.get(routine_id)
         return routine if routine is not None and routine.agent_id == agent_id else None
 
@@ -138,7 +145,7 @@ class _Store:
         *,
         states: frozenset[RoutineState] = frozenset(),
         limit: int = 50,
-    ) -> tuple[ScheduledRoutineV1, ...]:
+    ) -> tuple[ScheduledRoutine, ...]:
         return tuple(
             item
             for item in self.routines.values()
@@ -151,16 +158,16 @@ class _Store:
         routine_id: str,
         *,
         limit: int = 100,
-    ) -> tuple[RoutineOccurrenceV1, ...]:
+    ) -> tuple[RoutineOccurrence, ...]:
         del agent_id, routine_id, limit
         return ()
 
     async def revise_scheduled_routine(
         self,
-        routine: ScheduledRoutineV1,
+        routine: ScheduledRoutine,
         *,
         expected_revision: int,
-    ) -> ScheduledRoutineV1 | None:
+    ) -> ScheduledRoutine | None:
         current = self.routines.get(routine.routine_id)
         if current is None or current.revision != expected_revision:
             return None
@@ -175,7 +182,7 @@ class _Store:
         expected_revision: int,
         state: RoutineState,
         transitioned_at: datetime,
-    ) -> ScheduledRoutineV1 | None:
+    ) -> ScheduledRoutine | None:
         current = await self.load_scheduled_routine(agent_id, routine_id)
         if current is None or current.revision != expected_revision:
             return None
@@ -340,6 +347,10 @@ def _unbound_owner(store: _Store, skills: SkillStore | None = None) -> RoutineOw
         agent_id="agent-1",
         store=store,
         catalog=_Catalog(),
+        distribution=DistributionOwner(
+            agent_id="agent-1",
+            store=cast(DistributionStore, store),
+        ),
         skills=skills,
         eligible_model_routes=("mock",),
         maximum_per_run_tokens=10_000,
@@ -360,7 +371,7 @@ async def _proposal(
     capability_ids: tuple[str, ...] = ("test.read",),
     skill_names: tuple[str, ...] = (),
     basis_run_id: str | None = None,
-) -> ScheduledRoutineV1:
+) -> ScheduledRoutine:
     return await owner.prepare_create(
         run_id="run-origin",
         conversation_id="conversation-1",
@@ -376,6 +387,8 @@ async def _proposal(
         allowed_resource_ids=(RESOURCE.id,),
         allowed_capability_ids=capability_ids,
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        outcome_contract=no_artifact_outcome_contract(),
+        distribution_destination_id=conversation_inbox_destination_id("conversation-1"),
         eligible_model_routes=("mock",),
         per_run_max_tokens=1_000,
         per_run_max_cost_usd=Decimal("0.10"),
@@ -419,6 +432,35 @@ async def test_owner_admits_lists_inspects_and_controls_exact_agent_scope() -> N
     )
     assert paused.state is RoutineState.PAUSED
     assert paused.revision == 2
+
+
+async def test_owner_revalidates_exact_distribution_target_before_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _Store()
+    owner = _owner(store)
+    admitted = await owner.admit(await _proposal(owner))
+
+    monkeypatch.setattr(
+        owner._distribution,
+        "resolve_plan",
+        lambda *args, **kwargs: inbox_distribution_plan(
+            "conversation-1",
+            ModelSensitivity.CONFIDENTIAL,
+        ),
+    )
+    with pytest.raises(RoutineError) as changed:
+        await owner.authority_snapshot(admitted)
+    assert changed.value.code == "routine_distribution_destination_changed"
+
+    def revoked(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise ValueError("destination revoked")
+
+    monkeypatch.setattr(owner._distribution, "resolve_plan", revoked)
+    with pytest.raises(RoutineError) as unavailable:
+        await owner.authority_snapshot(admitted)
+    assert unavailable.value.code == "routine_distribution_destination_revoked"
 
 
 async def test_owner_rejects_interactive_capability_and_forged_origin() -> None:

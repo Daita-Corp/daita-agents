@@ -11,6 +11,7 @@ from typing import Protocol
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.mcp import MCPBindingState, MCPServerBinding
+from ..artifacts.models import ArtifactAuthorship
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
@@ -20,6 +21,12 @@ from ..capabilities import (
 )
 from ..catalog.models import CatalogResource, Sensitivity
 from ..errors import DaitaError, ErrorRetryability
+from ..distribution import (
+    DistributionOwner,
+    OutcomeContract,
+    distribution_plan_projection,
+    outcome_contract_projection,
+)
 from ..llm.models import ModelSensitivity
 from ..loop.models import (
     LoopExit,
@@ -41,14 +48,14 @@ from .models import (
     ReportingMode,
     ResourceRevisionPrecheck,
     RoutineControlAction,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutinePromotionEvidence,
     RoutineSchedule,
     RoutineSkillBinding,
     RoutineState,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
     text_digest,
 )
 from .schedule import validate_schedule
@@ -66,12 +73,12 @@ class RoutineError(DaitaError):
 
 class RoutineStore(Protocol):
     async def admit_scheduled_routine(
-        self, routine: ScheduledRoutineV1
-    ) -> ScheduledRoutineV1: ...
+        self, routine: ScheduledRoutine
+    ) -> ScheduledRoutine: ...
 
     async def load_scheduled_routine(
         self, agent_id: str, routine_id: str
-    ) -> ScheduledRoutineV1 | None: ...
+    ) -> ScheduledRoutine | None: ...
 
     async def list_scheduled_routines(
         self,
@@ -79,7 +86,7 @@ class RoutineStore(Protocol):
         *,
         states: frozenset[RoutineState] = frozenset(),
         limit: int = MAX_ROUTINE_LIST_PAGE_SIZE,
-    ) -> tuple[ScheduledRoutineV1, ...]: ...
+    ) -> tuple[ScheduledRoutine, ...]: ...
 
     async def list_routine_occurrences(
         self,
@@ -87,14 +94,14 @@ class RoutineStore(Protocol):
         routine_id: str,
         *,
         limit: int = MAX_ROUTINE_HISTORY_PAGE_SIZE,
-    ) -> tuple[RoutineOccurrenceV1, ...]: ...
+    ) -> tuple[RoutineOccurrence, ...]: ...
 
     async def revise_scheduled_routine(
         self,
-        routine: ScheduledRoutineV1,
+        routine: ScheduledRoutine,
         *,
         expected_revision: int,
-    ) -> ScheduledRoutineV1 | None: ...
+    ) -> ScheduledRoutine | None: ...
 
     async def transition_scheduled_routine(
         self,
@@ -104,7 +111,7 @@ class RoutineStore(Protocol):
         expected_revision: int,
         state: RoutineState,
         transitioned_at: datetime,
-    ) -> ScheduledRoutineV1 | None: ...
+    ) -> ScheduledRoutine | None: ...
 
     async def claim_manual_routine_occurrence(
         self,
@@ -161,6 +168,7 @@ class RoutineOwner:
         agent_id: str,
         store: RoutineStore,
         catalog: RoutineCatalog,
+        distribution: DistributionOwner,
         skills: RoutineSkillStore | None,
         eligible_model_routes: tuple[str, ...],
         maximum_per_run_tokens: int,
@@ -183,6 +191,7 @@ class RoutineOwner:
         self.agent_id = agent_id
         self._store = store
         self._catalog = catalog
+        self._distribution = distribution
         self._capabilities: CapabilityRegistry | None = None
         self._skills = skills
         self._eligible_model_routes = routes
@@ -224,6 +233,8 @@ class RoutineOwner:
         allowed_resource_ids: tuple[str, ...],
         allowed_capability_ids: tuple[str, ...],
         sensitivity_ceiling: ModelSensitivity,
+        outcome_contract: OutcomeContract,
+        distribution_destination_id: str,
         eligible_model_routes: tuple[str, ...],
         per_run_max_tokens: int,
         per_run_max_cost_usd: Decimal,
@@ -235,7 +246,7 @@ class RoutineOwner:
         expires_at: datetime,
         skill_names: tuple[str, ...],
         basis_run_id: str | None,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         origin = await self._owned_run(run_id, conversation_id)
         promotion = (
             None
@@ -255,7 +266,18 @@ class RoutineOwner:
             skill_names,
             attached_at=origin.run.created_at,
         )
-        record = ScheduledRoutineV1(
+        try:
+            distribution_plan = self._distribution.resolve_plan(
+                conversation_id,
+                destination_id=distribution_destination_id,
+                sensitivity_ceiling=sensitivity_ceiling,
+            )
+        except ValueError as error:
+            raise RoutineError(
+                "routine_distribution_destination_invalid",
+                "The exact distribution destination is not currently selectable.",
+            ) from error
+        record = ScheduledRoutine(
             routine_id=f"routine-{routine_hash}",
             agent_id=self.agent_id,
             conversation_id=conversation_id,
@@ -276,9 +298,10 @@ class RoutineOwner:
             allowed_access_modes=access_modes,
             allowed_operational_effects=frozenset({OperationalEffect.NONE}),
             sensitivity_ceiling=sensitivity_ceiling,
+            outcome_contract=outcome_contract,
+            distribution_plan=distribution_plan,
             eligible_model_routes=eligible_model_routes,
             skill_bindings=skill_bindings,
-            delivery_destination=f"conversation_inbox:{conversation_id}",
             per_run_max_tokens=per_run_max_tokens,
             per_run_max_cost_usd=per_run_max_cost_usd,
             cumulative_max_tokens=cumulative_max_tokens,
@@ -297,7 +320,7 @@ class RoutineOwner:
             next_due_at=None,
             active_occurrence_id=None,
             last_occurrence_id=None,
-            last_delivery_id=None,
+            last_delivery_ids=(),
             promotion_evidence=promotion,
             state=RoutineState.ACTIVE,
             revision=1,
@@ -307,7 +330,7 @@ class RoutineOwner:
         await self.proposal_authority_snapshot(record)
         return record
 
-    async def admit(self, routine: ScheduledRoutineV1) -> ScheduledRoutineV1:
+    async def admit(self, routine: ScheduledRoutine) -> ScheduledRoutine:
         await self._retain_bindings(routine.skill_bindings)
         await self.authority_snapshot(routine)
         try:
@@ -319,7 +342,7 @@ class RoutineOwner:
 
     async def prepare_revision(
         self,
-        current: ScheduledRoutineV1,
+        current: ScheduledRoutine,
         *,
         run_id: str,
         conversation_id: str,
@@ -334,6 +357,8 @@ class RoutineOwner:
         allowed_resource_ids: tuple[str, ...],
         allowed_capability_ids: tuple[str, ...],
         sensitivity_ceiling: ModelSensitivity,
+        outcome_contract: OutcomeContract,
+        distribution_destination_id: str,
         eligible_model_routes: tuple[str, ...],
         per_run_max_tokens: int,
         per_run_max_cost_usd: Decimal,
@@ -345,7 +370,7 @@ class RoutineOwner:
         expires_at: datetime,
         skill_names: tuple[str, ...],
         basis_run_id: str | None,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         origin = await self._owned_run(run_id, conversation_id)
         if current.conversation_id != conversation_id:
             raise RoutineError(
@@ -371,6 +396,17 @@ class RoutineOwner:
             skill_names,
             attached_at=origin.run.created_at,
         )
+        try:
+            distribution_plan = self._distribution.resolve_plan(
+                conversation_id,
+                destination_id=distribution_destination_id,
+                sensitivity_ceiling=sensitivity_ceiling,
+            )
+        except ValueError as error:
+            raise RoutineError(
+                "routine_distribution_destination_invalid",
+                "The exact distribution destination is not currently selectable.",
+            ) from error
         revised = replace(
             current,
             title=title,
@@ -387,6 +423,8 @@ class RoutineOwner:
             allowed_capability_ids=allowed_capability_ids,
             allowed_access_modes=self._access_modes(allowed_capability_ids),
             sensitivity_ceiling=sensitivity_ceiling,
+            outcome_contract=outcome_contract,
+            distribution_plan=distribution_plan,
             eligible_model_routes=eligible_model_routes,
             skill_bindings=skill_bindings,
             per_run_max_tokens=per_run_max_tokens,
@@ -406,10 +444,10 @@ class RoutineOwner:
 
     async def revise(
         self,
-        routine: ScheduledRoutineV1,
+        routine: ScheduledRoutine,
         *,
         expected_revision: int,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         await self._retain_bindings(routine.skill_bindings)
         await self.authority_snapshot(routine)
         try:
@@ -458,7 +496,7 @@ class RoutineOwner:
         expected_revision: int,
         action: RoutineControlAction,
         authorized_control_call_id: str,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         current = await self._load_owned(routine_id)
         if current is None or current.revision != expected_revision:
             raise RoutineError(
@@ -540,7 +578,7 @@ class RoutineOwner:
         self._notify()
         return updated
 
-    async def authority_snapshot(self, routine: ScheduledRoutineV1) -> FrozenJsonObject:
+    async def authority_snapshot(self, routine: ScheduledRoutine) -> FrozenJsonObject:
         """Revalidate the complete retained routine contract."""
 
         return await self._authority_snapshot(
@@ -549,7 +587,7 @@ class RoutineOwner:
         )
 
     async def proposal_authority_snapshot(
-        self, routine: ScheduledRoutineV1
+        self, routine: ScheduledRoutine
     ) -> FrozenJsonObject:
         """Revalidate a proposal before its exact skill bytes are retained."""
 
@@ -560,7 +598,7 @@ class RoutineOwner:
 
     async def _authority_snapshot(
         self,
-        routine: ScheduledRoutineV1,
+        routine: ScheduledRoutine,
         *,
         allow_unretained_skills: bool,
     ) -> FrozenJsonObject:
@@ -577,6 +615,23 @@ class RoutineOwner:
             raise RoutineError(
                 "routine_conversation_missing",
                 "The exact destination conversation is unavailable.",
+            )
+        target = routine.distribution_plan.targets[0]
+        try:
+            current_plan = self._distribution.resolve_plan(
+                routine.conversation_id,
+                destination_id=target.destination_id,
+                sensitivity_ceiling=target.sensitivity_ceiling,
+            )
+        except ValueError as error:
+            raise RoutineError(
+                "routine_distribution_destination_revoked",
+                "The exact distribution destination is no longer eligible.",
+            ) from error
+        if current_plan != routine.distribution_plan:
+            raise RoutineError(
+                "routine_distribution_destination_changed",
+                "The exact distribution destination revision changed.",
             )
         if not set(routine.eligible_model_routes) <= set(self._eligible_model_routes):
             raise RoutineError(
@@ -631,6 +686,40 @@ class RoutineOwner:
                     "contract_digest": capabilities.contract_digest(capability_id),
                 }
             )
+        for requirement in routine.outcome_contract.artifact_requirements:
+            producer_ids = requirement.allowed_producer_capability_ids or capability_ids
+            candidates = []
+            for producer_id in producer_ids:
+                if producer_id not in capability_ids:
+                    raise RoutineError(
+                        "routine_outcome_capability_outside_scope",
+                        "An outcome artifact producer is outside the capability ceiling.",
+                    )
+                producer = capabilities.capability(producer_id)
+                policy = producer.artifact_policy
+                if policy is None:
+                    continue
+                media_matches = not requirement.allowed_media_types or bool(
+                    set(requirement.allowed_media_types)
+                    & set(policy.allowed_media_types)
+                )
+                authorships = set(requirement.allowed_authorships)
+                if routine.outcome_contract.require_exact_source_bindings:
+                    authorships = (
+                        authorships & {ArtifactAuthorship.EXACT_SOURCE_DATA}
+                        if authorships
+                        else {ArtifactAuthorship.EXACT_SOURCE_DATA}
+                    )
+                authorship_matches = not authorships or bool(
+                    authorships & set(policy.allowed_authorships)
+                )
+                if media_matches and authorship_matches:
+                    candidates.append(producer_id)
+            if requirement.required and not candidates:
+                raise RoutineError(
+                    "routine_outcome_artifact_contract_invalid",
+                    "An outcome artifact requirement cannot be satisfied by its producers.",
+                )
         if bool(routine.skill_bindings) != (SKILL_VIEW_CAPABILITY_ID in capability_ids):
             raise RoutineError(
                 "routine_skill_capability_invalid",
@@ -775,6 +864,8 @@ class RoutineOwner:
                     "resources": tuple(resource_facts),
                     "bindings": tuple(binding_facts),
                     "skills": tuple(skill_facts),
+                    "outcome_contract_digest": routine.outcome_contract.digest,
+                    "distribution_plan_digest": routine.distribution_plan.plan_digest,
                     "eligible_model_routes": self._eligible_model_routes,
                 },
             }
@@ -959,7 +1050,7 @@ class RoutineOwner:
             raise RuntimeError("routine owner capability registry is not bound")
         return capabilities
 
-    async def _load_owned(self, routine_id: str) -> ScheduledRoutineV1 | None:
+    async def _load_owned(self, routine_id: str) -> ScheduledRoutine | None:
         if not isinstance(routine_id, str) or not routine_id:
             raise ValueError("routine_id must be non-empty text")
         return await self._store.load_scheduled_routine(self.agent_id, routine_id)
@@ -976,7 +1067,7 @@ class RoutineOwner:
             self._wake()
 
 
-def _summary(routine: ScheduledRoutineV1) -> ScheduledRoutineSummary:
+def _summary(routine: ScheduledRoutine) -> ScheduledRoutineSummary:
     return ScheduledRoutineSummary(
         routine_id=routine.routine_id,
         title=routine.title,
@@ -1043,7 +1134,7 @@ def _schedule_payload(schedule: RoutineSchedule) -> dict[str, object]:
     return payload
 
 
-def _routine_proposal_payload(routine: ScheduledRoutineV1) -> dict[str, object]:
+def _routine_proposal_payload(routine: ScheduledRoutine) -> dict[str, object]:
     return {
         "routine_id": routine.routine_id,
         "conversation_id": routine.conversation_id,
@@ -1080,7 +1171,8 @@ def _routine_proposal_payload(routine: ScheduledRoutineV1) -> dict[str, object]:
             }
             for binding in routine.skill_bindings
         ),
-        "delivery_destination": routine.delivery_destination,
+        "outcome_contract": outcome_contract_projection(routine.outcome_contract),
+        "distribution_plan": distribution_plan_projection(routine.distribution_plan),
         "per_run_max_tokens": routine.per_run_max_tokens,
         "per_run_max_cost_usd": str(routine.per_run_max_cost_usd),
         "cumulative_max_tokens": routine.cumulative_max_tokens,

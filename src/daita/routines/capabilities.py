@@ -26,6 +26,15 @@ from ..capabilities import (
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
+from ..artifacts.models import ArtifactAuthorship
+from ..distribution.models import (
+    MAX_OUTCOME_ARTIFACT_BYTES,
+    MAX_OUTCOME_ARTIFACT_REFERENCES,
+    MAX_OUTCOME_ARTIFACT_REQUIREMENTS,
+    MAX_OUTCOME_TOTAL_ARTIFACT_BYTES,
+    ArtifactRequirement,
+    OutcomeContract,
+)
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput, RunOrigin
 from .models import (
@@ -53,12 +62,12 @@ from .models import (
     ReportingMode,
     ResourceRevisionPrecheck,
     RoutineControlAction,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutineSchedule,
     RoutineState,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
 )
 from .owner import RoutineError, RoutineOwner, _routine_proposal_payload
 
@@ -479,7 +488,7 @@ def routine_capability_declarations(
 
 async def _create_proposal(
     owner: RoutineOwner, request: ToolExecution
-) -> ScheduledRoutineV1:
+) -> ScheduledRoutine:
     if request.conversation_id is None:
         raise RoutineError(
             "routine_conversation_required",
@@ -496,7 +505,7 @@ async def _create_proposal(
 
 async def _update_proposal(
     owner: RoutineOwner, request: ToolExecution
-) -> tuple[ScheduledRoutineV1, int]:
+) -> tuple[ScheduledRoutine, int]:
     if request.conversation_id is None:
         raise RoutineError(
             "routine_conversation_required",
@@ -532,6 +541,8 @@ class _ParsedSpec(TypedDict):
     allowed_resource_ids: tuple[str, ...]
     allowed_capability_ids: tuple[str, ...]
     sensitivity_ceiling: ModelSensitivity
+    outcome_contract: OutcomeContract
+    distribution_destination_id: str
     eligible_model_routes: tuple[str, ...]
     per_run_max_tokens: int
     per_run_max_cost_usd: Decimal
@@ -561,6 +572,12 @@ def _parsed_spec(arguments: Mapping[str, object]) -> _ParsedSpec:
         "allowed_capability_ids": _strings(arguments, "allowed_capability_ids"),
         "sensitivity_ceiling": ModelSensitivity(
             _string(arguments, "sensitivity_ceiling")
+        ),
+        "outcome_contract": _parse_outcome_contract(
+            _mapping(arguments, "outcome_contract")
+        ),
+        "distribution_destination_id": _string(
+            arguments, "distribution_destination_id"
         ),
         "eligible_model_routes": _strings(arguments, "eligible_model_routes"),
         "per_run_max_tokens": _integer(arguments, "per_run_max_tokens"),
@@ -627,6 +644,70 @@ def _parse_precheck(value: object) -> ResourceRevisionPrecheck | None:
     )
 
 
+def _parse_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
+    requirements_value = value.get("artifact_requirements")
+    if not isinstance(requirements_value, tuple):
+        raise CapabilityInputError(
+            "routine_outcome_contract_invalid",
+            "artifact_requirements must be an exact array.",
+        )
+    requirements: list[ArtifactRequirement] = []
+    for item in requirements_value:
+        if not isinstance(item, Mapping):
+            raise CapabilityInputError(
+                "routine_outcome_contract_invalid",
+                "Each artifact requirement must be an exact object.",
+            )
+        raw_authorships = _strings(item, "allowed_authorships")
+        try:
+            requirements.append(
+                ArtifactRequirement(
+                    required=_boolean(item, "required"),
+                    minimum_count=_integer(item, "minimum_count"),
+                    maximum_count=_integer(item, "maximum_count"),
+                    allowed_media_types=_strings(item, "allowed_media_types"),
+                    allowed_authorships=tuple(
+                        ArtifactAuthorship(authorship) for authorship in raw_authorships
+                    ),
+                    allowed_producer_capability_ids=_strings(
+                        item, "allowed_producer_capability_ids"
+                    ),
+                    maximum_artifact_bytes=_integer(item, "maximum_artifact_bytes"),
+                    maximum_total_bytes=_integer(item, "maximum_total_bytes"),
+                    maximum_sensitivity=ModelSensitivity(
+                        _string(item, "maximum_sensitivity")
+                    ),
+                )
+            )
+        except (TypeError, ValueError) as error:
+            raise CapabilityInputError(
+                "routine_outcome_contract_invalid",
+                "An artifact requirement is invalid.",
+            ) from error
+    try:
+        return OutcomeContract(
+            require_terminal_conclusion=_boolean(value, "require_terminal_conclusion"),
+            artifact_requirements=tuple(requirements),
+            maximum_total_artifact_bytes=_integer(
+                value, "maximum_total_artifact_bytes"
+            ),
+            maximum_effective_sensitivity=ModelSensitivity(
+                _string(value, "maximum_effective_sensitivity")
+            ),
+            require_current_run_provenance=_boolean(
+                value, "require_current_run_provenance"
+            ),
+            require_exact_source_bindings=_boolean(
+                value, "require_exact_source_bindings"
+            ),
+        )
+    except (TypeError, ValueError) as error:
+        raise CapabilityInputError(
+            "routine_outcome_contract_invalid",
+            "The outcome contract is invalid.",
+        ) from error
+
+
 def _spec_schema(*, update: bool) -> dict[str, object]:
     properties: dict[str, object] = {
         "title": {
@@ -656,6 +737,12 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         "sensitivity_ceiling": {
             "type": "string",
             "enum": [item.value for item in ModelSensitivity],
+        },
+        "outcome_contract": _outcome_contract_schema(),
+        "distribution_destination_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024,
         },
         "eligible_model_routes": _identity_array_schema(minimum=1),
         "per_run_max_tokens": {
@@ -709,6 +796,8 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         "allowed_resource_ids",
         "allowed_capability_ids",
         "sensitivity_ceiling",
+        "outcome_contract",
+        "distribution_destination_id",
         "eligible_model_routes",
         "per_run_max_tokens",
         "per_run_max_cost_usd",
@@ -757,6 +846,100 @@ def _identity_array_schema(*, minimum: int = 0) -> dict[str, object]:
     }
 
 
+def _outcome_contract_schema() -> dict[str, object]:
+    identity_array = _identity_array_schema()
+    media_array = {
+        "type": "array",
+        "items": {"type": "string", "minLength": 3, "maxLength": 128},
+        "maxItems": 16,
+        "uniqueItems": True,
+    }
+    requirement = {
+        "type": "object",
+        "properties": {
+            "required": {"type": "boolean"},
+            "minimum_count": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_OUTCOME_ARTIFACT_REFERENCES,
+            },
+            "maximum_count": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_OUTCOME_ARTIFACT_REFERENCES,
+            },
+            "allowed_media_types": media_array,
+            "allowed_authorships": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [item.value for item in ArtifactAuthorship],
+                },
+                "maxItems": len(ArtifactAuthorship),
+                "uniqueItems": True,
+            },
+            "allowed_producer_capability_ids": identity_array,
+            "maximum_artifact_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_OUTCOME_ARTIFACT_BYTES,
+            },
+            "maximum_total_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": MAX_OUTCOME_TOTAL_ARTIFACT_BYTES,
+            },
+            "maximum_sensitivity": {
+                "type": "string",
+                "enum": [item.value for item in ModelSensitivity],
+            },
+        },
+        "required": [
+            "required",
+            "minimum_count",
+            "maximum_count",
+            "allowed_media_types",
+            "allowed_authorships",
+            "allowed_producer_capability_ids",
+            "maximum_artifact_bytes",
+            "maximum_total_bytes",
+            "maximum_sensitivity",
+        ],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "require_terminal_conclusion": {"type": "boolean"},
+            "artifact_requirements": {
+                "type": "array",
+                "items": requirement,
+                "maxItems": MAX_OUTCOME_ARTIFACT_REQUIREMENTS,
+            },
+            "maximum_total_artifact_bytes": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": MAX_OUTCOME_TOTAL_ARTIFACT_BYTES,
+            },
+            "maximum_effective_sensitivity": {
+                "type": "string",
+                "enum": [item.value for item in ModelSensitivity],
+            },
+            "require_current_run_provenance": {"type": "boolean"},
+            "require_exact_source_bindings": {"type": "boolean"},
+        },
+        "required": [
+            "require_terminal_conclusion",
+            "artifact_requirements",
+            "maximum_total_artifact_bytes",
+            "maximum_effective_sensitivity",
+            "require_current_run_provenance",
+            "require_exact_source_bindings",
+        ],
+        "additionalProperties": False,
+    }
+
+
 def _money_schema(maximum: Decimal) -> dict[str, object]:
     del maximum
     return {
@@ -791,7 +974,7 @@ def _summary_payload(item: ScheduledRoutineSummary) -> dict[str, object]:
     }
 
 
-def _routine_payload(item: ScheduledRoutineV1) -> dict[str, object]:
+def _routine_payload(item: ScheduledRoutine) -> dict[str, object]:
     payload = _routine_proposal_payload(item)
     payload.update(
         {
@@ -809,7 +992,7 @@ def _routine_payload(item: ScheduledRoutineV1) -> dict[str, object]:
     return payload
 
 
-def _occurrence_payload(item: RoutineOccurrenceV1) -> dict[str, object]:
+def _occurrence_payload(item: RoutineOccurrence) -> dict[str, object]:
     return {
         "occurrence_id": item.occurrence_id,
         "routine_revision": item.routine_revision,
@@ -818,7 +1001,7 @@ def _occurrence_payload(item: RoutineOccurrenceV1) -> dict[str, object]:
         "disposition": item.disposition.value,
         "reserved_run_id": item.reserved_run_id,
         "terminal_run_id": item.terminal_run_id,
-        "delivery_id": item.delivery_id,
+        "delivery_ids": item.delivery_ids,
         "failure_code": item.failure_code,
         "attempt_count": item.attempt_count,
         "updated_at": item.updated_at.isoformat(),
@@ -846,6 +1029,15 @@ def _integer(values: Mapping[str, object], name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise CapabilityInputError(
             "routine_argument_invalid", f"{name} must be an integer."
+        )
+    return value
+
+
+def _boolean(values: Mapping[str, object], name: str) -> bool:
+    value = values.get(name)
+    if not isinstance(value, bool):
+        raise CapabilityInputError(
+            "routine_argument_invalid", f"{name} must be a boolean."
         )
     return value
 

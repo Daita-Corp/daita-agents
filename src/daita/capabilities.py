@@ -14,7 +14,7 @@ from types import MappingProxyType
 from typing import Protocol, TypeVar
 
 from ._json import FrozenJsonObject, canonical_json
-from .artifacts.models import ArtifactDraft
+from .artifacts.models import ArtifactAuthorship, ArtifactDraft
 from .llm.models import ModelSensitivity, ToolDefinition
 
 _T = TypeVar("_T")
@@ -82,7 +82,7 @@ class ExecutionScope:
     eligible_model_routes: tuple[str, ...]
     per_run_max_cost_usd: Decimal
     per_run_max_tokens: int
-    delivery_destination: str
+    distribution_plan_digest: str
     routine_id: str | None = None
     routine_revision: int | None = None
     occurrence_id: str | None = None
@@ -94,13 +94,18 @@ class ExecutionScope:
             (self.agent_id, "execution scope agent_id"),
             (self.principal_id, "execution scope principal_id"),
             (self.grant_id, "execution scope grant_id"),
-            (self.delivery_destination, "execution scope delivery_destination"),
+            (
+                self.distribution_plan_digest,
+                "execution scope distribution_plan_digest",
+            ),
         ):
             _text(identity_value, identity_name)
             if len(identity_value) > 512 or any(
                 character in "\r\n\x00" for character in identity_value
             ):
                 raise ValueError(f"{identity_name} must be bounded single-line text")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.distribution_plan_digest) is None:
+            raise ValueError("execution scope distribution plan digest is invalid")
         if self.job_id is not None:
             _text(self.job_id, "execution scope job_id")
             if len(self.job_id) > 512 or any(
@@ -250,7 +255,7 @@ class ExecutionScope:
                         "eligible_model_routes": self.eligible_model_routes,
                         "per_run_max_cost_usd": str(self.per_run_max_cost_usd),
                         "per_run_max_tokens": self.per_run_max_tokens,
-                        "delivery_destination": self.delivery_destination,
+                        "distribution_plan_digest": self.distribution_plan_digest,
                     }
                 ).encode("utf-8")
             ).hexdigest()
@@ -491,6 +496,7 @@ class ArtifactPolicy:
     """Stable capability metadata for its one optional artifact draft."""
 
     allowed_media_types: frozenset[str]
+    allowed_authorships: frozenset[ArtifactAuthorship]
     allowed_extensions: tuple[tuple[str, tuple[str, ...]], ...]
     artifact_required: bool
     max_artifact_count: int
@@ -503,6 +509,11 @@ class ArtifactPolicy:
             not isinstance(item, str) or not item.strip() for item in media_types
         ):
             raise ValueError("artifact policy media types must be non-empty text")
+        authorships = frozenset(self.allowed_authorships)
+        if not authorships or any(
+            not isinstance(item, ArtifactAuthorship) for item in authorships
+        ):
+            raise ValueError("artifact policy authorships must be non-empty")
         extensions = tuple(
             (media_type, tuple(values))
             for media_type, values in self.allowed_extensions
@@ -538,6 +549,7 @@ class ArtifactPolicy:
         if self.max_total_bytes_per_call < self.max_bytes_per_artifact:
             raise ValueError("per-call bytes cannot be below per-artifact bytes")
         object.__setattr__(self, "allowed_media_types", media_types)
+        object.__setattr__(self, "allowed_authorships", authorships)
         object.__setattr__(self, "allowed_extensions", extensions)
 
 

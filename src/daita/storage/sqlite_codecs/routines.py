@@ -16,13 +16,13 @@ from ...routines.models import (
     ResourceRevisionObservation,
     ResourceRevisionPrecheck,
     RoutineOccurrenceDisposition,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutinePromotionEvidence,
     RoutineSchedule,
     RoutineSkillBinding,
     RoutineSlotKind,
     RoutineState,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
 )
 from .common import (
     JsonValue,
@@ -44,14 +44,20 @@ from .common import (
     text,
 )
 from .execution_scope import decode_execution_scope, encode_execution_scope
+from .distribution import (
+    decode_distribution_plan,
+    decode_outcome_contract,
+    encode_distribution_plan,
+    encode_outcome_contract,
+)
 
 _ROUTINE_VERSION = 1
 _OCCURRENCE_VERSION = 1
 
 
-def encode_scheduled_routine(value: ScheduledRoutineV1) -> str:
-    if not isinstance(value, ScheduledRoutineV1):
-        raise TypeError("routine codec requires ScheduledRoutineV1")
+def encode_scheduled_routine(value: ScheduledRoutine) -> str:
+    if not isinstance(value, ScheduledRoutine):
+        raise TypeError("routine codec requires ScheduledRoutine")
     return dump_payload(
         record(
             "ScheduledRoutine",
@@ -95,7 +101,8 @@ def encode_scheduled_routine(value: ScheduledRoutineV1) -> str:
                 "skill_bindings": [
                     _encode_skill_binding(item) for item in value.skill_bindings
                 ],
-                "delivery_destination": value.delivery_destination,
+                "outcome_contract": encode_outcome_contract(value.outcome_contract),
+                "distribution_plan": encode_distribution_plan(value.distribution_plan),
                 "per_run_max_tokens": value.per_run_max_tokens,
                 "per_run_max_cost_usd": decimal_encode(value.per_run_max_cost_usd),
                 "cumulative_max_tokens": value.cumulative_max_tokens,
@@ -116,7 +123,7 @@ def encode_scheduled_routine(value: ScheduledRoutineV1) -> str:
                 "next_due_at": optional_datetime_encode(value.next_due_at),
                 "active_occurrence_id": value.active_occurrence_id,
                 "last_occurrence_id": value.last_occurrence_id,
-                "last_delivery_id": value.last_delivery_id,
+                "last_delivery_ids": list(value.last_delivery_ids),
                 "promotion_evidence": (
                     None
                     if value.promotion_evidence is None
@@ -136,7 +143,7 @@ def decode_scheduled_routine(
     *,
     agent_id: str,
     routine_id: str,
-) -> ScheduledRoutineV1:
+) -> ScheduledRoutine:
     fields = record_fields(
         load_payload(value),
         "ScheduledRoutine",
@@ -162,7 +169,8 @@ def decode_scheduled_routine(
             "sensitivity_ceiling",
             "eligible_model_routes",
             "skill_bindings",
-            "delivery_destination",
+            "outcome_contract",
+            "distribution_plan",
             "per_run_max_tokens",
             "per_run_max_cost_usd",
             "cumulative_max_tokens",
@@ -181,7 +189,7 @@ def decode_scheduled_routine(
             "next_due_at",
             "active_occurrence_id",
             "last_occurrence_id",
-            "last_delivery_id",
+            "last_delivery_ids",
             "promotion_evidence",
             "state",
             "revision",
@@ -214,7 +222,7 @@ def decode_scheduled_routine(
     precheck = fields["precheck"]
     observation = fields["last_acknowledged_precheck_observation"]
     promotion = fields["promotion_evidence"]
-    return ScheduledRoutineV1(
+    return ScheduledRoutine(
         routine_id=routine_id,
         agent_id=agent_id,
         conversation_id=text(fields["conversation_id"], "routine conversation"),
@@ -263,10 +271,8 @@ def decode_scheduled_routine(
             _decode_skill_binding(item)
             for item in sequence(fields["skill_bindings"], "skill bindings")
         ),
-        delivery_destination=text(
-            fields["delivery_destination"],
-            "routine destination",
-        ),
+        outcome_contract=decode_outcome_contract(fields["outcome_contract"]),
+        distribution_plan=decode_distribution_plan(fields["distribution_plan"]),
         per_run_max_tokens=integer(
             fields["per_run_max_tokens"],
             "routine per-run tokens",
@@ -309,9 +315,9 @@ def decode_scheduled_routine(
             fields["last_occurrence_id"],
             "routine last occurrence",
         ),
-        last_delivery_id=optional_text(
-            fields["last_delivery_id"],
-            "routine last delivery",
+        last_delivery_ids=_text_sequence(
+            fields["last_delivery_ids"],
+            "last delivery ids",
         ),
         promotion_evidence=(
             None if promotion is None else _decode_promotion(promotion)
@@ -323,9 +329,9 @@ def decode_scheduled_routine(
     )
 
 
-def encode_routine_occurrence(value: RoutineOccurrenceV1) -> str:
-    if not isinstance(value, RoutineOccurrenceV1):
-        raise TypeError("routine codec requires RoutineOccurrenceV1")
+def encode_routine_occurrence(value: RoutineOccurrence) -> str:
+    if not isinstance(value, RoutineOccurrence):
+        raise TypeError("routine codec requires RoutineOccurrence")
     return dump_payload(
         record(
             "RoutineOccurrence",
@@ -359,7 +365,7 @@ def encode_routine_occurrence(value: RoutineOccurrenceV1) -> str:
                 "run_terminal_at": optional_datetime_encode(value.run_terminal_at),
                 "conclusion_digest": value.conclusion_digest,
                 "terminal_run_id": value.terminal_run_id,
-                "delivery_id": value.delivery_id,
+                "delivery_ids": list(value.delivery_ids),
                 "attempt_count": value.attempt_count,
                 "failure_code": value.failure_code,
                 "retry_at": optional_datetime_encode(value.retry_at),
@@ -376,7 +382,7 @@ def decode_routine_occurrence(
     *,
     agent_id: str,
     occurrence_id: str,
-) -> RoutineOccurrenceV1:
+) -> RoutineOccurrence:
     fields = record_fields(
         load_payload(value),
         "RoutineOccurrence",
@@ -402,7 +408,7 @@ def decode_routine_occurrence(
             "run_terminal_at",
             "conclusion_digest",
             "terminal_run_id",
-            "delivery_id",
+            "delivery_ids",
             "attempt_count",
             "failure_code",
             "retry_at",
@@ -422,7 +428,7 @@ def decode_routine_occurrence(
         raise ValueError("stored occurrence enum is invalid") from None
     observation = fields["precheck_observation"]
     scope = fields["execution_scope"]
-    return RoutineOccurrenceV1(
+    return RoutineOccurrence(
         occurrence_id=occurrence_id,
         agent_id=agent_id,
         routine_id=text(fields["routine_id"], "occurrence routine id"),
@@ -468,7 +474,7 @@ def decode_routine_occurrence(
             fields["terminal_run_id"],
             "occurrence terminal run id",
         ),
-        delivery_id=optional_text(fields["delivery_id"], "occurrence delivery id"),
+        delivery_ids=_text_sequence(fields["delivery_ids"], "delivery ids"),
         attempt_count=integer(fields["attempt_count"], "occurrence attempts"),
         failure_code=optional_text(fields["failure_code"], "occurrence failure code"),
         retry_at=optional_datetime_decode(fields["retry_at"]),

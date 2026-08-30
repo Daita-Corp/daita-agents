@@ -387,6 +387,7 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
             "artifacts",
             "data",
             "data_profile_jobs",
+            "distribution",
             "jobs",
             "memory",
             "routines",
@@ -418,6 +419,9 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["start_data_profile"] == "data_profile_jobs"
         assert resolved["job_list"] == "jobs"
         assert resolved["routine_list"] == "routines"
+        assert resolved["distribution_destination_list"] == "distribution"
+        assert resolved["delivery_list"] == "distribution"
+        assert resolved["delivery_inspect"] == "distribution"
     finally:
         await agent.close()
 
@@ -453,18 +457,24 @@ def test_public_surface_is_focused():
         "ArtifactError",
         "ArtifactPayload",
         "ArtifactRef",
+        "ArtifactRequirement",
         "ApprovalDecision",
         "ApprovalHandler",
         "ApprovalRequest",
         "AmbiguousTimePolicy",
         "CalendarDaySelector",
         "CalendarSchedule",
+        "ConversationInboxTarget",
         "ConversationRun",
         "CatalogSummary",
         "DocumentCandidateContent",
-        "DeliverySubject",
+        "Delivery",
+        "DeliveryInspection",
         "DeliverySubjectKind",
         "DeliveryState",
+        "DistributionDestination",
+        "DistributionPlan",
+        "DistributionTargetBinding",
         "LearningCandidate",
         "LearningCandidateAction",
         "LearningCandidateError",
@@ -475,7 +485,7 @@ def test_public_surface_is_focused():
         "LearningReviewResult",
         "LearningReviewStatus",
         "JobExecutionMode",
-        "InboxItem",
+        "InboxView",
         "IntervalSchedule",
         "JobInspection",
         "JobResultView",
@@ -507,6 +517,11 @@ def test_public_surface_is_focused():
         "ModelRouteCandidate",
         "NonexistentTimePolicy",
         "OnceSchedule",
+        "OutcomeConclusionKind",
+        "OutcomeArtifactReference",
+        "OutcomeContract",
+        "OutcomeReference",
+        "OutcomeState",
         "PostgreSQLSource",
         "PostgreSQLUpdateReadiness",
         "RetryPolicy",
@@ -533,7 +548,7 @@ def test_public_surface_is_focused():
         "ScheduledRoutineDraft",
         "ScheduledRoutineInspection",
         "ScheduledRoutineSummary",
-        "ScheduledRoutineV1",
+        "ScheduledRoutine",
         "Transcript",
         "__version__",
         "create_llm_provider",
@@ -560,17 +575,28 @@ def test_stage_b_has_one_job_aggregate_and_no_parallel_execution_system():
         assert f"CREATE TABLE {parallel_table}" not in schema
 
 
-def test_stage_c_has_one_followup_aggregate_and_one_inbox_without_parallel_runtime():
+def test_stage_c_and_d2_have_one_followup_and_distribution_owner_without_parallel_runtime():
     assert _class_owners("AutonomousFollowup") == {"autonomy.py"}
-    assert _class_owners("InboxItem") == {"autonomy.py"}
+    assert _class_owners("Delivery") == {"distribution/models.py"}
+    assert _class_owners("DistributionOwner") == {"distribution/owner.py"}
     assert _class_owners("RunStartEnvelope") == {"loop/models.py"}
     assert _class_owners("InboxScreen") == {"tui/screens/inbox.py"}
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     assert schema.count("CREATE TABLE autonomous_followups") == 1
-    assert schema.count("CREATE TABLE conversation_inbox") == 1
+    assert schema.count("CREATE TABLE deliveries") == 1
     production = _python_text(PACKAGE)
+    assert "InboxItem" not in production
+    assert "conversation_inbox" not in schema
     assert "allowed_read_capabilities" not in production
     assert "mark_job_terminal_observed" not in production
+    sqlite = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    distribution_owner = (PACKAGE / "distribution" / "owner.py").read_text(
+        encoding="utf-8"
+    )
+    assert "OutcomeReference(" not in sqlite
+    assert "logical_delivery_key(" not in sqlite
+    assert sqlite.count("construct_logical_delivery(") == 2
+    assert "def construct_logical_delivery(" in distribution_owner
     for table in (
         "completion_events",
         "followup_attempts",
@@ -619,8 +645,8 @@ def test_stage_c_has_one_followup_aggregate_and_one_inbox_without_parallel_runti
 
 
 def test_stage_d1_has_one_routine_owner_and_one_production_capability_registry():
-    assert _class_owners("ScheduledRoutineV1") == {"routines/models.py"}
-    assert _class_owners("RoutineOccurrenceV1") == {"routines/models.py"}
+    assert _class_owners("ScheduledRoutine") == {"routines/models.py"}
+    assert _class_owners("RoutineOccurrence") == {"routines/models.py"}
     assert _class_owners("RoutineOwner") == {"routines/owner.py"}
     assert _class_owners("RoutineSupervisor") == {"routines/supervisor.py"}
 
@@ -1897,7 +1923,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "learning_candidates",
             "job_runs",
             "autonomous_followups",
-            "conversation_inbox",
+            "deliveries",
             "mcp_server_bindings",
             "messages",
             "metadata",
@@ -1929,13 +1955,17 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
                 "event_id",
                 "data",
             ),
-            "conversation_inbox": (
+            "deliveries": (
                 "agent_id",
                 "delivery_id",
                 "conversation_id",
                 "subject_kind",
                 "subject_id",
                 "logical_key",
+                "target_kind",
+                "target_fingerprint",
+                "state",
+                "created_at_us",
                 "data",
             ),
             "messages": ("run_id", "position", "data"),
@@ -1983,6 +2013,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "syncs": ("agent_id", "id", "source_id", "data"),
         }
         assert named_indexes == {
+            "deliveries_conversation_history": "deliveries",
             "routine_occurrences_stale": "routine_occurrences",
             "runs_conversation_turn": "runs",
             "scheduled_routines_due": "scheduled_routines",

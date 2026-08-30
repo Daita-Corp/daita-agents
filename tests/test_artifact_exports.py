@@ -688,6 +688,55 @@ async def _sqlite_export_agent(
     return agent, provider, source.id, database
 
 
+async def test_sqlite_export_is_discoverable_as_an_effect_free_source_read(
+    tmp_path: Path,
+) -> None:
+    downloads = tmp_path / "downloads-discovery"
+    downloads.mkdir()
+    agent, provider, _source_id, _database = await _sqlite_export_agent(
+        tmp_path,
+        name="csv-discovery",
+        rows=(("row", 1),),
+        downloads=downloads,
+    )
+    provider.replace_script(
+        (
+            _tools(
+                ToolCall(
+                    id="search-export",
+                    name="toolbox_search",
+                    arguments={
+                        "query": "exact SQLite CSV export",
+                        "toolboxes": ["artifacts"],
+                        "data_access": "read",
+                        "operational_effect": "none",
+                        "limit": 5,
+                    },
+                )
+            ),
+            _stop(),
+        )
+    )
+    try:
+        result = await agent.run("Find the exact SQLite CSV export tool.")
+        block = _result_for_call(await agent.transcript(result.run_id), "search-export")
+        assert block.is_error is False
+        data = block.output.get("data")
+        assert isinstance(data, Mapping)
+        matches = data.get("matches")
+        assert isinstance(matches, tuple)
+        export_matches = tuple(
+            item
+            for item in matches
+            if item.get("tool_name") == SQLITE_TABULAR_EXPORT_TOOL_NAME
+        )
+        assert len(export_matches) == 1
+        assert export_matches[0].get("data_access") == "read"
+        assert export_matches[0].get("operational_effect") == "none"
+    finally:
+        await agent.close()
+
+
 async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

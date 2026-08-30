@@ -66,7 +66,7 @@ EAGER_LIMITS = LoopLimits()
 def _profile(provider: MockModelProvider) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=20_000,
+        context_window_tokens=32_000,
         max_output_tokens=1_000,
         supports_tools=True,
         supports_parallel_tools=True,

@@ -12,6 +12,15 @@ from hashlib import sha256
 
 from ._json import FrozenJsonObject, canonical_json
 from .capabilities import AccessMode, ExecutionScope, OperationalEffect
+from .distribution.models import (
+    CONVERSATION_INBOX_DESTINATION_REVISION,
+    ConversationInboxTarget,
+    DistributionPlan,
+    OutcomeContract,
+    conversation_inbox_destination_id,
+    distribution_plan_digest,
+    target_fingerprint,
+)
 from .jobs.models import JobExecutionMode, JobRun
 from .llm.models import (
     MessageRole,
@@ -22,14 +31,10 @@ from .llm.models import (
 from .loop.models import LoopExit, LoopExitKind, LoopLimits, RunOrigin, Transcript
 
 MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT = 256
-MAX_CONVERSATION_INBOX_ITEMS_PER_AGENT = 256
-MAX_INBOX_PAGE_SIZE = 50
 MAX_FOLLOWUP_ATTEMPTS = 3
 MAX_FOLLOWUP_EVENT_BYTES = 16 * 1_024
 MAX_FOLLOWUP_AUDIT_BYTES = 1024 * 1_024
-MAX_INBOX_PAYLOAD_BYTES = 64 * 1_024
 MAX_FOLLOWUP_RESULT_PREVIEW_BYTES = 4 * 1_024
-MAX_INBOX_REPORT_PREVIEW_BYTES = 48 * 1_024
 FOLLOWUP_LEASE_SECONDS = 30.0
 FOLLOWUP_EXPIRY_SECONDS = 3_600.0
 FOLLOWUP_INSTRUCTION_ID = "stage_c.terminal_job_report.v1"
@@ -142,30 +147,6 @@ class FollowupDisposition(str, Enum):
     EXPIRED = "expired"
 
 
-class DeliveryState(str, Enum):
-    AVAILABLE = "available"
-    BLOCKED = "blocked"
-    ACKNOWLEDGED = "acknowledged"
-
-
-class DeliverySubjectKind(str, Enum):
-    STANDALONE_FOLLOWUP = "standalone_followup"
-    ROUTINE_OCCURRENCE = "routine_occurrence"
-
-
-@dataclass(frozen=True, slots=True)
-class DeliverySubject:
-    """The typed owner of one committed conclusion and logical delivery."""
-
-    kind: DeliverySubjectKind
-    subject_id: str
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.kind, DeliverySubjectKind):
-            raise TypeError("delivery subject kind is invalid")
-        _text(self.subject_id, "delivery subject_id", maximum=256)
-
-
 @dataclass(frozen=True, slots=True)
 class FollowupConclusionEvidence:
     """Code-derived proof that the bounded run inspected its exact job outcome."""
@@ -237,9 +218,9 @@ class FollowupGrant:
     instruction_id: str
     instruction_digest: str
     sensitivity_ceiling: ModelSensitivity
-    delivery_sensitivity_ceiling: ModelSensitivity
+    outcome_contract: OutcomeContract
+    distribution_plan: DistributionPlan
     eligible_model_routes: tuple[str, ...]
-    delivery_destination: str
     max_successful_runs: int
     max_attempts: int
     per_run_max_cost_usd: Decimal
@@ -260,7 +241,6 @@ class FollowupGrant:
                 "follow-up allowed terminal observation",
             ),
             (self.instruction_id, "follow-up instruction_id"),
-            (self.delivery_destination, "follow-up delivery destination"),
         ):
             _text(identity_value, identity_name)
         if _DIGEST.fullmatch(self.instruction_digest) is None:
@@ -282,11 +262,24 @@ class FollowupGrant:
             not isinstance(item, OperationalEffect) for item in effects
         ):
             raise ValueError("follow-up grant requires allowed operational effects")
-        if not isinstance(self.sensitivity_ceiling, ModelSensitivity) or not isinstance(
-            self.delivery_sensitivity_ceiling,
-            ModelSensitivity,
+        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
+            raise TypeError("follow-up sensitivity ceiling is invalid")
+        if not isinstance(self.outcome_contract, OutcomeContract):
+            raise TypeError("follow-up outcome contract is invalid")
+        if not isinstance(self.distribution_plan, DistributionPlan):
+            raise TypeError("follow-up distribution plan is invalid")
+        if any(
+            target.conversation_id != self.conversation_id
+            for target in self.distribution_plan.targets
         ):
-            raise TypeError("follow-up sensitivity ceilings are invalid")
+            raise ValueError(
+                "follow-up distribution plan belongs to another conversation"
+            )
+        if (
+            self.outcome_contract.maximum_effective_sensitivity.routing_rank
+            > self.sensitivity_ceiling.routing_rank
+        ):
+            raise ValueError("follow-up outcome sensitivity exceeds its ceiling")
         if self.max_successful_runs != 1:
             raise ValueError("Stage C permits exactly one successful run")
         if (
@@ -339,7 +332,7 @@ class FollowupGrant:
             and set(scope.eligible_model_routes) <= set(self.eligible_model_routes)
             and scope.per_run_max_cost_usd <= self.per_run_max_cost_usd
             and scope.per_run_max_tokens <= self.per_run_max_tokens
-            and scope.delivery_destination == self.delivery_destination
+            and scope.distribution_plan_digest == self.distribution_plan.plan_digest
         )
 
 
@@ -510,89 +503,6 @@ class AutonomousFollowup:
         object.__setattr__(self, "audit_context", audit)
 
 
-@dataclass(frozen=True, slots=True)
-class InboxItem:
-    delivery_id: str
-    agent_id: str
-    conversation_id: str
-    subject: DeliverySubject
-    resulting_run_id: str | None
-    grant_id: str
-    logical_key: str
-    conclusion_digest: str
-    payload: Mapping[str, object]
-    sensitivity: ModelSensitivity
-    destination: str
-    destination_sensitivity_ceiling: ModelSensitivity
-    state: DeliveryState
-    created_at: datetime
-    updated_at: datetime
-    attempt_count: int = 1
-    acknowledged_at: datetime | None = None
-    terminal_error: str | None = None
-
-    def __post_init__(self) -> None:
-        for value, name in (
-            (self.delivery_id, "inbox delivery_id"),
-            (self.agent_id, "inbox agent_id"),
-            (self.conversation_id, "inbox conversation_id"),
-            (self.grant_id, "inbox grant_id"),
-            (self.logical_key, "inbox logical_key"),
-            (self.destination, "inbox destination"),
-        ):
-            _text(value, name)
-        if not isinstance(self.subject, DeliverySubject):
-            raise TypeError("inbox subject is invalid")
-        if self.resulting_run_id is not None:
-            _text(self.resulting_run_id, "inbox resulting_run_id")
-        if _DIGEST.fullmatch(self.conclusion_digest) is None:
-            raise ValueError("inbox conclusion digest is invalid")
-        payload = _bounded_mapping(
-            self.payload,
-            "inbox payload",
-            MAX_INBOX_PAYLOAD_BYTES,
-        )
-        if (
-            self.subject.kind is DeliverySubjectKind.STANDALONE_FOLLOWUP
-            and self.resulting_run_id is None
-        ):
-            raise ValueError("follow-up inbox item requires a run")
-        if self.resulting_run_id is None and (
-            self.subject.kind is not DeliverySubjectKind.ROUTINE_OCCURRENCE
-            or payload.get("outcome") != "failed"
-            or payload.get("escalation") is not True
-        ):
-            raise ValueError("no-run inbox item must be a routine escalation")
-        if not isinstance(self.sensitivity, ModelSensitivity) or not isinstance(
-            self.destination_sensitivity_ceiling,
-            ModelSensitivity,
-        ):
-            raise TypeError("inbox sensitivity values are invalid")
-        if not isinstance(self.state, DeliveryState):
-            raise TypeError("inbox state is invalid")
-        _utc(self.created_at, "inbox created_at")
-        _utc(self.updated_at, "inbox updated_at")
-        _optional_utc(self.acknowledged_at, "inbox acknowledged_at")
-        if (
-            not isinstance(self.attempt_count, int)
-            or isinstance(self.attempt_count, bool)
-            or self.attempt_count < 1
-        ):
-            raise ValueError("inbox attempt_count must be positive")
-        if (self.state is DeliveryState.ACKNOWLEDGED) != (
-            self.acknowledged_at is not None
-        ):
-            raise ValueError("inbox acknowledgment state is inconsistent")
-        if self.state is DeliveryState.AVAILABLE and (
-            self.sensitivity.routing_rank
-            > self.destination_sensitivity_ceiling.routing_rank
-        ):
-            raise ValueError("inbox available state exceeds destination eligibility")
-        if self.terminal_error is not None:
-            _text(self.terminal_error, "inbox terminal_error", maximum=128)
-        object.__setattr__(self, "payload", payload)
-
-
 class FollowupIdentityConflictError(ValueError):
     """One event identity was reused with different bounded content."""
 
@@ -711,13 +621,6 @@ def assess_followup_conclusion(
     )
 
 
-def inbox_report_projection(report: str) -> tuple[str, str, bool]:
-    """Return stable report identity and one bounded user-visible preview."""
-
-    preview, truncated = _utf8_preview(report, MAX_INBOX_REPORT_PREVIEW_BYTES)
-    return _text_digest(report), preview, truncated
-
-
 def _result_capability_id(block: ToolResultBlock) -> str | None:
     return block.capability_id
 
@@ -796,6 +699,36 @@ def create_terminal_job_followup(
     expires_at = received_at + timedelta(seconds=FOLLOWUP_EXPIRY_SECONDS)
     cumulative_cost = limits.max_estimated_cost_usd * MAX_FOLLOWUP_ATTEMPTS
     cumulative_tokens = limits.max_total_tokens * MAX_FOLLOWUP_ATTEMPTS
+    destination_id = conversation_inbox_destination_id(job.conversation_id)
+    target = ConversationInboxTarget(
+        conversation_id=job.conversation_id,
+        destination_id=destination_id,
+        destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+        sensitivity_ceiling=sensitivity,
+        target_fingerprint=target_fingerprint(
+            conversation_id=job.conversation_id,
+            destination_id=destination_id,
+            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+            sensitivity_ceiling=sensitivity,
+        ),
+    )
+    targets = (target,)
+    distribution_plan = DistributionPlan(
+        targets=targets,
+        required_target_count=1,
+        plan_digest=distribution_plan_digest(
+            targets=targets,
+            required_target_count=1,
+        ),
+    )
+    outcome_contract = OutcomeContract(
+        require_terminal_conclusion=True,
+        artifact_requirements=(),
+        maximum_total_artifact_bytes=0,
+        maximum_effective_sensitivity=sensitivity,
+        require_current_run_provenance=True,
+        require_exact_source_bindings=False,
+    )
     grant = FollowupGrant(
         grant_id=grant_id,
         job_id=job.job_id,
@@ -811,9 +744,9 @@ def create_terminal_job_followup(
         instruction_id=FOLLOWUP_INSTRUCTION_ID,
         instruction_digest=FOLLOWUP_INSTRUCTION_DIGEST,
         sensitivity_ceiling=sensitivity,
-        delivery_sensitivity_ceiling=sensitivity,
+        outcome_contract=outcome_contract,
+        distribution_plan=distribution_plan,
         eligible_model_routes=eligible_model_routes,
-        delivery_destination=f"conversation_inbox:{job.conversation_id}",
         max_successful_runs=1,
         max_attempts=MAX_FOLLOWUP_ATTEMPTS,
         per_run_max_cost_usd=limits.max_estimated_cost_usd,
@@ -839,7 +772,7 @@ def create_terminal_job_followup(
         eligible_model_routes=eligible_model_routes,
         per_run_max_cost_usd=limits.max_estimated_cost_usd,
         per_run_max_tokens=limits.max_total_tokens,
-        delivery_destination=grant.delivery_destination,
+        distribution_plan_digest=grant.distribution_plan.plan_digest,
     )
     return AutonomousFollowup(
         followup_id=followup_id,
@@ -863,9 +796,6 @@ def create_terminal_job_followup(
 
 __all__ = [
     "AutonomousFollowup",
-    "DeliverySubject",
-    "DeliverySubjectKind",
-    "DeliveryState",
     "FOLLOWUP_EXPIRY_SECONDS",
     "FOLLOWUP_INSTRUCTION",
     "FOLLOWUP_INSTRUCTION_DIGEST",
@@ -877,13 +807,9 @@ __all__ = [
     "FollowupGrant",
     "FollowupIdentityConflictError",
     "FollowupObservationSource",
-    "InboxItem",
     "MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT",
-    "MAX_CONVERSATION_INBOX_ITEMS_PER_AGENT",
     "MAX_FOLLOWUP_ATTEMPTS",
-    "MAX_INBOX_PAGE_SIZE",
     "create_terminal_job_followup",
     "assess_followup_conclusion",
-    "inbox_report_projection",
     "terminal_job_event_payload",
 ]

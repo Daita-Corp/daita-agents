@@ -868,6 +868,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "mcp",
         "skills",
         "routines",
+        "inbox",
     }
     assert _surface(commands["detach"]) == (
         ("name", "source_id"),
@@ -960,6 +961,29 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name", "routine_id"),
         frozenset({"-h", "--help"}),
     )
+    inbox = _subcommands(commands["inbox"])
+    assert set(inbox) == {"destinations", "list", "inspect", "acknowledge"}
+    assert _surface(inbox["destinations"]) == (
+        ("name", "conversation_id"),
+        frozenset({"-h", "--help", "--sensitivity-ceiling"}),
+    )
+    assert _surface(inbox["list"]) == (
+        ("name",),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--conversation-id",
+                "--include-acknowledged",
+                "--limit",
+            }
+        ),
+    )
+    for command in ("inspect", "acknowledge"):
+        assert _surface(inbox[command]) == (
+            ("name", "delivery_id"),
+            frozenset({"-h", "--help"}),
+        )
 
 
 def test_cli_routine_list_uses_public_agent_surface(tmp_path: Path) -> None:

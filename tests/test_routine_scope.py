@@ -11,6 +11,7 @@ from _capability_runtime_support import (
     presentation_metadata,
     static_registry,
 )
+from _distribution_support import inbox_distribution_plan
 
 from daita.capabilities import (
     AccessMode,
@@ -83,7 +84,7 @@ def _scheduled_scope(capability_ids: tuple[str, ...]) -> ExecutionScope:
         eligible_model_routes=("mock:routine",),
         per_run_max_cost_usd=Decimal("0.05"),
         per_run_max_tokens=5_000,
-        delivery_destination="conversation_inbox:conversation-1",
+        distribution_plan_digest=inbox_distribution_plan("conversation-1").plan_digest,
         routine_id="routine-1",
         routine_revision=3,
         occurrence_id="routine-occ-1",
@@ -173,7 +174,9 @@ def test_nonroutine_scope_cannot_use_mcp_only_relaxation() -> None:
             eligible_model_routes=("mock:routine",),
             per_run_max_cost_usd=Decimal("0.05"),
             per_run_max_tokens=5_000,
-            delivery_destination="conversation_inbox:conversation-1",
+            distribution_plan_digest=inbox_distribution_plan(
+                "conversation-1"
+            ).plan_digest,
             allowed_connector_binding_ids=("binding-1",),
         )
 

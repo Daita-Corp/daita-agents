@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 from _workspace_support import workspace_for
+from _distribution_support import no_artifact_outcome_contract
 
 from daita import (
     Agent,
@@ -60,6 +62,11 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
                 text="Current value is 7.",
                 usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
             ),
+            ModelResponse(
+                finish_reason=FinishReason.STOP,
+                text="Current value is 7.",
+                usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
+            ),
         ),
         provider_id="mock:routines-public",
         complete_pricing=True,
@@ -76,6 +83,13 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
         resource = (await agent.list_catalog_resources(source_id=source.id))[0]
         origin = await agent.run("Read the current value for a scheduled report.")
         assert origin.conversation_id is not None
+        destinations = await agent.distribution_destinations(
+            origin.conversation_id,
+            sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        )
+        assert len(destinations) == 1
+        assert destinations[0].kind == "conversation_inbox"
+        assert destinations[0].selectable is True
         now = datetime.now(UTC)
         draft = ScheduledRoutineDraft(
             origin_run_id=origin.run_id,
@@ -92,6 +106,8 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
             allowed_resource_ids=(resource.id,),
             allowed_capability_ids=("catalog.inspect",),
             sensitivity_ceiling=ModelSensitivity.INTERNAL,
+            outcome_contract=no_artifact_outcome_contract(),
+            distribution_destination_id=destinations[0].destination_id,
             eligible_model_routes=(provider.provider_id,),
             per_run_max_tokens=1_000,
             per_run_max_cost_usd=Decimal("0"),
@@ -109,9 +125,27 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
         assert (await agent.list_routines())[0].routine_id == created.routine_id
         assert await agent.inspect_routine(created.routine_id) is not None
 
-        paused = await agent.pause_routine(
+        revision_origin = await agent.run(
+            "Authorize the revised scheduled report definition.",
+            conversation_id=origin.conversation_id,
+        )
+        revised = await agent.update_routine(
             created.routine_id,
             expected_revision=created.revision,
+            draft=replace(
+                draft,
+                origin_run_id=revision_origin.run_id,
+                title="Revised current value report",
+            ),
+        )
+        assert revised.revision == created.revision + 1
+        assert revised.title == "Revised current value report"
+        assert revised.outcome_contract == draft.outcome_contract
+        assert revised.distribution_plan == created.distribution_plan
+
+        paused = await agent.pause_routine(
+            revised.routine_id,
+            expected_revision=revised.revision,
         )
         resumed = await agent.resume_routine(
             paused.routine_id,
@@ -139,6 +173,11 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
                 for item in inspection.recent_occurrences
             ),
             len(provider.requests),
+        )
+        delivery = await agent.inspect_delivery(inbox[0].delivery_id)
+        assert delivery is not None
+        assert delivery.delivery.outcome.conclusion_digest == (
+            inbox[0].conclusion_digest
         )
         disabled = await agent.disable_routine(
             running.routine_id,

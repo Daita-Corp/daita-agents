@@ -455,6 +455,8 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
             "catalog_search",
             "data_query_postgresql",
             "data_query_sqlite",
+            "delivery_list",
+            "distribution_destination_list",
             "file_read",
             "file_search",
             "job_inspect",
@@ -487,6 +489,7 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
             "artifact_read",
             "artifact_save_local",
             "artifact_set_export_location",
+            "artifact_snapshot_result",
             "data_export_postgresql",
             "data_export_sqlite",
         }

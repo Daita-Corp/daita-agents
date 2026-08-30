@@ -13,14 +13,14 @@ from .models import (
     ResourceRevisionPrecheck,
     RoutineControlAction,
     RoutineOccurrenceDisposition,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutineSkillBinding,
     RoutineSlotKind,
     RoutineState,
     ScheduledRoutineDraft,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
 )
 
 __all__ = [
@@ -36,12 +36,12 @@ __all__ = [
     "ResourceRevisionPrecheck",
     "RoutineControlAction",
     "RoutineOccurrenceDisposition",
-    "RoutineOccurrenceV1",
+    "RoutineOccurrence",
     "RoutineSkillBinding",
     "RoutineSlotKind",
     "RoutineState",
     "ScheduledRoutineDraft",
     "ScheduledRoutineInspection",
     "ScheduledRoutineSummary",
-    "ScheduledRoutineV1",
+    "ScheduledRoutine",
 ]

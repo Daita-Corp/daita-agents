@@ -11,6 +11,9 @@ from hashlib import sha256
 from .._json import FrozenJsonObject, canonical_json
 from ..capabilities import ExecutionScope
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
+from ..artifacts.models import ArtifactError
+from ..artifacts.store import AgentHomeArtifactStore
+from ..distribution import DistributionOwner, OutcomeArtifactReference
 from ..llm.models import ModelSensitivity
 from ..loop.models import (
     InstructionAuthority,
@@ -23,9 +26,9 @@ from ..storage.sqlite import SQLiteStateStore
 from .models import (
     ResourceRevisionObservation,
     RoutineOccurrenceDisposition,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutineState,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
 )
 from .owner import RoutineOwner
 
@@ -33,7 +36,7 @@ _DEFAULT_POLL_SECONDS = 1.0
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
 
 RoutineRunExecutor = Callable[
-    [RoutineOccurrenceV1, RunInput, ResourceRevisionObservation | None],
+    [RoutineOccurrence, RunInput, ResourceRevisionObservation | None],
     Awaitable[LoopExit | None],
 ]
 
@@ -48,6 +51,8 @@ class RoutineSupervisor:
         store: SQLiteStateStore,
         owner: RoutineOwner,
         runtime: CapabilityRuntime,
+        distribution: DistributionOwner,
+        artifacts: AgentHomeArtifactStore,
         execute_run: RoutineRunExecutor | None,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
@@ -63,6 +68,8 @@ class RoutineSupervisor:
         self._store = store
         self._owner = owner
         self._runtime = runtime
+        self._distribution = distribution
+        self._artifacts = artifacts
         self._execute_run = execute_run
         self._clock = clock
         self._id_factory = id_factory
@@ -110,7 +117,9 @@ class RoutineSupervisor:
                 if self._execute_run is not None and (
                     self._worker is None or self._worker.done()
                 ):
-                    await self._claim_one_due()
+                    await self._recover()
+                    if self._worker is None or self._worker.done():
+                        await self._claim_one_due()
                 self._wake.clear()
                 timeout = self._poll_seconds
                 try:
@@ -182,7 +191,7 @@ class RoutineSupervisor:
             self._launch(occurrence)
             return
 
-    def _launch(self, occurrence: RoutineOccurrenceV1) -> None:
+    def _launch(self, occurrence: RoutineOccurrence) -> None:
         task = asyncio.create_task(
             self._run_claimed(occurrence),
             name=f"daita-routine:{occurrence.occurrence_id}",
@@ -198,7 +207,7 @@ class RoutineSupervisor:
 
         task.add_done_callback(done)
 
-    async def _run_claimed(self, occurrence: RoutineOccurrenceV1) -> None:
+    async def _run_claimed(self, occurrence: RoutineOccurrence) -> None:
         try:
             routine = await self._store.load_scheduled_routine(
                 self._agent_id,
@@ -243,11 +252,26 @@ class RoutineSupervisor:
             )
             if terminal is None:
                 return
+            artifact_references: tuple[OutcomeArtifactReference, ...] = ()
+            outcome_contract_failure_code = None
+            try:
+                artifact_references = (
+                    await self._distribution.validate_outcome_artifacts(
+                        self._artifacts,
+                        result.artifacts,
+                        contract=routine.outcome_contract,
+                        resulting_run_id=run_id,
+                    )
+                )
+            except (ArtifactError, TypeError, ValueError):
+                outcome_contract_failure_code = "outcome_artifact_contract_failed"
             await self._store.finalize_routine_occurrence(
                 self._agent_id,
                 occurrence.occurrence_id,
                 delivery_id=self._id_factory("delivery"),
                 finalized_at=self._clock(),
+                artifact_references=artifact_references,
+                outcome_contract_failure_code=outcome_contract_failure_code,
             )
         except asyncio.CancelledError:
             raise
@@ -256,8 +280,8 @@ class RoutineSupervisor:
 
     async def _observe_precheck(
         self,
-        routine: ScheduledRoutineV1,
-        occurrence: RoutineOccurrenceV1,
+        routine: ScheduledRoutine,
+        occurrence: RoutineOccurrence,
         scope: ExecutionScope,
     ) -> ResourceRevisionObservation | None:
         precheck = routine.precheck
@@ -298,7 +322,7 @@ class RoutineSupervisor:
 
     async def _fail_unbound(
         self,
-        occurrence: RoutineOccurrenceV1,
+        occurrence: RoutineOccurrence,
         error: BaseException,
     ) -> None:
         current = await self._store.load_routine_occurrence(
@@ -329,11 +353,17 @@ class RoutineSupervisor:
                     occurrence.disposition
                     is RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
                 ):
+                    (
+                        artifact_references,
+                        outcome_contract_failure_code,
+                    ) = await self._recovered_artifact_references(occurrence)
                     await self._store.finalize_routine_occurrence(
                         self._agent_id,
                         occurrence.occurrence_id,
                         delivery_id=self._id_factory("delivery"),
                         finalized_at=self._clock(),
+                        artifact_references=artifact_references,
+                        outcome_contract_failure_code=(outcome_contract_failure_code),
                     )
                 elif (
                     occurrence.reserved_run_id is None and self._execute_run is not None
@@ -343,10 +373,34 @@ class RoutineSupervisor:
             except Exception:
                 continue
 
+    async def _recovered_artifact_references(
+        self,
+        occurrence: RoutineOccurrence,
+    ) -> tuple[tuple[OutcomeArtifactReference, ...], str | None]:
+        if occurrence.terminal_run_id is None:
+            return (), "outcome_artifact_contract_failed"
+        routine = await self._store.load_scheduled_routine(
+            self._agent_id,
+            occurrence.routine_id,
+        )
+        result = await self._store.result(occurrence.terminal_run_id)
+        if routine is None or result is None:
+            return (), "outcome_artifact_contract_failed"
+        try:
+            references = await self._distribution.validate_outcome_artifacts(
+                self._artifacts,
+                result.artifacts,
+                contract=routine.outcome_contract,
+                resulting_run_id=occurrence.terminal_run_id,
+            )
+        except (ArtifactError, TypeError, ValueError):
+            return (), "outcome_artifact_contract_failed"
+        return references, None
+
 
 def _execution_scope(
-    routine: ScheduledRoutineV1,
-    occurrence: RoutineOccurrenceV1,
+    routine: ScheduledRoutine,
+    occurrence: RoutineOccurrence,
 ) -> ExecutionScope:
     return ExecutionScope(
         scope_id=f"scope:{occurrence.occurrence_id}",
@@ -369,13 +423,13 @@ def _execution_scope(
         eligible_model_routes=routine.eligible_model_routes,
         per_run_max_cost_usd=routine.per_run_max_cost_usd,
         per_run_max_tokens=routine.per_run_max_tokens,
-        delivery_destination=routine.delivery_destination,
+        distribution_plan_digest=routine.distribution_plan.plan_digest,
     )
 
 
 def _run_input(
-    routine: ScheduledRoutineV1,
-    occurrence: RoutineOccurrenceV1,
+    routine: ScheduledRoutine,
+    occurrence: RoutineOccurrence,
     scope: ExecutionScope,
     run_id: str,
     observation: ResourceRevisionObservation | None,

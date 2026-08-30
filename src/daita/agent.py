@@ -33,7 +33,7 @@ from .artifacts.models import (
     ArtifactDestination,
     ArtifactPayload,
 )
-from .autonomy import DeliverySubject, DeliverySubjectKind, InboxItem
+from .distribution import DeliveryInspection, DistributionDestination, InboxView
 from .capabilities import ApprovalHandler
 from .catalog.models import (
     CatalogResource,
@@ -82,7 +82,7 @@ from .routines import (
     ScheduledRoutineDraft,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
 )
 from .security import KeychainStore, SecretProvider, SecretReference
 from .semantics import (
@@ -349,7 +349,7 @@ class Agent:
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = 50,
-    ) -> tuple[InboxItem, ...]:
+    ) -> tuple[InboxView, ...]:
         """Inspect bounded durable autonomous results for this agent."""
 
         return await self._embedded.inbox(
@@ -358,7 +358,28 @@ class Agent:
             limit=limit,
         )
 
-    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+    async def distribution_destinations(
+        self,
+        conversation_id: str,
+        *,
+        sensitivity_ceiling: ModelSensitivity = ModelSensitivity.RESTRICTED,
+    ) -> tuple[DistributionDestination, ...]:
+        """List exact destinations currently selectable for one conversation."""
+
+        return await self._embedded.distribution_destinations(
+            conversation_id,
+            sensitivity_ceiling=sensitivity_ceiling,
+        )
+
+    async def inspect_delivery(
+        self,
+        delivery_id: str,
+    ) -> DeliveryInspection | None:
+        """Inspect immutable safe facts for one exact logical delivery."""
+
+        return await self._embedded.inspect_delivery(delivery_id)
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxView | None:
         """Idempotently acknowledge one exact inbox result."""
 
         return await self._embedded.acknowledge_inbox(delivery_id)
@@ -391,7 +412,7 @@ class Agent:
     async def cancel_job(self, job_id: str) -> JobInspection | None:
         return await self._embedded.cancel_job(job_id)
 
-    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutineV1:
+    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
         return await self._embedded.propose_routine(draft)
 
     async def promote_routine(
@@ -399,13 +420,13 @@ class Agent:
         draft: ScheduledRoutineDraft,
         *,
         basis_run_id: str,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._embedded.promote_routine(
             draft,
             basis_run_id=basis_run_id,
         )
 
-    async def create_routine(self, proposal: ScheduledRoutineV1) -> ScheduledRoutineV1:
+    async def create_routine(self, proposal: ScheduledRoutine) -> ScheduledRoutine:
         return await self._embedded.create_routine(proposal)
 
     async def list_routines(
@@ -428,7 +449,7 @@ class Agent:
         expected_revision: int,
         draft: ScheduledRoutineDraft,
         basis_run_id: str | None = None,
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._embedded.update_routine(
             routine_id,
             expected_revision=expected_revision,
@@ -438,7 +459,7 @@ class Agent:
 
     async def pause_routine(
         self, routine_id: str, *, expected_revision: int
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._embedded.pause_routine(
             routine_id,
             expected_revision=expected_revision,
@@ -446,7 +467,7 @@ class Agent:
 
     async def resume_routine(
         self, routine_id: str, *, expected_revision: int
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._embedded.resume_routine(
             routine_id,
             expected_revision=expected_revision,
@@ -454,7 +475,7 @@ class Agent:
 
     async def run_routine_now(
         self, routine_id: str, *, expected_revision: int
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._embedded.run_routine_now(
             routine_id,
             expected_revision=expected_revision,
@@ -462,7 +483,7 @@ class Agent:
 
     async def disable_routine(
         self, routine_id: str, *, expected_revision: int
-    ) -> ScheduledRoutineV1:
+    ) -> ScheduledRoutine:
         return await self._embedded.disable_routine(
             routine_id,
             expected_revision=expected_revision,
@@ -988,9 +1009,7 @@ __all__ = [
     "AgentNotConfiguredError",
     "AgentNotFoundError",
     "HostActiveError",
-    "DeliverySubject",
-    "DeliverySubjectKind",
-    "InboxItem",
+    "InboxView",
     "JobExecutionMode",
     "JobInspection",
     "JobResultView",

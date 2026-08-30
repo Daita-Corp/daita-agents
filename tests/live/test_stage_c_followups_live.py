@@ -28,8 +28,11 @@ from _workspace_support import workspace_for
 from daita import (
     Agent,
     DeliveryState,
+    DeliverySubjectKind,
     JobStatus,
     LoopLimits,
+    OutcomeConclusionKind,
+    OutcomeState,
     SQLiteSource,
     create_llm_provider,
 )
@@ -339,14 +342,15 @@ async def _assert_live_delivery(agent: Agent, job_id: str):
     assert len(items) == 1
     item = items[0]
     assert item.state is DeliveryState.AVAILABLE
-    assert item.payload["job_id"] == job_id
-    assert item.payload["outcome"] == "completed"
-    assert isinstance(item.payload["evidence_digest"], str)
-    assert item.payload["evidence_digest"].startswith("sha256:")
-    report = item.payload["report_preview"]
+    assert item.subject_kind is DeliverySubjectKind.AUTONOMOUS_FOLLOWUP
+    assert item.conclusion_kind is OutcomeConclusionKind.TERMINAL_RUN
+    assert item.conclusion_state is OutcomeState.SUCCEEDED
+    assert item.provenance_digest.startswith("sha256:")
+    report = item.conclusion_preview
     assert isinstance(report, str) and report.strip()
     assert str(_PROFILE_ROWS) in report or "five" in report.lower()
 
+    assert item.resulting_run_id is not None
     transcript = await agent.transcript(item.resulting_run_id)
     result = await agent._embedded._store.result(item.resulting_run_id)
     assert result is not None and result.kind is LoopExitKind.COMPLETED
@@ -545,7 +549,7 @@ async def test_live_model_runs_stage_b_start_through_stage_c_inbox(
         assert terminal.summary.status is JobStatus.SUCCEEDED
 
         item, _transcript, followup_result = await _assert_live_delivery(agent, job_id)
-        assert followup_result.final_text == item.payload["report_preview"]
+        assert followup_result.final_text == item.conclusion_preview
         assert len(await agent.list_jobs()) == 1
         acknowledged = await agent.acknowledge_inbox(item.delivery_id)
         assert acknowledged is not None
@@ -632,11 +636,12 @@ async def test_live_terminal_run_is_finalized_after_reopen_without_reasoning_aga
         assert len(await agent.inbox()) == 1
         retried = await agent._embedded._store.finalize_autonomous_followup(
             agent.id,
-            item.subject.subject_id,
+            item.subject_id,
             delivery_id="delivery-live-idempotent-retry",
             finalized_at=datetime.now(UTC),
         )
-        assert retried is not None and retried[1] == item
+        assert retried is not None
+        assert retried[1].delivery_id == item.delivery_id
         assert len(await agent.inbox()) == 1
         assert recovery.requests == ()
     finally:
@@ -665,12 +670,16 @@ async def test_live_failed_terminal_job_is_reported_without_inventing_a_result(
         assert len(items) == 1
         item = items[0]
         assert item.state is DeliveryState.AVAILABLE
-        assert item.payload["job_id"] == job_id
-        assert item.payload["outcome"] == "completed"
-        report = item.payload["report_preview"]
+        assert item.subject_kind is DeliverySubjectKind.AUTONOMOUS_FOLLOWUP
+        assert item.conclusion_kind is OutcomeConclusionKind.TERMINAL_RUN
+        assert item.conclusion_state is OutcomeState.SUCCEEDED
+        report = item.conclusion_preview
         assert isinstance(report, str) and "fail" in report.casefold()
 
+        assert item.resulting_run_id is not None
         transcript = await agent.transcript(item.resulting_run_id)
+        assert transcript.run.execution_scope is not None
+        assert transcript.run.execution_scope.job_id == job_id
         result = await agent._embedded._store.result(item.resulting_run_id)
         assert result is not None and result.kind is LoopExitKind.COMPLETED
         validate_completed_transcript(transcript, result)

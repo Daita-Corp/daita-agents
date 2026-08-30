@@ -13,6 +13,11 @@ from typing import TypeAlias
 
 from .._json import canonical_json
 from ..capabilities import AccessMode, ExecutionScope, OperationalEffect
+from ..distribution.models import (
+    MAX_DISTRIBUTION_TARGETS,
+    DistributionPlan,
+    OutcomeContract,
+)
 from ..llm.models import ModelSensitivity
 
 SCHEDULE_INTERPRETER_REVISION = 1
@@ -118,6 +123,18 @@ def _identities(
     if len(items) != len(set(items)):
         raise ValueError(f"{name} cannot contain duplicates")
     return tuple(sorted(items))
+
+
+def _delivery_ids(values: tuple[str, ...], name: str) -> tuple[str, ...]:
+    if not isinstance(values, tuple):
+        raise TypeError(f"{name} must be a tuple")
+    if len(values) > MAX_DISTRIBUTION_TARGETS:
+        raise ValueError(f"{name} exceeds its bound")
+    for item in values:
+        _text(item, name)
+    if len(values) != len(set(values)):
+        raise ValueError(f"{name} cannot contain duplicates")
+    return values
 
 
 def text_digest(value: str) -> str:
@@ -336,6 +353,8 @@ class ScheduledRoutineDraft:
     allowed_resource_ids: tuple[str, ...]
     allowed_capability_ids: tuple[str, ...]
     sensitivity_ceiling: ModelSensitivity
+    outcome_contract: OutcomeContract
+    distribution_destination_id: str
     eligible_model_routes: tuple[str, ...]
     per_run_max_tokens: int
     per_run_max_cost_usd: Decimal
@@ -400,6 +419,17 @@ class ScheduledRoutineDraft:
             raise ValueError("source-scoped draft requires exact resources")
         if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
             raise TypeError("routine draft sensitivity ceiling is invalid")
+        if not isinstance(self.outcome_contract, OutcomeContract):
+            raise TypeError("routine draft outcome contract is invalid")
+        _text(
+            self.distribution_destination_id,
+            "routine draft distribution_destination_id",
+        )
+        if (
+            self.outcome_contract.maximum_effective_sensitivity.routing_rank
+            > self.sensitivity_ceiling.routing_rank
+        ):
+            raise ValueError("routine draft outcome sensitivity exceeds its ceiling")
         for value, name, maximum in (
             (
                 self.per_run_max_tokens,
@@ -522,7 +552,7 @@ class RoutinePromotionEvidence:
 
 
 @dataclass(frozen=True, slots=True)
-class ScheduledRoutineV1:
+class ScheduledRoutine:
     routine_id: str
     agent_id: str
     conversation_id: str
@@ -545,7 +575,8 @@ class ScheduledRoutineV1:
     sensitivity_ceiling: ModelSensitivity
     eligible_model_routes: tuple[str, ...]
     skill_bindings: tuple[RoutineSkillBinding, ...]
-    delivery_destination: str
+    outcome_contract: OutcomeContract
+    distribution_plan: DistributionPlan
     per_run_max_tokens: int
     per_run_max_cost_usd: Decimal
     cumulative_max_tokens: int
@@ -564,7 +595,7 @@ class ScheduledRoutineV1:
     next_due_at: datetime | None
     active_occurrence_id: str | None
     last_occurrence_id: str | None
-    last_delivery_id: str | None
+    last_delivery_ids: tuple[str, ...]
     promotion_evidence: RoutinePromotionEvidence | None
     state: RoutineState
     revision: int
@@ -659,8 +690,22 @@ class ScheduledRoutineV1:
             raise ValueError("routine skill bindings must be sorted")
         if len({item.skill_name for item in skill_bindings}) != len(skill_bindings):
             raise ValueError("routine skill bindings cannot duplicate a skill")
-        if self.delivery_destination != f"conversation_inbox:{self.conversation_id}":
-            raise ValueError("D1 routine delivery must target its conversation inbox")
+        if not isinstance(self.outcome_contract, OutcomeContract):
+            raise TypeError("routine outcome contract is invalid")
+        if not isinstance(self.distribution_plan, DistributionPlan):
+            raise TypeError("routine distribution plan is invalid")
+        if any(
+            target.conversation_id != self.conversation_id
+            for target in self.distribution_plan.targets
+        ):
+            raise ValueError(
+                "routine distribution plan belongs to another conversation"
+            )
+        if (
+            self.outcome_contract.maximum_effective_sensitivity.routing_rank
+            > self.sensitivity_ceiling.routing_rank
+        ):
+            raise ValueError("routine outcome sensitivity exceeds its ceiling")
         for count_value, count_name, maximum, require_positive in (
             (
                 self.per_run_max_tokens,
@@ -779,10 +824,13 @@ class ScheduledRoutineV1:
         for optional_identity, identity_name in (
             (self.active_occurrence_id, "active occurrence_id"),
             (self.last_occurrence_id, "last occurrence_id"),
-            (self.last_delivery_id, "last delivery_id"),
         ):
             if optional_identity is not None:
                 _text(optional_identity, identity_name)
+        last_delivery_ids = _delivery_ids(
+            self.last_delivery_ids,
+            "routine last_delivery_ids",
+        )
         if not isinstance(self.state, RoutineState):
             raise TypeError("routine state is invalid")
         _positive_revision(self.revision, "routine revision")
@@ -794,10 +842,11 @@ class ScheduledRoutineV1:
         object.__setattr__(self, "allowed_access_modes", access_modes)
         object.__setattr__(self, "allowed_operational_effects", effects)
         object.__setattr__(self, "skill_bindings", skill_bindings)
+        object.__setattr__(self, "last_delivery_ids", last_delivery_ids)
 
 
 @dataclass(frozen=True, slots=True)
-class RoutineOccurrenceV1:
+class RoutineOccurrence:
     occurrence_id: str
     agent_id: str
     routine_id: str
@@ -820,7 +869,7 @@ class RoutineOccurrenceV1:
     run_terminal_at: datetime | None
     conclusion_digest: str | None
     terminal_run_id: str | None
-    delivery_id: str | None
+    delivery_ids: tuple[str, ...]
     attempt_count: int
     failure_code: str | None
     retry_at: datetime | None
@@ -874,10 +923,10 @@ class RoutineOccurrenceV1:
         for optional_identity, identity_name in (
             (self.reserved_run_id, "occurrence reserved_run_id"),
             (self.terminal_run_id, "occurrence terminal_run_id"),
-            (self.delivery_id, "occurrence delivery_id"),
         ):
             if optional_identity is not None:
                 _text(optional_identity, identity_name)
+        delivery_ids = _delivery_ids(self.delivery_ids, "occurrence delivery_ids")
         if self.run_bound_at is not None and self.reserved_run_id is None:
             raise ValueError("occurrence run binding requires a reserved run")
         if self.run_terminal_at is not None and self.terminal_run_id is None:
@@ -924,6 +973,7 @@ class RoutineOccurrenceV1:
         _utc(self.updated_at, "occurrence updated_at")
         if self.updated_at < self.created_at:
             raise ValueError("occurrence updated_at precedes created_at")
+        object.__setattr__(self, "delivery_ids", delivery_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -960,17 +1010,17 @@ class ScheduledRoutineSummary:
 
 @dataclass(frozen=True, slots=True)
 class ScheduledRoutineInspection:
-    routine: ScheduledRoutineV1
-    recent_occurrences: tuple[RoutineOccurrenceV1, ...]
+    routine: ScheduledRoutine
+    recent_occurrences: tuple[RoutineOccurrence, ...]
 
     def __post_init__(self) -> None:
-        if not isinstance(self.routine, ScheduledRoutineV1):
+        if not isinstance(self.routine, ScheduledRoutine):
             raise TypeError("routine inspection requires a routine")
         occurrences = tuple(self.recent_occurrences)
         if len(occurrences) > MAX_ROUTINE_HISTORY_PAGE_SIZE:
             raise ValueError("routine inspection history exceeds its bound")
         if any(
-            not isinstance(item, RoutineOccurrenceV1)
+            not isinstance(item, RoutineOccurrence)
             or item.agent_id != self.routine.agent_id
             or item.routine_id != self.routine.routine_id
             for item in occurrences

@@ -150,18 +150,28 @@ agent host is open and safe stale attempts are fenced on reopen. Daita does not
 self-install or silently fork a daemon; the explicit resident host described
 below is the only way to keep an agent open after the foreground process exits.
 
-D1 scheduled routines freeze one self-contained foreground-authorized read
+D2 scheduled routines freeze one self-contained foreground-authorized read
 instruction, canonical one-shot/interval/calendar schedule, exact source,
-resource, connector and capability ceilings, budgets, expiration, inbox
-destination, and optional skill content digests. Every due slot enters the same
+resource, connector and capability ceilings, typed outcome contract, immutable
+conversation-inbox distribution plan, budgets, expiration, and optional skill
+content digests. Every due slot enters the same
 `AgentLoop` and `CapabilityRuntime` used by foreground work. `/routines` shows
 record-owned lifecycle truth and supports pause, resume, run-now, and disable.
 An optional exact resource-revision check can advance an unchanged occurrence
-without a model call. Scheduled execution is read-only: it cannot update data,
+without a model call. Certified scheduled artifact producers can create a
+model-authored document, exact SQLite/PostgreSQL CSV or XLSX export, or a
+validated canonical JSON result snapshot. Admission rejects outcome media,
+authorship, producer, source-binding, sensitivity, or byte requirements that
+the frozen producer ceiling cannot satisfy. Scheduled execution is read-only:
+it cannot update data,
 start or cancel a job, manage another routine, deliver externally, or submit a
 graph. Repeated pre-run or execution failures move the routine to
 `needs_attention` at its configured threshold and create one conversation-inbox
 escalation; a pre-run escalation truthfully records that no model run started.
+Every terminal occurrence, including a no-change result, converges atomically
+with one immutable logical Delivery. `/inbox` and `daita inbox` provide bounded
+list, inspect, destination-discovery, and acknowledgment operations; the
+conversation inbox remains the only destination.
 See [Scheduled read routines](docs/SCHEDULED_ROUTINES.md).
 
 The external-executor contract currently has deterministic offline conformance
@@ -218,9 +228,12 @@ current-file pointer, or prompt keyword router.
 Local files are normally delivered automatically to the authorized default
 destination and reported with the verified saved path. Public recovery remains
 known-ID only through `Agent.read_artifact`, `Agent.save_artifact`, and
-`daita artifacts save`. Clearing conversations invalidates the corresponding
-internal artifact IDs but never deletes copies already delivered to user-owned
-directories.
+`daita artifacts save`. Clearing conversations invalidates ordinary
+transcript-only internal artifact IDs. Artifacts rooted by a durable job result
+or retained logical Delivery remain available by known ID; Daita resolves their
+complete immutable identity from the canonical artifact manifest and verifies
+it against the durable bounded reference. Copies already delivered to
+user-owned directories are never deleted.
 
 For the complete implementation boundaries, see [AGENTS.md](AGENTS.md).
 For workspace selection and read guarantees, see
@@ -306,8 +319,10 @@ and the flow never changes PostgreSQL roles or grants.
 
 Source detachment disables access and deletes a Daita-owned PostgreSQL
 credential. Its non-secret registration remains as inactive lifecycle history
-until the agent is deleted. Clearing conversations deletes all transcripts,
-learning candidate records, and review stamps while preserving separately
+until the agent is deleted. Clearing conversations deletes terminal transcripts,
+learning candidate records, and review stamps except for the minimum run state
+still required by active jobs, follow-ups, or routine occurrences. Durable job
+results and logical Deliveries remain independent roots, as do separately
 approved memory, user profile, semantics, and skills. Agent deletion removes
 the complete agent home and its Daita-owned keychain credentials; it never
 changes the attached source data itself.

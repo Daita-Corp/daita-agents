@@ -382,6 +382,10 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
                     },
                     "operational_effect": {
                         "type": "string",
+                        "description": (
+                            "External operational-effect filter; Daita-owned "
+                            "artifact creation remains none. Omit when uncertain."
+                        ),
                         "enum": [item.value for item in OperationalEffect],
                     },
                     "limit": {
@@ -1785,6 +1789,10 @@ class CapabilityRuntime:
             raise ToolOutputValidationError(
                 "artifact draft media type is outside the capability policy"
             )
+        if draft.provenance.authorship not in policy.allowed_authorships:
+            raise ToolOutputValidationError(
+                "artifact draft authorship is outside the capability policy"
+            )
         if (
             len(draft.content) > policy.max_bytes_per_artifact
             or len(draft.content) > policy.max_total_bytes_per_call
@@ -2873,6 +2881,12 @@ def _with_execution_lineage(
         result,
         capability_id=capability.id,
         executor_id=capability.executor_id,
+        output_sha256=(
+            None
+            if result.is_error
+            else "sha256:"
+            + sha256(canonical_json(result.output).encode("utf-8")).hexdigest()
+        ),
     )
 
 

@@ -24,13 +24,14 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
+from _distribution_support import no_artifact_outcome_contract
 from _workspace_support import workspace_for
 
 from daita import (
     Agent,
     DeliveryState,
     DeliverySubjectKind,
-    InboxItem,
+    InboxView,
     IntervalSchedule,
     LoopExit,
     LoopLimits,
@@ -39,7 +40,7 @@ from daita import (
     RoutineState,
     SQLiteSource,
     ScheduledRoutineDraft,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
     create_llm_provider,
 )
 from daita._json import canonical_json
@@ -51,6 +52,8 @@ from daita.capabilities import (
     ToolOutput,
 )
 from daita.domains.data import SQLITE_QUERY_CAPABILITY_ID
+from daita.distribution import conversation_inbox_destination_id
+from daita.distribution import OutcomeState
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -194,8 +197,8 @@ class _LiveScenario:
 
 @dataclass(frozen=True, slots=True)
 class _CompletedRoutine:
-    routine: ScheduledRoutineV1
-    item: InboxItem
+    routine: ScheduledRoutine
+    item: InboxView
     transcript: Transcript
     result: LoopExit
     conversation_id: str
@@ -362,15 +365,14 @@ async def _wait_for_routine_delivery(
     conversation_id: str,
     routine_id: str,
     timeout: float = 180.0,
-) -> tuple[InboxItem, ...]:
+) -> tuple[InboxView, ...]:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         items = await agent.inbox(conversation_id=conversation_id)
         matching = tuple(
             item
             for item in items
-            if item.subject.kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
-            and item.payload.get("routine_id") == routine_id
+            if item.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
         )
         if matching:
             return matching
@@ -421,6 +423,10 @@ async def _run_live_routine(
             allowed_resource_ids=(scenario.resource_id,),
             allowed_capability_ids=(SQLITE_QUERY_CAPABILITY_ID,),
             sensitivity_ceiling=ModelSensitivity.INTERNAL,
+            outcome_contract=no_artifact_outcome_contract(),
+            distribution_destination_id=conversation_inbox_destination_id(
+                conversation_id
+            ),
             eligible_model_routes=(scenario.provider.provider_id,),
             per_run_max_tokens=scenario.limits.max_total_tokens,
             per_run_max_cost_usd=cost_limit,
@@ -447,11 +453,9 @@ async def _run_live_routine(
     item = deliveries[0]
     assert item.state is DeliveryState.AVAILABLE
     assert item.resulting_run_id is not None
-    assert item.payload["run_id"] == item.resulting_run_id
-    assert item.payload["outcome"] == "completed"
-    assert item.payload["reason"] == "completed"
-    assert item.payload["escalation"] is False
-    report = item.payload["report_preview"]
+    assert item.conclusion_state is OutcomeState.SUCCEEDED
+    assert item.failure_code is None
+    report = item.conclusion_preview
     assert isinstance(report, str) and report.strip()
 
     transcript = await agent.transcript(item.resulting_run_id)
@@ -473,7 +477,7 @@ async def _run_live_routine(
     scope = transcript.run.execution_scope
     assert scope is not None
     assert scope.routine_id == running.routine_id
-    assert scope.occurrence_id == item.subject.subject_id
+    assert scope.occurrence_id == item.subject_id
     assert scope.allowed_source_ids == (scenario.source_id,)
     assert scope.allowed_resource_ids == (scenario.resource_id,)
     assert scope.allowed_capability_ids == (SQLITE_QUERY_CAPABILITY_ID,)
@@ -549,12 +553,12 @@ async def _assert_occurrence_and_disable(
     assert inspection is not None
     assert len(inspection.recent_occurrences) == 1
     occurrence = inspection.recent_occurrences[0]
-    assert occurrence.occurrence_id == completed.item.subject.subject_id
+    assert occurrence.occurrence_id == completed.item.subject_id
     assert occurrence.slot_kind is RoutineSlotKind.MANUAL
     assert occurrence.disposition is RoutineOccurrenceDisposition.COMPLETED
     assert occurrence.terminal_run_id == completed.item.resulting_run_id
-    assert occurrence.delivery_id == completed.item.delivery_id
-    assert inspection.routine.last_delivery_id == completed.item.delivery_id
+    assert occurrence.delivery_ids == (completed.item.delivery_id,)
+    assert inspection.routine.last_delivery_ids == (completed.item.delivery_id,)
 
     disabled = await scenario.agent.disable_routine(
         completed.routine.routine_id,

@@ -17,6 +17,7 @@ def _required_text(value: str, field_name: str) -> None:
 
 
 _PROVIDER_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+_SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,6 +165,7 @@ class ToolResultBlock:
     sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
     capability_id: str | None = None
     executor_id: str | None = None
+    output_sha256: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.call_id, "tool-result call_id")
@@ -188,6 +190,13 @@ class ToolResultBlock:
             _required_text(self.capability_id, "tool-result capability_id")
             assert self.executor_id is not None
             _required_text(self.executor_id, "tool-result executor_id")
+        if self.output_sha256 is not None and (
+            not isinstance(self.output_sha256, str)
+            or _SHA256.fullmatch(self.output_sha256) is None
+        ):
+            raise ValueError("tool-result output_sha256 must be a canonical digest")
+        if self.is_error and self.output_sha256 is not None:
+            raise ValueError("error tool results cannot establish an output digest")
         object.__setattr__(self, "output", FrozenJsonObject.from_mapping(self.output))
         object.__setattr__(self, "sensitivity_provenance", provenance)
 

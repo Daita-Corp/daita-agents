@@ -47,7 +47,7 @@ def encode_execution_scope(value: ExecutionScope):
             "eligible_model_routes": list(value.eligible_model_routes),
             "per_run_max_cost_usd": decimal_encode(value.per_run_max_cost_usd),
             "per_run_max_tokens": value.per_run_max_tokens,
-            "delivery_destination": value.delivery_destination,
+            "distribution_plan_digest": value.distribution_plan_digest,
         },
     )
 
@@ -77,7 +77,7 @@ def decode_execution_scope(value) -> ExecutionScope:
             "eligible_model_routes",
             "per_run_max_cost_usd",
             "per_run_max_tokens",
-            "delivery_destination",
+            "distribution_plan_digest",
         ),
     )
     try:
@@ -163,9 +163,9 @@ def decode_execution_scope(value) -> ExecutionScope:
             fields["per_run_max_tokens"],
             "execution scope per-run tokens",
         ),
-        delivery_destination=text(
-            fields["delivery_destination"],
-            "execution scope delivery destination",
+        distribution_plan_digest=text(
+            fields["distribution_plan_digest"],
+            "execution scope distribution plan digest",
         ),
     )
 

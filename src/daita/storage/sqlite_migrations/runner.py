@@ -15,6 +15,7 @@ MCPToolBinding codec-v1 uses exact toolbox presentation fields;
 ArtifactProvenance codec-v1 includes exact local-file edit binding facts;
 ArtifactDeliveryReceipt codec-v1 includes exact create/replace outcome facts;
 ScheduledRoutine and RoutineOccurrence codec-v1 use the accepted D1 shape;
+Delivery codec-v1 replaces the pre-production conversation inbox aggregate;
 mutable until the first production state baseline is explicitly frozen
 """
 

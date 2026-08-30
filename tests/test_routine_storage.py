@@ -9,15 +9,21 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from _distribution_support import (
+    inbox_distribution_plan,
+    no_artifact_outcome_contract,
+)
 
 import daita.storage.sqlite as sqlite_module
-from daita.autonomy import DeliveryState, DeliverySubject, DeliverySubjectKind
+from daita.distribution import DeliveryState, DeliverySubjectKind, OutcomeState
 from daita.capabilities import AccessMode, ExecutionScope, OperationalEffect
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelSensitivity,
     TextBlock,
+    ToolCall,
+    ToolResultBlock,
 )
 from daita.loop.models import (
     InstructionAuthority,
@@ -32,10 +38,10 @@ from daita.routines.models import (
     MisfirePolicy,
     ReportingMode,
     RoutineOccurrenceDisposition,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutineSlotKind,
     RoutineState,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
     text_digest,
 )
 from daita.routines.schedule import occurrence_id, scheduled_slot_key
@@ -59,9 +65,9 @@ def routine_record(
     state: RoutineState = RoutineState.ACTIVE,
     maximum_consecutive_failures: int = 3,
     consecutive_failures: int = 0,
-) -> ScheduledRoutineV1:
+) -> ScheduledRoutine:
     instruction = "Read the exact admitted resource and report its current value."
-    return ScheduledRoutineV1(
+    return ScheduledRoutine(
         routine_id=routine_id,
         agent_id=agent_id,
         conversation_id=conversation_id,
@@ -84,7 +90,8 @@ def routine_record(
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
         eligible_model_routes=("mock:routine",),
         skill_bindings=(),
-        delivery_destination=f"conversation_inbox:{conversation_id}",
+        outcome_contract=no_artifact_outcome_contract(),
+        distribution_plan=inbox_distribution_plan(conversation_id),
         per_run_max_tokens=5_000,
         per_run_max_cost_usd=Decimal("0.05"),
         cumulative_max_tokens=50_000,
@@ -103,7 +110,7 @@ def routine_record(
         next_due_at=next_due_at,
         active_occurrence_id=None,
         last_occurrence_id=None,
-        last_delivery_id=None,
+        last_delivery_ids=(),
         promotion_evidence=None,
         state=state,
         revision=1,
@@ -114,16 +121,16 @@ def routine_record(
 
 def occurrence_record(
     *,
-    routine: ScheduledRoutineV1 | None = None,
+    routine: ScheduledRoutine | None = None,
     scheduled_for: datetime = NOW,
-) -> RoutineOccurrenceV1:
+) -> RoutineOccurrence:
     routine = routine or routine_record()
     slot_key = scheduled_slot_key(
         routine.routine_id,
         routine.revision,
         scheduled_for,
     )
-    return RoutineOccurrenceV1(
+    return RoutineOccurrence(
         occurrence_id=occurrence_id(routine.routine_id, slot_key),
         agent_id=routine.agent_id,
         routine_id=routine.routine_id,
@@ -146,7 +153,7 @@ def occurrence_record(
         run_terminal_at=None,
         conclusion_digest=None,
         terminal_run_id=None,
-        delivery_id=None,
+        delivery_ids=(),
         attempt_count=1,
         failure_code=None,
         retry_at=None,
@@ -180,7 +187,7 @@ def test_occurrence_codec_v1_round_trip_is_exact() -> None:
     )
 
 
-def execution_scope(occurrence: RoutineOccurrenceV1) -> ExecutionScope:
+def execution_scope(occurrence: RoutineOccurrence) -> ExecutionScope:
     return ExecutionScope(
         scope_id=f"scope:{occurrence.occurrence_id}",
         revision=1,
@@ -198,7 +205,7 @@ def execution_scope(occurrence: RoutineOccurrenceV1) -> ExecutionScope:
         eligible_model_routes=("mock:routine",),
         per_run_max_cost_usd=Decimal("0.05"),
         per_run_max_tokens=5_000,
-        delivery_destination="conversation_inbox:conversation-1",
+        distribution_plan_digest=inbox_distribution_plan("conversation-1").plan_digest,
         routine_id=occurrence.routine_id,
         routine_revision=occurrence.routine_revision,
         occurrence_id=occurrence.occurrence_id,
@@ -265,7 +272,7 @@ async def test_duplicate_ticks_reserve_one_occurrence_and_one_budget(
         await store.close()
 
 
-async def test_pre_run_failure_below_threshold_advances_without_delivery(
+async def test_pre_run_failure_below_threshold_advances_with_one_delivery(
     tmp_path: Path,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
@@ -284,7 +291,7 @@ async def test_pre_run_failure_below_threshold_advances_without_delivery(
         finalized = await store.finalize_routine_occurrence(
             routine.agent_id,
             claimed.occurrence_id,
-            delivery_id="delivery-must-not-be-used",
+            delivery_id="delivery-pre-run-failure",
             finalized_at=NOW + timedelta(seconds=1),
             failure_code="routine_authority_revoked",
         )
@@ -292,8 +299,11 @@ async def test_pre_run_failure_below_threshold_advances_without_delivery(
         assert finalized is not None
         occurrence, delivery = finalized
         assert occurrence.disposition is RoutineOccurrenceDisposition.TERMINAL_FAILED
-        assert occurrence.delivery_id is None
-        assert delivery is None
+        assert delivery is not None
+        assert occurrence.delivery_ids == (delivery.delivery_id,)
+        assert delivery.outcome.resulting_run_id is None
+        assert delivery.outcome.conclusion_state is OutcomeState.FAILED
+        assert delivery.outcome.failure_code == "routine_authority_revoked"
         persisted = await store.load_scheduled_routine(
             routine.agent_id, routine.routine_id
         )
@@ -302,8 +312,72 @@ async def test_pre_run_failure_below_threshold_advances_without_delivery(
         assert persisted.consecutive_failures == 1
         assert persisted.active_occurrence_id is None
         assert persisted.next_due_at == NOW + timedelta(hours=1)
-        assert persisted.last_delivery_id is None
-        assert await store.list_inbox(routine.agent_id) == ()
+        assert persisted.last_delivery_ids == (delivery.delivery_id,)
+        assert await store.list_deliveries(routine.agent_id) == (delivery,)
+    finally:
+        await store.close()
+
+
+async def test_active_unbound_occurrence_preserves_target_until_delivery_commit(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    try:
+        origin = RunInput(
+            id="run-target-origin",
+            agent_id="agent-1",
+            conversation_id="conversation-1",
+            message="Authorize the scheduled inbox target.",
+            created_at=NOW - timedelta(minutes=1),
+        )
+        await store.start(origin)
+        await store.append(origin.id, origin.start_message())
+        origin_result = LoopExit(
+            run_id=origin.id,
+            conversation_id="conversation-1",
+            kind=LoopExitKind.COMPLETED,
+            reason="assistant_text",
+            created_at=NOW - timedelta(seconds=30),
+            final_text="Target authorized.",
+            steps=1,
+        )
+        await store.complete(
+            origin_result,
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                content=(TextBlock("Target authorized."),),
+            ),
+        )
+        routine = await store.admit_scheduled_routine(routine_record())
+        claimed = await store.claim_due_routine_occurrence(
+            routine.agent_id,
+            routine.routine_id,
+            expected_revision=routine.revision,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="claim-unbound-target",
+        )
+        assert claimed is not None and claimed.reserved_run_id is None
+
+        assert await store.clear_conversations(routine.agent_id) == 0
+        assert await store.conversation_exists(
+            routine.agent_id, routine.conversation_id
+        )
+        finalized = await store.finalize_routine_occurrence(
+            routine.agent_id,
+            claimed.occurrence_id,
+            delivery_id="delivery-unbound-target",
+            finalized_at=NOW + timedelta(seconds=1),
+            failure_code="routine_precheck_unavailable",
+        )
+        assert finalized is not None and finalized[1] is not None
+        assert finalized[1].conversation_id == routine.conversation_id
+
+        assert await store.clear_conversations(routine.agent_id) == 1
+        assert not await store.conversation_exists(
+            routine.agent_id, routine.conversation_id
+        )
+        assert len(await store.list_deliveries(routine.agent_id)) == 1
     finally:
         await store.close()
 
@@ -345,16 +419,14 @@ async def test_pre_run_failure_threshold_delivers_one_no_run_escalation(
         occurrence, delivery = first
         assert delivery is not None
         assert occurrence.disposition is RoutineOccurrenceDisposition.TERMINAL_FAILED
-        assert occurrence.delivery_id == delivery.delivery_id
-        assert delivery.resulting_run_id is None
-        assert delivery.state is DeliveryState.AVAILABLE
-        assert delivery.subject.kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
-        assert delivery.payload["outcome"] == "failed"
-        assert delivery.payload["reason"] == "routine_precheck_unavailable"
-        assert delivery.payload["escalation"] is True
-        assert delivery.payload["routine_state"] == "needs_attention"
+        assert occurrence.delivery_ids == (delivery.delivery_id,)
+        assert delivery.outcome.resulting_run_id is None
+        assert delivery.visibility_state is DeliveryState.AVAILABLE
+        assert delivery.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
+        assert delivery.outcome.conclusion_state is OutcomeState.FAILED
+        assert delivery.outcome.failure_code == "routine_precheck_unavailable"
         assert duplicate[1] == delivery
-        assert len(await store.list_inbox(routine.agent_id)) == 1
+        assert len(await store.list_deliveries(routine.agent_id)) == 1
 
         persisted = await store.load_scheduled_routine(
             routine.agent_id, routine.routine_id
@@ -364,16 +436,8 @@ async def test_pre_run_failure_threshold_delivers_one_no_run_escalation(
         assert persisted.consecutive_failures == 1
         assert persisted.active_occurrence_id is None
         assert persisted.next_due_at is None
-        assert persisted.last_delivery_id == delivery.delivery_id
+        assert persisted.last_delivery_ids == (delivery.delivery_id,)
 
-        with pytest.raises(ValueError, match="follow-up inbox item requires a run"):
-            replace(
-                delivery,
-                subject=DeliverySubject(
-                    DeliverySubjectKind.STANDALONE_FOLLOWUP,
-                    "followup-without-run",
-                ),
-            )
     finally:
         await store.close()
 
@@ -413,7 +477,7 @@ async def test_pre_run_escalation_finalization_rolls_back_as_one_transaction(
             failure_code="routine_authority_revoked",
         )
 
-    assert await store.list_inbox(routine.agent_id) == ()
+    assert await store.list_deliveries(routine.agent_id) == ()
     persisted_occurrence = await store.load_routine_occurrence(
         routine.agent_id, claimed.occurrence_id
     )
@@ -423,6 +487,198 @@ async def test_pre_run_escalation_finalization_rolls_back_as_one_transaction(
     )
     assert persisted_routine is not None
     assert persisted_routine.active_occurrence_id == claimed.occurrence_id
+    await store.close()
+
+
+async def test_delivery_retention_limit_rolls_back_the_producer_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    monkeypatch.setattr(sqlite_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    try:
+        first_routine = await store.admit_scheduled_routine(
+            routine_record(routine_id="routine-retention-one")
+        )
+        first = await store.claim_due_routine_occurrence(
+            first_routine.agent_id,
+            first_routine.routine_id,
+            expected_revision=first_routine.revision,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="claim-retention-one",
+        )
+        assert first is not None
+        assert (
+            await store.finalize_routine_occurrence(
+                first_routine.agent_id,
+                first.occurrence_id,
+                delivery_id="delivery-retention-one",
+                finalized_at=NOW + timedelta(seconds=1),
+                failure_code="routine_test_failure",
+            )
+            is not None
+        )
+
+        second_routine = await store.admit_scheduled_routine(
+            routine_record(routine_id="routine-retention-two")
+        )
+        second = await store.claim_due_routine_occurrence(
+            second_routine.agent_id,
+            second_routine.routine_id,
+            expected_revision=second_routine.revision,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="claim-retention-two",
+        )
+        assert second is not None
+        with pytest.raises(ValueError, match="delivery_retention_limit_exceeded"):
+            await store.finalize_routine_occurrence(
+                second_routine.agent_id,
+                second.occurrence_id,
+                delivery_id="delivery-retention-two",
+                finalized_at=NOW + timedelta(seconds=2),
+                failure_code="routine_test_failure",
+            )
+
+        assert len(await store.list_deliveries("agent-1")) == 1
+        persisted_occurrence = await store.load_routine_occurrence(
+            "agent-1", second.occurrence_id
+        )
+        assert persisted_occurrence == second
+        persisted_routine = await store.load_scheduled_routine(
+            "agent-1", second_routine.routine_id
+        )
+        assert persisted_routine is not None
+        assert persisted_routine.active_occurrence_id == second.occurrence_id
+    finally:
+        await store.close()
+
+
+async def test_acknowledged_delivery_is_reclaimed_for_next_atomic_finalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    monkeypatch.setattr(sqlite_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    try:
+        first_routine = await store.admit_scheduled_routine(
+            routine_record(routine_id="routine-reclaim-one")
+        )
+        first = await store.claim_due_routine_occurrence(
+            first_routine.agent_id,
+            first_routine.routine_id,
+            expected_revision=first_routine.revision,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="claim-reclaim-one",
+        )
+        assert first is not None
+        finalized_first = await store.finalize_routine_occurrence(
+            first_routine.agent_id,
+            first.occurrence_id,
+            delivery_id="delivery-reclaim-one",
+            finalized_at=NOW + timedelta(seconds=1),
+            failure_code="routine_test_failure",
+        )
+        assert finalized_first is not None and finalized_first[1] is not None
+        assert await store.acknowledge_delivery(
+            first_routine.agent_id,
+            finalized_first[1].delivery_id,
+            acknowledged_at=NOW + timedelta(seconds=2),
+        )
+
+        second_routine = await store.admit_scheduled_routine(
+            routine_record(routine_id="routine-reclaim-two")
+        )
+        second = await store.claim_due_routine_occurrence(
+            second_routine.agent_id,
+            second_routine.routine_id,
+            expected_revision=second_routine.revision,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="claim-reclaim-two",
+        )
+        assert second is not None
+        finalized_second = await store.finalize_routine_occurrence(
+            second_routine.agent_id,
+            second.occurrence_id,
+            delivery_id="delivery-reclaim-two",
+            finalized_at=NOW + timedelta(seconds=3),
+            failure_code="routine_test_failure",
+        )
+        assert finalized_second is not None and finalized_second[1] is not None
+        assert finalized_second[1].delivery_id == "delivery-reclaim-two"
+        retained = await store.list_deliveries(
+            first_routine.agent_id,
+            include_acknowledged=True,
+        )
+        assert tuple(item.delivery_id for item in retained) == ("delivery-reclaim-two",)
+        assert (
+            await store.load_delivery(
+                first_routine.agent_id,
+                "delivery-reclaim-one",
+            )
+            is None
+        )
+    finally:
+        await store.close()
+
+
+async def test_cancelled_delivery_finalization_cannot_partially_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    routine = await store.admit_scheduled_routine(routine_record())
+    claimed = await store.claim_due_routine_occurrence(
+        routine.agent_id,
+        routine.routine_id,
+        expected_revision=routine.revision,
+        expected_due_at=NOW,
+        claimed_at=NOW,
+        claim_token="claim-cancel-finalization",
+    )
+    assert claimed is not None
+    claimed_routine = await store.load_scheduled_routine(
+        routine.agent_id, routine.routine_id
+    )
+    assert claimed_routine is not None
+    entered = threading.Event()
+    release = threading.Event()
+    original_start = sqlite_module._CatalogCommitGate.start
+
+    def blocked_start(gate, connection):
+        entered.set()
+        release.wait(timeout=5)
+        return original_start(gate, connection)
+
+    monkeypatch.setattr(sqlite_module._CatalogCommitGate, "start", blocked_start)
+    task = asyncio.create_task(
+        store.finalize_routine_occurrence(
+            routine.agent_id,
+            claimed.occurrence_id,
+            delivery_id="delivery-cancelled",
+            finalized_at=NOW + timedelta(seconds=1),
+            failure_code="routine_test_failure",
+        )
+    )
+    await asyncio.to_thread(entered.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert await store.list_deliveries(routine.agent_id) == ()
+    assert (
+        await store.load_routine_occurrence(routine.agent_id, claimed.occurrence_id)
+        == claimed
+    )
+    assert (
+        await store.load_scheduled_routine(routine.agent_id, routine.routine_id)
+        == claimed_routine
+    )
     await store.close()
 
 
@@ -618,6 +874,11 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
                 content=(TextBlock(final_text),),
             ),
         )
+        assert await store.clear_conversations(routine.agent_id) == 0
+        assert await store.result(run.id) == result
+        assert await store.conversation_exists(
+            routine.agent_id, routine.conversation_id
+        )
         terminal = await store.mark_routine_occurrence_run_terminal(
             routine.agent_id,
             claimed.occurrence_id,
@@ -642,10 +903,10 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         assert duplicate_delivery is not None
         assert first[0].disposition is RoutineOccurrenceDisposition.COMPLETED
         assert duplicate_delivery.delivery_id == "delivery-routine-1"
-        assert duplicate_delivery.subject.kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
-        inbox = await store.list_inbox(routine.agent_id)
+        assert duplicate_delivery.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
+        inbox = await store.list_deliveries(routine.agent_id)
         assert len(inbox) == 1
-        assert inbox[0].payload["report_preview"] == final_text
+        assert inbox[0].outcome.conclusion_preview == final_text
         persisted = await store.load_scheduled_routine(
             routine.agent_id,
             routine.routine_id,
@@ -653,8 +914,119 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         assert persisted is not None
         assert persisted.active_occurrence_id is None
         assert persisted.reserved_tokens == 0
-        assert persisted.last_delivery_id == "delivery-routine-1"
+        assert persisted.last_delivery_ids == ("delivery-routine-1",)
         assert persisted.next_due_at == NOW + timedelta(hours=1)
+    finally:
+        await store.close()
+
+
+async def test_terminal_result_sensitivity_escalation_fails_and_blocks_delivery(
+    tmp_path: Path,
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    try:
+        routine = await store.admit_scheduled_routine(routine_record())
+        claimed = await store.claim_due_routine_occurrence(
+            routine.agent_id,
+            routine.routine_id,
+            expected_revision=routine.revision,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="claim-sensitive",
+        )
+        assert claimed is not None
+        scope = execution_scope(claimed)
+        run_id = "run-routine-sensitive"
+        bound = await store.bind_routine_occurrence_run(
+            routine.agent_id,
+            claimed.occurrence_id,
+            claim_token="claim-sensitive",
+            run_id=run_id,
+            execution_scope=scope,
+            bound_at=NOW + timedelta(seconds=1),
+        )
+        assert bound is not None
+        run = RunInput(
+            id=run_id,
+            agent_id=routine.agent_id,
+            message=routine.authorized_instruction,
+            created_at=NOW + timedelta(seconds=1),
+            conversation_id=routine.conversation_id,
+            source_id="source-1",
+            start=RunStartEnvelope(
+                origin=RunOrigin.SCHEDULED_ROUTINE,
+                instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
+                trusted_instruction_id="routine:routine-1:revision:1",
+                trusted_instruction=routine.authorized_instruction,
+                instruction_digest=routine.instruction_digest,
+                untrusted_payload={},
+                payload_digest="sha256:" + sha256(b"{}").hexdigest(),
+                execution_scope=scope,
+            ),
+        )
+        await store.start(run)
+        await store.append(run.id, run.start_message())
+        call = ToolCall(id="sensitive-read", name="data_sqlite_query", arguments={})
+        await store.append(
+            run.id,
+            CanonicalMessage(role=MessageRole.ASSISTANT, tool_calls=(call,)),
+        )
+        await store.append(
+            run.id,
+            CanonicalMessage(
+                role=MessageRole.TOOL,
+                content=(
+                    ToolResultBlock(
+                        call_id=call.id,
+                        output={"kind": "data.query", "data": {"value": 42}},
+                        sensitivity=ModelSensitivity.CONFIDENTIAL,
+                        sensitivity_provenance={"authority": "current_resource"},
+                        capability_id="data.sqlite.query",
+                        executor_id="data.sqlite.query.executor",
+                    ),
+                ),
+            ),
+        )
+        result = LoopExit(
+            run_id=run.id,
+            conversation_id=routine.conversation_id,
+            kind=LoopExitKind.COMPLETED,
+            reason="completed",
+            created_at=NOW + timedelta(seconds=2),
+            final_text="The sensitive current value is 42.",
+            steps=2,
+        )
+        await store.complete(
+            result,
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                content=(TextBlock("The sensitive current value is 42."),),
+            ),
+        )
+        terminal = await store.mark_routine_occurrence_run_terminal(
+            routine.agent_id,
+            claimed.occurrence_id,
+            run_id=run.id,
+            terminal_at=result.created_at,
+        )
+        assert terminal is not None
+        finalized = await store.finalize_routine_occurrence(
+            routine.agent_id,
+            claimed.occurrence_id,
+            delivery_id="delivery-sensitive",
+            finalized_at=NOW + timedelta(seconds=3),
+        )
+        assert finalized is not None
+        occurrence, delivery = finalized
+        assert delivery is not None
+        assert occurrence.disposition is RoutineOccurrenceDisposition.TERMINAL_FAILED
+        assert occurrence.failure_code == "outcome_sensitivity_contract_failed"
+        assert delivery.outcome.conclusion_state is OutcomeState.FAILED
+        assert delivery.outcome.failure_code == "outcome_sensitivity_contract_failed"
+        assert delivery.outcome.effective_sensitivity is ModelSensitivity.CONFIDENTIAL
+        assert delivery.outcome.conclusion_preview == ""
+        assert delivery.visibility_state is DeliveryState.BLOCKED
+        assert delivery.blocked_reason_code == "sensitivity_exceeds_destination"
     finally:
         await store.close()
 
@@ -741,17 +1113,17 @@ async def test_terminal_failure_at_threshold_uses_its_one_conclusion_as_escalati
         occurrence, delivery = first
         assert delivery is not None
         assert occurrence.failure_code == "routine_run_model_limit"
-        assert delivery.resulting_run_id == run.id
-        assert delivery.payload["escalation"] is True
-        assert delivery.payload["routine_state"] == "needs_attention"
+        assert delivery.outcome.resulting_run_id == run.id
+        assert delivery.outcome.conclusion_state is OutcomeState.FAILED
+        assert delivery.outcome.failure_code == "routine_run_model_limit"
         assert duplicate[1] == delivery
-        assert len(await store.list_inbox(routine.agent_id)) == 1
+        assert len(await store.list_deliveries(routine.agent_id)) == 1
         persisted = await store.load_scheduled_routine(
             routine.agent_id, routine.routine_id
         )
         assert persisted is not None
         assert persisted.state is RoutineState.NEEDS_ATTENTION
-        assert persisted.last_delivery_id == delivery.delivery_id
+        assert persisted.last_delivery_ids == (delivery.delivery_id,)
     finally:
         await store.close()
 
@@ -840,6 +1212,6 @@ async def test_reopen_converges_completed_reserved_run_without_reexecution(
         )
         assert finalized is not None
         assert finalized[0].disposition is RoutineOccurrenceDisposition.COMPLETED
-        assert len(await reopened.list_inbox(routine.agent_id)) == 1
+        assert len(await reopened.list_deliveries(routine.agent_id)) == 1
     finally:
         await reopened.close()

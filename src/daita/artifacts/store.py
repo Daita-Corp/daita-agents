@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import NoReturn, Protocol, cast
+from typing import TYPE_CHECKING, NoReturn, Protocol, cast
 from uuid import uuid4
 
 from .._json import canonical_json
@@ -30,7 +30,11 @@ from .models import (
     artifact_ref_from_mapping,
     artifact_ref_to_mapping,
     canonical_artifact_filename,
+    artifact_provenance_to_mapping,
 )
+
+if TYPE_CHECKING:
+    from ..distribution.models import OutcomeArtifactReference
 
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
 _ARTIFACT_ID = re.compile(r"artifact-[0-9a-f]{32}\Z")
@@ -49,6 +53,32 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
+def _matches_delivery_reference(
+    ref: ArtifactRef,
+    expected: OutcomeArtifactReference,
+) -> bool:
+    provenance_digest = (
+        "sha256:"
+        + sha256(
+            canonical_json(artifact_provenance_to_mapping(ref.provenance)).encode(
+                "utf-8"
+            )
+        ).hexdigest()
+    )
+    return (
+        ref.artifact_id == expected.artifact_id
+        and ref.run_id == expected.producing_run_id
+        and ref.call_id == expected.producing_call_id
+        and ref.capability_id == expected.producer_capability_id
+        and ref.sha256 == expected.sha256
+        and ref.media_type == expected.media_type
+        and ref.byte_size == expected.byte_size
+        and ref.sensitivity.value == expected.sensitivity.value
+        and provenance_digest == expected.provenance_digest
+        and ref.provenance.authorship is expected.authorship
+    )
+
+
 class ArtifactReferenceReader(Protocol):
     async def list_artifact_refs(
         self,
@@ -57,6 +87,14 @@ class ArtifactReferenceReader(Protocol):
         run_id: str | None = None,
         conversation_id: str | None = None,
     ) -> tuple[ArtifactRef, ...]: ...
+
+    async def list_delivery_artifact_references(
+        self,
+        agent_id: str,
+        *,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[OutcomeArtifactReference, ...]: ...
 
 
 class _CancelledBeforePublication(BaseException):
@@ -129,6 +167,7 @@ class AgentHomeArtifactStore:
         )
         try:
             refs = await references.list_artifact_refs(agent_id)
+            delivery_refs = await references.list_delivery_artifact_references(agent_id)
             reservation_loader = getattr(
                 references,
                 "list_reserved_artifact_ids",
@@ -158,7 +197,12 @@ class AgentHomeArtifactStore:
             return store
 
         worker = asyncio.create_task(
-            asyncio.to_thread(store._admit_and_cleanup, refs, reservations)
+            asyncio.to_thread(
+                store._admit_and_cleanup,
+                refs,
+                delivery_refs,
+                reservations,
+            )
         )
         cancelled = False
         while not worker.done():
@@ -197,8 +241,7 @@ class AgentHomeArtifactStore:
         conversation_id: str | None = None,
     ) -> tuple[ArtifactRef, ...]:
         self._require_available()
-        refs = await self._references.list_artifact_refs(
-            self.agent_id,
+        refs = await self._list_reachable_refs(
             run_id=run_id,
             conversation_id=conversation_id,
         )
@@ -309,11 +352,78 @@ class AgentHomeArtifactStore:
             raise asyncio.CancelledError
         return ref
 
-    async def remove_all_run_artifacts(self) -> None:
-        """Remove unreachable run directories while retaining delivery config."""
+    async def remove_unreferenced_run_artifacts(self) -> None:
+        """Remove only run artifacts no longer referenced by durable state."""
 
         self._require_available()
-        await asyncio.to_thread(self._remove_all_run_artifacts_sync)
+        refs = await self._list_reachable_refs()
+        retained = frozenset((ref.run_id, ref.artifact_id) for ref in refs)
+        await asyncio.to_thread(
+            self._remove_unreferenced_run_artifacts_sync,
+            retained,
+        )
+
+    async def _list_reachable_refs(
+        self,
+        *,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[ArtifactRef, ...]:
+        transcript_and_job_refs = await self._references.list_artifact_refs(
+            self.agent_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+        )
+        delivery_refs = await self._references.list_delivery_artifact_references(
+            self.agent_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+        )
+        resolved_delivery_refs = await asyncio.to_thread(
+            self._resolve_delivery_refs,
+            delivery_refs,
+        )
+        return self._merge_reachable_refs(
+            transcript_and_job_refs,
+            resolved_delivery_refs,
+        )
+
+    def _resolve_delivery_refs(
+        self,
+        refs: tuple[OutcomeArtifactReference, ...],
+    ) -> tuple[ArtifactRef, ...]:
+        resolved: list[ArtifactRef] = []
+        for expected in refs:
+            ref = self._load_manifest_ref(
+                expected.producing_run_id,
+                expected.artifact_id,
+            )
+            if not _matches_delivery_reference(ref, expected):
+                _corrupt(expected.artifact_id, "delivery_reference_mismatch")
+            resolved.append(ref)
+        return tuple(resolved)
+
+    @staticmethod
+    def _merge_reachable_refs(
+        *groups: tuple[ArtifactRef, ...],
+    ) -> tuple[ArtifactRef, ...]:
+        merged: dict[str, ArtifactRef] = {}
+        for group in groups:
+            for ref in group:
+                current = merged.get(ref.artifact_id)
+                if current is not None and current != ref:
+                    raise ArtifactError(
+                        "artifact_corrupt",
+                        "The artifact identity is ambiguous in durable state.",
+                        {"artifact_id": ref.artifact_id},
+                    )
+                merged[ref.artifact_id] = ref
+        return tuple(
+            sorted(
+                merged.values(),
+                key=lambda item: (item.created_at, item.artifact_id),
+            )
+        )
 
     def _require_available(self) -> None:
         if self._admission_error is not None:
@@ -326,6 +436,7 @@ class AgentHomeArtifactStore:
     def _admit_and_cleanup(
         self,
         refs: tuple[ArtifactRef, ...],
+        delivery_refs: tuple[OutcomeArtifactReference, ...],
         reservations: frozenset[tuple[str, str]],
     ) -> None:
         try:
@@ -348,6 +459,10 @@ class AgentHomeArtifactStore:
             for entry in staging_entries:
                 _remove_staging_entry(Path(entry.path))
 
+            refs = self._merge_reachable_refs(
+                refs,
+                self._resolve_delivery_refs(delivery_refs),
+            )
             referenced = {item.artifact_id: item for item in refs}
             final_count = 0
             for run_entry in _run_entries(self.root):
@@ -412,13 +527,7 @@ class AgentHomeArtifactStore:
         if not directory.exists():
             return None
         try:
-            manifest = _read_regular(directory / "manifest.json", _MAX_MANIFEST_BYTES)
-            raw = json.loads(manifest.decode("utf-8"))
-            if not isinstance(raw, dict):
-                raise ValueError("artifact manifest is not an object")
-            ref = artifact_ref_from_mapping(raw)
-            if ref.run_id != run_id or ref.artifact_id != artifact_id:
-                raise ValueError("reserved artifact manifest identity changed")
+            ref = self._load_manifest_ref(run_id, artifact_id)
             self._read_ref(ref)
             return ref
         except ArtifactError:
@@ -619,47 +728,10 @@ class AgentHomeArtifactStore:
         return run_count, run_bytes, agent_count, agent_bytes
 
     def _read_ref(self, ref: ArtifactRef) -> ArtifactPayload:
-        try:
-            self._verify_storage_roots()
-        except ArtifactError:
-            _corrupt(ref.artifact_id, "storage_root_changed")
-        if (
-            _RUN_ID.fullmatch(ref.run_id) is None
-            or _ARTIFACT_ID.fullmatch(ref.artifact_id) is None
-        ):
-            raise ArtifactError(
-                "artifact_missing",
-                "The requested artifact is not available.",
-                {"artifact_id": ref.artifact_id},
-            )
-        directory = self.root / ref.run_id / ref.artifact_id
-        try:
-            facts = directory.lstat()
-        except FileNotFoundError:
-            raise ArtifactError(
-                "artifact_missing",
-                "The requested artifact is not available.",
-                {"artifact_id": ref.artifact_id},
-            ) from None
-        if not stat.S_ISDIR(facts.st_mode) or directory.is_symlink():
-            _corrupt(ref.artifact_id, "invalid_directory_type")
-        try:
-            resolved = directory.resolve(strict=True)
-            resolved.relative_to(self.root.resolve(strict=True))
-        except (OSError, ValueError):
-            _corrupt(ref.artifact_id, "outside_agent_home")
-        manifest = _read_regular(directory / "manifest.json", _MAX_MANIFEST_BYTES)
-        try:
-            raw_manifest = json.loads(manifest.decode("utf-8"))
-            if not isinstance(raw_manifest, dict):
-                raise ValueError("manifest is not an object")
-            stored_ref = artifact_ref_from_mapping(raw_manifest)
-        except Exception:
-            _corrupt(ref.artifact_id, "malformed_manifest")
-        if stored_ref != ref or manifest != canonical_json(
-            artifact_ref_to_mapping(ref)
-        ).encode("utf-8"):
+        stored_ref = self._load_manifest_ref(ref.run_id, ref.artifact_id)
+        if stored_ref != ref:
             _corrupt(ref.artifact_id, "manifest_mismatch")
+        directory = self.root / ref.run_id / ref.artifact_id
         content = _read_regular(directory / "payload", ref.byte_size)
         if len(content) != ref.byte_size:
             _corrupt(ref.artifact_id, "size_mismatch")
@@ -668,8 +740,68 @@ class AgentHomeArtifactStore:
             _corrupt(ref.artifact_id, "digest_mismatch")
         return ArtifactPayload(ref=ref, content=content)
 
-    def _remove_all_run_artifacts_sync(self) -> None:
+    def _load_manifest_ref(self, run_id: str, artifact_id: str) -> ArtifactRef:
+        try:
+            self._verify_storage_roots()
+        except ArtifactError:
+            _corrupt(artifact_id, "storage_root_changed")
+        if (
+            _RUN_ID.fullmatch(run_id) is None
+            or _ARTIFACT_ID.fullmatch(artifact_id) is None
+        ):
+            raise ArtifactError(
+                "artifact_missing",
+                "The requested artifact is not available.",
+                {"artifact_id": artifact_id},
+            )
+        directory = self.root / run_id / artifact_id
+        try:
+            facts = directory.lstat()
+        except FileNotFoundError:
+            raise ArtifactError(
+                "artifact_missing",
+                "The requested artifact is not available.",
+                {"artifact_id": artifact_id},
+            ) from None
+        if not stat.S_ISDIR(facts.st_mode) or directory.is_symlink():
+            _corrupt(artifact_id, "invalid_directory_type")
+        try:
+            resolved = directory.resolve(strict=True)
+            resolved.relative_to(self.root.resolve(strict=True))
+        except (OSError, ValueError):
+            _corrupt(artifact_id, "outside_agent_home")
+        manifest = _read_regular(directory / "manifest.json", _MAX_MANIFEST_BYTES)
+        try:
+            raw_manifest = json.loads(manifest.decode("utf-8"))
+            if not isinstance(raw_manifest, dict):
+                raise ValueError("manifest is not an object")
+            stored_ref = artifact_ref_from_mapping(raw_manifest)
+        except Exception:
+            _corrupt(artifact_id, "malformed_manifest")
+        if (
+            stored_ref.run_id != run_id
+            or stored_ref.artifact_id != artifact_id
+            or manifest
+            != canonical_json(artifact_ref_to_mapping(stored_ref)).encode("utf-8")
+        ):
+            _corrupt(artifact_id, "manifest_mismatch")
+        return stored_ref
+
+    def _remove_unreferenced_run_artifacts_sync(
+        self,
+        retained: frozenset[tuple[str, str]],
+    ) -> None:
         self._verify_storage_roots()
+        if any(
+            _RUN_ID.fullmatch(run_id) is None
+            or _ARTIFACT_ID.fullmatch(artifact_id) is None
+            for run_id, artifact_id in retained
+        ):
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "Artifact conversation cleanup received an invalid retained identity.",
+                {"stage": "conversation_clear"},
+            )
         count = 0
         for entry in _run_entries(self.root):
             if (
@@ -698,8 +830,11 @@ class AgentHomeArtifactStore:
                         "Artifact conversation cleanup found an invalid identity.",
                         {"stage": "conversation_clear"},
                     )
+                if (entry.name, artifact_entry.name) in retained:
+                    continue
                 _remove_artifact_directory(Path(artifact_entry.path))
-            Path(entry.path).rmdir()
+            if not any(Path(entry.path).iterdir()):
+                Path(entry.path).rmdir()
         _fsync_directory(self.root)
 
     def _verify_storage_roots(self) -> None:

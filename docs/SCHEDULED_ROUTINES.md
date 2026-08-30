@@ -1,9 +1,10 @@
-# Scheduled read routines
+# Scheduled read routines and D2 outcomes
 
-Daita D1 scheduled routines repeat bounded read-only agent work without adding
+Daita D2 scheduled routines repeat bounded read-only agent work without adding
 a second loop, runtime, or state owner. A routine freezes one exact
 self-contained instruction and executes each admitted occurrence through the
-ordinary `AgentLoop` and `CapabilityRuntime`. Results go only to the originating
+ordinary `AgentLoop` and `CapabilityRuntime`. Each terminal occurrence converges
+atomically with one immutable logical Delivery in the originating
 conversation's durable inbox.
 
 ## Supported schedules
@@ -26,13 +27,28 @@ host restarts converge on the existing occurrence.
 
 Admission validates and retains the exact agent, conversation, source,
 resource, MCP binding, capability contract, model route, sensitivity, budget,
-expiration, and inbox destination. Only capabilities statically declared
+expiration, typed outcome contract, and immutable inbox distribution plan. Only
+capabilities statically declared
 `scheduled_direct`, with `OperationalEffect.NONE` and read/none data access,
 can enter the ceiling. Routine-management capabilities remain interactive-only.
+If an artifact is required, admission also proves that at least one allowed
+producer can satisfy its media type, authorship, exact-source, sensitivity, and
+byte bounds. Impossible contracts fail before the routine is created.
+
+The certified scheduled artifact surface is deliberately small:
+
+- `artifact.create_document` for model-authored text or Markdown;
+- `data.sqlite.export_tabular` and `data.postgresql.export_tabular` for exact
+  source-data CSV or XLSX;
+- `artifact.snapshot_result` for canonical JSON from an exact earlier
+  successful result in the current scheduled run.
+
+Artifact inventory, reading, conversion, editing, local publication, and
+export-location capabilities remain interactive-only.
 
 An optional `changes_only` resource-revision precheck runs through the ordinary
 trusted runtime request. When its canonical observation is unchanged, the
-occurrence advances with zero model calls and no inbox report. `always`
+occurrence advances with zero model calls and one no-change Delivery. `always`
 routines do not use that precheck.
 
 Failures before a model run starts release the reserved occurrence budget and
@@ -50,7 +66,7 @@ routine; missing or digest-mismatched retained bytes fail closed. Skill text,
 source values, MCP metadata and output, precheck observations, and prior
 transcript content remain untrusted data and cannot expand authority.
 
-D1 cannot write data, start or cancel a durable job, create or manage another
+D2 cannot write data, start or cancel a durable job, create or manage another
 routine, call a remote write tool, deliver externally, run shell commands, or
 submit a graph. Email/external delivery, recurring ingestion, and graphs are
 not implemented.
@@ -117,6 +133,15 @@ definition. For example:
   "allowed_resource_ids": ["catalog-resource:..."],
   "allowed_capability_ids": ["catalog.inspect", "data.sqlite.query"],
   "sensitivity_ceiling": "internal",
+  "outcome_contract": {
+    "require_terminal_conclusion": true,
+    "artifact_requirements": [],
+    "maximum_total_artifact_bytes": 0,
+    "maximum_effective_sensitivity": "internal",
+    "require_current_run_provenance": true,
+    "require_exact_source_bindings": false
+  },
+  "distribution_destination_id": "conversation_inbox:conversation-...",
   "eligible_model_routes": ["openai"],
   "per_run_max_tokens": 4000,
   "per_run_max_cost_usd": "0.10",
@@ -132,8 +157,33 @@ definition. For example:
 
 The IDs and model routes must already be admitted to that agent. Create and
 update fail closed if any identity, capability contract, sensitivity, route,
-pricing, destination, or skill binding is unavailable. Use `daita routines
+pricing, outcome, destination, or skill binding is unavailable. Use `daita routines
 --help` for the command surface.
+
+## Inbox lifecycle and retention
+
+`/inbox` opens the bounded product projection. The headless equivalents are:
+
+```bash
+daita inbox destinations atlas <conversation-id>
+daita inbox list atlas
+daita inbox inspect atlas <delivery-id>
+daita inbox acknowledge atlas <delivery-id>
+```
+
+Acknowledgment is idempotent. Unacknowledged available or blocked Deliveries
+are never evicted. When the fixed per-agent Delivery bound is full, producer
+finalization remains atomic and pending rather than losing the outcome. Once a
+Delivery is acknowledged, its oldest retained history entry can be reclaimed
+inside a later producer finalization transaction; acknowledgment wakes both
+producer drivers so pending work can converge immediately.
+
+A Delivery stores a bounded immutable artifact reference rather than a second
+copy of the full artifact manifest. Artifact reads resolve the existing
+canonical manifest and require every projected identity, digest, provenance,
+authorship, sensitivity, and size fact to match. This lets terminal transcripts
+be cleared without losing an artifact that is still rooted by a retained
+Delivery.
 
 ## Resident host and handoff
 
@@ -150,7 +200,7 @@ The process reports a JSON readiness record, handles `SIGINT` and `SIGTERM`,
 and closes the ordinary supervisors and agent composition before exiting. It
 uses the same writer lock as every foreground open. A TUI, CLI invocation, and
 resident host cannot own the same agent home concurrently: stop the current
-host, open the other process, then restart the resident host. D1 adds no IPC,
+host, open the other process, then restart the resident host. D2 adds no IPC,
 remote API, transparent client gateway, multi-host queue, or competing writer.
 
 If a host stops, persisted routines and occurrences remain inspectable but no
@@ -186,3 +236,19 @@ set to another release-reviewed, API-backed, tool-capable streaming model. The
 tests do not run as part of the default deterministic suite. Running one test
 by node ID authorizes only its one scheduled loop; running the complete module
 authorizes all three. Their presence does not claim a live certification result.
+
+One separately authorized D2 acceptance test certifies the frozen SQLite CSV
+outcome and logical Delivery path. It permits at most one live scheduled loop
+with a default `$0.10` estimated-cost ceiling:
+
+```bash
+DAITA_RUN_LIVE_STAGE_D2_OUTCOME=1 \
+DAITA_STAGE_D2_LIVE_LLM_API_KEY=<provider-api-key> \
+DAITA_STAGE_D2_LIVE_MAX_COST_USD=0.10 \
+.venv/bin/python -m pytest \
+  tests/live/test_stage_d2_outcomes_live.py -v -s
+```
+
+`DAITA_STAGE_D2_LIVE_MODEL_ID` defaults to `openai:gpt-5.6-terra`. This test is
+also skipped unless explicitly authorized and does not itself claim that a
+live certification run has been performed.

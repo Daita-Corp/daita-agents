@@ -47,7 +47,7 @@ from . import (
     RoutineState,
     ScheduledRoutineDraft,
     ScheduledRoutineInspection,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
     Skill,
     SkillSummary,
     SQLiteSource,
@@ -56,6 +56,7 @@ from . import (
     run_resident_host,
 )
 from .artifacts.models import (
+    ArtifactAuthorship,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
@@ -70,6 +71,15 @@ from .cli_text import (
     _write_semantic_view,
 )
 from .errors import StateCompatibilityError
+from .distribution import (
+    ArtifactRequirement,
+    OutcomeContract,
+    delivery_inspection_projection,
+    distribution_destination_projection,
+    distribution_plan_projection,
+    inbox_view_projection,
+    outcome_contract_projection,
+)
 from .learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
     learning_candidate_content_to_mapping,
@@ -540,6 +550,31 @@ def build_parser() -> argparse.ArgumentParser:
         action.add_argument("name")
         action.add_argument("routine_id")
         action.add_argument("expected_revision", type=int)
+
+    inbox = commands.add_parser(
+        "inbox",
+        help="discover destinations and inspect logical deliveries",
+    )
+    inbox_commands = inbox.add_subparsers(dest="inbox_command", required=True)
+    inbox_destinations = inbox_commands.add_parser("destinations")
+    inbox_destinations.add_argument("name")
+    inbox_destinations.add_argument("conversation_id")
+    inbox_destinations.add_argument(
+        "--sensitivity-ceiling",
+        choices=tuple(item.value for item in ModelSensitivity),
+        default=ModelSensitivity.RESTRICTED.value,
+    )
+    inbox_list = inbox_commands.add_parser("list")
+    inbox_list.add_argument("name")
+    inbox_list.add_argument("--conversation-id")
+    inbox_list.add_argument("--include-acknowledged", action="store_true")
+    inbox_list.add_argument("--limit", type=int, default=50)
+    inbox_inspect = inbox_commands.add_parser("inspect")
+    inbox_inspect.add_argument("name")
+    inbox_inspect.add_argument("delivery_id")
+    inbox_acknowledge = inbox_commands.add_parser("acknowledge")
+    inbox_acknowledge.add_argument("name")
+    inbox_acknowledge.add_argument("delivery_id")
     return parser
 
 
@@ -1349,6 +1384,13 @@ def _routine_draft_from_file(path: Path) -> ScheduledRoutineDraft:
         sensitivity_ceiling=ModelSensitivity(
             _required_text(document, "sensitivity_ceiling")
         ),
+        outcome_contract=_routine_outcome_contract(
+            _object_mapping(document.get("outcome_contract"), "outcome contract")
+        ),
+        distribution_destination_id=_required_text(
+            document,
+            "distribution_destination_id",
+        ),
         eligible_model_routes=_string_tuple(document, "eligible_model_routes"),
         per_run_max_tokens=_required_integer(document, "per_run_max_tokens"),
         per_run_max_cost_usd=_routine_decimal(document, "per_run_max_cost_usd"),
@@ -1375,6 +1417,70 @@ def _routine_precheck(value: Mapping[str, object]) -> ResourceRevisionPrecheck:
     )
 
 
+def _routine_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
+    raw_requirements = value.get("artifact_requirements")
+    if not isinstance(raw_requirements, (list, tuple)):
+        raise ValueError("artifact_requirements must be an array")
+    requirements: list[ArtifactRequirement] = []
+    for raw_requirement in raw_requirements:
+        requirement = _object_mapping(raw_requirement, "artifact requirement")
+        requirements.append(
+            ArtifactRequirement(
+                required=_required_boolean(requirement, "required"),
+                minimum_count=_required_integer(requirement, "minimum_count"),
+                maximum_count=_required_integer(requirement, "maximum_count"),
+                allowed_media_types=_string_tuple(
+                    requirement,
+                    "allowed_media_types",
+                ),
+                allowed_authorships=tuple(
+                    ArtifactAuthorship(item)
+                    for item in _string_tuple(
+                        requirement,
+                        "allowed_authorships",
+                    )
+                ),
+                allowed_producer_capability_ids=_string_tuple(
+                    requirement,
+                    "allowed_producer_capability_ids",
+                ),
+                maximum_artifact_bytes=_required_integer(
+                    requirement,
+                    "maximum_artifact_bytes",
+                ),
+                maximum_total_bytes=_required_integer(
+                    requirement,
+                    "maximum_total_bytes",
+                ),
+                maximum_sensitivity=ModelSensitivity(
+                    _required_text(requirement, "maximum_sensitivity")
+                ),
+            )
+        )
+    return OutcomeContract(
+        require_terminal_conclusion=_required_boolean(
+            value,
+            "require_terminal_conclusion",
+        ),
+        artifact_requirements=tuple(requirements),
+        maximum_total_artifact_bytes=_required_integer(
+            value,
+            "maximum_total_artifact_bytes",
+        ),
+        maximum_effective_sensitivity=ModelSensitivity(
+            _required_text(value, "maximum_effective_sensitivity")
+        ),
+        require_current_run_provenance=_required_boolean(
+            value,
+            "require_current_run_provenance",
+        ),
+        require_exact_source_bindings=_required_boolean(
+            value,
+            "require_exact_source_bindings",
+        ),
+    )
+
+
 def _object_mapping(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
         raise ValueError(f"{name} must be a JSON object")
@@ -1392,6 +1498,13 @@ def _required_integer(value: Mapping[str, object], name: str) -> int:
     item = value.get(name)
     if not isinstance(item, int) or isinstance(item, bool):
         raise ValueError(f"{name} must be an integer")
+    return item
+
+
+def _required_boolean(value: Mapping[str, object], name: str) -> bool:
+    item = value.get(name)
+    if not isinstance(item, bool):
+        raise ValueError(f"{name} must be a boolean")
     return item
 
 
@@ -1434,7 +1547,7 @@ def _routine_datetime(value: str) -> datetime:
         raise ValueError("routine datetime must be ISO 8601") from error
 
 
-def _routine_mapping(routine: ScheduledRoutineV1) -> dict[str, object]:
+def _routine_mapping(routine: ScheduledRoutine) -> dict[str, object]:
     schedule: dict[str, object]
     if isinstance(routine.schedule, OnceSchedule):
         schedule = {"kind": "once", "exact_at": routine.schedule.exact_at.isoformat()}
@@ -1489,7 +1602,9 @@ def _routine_mapping(routine: ScheduledRoutineV1) -> dict[str, object]:
         "charged_tokens": routine.charged_tokens,
         "charged_cost_usd": str(routine.charged_cost_usd),
         "last_occurrence_id": routine.last_occurrence_id,
-        "last_delivery_id": routine.last_delivery_id,
+        "outcome_contract": outcome_contract_projection(routine.outcome_contract),
+        "distribution_plan": distribution_plan_projection(routine.distribution_plan),
+        "last_delivery_ids": routine.last_delivery_ids,
     }
 
 
@@ -1506,7 +1621,7 @@ def _routine_inspection_mapping(
                 "disposition": item.disposition.value,
                 "reserved_run_id": item.reserved_run_id,
                 "terminal_run_id": item.terminal_run_id,
-                "delivery_id": item.delivery_id,
+                "delivery_ids": item.delivery_ids,
                 "failure_code": item.failure_code,
             }
             for item in inspection.recent_occurrences
@@ -1869,6 +1984,33 @@ async def _execute(args: argparse.Namespace) -> object:
                 return {"name": args.skill_name, "changed": changed}
             deleted = await agent.delete_skill(args.skill_name)
             return {"name": args.skill_name, "deleted": deleted}
+        if args.command == "inbox":
+            if args.inbox_command == "destinations":
+                return [
+                    distribution_destination_projection(item)
+                    for item in await agent.distribution_destinations(
+                        args.conversation_id,
+                        sensitivity_ceiling=ModelSensitivity(args.sensitivity_ceiling),
+                    )
+                ]
+            if args.inbox_command == "list":
+                return [
+                    inbox_view_projection(item)
+                    for item in await agent.inbox(
+                        conversation_id=args.conversation_id,
+                        include_acknowledged=args.include_acknowledged,
+                        limit=args.limit,
+                    )
+                ]
+            if args.inbox_command == "inspect":
+                delivery_inspection = await agent.inspect_delivery(args.delivery_id)
+                if delivery_inspection is None:
+                    raise ValueError("delivery not found")
+                return delivery_inspection_projection(delivery_inspection)
+            acknowledged = await agent.acknowledge_inbox(args.delivery_id)
+            if acknowledged is None:
+                raise ValueError("delivery not found")
+            return inbox_view_projection(acknowledged)
         if args.command == "routines":
             if args.routines_command == "list":
                 states = frozenset(RoutineState(item) for item in (args.state or ()))

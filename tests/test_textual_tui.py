@@ -37,14 +37,15 @@ from daita import (
     ApprovalDecision,
     ApprovalRequest,
     DeliveryState,
-    DeliverySubject,
     DeliverySubjectKind,
-    InboxItem,
+    InboxView,
     JobStatus,
     IntervalSchedule,
     LoopExit,
     LoopExitKind,
     MisfirePolicy,
+    OutcomeConclusionKind,
+    OutcomeState,
     ReportingMode,
     RoutineState,
     ScheduledRoutineInspection,
@@ -929,40 +930,29 @@ def _tui_inbox_item(
     delivery_id: str = "delivery-stage-c",
     *,
     report: str = "The durable profile completed successfully.",
-) -> InboxItem:
+) -> InboxView:
     observed = datetime(2026, 8, 23, 14, 5, tzinfo=UTC)
-    return InboxItem(
+    return InboxView(
         delivery_id=delivery_id,
-        agent_id="agent-inbox",
         conversation_id="conversation-inbox",
-        subject=DeliverySubject(
-            kind=DeliverySubjectKind.STANDALONE_FOLLOWUP,
-            subject_id="followup-inbox",
-        ),
+        subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
+        subject_id="followup-inbox",
+        conclusion_kind=OutcomeConclusionKind.TERMINAL_RUN,
+        conclusion_state=OutcomeState.SUCCEEDED,
+        conclusion_digest="sha256:" + "2" * 64,
+        conclusion_preview=report,
+        conclusion_preview_truncated=False,
         resulting_run_id="run-followup",
-        grant_id="grant-followup",
-        logical_key="standalone_followup:followup-inbox:conclusion",
-        conclusion_digest="sha256:" + "1" * 64,
-        payload={
-            "subject": {
-                "kind": "standalone_followup",
-                "subject_id": "followup-inbox",
-            },
-            "job_id": "job-profile",
-            "run_id": "run-followup",
-            "outcome": "completed",
-            "reason": "completed",
-            "report_digest": "sha256:" + "2" * 64,
-            "report_preview": report,
-            "report_truncated": False,
-            "evidence_digest": "sha256:" + "3" * 64,
-        },
-        sensitivity=ModelSensitivity.INTERNAL,
-        destination="conversation_inbox:conversation-inbox",
-        destination_sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        artifact_references=(),
+        effective_sensitivity=ModelSensitivity.INTERNAL,
+        provenance_digest="sha256:" + "3" * 64,
+        destination_id="conversation_inbox:conversation-inbox",
         state=DeliveryState.AVAILABLE,
         created_at=observed,
         updated_at=observed,
+        acknowledged_at=None,
+        blocked_reason_code=None,
+        failure_code=None,
     )
 
 
@@ -1101,16 +1091,36 @@ async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
     items = [item]
     acknowledgments: list[str] = []
 
-    async def list_inbox() -> tuple[InboxItem, ...]:
+    async def list_inbox() -> tuple[InboxView, ...]:
         return tuple(items)
 
-    async def acknowledge_inbox(delivery_id: str) -> InboxItem | None:
+    async def acknowledge_inbox(delivery_id: str) -> InboxView | None:
         acknowledgments.append(delivery_id)
         items.clear()
         return item
 
+    async def list_distribution_destinations(
+        conversation_id: str,
+        *,
+        sensitivity_ceiling: ModelSensitivity,
+    ) -> tuple[SimpleNamespace, ...]:
+        assert conversation_id == item.conversation_id
+        assert sensitivity_ceiling is ModelSensitivity.INTERNAL
+        return (
+            SimpleNamespace(
+                label="Current conversation Inbox",
+                state=SimpleNamespace(value="available"),
+                revision=1,
+            ),
+        )
+
     monkeypatch.setattr(app.controller, "list_inbox", list_inbox)
     monkeypatch.setattr(app.controller, "acknowledge_inbox", acknowledge_inbox)
+    monkeypatch.setattr(
+        app.controller,
+        "list_distribution_destinations",
+        list_distribution_destinations,
+    )
 
     async with app.run_test(size=(110, 36)) as pilot:
         await app.push_screen(InboxScreen())
@@ -1150,49 +1160,33 @@ def test_inbox_rendering_withholds_blocked_reports_and_marks_bounded_previews():
     available = _tui_inbox_item(report="bounded preview")
     truncated = replace(
         available,
-        payload={**dict(available.payload), "report_truncated": True},
+        conclusion_preview_truncated=True,
     )
     assert "Preview truncated" in render_inbox_item(truncated)
 
     blocked = replace(
         available,
         state=DeliveryState.BLOCKED,
-        payload={**dict(available.payload), "report_preview": None},
-        destination_sensitivity_ceiling=ModelSensitivity.PUBLIC,
-        terminal_error="delivery_sensitivity_ineligible",
+        conclusion_preview="",
+        blocked_reason_code="sensitivity_exceeds_destination",
     )
     rendered = render_inbox_item(blocked)
     assert "bounded preview" not in rendered
     assert "Preview withheld" in rendered
-    assert "delivery_sensitivity_ineligible" in rendered
+    assert "sensitivity_exceeds_destination" in rendered
 
     routine_escalation = replace(
         available,
-        subject=DeliverySubject(
-            DeliverySubjectKind.ROUTINE_OCCURRENCE,
-            "occurrence-pre-run-failure",
-        ),
+        subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
+        subject_id="occurrence-pre-run-failure",
+        conclusion_kind=OutcomeConclusionKind.NO_MODEL_OCCURRENCE,
+        conclusion_state=OutcomeState.FAILED,
         resulting_run_id=None,
-        logical_key="routine_occurrence:occurrence-pre-run-failure:conclusion",
-        payload={
-            "subject": {
-                "kind": "routine_occurrence",
-                "subject_id": "occurrence-pre-run-failure",
-            },
-            "routine_id": "routine-daily-report",
-            "run_id": None,
-            "outcome": "failed",
-            "reason": "routine_precheck_unavailable",
-            "escalation": True,
-            "routine_state": "needs_attention",
-            "report_digest": None,
-            "report_preview": None,
-            "report_truncated": False,
-        },
-        terminal_error="routine_precheck_unavailable",
+        conclusion_preview="",
+        failure_code="routine_precheck_unavailable",
     )
     escalation = render_inbox_item(routine_escalation)
-    assert "Routine: routine-daily-report" in escalation
+    assert "Routine: occurrence-pre-run-failure" in escalation
     assert "Result run: No model run started" in escalation
     assert "Escalation" in escalation
     assert "failed before a model run could start" in escalation
@@ -1212,13 +1206,13 @@ async def test_background_status_notifies_once_and_remains_outside_transcript(
     running = _tui_job_summary(
         "job-running-status", JobStatus.RUNNING, result_available=False
     )
-    current_inbox: list[InboxItem] = []
+    current_inbox: list[InboxView] = []
     notifications: list[tuple[str, str | None]] = []
 
     async def list_jobs() -> tuple[object, ...]:
         return (running,)
 
-    async def list_inbox() -> tuple[InboxItem, ...]:
+    async def list_inbox() -> tuple[InboxView, ...]:
         return tuple(current_inbox)
 
     def notify(message: str, *, title: str | None = None, **_kwargs: object) -> None:

@@ -5,6 +5,7 @@ from hashlib import sha256
 from typing import cast
 
 import pytest
+from _distribution_support import inbox_distribution_plan
 from _capability_runtime_support import ContextToolProjectionAdapter
 from _workspace_support import workspace_for
 
@@ -157,7 +158,7 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
         eligible_model_routes=(provider.provider_id,),
         per_run_max_cost_usd=Decimal("0.25"),
         per_run_max_tokens=123,
-        delivery_destination="conversation_inbox:conversation-1",
+        distribution_plan_digest=inbox_distribution_plan("conversation-1").plan_digest,
     )
     run = RunInput(
         id="run-scoped-budget",

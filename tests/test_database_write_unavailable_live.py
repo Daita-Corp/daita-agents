@@ -17,11 +17,14 @@ from daita.domains.data.capabilities import (
 )
 from daita.llm.models import (
     CanonicalMessage,
+    FinishReason,
     ModelRequest,
     ModelResponse,
+    ModelUsage,
     ToolCall,
     ToolResultBlock,
 )
+from daita.llm.pricing import CostEstimate
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ModelProvider, provider_has_complete_pricing
 from daita.loop.models import LoopExitKind, Transcript
@@ -44,6 +47,8 @@ _FORBIDDEN_MODEL_TOOLS = frozenset(
 )
 _ALLOWED_MODEL_CALLS = frozenset(
     {
+        "toolbox_search",
+        "toolbox_load",
         "catalog_search",
         "catalog_schema",
         "catalog_inspect",
@@ -75,6 +80,7 @@ class _GuardedRecordingProvider:
     def __init__(self, delegate: ModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
+        self.bootstrap_count = 0
 
     @property
     def provider_id(self) -> str:
@@ -93,8 +99,31 @@ class _GuardedRecordingProvider:
             raise AssertionError(
                 f"an unrelated mutation surface was projected to the model: {forbidden}"
             )
-        assert POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME in projected
-        assert POSTGRESQL_UPDATE_TOOL_NAME in projected
+        required_update_tools = {
+            POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
+            POSTGRESQL_UPDATE_TOOL_NAME,
+        }
+        if not required_update_tools.issubset(projected):
+            if self.bootstrap_count != 0:
+                raise AssertionError("guard update-tool bootstrap did not take effect")
+            if "toolbox_load" not in projected:
+                raise AssertionError("toolbox_load is unavailable for guard bootstrap")
+            self.bootstrap_count = 1
+            self.requests.append(request)
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="guard-load-postgresql-update-tools",
+                        name="toolbox_load",
+                        arguments={"tool_names": sorted(required_update_tools)},
+                    ),
+                ),
+                provider_id=self.provider_id,
+                usage=ModelUsage(
+                    cost_estimate=CostEstimate.complete(Decimal("0")),
+                ),
+            )
         calls = {
             call.id: call.name
             for message in request.messages
@@ -225,7 +254,7 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
         secret_provider=EnvironmentSecretProvider(),
         approval_handler=reject_unexpected_approval,
         limits=LoopLimits(
-            max_steps=8,
+            max_steps=12,
             max_total_tokens=20_000,
             max_wall_time_seconds=120,
             max_estimated_cost_usd=_cost_limit(),
@@ -261,11 +290,11 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
 
         exit = await agent.run(
             "Set analytics.customers customer_id = 1 is_active to the confirmed "
-            "exact boolean value false. Use only the PostgreSQL update-preview and "
-            "PostgreSQL update tools; do not call a query tool, merely show SQL, or "
-            "claim success without a committed update result. If the database role "
-            "cannot pass the write guardrails, explain that the change was not "
-            "committed.",
+            "exact boolean value false. Load the PostgreSQL update-preview and "
+            "PostgreSQL update tools, then use only those update tools; do not call "
+            "a query tool, merely show SQL, or claim success without a committed "
+            "update result. If the database role cannot pass the write guardrails, "
+            "explain that the change was not committed.",
             source_id=source.id,
         )
         transcript = await agent.transcript(exit.run_id)
@@ -285,19 +314,21 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
     after = await _customer_snapshot(password=database_password, port=port)
     assert exit.kind is LoopExitKind.COMPLETED
     assert provider.requests
+    assert provider.bootstrap_count == 1
     assert all(
         _FORBIDDEN_MODEL_TOOLS.isdisjoint(
             definition.name for definition in request.tools
         )
         for request in provider.requests
     )
-    assert all(
-        {
-            POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
-            POSTGRESQL_UPDATE_TOOL_NAME,
-        }.issubset({definition.name for definition in request.tools})
+    projected_names = tuple(
+        {definition.name for definition in request.tools}
         for request in provider.requests
     )
+    assert any(
+        POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME in names for names in projected_names
+    )
+    assert any(POSTGRESQL_UPDATE_TOOL_NAME in names for names in projected_names)
     results = _tool_results(transcript.messages)
     write_calls = tuple(
         call

@@ -34,18 +34,11 @@ from ..artifacts.models import (
 )
 from ..autonomy import (
     MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT,
-    MAX_CONVERSATION_INBOX_ITEMS_PER_AGENT,
-    MAX_INBOX_PAGE_SIZE,
     AutonomousFollowup,
-    DeliveryState,
-    DeliverySubject,
-    DeliverySubjectKind,
     FollowupCompletionConflictError,
     FollowupDisposition,
     FollowupIdentityConflictError,
-    InboxItem,
     assess_followup_conclusion,
-    inbox_report_projection,
     terminal_job_event_payload,
 )
 from ..capabilities import ExecutionScope
@@ -63,6 +56,20 @@ from ..catalog.models import (
 )
 from ..catalog.protocols import CatalogStoreError
 from ..errors import StateCompatibilityCode, StateCompatibilityError
+from ..distribution.models import (
+    MAX_DELIVERIES_PER_AGENT,
+    MAX_DELIVERY_LIST_PAGE_SIZE,
+    Delivery,
+    DeliveryState,
+    DeliverySubjectKind,
+    OutcomeArtifactReference,
+    OutcomeConclusionKind,
+    OutcomeState,
+    conclusion_preview_projection,
+    outcome_artifact_reference,
+    validate_outcome_artifact_references,
+)
+from ..distribution.owner import construct_logical_delivery
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..jobs.models import (
     MAX_ACTIVE_JOBS_PER_AGENT,
@@ -101,6 +108,7 @@ from ..learning_candidates import (
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
+    ModelSensitivity,
     ToolResultBlock,
 )
 from ..llm.pricing import CostEstimateStatus
@@ -122,10 +130,10 @@ from ..routines.models import (
     ROUTINE_CLAIM_LEASE_SECONDS,
     ResourceRevisionObservation,
     RoutineOccurrenceDisposition,
-    RoutineOccurrenceV1,
+    RoutineOccurrence,
     RoutineSlotKind,
     RoutineState,
-    ScheduledRoutineV1,
+    ScheduledRoutine,
 )
 from ..routines.schedule import (
     first_slot,
@@ -151,7 +159,7 @@ from .sqlite_codecs import (
     decode_catalog_sync,
     decode_identifier,
     decode_identity,
-    decode_inbox_item,
+    decode_delivery,
     decode_job_run,
     decode_learning_candidate,
     decode_loop_exit,
@@ -171,7 +179,7 @@ from .sqlite_codecs import (
     encode_catalog_sync,
     encode_identifier,
     encode_identity,
-    encode_inbox_item,
+    encode_delivery,
     encode_job_run,
     encode_learning_candidate,
     encode_loop_exit,
@@ -328,22 +336,69 @@ def _replace_followup_row(
         raise RuntimeError("follow-up changed during its conditional transition")
 
 
-def _load_inbox_row(
+def _load_delivery_row(
     connection: sqlite3.Connection,
     agent_id: str,
     delivery_id: str,
-) -> tuple[InboxItem, str] | None:
+) -> tuple[Delivery, str] | None:
     row = connection.execute(
-        "SELECT data FROM conversation_inbox " "WHERE agent_id = ? AND delivery_id = ?",
+        "SELECT data FROM deliveries WHERE agent_id = ? AND delivery_id = ?",
         (agent_id, delivery_id),
     ).fetchone()
     if row is None:
         return None
     if not isinstance(row[0], str):
-        raise RuntimeError("stored inbox payload is invalid")
+        raise RuntimeError("stored delivery payload is invalid")
     return (
-        decode_inbox_item(row[0], agent_id=agent_id, delivery_id=delivery_id),
+        decode_delivery(row[0], agent_id=agent_id, delivery_id=delivery_id),
         row[0],
+    )
+
+
+def _insert_delivery(connection: sqlite3.Connection, delivery: Delivery) -> None:
+    count = connection.execute(
+        "SELECT COUNT(*) FROM deliveries WHERE agent_id = ?",
+        (delivery.agent_id,),
+    ).fetchone()
+    if int(count[0]) >= MAX_DELIVERIES_PER_AGENT:
+        acknowledged = connection.execute(
+            "SELECT delivery_id FROM deliveries "
+            "WHERE agent_id = ? AND state = ? "
+            "ORDER BY created_at_us, delivery_id LIMIT 1",
+            (delivery.agent_id, DeliveryState.ACKNOWLEDGED.value),
+        ).fetchone()
+        if acknowledged is None:
+            raise ValueError("delivery_retention_limit_exceeded")
+        deleted = connection.execute(
+            "DELETE FROM deliveries "
+            "WHERE agent_id = ? AND delivery_id = ? AND state = ?",
+            (
+                delivery.agent_id,
+                acknowledged[0],
+                DeliveryState.ACKNOWLEDGED.value,
+            ),
+        )
+        if deleted.rowcount != 1:
+            raise RuntimeError("acknowledged delivery changed during reclamation")
+    connection.execute(
+        """INSERT INTO deliveries(
+               agent_id, delivery_id, conversation_id, subject_kind, subject_id,
+               logical_key, target_kind, target_fingerprint, state,
+               created_at_us, data
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            delivery.agent_id,
+            delivery.delivery_id,
+            delivery.conversation_id,
+            delivery.subject_kind.value,
+            delivery.subject_id,
+            delivery.logical_key,
+            "conversation_inbox",
+            delivery.target.target_fingerprint,
+            delivery.visibility_state.value,
+            _datetime_us(delivery.created_at),
+            encode_delivery(delivery),
+        ),
     )
 
 
@@ -360,7 +415,7 @@ def _load_routine_row(
     connection: sqlite3.Connection,
     agent_id: str,
     routine_id: str,
-) -> tuple[ScheduledRoutineV1, str] | None:
+) -> tuple[ScheduledRoutine, str] | None:
     row = connection.execute(
         "SELECT data FROM scheduled_routines " "WHERE agent_id = ? AND routine_id = ?",
         (agent_id, routine_id),
@@ -382,7 +437,7 @@ def _load_routine_row(
 def _replace_routine_row(
     connection: sqlite3.Connection,
     current_data: str,
-    routine: ScheduledRoutineV1,
+    routine: ScheduledRoutine,
 ) -> None:
     result = connection.execute(
         """UPDATE scheduled_routines
@@ -406,7 +461,7 @@ def _load_routine_occurrence_row(
     connection: sqlite3.Connection,
     agent_id: str,
     occurrence_id: str,
-) -> tuple[RoutineOccurrenceV1, str] | None:
+) -> tuple[RoutineOccurrence, str] | None:
     row = connection.execute(
         "SELECT data FROM routine_occurrences "
         "WHERE agent_id = ? AND occurrence_id = ?",
@@ -429,7 +484,7 @@ def _load_routine_occurrence_row(
 def _replace_routine_occurrence_row(
     connection: sqlite3.Connection,
     current_data: str,
-    occurrence: RoutineOccurrenceV1,
+    occurrence: RoutineOccurrence,
 ) -> None:
     result = connection.execute(
         """UPDATE routine_occurrences
@@ -451,7 +506,7 @@ def _replace_routine_occurrence_row(
 
 def _insert_routine_occurrence(
     connection: sqlite3.Connection,
-    occurrence: RoutineOccurrenceV1,
+    occurrence: RoutineOccurrence,
 ) -> None:
     connection.execute(
         """INSERT INTO routine_occurrences(
@@ -896,17 +951,17 @@ class SQLiteStateStore:
 
     async def admit_scheduled_routine(
         self,
-        routine: ScheduledRoutineV1,
-    ) -> ScheduledRoutineV1:
+        routine: ScheduledRoutine,
+    ) -> ScheduledRoutine:
         """Atomically admit one pristine bounded routine and its first due slot."""
 
-        if not isinstance(routine, ScheduledRoutineV1):
-            raise TypeError("routine must be ScheduledRoutineV1")
+        if not isinstance(routine, ScheduledRoutine):
+            raise TypeError("routine must be ScheduledRoutine")
         if (
             routine.revision != 1
             or routine.active_occurrence_id is not None
             or routine.last_occurrence_id is not None
-            or routine.last_delivery_id is not None
+            or bool(routine.last_delivery_ids)
             or routine.reserved_tokens != 0
             or routine.reserved_cost_usd != Decimal("0")
             or routine.charged_tokens != 0
@@ -932,7 +987,7 @@ class SQLiteStateStore:
         normalized = replace(routine, next_due_at=next_due)
         encoded = encode_scheduled_routine(normalized)
 
-        def write(connection: sqlite3.Connection) -> ScheduledRoutineV1:
+        def write(connection: sqlite3.Connection) -> ScheduledRoutine:
             row = connection.execute(
                 "SELECT 1 FROM scheduled_routines "
                 "WHERE agent_id = ? AND routine_id = ?",
@@ -978,8 +1033,8 @@ class SQLiteStateStore:
         self,
         agent_id: str,
         routine_id: str,
-    ) -> ScheduledRoutineV1 | None:
-        def read() -> ScheduledRoutineV1 | None:
+    ) -> ScheduledRoutine | None:
+        def read() -> ScheduledRoutine | None:
             with _connect(self.path) as connection:
                 loaded = _load_routine_row(connection, agent_id, routine_id)
             return None if loaded is None else loaded[0]
@@ -992,7 +1047,7 @@ class SQLiteStateStore:
         *,
         states: frozenset[RoutineState] = frozenset(),
         limit: int = MAX_ROUTINE_LIST_PAGE_SIZE,
-    ) -> tuple[ScheduledRoutineV1, ...]:
+    ) -> tuple[ScheduledRoutine, ...]:
         if (
             not isinstance(limit, int)
             or isinstance(limit, bool)
@@ -1003,7 +1058,7 @@ class SQLiteStateStore:
         if any(not isinstance(item, RoutineState) for item in states):
             raise TypeError("routine states must contain RoutineState values")
 
-        def read() -> tuple[ScheduledRoutineV1, ...]:
+        def read() -> tuple[ScheduledRoutine, ...]:
             with _connect(self.path) as connection:
                 rows = tuple(
                     connection.execute(
@@ -1037,7 +1092,7 @@ class SQLiteStateStore:
         routine_id: str,
         *,
         limit: int = MAX_ROUTINE_HISTORY_PAGE_SIZE,
-    ) -> tuple[RoutineOccurrenceV1, ...]:
+    ) -> tuple[RoutineOccurrence, ...]:
         if (
             not isinstance(limit, int)
             or isinstance(limit, bool)
@@ -1045,7 +1100,7 @@ class SQLiteStateStore:
         ):
             raise ValueError("routine history limit is outside its bound")
 
-        def read() -> tuple[RoutineOccurrenceV1, ...]:
+        def read() -> tuple[RoutineOccurrence, ...]:
             with _connect(self.path) as connection:
                 rows = tuple(
                     connection.execute(
@@ -1068,17 +1123,17 @@ class SQLiteStateStore:
 
     async def revise_scheduled_routine(
         self,
-        routine: ScheduledRoutineV1,
+        routine: ScheduledRoutine,
         *,
         expected_revision: int,
-    ) -> ScheduledRoutineV1 | None:
+    ) -> ScheduledRoutine | None:
         """Conditionally persist one complete material routine revision."""
 
-        if not isinstance(routine, ScheduledRoutineV1):
-            raise TypeError("routine must be ScheduledRoutineV1")
+        if not isinstance(routine, ScheduledRoutine):
+            raise TypeError("routine must be ScheduledRoutine")
         validate_schedule(routine.schedule)
 
-        def write(connection: sqlite3.Connection) -> ScheduledRoutineV1 | None:
+        def write(connection: sqlite3.Connection) -> ScheduledRoutine | None:
             loaded = _load_routine_row(connection, routine.agent_id, routine.routine_id)
             if loaded is None:
                 return None
@@ -1130,12 +1185,12 @@ class SQLiteStateStore:
         expected_revision: int,
         state: RoutineState,
         transitioned_at: datetime,
-    ) -> ScheduledRoutineV1 | None:
+    ) -> ScheduledRoutine | None:
         if not isinstance(state, RoutineState):
             raise TypeError("routine transition state is invalid")
         _datetime_us(transitioned_at)
 
-        def write(connection: sqlite3.Connection) -> ScheduledRoutineV1 | None:
+        def write(connection: sqlite3.Connection) -> ScheduledRoutine | None:
             loaded = _load_routine_row(connection, agent_id, routine_id)
             if loaded is None:
                 return None
@@ -1198,8 +1253,8 @@ class SQLiteStateStore:
         self,
         agent_id: str,
         occurrence_id: str,
-    ) -> RoutineOccurrenceV1 | None:
-        def read() -> RoutineOccurrenceV1 | None:
+    ) -> RoutineOccurrence | None:
+        def read() -> RoutineOccurrence | None:
             with _connect(self.path) as connection:
                 loaded = _load_routine_occurrence_row(
                     connection,
@@ -1219,13 +1274,13 @@ class SQLiteStateStore:
         expected_due_at: datetime,
         claimed_at: datetime,
         claim_token: str,
-    ) -> RoutineOccurrenceV1 | None:
+    ) -> RoutineOccurrence | None:
         """Conditionally claim one due canonical slot and reserve its run budget."""
 
         due_us = _datetime_us(expected_due_at)
         _datetime_us(claimed_at)
 
-        def write(connection: sqlite3.Connection) -> RoutineOccurrenceV1 | None:
+        def write(connection: sqlite3.Connection) -> RoutineOccurrence | None:
             loaded = _load_routine_row(connection, agent_id, routine_id)
             if loaded is None:
                 return None
@@ -1295,7 +1350,7 @@ class SQLiteStateStore:
         authorized_control_call_id: str,
         claimed_at: datetime,
         claim_token: str,
-    ) -> RoutineOccurrenceV1 | None:
+    ) -> RoutineOccurrence | None:
         _datetime_us(claimed_at)
         slot = manual_slot_key(
             routine_id,
@@ -1303,7 +1358,7 @@ class SQLiteStateStore:
             authorized_control_call_id,
         )
 
-        def write(connection: sqlite3.Connection) -> RoutineOccurrenceV1 | None:
+        def write(connection: sqlite3.Connection) -> RoutineOccurrence | None:
             existing = connection.execute(
                 """SELECT occurrence_id, data FROM routine_occurrences
                    WHERE agent_id = ? AND routine_id = ?
@@ -1343,7 +1398,7 @@ class SQLiteStateStore:
     def _claim_routine_slot_in_transaction(
         self,
         connection: sqlite3.Connection,
-        current: ScheduledRoutineV1,
+        current: ScheduledRoutine,
         encoded: str,
         *,
         slot_kind: RoutineSlotKind,
@@ -1351,7 +1406,7 @@ class SQLiteStateStore:
         scheduled_for: datetime,
         claimed_at: datetime,
         claim_token: str,
-    ) -> RoutineOccurrenceV1:
+    ) -> RoutineOccurrence:
         if (
             current.attempt_count >= current.cumulative_max_attempts
             or current.occurrence_count >= current.cumulative_max_occurrences
@@ -1369,7 +1424,7 @@ class SQLiteStateStore:
         ):
             raise ValueError("routine_model_budget_exhausted")
         identity = routine_occurrence_id(current.routine_id, slot_key)
-        occurrence = RoutineOccurrenceV1(
+        occurrence = RoutineOccurrence(
             occurrence_id=identity,
             agent_id=current.agent_id,
             routine_id=current.routine_id,
@@ -1393,7 +1448,7 @@ class SQLiteStateStore:
             run_terminal_at=None,
             conclusion_digest=None,
             terminal_run_id=None,
-            delivery_id=None,
+            delivery_ids=(),
             attempt_count=1,
             failure_code=None,
             retry_at=None,
@@ -1426,12 +1481,12 @@ class SQLiteStateStore:
         execution_scope: ExecutionScope,
         bound_at: datetime,
         precheck_observation: ResourceRevisionObservation | None = None,
-    ) -> RoutineOccurrenceV1 | None:
+    ) -> RoutineOccurrence | None:
         if not isinstance(execution_scope, ExecutionScope):
             raise TypeError("routine execution scope is invalid")
         _datetime_us(bound_at)
 
-        def write(connection: sqlite3.Connection) -> RoutineOccurrenceV1 | None:
+        def write(connection: sqlite3.Connection) -> RoutineOccurrence | None:
             loaded = _load_routine_occurrence_row(connection, agent_id, occurrence_id)
             if loaded is None:
                 return None
@@ -1484,10 +1539,10 @@ class SQLiteStateStore:
         *,
         run_id: str,
         terminal_at: datetime,
-    ) -> RoutineOccurrenceV1 | None:
+    ) -> RoutineOccurrence | None:
         _datetime_us(terminal_at)
 
-        def write(connection: sqlite3.Connection) -> RoutineOccurrenceV1 | None:
+        def write(connection: sqlite3.Connection) -> RoutineOccurrence | None:
             loaded = _load_routine_occurrence_row(connection, agent_id, occurrence_id)
             if loaded is None:
                 return None
@@ -1535,37 +1590,56 @@ class SQLiteStateStore:
         finalized_at: datetime,
         skipped_no_change_observation: ResourceRevisionObservation | None = None,
         failure_code: str | None = None,
-    ) -> tuple[RoutineOccurrenceV1, InboxItem | None] | None:
+        artifact_references: tuple[OutcomeArtifactReference, ...] = (),
+        outcome_contract_failure_code: str | None = None,
+    ) -> tuple[RoutineOccurrence, Delivery | None] | None:
         """Converge one occurrence, routine budget, slot, and logical delivery."""
 
         _datetime_us(finalized_at)
 
         def write(
             connection: sqlite3.Connection,
-        ) -> tuple[RoutineOccurrenceV1, InboxItem | None] | None:
+        ) -> tuple[RoutineOccurrence, Delivery | None] | None:
             loaded = _load_routine_occurrence_row(connection, agent_id, occurrence_id)
             if loaded is None:
                 return None
             current, occurrence_data = loaded
             if skipped_no_change_observation is not None and failure_code is not None:
                 raise ValueError("routine finalization outcomes are mutually exclusive")
+            if outcome_contract_failure_code is not None and not re.fullmatch(
+                r"[a-z][a-z0-9_]{0,127}", outcome_contract_failure_code
+            ):
+                raise ValueError("routine outcome contract failure code is invalid")
+            contract_failure_code = outcome_contract_failure_code
+            routine_loaded = _load_routine_row(
+                connection,
+                agent_id,
+                current.routine_id,
+            )
+            if routine_loaded is None:
+                return None
+            routine, routine_data = routine_loaded
+            target = routine.distribution_plan.targets[0]
             existing_row = connection.execute(
-                "SELECT delivery_id, data FROM conversation_inbox "
-                "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ?",
+                "SELECT delivery_id, data FROM deliveries "
+                "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ? "
+                "AND target_fingerprint = ?",
                 (
                     agent_id,
                     DeliverySubjectKind.ROUTINE_OCCURRENCE.value,
                     occurrence_id,
+                    target.target_fingerprint,
                 ),
             ).fetchone()
             if existing_row is not None:
-                existing_inbox = decode_inbox_item(
+                existing_delivery = decode_delivery(
                     existing_row[1],
                     agent_id=agent_id,
                     delivery_id=existing_row[0],
                 )
-                return current, existing_inbox
-
+                return current, existing_delivery
+            if routine.active_occurrence_id != occurrence_id:
+                return None
             pre_run_outcome = (
                 skipped_no_change_observation is not None or failure_code is not None
             )
@@ -1593,17 +1667,6 @@ class SQLiteStateStore:
             ):
                 return None
 
-            routine_loaded = _load_routine_row(
-                connection,
-                agent_id,
-                current.routine_id,
-            )
-            if routine_loaded is None:
-                return None
-            routine, routine_data = routine_loaded
-            if routine.active_occurrence_id != occurrence_id:
-                return None
-
             occurrence_observation = current.precheck_observation
             resulting_run_id: str | None = None
             charged_tokens = 0
@@ -1612,6 +1675,7 @@ class SQLiteStateStore:
             report_digest: str | None = None
             report_preview: str | None = None
             report_truncated = False
+            validated_artifact_references: tuple[OutcomeArtifactReference, ...] = ()
             if pre_run_outcome:
                 occurrence_observation = skipped_no_change_observation
                 successful = occurrence_observation is not None
@@ -1635,6 +1699,15 @@ class SQLiteStateStore:
                         or occurrence_observation.resource_id != precheck.resource_id
                     ):
                         raise ValueError("routine precheck observation is out of scope")
+                if successful and any(
+                    requirement.minimum_count > 0
+                    for requirement in routine.outcome_contract.artifact_requirements
+                ):
+                    successful = False
+                    terminal_failure_code = "outcome_artifact_contract_failed"
+                    disposition = RoutineOccurrenceDisposition.TERMINAL_FAILED
+                    outcome = "failed"
+                    reason = terminal_failure_code
             else:
                 assert current.reserved_run_id is not None
                 run_row = connection.execute(
@@ -1652,6 +1725,8 @@ class SQLiteStateStore:
                     or run_input.execution_scope.routine_revision
                     != current.routine_revision
                     or run_input.execution_scope.occurrence_id != current.occurrence_id
+                    or run_input.execution_scope.distribution_plan_digest
+                    != routine.distribution_plan.plan_digest
                     or result.run_id != current.reserved_run_id
                 ):
                     raise ValueError("routine terminal run scope is invalid")
@@ -1679,6 +1754,12 @@ class SQLiteStateStore:
                             > sensitivity.routing_rank
                         ):
                             sensitivity = block.sensitivity
+                if (
+                    sensitivity.routing_rank
+                    > routine.outcome_contract.maximum_effective_sensitivity.routing_rank
+                ):
+                    successful = False
+                    contract_failure_code = "outcome_sensitivity_contract_failed"
                 estimate = result.usage.cost_estimate
                 charged_cost = (
                     estimate.amount_usd
@@ -1688,13 +1769,45 @@ class SQLiteStateStore:
                     else current.reserved_cost_usd
                 )
                 charged_tokens = min(result.usage.total_tokens, current.reserved_tokens)
+                if successful:
+                    contract_failure = contract_failure_code
+                    try:
+                        expected_artifact_references = tuple(
+                            sorted(
+                                (
+                                    outcome_artifact_reference(ref)
+                                    for ref in result.artifacts
+                                ),
+                                key=lambda item: item.artifact_id,
+                            )
+                        )
+                        validated_artifact_references = (
+                            validate_outcome_artifact_references(
+                                artifact_references,
+                                contract=routine.outcome_contract,
+                                resulting_run_id=current.reserved_run_id,
+                            )
+                        )
+                        if (
+                            validated_artifact_references
+                            != expected_artifact_references
+                        ):
+                            raise ValueError("validated artifact references differ")
+                    except (TypeError, ValueError):
+                        contract_failure = "outcome_artifact_contract_failed"
+                        validated_artifact_references = ()
+                    if contract_failure is not None:
+                        successful = False
+                        contract_failure_code = contract_failure
                 if result.final_text is not None:
                     report_digest, report_preview, report_truncated = (
-                        inbox_report_projection(result.final_text)
+                        conclusion_preview_projection(result.final_text)
                     )
                 resulting_run_id = current.reserved_run_id
                 terminal_failure_code = (
-                    None if successful else f"routine_run_{result.reason}"
+                    None
+                    if successful
+                    else (contract_failure_code or f"routine_run_{result.reason}")
                 )
                 disposition = (
                     RoutineOccurrenceDisposition.COMPLETED
@@ -1736,14 +1849,10 @@ class SQLiteStateStore:
                 next_state = RoutineState.ACTIVE
             escalation = not successful and next_state is RoutineState.NEEDS_ATTENTION
 
-            subject = DeliverySubject(
-                kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
-                subject_id=occurrence_id,
-            )
             payload = {
                 "subject": {
-                    "kind": subject.kind.value,
-                    "subject_id": subject.subject_id,
+                    "kind": DeliverySubjectKind.ROUTINE_OCCURRENCE.value,
+                    "subject_id": occurrence_id,
                 },
                 "routine_id": current.routine_id,
                 "routine_revision": current.routine_revision,
@@ -1766,60 +1875,48 @@ class SQLiteStateStore:
             conclusion_digest = (
                 "sha256:" + sha256(canonical_json(payload).encode("utf-8")).hexdigest()
             )
-            inbox: InboxItem | None = None
-            if resulting_run_id is not None or escalation:
-                delivery_state = (
-                    DeliveryState.AVAILABLE
-                    if sensitivity.routing_rank
-                    <= routine.sensitivity_ceiling.routing_rank
-                    else DeliveryState.BLOCKED
-                )
-                logical_key = f"{subject.kind.value}:{occurrence_id}:conclusion"
-                inbox = InboxItem(
-                    delivery_id=delivery_id,
-                    agent_id=agent_id,
-                    conversation_id=routine.conversation_id,
-                    subject=subject,
-                    resulting_run_id=resulting_run_id,
-                    grant_id=(
-                        f"routine:{routine.routine_id}:revision:{routine.revision}"
-                    ),
-                    logical_key=logical_key,
-                    conclusion_digest=conclusion_digest,
-                    payload=payload,
-                    sensitivity=sensitivity,
-                    destination=routine.delivery_destination,
-                    destination_sensitivity_ceiling=routine.sensitivity_ceiling,
-                    state=delivery_state,
-                    created_at=finalized_at,
-                    updated_at=finalized_at,
-                    terminal_error=(
-                        "delivery_sensitivity_ineligible"
-                        if delivery_state is DeliveryState.BLOCKED
-                        else terminal_failure_code
-                    ),
-                )
-                count = connection.execute(
-                    "SELECT COUNT(*) FROM conversation_inbox WHERE agent_id = ?",
-                    (agent_id,),
-                ).fetchone()
-                if int(count[0]) >= MAX_CONVERSATION_INBOX_ITEMS_PER_AGENT:
-                    raise ValueError("conversation_inbox_retention_limit_exceeded")
-                connection.execute(
-                    "INSERT INTO conversation_inbox("
-                    "agent_id, delivery_id, conversation_id, subject_kind, subject_id, "
-                    "logical_key, data"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        agent_id,
-                        delivery_id,
-                        inbox.conversation_id,
-                        subject.kind.value,
-                        subject.subject_id,
-                        logical_key,
-                        encode_inbox_item(inbox),
-                    ),
-                )
+            conclusion_kind = (
+                OutcomeConclusionKind.TERMINAL_RUN
+                if resulting_run_id is not None
+                else OutcomeConclusionKind.NO_MODEL_OCCURRENCE
+            )
+            delivery = construct_logical_delivery(
+                delivery_id=delivery_id,
+                agent_id=agent_id,
+                conversation_id=routine.conversation_id,
+                subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
+                subject_id=occurrence_id,
+                target=target,
+                conclusion_kind=conclusion_kind,
+                conclusion_state=(
+                    OutcomeState.SKIPPED_NO_CHANGE
+                    if disposition is RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
+                    else (OutcomeState.SUCCEEDED if successful else OutcomeState.FAILED)
+                ),
+                conclusion_id=resulting_run_id or occurrence_id,
+                conclusion_digest=report_digest or conclusion_digest,
+                conclusion_preview=report_preview or "",
+                conclusion_preview_truncated=report_truncated,
+                resulting_run_id=resulting_run_id,
+                artifact_references=(
+                    validated_artifact_references
+                    if resulting_run_id is not None and successful
+                    else ()
+                ),
+                effective_sensitivity=sensitivity,
+                provenance_digest=(
+                    current.execution_scope_digest
+                    or (
+                        None
+                        if occurrence_observation is None
+                        else occurrence_observation.digest
+                    )
+                    or conclusion_digest
+                ),
+                failure_code=terminal_failure_code,
+                observed_at=finalized_at,
+            )
+            _insert_delivery(connection, delivery)
 
             completed_occurrence = replace(
                 current,
@@ -1829,7 +1926,7 @@ class SQLiteStateStore:
                 charged_tokens=charged_tokens,
                 charged_cost_usd=charged_cost,
                 conclusion_digest=conclusion_digest,
-                delivery_id=(None if inbox is None else inbox.delivery_id),
+                delivery_ids=(delivery.delivery_id,),
                 failure_code=terminal_failure_code,
                 lease_expires_at=None,
                 disposition=disposition,
@@ -1850,9 +1947,7 @@ class SQLiteStateStore:
                 last_acknowledged_precheck_observation=acknowledged_observation,
                 active_occurrence_id=None,
                 last_occurrence_id=current.occurrence_id,
-                last_delivery_id=(
-                    routine.last_delivery_id if inbox is None else inbox.delivery_id
-                ),
+                last_delivery_ids=(delivery.delivery_id,),
                 next_due_at=following,
                 state=next_state,
                 updated_at=finalized_at,
@@ -1863,7 +1958,7 @@ class SQLiteStateStore:
                 completed_occurrence,
             )
             _replace_routine_row(connection, routine_data, completed_routine)
-            return completed_occurrence, inbox
+            return completed_occurrence, delivery
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
@@ -1873,28 +1968,46 @@ class SQLiteStateStore:
         *,
         recovered_at: datetime,
         claim_token_factory: Callable[[str], str],
-    ) -> tuple[RoutineOccurrenceV1, ...]:
+    ) -> tuple[RoutineOccurrence, ...]:
         """Fence stale claims and converge already-terminal reserved runs."""
 
         recovered_us = _datetime_us(recovered_at)
 
-        def write(connection: sqlite3.Connection) -> tuple[RoutineOccurrenceV1, ...]:
+        def write(connection: sqlite3.Connection) -> tuple[RoutineOccurrence, ...]:
             rows = tuple(
                 connection.execute(
                     """SELECT occurrence_id, data FROM routine_occurrences
-                       WHERE agent_id = ? AND lease_expires_at_us IS NOT NULL
-                         AND lease_expires_at_us <= ?
-                       ORDER BY lease_expires_at_us, occurrence_id""",
-                    (agent_id, recovered_us),
+                       WHERE agent_id = ?
+                         AND (state = ?
+                              OR (state IN (?, ?, ?)
+                                  AND (lease_expires_at_us IS NULL
+                                       OR lease_expires_at_us <= ?)))
+                       ORDER BY COALESCE(lease_expires_at_us, 0), occurrence_id""",
+                    (
+                        agent_id,
+                        (
+                            RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION.value
+                        ),
+                        RoutineOccurrenceDisposition.CLAIMED.value,
+                        RoutineOccurrenceDisposition.PRECHECKING.value,
+                        RoutineOccurrenceDisposition.RUNNING.value,
+                        recovered_us,
+                    ),
                 )
             )
-            recovered: list[RoutineOccurrenceV1] = []
+            recovered: list[RoutineOccurrence] = []
             for occurrence_id_value, occurrence_data in rows:
                 current = decode_routine_occurrence(
                     occurrence_data,
                     agent_id=agent_id,
                     occurrence_id=occurrence_id_value,
                 )
+                if (
+                    current.disposition
+                    is RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+                ):
+                    recovered.append(current)
+                    continue
                 if current.disposition not in {
                     RoutineOccurrenceDisposition.CLAIMED,
                     RoutineOccurrenceDisposition.PRECHECKING,
@@ -2642,32 +2755,35 @@ class SQLiteStateStore:
         *,
         delivery_id: str,
         finalized_at: datetime,
-    ) -> tuple[AutonomousFollowup, InboxItem] | None:
+    ) -> tuple[AutonomousFollowup, Delivery] | None:
         """Atomically charge, consume, and create exactly one logical delivery."""
 
         def write(
             connection: sqlite3.Connection,
-        ) -> tuple[AutonomousFollowup, InboxItem] | None:
+        ) -> tuple[AutonomousFollowup, Delivery] | None:
             loaded = _load_followup_row(connection, agent_id, followup_id)
             if loaded is None:
                 return None
             current, encoded = loaded
+            target = current.grant.distribution_plan.targets[0]
             existing_row = connection.execute(
-                "SELECT delivery_id, data FROM conversation_inbox "
-                "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ?",
+                "SELECT delivery_id, data FROM deliveries "
+                "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ? "
+                "AND target_fingerprint = ?",
                 (
                     agent_id,
-                    DeliverySubjectKind.STANDALONE_FOLLOWUP.value,
+                    DeliverySubjectKind.AUTONOMOUS_FOLLOWUP.value,
                     followup_id,
+                    target.target_fingerprint,
                 ),
             ).fetchone()
             if existing_row is not None:
-                inbox = decode_inbox_item(
+                delivery = decode_delivery(
                     existing_row[1],
                     agent_id=agent_id,
                     delivery_id=existing_row[0],
                 )
-                return current, inbox
+                return current, delivery
             if (
                 current.disposition
                 is not FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
@@ -2685,8 +2801,17 @@ class SQLiteStateStore:
                 "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
                 (current.reserved_run_id,),
             ).fetchall()
+            run_input = decode_run_input(run_row[0])
+            if (
+                run_input.origin is not RunOrigin.JOB_EVENT
+                or run_input.execution_scope != current.execution_scope
+                or run_input.execution_scope.distribution_plan_digest
+                != current.grant.distribution_plan.plan_digest
+                or result.run_id != current.reserved_run_id
+            ):
+                raise ValueError("follow-up terminal run scope is invalid")
             transcript = Transcript(
-                run=decode_run_input(run_row[0]),
+                run=run_input,
                 messages=tuple(
                     decode_message(message_data) for (message_data,) in message_rows
                 ),
@@ -2702,6 +2827,17 @@ class SQLiteStateStore:
                 result,
             )
             successful = result.kind is LoopExitKind.COMPLETED and evidence is not None
+            try:
+                validate_outcome_artifact_references(
+                    (),
+                    contract=current.grant.outcome_contract,
+                    resulting_run_id=current.reserved_run_id,
+                )
+                if result.artifacts:
+                    raise ValueError("follow-up outcome contract permits no artifacts")
+            except (TypeError, ValueError):
+                successful = False
+                conclusion_failure_code = "outcome_artifact_contract_failed"
             sensitivity = current.execution_scope.sensitivity_ceiling
             for message in transcript.messages:
                 for block in message.content:
@@ -2711,6 +2847,12 @@ class SQLiteStateStore:
                         and block.sensitivity.routing_rank > sensitivity.routing_rank
                     ):
                         sensitivity = block.sensitivity
+            if (
+                sensitivity.routing_rank
+                > current.grant.outcome_contract.maximum_effective_sensitivity.routing_rank
+            ):
+                successful = False
+                conclusion_failure_code = "outcome_sensitivity_contract_failed"
             estimate = result.usage.cost_estimate
             charged_cost = (
                 estimate.amount_usd
@@ -2720,26 +2862,14 @@ class SQLiteStateStore:
                 else current.reserved_cost_usd
             )
             charged_tokens = min(result.usage.total_tokens, current.reserved_tokens)
-            delivery_state = (
-                DeliveryState.AVAILABLE
-                if sensitivity.routing_rank
-                <= current.grant.delivery_sensitivity_ceiling.routing_rank
-                else DeliveryState.BLOCKED
-            )
-            subject = DeliverySubject(
-                kind=DeliverySubjectKind.STANDALONE_FOLLOWUP,
-                subject_id=followup_id,
-            )
-            logical_key = f"{subject.kind.value}:{subject.subject_id}:conclusion"
             report_digest: str | None = None
             report_preview: str | None = None
             report_truncated = False
             if result.final_text is not None:
                 report_digest, bounded_report, report_truncated = (
-                    inbox_report_projection(result.final_text)
+                    conclusion_preview_projection(result.final_text)
                 )
-                if successful and delivery_state is DeliveryState.AVAILABLE:
-                    report_preview = bounded_report
+                report_preview = bounded_report
             if successful:
                 failure_code = None
             elif result.kind is LoopExitKind.COMPLETED:
@@ -2752,8 +2882,8 @@ class SQLiteStateStore:
                 failure_code = f"followup_run_{result.reason}"
             payload = {
                 "subject": {
-                    "kind": subject.kind.value,
-                    "subject_id": subject.subject_id,
+                    "kind": DeliverySubjectKind.AUTONOMOUS_FOLLOWUP.value,
+                    "subject_id": followup_id,
                 },
                 "job_id": current.job_id,
                 "run_id": current.reserved_run_id,
@@ -2764,54 +2894,35 @@ class SQLiteStateStore:
                 "report_truncated": report_truncated,
                 "evidence_digest": None if evidence is None else evidence.digest,
             }
-            conclusion_digest = (
+            payload_digest = (
                 "sha256:" + sha256(canonical_json(payload).encode("utf-8")).hexdigest()
             )
-            inbox = InboxItem(
+            conclusion_digest = report_digest or payload_digest
+            delivery = construct_logical_delivery(
                 delivery_id=delivery_id,
                 agent_id=agent_id,
                 conversation_id=current.conversation_id,
-                subject=subject,
-                resulting_run_id=current.reserved_run_id,
-                grant_id=current.grant.grant_id,
-                logical_key=logical_key,
+                subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
+                subject_id=followup_id,
+                target=target,
+                conclusion_kind=OutcomeConclusionKind.TERMINAL_RUN,
+                conclusion_state=(
+                    OutcomeState.SUCCEEDED if successful else OutcomeState.FAILED
+                ),
+                conclusion_id=current.reserved_run_id,
                 conclusion_digest=conclusion_digest,
-                payload=payload,
-                sensitivity=sensitivity,
-                destination=current.grant.delivery_destination,
-                destination_sensitivity_ceiling=(
-                    current.grant.delivery_sensitivity_ceiling
+                conclusion_preview=report_preview or "",
+                conclusion_preview_truncated=report_truncated,
+                resulting_run_id=current.reserved_run_id,
+                artifact_references=(),
+                effective_sensitivity=sensitivity,
+                provenance_digest=(
+                    evidence.digest if evidence is not None else payload_digest
                 ),
-                state=delivery_state,
-                created_at=finalized_at,
-                updated_at=finalized_at,
-                terminal_error=(
-                    "delivery_sensitivity_ineligible"
-                    if delivery_state is DeliveryState.BLOCKED
-                    else failure_code
-                ),
+                failure_code=failure_code,
+                observed_at=finalized_at,
             )
-            count = connection.execute(
-                "SELECT COUNT(*) FROM conversation_inbox WHERE agent_id = ?",
-                (agent_id,),
-            ).fetchone()
-            if int(count[0]) >= MAX_CONVERSATION_INBOX_ITEMS_PER_AGENT:
-                raise ValueError("conversation_inbox_retention_limit_exceeded")
-            connection.execute(
-                "INSERT INTO conversation_inbox("
-                "agent_id, delivery_id, conversation_id, subject_kind, subject_id, "
-                "logical_key, data"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    agent_id,
-                    delivery_id,
-                    inbox.conversation_id,
-                    subject.kind.value,
-                    subject.subject_id,
-                    logical_key,
-                    encode_inbox_item(inbox),
-                ),
-            )
+            _insert_delivery(connection, delivery)
             completed = replace(
                 current,
                 disposition=(
@@ -2831,77 +2942,92 @@ class SQLiteStateStore:
                 failure_code=failure_code,
             )
             _replace_followup_row(connection, encoded, completed)
-            return completed, inbox
+            return completed, delivery
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
-    async def list_inbox(
+    async def load_delivery(
+        self,
+        agent_id: str,
+        delivery_id: str,
+    ) -> Delivery | None:
+        def read() -> Delivery | None:
+            with _connect(self.path) as connection:
+                loaded = _load_delivery_row(connection, agent_id, delivery_id)
+                return None if loaded is None else loaded[0]
+
+        return await asyncio.to_thread(read)
+
+    async def list_deliveries(
         self,
         agent_id: str,
         *,
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
-        limit: int = MAX_INBOX_PAGE_SIZE,
-    ) -> tuple[InboxItem, ...]:
-        if not 1 <= limit <= MAX_INBOX_PAGE_SIZE:
-            raise ValueError("inbox list limit is outside its bound")
+        limit: int = MAX_DELIVERY_LIST_PAGE_SIZE,
+    ) -> tuple[Delivery, ...]:
+        if not 1 <= limit <= MAX_DELIVERY_LIST_PAGE_SIZE:
+            raise ValueError("delivery list limit is outside its bound")
 
-        def read() -> tuple[InboxItem, ...]:
+        def read() -> tuple[Delivery, ...]:
+            clauses = ["agent_id = ?"]
+            parameters: list[object] = [agent_id]
+            if conversation_id is not None:
+                clauses.append("conversation_id = ?")
+                parameters.append(conversation_id)
+            if not include_acknowledged:
+                clauses.append("state != ?")
+                parameters.append(DeliveryState.ACKNOWLEDGED.value)
+            parameters.append(limit)
             with _connect(self.path) as connection:
                 rows = connection.execute(
-                    "SELECT delivery_id, data FROM conversation_inbox "
-                    "WHERE agent_id = ?",
-                    (agent_id,),
+                    "SELECT delivery_id, data FROM deliveries WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY created_at_us DESC, delivery_id DESC LIMIT ?",
+                    tuple(parameters),
                 ).fetchall()
-            items = (
-                decode_inbox_item(data, agent_id=agent_id, delivery_id=delivery_id)
-                for delivery_id, data in rows
-            )
-            selected = (
-                item
-                for item in items
-                if (conversation_id is None or item.conversation_id == conversation_id)
-                and (
-                    include_acknowledged or item.state is not DeliveryState.ACKNOWLEDGED
-                )
-            )
             return tuple(
-                sorted(
-                    selected,
-                    key=lambda item: (item.created_at, item.delivery_id),
-                    reverse=True,
-                )[:limit]
+                decode_delivery(data, agent_id=agent_id, delivery_id=delivery_id)
+                for delivery_id, data in rows
             )
 
         return await asyncio.to_thread(read)
 
-    async def acknowledge_inbox(
+    async def acknowledge_delivery(
         self,
         agent_id: str,
         delivery_id: str,
         *,
         acknowledged_at: datetime,
-    ) -> InboxItem | None:
-        def write(connection: sqlite3.Connection) -> InboxItem | None:
-            loaded = _load_inbox_row(connection, agent_id, delivery_id)
+    ) -> Delivery | None:
+        _datetime_us(acknowledged_at)
+
+        def write(connection: sqlite3.Connection) -> Delivery | None:
+            loaded = _load_delivery_row(connection, agent_id, delivery_id)
             if loaded is None:
                 return None
             current, encoded = loaded
-            if current.state is DeliveryState.ACKNOWLEDGED:
+            if current.visibility_state is DeliveryState.ACKNOWLEDGED:
                 return current
             updated = replace(
                 current,
-                state=DeliveryState.ACKNOWLEDGED,
+                visibility_state=DeliveryState.ACKNOWLEDGED,
                 updated_at=acknowledged_at,
                 acknowledged_at=acknowledged_at,
             )
             result = connection.execute(
-                "UPDATE conversation_inbox SET data = ? "
+                "UPDATE deliveries SET state = ?, data = ? "
                 "WHERE agent_id = ? AND delivery_id = ? AND data = ?",
-                (encode_inbox_item(updated), agent_id, delivery_id, encoded),
+                (
+                    updated.visibility_state.value,
+                    encode_delivery(updated),
+                    agent_id,
+                    delivery_id,
+                    encoded,
+                ),
             )
             if result.rowcount != 1:
-                raise RuntimeError("inbox item changed during acknowledgment")
+                raise RuntimeError("delivery changed during acknowledgment")
             return updated
 
         return await _run_cancellation_safe_transaction(self.path, write)
@@ -5474,6 +5600,62 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def list_delivery_artifact_references(
+        self,
+        agent_id: str,
+        *,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[OutcomeArtifactReference, ...]:
+        """Return bounded artifact roots carried by retained logical deliveries."""
+
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be non-empty text")
+        if run_id is not None and (not isinstance(run_id, str) or not run_id):
+            raise ValueError("run_id must be non-empty text or None")
+        if conversation_id is not None and (
+            not isinstance(conversation_id, str) or not conversation_id
+        ):
+            raise ValueError("conversation_id must be non-empty text or None")
+
+        def read() -> tuple[OutcomeArtifactReference, ...]:
+            clauses = ["agent_id = ?"]
+            parameters: list[object] = [agent_id]
+            if conversation_id is not None:
+                clauses.append("conversation_id = ?")
+                parameters.append(conversation_id)
+            with _connect_read_only(self.path) as connection:
+                rows = connection.execute(
+                    "SELECT delivery_id, data FROM deliveries WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY created_at_us, delivery_id",
+                    tuple(parameters),
+                ).fetchall()
+            references: dict[str, OutcomeArtifactReference] = {}
+            for delivery_id, data in rows:
+                delivery = decode_delivery(
+                    data,
+                    agent_id=agent_id,
+                    delivery_id=delivery_id,
+                )
+                for reference in delivery.outcome.artifact_references:
+                    if run_id is not None and reference.producing_run_id != run_id:
+                        continue
+                    current = references.get(reference.artifact_id)
+                    if current is not None and current != reference:
+                        raise RuntimeError(
+                            "stored delivery artifact identity is ambiguous"
+                        )
+                    references[reference.artifact_id] = reference
+            return tuple(
+                sorted(
+                    references.values(),
+                    key=lambda item: (item.producing_run_id, item.artifact_id),
+                )
+            )
+
+        return await asyncio.to_thread(read)
+
     async def list_reserved_artifact_ids(
         self,
         agent_id: str,
@@ -5591,7 +5773,66 @@ class SQLiteStateStore:
                         ),
                     )
                     if followup.reserved_run_id is not None
+                    and followup.disposition
+                    in {
+                        FollowupDisposition.CLAIMED,
+                        FollowupDisposition.RUNNING,
+                        FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
+                        FollowupDisposition.RETRYABLE_FAILED,
+                    }
                 }
+                occurrence_rows = connection.execute(
+                    "SELECT occurrence_id, data FROM routine_occurrences "
+                    "WHERE agent_id = ?",
+                    (agent_id,),
+                ).fetchall()
+                protected_run_ids.update(
+                    occurrence.reserved_run_id
+                    for occurrence_id, data in occurrence_rows
+                    for occurrence in (
+                        decode_routine_occurrence(
+                            data,
+                            agent_id=agent_id,
+                            occurrence_id=occurrence_id,
+                        ),
+                    )
+                    if occurrence.reserved_run_id is not None
+                    and occurrence.disposition
+                    in {
+                        RoutineOccurrenceDisposition.CLAIMED,
+                        RoutineOccurrenceDisposition.PRECHECKING,
+                        RoutineOccurrenceDisposition.RUNNING,
+                        (
+                            RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+                        ),
+                        RoutineOccurrenceDisposition.RETRYABLE,
+                    }
+                )
+                active_routine_conversations = {
+                    routine.conversation_id
+                    for routine_id, data in connection.execute(
+                        "SELECT routine_id, data FROM scheduled_routines "
+                        "WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+                    for routine in (
+                        decode_scheduled_routine(
+                            data,
+                            agent_id=agent_id,
+                            routine_id=routine_id,
+                        ),
+                    )
+                    if routine.active_occurrence_id is not None
+                }
+                for conversation_id in active_routine_conversations:
+                    anchor = connection.execute(
+                        "SELECT id FROM runs "
+                        "WHERE agent_id = ? AND conversation_id = ? "
+                        "ORDER BY turn_index, id LIMIT 1",
+                        (agent_id, conversation_id),
+                    ).fetchone()
+                    if anchor is not None:
+                        protected_run_ids.add(str(anchor[0]))
                 run_ids = tuple(
                     str(row[0])
                     for row in connection.execute(
@@ -6363,7 +6604,7 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
         if candidate.agent_id != agent_id or candidate.id != candidate_id:
             raise ValueError("stored learning candidate ownership is invalid")
 
-    routines: dict[tuple[str, str], ScheduledRoutineV1] = {}
+    routines: dict[tuple[str, str], ScheduledRoutine] = {}
     routine_counts: dict[str, int] = {}
     active_routine_counts: dict[str, int] = {}
     for (
@@ -6407,7 +6648,7 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
     ):
         raise ValueError("stored active routine count exceeds its fixed bound")
 
-    occurrences: dict[tuple[str, str], RoutineOccurrenceV1] = {}
+    occurrences: dict[tuple[str, str], RoutineOccurrence] = {}
     occurrence_counts: dict[tuple[str, str], int] = {}
     for (
         agent_id,
@@ -6452,6 +6693,75 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
         active = occurrences.get((routine.agent_id, routine.active_occurrence_id))
         if active is None or active.routine_id != routine.routine_id:
             raise ValueError("stored routine active occurrence is invalid")
+
+    followups: dict[tuple[str, str], AutonomousFollowup] = {}
+    for agent_id, followup_id, job_id, event_id, data in connection.execute(
+        """SELECT agent_id, followup_id, job_id, event_id, data
+           FROM autonomous_followups"""
+    ):
+        followup = decode_autonomous_followup(
+            data,
+            agent_id=agent_id,
+            followup_id=followup_id,
+        )
+        if followup.job_id != job_id or followup.event_id != event_id:
+            raise ValueError("stored autonomous follow-up projection is invalid")
+        if identity is not None and followup.agent_id != identity.id:
+            raise ValueError("stored autonomous follow-up belongs to another agent")
+        followups[(agent_id, followup_id)] = followup
+
+    delivery_counts: dict[str, int] = {}
+    for (
+        agent_id,
+        delivery_id,
+        conversation_id,
+        subject_kind,
+        subject_id,
+        logical_key,
+        target_kind,
+        target_fingerprint_value,
+        state,
+        created_at_us,
+        data,
+    ) in connection.execute(
+        """SELECT agent_id, delivery_id, conversation_id, subject_kind,
+                  subject_id, logical_key, target_kind, target_fingerprint,
+                  state, created_at_us, data
+           FROM deliveries"""
+    ):
+        delivery = decode_delivery(
+            data,
+            agent_id=agent_id,
+            delivery_id=delivery_id,
+        )
+        if (
+            delivery.conversation_id != conversation_id
+            or delivery.subject_kind.value != subject_kind
+            or delivery.subject_id != subject_id
+            or delivery.logical_key != logical_key
+            or target_kind != "conversation_inbox"
+            or delivery.target.target_fingerprint != target_fingerprint_value
+            or delivery.visibility_state.value != state
+            or _datetime_us(delivery.created_at) != created_at_us
+        ):
+            raise ValueError("stored delivery projection is invalid")
+        if identity is not None and delivery.agent_id != identity.id:
+            raise ValueError("stored delivery belongs to another agent")
+        producer: AutonomousFollowup | RoutineOccurrence | None
+        if delivery.subject_kind is DeliverySubjectKind.AUTONOMOUS_FOLLOWUP:
+            producer = followups.get((agent_id, subject_id))
+        else:
+            producer = occurrences.get((agent_id, subject_id))
+        producer_references_delivery = producer is not None and (
+            producer.delivery_id == delivery_id
+            if isinstance(producer, AutonomousFollowup)
+            else delivery_id in producer.delivery_ids
+        )
+        if not producer_references_delivery:
+            raise ValueError("stored delivery producer reference is invalid")
+        delivery_counts[agent_id] = delivery_counts.get(agent_id, 0) + 1
+        if delivery_counts[agent_id] > MAX_DELIVERIES_PER_AGENT:
+            raise ValueError("stored delivery count exceeds its fixed bound")
 
 
 def _logical_state_fingerprint(connection: sqlite3.Connection) -> str:
