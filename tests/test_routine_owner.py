@@ -14,6 +14,7 @@ from _distribution_support import (
     no_artifact_outcome_contract,
 )
 
+from daita.adapters.mcp import MCPServerBinding
 from daita.capabilities import (
     AccessMode,
     AutomationEligibility,
@@ -30,13 +31,14 @@ from daita.capabilities import (
     ToolTextTrust,
     ToolView,
 )
-from daita.adapters.mcp import MCPServerBinding
 from daita.catalog.models import (
     CatalogResource,
     ResourceKind,
     Sensitivity,
     catalog_resource_id,
 )
+from daita.distribution import DistributionOwner, conversation_inbox_destination_id
+from daita.distribution.owner import DistributionStore
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -45,8 +47,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.distribution import DistributionOwner, conversation_inbox_destination_id
-from daita.distribution.owner import DistributionStore
 from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
 from daita.routines.capabilities import (
     ROUTINE_CREATE_CAPABILITY_ID,

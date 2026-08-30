@@ -55,7 +55,6 @@ from ..catalog.models import (
     SourceCatalogSnapshot,
 )
 from ..catalog.protocols import CatalogStoreError
-from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..distribution.models import (
     MAX_DELIVERIES_PER_AGENT,
     MAX_DELIVERY_LIST_PAGE_SIZE,
@@ -70,6 +69,7 @@ from ..distribution.models import (
     validate_outcome_artifact_references,
 )
 from ..distribution.owner import construct_logical_delivery
+from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..jobs.models import (
     MAX_ACTIVE_JOBS_PER_AGENT,
@@ -129,8 +129,8 @@ from ..routines.models import (
     MAX_SCHEDULED_ROUTINES_PER_AGENT,
     ROUTINE_CLAIM_LEASE_SECONDS,
     ResourceRevisionObservation,
-    RoutineOccurrenceDisposition,
     RoutineOccurrence,
+    RoutineOccurrenceDisposition,
     RoutineSlotKind,
     RoutineState,
     ScheduledRoutine,
@@ -157,9 +157,9 @@ from .sqlite_codecs import (
     decode_autonomous_followup,
     decode_catalog_snapshot,
     decode_catalog_sync,
+    decode_delivery,
     decode_identifier,
     decode_identity,
-    decode_delivery,
     decode_job_run,
     decode_learning_candidate,
     decode_loop_exit,
@@ -170,16 +170,16 @@ from .sqlite_codecs import (
     decode_review_stamps,
     decode_routine_occurrence,
     decode_run_input,
+    decode_scheduled_routine,
     decode_semantic_annotation,
     decode_source,
     decode_source_read_scope,
-    decode_scheduled_routine,
     encode_autonomous_followup,
     encode_catalog_snapshot,
     encode_catalog_sync,
+    encode_delivery,
     encode_identifier,
     encode_identity,
-    encode_delivery,
     encode_job_run,
     encode_learning_candidate,
     encode_loop_exit,
@@ -190,10 +190,10 @@ from .sqlite_codecs import (
     encode_review_stamps,
     encode_routine_occurrence,
     encode_run_input,
+    encode_scheduled_routine,
     encode_semantic_annotation,
     encode_source,
     encode_source_read_scope,
-    encode_scheduled_routine,
 )
 from .sqlite_migrations import (
     CURRENT_REVISION,

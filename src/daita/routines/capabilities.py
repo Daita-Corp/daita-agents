@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import TypedDict
 
 from .._json import FrozenJsonObject
+from ..artifacts.models import ArtifactAuthorship
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
@@ -26,7 +27,6 @@ from ..capabilities import (
     ToolView,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
-from ..artifacts.models import ArtifactAuthorship
 from ..distribution.models import (
     MAX_OUTCOME_ARTIFACT_BYTES,
     MAX_OUTCOME_ARTIFACT_REFERENCES,
@@ -65,9 +65,9 @@ from .models import (
     RoutineOccurrence,
     RoutineSchedule,
     RoutineState,
+    ScheduledRoutine,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
-    ScheduledRoutine,
 )
 from .owner import RoutineError, RoutineOwner, _routine_proposal_payload
 

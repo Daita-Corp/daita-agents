@@ -10,8 +10,8 @@ from ...artifacts.models import (
     ArtifactLocalFileBinding,
     ArtifactProvenance,
     ArtifactRef,
-    ArtifactResultBinding,
     ArtifactResourceBinding,
+    ArtifactResultBinding,
     ArtifactTextChangeSummary,
     artifact_text_change_summary_to_mapping,
 )

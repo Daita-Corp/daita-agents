@@ -13,8 +13,8 @@ from daita.capabilities import (
     AccessMode,
     AutomationEligibility,
     CapabilityDeclarations,
-    Executor,
     ExecutionScope,
+    Executor,
     OperationalEffect,
     ToolExecution,
 )

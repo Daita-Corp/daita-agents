@@ -21,10 +21,10 @@ from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
     TOOLBOX_DEFINITIONS,
     AccessMode,
-    AutomationEligibility,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,

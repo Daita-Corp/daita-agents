@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Self, TypeVar, TypedDict, cast
+from typing import Self, TypedDict, TypeVar, cast
 from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
@@ -85,6 +85,16 @@ from ..catalog.models import (
 )
 from ..catalog.service import CatalogService
 from ..config import AgentConfig
+from ..distribution import (
+    DISTRIBUTION_DOMAIN_OWNER_ID,
+    DeliveryInspection,
+    DistributionCapabilityDomain,
+    DistributionDestination,
+    DistributionOwner,
+    InboxView,
+    OutcomeContract,
+    distribution_capability_declarations,
+)
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
@@ -119,16 +129,6 @@ from ..domains.data.sql import (
 from ..domains.learning import LearningCandidateGuard
 from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
 from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
-from ..distribution import (
-    DISTRIBUTION_DOMAIN_OWNER_ID,
-    DeliveryInspection,
-    DistributionCapabilityDomain,
-    DistributionDestination,
-    DistributionOwner,
-    InboxView,
-    OutcomeContract,
-    distribution_capability_declarations,
-)
 from ..identity import AgentIdentity
 from ..jobs.capabilities import (
     JOB_DOMAIN_OWNER_ID,
@@ -195,12 +195,18 @@ from ..loop.models import (
     RunStartEnvelope,
     Transcript,
 )
+from ..memory import MemoryStore
+from ..memory.capabilities import (
+    MEMORY_DOMAIN_OWNER_ID,
+    MemoryCapabilityDomain,
+    memory_set_declarations,
+)
+from ..observation import AgentObserver
 from ..routines.capabilities import (
     ROUTINE_DOMAIN_OWNER_ID,
     RoutineCapabilityDomain,
     routine_capability_declarations,
 )
-from ..routines.owner import RoutineError, RoutineOwner
 from ..routines.models import (
     MisfirePolicy,
     ReportingMode,
@@ -210,19 +216,13 @@ from ..routines.models import (
     RoutineOccurrence,
     RoutineSchedule,
     RoutineState,
+    ScheduledRoutine,
     ScheduledRoutineDraft,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
-    ScheduledRoutine,
 )
+from ..routines.owner import RoutineError, RoutineOwner
 from ..routines.supervisor import RoutineSupervisor
-from ..memory import MemoryStore
-from ..memory.capabilities import (
-    MEMORY_DOMAIN_OWNER_ID,
-    MemoryCapabilityDomain,
-    memory_set_declarations,
-)
-from ..observation import AgentObserver
 from ..security import (
     CredentialSession,
     KeychainSecretProvider,

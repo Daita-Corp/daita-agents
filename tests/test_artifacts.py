@@ -31,9 +31,9 @@ from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import ArtifactPolicy, Capability, ToolOutput
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import Sensitivity
+from daita.distribution import OutcomeArtifactReference
 from daita.domains.data.export_capabilities import _resolved_sensitivity
 from daita.domains.data.file_capabilities import LocalFileReadExecutor
-from daita.distribution import OutcomeArtifactReference
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,

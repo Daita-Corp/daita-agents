@@ -12,11 +12,11 @@ from ..capabilities import (
     Capability,
     CapabilityDeclarations,
     Executor,
+    ToolboxId,
     ToolExecution,
     ToolLoadMode,
     ToolOutput,
     ToolPresentation,
-    ToolboxId,
     ToolTextTrust,
     ToolView,
 )

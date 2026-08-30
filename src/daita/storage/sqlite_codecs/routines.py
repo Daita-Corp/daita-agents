@@ -15,8 +15,8 @@ from ...routines.models import (
     ReportingMode,
     ResourceRevisionObservation,
     ResourceRevisionPrecheck,
-    RoutineOccurrenceDisposition,
     RoutineOccurrence,
+    RoutineOccurrenceDisposition,
     RoutinePromotionEvidence,
     RoutineSchedule,
     RoutineSkillBinding,
@@ -43,13 +43,13 @@ from .common import (
     sequence,
     text,
 )
-from .execution_scope import decode_execution_scope, encode_execution_scope
 from .distribution import (
     decode_distribution_plan,
     decode_outcome_contract,
     encode_distribution_plan,
     encode_outcome_contract,
 )
+from .execution_scope import decode_execution_scope, encode_execution_scope
 
 _ROUTINE_VERSION = 1
 _OCCURRENCE_VERSION = 1

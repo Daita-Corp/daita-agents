@@ -5,8 +5,8 @@ from hashlib import sha256
 from typing import cast
 
 import pytest
-from _distribution_support import inbox_distribution_plan
 from _capability_runtime_support import ContextToolProjectionAdapter
+from _distribution_support import inbox_distribution_plan
 from _workspace_support import workspace_for
 
 from daita._json import canonical_json

@@ -22,18 +22,12 @@ from ...artifacts.models import (
     ArtifactPayload,
     ArtifactProvenance,
     ArtifactRef,
-    ArtifactResultBinding,
     ArtifactResourceBinding,
+    ArtifactResultBinding,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
     artifact_text_change_summary_to_mapping,
     canonical_artifact_filename,
-)
-from ...artifacts.result_snapshot import (
-    MAX_RESULT_SNAPSHOT_BYTES,
-    RESULT_SNAPSHOT_ALLOWED_EXTENSIONS,
-    RESULT_SNAPSHOT_MEDIA_TYPE,
-    serialize_result_snapshot,
 )
 from ...artifacts.renderers import (
     CSV_ALLOWED_EXTENSIONS,
@@ -57,6 +51,12 @@ from ...artifacts.renderers import (
     render_exact_csv,
     render_model_document,
     text_edit_media_type,
+)
+from ...artifacts.result_snapshot import (
+    MAX_RESULT_SNAPSHOT_BYTES,
+    RESULT_SNAPSHOT_ALLOWED_EXTENSIONS,
+    RESULT_SNAPSHOT_MEDIA_TYPE,
+    serialize_result_snapshot,
 )
 from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (

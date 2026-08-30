@@ -39,8 +39,8 @@ from daita import (
     DeliveryState,
     DeliverySubjectKind,
     InboxView,
-    JobStatus,
     IntervalSchedule,
+    JobStatus,
     LoopExit,
     LoopExitKind,
     MisfirePolicy,
@@ -102,13 +102,13 @@ from daita.tui.screens.confirm import ConfirmScreen
 from daita.tui.screens.editing import ReviewCostScreen
 from daita.tui.screens.inbox import InboxScreen, render_inbox_item
 from daita.tui.screens.jobs import JobsScreen
-from daita.tui.screens.routines import RoutinesScreen
 from daita.tui.screens.onboarding import (
     AgentCreateScreen,
     ModelSetupScreen,
     SourceSetupScreen,
 )
 from daita.tui.screens.permissions import PermissionsScreen
+from daita.tui.screens.routines import RoutinesScreen
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.screens.source_edit import SourceEditScreen
 from daita.tui.widgets.approval import ApprovalPanel

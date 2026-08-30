@@ -49,7 +49,6 @@ from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
 from .screens.inbox import InboxScreen
 from .screens.jobs import JobsScreen
-from .screens.routines import RoutinesScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
 from .screens.onboarding import (
     AgentCreateScreen,
@@ -57,6 +56,7 @@ from .screens.onboarding import (
     SourceSetupScreen,
 )
 from .screens.permissions import PermissionsScreen
+from .screens.routines import RoutinesScreen
 from .screens.selection import SelectionScreen
 from .screens.source_edit import SourceEditScreen
 from .widgets.composer import (

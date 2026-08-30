@@ -10,12 +10,6 @@ from .catalog import (
     encode_catalog_snapshot,
     encode_catalog_sync,
 )
-from .identity import (
-    decode_identifier,
-    decode_identity,
-    encode_identifier,
-    encode_identity,
-)
 from .distribution import (
     decode_conversation_inbox_target,
     decode_delivery,
@@ -27,6 +21,12 @@ from .distribution import (
     encode_distribution_plan,
     encode_outcome_contract,
     encode_outcome_reference,
+)
+from .identity import (
+    decode_identifier,
+    decode_identity,
+    encode_identifier,
+    encode_identity,
 )
 from .jobs import decode_job_run, encode_job_run
 from .learning import (
