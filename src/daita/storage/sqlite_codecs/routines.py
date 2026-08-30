@@ -1,4 +1,4 @@
-"""Encode and decode the two current D1 codec-v1 routine aggregates."""
+"""Encode and decode the current codec-v1 routine aggregates."""
 
 from __future__ import annotations
 

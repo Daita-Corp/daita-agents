@@ -505,7 +505,7 @@ class CapabilityRuntime:
         )
         if capability.operational_effect is not OperationalEffect.NONE:
             raise ValueError(
-                "Phase B internal execution cannot bypass operational-effect governance"
+                "internal execution cannot bypass operational-effect governance"
             )
         domain = self._domains[owner_id]
         call = ToolCall(

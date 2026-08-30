@@ -1,4 +1,4 @@
-"""Encode the current codec-v1 Stage C follow-up and shared inbox families."""
+"""Encode the current codec-v1 follow-up and shared delivery families."""
 
 from __future__ import annotations
 

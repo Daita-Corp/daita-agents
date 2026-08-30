@@ -179,10 +179,10 @@ def test_managed_installer_documentation_is_explicitly_pre_publication():
 
     assert "has not been promoted" in readme
     assert "UNRESOLVED_*" in status
-    assert "Unverified; not claimed" in status
+    assert "support is not\nclaimed for any managed-installer target" in status
     assert "0.x-to-1.0 migration is unsupported" in readme
     assert "does not adopt, migrate, delete, or overwrite" in readme
-    assert "No step in this repository change publishes" in status
+    assert "repository installer cannot publish, upload, or promote" in status
 
 
 def _missing_import(module: str, action: Callable[[], object]) -> ImportError:

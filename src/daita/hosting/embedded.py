@@ -2111,7 +2111,7 @@ class EmbeddedAgent:
                         raise
                     except Exception:
                         # The durable claim or terminal run remains recoverable. One
-                        # item must not stop unrelated Stage C progress.
+                        # item must not stop unrelated durable-job follow-ups.
                         pass
                     continue
                 timeout = _STAGE_C_SAFETY_WAKE_SECONDS

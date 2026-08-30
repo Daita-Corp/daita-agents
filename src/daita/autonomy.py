@@ -1,4 +1,4 @@
-"""Own the bounded Stage C follow-up and shared conversation-inbox values."""
+"""Define bounded durable-job follow-ups and conversation-inbox values."""
 
 from __future__ import annotations
 
@@ -281,7 +281,7 @@ class FollowupGrant:
         ):
             raise ValueError("follow-up outcome sensitivity exceeds its ceiling")
         if self.max_successful_runs != 1:
-            raise ValueError("Stage C permits exactly one successful run")
+            raise ValueError("a durable-job follow-up permits one successful run")
         if (
             not isinstance(self.max_attempts, int)
             or isinstance(self.max_attempts, bool)
@@ -677,7 +677,7 @@ def create_terminal_job_followup(
     eligible_model_routes: tuple[str, ...],
     limits: LoopLimits,
 ) -> AutonomousFollowup:
-    """Create the sole code-authored Stage C grant for one terminal Daita job."""
+    """Create the sole code-authored follow-up grant for a terminal Daita job."""
 
     if (
         not isinstance(job, JobRun)

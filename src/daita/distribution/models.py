@@ -222,7 +222,7 @@ class OutcomeContract:
 
     def __post_init__(self) -> None:
         if self.require_terminal_conclusion is not True:
-            raise ValueError("D2 outcome contract requires a terminal conclusion")
+            raise ValueError("outcome contract requires a terminal conclusion")
         if not isinstance(self.artifact_requirements, tuple):
             raise TypeError("outcome artifact requirements must be a tuple")
         requirements = tuple(self.artifact_requirements)
@@ -250,7 +250,7 @@ class OutcomeContract:
             raise ValueError("artifact requirement exceeds the outcome byte ceiling")
         _sensitivity_mapping(self.maximum_effective_sensitivity)
         if self.require_current_run_provenance is not True:
-            raise ValueError("D2 outcome contract requires current-run provenance")
+            raise ValueError("outcome contract requires current-run provenance")
         if not isinstance(self.require_exact_source_bindings, bool):
             raise TypeError("exact-source-binding requirement must be a boolean")
         object.__setattr__(self, "artifact_requirements", requirements)
@@ -299,7 +299,7 @@ def target_fingerprint(
 
 @dataclass(frozen=True, slots=True)
 class ConversationInboxTarget:
-    """The only exact distribution destination admitted by D2."""
+    """The only supported distribution destination."""
 
     conversation_id: str
     destination_id: str
@@ -331,7 +331,7 @@ DistributionTargetBinding: TypeAlias = ConversationInboxTarget
 
 @dataclass(frozen=True, slots=True)
 class DistributionPlan:
-    """One immutable ordered target ceiling; D2 admits exactly one inbox."""
+    """One immutable ordered target ceiling containing one inbox."""
 
     targets: tuple[DistributionTargetBinding, ...]
     required_target_count: int
@@ -346,7 +346,9 @@ class DistributionPlan:
         ):
             raise ValueError("distribution targets are invalid or outside their bound")
         if len(targets) != 1:
-            raise ValueError("D2 admits exactly one conversation inbox target")
+            raise ValueError(
+                "distribution requires exactly one conversation inbox target"
+            )
         targets = tuple(sorted(targets, key=lambda value: value.target_fingerprint))
         if len({value.target_fingerprint for value in targets}) != len(targets):
             raise ValueError("distribution targets cannot duplicate")
@@ -825,7 +827,7 @@ class DistributionDestination:
         _text(self.destination_id, "distribution destination_id")
         _text(self.kind, "distribution destination kind", maximum=64)
         if self.kind != "conversation_inbox":
-            raise ValueError("D2 supports only conversation inbox destinations")
+            raise ValueError("only conversation inbox destinations are supported")
         _text(
             self.label,
             "distribution destination label",
@@ -888,7 +890,7 @@ def outcome_contract_projection(value: OutcomeContract) -> dict[str, object]:
 
 def _target_mapping(value: DistributionTargetBinding) -> dict[str, object]:
     if not isinstance(value, ConversationInboxTarget):
-        raise TypeError("D2 distribution target must be ConversationInboxTarget")
+        raise TypeError("distribution target must be ConversationInboxTarget")
     return {
         "kind": "conversation_inbox",
         "conversation_id": value.conversation_id,

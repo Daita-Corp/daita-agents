@@ -145,7 +145,7 @@ class OutcomeArtifactReader(Protocol):
 
 
 class DistributionOwner:
-    """The sole D2 destination and logical-delivery lifecycle owner."""
+    """Implement destination and logical-delivery lifecycle operations."""
 
     def __init__(self, *, agent_id: str, store: DistributionStore) -> None:
         if not isinstance(agent_id, str) or not agent_id.strip():
@@ -232,7 +232,7 @@ class DistributionOwner:
         destination_id: str,
         sensitivity_ceiling: ModelSensitivity,
     ) -> DistributionPlan:
-        """Resolve the exact currently selectable D2 distribution plan."""
+        """Resolve the exact currently selectable distribution plan."""
 
         target = self.resolve_conversation_inbox(
             conversation_id,

@@ -36,9 +36,8 @@ Two deliberate PostgreSQL boundary cases are present:
 - `catalog.unsupported_type_probe` uses a custom enum. Daita currently omits
   an entire table containing a non-`pg_catalog` type rather than execute an
   unproven custom output function.
-- `analytics.monthly_revenue` is a view. Daita's PostgreSQL MVP catalogs only
-  base tables, so the view is visible to PostgreSQL but absent from Daita's
-  catalog.
+- `analytics.monthly_revenue` is a view. Daita catalogs only PostgreSQL base
+  tables, so the view is visible to PostgreSQL but absent from Daita's catalog.
 
 All generated values are deterministic. The database files live in container
 tmpfs and are discarded by `docker compose down`.
@@ -113,9 +112,10 @@ deterministic fresh-fixture canary is `ticket_id = 42`, whose initial priority
 is `medium`. Use it to verify that a single-row selection goes through the same
 preview and `[Y] Approve once` flow as a bulk selection.
 
-For a deterministic bulk target, select tickets where `ticket_status =
-'waiting'` and `category = 'billing'`. On a fresh fixture those rows have
-priority `low`. Preview changing their priority to `high`, confirm the exact
+For a deterministic bulk target, select tickets where
+`ticket_status = 'waiting'` and `category = 'billing'`. On a fresh fixture,
+those rows have priority `low`. Preview changing their priority to `high`,
+confirm the exact
 matched row count and bounded before/after samples, deny once, and verify no
 rows changed. Repeat and approve once, independently read the aggregate back,
 then preview and approve restoring the same selection to `low`.

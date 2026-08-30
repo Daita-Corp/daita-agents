@@ -1,4 +1,4 @@
-"""Strict bounded values for the accepted D1 scheduled-routine slice."""
+"""Strict bounded values for scheduled routines and occurrences."""
 
 from __future__ import annotations
 
@@ -672,10 +672,10 @@ class ScheduledRoutine:
             raise ValueError("source-scoped routine requires exact resource identities")
         access_modes = frozenset(self.allowed_access_modes)
         if not access_modes or not access_modes <= {AccessMode.NONE, AccessMode.READ}:
-            raise ValueError("D1 routine permits only none/read access modes")
+            raise ValueError("scheduled routines permit only none/read access modes")
         effects = frozenset(self.allowed_operational_effects)
         if effects != {OperationalEffect.NONE}:
-            raise ValueError("D1 routine permits only no operational effect")
+            raise ValueError("scheduled routines permit only no operational effect")
         if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
             raise TypeError("routine sensitivity ceiling is invalid")
         skill_bindings = tuple(self.skill_bindings)

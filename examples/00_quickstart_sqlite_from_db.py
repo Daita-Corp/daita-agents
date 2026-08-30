@@ -1,4 +1,4 @@
-"""Ask one grounded question of a cataloged SQLite source with the MVP Agent."""
+"""Ask one grounded question of a cataloged SQLite source with Daita."""
 
 from __future__ import annotations
 

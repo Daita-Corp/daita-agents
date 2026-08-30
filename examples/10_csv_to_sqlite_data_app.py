@@ -1,4 +1,4 @@
-"""Promote a local CSV with stdlib SQLite, then query it through the MVP Agent."""
+"""Promote a local CSV with stdlib SQLite, then query it through Daita."""
 
 from __future__ import annotations
 

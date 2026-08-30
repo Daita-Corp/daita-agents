@@ -151,7 +151,7 @@ class DeliveryInspectExecutor:
 
 
 class DistributionCapabilityDomain:
-    """Own the exact interactive-only D2 discovery and read surface."""
+    """Implement the exact interactive-only distribution read surface."""
 
     domain_owner_id = DISTRIBUTION_DOMAIN_OWNER_ID
 

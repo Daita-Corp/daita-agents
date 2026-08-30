@@ -355,7 +355,7 @@ class MCPCapabilityDomain:
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
         del run, call, capability, execution, fingerprint
-        raise ValueError("MCP Stage M2 capabilities are never side-effecting")
+        raise ValueError("MCP capabilities cannot be side-effecting")
 
     async def finalize_output(
         self,

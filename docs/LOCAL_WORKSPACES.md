@@ -16,9 +16,10 @@ daita --workspace /absolute/path/project --workspace-sensitivity confidential
 ```
 
 Without `--workspace`, the CLI uses the current directory when it is safe and
-does not overlap Daita state. Otherwise it creates or reuses `~/Daita
-Workspace`. The allowed sensitivity labels are `internal`, `confidential`, and
-`restricted`; `internal` is the default. Workspace sensitivity applies before
+does not overlap Daita state. Otherwise it creates or reuses
+`~/Daita Workspace`. The allowed sensitivity labels are `internal`,
+`confidential`, and `restricted`; `internal` is the default. Workspace
+sensitivity applies before
 the first model request, including turns that do not ultimately read a file.
 
 The terminal status and `/workspace` command show the admitted workspace. Use
@@ -106,7 +107,7 @@ artifact never changes the workspace.
 The final save derives its only target from that committed binding and asks
 once for approval with a bounded relative-path change summary. Daita verifies
 the exact file identity, revision, content hash, ownership, links, metadata,
-and parent-directory safety again after approval. It stages and verifies the
+and parent-directory safety again after approval. It writes and verifies the
 complete output beside the target, preserves safe mode and ownership, fsyncs,
 atomically replaces, and records a succeeded, failed, or uncertain receipt.
 If the source changes at any point, Daita requires a fresh read and edit; it
@@ -117,9 +118,8 @@ document editor, or generic filesystem API. New files continue through a
 committed artifact and `artifact_save_local` in `create_new` mode. Hosted and
 machine-originated runs receive no ambient local edit authority.
 
-## Pre-production state
+## Development-state compatibility
 
-Development agent homes created before this workspace slice are disposable.
-If a home contains the removed cataloged file-source registration, Daita
-rejects it during admission; delete and recreate that development agent. There
-is no compatibility alias or migration for unreleased state.
+An unreleased development home containing the removed cataloged file-source
+registration is rejected during admission. Delete and recreate that agent;
+unreleased state has no compatibility alias or migration.

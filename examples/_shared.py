@@ -1,4 +1,4 @@
-"""Small, example-only helpers shared by the MVP walkthroughs."""
+"""Small helpers shared by the offline walkthroughs."""
 
 from __future__ import annotations
 
@@ -83,7 +83,7 @@ def parser(description: str, *, include_root: bool = True) -> argparse.ArgumentP
             "--root",
             type=Path,
             help=(
-                "Explicit fresh MVP state root. If omitted, the example creates "
+                "Explicit fresh state root. If omitted, the example creates "
                 "and removes a fresh temporary root."
             ),
         )

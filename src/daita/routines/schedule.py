@@ -1,4 +1,4 @@
-"""Pure deterministic schedule mathematics for D1 routines."""
+"""Pure deterministic schedule mathematics for scheduled routines."""
 
 from __future__ import annotations
 

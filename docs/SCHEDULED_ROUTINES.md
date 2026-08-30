@@ -1,11 +1,10 @@
-# Scheduled read routines and D2 outcomes
+# Scheduled read routines and outcomes
 
-Daita D2 scheduled routines repeat bounded read-only agent work without adding
-a second loop, runtime, or state owner. A routine freezes one exact
-self-contained instruction and executes each admitted occurrence through the
-ordinary `AgentLoop` and `CapabilityRuntime`. Each terminal occurrence converges
-atomically with one immutable logical Delivery in the originating
-conversation's durable inbox.
+Daita scheduled routines repeat bounded read-only agent work. A routine freezes
+one exact self-contained instruction and executes each admitted occurrence
+through the ordinary `AgentLoop` and `CapabilityRuntime`. Each terminal
+occurrence converges atomically with one immutable logical `Delivery` in the
+originating conversation's durable inbox.
 
 ## Supported schedules
 
@@ -66,10 +65,10 @@ routine; missing or digest-mismatched retained bytes fail closed. Skill text,
 source values, MCP metadata and output, precheck observations, and prior
 transcript content remain untrusted data and cannot expand authority.
 
-D2 cannot write data, start or cancel a durable job, create or manage another
-routine, call a remote write tool, deliver externally, run shell commands, or
-submit a graph. Email/external delivery, recurring ingestion, and graphs are
-not implemented.
+Scheduled execution cannot write data, start or cancel a durable job, manage
+another routine, call a remote write tool, deliver externally, run shell
+commands, or submit a graph. Email/external delivery, recurring ingestion, and
+graphs are not implemented.
 
 ## Terminal use
 
@@ -157,8 +156,8 @@ definition. For example:
 
 The IDs and model routes must already be admitted to that agent. Create and
 update fail closed if any identity, capability contract, sensitivity, route,
-pricing, outcome, destination, or skill binding is unavailable. Use `daita routines
---help` for the command surface.
+pricing, outcome, destination, or skill binding is unavailable. Use
+`daita routines --help` for the command surface.
 
 ## Inbox lifecycle and retention
 
@@ -200,55 +199,11 @@ The process reports a JSON readiness record, handles `SIGINT` and `SIGTERM`,
 and closes the ordinary supervisors and agent composition before exiting. It
 uses the same writer lock as every foreground open. A TUI, CLI invocation, and
 resident host cannot own the same agent home concurrently: stop the current
-host, open the other process, then restart the resident host. D2 adds no IPC,
-remote API, transparent client gateway, multi-host queue, or competing writer.
+host, open the other process, then restart the resident host. The resident host
+does not add IPC, a remote API, a transparent client gateway, a multi-host
+queue, or a competing writer.
 
 If a host stops, persisted routines and occurrences remain inspectable but no
 new due work runs. On reopen, Daita fences stale claims, finalizes a run that
 was already durably terminal without rerunning it, and preserves exactly one
 logical inbox delivery.
-
-## Optional live-model certification
-
-The deterministic suite remains authoritative for scheduling, recovery,
-fencing, budgets, and exactly-once finalization. Three opt-in acceptance tests
-additionally certify the boundaries where real model behavior matters. They
-cover the ordinary scheduled model-to-tool path, model correction after one
-injected model-visible read failure, and resistance to instruction-like text
-returned as untrusted database data. Every test commits exactly one grounded
-report to the originating conversation inbox.
-
-The tests are skipped unless explicitly authorized. The complete module makes
-at most three live scheduled loop runs. Each run has its own token, wall-time,
-step, and estimated-cost ceiling; with the documented default, the complete
-module's maximum estimated-cost ceiling is `$0.30`:
-
-```bash
-DAITA_RUN_LIVE_STAGE_D1_ROUTINES=1 \
-DAITA_STAGE_D1_LIVE_LLM_API_KEY=<provider-api-key> \
-DAITA_STAGE_D1_LIVE_MAX_COST_USD=0.10 \
-.venv/bin/python -m pytest \
-  tests/live/test_stage_d1_routines_live.py -v -s
-```
-
-`DAITA_STAGE_D1_LIVE_MODEL_ID` defaults to `openai:gpt-5.6-terra` and may be
-set to another release-reviewed, API-backed, tool-capable streaming model. The
-tests do not run as part of the default deterministic suite. Running one test
-by node ID authorizes only its one scheduled loop; running the complete module
-authorizes all three. Their presence does not claim a live certification result.
-
-One separately authorized D2 acceptance test certifies the frozen SQLite CSV
-outcome and logical Delivery path. It permits at most one live scheduled loop
-with a default `$0.10` estimated-cost ceiling:
-
-```bash
-DAITA_RUN_LIVE_STAGE_D2_OUTCOME=1 \
-DAITA_STAGE_D2_LIVE_LLM_API_KEY=<provider-api-key> \
-DAITA_STAGE_D2_LIVE_MAX_COST_USD=0.10 \
-.venv/bin/python -m pytest \
-  tests/live/test_stage_d2_outcomes_live.py -v -s
-```
-
-`DAITA_STAGE_D2_LIVE_MODEL_ID` defaults to `openai:gpt-5.6-terra`. This test is
-also skipped unless explicitly authorized and does not itself claim that a
-live certification run has been performed.

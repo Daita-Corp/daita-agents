@@ -979,7 +979,7 @@ class PresentationController:
             return CommandOutcome(
                 "run",
                 run_message=(
-                    "Create a D1 scheduled read routine for this self-contained "
+                    "Create a scheduled read routine for this self-contained "
                     "instruction, eliciting any missing schedule or scope details and "
                     "using the routine management tools: " + instruction
                 ),
@@ -992,7 +992,7 @@ class PresentationController:
                 run_message=(
                     "Promote completed run "
                     + parts[2]
-                    + " into a D1 scheduled read routine with this self-contained "
+                    + " into a scheduled read routine with this self-contained "
                     "instruction, using exact promotion evidence: " + instruction
                 ),
                 conversation_id=conversation_id,
@@ -1002,7 +1002,7 @@ class PresentationController:
             return CommandOutcome(
                 "run",
                 run_message=(
-                    "Inspect and update D1 scheduled read routine "
+                    "Inspect and update scheduled read routine "
                     + parts[2]
                     + " using its exact current revision and the routine management "
                     "tools. The replacement self-contained instruction is: "

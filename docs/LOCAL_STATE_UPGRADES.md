@@ -1,58 +1,51 @@
-# Local state during development
+# Local state compatibility
 
-Daita has not frozen its first production state format. Until the North Star
-work is complete and the first production release is explicitly approved,
-local development state has no backward-compatibility guarantee.
+Daita has not frozen its first production state format. Local development
+state therefore has no backward-compatibility guarantee.
 
 ## Current development contract
 
 - SQLite has one current physical schema.
 - Each persisted record family has one current shape.
-- A codec may carry a version discriminator, but its only supported development
-  value is `1`.
+- A codec may carry a version discriminator, but the only supported value is
+  `1`.
 - Schema and record-shape changes update the current implementation directly.
-- No migration, legacy decoder, pre-ledger bridge, or compatibility fixture is
-  added for state produced only by unreleased code.
+- State produced only by unreleased code receives no migration, historical
+  decoder, bridge, or compatibility fixture.
 - A development agent home may need to be deleted and recreated after a state
   change.
 
-`SQLiteStateStore` remains the sole state owner. Fresh databases are created at
-the complete current schema and stamped with one checksummed
-`development_baseline` row. That baseline is intentionally mutable before the
-production freeze, so a changed checksum rejects an older development database
-without modifying it.
+`SQLiteStateStore` is the sole state boundary. A new database is created at the
+complete current schema and stamped with one checksummed
+`development_baseline` row. The baseline remains mutable until the first
+production state freeze. A checksum change rejects an older development
+database without modifying it.
 
-The generic migration engine remains in place and is tested with isolated
-synthetic revisions. It is not used to preserve intermediate development
-formats.
+The migration engine is retained and tested with isolated synthetic revisions.
+It does not preserve intermediate development formats.
 
-## First production freeze
+## Production baseline
 
-The first production release will explicitly freeze:
+The first production state freeze makes the complete SQLite schema, every
+codec-v1 record shape, journal baseline, checksum, and release fixture
+immutable. Durable changes after that point use new owner-local migrations or
+additional supported codec versions. A released migration ID or checksum does
+not change.
 
-- the complete SQLite schema;
-- each codec-v1 record shape;
-- the first immutable journal baseline and checksum; and
-- exact release fixtures used by future upgrade tests.
+## Upgrade behavior
 
-Only durable changes after that freeze will add owner-local migrations or new
-supported codec versions. Released migration IDs and checksums will then be
-immutable.
-
-## Future production upgrade contract
-
-After the production baseline exists, the intended user flow remains:
+The normal upgrade flow is:
 
 ```bash
 pipx upgrade daita-agents
 daita
 ```
 
-The first normal open will validate a supported journal prefix under the
-existing agent-home writer lock. If migrations are required, Daita will clone a
-verified backup into a same-directory staged database, apply the known suffix
-in one transaction, validate the complete target, retain one rollback point,
-and atomically activate the stage. Failure before activation will leave the
-active database unchanged.
+On open, Daita validates the migration journal under the existing agent-home
+writer lock. When a migration is required, it clones a verified backup into a
+same-directory temporary database, applies the known journal suffix in one
+transaction, validates the complete target, retains one rollback point, and
+atomically replaces the active database. A failure before replacement leaves
+the active database unchanged.
 
-There is no separate state-upgrade command or parallel migration owner.
+There is no separate state-upgrade command or parallel migration component.

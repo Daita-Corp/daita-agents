@@ -1,4 +1,4 @@
-"""Claim, execute, recover, and converge D1 scheduled-read occurrences."""
+"""Claim, execute, recover, and converge scheduled-read occurrences."""
 
 from __future__ import annotations
 

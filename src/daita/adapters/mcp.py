@@ -196,7 +196,9 @@ class MCPToolSelection:
         if not isinstance(self.result_sensitivity, ModelSensitivity):
             raise TypeError("MCP result_sensitivity is invalid")
         if self.read_only is not True:
-            raise ValueError("Stage M2 admits only explicitly attested read-only tools")
+            raise ValueError(
+                "MCP admission requires explicitly attested read-only tools"
+            )
 
 
 @dataclass(frozen=True, slots=True)

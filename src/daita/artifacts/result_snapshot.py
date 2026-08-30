@@ -47,7 +47,7 @@ def serialize_result_snapshot(
     clock: Callable[[], float] = monotonic,
     maximum_seconds: float = MAX_RESULT_SNAPSHOT_SECONDS,
 ) -> ResultSnapshot:
-    """Return canonical UTF-8 JSON after applying the fixed D2 bounds."""
+    """Return canonical UTF-8 JSON after applying fixed snapshot bounds."""
 
     if not isinstance(value, Mapping):
         raise ArtifactError(
