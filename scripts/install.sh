@@ -13,11 +13,11 @@ readonly PATH_END="# <<< Daita managed PATH <<<"
 
 readonly INSTALLER_VERSION="UNRESOLVED_INSTALLER_VERSION"
 readonly RELEASE_SEQUENCE="UNRESOLVED_RELEASE_SEQUENCE"
-readonly DAITA_VERSION="1.0.0"
-readonly WHEEL_FILENAME="daita_agents-1.0.0-py3-none-any.whl"
+readonly DAITA_VERSION="UNRESOLVED_DAITA_VERSION"
+readonly WHEEL_FILENAME="UNRESOLVED_WHEEL_FILENAME"
 readonly WHEEL_URL="UNRESOLVED_WHEEL_URL"
 readonly WHEEL_SHA256="UNRESOLVED_WHEEL_SHA256"
-readonly WHEEL_REQUIRES_PYTHON="<3.13,>=3.11"
+readonly WHEEL_REQUIRES_PYTHON="UNRESOLVED_WHEEL_REQUIRES_PYTHON"
 readonly UV_VERSION="UNRESOLVED_UV_VERSION"
 readonly PYTHON_REQUEST="UNRESOLVED_PYTHON_REQUEST"
 
@@ -337,7 +337,8 @@ validate_url_literal() {
 
 validate_release_literals() {
     local value
-    for value in "$INSTALLER_VERSION" "$RELEASE_SEQUENCE" "$UV_VERSION" "$PYTHON_REQUEST" \
+    for value in "$INSTALLER_VERSION" "$RELEASE_SEQUENCE" "$DAITA_VERSION" \
+        "$WHEEL_FILENAME" "$WHEEL_REQUIRES_PYTHON" "$UV_VERSION" "$PYTHON_REQUEST" \
         "$PYTHON_IDENTITY" "$UV_ARCHIVE" "$UV_ARCHIVE_MEMBER"; do
         [[ "$value" != *UNRESOLVED* && -n "$value" ]] || \
             fail "this installer is not release-ready: required artifact literals are unresolved"
