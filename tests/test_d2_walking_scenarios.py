@@ -187,11 +187,13 @@ async def _run_routine(
         created.routine_id,
         expected_revision=created.revision,
     )
-    for _ in range(500):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while loop.time() < deadline:
         inbox = await agent.inbox(conversation_id=conversation_id)
         if inbox:
             return inbox[0]
-        await asyncio.sleep(0)
+        await asyncio.sleep(0.01)
     inspection = await agent.inspect_routine(created.routine_id)
     raise AssertionError(inspection)
 
