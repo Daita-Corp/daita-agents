@@ -1,0 +1,242 @@
+name: Daita managed release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified tag as an immutable managed release
+        required: true
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: managed-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      wheel: ${{ steps.release.outputs.wheel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]" pipx build==1.5.1
+      - id: release
+        name: Validate release identity
+        env:
+          PUBLISH_REQUESTED: ${{ inputs.publish || false }}
+        shell: bash
+        run: |
+          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          policy_version="$(python -c 'import json; print(json.load(open("release/managed-installer.json"))["installer"]["version"])')"
+          test "$policy_version" = "$version"
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+            test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
+          fi
+          if [[ "$PUBLISH_REQUESTED" == "true" ]]; then
+            test "$GITHUB_REF_TYPE" = "tag"
+          fi
+          wheel="daita_agents-${version}-py3-none-any.whl"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "wheel=$wheel" >> "$GITHUB_OUTPUT"
+          echo "source_date_epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Build candidate wheel once
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.release.outputs.source_date_epoch }}
+        run: python -m build --wheel --outdir release-artifacts
+      - name: Render immutable installer and release evidence
+        shell: bash
+        run: |
+          candidate="release-artifacts/${{ steps.release.outputs.wheel }}"
+          test -f "$candidate"
+          python scripts/render_managed_installer.py \
+            --wheel "$candidate" \
+            --wheel-url "https://github.com/Daita-Corp/daita-agents/releases/download/v${{ steps.release.outputs.version }}/${{ steps.release.outputs.wheel }}" \
+            --installer-output release-artifacts/install.sh \
+            --manifest-output release-artifacts/release-manifest.json
+          python scripts/render_managed_installer.py \
+            --wheel "$candidate" \
+            --wheel-url "https://github.com/Daita-Corp/daita-agents/releases/download/v${{ steps.release.outputs.version }}/${{ steps.release.outputs.wheel }}" \
+            --installer-output "$RUNNER_TEMP/install.sh" \
+            --manifest-output "$RUNNER_TEMP/release-manifest.json"
+          cmp release-artifacts/install.sh "$RUNNER_TEMP/install.sh"
+          cmp release-artifacts/release-manifest.json "$RUNNER_TEMP/release-manifest.json"
+          bash -n release-artifacts/install.sh
+          shellcheck release-artifacts/install.sh
+          release-artifacts/install.sh --version
+          release-artifacts/install.sh --dry-run --no-onboard --no-modify-path
+      - name: Exercise the once-built wheel through both local lifecycles
+        shell: bash
+        run: |
+          candidate="$(pwd)/release-artifacts/${{ steps.release.outputs.wheel }}"
+          python tests/managed_installer_lifecycle_smoke.py --candidate-wheel "$candidate"
+          python tests/pipx_lifecycle_smoke.py --candidate-wheel "$candidate"
+      - name: Record release checksums
+        working-directory: release-artifacts
+        shell: bash
+        run: sha256sum "${{ steps.release.outputs.wheel }}" install.sh release-manifest.json > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: managed-release
+          path: release-artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+  native-installer-smoke:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            runner: macos-15
+          - target: macos-x86_64
+            runner: macos-15-intel
+          - target: linux-arm64-glibc
+            runner: ubuntu-24.04-arm
+          - target: linux-x86_64-glibc
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: managed-release
+          path: release-artifacts
+      - id: runtime
+        name: Resolve the reviewed target policy
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          python - "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import os
+          import sys
+
+          policy = json.load(open("release/managed-installer.json", encoding="utf-8"))
+          runtime = policy["runtime"]
+          values = {
+              "uv_version": runtime["uv_version"],
+              "python_request": runtime["python_request"],
+              **runtime["targets"][os.environ["TARGET"]],
+          }
+          with open(sys.argv[1], "a", encoding="utf-8") as output:
+              for key, value in values.items():
+                  output.write(f"{key}={value}\n")
+          PY
+      - name: Verify official uv bootstrap archive
+        shell: bash
+        run: |
+          archive="$RUNNER_TEMP/${{ steps.runtime.outputs.uv_archive }}"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors \
+            --output "$archive" \
+            "${{ steps.runtime.outputs.uv_url }}"
+          actual="$(python -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$archive")"
+          test "$actual" = "${{ steps.runtime.outputs.uv_sha256 }}"
+      - name: Exercise real managed lifecycle on ${{ matrix.target }}
+        shell: bash
+        run: |
+          python tests/managed_installer_lifecycle_smoke.py \
+            --candidate-wheel "$(pwd)/release-artifacts/${{ needs.build.outputs.wheel }}" \
+            --real-uv-archive "$RUNNER_TEMP/${{ steps.runtime.outputs.uv_archive }}" \
+            --real-uv-version "${{ steps.runtime.outputs.uv_version }}" \
+            --real-uv-member "${{ steps.runtime.outputs.uv_member }}" \
+            --real-python-request "${{ steps.runtime.outputs.python_request }}" \
+            --real-python-identity "${{ steps.runtime.outputs.python_identity }}"
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref_type == 'tag'
+    needs:
+      - build
+      - native-installer-smoke
+    runs-on: ubuntu-24.04
+    environment: managed-installer-release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: managed-release
+          path: release-artifacts
+      - name: Refuse an existing mutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing to replace assets." >&2
+            exit 1
+          fi
+      - name: Require a forward-only release sequence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          current="$(python -c 'import json; print(json.load(open("release-artifacts/release-manifest.json"))["installer"]["release_sequence"])')"
+          previous_tag="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
+          if [[ -z "$previous_tag" ]]; then
+            test "$current" -eq 1
+            exit 0
+          fi
+          mkdir "$RUNNER_TEMP/previous-release"
+          gh release download "$previous_tag" \
+            --pattern release-manifest.json \
+            --dir "$RUNNER_TEMP/previous-release"
+          previous="$(python -c 'import json, os; print(json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "previous-release", "release-manifest.json")))["installer"]["release_sequence"])')"
+          if (( current <= previous )); then
+            echo "Release sequence $current must be greater than published sequence $previous." >&2
+            exit 1
+          fi
+      - name: Attest exact release artifacts
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: |
+            release-artifacts/${{ needs.build.outputs.wheel }}
+            release-artifacts/install.sh
+            release-artifacts/release-manifest.json
+            release-artifacts/SHA256SUMS
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "release-artifacts/${{ needs.build.outputs.wheel }}" \
+            "release-artifacts/install.sh" \
+            "release-artifacts/release-manifest.json" \
+            "release-artifacts/SHA256SUMS" \
+            --verify-tag \
+            --title "Daita ${{ needs.build.outputs.version }}" \
+            --generate-notes
+      - name: Verify published bytes
+        shell: bash
+        run: |
+          base="https://github.com/Daita-Corp/daita-agents/releases/download/$GITHUB_REF_NAME"
+          for artifact in "${{ needs.build.outputs.wheel }}" install.sh release-manifest.json SHA256SUMS; do
+            curl --fail --silent --show-error --location \
+              --proto '=https' --tlsv1.2 \
+              --retry 5 --retry-all-errors \
+              --output "$RUNNER_TEMP/$artifact" "$base/$artifact"
+            cmp "release-artifacts/$artifact" "$RUNNER_TEMP/$artifact"
+          done

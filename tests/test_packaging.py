@@ -171,7 +171,7 @@ def test_ci_requires_clean_pipx_wheel_smoke_on_each_supported_python():
     assert "[dev,sqlite]" not in workflow
 
 
-def test_managed_installer_documentation_is_explicitly_pre_publication():
+def test_managed_installer_documentation_describes_the_gated_release_pipeline():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     status = (ROOT / "docs" / "MANAGED_INSTALLER_RELEASE.md").read_text(
         encoding="utf-8"
@@ -179,10 +179,16 @@ def test_managed_installer_documentation_is_explicitly_pre_publication():
 
     assert "has not been promoted" in readme
     assert "UNRESOLVED_*" in status
-    assert "support is not\nclaimed for any managed-installer target" in status
+    assert "release/managed-installer.json" in status
+    assert "scripts/render_managed_installer.py" in status
+    assert ".github/workflows/managed-release.yml" in status
+    assert "managed-installer-release" in status
+    assert "all four native\n   target runners" in status
+    assert "refuses to replace an existing release" in status
+    assert "Stable endpoint promotion" in status
+    assert "installer.sha256" in status
     assert "0.x-to-1.0 migration is unsupported" in readme
     assert "does not adopt, migrate, delete, or overwrite" in readme
-    assert "repository installer cannot publish, upload, or promote" in status
 
 
 def _missing_import(module: str, action: Callable[[], object]) -> ImportError:

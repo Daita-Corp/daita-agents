@@ -375,6 +375,36 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
         id_factory=_ids(),
         poll_seconds=30,
     )
+    driver_ready_to_wait = asyncio.Event()
+    release_driver = asyncio.Event()
+    claim_one_due = supervisor._claim_one_due
+
+    async def claim_one_due_with_wait_barrier() -> None:
+        await claim_one_due()
+        current = await store.load_scheduled_routine(
+            "agent-1",
+            waiting_routine.routine_id,
+        )
+        if current is None or current.active_occurrence_id is None:
+            return
+        occurrence = await store.load_routine_occurrence(
+            "agent-1",
+            current.active_occurrence_id,
+        )
+        if (
+            occurrence is not None
+            and occurrence.disposition
+            is RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+            and not driver_ready_to_wait.is_set()
+        ):
+            driver_ready_to_wait.set()
+            await release_driver.wait()
+
+    monkeypatch.setattr(
+        supervisor,
+        "_claim_one_due",
+        claim_one_due_with_wait_barrier,
+    )
     try:
         await supervisor.start()
         occurrence_id = await _wait_for_occurrence_id(
@@ -392,6 +422,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
             await asyncio.sleep(0.01)
         else:
             raise AssertionError("routine did not reach pending finalization")
+        await asyncio.wait_for(driver_ready_to_wait.wait(), timeout=2)
 
         acknowledged = await store.acknowledge_delivery(
             "agent-1",
@@ -400,6 +431,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
         )
         assert acknowledged is not None
         supervisor.wake()
+        release_driver.set()
         terminal = await _wait_for_terminal(store, occurrence_id)
         assert terminal.disposition is RoutineOccurrenceDisposition.COMPLETED
         deliveries = await store.list_deliveries(
@@ -408,6 +440,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
         )
         assert tuple(value.subject_id for value in deliveries) == (occurrence_id,)
     finally:
+        release_driver.set()
         await supervisor.close()
         await store.close()
 

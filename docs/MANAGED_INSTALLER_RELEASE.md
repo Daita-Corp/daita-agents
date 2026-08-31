@@ -6,10 +6,10 @@ into isolated generations under `~/.local/share/daita`, publishes
 `~/.local/bin/daita`, and leaves application data under `~/.daita` separately
 owned.
 
-## Current availability
+## Release boundary
 
-The checked-in installer is not publishable. Its release literals contain
-explicit `UNRESOLVED_*` sentinels for:
+The checked-in `scripts/install.sh` remains a fail-closed source template. Its
+release literals contain explicit `UNRESOLVED_*` sentinels for:
 
 - installer version and release sequence;
 - the immutable `daita-agents` wheel URL and SHA-256;
@@ -18,13 +18,28 @@ explicit `UNRESOLVED_*` sentinels for:
   identity.
 
 Installation and repair stop before mutation while any sentinel remains.
-`--help`, `--version`, and `--dry-run` remain available for review. The public
-`https://daita-tech.io/install.sh` endpoint is not live, and support is not
-claimed for any managed-installer target.
+`--help`, `--version`, and `--dry-run` remain available for template review.
+Never serve this source template directly.
 
-Deterministic tests render fixture-pinned copies of the same script. Those
-tests validate installer mechanics but do not establish public artifact,
-clean-machine, operating-system, or terminal support.
+`release/managed-installer.json` is the reviewed release policy. It pins one
+installer sequence, uv 0.12.7, exact official uv archives and SHA-256 digests,
+and the CPython 3.12.14 identity for each supported target:
+
+- Apple Silicon macOS;
+- Intel macOS;
+- ARM64 Linux with glibc; and
+- x86-64 Linux with glibc.
+
+`scripts/render_managed_installer.py` validates the policy, the candidate
+wheel archive, its distribution metadata, and its immutable versioned URL. It
+then renders `install.sh` and `release-manifest.json` atomically. The manifest
+records the exact wheel, installer, runtime, target, and checksum evidence.
+The deterministic installer fixtures use this renderer too; there is no
+second test-only substitution implementation.
+
+The public `https://daita-tech.io/install.sh` endpoint has not been promoted
+yet. Keep the customer-facing quick start on pipx until that endpoint serves
+the exact reviewed release asset and passes the post-promotion checks below.
 
 ## Candidate verification
 
@@ -53,20 +68,54 @@ Run the same once-built candidate wheel through
 shellcheck, deterministic tests, architecture checks, formatting, typing, and
 clean-machine tests on every platform for which support will be claimed.
 
-## Publication responsibilities
+## Automated release
 
-Publishing is an external release operation. The release process must:
+`.github/workflows/managed-release.yml` is the publication control plane. A
+manual run with **Publish** disabled builds and verifies a release candidate
+without publishing it. Pushing a tag matching the project version, such as
+`v1.0.0`, runs the same verification without publishing. To publish, manually
+run the workflow on that exact tag with **Publish** enabled. The publication
+job also names the `managed-installer-release` GitHub environment; configure
+that environment with required reviewers before the first release for a
+second approval boundary.
 
-1. build the candidate wheel once in an isolated environment;
-2. verify those exact bytes with both lifecycle smoke scripts on each claimed
-   target;
-3. publish the same wheel bytes to the canonical package host;
-4. record the immutable wheel URL and SHA-256;
-5. replace every installer sentinel with reviewed official artifact values;
-6. rerun the complete verification set against the resolved installer; and
-7. publish the reviewed versioned installer before updating the stable
-   endpoint.
+The workflow:
 
-The repository installer cannot publish, upload, or promote artifacts. Binary
-rollback changes only the active verified generation; it never rolls back
-application data or OS-keychain entries.
+1. validates that the tag, project version, and reviewed installer policy
+   agree;
+2. builds the wheel once and passes those exact bytes to every later job;
+3. renders the installer twice and requires byte-for-byte deterministic output;
+4. runs the managed and pipx lifecycles against the once-built wheel;
+5. downloads and verifies the pinned official uv archive, installs the exact
+   managed Python, and runs the real managed lifecycle on all four native
+   target runners;
+6. records `SHA256SUMS` and GitHub artifact attestations;
+7. requires an explicit publish run, enforces a forward-only sequence, and
+   refuses to replace an existing release; and
+8. creates the versioned GitHub release and downloads every public asset again
+   to prove that the published bytes match the verified bytes.
+
+Before tagging a later release, increment `installer.release_sequence` in the
+reviewed policy. An older installer refuses to replace a newer installed
+sequence.
+
+## Stable endpoint promotion
+
+The release workflow intentionally does not mutate the marketing deployment.
+After the versioned GitHub release succeeds, deploy its exact `install.sh`
+asset to `/install.sh` on `daita-tech.io` without templating, redirects, or
+runtime substitution. Record the release-manifest checksum in the deployment
+change and verify the public bytes:
+
+```bash
+curl -fsSL --proto '=https' --tlsv1.2 \
+  https://daita-tech.io/install.sh -o /tmp/daita-install.sh
+shasum -a 256 /tmp/daita-install.sh
+bash /tmp/daita-install.sh --version
+bash /tmp/daita-install.sh --dry-run --no-onboard --no-modify-path
+```
+
+The SHA-256 must equal `installer.sha256` in the versioned
+`release-manifest.json`. Only then should the website expose the pipe-to-shell
+command. Stable rollback means redeploying an earlier reviewed `install.sh`;
+it never changes application data or OS-keychain entries.

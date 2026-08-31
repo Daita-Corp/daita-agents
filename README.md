@@ -372,9 +372,12 @@ homes or credentials stored in the OS keychain.
 The managed installer owns only `~/.local/bin/daita` and
 `~/.local/share/daita`; application data remains separately owned under
 `~/.daita`. Install, verification, repair, rollback, and uninstall never roll
-back or delete application data or OS-keychain entries. The managed installer
-has not been promoted to `https://daita-tech.io/install.sh`; that endpoint is
-not live. See [managed installer status](docs/MANAGED_INSTALLER_RELEASE.md).
+back or delete application data or OS-keychain entries. Its reviewed renderer,
+four-platform release verification, attestations, and immutable GitHub release
+workflow are implemented. The stable installer has not been promoted to
+`https://daita-tech.io/install.sh` yet, so keep using the pipx quick start until
+the public bytes pass the documented promotion checks. See
+[managed installer status](docs/MANAGED_INSTALLER_RELEASE.md).
 
 Daita 0.19.0 and earlier belong to a different legacy framework family. A
 0.x-to-1.0 migration is unsupported. Preserve or archive legacy `~/.daita`
@@ -405,7 +408,10 @@ both `tests/managed_installer_lifecycle_smoke.py` and
 downloads and verifies install, repeat, repair, rollback, verification,
 uninstall, and data preservation. The pipx smoke exercises dependency checks,
 the real XLSX runtime, reinstall, state preservation, and uninstall on Python
-3.11 and 3.12 and may download declared dependencies.
+3.11 and 3.12 and may download declared dependencies. Tagged managed releases
+also run the real pinned uv and CPython lifecycle on native Apple Silicon,
+Intel macOS, Linux ARM64/glibc, and Linux x64/glibc runners before the protected
+publication job can create versioned, checksummed, attested assets.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
 [SECURITY.md](SECURITY.md) for private vulnerability reporting.

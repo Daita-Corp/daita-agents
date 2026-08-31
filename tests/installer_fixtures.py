@@ -11,10 +11,12 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from scripts.render_managed_installer import render_managed_installer
+
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER_SOURCE = ROOT / "scripts" / "install.sh"
-FIXTURE_PYTHON_IDENTITY = "cpython-3.12.99-fixture-none"
-FIXTURE_PYTHON_REQUEST = "cpython-3.12.99+fixture"
+FIXTURE_PYTHON_IDENTITY = "cpython-3.12.99-linux-x86_64-gnu"
+FIXTURE_PYTHON_REQUEST = "cpython-3.12.99"
 FIXTURE_UV_VERSION = "0.0.0-fixture"
 
 
@@ -83,7 +85,7 @@ def build_minimal_wheel(directory: Path, *, version: str = "1.0.0") -> Path:
             "Metadata-Version: 2.4\n"
             "Name: daita-agents\n"
             f"Version: {version}\n"
-            "Requires-Python: <3.13,>=3.11\n",
+            "Requires-Python: >=3.11,<3.13\n",
         )
         archive.writestr(
             f"{dist_info}/WHEEL",
@@ -118,7 +120,7 @@ def create_installer_fixture(
     downloads.mkdir()
     fake_bin.mkdir()
     source_wheel = build_minimal_wheel(directory) if wheel is None else wheel.resolve()
-    name, version, requires_python = wheel_metadata(source_wheel)
+    name, version, _requires_python = wheel_metadata(source_wheel)
     if name != "daita-agents":
         raise AssertionError(f"unexpected wheel distribution: {name}")
     wheel_copy = downloads / source_wheel.name
@@ -174,52 +176,37 @@ def create_installer_fixture(
     curl.write_text(_fake_curl_source(), encoding="utf-8")
     curl.chmod(0o755)
 
-    rendered = INSTALLER_SOURCE.read_text(encoding="utf-8")
-    replacements = {
-        "UNRESOLVED_INSTALLER_VERSION": installer_version,
-        "UNRESOLVED_RELEASE_SEQUENCE": str(release_sequence),
-        "UNRESOLVED_WHEEL_URL": f"https://fixtures.invalid/releases/{wheel_copy.name}",
-        "UNRESOLVED_WHEEL_SHA256": sha256(wheel_copy),
-        "UNRESOLVED_UV_VERSION": bootstrap_uv_version,
-        "UNRESOLVED_PYTHON_REQUEST": bootstrap_python_request,
+    target = {
+        "uv_archive": archive_name,
+        "uv_member": archive_member,
+        "uv_url": f"https://fixtures.invalid/releases/{archive_name}",
+        "uv_sha256": sha256(uv_archive),
+        "python_identity": bootstrap_python_identity,
     }
-    for platform in (
-        "DARWIN_ARM64",
-        "DARWIN_X86_64",
-        "LINUX_ARM64",
-        "LINUX_X86_64",
-    ):
-        replacements.update(
-            {
-                f"UNRESOLVED_UV_{platform}_ARCHIVE": archive_name,
-                f"UNRESOLVED_UV_{platform}_MEMBER": archive_member,
-                f"UNRESOLVED_UV_{platform}_URL": (
-                    f"https://fixtures.invalid/releases/{archive_name}"
-                ),
-                f"UNRESOLVED_UV_{platform}_SHA256": sha256(uv_archive),
-                f"UNRESOLVED_PYTHON_{platform}_IDENTITY": (bootstrap_python_identity),
-            }
-        )
-    for placeholder, value in replacements.items():
-        if placeholder not in rendered:
-            raise AssertionError(f"installer placeholder is missing: {placeholder}")
-        rendered = rendered.replace(placeholder, value)
-    rendered = (
-        rendered.replace(
-            'readonly DAITA_VERSION="1.0.0"',
-            f'readonly DAITA_VERSION="{version}"',
-        )
-        .replace(
-            'readonly WHEEL_FILENAME="daita_agents-1.0.0-py3-none-any.whl"',
-            f'readonly WHEEL_FILENAME="{wheel_copy.name}"',
-        )
-        .replace(
-            'readonly WHEEL_REQUIRES_PYTHON="<3.13,>=3.11"',
-            f'readonly WHEEL_REQUIRES_PYTHON="{requires_python}"',
-        )
-    )
-    if "UNRESOLVED_" in rendered:
-        raise AssertionError("rendered fixture installer retains unresolved literals")
+    policy = {
+        "schema_version": 1,
+        "installer": {
+            "version": installer_version,
+            "release_sequence": release_sequence,
+        },
+        "runtime": {
+            "uv_version": bootstrap_uv_version,
+            "python_request": bootstrap_python_request,
+            "targets": {
+                "macos-arm64": dict(target),
+                "macos-x86_64": dict(target),
+                "linux-arm64-glibc": dict(target),
+                "linux-x86_64-glibc": dict(target),
+            },
+        },
+    }
+    rendered = render_managed_installer(
+        policy=policy,
+        wheel=wheel_copy,
+        wheel_url=(
+            f"https://fixtures.invalid/releases/download/v{version}/{wheel_copy.name}"
+        ),
+    ).installer
     installer = directory / "install.sh"
     installer.write_text(rendered, encoding="utf-8")
     installer.chmod(0o755)

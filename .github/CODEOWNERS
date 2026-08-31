@@ -9,6 +9,8 @@
 src/daita/          @jendala @pablo-prieto
 tests/              @jendala @pablo-prieto
 docs/               @jendala @pablo-prieto
+release/            @jendala @pablo-prieto
+scripts/            @jendala @pablo-prieto
 
 # CI and repo configuration — extra scrutiny
 .github/            @jendala @pablo-prieto

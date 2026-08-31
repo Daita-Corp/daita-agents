@@ -130,7 +130,7 @@ def test_help_version_and_parser_errors_are_non_mutating(tmp_path: Path):
     combined_help = _run(INSTALLER_SOURCE, "--help", "--dry-run", env=environment)
 
     assert version.returncode == 0
-    assert "Daita 1.0.0" in version.stdout
+    assert "Daita UNRESOLVED_DAITA_VERSION" in version.stdout
     assert help_result.returncode == 0
     for option in (
         "--dry-run",
