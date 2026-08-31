@@ -16,7 +16,7 @@ from ..llm.models import ModelSensitivity
 
 MAX_JOBS_PER_AGENT = 256
 # The active bound must be reachable through the only two nonterminal capacity
-# states admitted by Stage B: queued and running.
+# Only queued and running jobs can lack a terminal result.
 MAX_ACTIVE_JOBS_PER_AGENT = 52
 MAX_QUEUED_JOBS_PER_AGENT = 48
 MAX_RUNNING_JOBS_PER_AGENT = 4

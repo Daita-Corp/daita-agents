@@ -11,6 +11,7 @@ from .driver import (
 )
 from .models import (
     ConversationRun,
+    InstructionAuthority,
     LoopExit,
     LoopExitKind,
     LoopLimits,
@@ -27,6 +28,7 @@ __all__ = [
     "AgentLoop",
     "ContextBuilder",
     "ConversationRun",
+    "InstructionAuthority",
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",

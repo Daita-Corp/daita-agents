@@ -34,20 +34,14 @@ from ..artifacts.models import (
 )
 from ..autonomy import (
     MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT,
-    MAX_CONVERSATION_INBOX_ITEMS_PER_AGENT,
-    MAX_INBOX_PAGE_SIZE,
     AutonomousFollowup,
-    DeliveryState,
-    DeliverySubject,
-    DeliverySubjectKind,
     FollowupCompletionConflictError,
     FollowupDisposition,
     FollowupIdentityConflictError,
-    InboxItem,
     assess_followup_conclusion,
-    inbox_report_projection,
     terminal_job_event_payload,
 )
+from ..capabilities import ExecutionScope
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
@@ -61,6 +55,20 @@ from ..catalog.models import (
     SourceCatalogSnapshot,
 )
 from ..catalog.protocols import CatalogStoreError
+from ..distribution.models import (
+    MAX_DELIVERIES_PER_AGENT,
+    MAX_DELIVERY_LIST_PAGE_SIZE,
+    Delivery,
+    DeliveryState,
+    DeliverySubjectKind,
+    OutcomeArtifactReference,
+    OutcomeConclusionKind,
+    OutcomeState,
+    conclusion_preview_projection,
+    outcome_artifact_reference,
+    validate_outcome_artifact_references,
+)
+from ..distribution.owner import construct_logical_delivery
 from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..jobs.models import (
@@ -100,6 +108,7 @@ from ..learning_candidates import (
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
+    ModelSensitivity,
     ToolResultBlock,
 )
 from ..llm.pricing import CostEstimateStatus
@@ -108,8 +117,32 @@ from ..loop.models import (
     LoopExit,
     LoopExitKind,
     RunInput,
+    RunOrigin,
     Transcript,
     validate_completed_transcript,
+)
+from ..routines.models import (
+    MAX_ACTIVE_ROUTINES_PER_AGENT,
+    MAX_ROUTINE_ATTEMPTS,
+    MAX_ROUTINE_HISTORY_PAGE_SIZE,
+    MAX_ROUTINE_LIST_PAGE_SIZE,
+    MAX_SCHEDULED_ROUTINES_PER_AGENT,
+    ROUTINE_CLAIM_LEASE_SECONDS,
+    ResourceRevisionObservation,
+    RoutineOccurrence,
+    RoutineOccurrenceDisposition,
+    RoutineSlotKind,
+    RoutineState,
+    ScheduledRoutine,
+)
+from ..routines.schedule import (
+    first_slot,
+    manual_slot_key,
+    next_slot,
+    occurrence_id as routine_occurrence_id,
+    scheduled_slot_key,
+    select_due_slot,
+    validate_schedule,
 )
 from ..semantics import (
     SEMANTIC_MAX_ANNOTATIONS,
@@ -124,9 +157,9 @@ from .sqlite_codecs import (
     decode_autonomous_followup,
     decode_catalog_snapshot,
     decode_catalog_sync,
+    decode_delivery,
     decode_identifier,
     decode_identity,
-    decode_inbox_item,
     decode_job_run,
     decode_learning_candidate,
     decode_loop_exit,
@@ -135,16 +168,18 @@ from .sqlite_codecs import (
     decode_postgresql_update_scope,
     decode_receipt,
     decode_review_stamps,
+    decode_routine_occurrence,
     decode_run_input,
+    decode_scheduled_routine,
     decode_semantic_annotation,
     decode_source,
     decode_source_read_scope,
     encode_autonomous_followup,
     encode_catalog_snapshot,
     encode_catalog_sync,
+    encode_delivery,
     encode_identifier,
     encode_identity,
-    encode_inbox_item,
     encode_job_run,
     encode_learning_candidate,
     encode_loop_exit,
@@ -153,7 +188,9 @@ from .sqlite_codecs import (
     encode_postgresql_update_scope,
     encode_receipt,
     encode_review_stamps,
+    encode_routine_occurrence,
     encode_run_input,
+    encode_scheduled_routine,
     encode_semantic_annotation,
     encode_source,
     encode_source_read_scope,
@@ -299,22 +336,194 @@ def _replace_followup_row(
         raise RuntimeError("follow-up changed during its conditional transition")
 
 
-def _load_inbox_row(
+def _load_delivery_row(
     connection: sqlite3.Connection,
     agent_id: str,
     delivery_id: str,
-) -> tuple[InboxItem, str] | None:
+) -> tuple[Delivery, str] | None:
     row = connection.execute(
-        "SELECT data FROM conversation_inbox " "WHERE agent_id = ? AND delivery_id = ?",
+        "SELECT data FROM deliveries WHERE agent_id = ? AND delivery_id = ?",
         (agent_id, delivery_id),
     ).fetchone()
     if row is None:
         return None
     if not isinstance(row[0], str):
-        raise RuntimeError("stored inbox payload is invalid")
+        raise RuntimeError("stored delivery payload is invalid")
     return (
-        decode_inbox_item(row[0], agent_id=agent_id, delivery_id=delivery_id),
+        decode_delivery(row[0], agent_id=agent_id, delivery_id=delivery_id),
         row[0],
+    )
+
+
+def _insert_delivery(connection: sqlite3.Connection, delivery: Delivery) -> None:
+    count = connection.execute(
+        "SELECT COUNT(*) FROM deliveries WHERE agent_id = ?",
+        (delivery.agent_id,),
+    ).fetchone()
+    if int(count[0]) >= MAX_DELIVERIES_PER_AGENT:
+        acknowledged = connection.execute(
+            "SELECT delivery_id FROM deliveries "
+            "WHERE agent_id = ? AND state = ? "
+            "ORDER BY created_at_us, delivery_id LIMIT 1",
+            (delivery.agent_id, DeliveryState.ACKNOWLEDGED.value),
+        ).fetchone()
+        if acknowledged is None:
+            raise ValueError("delivery_retention_limit_exceeded")
+        deleted = connection.execute(
+            "DELETE FROM deliveries "
+            "WHERE agent_id = ? AND delivery_id = ? AND state = ?",
+            (
+                delivery.agent_id,
+                acknowledged[0],
+                DeliveryState.ACKNOWLEDGED.value,
+            ),
+        )
+        if deleted.rowcount != 1:
+            raise RuntimeError("acknowledged delivery changed during reclamation")
+    connection.execute(
+        """INSERT INTO deliveries(
+               agent_id, delivery_id, conversation_id, subject_kind, subject_id,
+               logical_key, target_kind, target_fingerprint, state,
+               created_at_us, data
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            delivery.agent_id,
+            delivery.delivery_id,
+            delivery.conversation_id,
+            delivery.subject_kind.value,
+            delivery.subject_id,
+            delivery.logical_key,
+            "conversation_inbox",
+            delivery.target.target_fingerprint,
+            delivery.visibility_state.value,
+            _datetime_us(delivery.created_at),
+            encode_delivery(delivery),
+        ),
+    )
+
+
+def _datetime_us(value: datetime | None) -> int | None:
+    if value is None:
+        return None
+    if value.tzinfo is None or value.utcoffset() != timedelta(0):
+        raise ValueError("routine query instant must be timezone-aware UTC")
+    delta = value - datetime(1970, 1, 1, tzinfo=UTC)
+    return delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
+
+
+def _load_routine_row(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    routine_id: str,
+) -> tuple[ScheduledRoutine, str] | None:
+    row = connection.execute(
+        "SELECT data FROM scheduled_routines " "WHERE agent_id = ? AND routine_id = ?",
+        (agent_id, routine_id),
+    ).fetchone()
+    if row is None:
+        return None
+    if not isinstance(row[0], str):
+        raise RuntimeError("stored scheduled routine payload is invalid")
+    return (
+        decode_scheduled_routine(
+            row[0],
+            agent_id=agent_id,
+            routine_id=routine_id,
+        ),
+        row[0],
+    )
+
+
+def _replace_routine_row(
+    connection: sqlite3.Connection,
+    current_data: str,
+    routine: ScheduledRoutine,
+) -> None:
+    result = connection.execute(
+        """UPDATE scheduled_routines
+           SET conversation_id = ?, state = ?, next_due_at_us = ?, data = ?
+           WHERE agent_id = ? AND routine_id = ? AND data = ?""",
+        (
+            routine.conversation_id,
+            routine.state.value,
+            _datetime_us(routine.next_due_at),
+            encode_scheduled_routine(routine),
+            routine.agent_id,
+            routine.routine_id,
+            current_data,
+        ),
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("scheduled routine changed during its transition")
+
+
+def _load_routine_occurrence_row(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    occurrence_id: str,
+) -> tuple[RoutineOccurrence, str] | None:
+    row = connection.execute(
+        "SELECT data FROM routine_occurrences "
+        "WHERE agent_id = ? AND occurrence_id = ?",
+        (agent_id, occurrence_id),
+    ).fetchone()
+    if row is None:
+        return None
+    if not isinstance(row[0], str):
+        raise RuntimeError("stored routine occurrence payload is invalid")
+    return (
+        decode_routine_occurrence(
+            row[0],
+            agent_id=agent_id,
+            occurrence_id=occurrence_id,
+        ),
+        row[0],
+    )
+
+
+def _replace_routine_occurrence_row(
+    connection: sqlite3.Connection,
+    current_data: str,
+    occurrence: RoutineOccurrence,
+) -> None:
+    result = connection.execute(
+        """UPDATE routine_occurrences
+           SET state = ?, lease_expires_at_us = ?, reserved_run_id = ?, data = ?
+           WHERE agent_id = ? AND occurrence_id = ? AND data = ?""",
+        (
+            occurrence.disposition.value,
+            _datetime_us(occurrence.lease_expires_at),
+            occurrence.reserved_run_id,
+            encode_routine_occurrence(occurrence),
+            occurrence.agent_id,
+            occurrence.occurrence_id,
+            current_data,
+        ),
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("routine occurrence changed during its transition")
+
+
+def _insert_routine_occurrence(
+    connection: sqlite3.Connection,
+    occurrence: RoutineOccurrence,
+) -> None:
+    connection.execute(
+        """INSERT INTO routine_occurrences(
+               agent_id, occurrence_id, routine_id, routine_revision, slot_key,
+               state, lease_expires_at_us, reserved_run_id, data
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            occurrence.agent_id,
+            occurrence.occurrence_id,
+            occurrence.routine_id,
+            occurrence.routine_revision,
+            occurrence.slot_key,
+            occurrence.disposition.value,
+            _datetime_us(occurrence.lease_expires_at),
+            occurrence.reserved_run_id,
+            encode_routine_occurrence(occurrence),
+        ),
     )
 
 
@@ -737,6 +946,1134 @@ class SQLiteStateStore:
             if result.rowcount != 1:
                 raise RuntimeError("MCP binding changed during its transition")
             return binding
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def admit_scheduled_routine(
+        self,
+        routine: ScheduledRoutine,
+    ) -> ScheduledRoutine:
+        """Atomically admit one pristine bounded routine and its first due slot."""
+
+        if not isinstance(routine, ScheduledRoutine):
+            raise TypeError("routine must be ScheduledRoutine")
+        if (
+            routine.revision != 1
+            or routine.active_occurrence_id is not None
+            or routine.last_occurrence_id is not None
+            or bool(routine.last_delivery_ids)
+            or routine.reserved_tokens != 0
+            or routine.reserved_cost_usd != Decimal("0")
+            or routine.charged_tokens != 0
+            or routine.charged_cost_usd != Decimal("0")
+            or routine.attempt_count != 0
+            or routine.occurrence_count != 0
+            or routine.consecutive_failures != 0
+            or routine.state not in {RoutineState.ACTIVE, RoutineState.PAUSED}
+        ):
+            raise ValueError(
+                "new routine must be one pristine active or paused aggregate"
+            )
+        validate_schedule(routine.schedule)
+        next_due = None
+        if routine.state is RoutineState.ACTIVE:
+            next_due = first_slot(
+                routine.schedule,
+                not_before=routine.created_at,
+                expires_at=routine.expires_at,
+            )
+            if next_due is None:
+                raise ValueError("routine_schedule_expired")
+        normalized = replace(routine, next_due_at=next_due)
+        encoded = encode_scheduled_routine(normalized)
+
+        def write(connection: sqlite3.Connection) -> ScheduledRoutine:
+            row = connection.execute(
+                "SELECT 1 FROM scheduled_routines "
+                "WHERE agent_id = ? AND routine_id = ?",
+                (normalized.agent_id, normalized.routine_id),
+            ).fetchone()
+            if row is not None:
+                raise ValueError("routine_identity_already_exists")
+            count = connection.execute(
+                "SELECT COUNT(*) FROM scheduled_routines WHERE agent_id = ?",
+                (normalized.agent_id,),
+            ).fetchone()
+            if int(count[0]) >= MAX_SCHEDULED_ROUTINES_PER_AGENT:
+                raise ValueError("routine_retention_limit_exceeded")
+            active_count = connection.execute(
+                "SELECT COUNT(*) FROM scheduled_routines "
+                "WHERE agent_id = ? AND state = ?",
+                (normalized.agent_id, RoutineState.ACTIVE.value),
+            ).fetchone()
+            if (
+                normalized.state is RoutineState.ACTIVE
+                and int(active_count[0]) >= MAX_ACTIVE_ROUTINES_PER_AGENT
+            ):
+                raise ValueError("routine_active_limit_exceeded")
+            connection.execute(
+                """INSERT INTO scheduled_routines(
+                       agent_id, routine_id, conversation_id, state,
+                       next_due_at_us, data
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    normalized.agent_id,
+                    normalized.routine_id,
+                    normalized.conversation_id,
+                    normalized.state.value,
+                    _datetime_us(normalized.next_due_at),
+                    encoded,
+                ),
+            )
+            return normalized
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def load_scheduled_routine(
+        self,
+        agent_id: str,
+        routine_id: str,
+    ) -> ScheduledRoutine | None:
+        def read() -> ScheduledRoutine | None:
+            with _connect(self.path) as connection:
+                loaded = _load_routine_row(connection, agent_id, routine_id)
+            return None if loaded is None else loaded[0]
+
+        return await asyncio.to_thread(read)
+
+    async def list_scheduled_routines(
+        self,
+        agent_id: str,
+        *,
+        states: frozenset[RoutineState] = frozenset(),
+        limit: int = MAX_ROUTINE_LIST_PAGE_SIZE,
+    ) -> tuple[ScheduledRoutine, ...]:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= MAX_ROUTINE_LIST_PAGE_SIZE
+        ):
+            raise ValueError("routine list limit is outside its bound")
+        states = frozenset(states)
+        if any(not isinstance(item, RoutineState) for item in states):
+            raise TypeError("routine states must contain RoutineState values")
+
+        def read() -> tuple[ScheduledRoutine, ...]:
+            with _connect(self.path) as connection:
+                rows = tuple(
+                    connection.execute(
+                        "SELECT routine_id, data FROM scheduled_routines "
+                        "WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+                )
+            if len(rows) > MAX_SCHEDULED_ROUTINES_PER_AGENT:
+                raise RuntimeError("stored routine count exceeds its fixed bound")
+            decoded = tuple(
+                decode_scheduled_routine(data, agent_id=agent_id, routine_id=routine_id)
+                for routine_id, data in rows
+            )
+            selected = tuple(
+                item for item in decoded if not states or item.state in states
+            )
+            return tuple(
+                sorted(
+                    selected,
+                    key=lambda item: (item.updated_at, item.routine_id),
+                    reverse=True,
+                )[:limit]
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def list_routine_occurrences(
+        self,
+        agent_id: str,
+        routine_id: str,
+        *,
+        limit: int = MAX_ROUTINE_HISTORY_PAGE_SIZE,
+    ) -> tuple[RoutineOccurrence, ...]:
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= MAX_ROUTINE_HISTORY_PAGE_SIZE
+        ):
+            raise ValueError("routine history limit is outside its bound")
+
+        def read() -> tuple[RoutineOccurrence, ...]:
+            with _connect(self.path) as connection:
+                rows = tuple(
+                    connection.execute(
+                        """SELECT occurrence_id, data FROM routine_occurrences
+                           WHERE agent_id = ? AND routine_id = ?
+                           ORDER BY occurrence_id DESC LIMIT ?""",
+                        (agent_id, routine_id, limit),
+                    )
+                )
+            return tuple(
+                decode_routine_occurrence(
+                    data,
+                    agent_id=agent_id,
+                    occurrence_id=occurrence_id,
+                )
+                for occurrence_id, data in rows
+            )
+
+        return await asyncio.to_thread(read)
+
+    async def revise_scheduled_routine(
+        self,
+        routine: ScheduledRoutine,
+        *,
+        expected_revision: int,
+    ) -> ScheduledRoutine | None:
+        """Conditionally persist one complete material routine revision."""
+
+        if not isinstance(routine, ScheduledRoutine):
+            raise TypeError("routine must be ScheduledRoutine")
+        validate_schedule(routine.schedule)
+
+        def write(connection: sqlite3.Connection) -> ScheduledRoutine | None:
+            loaded = _load_routine_row(connection, routine.agent_id, routine.routine_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            if current.revision != expected_revision:
+                return None
+            if current.active_occurrence_id is not None:
+                raise ValueError("routine_has_active_occurrence")
+            if (
+                routine.revision != current.revision + 1
+                or routine.agent_id != current.agent_id
+                or routine.routine_id != current.routine_id
+                or routine.conversation_id != current.conversation_id
+                or routine.owner_principal_id != current.owner_principal_id
+                or routine.created_at != current.created_at
+                or routine.reserved_tokens != current.reserved_tokens
+                or routine.reserved_cost_usd != current.reserved_cost_usd
+                or routine.charged_tokens != current.charged_tokens
+                or routine.charged_cost_usd != current.charged_cost_usd
+                or routine.attempt_count != current.attempt_count
+                or routine.occurrence_count != current.occurrence_count
+            ):
+                raise ValueError("routine revision changed immutable lifecycle state")
+            if routine.state is RoutineState.ACTIVE:
+                due = first_slot(
+                    routine.schedule,
+                    not_before=routine.updated_at,
+                    expires_at=routine.expires_at,
+                )
+                if due is None:
+                    raise ValueError("routine_schedule_expired")
+            else:
+                due = None
+            normalized = replace(
+                routine,
+                next_due_at=due,
+                active_occurrence_id=None,
+            )
+            _replace_routine_row(connection, encoded, normalized)
+            return normalized
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def transition_scheduled_routine(
+        self,
+        agent_id: str,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        state: RoutineState,
+        transitioned_at: datetime,
+    ) -> ScheduledRoutine | None:
+        if not isinstance(state, RoutineState):
+            raise TypeError("routine transition state is invalid")
+        _datetime_us(transitioned_at)
+
+        def write(connection: sqlite3.Connection) -> ScheduledRoutine | None:
+            loaded = _load_routine_row(connection, agent_id, routine_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            if current.revision != expected_revision:
+                return None
+            if current.active_occurrence_id is not None:
+                raise ValueError("routine_has_active_occurrence")
+            if state is RoutineState.ACTIVE:
+                due = next_slot(
+                    current.schedule,
+                    after=transitioned_at,
+                    expires_at=current.expires_at,
+                )
+                if due is None:
+                    state_value = RoutineState.EXPIRED
+                    due = None
+                else:
+                    state_value = RoutineState.ACTIVE
+            else:
+                state_value = state
+                due = None
+            updated = replace(
+                current,
+                state=state_value,
+                next_due_at=due,
+                revision=current.revision + 1,
+                updated_at=transitioned_at,
+            )
+            _replace_routine_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def next_routine_deadline(self, agent_id: str) -> datetime | None:
+        def read() -> datetime | None:
+            with _connect(self.path) as connection:
+                rows = tuple(
+                    connection.execute(
+                        """SELECT routine_id, data FROM scheduled_routines
+                           WHERE agent_id = ? AND state = ?
+                             AND next_due_at_us IS NOT NULL
+                           ORDER BY next_due_at_us, routine_id""",
+                        (agent_id, RoutineState.ACTIVE.value),
+                    )
+                )
+            for routine_id, data in rows:
+                routine = decode_scheduled_routine(
+                    data,
+                    agent_id=agent_id,
+                    routine_id=routine_id,
+                )
+                if routine.active_occurrence_id is None:
+                    return routine.next_due_at
+            return None
+
+        return await asyncio.to_thread(read)
+
+    async def load_routine_occurrence(
+        self,
+        agent_id: str,
+        occurrence_id: str,
+    ) -> RoutineOccurrence | None:
+        def read() -> RoutineOccurrence | None:
+            with _connect(self.path) as connection:
+                loaded = _load_routine_occurrence_row(
+                    connection,
+                    agent_id,
+                    occurrence_id,
+                )
+            return None if loaded is None else loaded[0]
+
+        return await asyncio.to_thread(read)
+
+    async def claim_due_routine_occurrence(
+        self,
+        agent_id: str,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        expected_due_at: datetime,
+        claimed_at: datetime,
+        claim_token: str,
+    ) -> RoutineOccurrence | None:
+        """Conditionally claim one due canonical slot and reserve its run budget."""
+
+        due_us = _datetime_us(expected_due_at)
+        _datetime_us(claimed_at)
+
+        def write(connection: sqlite3.Connection) -> RoutineOccurrence | None:
+            loaded = _load_routine_row(connection, agent_id, routine_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            if (
+                current.revision != expected_revision
+                or current.state is not RoutineState.ACTIVE
+                or current.next_due_at != expected_due_at
+            ):
+                return None
+            if current.active_occurrence_id is not None:
+                active = _load_routine_occurrence_row(
+                    connection,
+                    agent_id,
+                    current.active_occurrence_id,
+                )
+                if (
+                    active is not None
+                    and active[0].slot_kind is RoutineSlotKind.SCHEDULED
+                ):
+                    return active[0]
+                return None
+            selection = select_due_slot(
+                current.schedule,
+                materialized_due_at=expected_due_at,
+                now=claimed_at,
+                expires_at=current.expires_at,
+                misfire_policy=current.misfire_policy,
+            )
+            if selection.selected_at is None:
+                skipped = replace(
+                    current,
+                    next_due_at=selection.next_due_at,
+                    updated_at=claimed_at,
+                    state=(
+                        RoutineState.ACTIVE
+                        if selection.next_due_at is not None
+                        else RoutineState.EXPIRED
+                    ),
+                )
+                _replace_routine_row(connection, encoded, skipped)
+                return None
+            return self._claim_routine_slot_in_transaction(
+                connection,
+                current,
+                encoded,
+                slot_kind=RoutineSlotKind.SCHEDULED,
+                slot_key=scheduled_slot_key(
+                    current.routine_id,
+                    current.revision,
+                    selection.selected_at,
+                ),
+                scheduled_for=selection.selected_at,
+                claimed_at=claimed_at,
+                claim_token=claim_token,
+            )
+
+        del due_us
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def claim_manual_routine_occurrence(
+        self,
+        agent_id: str,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        authorized_control_call_id: str,
+        claimed_at: datetime,
+        claim_token: str,
+    ) -> RoutineOccurrence | None:
+        _datetime_us(claimed_at)
+        slot = manual_slot_key(
+            routine_id,
+            expected_revision,
+            authorized_control_call_id,
+        )
+
+        def write(connection: sqlite3.Connection) -> RoutineOccurrence | None:
+            existing = connection.execute(
+                """SELECT occurrence_id, data FROM routine_occurrences
+                   WHERE agent_id = ? AND routine_id = ?
+                     AND routine_revision = ? AND slot_key = ?""",
+                (agent_id, routine_id, expected_revision, slot),
+            ).fetchone()
+            if existing is not None:
+                return decode_routine_occurrence(
+                    existing[1],
+                    agent_id=agent_id,
+                    occurrence_id=existing[0],
+                )
+            loaded = _load_routine_row(connection, agent_id, routine_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            if (
+                current.revision != expected_revision
+                or current.state is not RoutineState.ACTIVE
+                or current.active_occurrence_id is not None
+                or claimed_at >= current.expires_at
+            ):
+                return None
+            return self._claim_routine_slot_in_transaction(
+                connection,
+                current,
+                encoded,
+                slot_kind=RoutineSlotKind.MANUAL,
+                slot_key=slot,
+                scheduled_for=claimed_at,
+                claimed_at=claimed_at,
+                claim_token=claim_token,
+            )
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    def _claim_routine_slot_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        current: ScheduledRoutine,
+        encoded: str,
+        *,
+        slot_kind: RoutineSlotKind,
+        slot_key: str,
+        scheduled_for: datetime,
+        claimed_at: datetime,
+        claim_token: str,
+    ) -> RoutineOccurrence:
+        if (
+            current.attempt_count >= current.cumulative_max_attempts
+            or current.occurrence_count >= current.cumulative_max_occurrences
+        ):
+            raise ValueError("routine_occurrence_budget_exhausted")
+        if (
+            current.reserved_tokens
+            + current.charged_tokens
+            + current.per_run_max_tokens
+            > current.cumulative_max_tokens
+            or current.reserved_cost_usd
+            + current.charged_cost_usd
+            + current.per_run_max_cost_usd
+            > current.cumulative_max_cost_usd
+        ):
+            raise ValueError("routine_model_budget_exhausted")
+        identity = routine_occurrence_id(current.routine_id, slot_key)
+        occurrence = RoutineOccurrence(
+            occurrence_id=identity,
+            agent_id=current.agent_id,
+            routine_id=current.routine_id,
+            routine_revision=current.revision,
+            slot_kind=slot_kind,
+            slot_key=slot_key,
+            scheduled_for=scheduled_for,
+            claimed_at=claimed_at,
+            claim_token=claim_token,
+            lease_expires_at=claimed_at
+            + timedelta(seconds=ROUTINE_CLAIM_LEASE_SECONDS),
+            precheck_observation=None,
+            execution_scope=None,
+            execution_scope_digest=None,
+            reserved_run_id=None,
+            reserved_tokens=current.per_run_max_tokens,
+            reserved_cost_usd=current.per_run_max_cost_usd,
+            charged_tokens=0,
+            charged_cost_usd=Decimal("0"),
+            run_bound_at=None,
+            run_terminal_at=None,
+            conclusion_digest=None,
+            terminal_run_id=None,
+            delivery_ids=(),
+            attempt_count=1,
+            failure_code=None,
+            retry_at=None,
+            disposition=RoutineOccurrenceDisposition.CLAIMED,
+            created_at=claimed_at,
+            updated_at=claimed_at,
+        )
+        _insert_routine_occurrence(connection, occurrence)
+        updated = replace(
+            current,
+            active_occurrence_id=identity,
+            reserved_tokens=current.reserved_tokens + current.per_run_max_tokens,
+            reserved_cost_usd=(
+                current.reserved_cost_usd + current.per_run_max_cost_usd
+            ),
+            attempt_count=current.attempt_count + 1,
+            occurrence_count=current.occurrence_count + 1,
+            updated_at=claimed_at,
+        )
+        _replace_routine_row(connection, encoded, updated)
+        return occurrence
+
+    async def bind_routine_occurrence_run(
+        self,
+        agent_id: str,
+        occurrence_id: str,
+        *,
+        claim_token: str,
+        run_id: str,
+        execution_scope: ExecutionScope,
+        bound_at: datetime,
+        precheck_observation: ResourceRevisionObservation | None = None,
+    ) -> RoutineOccurrence | None:
+        if not isinstance(execution_scope, ExecutionScope):
+            raise TypeError("routine execution scope is invalid")
+        _datetime_us(bound_at)
+
+        def write(connection: sqlite3.Connection) -> RoutineOccurrence | None:
+            loaded = _load_routine_occurrence_row(connection, agent_id, occurrence_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            if current.reserved_run_id is not None:
+                return current if current.reserved_run_id == run_id else None
+            if (
+                current.disposition is not RoutineOccurrenceDisposition.CLAIMED
+                or current.claim_token != claim_token
+                or current.lease_expires_at is None
+                or current.lease_expires_at < bound_at
+                or execution_scope.agent_id != current.agent_id
+                or execution_scope.routine_id != current.routine_id
+                or execution_scope.routine_revision != current.routine_revision
+                or execution_scope.occurrence_id != current.occurrence_id
+            ):
+                return None
+            routine = _load_routine_row(connection, agent_id, current.routine_id)
+            if routine is None or routine[0].active_occurrence_id != occurrence_id:
+                return None
+            precheck = routine[0].precheck
+            if (precheck is None) != (precheck_observation is None):
+                return None
+            if precheck is not None:
+                assert precheck_observation is not None
+                if (
+                    precheck.source_id != precheck_observation.source_id
+                    or precheck.resource_id != precheck_observation.resource_id
+                ):
+                    return None
+            updated = replace(
+                current,
+                precheck_observation=precheck_observation,
+                execution_scope=execution_scope,
+                execution_scope_digest=execution_scope.digest,
+                reserved_run_id=run_id,
+                run_bound_at=bound_at,
+                disposition=RoutineOccurrenceDisposition.RUNNING,
+                updated_at=bound_at,
+            )
+            _replace_routine_occurrence_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def mark_routine_occurrence_run_terminal(
+        self,
+        agent_id: str,
+        occurrence_id: str,
+        *,
+        run_id: str,
+        terminal_at: datetime,
+    ) -> RoutineOccurrence | None:
+        _datetime_us(terminal_at)
+
+        def write(connection: sqlite3.Connection) -> RoutineOccurrence | None:
+            loaded = _load_routine_occurrence_row(connection, agent_id, occurrence_id)
+            if loaded is None:
+                return None
+            current, encoded = loaded
+            if (
+                current.disposition
+                is RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+            ):
+                return current
+            if (
+                current.disposition is not RoutineOccurrenceDisposition.RUNNING
+                or current.reserved_run_id != run_id
+            ):
+                return None
+            row = connection.execute(
+                "SELECT result FROM runs WHERE id = ? AND agent_id = ?",
+                (run_id, agent_id),
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            result = decode_loop_exit(row[0])
+            if result.run_id != run_id:
+                raise ValueError("routine terminal run identity is invalid")
+            updated = replace(
+                current,
+                run_terminal_at=terminal_at,
+                terminal_run_id=run_id,
+                lease_expires_at=None,
+                disposition=(
+                    RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+                ),
+                updated_at=terminal_at,
+            )
+            _replace_routine_occurrence_row(connection, encoded, updated)
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def finalize_routine_occurrence(
+        self,
+        agent_id: str,
+        occurrence_id: str,
+        *,
+        delivery_id: str,
+        finalized_at: datetime,
+        skipped_no_change_observation: ResourceRevisionObservation | None = None,
+        failure_code: str | None = None,
+        artifact_references: tuple[OutcomeArtifactReference, ...] = (),
+        outcome_contract_failure_code: str | None = None,
+    ) -> tuple[RoutineOccurrence, Delivery | None] | None:
+        """Converge one occurrence, routine budget, slot, and logical delivery."""
+
+        _datetime_us(finalized_at)
+
+        def write(
+            connection: sqlite3.Connection,
+        ) -> tuple[RoutineOccurrence, Delivery | None] | None:
+            loaded = _load_routine_occurrence_row(connection, agent_id, occurrence_id)
+            if loaded is None:
+                return None
+            current, occurrence_data = loaded
+            if skipped_no_change_observation is not None and failure_code is not None:
+                raise ValueError("routine finalization outcomes are mutually exclusive")
+            if outcome_contract_failure_code is not None and not re.fullmatch(
+                r"[a-z][a-z0-9_]{0,127}", outcome_contract_failure_code
+            ):
+                raise ValueError("routine outcome contract failure code is invalid")
+            contract_failure_code = outcome_contract_failure_code
+            routine_loaded = _load_routine_row(
+                connection,
+                agent_id,
+                current.routine_id,
+            )
+            if routine_loaded is None:
+                return None
+            routine, routine_data = routine_loaded
+            target = routine.distribution_plan.targets[0]
+            existing_row = connection.execute(
+                "SELECT delivery_id, data FROM deliveries "
+                "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ? "
+                "AND target_fingerprint = ?",
+                (
+                    agent_id,
+                    DeliverySubjectKind.ROUTINE_OCCURRENCE.value,
+                    occurrence_id,
+                    target.target_fingerprint,
+                ),
+            ).fetchone()
+            if existing_row is not None:
+                existing_delivery = decode_delivery(
+                    existing_row[1],
+                    agent_id=agent_id,
+                    delivery_id=existing_row[0],
+                )
+                return current, existing_delivery
+            if routine.active_occurrence_id != occurrence_id:
+                return None
+            pre_run_outcome = (
+                skipped_no_change_observation is not None or failure_code is not None
+            )
+            if pre_run_outcome:
+                expected_disposition = (
+                    RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
+                    if skipped_no_change_observation is not None
+                    else RoutineOccurrenceDisposition.TERMINAL_FAILED
+                )
+                if current.disposition is expected_disposition:
+                    return current, None
+                if (
+                    current.disposition
+                    not in {
+                        RoutineOccurrenceDisposition.CLAIMED,
+                        RoutineOccurrenceDisposition.PRECHECKING,
+                    }
+                    or current.reserved_run_id is not None
+                ):
+                    return None
+            elif (
+                current.disposition
+                is not RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+                or current.reserved_run_id is None
+            ):
+                return None
+
+            occurrence_observation = current.precheck_observation
+            resulting_run_id: str | None = None
+            charged_tokens = 0
+            charged_cost = Decimal("0")
+            sensitivity = routine.sensitivity_ceiling
+            report_digest: str | None = None
+            report_preview: str | None = None
+            report_truncated = False
+            validated_artifact_references: tuple[OutcomeArtifactReference, ...] = ()
+            if pre_run_outcome:
+                occurrence_observation = skipped_no_change_observation
+                successful = occurrence_observation is not None
+                terminal_failure_code = failure_code
+                disposition = (
+                    RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
+                    if successful
+                    else RoutineOccurrenceDisposition.TERMINAL_FAILED
+                )
+                outcome = "skipped_no_change" if successful else "failed"
+                reason = (
+                    "resource_revision_unchanged"
+                    if successful
+                    else terminal_failure_code
+                )
+                if occurrence_observation is not None:
+                    precheck = routine.precheck
+                    if (
+                        precheck is None
+                        or occurrence_observation.source_id != precheck.source_id
+                        or occurrence_observation.resource_id != precheck.resource_id
+                    ):
+                        raise ValueError("routine precheck observation is out of scope")
+                if successful and any(
+                    requirement.minimum_count > 0
+                    for requirement in routine.outcome_contract.artifact_requirements
+                ):
+                    successful = False
+                    terminal_failure_code = "outcome_artifact_contract_failed"
+                    disposition = RoutineOccurrenceDisposition.TERMINAL_FAILED
+                    outcome = "failed"
+                    reason = terminal_failure_code
+            else:
+                assert current.reserved_run_id is not None
+                run_row = connection.execute(
+                    "SELECT input, result FROM runs WHERE id = ? AND agent_id = ?",
+                    (current.reserved_run_id, agent_id),
+                ).fetchone()
+                if run_row is None or run_row[1] is None:
+                    return None
+                run_input = decode_run_input(run_row[0])
+                result = decode_loop_exit(run_row[1])
+                if (
+                    run_input.origin is not RunOrigin.SCHEDULED_ROUTINE
+                    or run_input.execution_scope is None
+                    or run_input.execution_scope.routine_id != current.routine_id
+                    or run_input.execution_scope.routine_revision
+                    != current.routine_revision
+                    or run_input.execution_scope.occurrence_id != current.occurrence_id
+                    or run_input.execution_scope.distribution_plan_digest
+                    != routine.distribution_plan.plan_digest
+                    or result.run_id != current.reserved_run_id
+                ):
+                    raise ValueError("routine terminal run scope is invalid")
+                message_rows = connection.execute(
+                    "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
+                    (current.reserved_run_id,),
+                ).fetchall()
+                transcript = Transcript(
+                    run=run_input,
+                    messages=tuple(
+                        decode_message(message_data) for (message_data,) in message_rows
+                    ),
+                )
+                successful = (
+                    result.kind is LoopExitKind.COMPLETED
+                    and isinstance(result.final_text, str)
+                    and bool(result.final_text.strip())
+                )
+                for message in transcript.messages:
+                    for block in message.content:
+                        if (
+                            isinstance(block, ToolResultBlock)
+                            and block.sensitivity is not None
+                            and block.sensitivity.routing_rank
+                            > sensitivity.routing_rank
+                        ):
+                            sensitivity = block.sensitivity
+                if (
+                    sensitivity.routing_rank
+                    > routine.outcome_contract.maximum_effective_sensitivity.routing_rank
+                ):
+                    successful = False
+                    contract_failure_code = "outcome_sensitivity_contract_failed"
+                estimate = result.usage.cost_estimate
+                charged_cost = (
+                    estimate.amount_usd
+                    if estimate.status is CostEstimateStatus.COMPLETE
+                    and estimate.amount_usd is not None
+                    and estimate.amount_usd <= current.reserved_cost_usd
+                    else current.reserved_cost_usd
+                )
+                charged_tokens = min(result.usage.total_tokens, current.reserved_tokens)
+                if successful:
+                    contract_failure = contract_failure_code
+                    try:
+                        expected_artifact_references = tuple(
+                            sorted(
+                                (
+                                    outcome_artifact_reference(ref)
+                                    for ref in result.artifacts
+                                ),
+                                key=lambda item: item.artifact_id,
+                            )
+                        )
+                        validated_artifact_references = (
+                            validate_outcome_artifact_references(
+                                artifact_references,
+                                contract=routine.outcome_contract,
+                                resulting_run_id=current.reserved_run_id,
+                            )
+                        )
+                        if (
+                            validated_artifact_references
+                            != expected_artifact_references
+                        ):
+                            raise ValueError("validated artifact references differ")
+                    except (TypeError, ValueError):
+                        contract_failure = "outcome_artifact_contract_failed"
+                        validated_artifact_references = ()
+                    if contract_failure is not None:
+                        successful = False
+                        contract_failure_code = contract_failure
+                if result.final_text is not None:
+                    report_digest, report_preview, report_truncated = (
+                        conclusion_preview_projection(result.final_text)
+                    )
+                resulting_run_id = current.reserved_run_id
+                terminal_failure_code = (
+                    None
+                    if successful
+                    else (contract_failure_code or f"routine_run_{result.reason}")
+                )
+                disposition = (
+                    RoutineOccurrenceDisposition.COMPLETED
+                    if successful
+                    else RoutineOccurrenceDisposition.TERMINAL_FAILED
+                )
+                outcome = "completed" if successful else "failed"
+                reason = "completed" if successful else terminal_failure_code
+
+            if current.slot_kind is RoutineSlotKind.MANUAL:
+                following = routine.next_due_at
+            else:
+                following = next_slot(
+                    routine.schedule,
+                    after=current.scheduled_for,
+                    expires_at=routine.expires_at,
+                )
+                while following is not None and following <= finalized_at:
+                    following = next_slot(
+                        routine.schedule,
+                        after=following,
+                        expires_at=routine.expires_at,
+                    )
+            failures = 0 if successful else routine.consecutive_failures + 1
+            if successful:
+                next_state = (
+                    RoutineState.ACTIVE
+                    if following is not None
+                    else (
+                        RoutineState.EXPIRED
+                        if finalized_at >= routine.expires_at
+                        else RoutineState.COMPLETED
+                    )
+                )
+            elif failures >= routine.maximum_consecutive_failures or following is None:
+                next_state = RoutineState.NEEDS_ATTENTION
+                following = None
+            else:
+                next_state = RoutineState.ACTIVE
+            escalation = not successful and next_state is RoutineState.NEEDS_ATTENTION
+
+            payload = {
+                "subject": {
+                    "kind": DeliverySubjectKind.ROUTINE_OCCURRENCE.value,
+                    "subject_id": occurrence_id,
+                },
+                "routine_id": current.routine_id,
+                "routine_revision": current.routine_revision,
+                "occurrence_id": current.occurrence_id,
+                "scheduled_for": current.scheduled_for.isoformat(),
+                "run_id": resulting_run_id,
+                "outcome": outcome,
+                "reason": reason,
+                "escalation": escalation,
+                "routine_state": next_state.value,
+                "observation_digest": (
+                    None
+                    if occurrence_observation is None
+                    else occurrence_observation.digest
+                ),
+                "report_digest": report_digest,
+                "report_preview": report_preview,
+                "report_truncated": report_truncated,
+            }
+            conclusion_digest = (
+                "sha256:" + sha256(canonical_json(payload).encode("utf-8")).hexdigest()
+            )
+            conclusion_kind = (
+                OutcomeConclusionKind.TERMINAL_RUN
+                if resulting_run_id is not None
+                else OutcomeConclusionKind.NO_MODEL_OCCURRENCE
+            )
+            delivery = construct_logical_delivery(
+                delivery_id=delivery_id,
+                agent_id=agent_id,
+                conversation_id=routine.conversation_id,
+                subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
+                subject_id=occurrence_id,
+                target=target,
+                conclusion_kind=conclusion_kind,
+                conclusion_state=(
+                    OutcomeState.SKIPPED_NO_CHANGE
+                    if disposition is RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
+                    else (OutcomeState.SUCCEEDED if successful else OutcomeState.FAILED)
+                ),
+                conclusion_id=resulting_run_id or occurrence_id,
+                conclusion_digest=report_digest or conclusion_digest,
+                conclusion_preview=report_preview or "",
+                conclusion_preview_truncated=report_truncated,
+                resulting_run_id=resulting_run_id,
+                artifact_references=(
+                    validated_artifact_references
+                    if resulting_run_id is not None and successful
+                    else ()
+                ),
+                effective_sensitivity=sensitivity,
+                provenance_digest=(
+                    current.execution_scope_digest
+                    or (
+                        None
+                        if occurrence_observation is None
+                        else occurrence_observation.digest
+                    )
+                    or conclusion_digest
+                ),
+                failure_code=terminal_failure_code,
+                observed_at=finalized_at,
+            )
+            _insert_delivery(connection, delivery)
+
+            completed_occurrence = replace(
+                current,
+                precheck_observation=occurrence_observation,
+                reserved_tokens=0,
+                reserved_cost_usd=Decimal("0"),
+                charged_tokens=charged_tokens,
+                charged_cost_usd=charged_cost,
+                conclusion_digest=conclusion_digest,
+                delivery_ids=(delivery.delivery_id,),
+                failure_code=terminal_failure_code,
+                lease_expires_at=None,
+                disposition=disposition,
+                updated_at=finalized_at,
+            )
+            acknowledged_observation = routine.last_acknowledged_precheck_observation
+            if successful and occurrence_observation is not None:
+                acknowledged_observation = occurrence_observation
+            completed_routine = replace(
+                routine,
+                reserved_tokens=routine.reserved_tokens - current.reserved_tokens,
+                reserved_cost_usd=(
+                    routine.reserved_cost_usd - current.reserved_cost_usd
+                ),
+                charged_tokens=routine.charged_tokens + charged_tokens,
+                charged_cost_usd=routine.charged_cost_usd + charged_cost,
+                consecutive_failures=failures,
+                last_acknowledged_precheck_observation=acknowledged_observation,
+                active_occurrence_id=None,
+                last_occurrence_id=current.occurrence_id,
+                last_delivery_ids=(delivery.delivery_id,),
+                next_due_at=following,
+                state=next_state,
+                updated_at=finalized_at,
+            )
+            _replace_routine_occurrence_row(
+                connection,
+                occurrence_data,
+                completed_occurrence,
+            )
+            _replace_routine_row(connection, routine_data, completed_routine)
+            return completed_occurrence, delivery
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def recover_stale_routine_occurrences(
+        self,
+        agent_id: str,
+        *,
+        recovered_at: datetime,
+        claim_token_factory: Callable[[str], str],
+    ) -> tuple[RoutineOccurrence, ...]:
+        """Fence stale claims and converge already-terminal reserved runs."""
+
+        recovered_us = _datetime_us(recovered_at)
+
+        def write(connection: sqlite3.Connection) -> tuple[RoutineOccurrence, ...]:
+            rows = tuple(
+                connection.execute(
+                    """SELECT occurrence_id, data FROM routine_occurrences
+                       WHERE agent_id = ?
+                         AND (state = ?
+                              OR (state IN (?, ?, ?)
+                                  AND (lease_expires_at_us IS NULL
+                                       OR lease_expires_at_us <= ?)))
+                       ORDER BY COALESCE(lease_expires_at_us, 0), occurrence_id""",
+                    (
+                        agent_id,
+                        (
+                            RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION.value
+                        ),
+                        RoutineOccurrenceDisposition.CLAIMED.value,
+                        RoutineOccurrenceDisposition.PRECHECKING.value,
+                        RoutineOccurrenceDisposition.RUNNING.value,
+                        recovered_us,
+                    ),
+                )
+            )
+            recovered: list[RoutineOccurrence] = []
+            for occurrence_id_value, occurrence_data in rows:
+                current = decode_routine_occurrence(
+                    occurrence_data,
+                    agent_id=agent_id,
+                    occurrence_id=occurrence_id_value,
+                )
+                if (
+                    current.disposition
+                    is RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+                ):
+                    recovered.append(current)
+                    continue
+                if current.disposition not in {
+                    RoutineOccurrenceDisposition.CLAIMED,
+                    RoutineOccurrenceDisposition.PRECHECKING,
+                    RoutineOccurrenceDisposition.RUNNING,
+                }:
+                    continue
+                if current.reserved_run_id is not None:
+                    run_row = connection.execute(
+                        "SELECT result FROM runs WHERE id = ? AND agent_id = ?",
+                        (current.reserved_run_id, agent_id),
+                    ).fetchone()
+                    if run_row is not None and run_row[0] is not None:
+                        updated = replace(
+                            current,
+                            run_terminal_at=recovered_at,
+                            terminal_run_id=current.reserved_run_id,
+                            lease_expires_at=None,
+                            disposition=(
+                                RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+                            ),
+                            updated_at=recovered_at,
+                        )
+                        _replace_routine_occurrence_row(
+                            connection,
+                            occurrence_data,
+                            updated,
+                        )
+                        recovered.append(updated)
+                        continue
+                    if run_row is not None:
+                        continue
+                if current.attempt_count >= MAX_ROUTINE_ATTEMPTS:
+                    continue
+                routine_loaded = _load_routine_row(
+                    connection,
+                    agent_id,
+                    current.routine_id,
+                )
+                if routine_loaded is None:
+                    continue
+                routine, routine_data = routine_loaded
+                if routine.active_occurrence_id != current.occurrence_id:
+                    continue
+                token = claim_token_factory(current.occurrence_id)
+                updated = replace(
+                    current,
+                    claimed_at=recovered_at,
+                    claim_token=token,
+                    lease_expires_at=recovered_at
+                    + timedelta(seconds=ROUTINE_CLAIM_LEASE_SECONDS),
+                    attempt_count=current.attempt_count + 1,
+                    updated_at=recovered_at,
+                )
+                updated_routine = replace(
+                    routine,
+                    attempt_count=routine.attempt_count + 1,
+                    updated_at=recovered_at,
+                )
+                _replace_routine_occurrence_row(
+                    connection,
+                    occurrence_data,
+                    updated,
+                )
+                _replace_routine_row(connection, routine_data, updated_routine)
+                recovered.append(updated)
+            return tuple(recovered)
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
@@ -1418,32 +2755,35 @@ class SQLiteStateStore:
         *,
         delivery_id: str,
         finalized_at: datetime,
-    ) -> tuple[AutonomousFollowup, InboxItem] | None:
+    ) -> tuple[AutonomousFollowup, Delivery] | None:
         """Atomically charge, consume, and create exactly one logical delivery."""
 
         def write(
             connection: sqlite3.Connection,
-        ) -> tuple[AutonomousFollowup, InboxItem] | None:
+        ) -> tuple[AutonomousFollowup, Delivery] | None:
             loaded = _load_followup_row(connection, agent_id, followup_id)
             if loaded is None:
                 return None
             current, encoded = loaded
+            target = current.grant.distribution_plan.targets[0]
             existing_row = connection.execute(
-                "SELECT delivery_id, data FROM conversation_inbox "
-                "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ?",
+                "SELECT delivery_id, data FROM deliveries "
+                "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ? "
+                "AND target_fingerprint = ?",
                 (
                     agent_id,
-                    DeliverySubjectKind.STANDALONE_FOLLOWUP.value,
+                    DeliverySubjectKind.AUTONOMOUS_FOLLOWUP.value,
                     followup_id,
+                    target.target_fingerprint,
                 ),
             ).fetchone()
             if existing_row is not None:
-                inbox = decode_inbox_item(
+                delivery = decode_delivery(
                     existing_row[1],
                     agent_id=agent_id,
                     delivery_id=existing_row[0],
                 )
-                return current, inbox
+                return current, delivery
             if (
                 current.disposition
                 is not FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
@@ -1461,8 +2801,17 @@ class SQLiteStateStore:
                 "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
                 (current.reserved_run_id,),
             ).fetchall()
+            run_input = decode_run_input(run_row[0])
+            if (
+                run_input.origin is not RunOrigin.JOB_EVENT
+                or run_input.execution_scope != current.execution_scope
+                or run_input.execution_scope.distribution_plan_digest
+                != current.grant.distribution_plan.plan_digest
+                or result.run_id != current.reserved_run_id
+            ):
+                raise ValueError("follow-up terminal run scope is invalid")
             transcript = Transcript(
-                run=decode_run_input(run_row[0]),
+                run=run_input,
                 messages=tuple(
                     decode_message(message_data) for (message_data,) in message_rows
                 ),
@@ -1478,6 +2827,17 @@ class SQLiteStateStore:
                 result,
             )
             successful = result.kind is LoopExitKind.COMPLETED and evidence is not None
+            try:
+                validate_outcome_artifact_references(
+                    (),
+                    contract=current.grant.outcome_contract,
+                    resulting_run_id=current.reserved_run_id,
+                )
+                if result.artifacts:
+                    raise ValueError("follow-up outcome contract permits no artifacts")
+            except (TypeError, ValueError):
+                successful = False
+                conclusion_failure_code = "outcome_artifact_contract_failed"
             sensitivity = current.execution_scope.sensitivity_ceiling
             for message in transcript.messages:
                 for block in message.content:
@@ -1487,6 +2847,12 @@ class SQLiteStateStore:
                         and block.sensitivity.routing_rank > sensitivity.routing_rank
                     ):
                         sensitivity = block.sensitivity
+            if (
+                sensitivity.routing_rank
+                > current.grant.outcome_contract.maximum_effective_sensitivity.routing_rank
+            ):
+                successful = False
+                conclusion_failure_code = "outcome_sensitivity_contract_failed"
             estimate = result.usage.cost_estimate
             charged_cost = (
                 estimate.amount_usd
@@ -1496,26 +2862,14 @@ class SQLiteStateStore:
                 else current.reserved_cost_usd
             )
             charged_tokens = min(result.usage.total_tokens, current.reserved_tokens)
-            delivery_state = (
-                DeliveryState.AVAILABLE
-                if sensitivity.routing_rank
-                <= current.grant.delivery_sensitivity_ceiling.routing_rank
-                else DeliveryState.BLOCKED
-            )
-            subject = DeliverySubject(
-                kind=DeliverySubjectKind.STANDALONE_FOLLOWUP,
-                subject_id=followup_id,
-            )
-            logical_key = f"{subject.kind.value}:{subject.subject_id}:conclusion"
             report_digest: str | None = None
             report_preview: str | None = None
             report_truncated = False
             if result.final_text is not None:
                 report_digest, bounded_report, report_truncated = (
-                    inbox_report_projection(result.final_text)
+                    conclusion_preview_projection(result.final_text)
                 )
-                if successful and delivery_state is DeliveryState.AVAILABLE:
-                    report_preview = bounded_report
+                report_preview = bounded_report
             if successful:
                 failure_code = None
             elif result.kind is LoopExitKind.COMPLETED:
@@ -1528,8 +2882,8 @@ class SQLiteStateStore:
                 failure_code = f"followup_run_{result.reason}"
             payload = {
                 "subject": {
-                    "kind": subject.kind.value,
-                    "subject_id": subject.subject_id,
+                    "kind": DeliverySubjectKind.AUTONOMOUS_FOLLOWUP.value,
+                    "subject_id": followup_id,
                 },
                 "job_id": current.job_id,
                 "run_id": current.reserved_run_id,
@@ -1540,54 +2894,35 @@ class SQLiteStateStore:
                 "report_truncated": report_truncated,
                 "evidence_digest": None if evidence is None else evidence.digest,
             }
-            conclusion_digest = (
+            payload_digest = (
                 "sha256:" + sha256(canonical_json(payload).encode("utf-8")).hexdigest()
             )
-            inbox = InboxItem(
+            conclusion_digest = report_digest or payload_digest
+            delivery = construct_logical_delivery(
                 delivery_id=delivery_id,
                 agent_id=agent_id,
                 conversation_id=current.conversation_id,
-                subject=subject,
-                resulting_run_id=current.reserved_run_id,
-                grant_id=current.grant.grant_id,
-                logical_key=logical_key,
+                subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
+                subject_id=followup_id,
+                target=target,
+                conclusion_kind=OutcomeConclusionKind.TERMINAL_RUN,
+                conclusion_state=(
+                    OutcomeState.SUCCEEDED if successful else OutcomeState.FAILED
+                ),
+                conclusion_id=current.reserved_run_id,
                 conclusion_digest=conclusion_digest,
-                payload=payload,
-                sensitivity=sensitivity,
-                destination=current.grant.delivery_destination,
-                destination_sensitivity_ceiling=(
-                    current.grant.delivery_sensitivity_ceiling
+                conclusion_preview=report_preview or "",
+                conclusion_preview_truncated=report_truncated,
+                resulting_run_id=current.reserved_run_id,
+                artifact_references=(),
+                effective_sensitivity=sensitivity,
+                provenance_digest=(
+                    evidence.digest if evidence is not None else payload_digest
                 ),
-                state=delivery_state,
-                created_at=finalized_at,
-                updated_at=finalized_at,
-                terminal_error=(
-                    "delivery_sensitivity_ineligible"
-                    if delivery_state is DeliveryState.BLOCKED
-                    else failure_code
-                ),
+                failure_code=failure_code,
+                observed_at=finalized_at,
             )
-            count = connection.execute(
-                "SELECT COUNT(*) FROM conversation_inbox WHERE agent_id = ?",
-                (agent_id,),
-            ).fetchone()
-            if int(count[0]) >= MAX_CONVERSATION_INBOX_ITEMS_PER_AGENT:
-                raise ValueError("conversation_inbox_retention_limit_exceeded")
-            connection.execute(
-                "INSERT INTO conversation_inbox("
-                "agent_id, delivery_id, conversation_id, subject_kind, subject_id, "
-                "logical_key, data"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (
-                    agent_id,
-                    delivery_id,
-                    inbox.conversation_id,
-                    subject.kind.value,
-                    subject.subject_id,
-                    logical_key,
-                    encode_inbox_item(inbox),
-                ),
-            )
+            _insert_delivery(connection, delivery)
             completed = replace(
                 current,
                 disposition=(
@@ -1607,77 +2942,92 @@ class SQLiteStateStore:
                 failure_code=failure_code,
             )
             _replace_followup_row(connection, encoded, completed)
-            return completed, inbox
+            return completed, delivery
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
-    async def list_inbox(
+    async def load_delivery(
+        self,
+        agent_id: str,
+        delivery_id: str,
+    ) -> Delivery | None:
+        def read() -> Delivery | None:
+            with _connect(self.path) as connection:
+                loaded = _load_delivery_row(connection, agent_id, delivery_id)
+                return None if loaded is None else loaded[0]
+
+        return await asyncio.to_thread(read)
+
+    async def list_deliveries(
         self,
         agent_id: str,
         *,
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
-        limit: int = MAX_INBOX_PAGE_SIZE,
-    ) -> tuple[InboxItem, ...]:
-        if not 1 <= limit <= MAX_INBOX_PAGE_SIZE:
-            raise ValueError("inbox list limit is outside its bound")
+        limit: int = MAX_DELIVERY_LIST_PAGE_SIZE,
+    ) -> tuple[Delivery, ...]:
+        if not 1 <= limit <= MAX_DELIVERY_LIST_PAGE_SIZE:
+            raise ValueError("delivery list limit is outside its bound")
 
-        def read() -> tuple[InboxItem, ...]:
+        def read() -> tuple[Delivery, ...]:
+            clauses = ["agent_id = ?"]
+            parameters: list[object] = [agent_id]
+            if conversation_id is not None:
+                clauses.append("conversation_id = ?")
+                parameters.append(conversation_id)
+            if not include_acknowledged:
+                clauses.append("state != ?")
+                parameters.append(DeliveryState.ACKNOWLEDGED.value)
+            parameters.append(limit)
             with _connect(self.path) as connection:
                 rows = connection.execute(
-                    "SELECT delivery_id, data FROM conversation_inbox "
-                    "WHERE agent_id = ?",
-                    (agent_id,),
+                    "SELECT delivery_id, data FROM deliveries WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY created_at_us DESC, delivery_id DESC LIMIT ?",
+                    tuple(parameters),
                 ).fetchall()
-            items = (
-                decode_inbox_item(data, agent_id=agent_id, delivery_id=delivery_id)
-                for delivery_id, data in rows
-            )
-            selected = (
-                item
-                for item in items
-                if (conversation_id is None or item.conversation_id == conversation_id)
-                and (
-                    include_acknowledged or item.state is not DeliveryState.ACKNOWLEDGED
-                )
-            )
             return tuple(
-                sorted(
-                    selected,
-                    key=lambda item: (item.created_at, item.delivery_id),
-                    reverse=True,
-                )[:limit]
+                decode_delivery(data, agent_id=agent_id, delivery_id=delivery_id)
+                for delivery_id, data in rows
             )
 
         return await asyncio.to_thread(read)
 
-    async def acknowledge_inbox(
+    async def acknowledge_delivery(
         self,
         agent_id: str,
         delivery_id: str,
         *,
         acknowledged_at: datetime,
-    ) -> InboxItem | None:
-        def write(connection: sqlite3.Connection) -> InboxItem | None:
-            loaded = _load_inbox_row(connection, agent_id, delivery_id)
+    ) -> Delivery | None:
+        _datetime_us(acknowledged_at)
+
+        def write(connection: sqlite3.Connection) -> Delivery | None:
+            loaded = _load_delivery_row(connection, agent_id, delivery_id)
             if loaded is None:
                 return None
             current, encoded = loaded
-            if current.state is DeliveryState.ACKNOWLEDGED:
+            if current.visibility_state is DeliveryState.ACKNOWLEDGED:
                 return current
             updated = replace(
                 current,
-                state=DeliveryState.ACKNOWLEDGED,
+                visibility_state=DeliveryState.ACKNOWLEDGED,
                 updated_at=acknowledged_at,
                 acknowledged_at=acknowledged_at,
             )
             result = connection.execute(
-                "UPDATE conversation_inbox SET data = ? "
+                "UPDATE deliveries SET state = ?, data = ? "
                 "WHERE agent_id = ? AND delivery_id = ? AND data = ?",
-                (encode_inbox_item(updated), agent_id, delivery_id, encoded),
+                (
+                    updated.visibility_state.value,
+                    encode_delivery(updated),
+                    agent_id,
+                    delivery_id,
+                    encoded,
+                ),
             )
             if result.rowcount != 1:
-                raise RuntimeError("inbox item changed during acknowledgment")
+                raise RuntimeError("delivery changed during acknowledgment")
             return updated
 
         return await _run_cancellation_safe_transaction(self.path, write)
@@ -4250,6 +5600,62 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def list_delivery_artifact_references(
+        self,
+        agent_id: str,
+        *,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[OutcomeArtifactReference, ...]:
+        """Return bounded artifact roots carried by retained logical deliveries."""
+
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be non-empty text")
+        if run_id is not None and (not isinstance(run_id, str) or not run_id):
+            raise ValueError("run_id must be non-empty text or None")
+        if conversation_id is not None and (
+            not isinstance(conversation_id, str) or not conversation_id
+        ):
+            raise ValueError("conversation_id must be non-empty text or None")
+
+        def read() -> tuple[OutcomeArtifactReference, ...]:
+            clauses = ["agent_id = ?"]
+            parameters: list[object] = [agent_id]
+            if conversation_id is not None:
+                clauses.append("conversation_id = ?")
+                parameters.append(conversation_id)
+            with _connect_read_only(self.path) as connection:
+                rows = connection.execute(
+                    "SELECT delivery_id, data FROM deliveries WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY created_at_us, delivery_id",
+                    tuple(parameters),
+                ).fetchall()
+            references: dict[str, OutcomeArtifactReference] = {}
+            for delivery_id, data in rows:
+                delivery = decode_delivery(
+                    data,
+                    agent_id=agent_id,
+                    delivery_id=delivery_id,
+                )
+                for reference in delivery.outcome.artifact_references:
+                    if run_id is not None and reference.producing_run_id != run_id:
+                        continue
+                    current = references.get(reference.artifact_id)
+                    if current is not None and current != reference:
+                        raise RuntimeError(
+                            "stored delivery artifact identity is ambiguous"
+                        )
+                    references[reference.artifact_id] = reference
+            return tuple(
+                sorted(
+                    references.values(),
+                    key=lambda item: (item.producing_run_id, item.artifact_id),
+                )
+            )
+
+        return await asyncio.to_thread(read)
+
     async def list_reserved_artifact_ids(
         self,
         agent_id: str,
@@ -4367,7 +5773,66 @@ class SQLiteStateStore:
                         ),
                     )
                     if followup.reserved_run_id is not None
+                    and followup.disposition
+                    in {
+                        FollowupDisposition.CLAIMED,
+                        FollowupDisposition.RUNNING,
+                        FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
+                        FollowupDisposition.RETRYABLE_FAILED,
+                    }
                 }
+                occurrence_rows = connection.execute(
+                    "SELECT occurrence_id, data FROM routine_occurrences "
+                    "WHERE agent_id = ?",
+                    (agent_id,),
+                ).fetchall()
+                protected_run_ids.update(
+                    occurrence.reserved_run_id
+                    for occurrence_id, data in occurrence_rows
+                    for occurrence in (
+                        decode_routine_occurrence(
+                            data,
+                            agent_id=agent_id,
+                            occurrence_id=occurrence_id,
+                        ),
+                    )
+                    if occurrence.reserved_run_id is not None
+                    and occurrence.disposition
+                    in {
+                        RoutineOccurrenceDisposition.CLAIMED,
+                        RoutineOccurrenceDisposition.PRECHECKING,
+                        RoutineOccurrenceDisposition.RUNNING,
+                        (
+                            RoutineOccurrenceDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+                        ),
+                        RoutineOccurrenceDisposition.RETRYABLE,
+                    }
+                )
+                active_routine_conversations = {
+                    routine.conversation_id
+                    for routine_id, data in connection.execute(
+                        "SELECT routine_id, data FROM scheduled_routines "
+                        "WHERE agent_id = ?",
+                        (agent_id,),
+                    )
+                    for routine in (
+                        decode_scheduled_routine(
+                            data,
+                            agent_id=agent_id,
+                            routine_id=routine_id,
+                        ),
+                    )
+                    if routine.active_occurrence_id is not None
+                }
+                for conversation_id in active_routine_conversations:
+                    anchor = connection.execute(
+                        "SELECT id FROM runs "
+                        "WHERE agent_id = ? AND conversation_id = ? "
+                        "ORDER BY turn_index, id LIMIT 1",
+                        (agent_id, conversation_id),
+                    ).fetchone()
+                    if anchor is not None:
+                        protected_run_ids.add(str(anchor[0]))
                 run_ids = tuple(
                     str(row[0])
                     for row in connection.execute(
@@ -5138,6 +6603,165 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
         candidate = decode_learning_candidate(data)
         if candidate.agent_id != agent_id or candidate.id != candidate_id:
             raise ValueError("stored learning candidate ownership is invalid")
+
+    routines: dict[tuple[str, str], ScheduledRoutine] = {}
+    routine_counts: dict[str, int] = {}
+    active_routine_counts: dict[str, int] = {}
+    for (
+        agent_id,
+        routine_id,
+        conversation_id,
+        state,
+        next_due_at_us,
+        data,
+    ) in connection.execute(
+        """SELECT agent_id, routine_id, conversation_id, state,
+                  next_due_at_us, data
+           FROM scheduled_routines"""
+    ):
+        routine = decode_scheduled_routine(
+            data,
+            agent_id=agent_id,
+            routine_id=routine_id,
+        )
+        if (
+            routine.conversation_id != conversation_id
+            or routine.state.value != state
+            or _datetime_us(routine.next_due_at) != next_due_at_us
+        ):
+            raise ValueError("stored scheduled routine projection is invalid")
+        validate_schedule(routine.schedule)
+        if identity is not None and routine.agent_id != identity.id:
+            raise ValueError("stored scheduled routine belongs to another agent")
+        key = (agent_id, routine_id)
+        routines[key] = routine
+        routine_counts[agent_id] = routine_counts.get(agent_id, 0) + 1
+        if routine.state is RoutineState.ACTIVE:
+            active_routine_counts[agent_id] = active_routine_counts.get(agent_id, 0) + 1
+    if any(
+        value > MAX_SCHEDULED_ROUTINES_PER_AGENT for value in routine_counts.values()
+    ):
+        raise ValueError("stored routine count exceeds its fixed bound")
+    if any(
+        value > MAX_ACTIVE_ROUTINES_PER_AGENT
+        for value in active_routine_counts.values()
+    ):
+        raise ValueError("stored active routine count exceeds its fixed bound")
+
+    occurrences: dict[tuple[str, str], RoutineOccurrence] = {}
+    occurrence_counts: dict[tuple[str, str], int] = {}
+    for (
+        agent_id,
+        occurrence_id_value,
+        routine_id,
+        routine_revision,
+        slot_key,
+        state,
+        lease_expires_at_us,
+        reserved_run_id,
+        data,
+    ) in connection.execute(
+        """SELECT agent_id, occurrence_id, routine_id, routine_revision,
+                  slot_key, state, lease_expires_at_us, reserved_run_id, data
+           FROM routine_occurrences"""
+    ):
+        occurrence = decode_routine_occurrence(
+            data,
+            agent_id=agent_id,
+            occurrence_id=occurrence_id_value,
+        )
+        owning_routine = routines.get((agent_id, routine_id))
+        if (
+            owning_routine is None
+            or occurrence.routine_id != routine_id
+            or occurrence.routine_revision != routine_revision
+            or occurrence.routine_revision > owning_routine.revision
+            or occurrence.slot_key != slot_key
+            or occurrence.disposition.value != state
+            or _datetime_us(occurrence.lease_expires_at) != lease_expires_at_us
+            or occurrence.reserved_run_id != reserved_run_id
+        ):
+            raise ValueError("stored routine occurrence projection is invalid")
+        occurrences[(agent_id, occurrence_id_value)] = occurrence
+        owner_key = (agent_id, routine_id)
+        occurrence_counts[owner_key] = occurrence_counts.get(owner_key, 0) + 1
+        if occurrence_counts[owner_key] > owning_routine.cumulative_max_occurrences:
+            raise ValueError("stored routine occurrence count exceeds its ceiling")
+    for routine in routines.values():
+        if routine.active_occurrence_id is None:
+            continue
+        active = occurrences.get((routine.agent_id, routine.active_occurrence_id))
+        if active is None or active.routine_id != routine.routine_id:
+            raise ValueError("stored routine active occurrence is invalid")
+
+    followups: dict[tuple[str, str], AutonomousFollowup] = {}
+    for agent_id, followup_id, job_id, event_id, data in connection.execute(
+        """SELECT agent_id, followup_id, job_id, event_id, data
+           FROM autonomous_followups"""
+    ):
+        followup = decode_autonomous_followup(
+            data,
+            agent_id=agent_id,
+            followup_id=followup_id,
+        )
+        if followup.job_id != job_id or followup.event_id != event_id:
+            raise ValueError("stored autonomous follow-up projection is invalid")
+        if identity is not None and followup.agent_id != identity.id:
+            raise ValueError("stored autonomous follow-up belongs to another agent")
+        followups[(agent_id, followup_id)] = followup
+
+    delivery_counts: dict[str, int] = {}
+    for (
+        agent_id,
+        delivery_id,
+        conversation_id,
+        subject_kind,
+        subject_id,
+        logical_key,
+        target_kind,
+        target_fingerprint_value,
+        state,
+        created_at_us,
+        data,
+    ) in connection.execute(
+        """SELECT agent_id, delivery_id, conversation_id, subject_kind,
+                  subject_id, logical_key, target_kind, target_fingerprint,
+                  state, created_at_us, data
+           FROM deliveries"""
+    ):
+        delivery = decode_delivery(
+            data,
+            agent_id=agent_id,
+            delivery_id=delivery_id,
+        )
+        if (
+            delivery.conversation_id != conversation_id
+            or delivery.subject_kind.value != subject_kind
+            or delivery.subject_id != subject_id
+            or delivery.logical_key != logical_key
+            or target_kind != "conversation_inbox"
+            or delivery.target.target_fingerprint != target_fingerprint_value
+            or delivery.visibility_state.value != state
+            or _datetime_us(delivery.created_at) != created_at_us
+        ):
+            raise ValueError("stored delivery projection is invalid")
+        if identity is not None and delivery.agent_id != identity.id:
+            raise ValueError("stored delivery belongs to another agent")
+        producer: AutonomousFollowup | RoutineOccurrence | None
+        if delivery.subject_kind is DeliverySubjectKind.AUTONOMOUS_FOLLOWUP:
+            producer = followups.get((agent_id, subject_id))
+        else:
+            producer = occurrences.get((agent_id, subject_id))
+        producer_references_delivery = producer is not None and (
+            producer.delivery_id == delivery_id
+            if isinstance(producer, AutonomousFollowup)
+            else delivery_id in producer.delivery_ids
+        )
+        if not producer_references_delivery:
+            raise ValueError("stored delivery producer reference is invalid")
+        delivery_counts[agent_id] = delivery_counts.get(agent_id, 0) + 1
+        if delivery_counts[agent_id] > MAX_DELIVERIES_PER_AGENT:
+            raise ValueError("stored delivery count exceeds its fixed bound")
 
 
 def _logical_state_fingerprint(connection: sqlite3.Connection) -> str:

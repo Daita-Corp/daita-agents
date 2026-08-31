@@ -10,15 +10,20 @@ from hashlib import sha256
 from pathlib import Path
 
 import pytest
+from _distribution_support import inbox_distribution_plan
 from _toolbox_model_support import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
 from _workspace_support import workspace_for
 
+import daita.storage.sqlite as sqlite_module
 from daita import (
     Agent,
     DeliveryState,
+    DeliverySubjectKind,
+    InboxView,
     JobStatus,
+    OutcomeState,
     ResourceRevisionBinding,
     SemanticAnnotation,
     SemanticEvidence,
@@ -32,7 +37,6 @@ from daita._json import FrozenJsonObject, canonical_json
 from daita.autonomy import (
     FOLLOWUP_INSTRUCTION,
     MAX_FOLLOWUP_EVENT_BYTES,
-    MAX_INBOX_REPORT_PREVIEW_BYTES,
     FollowupCompletionConflictError,
     FollowupDisposition,
     FollowupIdentityConflictError,
@@ -40,6 +44,7 @@ from daita.autonomy import (
     terminal_job_event_payload,
 )
 from daita.capabilities import AccessMode, OperationalEffect
+from daita.distribution.models import MAX_OUTCOME_CONCLUSION_PREVIEW_BYTES
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
 from daita.jobs.models import MAX_JOB_RESOURCE_BINDINGS
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
@@ -242,6 +247,14 @@ async def _inbox(agent: Agent):
     raise AssertionError(f"follow-up did not produce an inbox result: {followups!r}")
 
 
+async def _delivery_job_id(agent: Agent, delivery: InboxView) -> str:
+    assert delivery.subject_kind is DeliverySubjectKind.AUTONOMOUS_FOLLOWUP
+    followups = await agent._embedded._store.list_autonomous_followups(agent.id)
+    return next(
+        item.job_id for item in followups if item.followup_id == delivery.subject_id
+    )
+
+
 async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
     tmp_path: Path,
 ) -> None:
@@ -285,11 +298,11 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
         assert len(items) == 1
         delivery = items[0]
         assert delivery.state is DeliveryState.AVAILABLE
-        assert delivery.payload["job_id"] == job_id
-        assert delivery.payload["report_preview"] == (
+        assert await _delivery_job_id(agent, delivery) == job_id
+        assert delivery.conclusion_preview == (
             "The durable profile completed and its result is available."
         )
-        assert delivery.payload["report_truncated"] is False
+        assert delivery.conclusion_preview_truncated is False
         followup_run_id = delivery.resulting_run_id
         transcript = await agent.transcript(followup_run_id)
         assert transcript.run.origin is RunOrigin.JOB_EVENT
@@ -400,8 +413,8 @@ async def test_failed_terminal_job_delivers_grounded_no_result_report(
         items = await _inbox(agent)
         assert len(items) == 1
         assert items[0].state is DeliveryState.AVAILABLE
-        assert items[0].payload["outcome"] == "completed"
-        assert items[0].payload["report_preview"] == (
+        assert items[0].conclusion_state is OutcomeState.SUCCEEDED
+        assert items[0].conclusion_preview == (
             "The profile job failed and has no successful result."
         )
         transcript = await agent.transcript(items[0].resulting_run_id)
@@ -504,8 +517,8 @@ async def test_injected_router_fallback_is_scoped_sticky_and_delivers_once(
     try:
         items = await _inbox(agent)
         assert len(items) == 1
-        assert items[0].payload["job_id"] == job_id
-        assert items[0].payload["outcome"] == "completed", items[0]
+        assert await _delivery_job_id(agent, items[0]) == job_id
+        assert items[0].conclusion_state is OutcomeState.SUCCEEDED, items[0]
         assert len(unavailable.requests) == 1
         assert len(fallback.requests) == 2
         assert len(await agent.inbox()) == 1
@@ -957,19 +970,102 @@ async def test_host_loss_after_terminal_commit_retries_delivery_not_reasoning(
     try:
         items = await _inbox(agent)
         assert len(items) == 1
-        assert items[0].payload["job_id"] == job_id
+        assert await _delivery_job_id(agent, items[0]) == job_id
         assert recovery.requests == ()
         assert len(provider.logical_requests) == original_request_count
         finalized = await agent._embedded._store.finalize_autonomous_followup(
             agent.id,
-            items[0].subject.subject_id,
+            items[0].subject_id,
             delivery_id="delivery-retry-must-not-replace",
             finalized_at=datetime.now(UTC),
         )
         assert finalized is not None
-        assert finalized[1] == items[0]
+        assert finalized[1].delivery_id == items[0].delivery_id
+        assert finalized[1].outcome.conclusion_digest == items[0].conclusion_digest
         assert len(await agent.inbox()) == 1
         assert recovery.requests == ()
+    finally:
+        await agent.close()
+
+
+async def test_acknowledgment_unblocks_pending_stage_c_delivery_at_capacity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "source.sqlite"
+    _database(database)
+    bootstrap = await Agent.create(
+        "stage-c-capacity",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
+    source = await bootstrap.attach(SQLiteSource(database))
+    resource = (await bootstrap.list_catalog_resources(source_id=source.id))[0]
+    await bootstrap.close()
+
+    monkeypatch.setattr(sqlite_module, "MAX_DELIVERIES_PER_AGENT", 1)
+    provider = MockModelProvider((), complete_pricing=True)
+    ids = _IdFactory("capacity")
+    provider.replace_script(
+        (
+            _start_profile(resource.id),
+            _stop("First job accepted."),
+            _inspect_and_read_job("job-capacity-1"),
+            _stop("First terminal result delivered."),
+        )
+    )
+    agent = await Agent.open(
+        "stage-c-capacity",
+        root=tmp_path,
+        model=provider,
+        model_profile=provider.model_profile,
+        limits=LIMITS,
+        id_factory=ids,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        await agent.run("profile first")
+        first_job_id = _job_id(provider)
+        assert first_job_id == "job-capacity-1"
+        await _terminal(agent, first_job_id)
+        (first_delivery,) = await _inbox(agent)
+
+        provider.replace_script(
+            (
+                _start_profile(resource.id),
+                _stop("Second job accepted."),
+                _inspect_and_read_job("job-capacity-2"),
+                _stop("Second terminal result delivered after capacity is freed."),
+            )
+        )
+        await agent.run("profile second")
+        second_job_id = _job_id_from_request(provider, 5)
+        assert second_job_id == "job-capacity-2"
+        await _terminal(agent, second_job_id)
+
+        for _ in range(500):
+            followups = await agent._embedded._store.list_autonomous_followups(agent.id)
+            second_followup = next(
+                (item for item in followups if item.job_id == second_job_id),
+                None,
+            )
+            if (
+                second_followup is not None
+                and second_followup.disposition
+                is FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
+            ):
+                break
+            await asyncio.sleep(0.005)
+        else:
+            raise AssertionError("Stage C follow-up did not wait for delivery capacity")
+
+        acknowledged = await agent.acknowledge_inbox(first_delivery.delivery_id)
+        assert acknowledged is not None
+        (second_delivery,) = await _inbox(agent)
+        assert await _delivery_job_id(agent, second_delivery) == second_job_id
+        assert second_delivery.delivery_id != first_delivery.delivery_id
+        retained = await agent.inbox(include_acknowledged=True)
+        assert retained == (second_delivery,)
     finally:
         await agent.close()
 
@@ -1061,7 +1157,7 @@ async def test_one_delivery_failure_does_not_block_a_sibling_followup(
     try:
         items = await _inbox(agent)
         assert len(items) == 1
-        assert items[0].payload["job_id"] == second_job_id
+        assert await _delivery_job_id(agent, items[0]) == second_job_id
         followups = await agent._embedded._store.list_autonomous_followups(agent.id)
         by_job = {item.job_id: item for item in followups}
         assert (
@@ -1122,11 +1218,19 @@ async def test_delivery_is_blocked_when_destination_sensitivity_is_too_low(
             eligible_model_routes=("mock:scripted",),
             limits=LIMITS,
         )
+        public_plan = inbox_distribution_plan(
+            followup.conversation_id,
+            ModelSensitivity.PUBLIC,
+        )
         followup = replace(
             followup,
             grant=replace(
                 followup.grant,
-                delivery_sensitivity_ceiling=ModelSensitivity.PUBLIC,
+                distribution_plan=public_plan,
+            ),
+            execution_scope=replace(
+                followup.execution_scope,
+                distribution_plan_digest=public_plan.plan_digest,
             ),
         )
         await store.admit_autonomous_followup(followup)
@@ -1152,8 +1256,8 @@ async def test_delivery_is_blocked_when_destination_sensitivity_is_too_low(
         items = await _inbox(agent)
         assert len(items) == 1
         assert items[0].state is DeliveryState.BLOCKED
-        assert items[0].payload["report_preview"] is None
-        assert items[0].terminal_error == "delivery_sensitivity_ineligible"
+        assert items[0].conclusion_preview == ""
+        assert items[0].blocked_reason_code == "sensitivity_exceeds_destination"
     finally:
         await agent.close()
 
@@ -1216,9 +1320,9 @@ async def test_completed_model_text_without_all_job_evidence_fails_closed(
         items = await _inbox(agent)
 
         assert len(items) == 1
-        assert items[0].payload["outcome"] == "failed"
-        assert items[0].payload["report_preview"] is None
-        assert items[0].terminal_error == failure_code
+        assert items[0].conclusion_state is OutcomeState.FAILED
+        assert items[0].conclusion_preview == ""
+        assert items[0].failure_code == failure_code
         followup = (await agent._embedded._store.list_autonomous_followups(agent.id))[0]
         assert followup.disposition is FollowupDisposition.TERMINAL_FAILED
         assert followup.grant_consumed_at is None
@@ -1277,8 +1381,8 @@ async def test_cleared_origin_conversation_does_not_revoke_followup(
     )
     try:
         items = await _inbox(agent)
-        assert items[0].payload["outcome"] == "completed"
-        assert items[0].payload["report_preview"] == (
+        assert items[0].conclusion_state is OutcomeState.SUCCEEDED
+        assert items[0].conclusion_preview == (
             "Recovered from durable job truth with empty prior history."
         )
         assert "origin text must not be required after clearing" not in repr(
@@ -1383,7 +1487,7 @@ async def test_followup_history_excludes_other_conversation_sources(
         await _terminal(agent, job_id)
         items = await _inbox(agent)
 
-        assert items[0].payload["outcome"] == "completed"
+        assert items[0].conclusion_state is OutcomeState.SUCCEEDED
         followup_requests = provider.logical_requests[3:]
         assert len(followup_requests) == 2
         assert all(
@@ -1569,14 +1673,13 @@ async def test_inbox_uses_bounded_report_preview_and_run_reference(
         await _terminal(agent, job_id)
         item = (await _inbox(agent))[0]
 
-        assert item.payload["report_truncated"] is True
-        preview = item.payload["report_preview"]
+        assert item.conclusion_preview_truncated is True
+        preview = item.conclusion_preview
         assert isinstance(preview, str)
-        assert len(preview.encode("utf-8")) <= MAX_INBOX_REPORT_PREVIEW_BYTES
-        assert item.payload["report_digest"] == (
+        assert len(preview.encode("utf-8")) <= MAX_OUTCOME_CONCLUSION_PREVIEW_BYTES
+        assert item.conclusion_digest == (
             "sha256:" + sha256(report.encode("utf-8")).hexdigest()
         )
-        assert item.resulting_run_id == item.payload["run_id"]
         transcript = await agent.transcript(item.resulting_run_id)
         final_block = transcript.messages[-1].content[0]
         assert isinstance(final_block, TextBlock)

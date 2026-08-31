@@ -2053,7 +2053,7 @@ def _system_prompt(
             "matched_rows, bounded samples, and warnings, not that a change is "
             "guaranteed or applied. "
             "A preview fingerprint is not approval or authority, and database "
-            "mutation remains unavailable in this release phase."
+            "mutation remains unavailable in the current execution scope."
         )
     if ARTIFACT_EDIT_TEXT_CAPABILITY_ID in capability_ids:
         instructions.append(

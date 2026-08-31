@@ -1222,7 +1222,7 @@ async def test_generated_maximum_catalog_is_bounded_searchable_and_replacing(
 
         assert len(catalog.entries) == limits.max_run_tool_catalog_entries == 512
         assert catalog.aggregate_bytes <= limits.max_run_tool_catalog_bytes
-        assert len(catalog.toolbox_manifest) == limits.max_toolbox_manifest_entries == 5
+        assert len(catalog.toolbox_manifest) == limits.max_toolbox_manifest_entries == 6
         assert catalog.manifest_bytes <= limits.max_toolbox_manifest_bytes
         assert (catalog.manifest_bytes + 3) // 4 <= limits.max_toolbox_manifest_tokens
         assert len(catalog.pinned_provider_definitions) == limits.max_pinned_tools

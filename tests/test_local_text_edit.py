@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from _distribution_support import inbox_distribution_plan
 
 import daita.artifacts.delivery as delivery_module
 from daita import Agent, ApprovalDecision, ApprovalRequest, LocalWorkspace
@@ -34,7 +35,12 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.loop.models import RunInput, RunOrigin, RunStartEnvelope
+from daita.loop.models import (
+    InstructionAuthority,
+    RunInput,
+    RunOrigin,
+    RunStartEnvelope,
+)
 
 
 class _EditWorkflowProvider:
@@ -1070,7 +1076,9 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
         eligible_model_routes=(provider.provider_id,),
         per_run_max_cost_usd=Decimal("0.01"),
         per_run_max_tokens=1_000,
-        delivery_destination="conversation_inbox:conversation-machine-edit",
+        distribution_plan_digest=inbox_distribution_plan(
+            "conversation-machine-edit"
+        ).plan_digest,
     )
     run = RunInput(
         id="run-machine-local-edit-negative",
@@ -1080,6 +1088,7 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
         created_at=datetime.now(UTC),
         start=RunStartEnvelope(
             origin=RunOrigin.JOB_EVENT,
+            instruction_authority=InstructionAuthority.CODE_OWNED,
             trusted_instruction_id="followup-local-edit-v1",
             trusted_instruction=instruction,
             instruction_digest=(

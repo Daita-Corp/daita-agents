@@ -1,4 +1,4 @@
-"""Use catalog search and relationship-aware SQL in one MVP run."""
+"""Use catalog search and relationship-aware SQL in one Daita run."""
 
 from __future__ import annotations
 

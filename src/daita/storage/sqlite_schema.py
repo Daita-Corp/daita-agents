@@ -95,13 +95,36 @@ AUTONOMOUS_FOLLOWUP_TABLE = (
     ("event_id", "TEXT", 1, None, 0),
     ("data", "TEXT", 1, None, 0),
 )
-CONVERSATION_INBOX_TABLE = (
+DELIVERY_TABLE = (
     ("agent_id", "TEXT", 1, None, 1),
     ("delivery_id", "TEXT", 1, None, 2),
     ("conversation_id", "TEXT", 1, None, 0),
     ("subject_kind", "TEXT", 1, None, 0),
     ("subject_id", "TEXT", 1, None, 0),
     ("logical_key", "TEXT", 1, None, 0),
+    ("target_kind", "TEXT", 1, None, 0),
+    ("target_fingerprint", "TEXT", 1, None, 0),
+    ("state", "TEXT", 1, None, 0),
+    ("created_at_us", "INTEGER", 1, None, 0),
+    ("data", "TEXT", 1, None, 0),
+)
+SCHEDULED_ROUTINE_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("routine_id", "TEXT", 1, None, 2),
+    ("conversation_id", "TEXT", 1, None, 0),
+    ("state", "TEXT", 1, None, 0),
+    ("next_due_at_us", "INTEGER", 0, None, 0),
+    ("data", "TEXT", 1, None, 0),
+)
+ROUTINE_OCCURRENCE_TABLE = (
+    ("agent_id", "TEXT", 1, None, 1),
+    ("occurrence_id", "TEXT", 1, None, 2),
+    ("routine_id", "TEXT", 1, None, 0),
+    ("routine_revision", "INTEGER", 1, None, 0),
+    ("slot_key", "TEXT", 1, None, 0),
+    ("state", "TEXT", 1, None, 0),
+    ("lease_expires_at_us", "INTEGER", 0, None, 0),
+    ("reserved_run_id", "TEXT", 0, None, 0),
     ("data", "TEXT", 1, None, 0),
 )
 
@@ -114,7 +137,9 @@ CURRENT_TABLES = {
     "mcp_server_bindings": MCP_BINDING_TABLE,
     "job_runs": JOB_RUN_TABLE,
     "autonomous_followups": AUTONOMOUS_FOLLOWUP_TABLE,
-    "conversation_inbox": CONVERSATION_INBOX_TABLE,
+    "deliveries": DELIVERY_TABLE,
+    "scheduled_routines": SCHEDULED_ROUTINE_TABLE,
+    "routine_occurrences": ROUTINE_OCCURRENCE_TABLE,
 }
 
 MESSAGES_FOREIGN_KEYS = (("runs", "run_id", "id", "NO ACTION", "CASCADE", "NONE"),)
@@ -122,12 +147,45 @@ SOURCE_SCOPE_FOREIGN_KEYS = (
     ("sources", "agent_id", "agent_id", "NO ACTION", "CASCADE", "NONE"),
     ("sources", "source_id", "id", "NO ACTION", "CASCADE", "NONE"),
 )
+ROUTINE_OCCURRENCE_FOREIGN_KEYS = (
+    (
+        "scheduled_routines",
+        "agent_id",
+        "agent_id",
+        "NO ACTION",
+        "CASCADE",
+        "NONE",
+    ),
+    (
+        "scheduled_routines",
+        "routine_id",
+        "routine_id",
+        "NO ACTION",
+        "CASCADE",
+        "NONE",
+    ),
+)
 NAMED_INDEXES = {
     "runs_conversation_turn": (
         "runs",
         True,
         ("agent_id", "conversation_id", "turn_index"),
-    )
+    ),
+    "scheduled_routines_due": (
+        "scheduled_routines",
+        False,
+        ("agent_id", "state", "next_due_at_us", "routine_id"),
+    ),
+    "routine_occurrences_stale": (
+        "routine_occurrences",
+        False,
+        ("agent_id", "state", "lease_expires_at_us", "occurrence_id"),
+    ),
+    "deliveries_conversation_history": (
+        "deliveries",
+        False,
+        ("agent_id", "conversation_id", "created_at_us", "delivery_id"),
+    ),
 }
 UNIQUE_CONSTRAINTS = {
     "database_write_receipts": frozenset({("agent_id", "run_id", "call_id")}),
@@ -135,10 +193,21 @@ UNIQUE_CONSTRAINTS = {
     "autonomous_followups": frozenset(
         {("agent_id", "event_id"), ("agent_id", "job_id")}
     ),
-    "conversation_inbox": frozenset(
+    "deliveries": frozenset(
         {
             ("agent_id", "logical_key"),
-            ("agent_id", "subject_kind", "subject_id"),
+            (
+                "agent_id",
+                "subject_kind",
+                "subject_id",
+                "target_fingerprint",
+            ),
+        }
+    ),
+    "routine_occurrences": frozenset(
+        {
+            ("agent_id", "routine_id", "routine_revision", "slot_key"),
+            ("agent_id", "reserved_run_id"),
         }
     ),
 }
@@ -275,19 +344,61 @@ CREATE TABLE autonomous_followups (
 )
 """
 
-CONVERSATION_INBOX_TABLE_SQL = """
-CREATE TABLE conversation_inbox (
+DELIVERY_TABLE_SQL = """
+CREATE TABLE deliveries (
     agent_id TEXT NOT NULL,
     delivery_id TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
     subject_kind TEXT NOT NULL,
     subject_id TEXT NOT NULL,
     logical_key TEXT NOT NULL,
-    data TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at_us INTEGER NOT NULL,
+    data TEXT NOT NULL CHECK (json_valid(data)),
     PRIMARY KEY (agent_id, delivery_id),
     UNIQUE (agent_id, logical_key),
-    UNIQUE (agent_id, subject_kind, subject_id)
-)
+    UNIQUE (agent_id, subject_kind, subject_id, target_fingerprint)
+);
+CREATE INDEX deliveries_conversation_history
+    ON deliveries(agent_id, conversation_id, created_at_us, delivery_id)
+"""
+
+SCHEDULED_ROUTINE_TABLE_SQL = """
+CREATE TABLE scheduled_routines (
+    agent_id TEXT NOT NULL,
+    routine_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    next_due_at_us INTEGER,
+    data TEXT NOT NULL CHECK (json_valid(data)),
+    PRIMARY KEY (agent_id, routine_id)
+);
+CREATE INDEX scheduled_routines_due
+    ON scheduled_routines(agent_id, state, next_due_at_us, routine_id)
+"""
+
+ROUTINE_OCCURRENCE_TABLE_SQL = """
+CREATE TABLE routine_occurrences (
+    agent_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    routine_id TEXT NOT NULL,
+    routine_revision INTEGER NOT NULL,
+    slot_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    lease_expires_at_us INTEGER,
+    reserved_run_id TEXT,
+    data TEXT NOT NULL CHECK (json_valid(data)),
+    PRIMARY KEY (agent_id, occurrence_id),
+    UNIQUE (agent_id, routine_id, routine_revision, slot_key),
+    UNIQUE (agent_id, reserved_run_id),
+    FOREIGN KEY (agent_id, routine_id)
+        REFERENCES scheduled_routines(agent_id, routine_id)
+        ON DELETE CASCADE
+);
+CREATE INDEX routine_occurrences_stale
+    ON routine_occurrences(agent_id, state, lease_expires_at_us, occurrence_id)
 """
 
 
@@ -337,6 +448,11 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
         **(
             {"postgresql_update_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
             if "postgresql_update_scopes" in definitions
+            else {}
+        ),
+        **(
+            {"routine_occurrences": ROUTINE_OCCURRENCE_FOREIGN_KEYS}
+            if "routine_occurrences" in definitions
             else {}
         ),
     }

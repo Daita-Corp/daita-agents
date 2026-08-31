@@ -10,14 +10,16 @@ Instead, report it privately by emailing **support@daita-tech.io** with:
 - Steps to reproduce or a proof-of-concept
 - Any relevant logs, code snippets, or configuration details
 
-We will acknowledge your report within **48 hours** and aim to provide a fix or mitigation plan within **14 days** for confirmed vulnerabilities.
+We will acknowledge your report within **48 hours** and aim to provide a fix or
+mitigation plan within **14 days** for confirmed vulnerabilities.
 
 ## Scope
 
-This policy covers the `daita-agents` package and its core framework. It does not cover:
+This policy covers the `daita-agents` package and repository-owned code. It
+does not cover:
 
 - Third-party LLM provider APIs (OpenAI, Anthropic, etc.) — report those to the respective vendors
-- Infrastructure you run yourself using this framework
+- Infrastructure operated outside this repository
 
 ## Supported Versions
 
@@ -25,4 +27,6 @@ We apply security fixes to the latest release only. We recommend always running 
 
 ## Disclosure
 
-We follow coordinated disclosure. Once a fix is released, we will publish a security advisory on this repository. We credit reporters by name unless you prefer to remain anonymous.
+We follow coordinated disclosure. Once a fix is released, we will publish a
+security advisory in this repository. We credit reporters by name unless you
+prefer to remain anonymous.

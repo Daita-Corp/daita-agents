@@ -8,9 +8,10 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
+from typing import Iterator, cast
 
 import pytest
 from _workspace_support import workspace_for
@@ -36,12 +37,19 @@ from daita import (
     ApprovalDecision,
     ApprovalRequest,
     DeliveryState,
-    DeliverySubject,
     DeliverySubjectKind,
-    InboxItem,
+    InboxView,
+    IntervalSchedule,
     JobStatus,
     LoopExit,
     LoopExitKind,
+    MisfirePolicy,
+    OutcomeConclusionKind,
+    OutcomeState,
+    ReportingMode,
+    RoutineState,
+    ScheduledRoutineInspection,
+    ScheduledRoutineSummary,
     SQLiteSource,
 )
 from daita._json import FrozenJsonObject
@@ -54,6 +62,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider
+from daita.routines.models import ScheduleKind
 from daita.security import CredentialSession, SecretReference, SecretResolutionError
 from daita.tui.app import DaitaApp, _run_failure_notice
 from daita.tui.clipboard import (
@@ -99,6 +108,7 @@ from daita.tui.screens.onboarding import (
     SourceSetupScreen,
 )
 from daita.tui.screens.permissions import PermissionsScreen
+from daita.tui.screens.routines import RoutinesScreen
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.screens.source_edit import SourceEditScreen
 from daita.tui.widgets.approval import ApprovalPanel
@@ -135,6 +145,124 @@ def test_source_override_and_learning_parse():
     assert parse_source_override("hello") is None
     assert parse_source_override("@sales how many") == ("sales", "how many")
     assert parse_source_override('@"north west" total') == ("north west", "total")
+
+
+async def test_routines_command_opens_records_and_routes_create_through_agent_loop():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    listing = await app.controller.dispatch_command("/routines")
+    assert listing.kind == "screen"
+    assert listing.screen == "routines"
+    create = await app.controller.dispatch_command(
+        "/routines create report the current invoice count every morning"
+    )
+    assert create.kind == "run"
+    assert create.run_message is not None
+    assert "routine management tools" in create.run_message
+    update = await app.controller.dispatch_command(
+        "/routines update routine-1 report the current invoice count every afternoon"
+    )
+    assert update.kind == "run"
+    assert update.run_message is not None
+    assert "exact current revision" in update.run_message
+
+
+async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatch):
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    observed = datetime(2026, 8, 28, 12, tzinfo=UTC)
+    summary = ScheduledRoutineSummary(
+        routine_id="routine-ui",
+        title="Invoice count",
+        state=RoutineState.ACTIVE,
+        schedule_kind=ScheduleKind.INTERVAL,
+        next_due_at=observed,
+        revision=1,
+        occurrence_count=0,
+        consecutive_failures=0,
+    )
+    current = summary
+    controls: list[tuple[str, int, str]] = []
+
+    def inspection() -> ScheduledRoutineInspection:
+        routine = SimpleNamespace(
+            routine_id=current.routine_id,
+            title=current.title,
+            state=current.state,
+            revision=current.revision,
+            schedule=IntervalSchedule(3600, observed),
+            next_due_at=current.next_due_at,
+            reporting_mode=ReportingMode.ALWAYS,
+            misfire_policy=MisfirePolicy.LATEST_ONLY,
+            instruction_digest="sha256:" + "1" * 64,
+            authorized_instruction="Read and report the exact invoice count.",
+            allowed_source_ids=("source-1",),
+            allowed_connector_binding_ids=(),
+            allowed_resource_ids=("resource-1",),
+            allowed_capability_ids=("catalog.inspect",),
+            skill_bindings=(),
+            charged_tokens=0,
+            cumulative_max_tokens=1000,
+            charged_cost_usd=Decimal("0"),
+            cumulative_max_cost_usd=Decimal("1"),
+            occurrence_count=0,
+            consecutive_failures=0,
+            expires_at=observed,
+        )
+        return cast(
+            ScheduledRoutineInspection,
+            SimpleNamespace(routine=routine, recent_occurrences=()),
+        )
+
+    async def list_routines() -> tuple[ScheduledRoutineSummary, ...]:
+        return (current,)
+
+    async def inspect_routine(routine_id: str) -> ScheduledRoutineInspection | None:
+        return inspection() if routine_id == current.routine_id else None
+
+    async def control_routine(
+        routine_id: str, *, expected_revision: int, action: str
+    ) -> object:
+        nonlocal current
+        controls.append((routine_id, expected_revision, action))
+        current = replace(
+            current,
+            state=RoutineState.PAUSED,
+            revision=current.revision + 1,
+            next_due_at=None,
+        )
+        return inspection().routine
+
+    monkeypatch.setattr(app.controller, "list_routines", list_routines)
+    monkeypatch.setattr(app.controller, "inspect_routine", inspect_routine)
+    monkeypatch.setattr(app.controller, "control_routine", control_routine)
+
+    async with app.run_test(size=(110, 36)) as pilot:
+        await app.push_screen(RoutinesScreen())
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if "1 routine" in str(
+                app.screen.query_one("#routines-summary", Static).content
+            ):
+                break
+        manager = app.screen
+        assert isinstance(manager, RoutinesScreen)
+        assert manager.query_one("#routines-list", OptionList).option_count == 1
+        assert "Instruction digest" in str(
+            manager.query_one("#routines-detail", Static).content
+        )
+        assert await pilot.click("#routines-pause") is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, ConfirmScreen):
+                break
+        assert isinstance(app.screen, ConfirmScreen)
+        await pilot.press("y")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if app.screen is manager and controls:
+                break
+        assert controls == [("routine-ui", 1, "pause")]
+        assert manager.query_one("#routines-resume", Button).disabled is False
+        app.exit(0)
 
 
 def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
@@ -802,40 +930,29 @@ def _tui_inbox_item(
     delivery_id: str = "delivery-stage-c",
     *,
     report: str = "The durable profile completed successfully.",
-) -> InboxItem:
+) -> InboxView:
     observed = datetime(2026, 8, 23, 14, 5, tzinfo=UTC)
-    return InboxItem(
+    return InboxView(
         delivery_id=delivery_id,
-        agent_id="agent-inbox",
         conversation_id="conversation-inbox",
-        subject=DeliverySubject(
-            kind=DeliverySubjectKind.STANDALONE_FOLLOWUP,
-            subject_id="followup-inbox",
-        ),
+        subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
+        subject_id="followup-inbox",
+        conclusion_kind=OutcomeConclusionKind.TERMINAL_RUN,
+        conclusion_state=OutcomeState.SUCCEEDED,
+        conclusion_digest="sha256:" + "2" * 64,
+        conclusion_preview=report,
+        conclusion_preview_truncated=False,
         resulting_run_id="run-followup",
-        grant_id="grant-followup",
-        logical_key="standalone_followup:followup-inbox:conclusion",
-        conclusion_digest="sha256:" + "1" * 64,
-        payload={
-            "subject": {
-                "kind": "standalone_followup",
-                "subject_id": "followup-inbox",
-            },
-            "job_id": "job-profile",
-            "run_id": "run-followup",
-            "outcome": "completed",
-            "reason": "completed",
-            "report_digest": "sha256:" + "2" * 64,
-            "report_preview": report,
-            "report_truncated": False,
-            "evidence_digest": "sha256:" + "3" * 64,
-        },
-        sensitivity=ModelSensitivity.INTERNAL,
-        destination="conversation_inbox:conversation-inbox",
-        destination_sensitivity_ceiling=ModelSensitivity.INTERNAL,
+        artifact_references=(),
+        effective_sensitivity=ModelSensitivity.INTERNAL,
+        provenance_digest="sha256:" + "3" * 64,
+        destination_id="conversation_inbox:conversation-inbox",
         state=DeliveryState.AVAILABLE,
         created_at=observed,
         updated_at=observed,
+        acknowledged_at=None,
+        blocked_reason_code=None,
+        failure_code=None,
     )
 
 
@@ -974,16 +1091,36 @@ async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
     items = [item]
     acknowledgments: list[str] = []
 
-    async def list_inbox() -> tuple[InboxItem, ...]:
+    async def list_inbox() -> tuple[InboxView, ...]:
         return tuple(items)
 
-    async def acknowledge_inbox(delivery_id: str) -> InboxItem | None:
+    async def acknowledge_inbox(delivery_id: str) -> InboxView | None:
         acknowledgments.append(delivery_id)
         items.clear()
         return item
 
+    async def list_distribution_destinations(
+        conversation_id: str,
+        *,
+        sensitivity_ceiling: ModelSensitivity,
+    ) -> tuple[SimpleNamespace, ...]:
+        assert conversation_id == item.conversation_id
+        assert sensitivity_ceiling is ModelSensitivity.INTERNAL
+        return (
+            SimpleNamespace(
+                label="Current conversation Inbox",
+                state=SimpleNamespace(value="available"),
+                revision=1,
+            ),
+        )
+
     monkeypatch.setattr(app.controller, "list_inbox", list_inbox)
     monkeypatch.setattr(app.controller, "acknowledge_inbox", acknowledge_inbox)
+    monkeypatch.setattr(
+        app.controller,
+        "list_distribution_destinations",
+        list_distribution_destinations,
+    )
 
     async with app.run_test(size=(110, 36)) as pilot:
         await app.push_screen(InboxScreen())
@@ -1023,21 +1160,36 @@ def test_inbox_rendering_withholds_blocked_reports_and_marks_bounded_previews():
     available = _tui_inbox_item(report="bounded preview")
     truncated = replace(
         available,
-        payload={**dict(available.payload), "report_truncated": True},
+        conclusion_preview_truncated=True,
     )
     assert "Preview truncated" in render_inbox_item(truncated)
 
     blocked = replace(
         available,
         state=DeliveryState.BLOCKED,
-        payload={**dict(available.payload), "report_preview": None},
-        destination_sensitivity_ceiling=ModelSensitivity.PUBLIC,
-        terminal_error="delivery_sensitivity_ineligible",
+        conclusion_preview="",
+        blocked_reason_code="sensitivity_exceeds_destination",
     )
     rendered = render_inbox_item(blocked)
     assert "bounded preview" not in rendered
     assert "Preview withheld" in rendered
-    assert "delivery_sensitivity_ineligible" in rendered
+    assert "sensitivity_exceeds_destination" in rendered
+
+    routine_escalation = replace(
+        available,
+        subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
+        subject_id="occurrence-pre-run-failure",
+        conclusion_kind=OutcomeConclusionKind.NO_MODEL_OCCURRENCE,
+        conclusion_state=OutcomeState.FAILED,
+        resulting_run_id=None,
+        conclusion_preview="",
+        failure_code="routine_precheck_unavailable",
+    )
+    escalation = render_inbox_item(routine_escalation)
+    assert "Routine: occurrence-pre-run-failure" in escalation
+    assert "Result run: No model run started" in escalation
+    assert "Escalation" in escalation
+    assert "failed before a model run could start" in escalation
 
 
 async def test_background_status_notifies_once_and_remains_outside_transcript(
@@ -1054,13 +1206,13 @@ async def test_background_status_notifies_once_and_remains_outside_transcript(
     running = _tui_job_summary(
         "job-running-status", JobStatus.RUNNING, result_available=False
     )
-    current_inbox: list[InboxItem] = []
+    current_inbox: list[InboxView] = []
     notifications: list[tuple[str, str | None]] = []
 
     async def list_jobs() -> tuple[object, ...]:
         return (running,)
 
-    async def list_inbox() -> tuple[InboxItem, ...]:
+    async def list_inbox() -> tuple[InboxView, ...]:
         return tuple(current_inbox)
 
     def notify(message: str, *, title: str | None = None, **_kwargs: object) -> None:

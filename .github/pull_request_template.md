@@ -21,5 +21,5 @@ Describe how you tested this change. If you added tests, point to them.
 ## Checklist
 
 - [ ] Tests pass (`pytest tests/ -m "not requires_llm and not requires_db"`)
-- [ ] Code is formatted (`black` / `isort`)
+- [ ] Python is formatted with `black`
 - [ ] Public API changes are documented

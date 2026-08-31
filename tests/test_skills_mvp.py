@@ -540,9 +540,12 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
             "artifact_list",
             "artifact_read",
+            "delivery_list",
+            "distribution_destination_list",
             "file_read",
             "file_search",
             "job_list",
+            "routine_list",
             SKILL_VIEW_TOOL_NAME,
             "toolbox_load",
             "toolbox_search",
@@ -769,9 +772,12 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         assert tuple(tool.name for tool in provider.requests[0].tools) == (
             "artifact_list",
             "artifact_read",
+            "delivery_list",
+            "distribution_destination_list",
             "file_read",
             "file_search",
             "job_list",
+            "routine_list",
             "skill_view",
             "toolbox_load",
             "toolbox_search",
@@ -1037,7 +1043,7 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
         }
         assert tables == {
             "autonomous_followups",
-            "conversation_inbox",
+            "deliveries",
             "database_write_receipts",
             "learning_candidates",
             "job_runs",
@@ -1046,6 +1052,8 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
             "metadata",
             "postgresql_update_scopes",
             "runs",
+            "routine_occurrences",
+            "scheduled_routines",
             "semantic_annotations",
             "snapshots",
             "source_read_scopes",

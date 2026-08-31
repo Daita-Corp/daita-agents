@@ -100,6 +100,13 @@ from .file_capabilities import (
     local_file_declarations,
 )
 from .results import BoundedResultProjection, project_result_rows
+from .routine_precheck import (
+    RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
+    RESOURCE_REVISION_OBSERVATION_EXECUTOR_ID,
+    RESOURCE_REVISION_OBSERVATION_OUTPUT_KIND,
+    ResourceRevisionObservationDeclarations,
+    resource_revision_observation_declarations,
+)
 from .sql import (
     POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES,
     PostgreSQLUpdateCell,
@@ -199,6 +206,10 @@ __all__ = [
     "PostgreSQLUpdateBackend",
     "PostgreSQLUpdateCatalogReader",
     "ReadScopedCatalogReader",
+    "RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID",
+    "RESOURCE_REVISION_OBSERVATION_EXECUTOR_ID",
+    "RESOURCE_REVISION_OBSERVATION_OUTPUT_KIND",
+    "ResourceRevisionObservationDeclarations",
     "PostgreSQLUpdateCommand",
     "PostgreSQLUpdateFilter",
     "PostgreSQLUpdateDeclarations",
@@ -243,6 +254,7 @@ __all__ = [
     "postgresql_update_declarations",
     "postgresql_update_capability_declarations",
     "project_result_rows",
+    "resource_revision_observation_declarations",
     "render_postgresql_update_statement",
     "sqlite_declared_type_affinity",
     "sqlite_identifier_key",

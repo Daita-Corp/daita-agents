@@ -18,7 +18,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Self, TypeVar, cast
+from typing import Self, TypedDict, TypeVar, cast
 from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
@@ -58,7 +58,6 @@ from ..autonomy import (
     FOLLOWUP_INSTRUCTION_ID,
     FOLLOWUP_LEASE_SECONDS,
     FollowupDisposition,
-    InboxItem,
     create_terminal_job_followup,
 )
 from ..capabilities import (
@@ -86,6 +85,16 @@ from ..catalog.models import (
 )
 from ..catalog.service import CatalogService
 from ..config import AgentConfig
+from ..distribution import (
+    DISTRIBUTION_DOMAIN_OWNER_ID,
+    DeliveryInspection,
+    DistributionCapabilityDomain,
+    DistributionDestination,
+    DistributionOwner,
+    InboxView,
+    OutcomeContract,
+    distribution_capability_declarations,
+)
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
@@ -103,6 +112,7 @@ from ..domains.data import (
     postgresql_query_declarations,
     postgresql_update_declarations,
     postgresql_update_preview_declarations,
+    resource_revision_observation_declarations,
     sqlite_query_declarations,
 )
 from ..domains.data.context import _project_completed_history
@@ -177,6 +187,7 @@ from ..loop.driver import (
 )
 from ..loop.models import (
     ConversationRun,
+    InstructionAuthority,
     LoopExit,
     LoopLimits,
     RunInput,
@@ -191,6 +202,27 @@ from ..memory.capabilities import (
     memory_set_declarations,
 )
 from ..observation import AgentObserver
+from ..routines.capabilities import (
+    ROUTINE_DOMAIN_OWNER_ID,
+    RoutineCapabilityDomain,
+    routine_capability_declarations,
+)
+from ..routines.models import (
+    MisfirePolicy,
+    ReportingMode,
+    ResourceRevisionObservation,
+    ResourceRevisionPrecheck,
+    RoutineControlAction,
+    RoutineOccurrence,
+    RoutineSchedule,
+    RoutineState,
+    ScheduledRoutine,
+    ScheduledRoutineDraft,
+    ScheduledRoutineInspection,
+    ScheduledRoutineSummary,
+)
+from ..routines.owner import RoutineError, RoutineOwner
+from ..routines.supervisor import RoutineSupervisor
 from ..security import (
     CredentialSession,
     KeychainSecretProvider,
@@ -228,6 +260,61 @@ from ..storage.sqlite_records import (
     postgresql_update_authorization_fingerprint,
 )
 from ..workspace import LocalWorkspace
+
+
+class _RoutineDraftValues(TypedDict):
+    title: str
+    authorized_instruction: str
+    schedule: RoutineSchedule
+    misfire_policy: MisfirePolicy
+    reporting_mode: ReportingMode
+    precheck: ResourceRevisionPrecheck | None
+    allowed_source_ids: tuple[str, ...]
+    allowed_connector_binding_ids: tuple[str, ...]
+    allowed_resource_ids: tuple[str, ...]
+    allowed_capability_ids: tuple[str, ...]
+    sensitivity_ceiling: ModelSensitivity
+    outcome_contract: OutcomeContract
+    distribution_destination_id: str
+    eligible_model_routes: tuple[str, ...]
+    per_run_max_tokens: int
+    per_run_max_cost_usd: Decimal
+    cumulative_max_tokens: int
+    cumulative_max_cost_usd: Decimal
+    cumulative_max_attempts: int
+    cumulative_max_occurrences: int
+    maximum_consecutive_failures: int
+    expires_at: datetime
+    skill_names: tuple[str, ...]
+
+
+def _routine_draft_values(draft: ScheduledRoutineDraft) -> _RoutineDraftValues:
+    return {
+        "title": draft.title,
+        "authorized_instruction": draft.authorized_instruction,
+        "schedule": draft.schedule,
+        "misfire_policy": draft.misfire_policy,
+        "reporting_mode": draft.reporting_mode,
+        "precheck": draft.precheck,
+        "allowed_source_ids": draft.allowed_source_ids,
+        "allowed_connector_binding_ids": draft.allowed_connector_binding_ids,
+        "allowed_resource_ids": draft.allowed_resource_ids,
+        "allowed_capability_ids": draft.allowed_capability_ids,
+        "sensitivity_ceiling": draft.sensitivity_ceiling,
+        "outcome_contract": draft.outcome_contract,
+        "distribution_destination_id": draft.distribution_destination_id,
+        "eligible_model_routes": draft.eligible_model_routes,
+        "per_run_max_tokens": draft.per_run_max_tokens,
+        "per_run_max_cost_usd": draft.per_run_max_cost_usd,
+        "cumulative_max_tokens": draft.cumulative_max_tokens,
+        "cumulative_max_cost_usd": draft.cumulative_max_cost_usd,
+        "cumulative_max_attempts": draft.cumulative_max_attempts,
+        "cumulative_max_occurrences": draft.cumulative_max_occurrences,
+        "maximum_consecutive_failures": draft.maximum_consecutive_failures,
+        "expires_at": draft.expires_at,
+        "skill_names": draft.skill_names,
+    }
+
 
 _AGENT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 _CONVERSATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
@@ -476,6 +563,7 @@ class EmbeddedAgent:
         workspace_backend: LocalWorkspaceBackend | None,
         writer_lock: _WriterLock,
         store: SQLiteStateStore,
+        distribution_owner: DistributionOwner,
         loop: AgentLoop | None,
         transcripts: SQLiteStateStore,
         capabilities: CapabilityRegistry,
@@ -483,6 +571,8 @@ class EmbeddedAgent:
         data_view: CatalogDataView,
         capability_runtime: CapabilityRuntime,
         job_owner: JobOwner,
+        routine_owner: RoutineOwner,
+        routine_supervisor: RoutineSupervisor,
         job_supervisor: JobSupervisor,
         data_profile_admission: DataProfileAdmission,
         followup_wake: asyncio.Event,
@@ -500,6 +590,7 @@ class EmbeddedAgent:
         artifact_delivery: LocalArtifactDelivery | None,
         candidate_acceptance_supported: bool,
         mutation_lock: asyncio.Lock,
+        run_lock: asyncio.Lock,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
         limits: LoopLimits,
@@ -529,6 +620,7 @@ class EmbeddedAgent:
         }
         self._writer_lock = writer_lock
         self._store = store
+        self._distribution_owner = distribution_owner
         self._loop = loop
         self._transcripts = transcripts
         self._capabilities = capabilities
@@ -536,6 +628,8 @@ class EmbeddedAgent:
         self._data_view = data_view
         self._capability_runtime = capability_runtime
         self._job_owner = job_owner
+        self._routine_owner = routine_owner
+        self._routine_supervisor = routine_supervisor
         self._job_supervisor = job_supervisor
         self._data_profile_admission = data_profile_admission
         self._followup_wake = followup_wake
@@ -556,7 +650,7 @@ class EmbeddedAgent:
         self._clock = clock
         self._id_factory = id_factory
         self._mutation_lock = mutation_lock
-        self._run_lock = asyncio.Lock()
+        self._run_lock = run_lock
         self._source_permission_confirmation_key = secrets.token_bytes(32)
         self._source_permission_previews: dict[str, SourcePermissionsPreview] = {}
         self._closed = False
@@ -1038,6 +1132,11 @@ class EmbeddedAgent:
             identity.id,
             postgresql_preview_backend,
         )
+        routine_precheck = resource_revision_observation_declarations(
+            agent_id=identity.id,
+            catalog=data_view,
+            clock=clock,
+        )
         if hosted != (workspace is None and workspace_backend is None):
             raise AgentHomeError("workspace composition is inconsistent")
         if hosted != (artifact_delivery is None):
@@ -1049,6 +1148,7 @@ class EmbeddedAgent:
         )
         files_only_run_ids: set[str] = set()
         mutation_lock = asyncio.Lock()
+        run_lock = asyncio.Lock()
         memory_store = MemoryStore(home, mutation_lock)
         skill_store = SkillStore(home, mutation_lock)
         resolved_reviewer_model = reviewer_model
@@ -1122,6 +1222,7 @@ class EmbeddedAgent:
                 *postgresql.capabilities,
                 *postgresql_preview.capabilities,
                 *postgresql_update.capabilities,
+                *routine_precheck.capabilities,
                 *(local_files.capabilities if local_files is not None else ()),
             ),
             executor_ids=tuple(
@@ -1132,6 +1233,7 @@ class EmbeddedAgent:
                     *postgresql.capabilities,
                     *postgresql_preview.capabilities,
                     *postgresql_update.capabilities,
+                    *routine_precheck.capabilities,
                     *(local_files.capabilities if local_files is not None else ()),
                 )
             ),
@@ -1224,6 +1326,7 @@ class EmbeddedAgent:
                 artifact_delivery,
                 workspace_backend,
                 learning_candidate_guard,
+                clock=clock,
                 files_only_run_ids=files_only_run_ids,
             )
         )
@@ -1252,7 +1355,7 @@ class EmbeddedAgent:
             clock=clock,
             files_only_run_ids=files_only_run_ids,
         )
-        domains = (
+        base_domains = (
             data_domain,
             memory_domain,
             skill_domain,
@@ -1262,12 +1365,13 @@ class EmbeddedAgent:
             *((artifact_domain,) if artifact_domain is not None else ()),
             *((mcp_domain,) if mcp_domain is not None else ()),
         )
-        registered_executors = (
+        base_executors = (
             *catalog.executors,
             *sqlite.executors,
             *postgresql.executors,
             *postgresql_preview.executors,
             *postgresql_update.executors,
+            *routine_precheck.executors,
             *(local_files.executors if local_files is not None else ()),
             *memory.executors,
             *skills.executors,
@@ -1276,6 +1380,52 @@ class EmbeddedAgent:
             *data_profile_jobs.executors,
             *(artifacts.executors if artifacts is not None else ()),
             *mcp_executors,
+        )
+        distribution_owner = DistributionOwner(agent_id=identity.id, store=store)
+        distribution_lifecycle = distribution_capability_declarations(
+            distribution_owner
+        )
+        distribution_declaration_bundle = CapabilityDeclarations(
+            domain_owner_id=DISTRIBUTION_DOMAIN_OWNER_ID,
+            capabilities=distribution_lifecycle.capabilities,
+            executor_ids=tuple(
+                item.executor_id for item in distribution_lifecycle.capabilities
+            ),
+            tool_views=distribution_lifecycle.tool_views,
+        )
+        distribution_domain = DistributionCapabilityDomain(
+            distribution_declaration_bundle,
+            distribution_owner,
+        )
+        routine_owner = RoutineOwner(
+            agent_id=identity.id,
+            store=store,
+            catalog=data_view,
+            distribution=distribution_owner,
+            skills=skill_store,
+            eligible_model_routes=_stage_c_model_routes(model, model_route),
+            maximum_per_run_tokens=limits.max_total_tokens,
+            maximum_per_run_cost_usd=limits.max_estimated_cost_usd,
+            clock=clock,
+        )
+        routine_lifecycle = routine_capability_declarations(routine_owner)
+        routine_declaration_bundle = CapabilityDeclarations(
+            domain_owner_id=ROUTINE_DOMAIN_OWNER_ID,
+            capabilities=routine_lifecycle.capabilities,
+            executor_ids=tuple(
+                item.executor_id for item in routine_lifecycle.capabilities
+            ),
+            tool_views=routine_lifecycle.tool_views,
+        )
+        routine_domain = RoutineCapabilityDomain(
+            routine_declaration_bundle,
+            routine_owner,
+        )
+        domains = (*base_domains, distribution_domain, routine_domain)
+        registered_executors = (
+            *base_executors,
+            *distribution_lifecycle.executors,
+            *routine_lifecycle.executors,
         )
         if hosted:
             declared_capability_ids = {
@@ -1308,6 +1458,9 @@ class EmbeddedAgent:
             declarations=tuple(domain.declarations for domain in domains),
             executors=registered_executors,
         )
+        if artifact_domain is not None:
+            artifact_domain.bind_capability_registry(capabilities)
+        routine_owner.bind_capability_registry(capabilities)
         capability_runtime = CapabilityRuntime(
             capabilities,
             domains,
@@ -1379,6 +1532,80 @@ class EmbeddedAgent:
                 ),
             )
         )
+
+        async def execute_routine_run(
+            occurrence: RoutineOccurrence,
+            run_input: RunInput,
+            observation: ResourceRevisionObservation | None,
+        ) -> LoopExit | None:
+            if loop is None:
+                return None
+            routine = await store.load_scheduled_routine(
+                identity.id,
+                occurrence.routine_id,
+            )
+            if routine is None or routine.revision != occurrence.routine_revision:
+                return None
+            skill_domain.select_scheduled_bindings(
+                run_input.id,
+                tuple(
+                    (binding.skill_name, binding.content_digest)
+                    for binding in routine.skill_bindings
+                ),
+            )
+            try:
+                async with run_lock:
+                    conversation_exists, conversation, older_history_exists = (
+                        await store.completed_conversation_tail(
+                            identity.id,
+                            run_input.conversation_id or run_input.id,
+                        )
+                    )
+                    if not conversation_exists:
+                        raise ValueError("routine_destination_conversation_missing")
+                    prior_messages = _project_completed_history(
+                        conversation,
+                        older_history_exists=older_history_exists,
+                    )
+                    prepared = await loop.prepare(
+                        run_input,
+                        prior_messages=prior_messages,
+                    )
+                    assert occurrence.claim_token is not None
+                    assert run_input.execution_scope is not None
+                    bound = await store.bind_routine_occurrence_run(
+                        identity.id,
+                        occurrence.occurrence_id,
+                        claim_token=occurrence.claim_token,
+                        run_id=run_input.id,
+                        execution_scope=run_input.execution_scope,
+                        bound_at=clock(),
+                        precheck_observation=observation,
+                    )
+                    if bound is None:
+                        return None
+                    return await loop.run(
+                        run_input,
+                        prior_messages=prior_messages,
+                        prepared=prepared,
+                    )
+            finally:
+                skill_domain.clear_scheduled_bindings(run_input.id)
+                if artifact_delivery is not None:
+                    artifact_delivery.end_run(run_input.id)
+
+        routine_supervisor = RoutineSupervisor(
+            agent_id=identity.id,
+            store=store,
+            owner=routine_owner,
+            runtime=capability_runtime,
+            distribution=distribution_owner,
+            artifacts=artifact_store,
+            execute_run=(execute_routine_run if loop is not None else None),
+            clock=clock,
+            id_factory=id_factory,
+        )
+        routine_owner.bind_wake(routine_supervisor.wake)
         embedded = cls(
             identity=identity,
             home=home,
@@ -1386,6 +1613,7 @@ class EmbeddedAgent:
             workspace_backend=workspace_backend,
             writer_lock=writer_lock,
             store=store,
+            distribution_owner=distribution_owner,
             loop=loop,
             transcripts=transcripts,
             capabilities=capabilities,
@@ -1393,6 +1621,8 @@ class EmbeddedAgent:
             data_view=data_view,
             capability_runtime=capability_runtime,
             job_owner=job_owner,
+            routine_owner=routine_owner,
+            routine_supervisor=routine_supervisor,
             job_supervisor=job_supervisor,
             data_profile_admission=data_profile_admission,
             followup_wake=followup_wake,
@@ -1417,6 +1647,7 @@ class EmbeddedAgent:
                 and resolved_tools is capability_runtime
             ),
             mutation_lock=mutation_lock,
+            run_lock=run_lock,
             model_profile=model_profile,
             model_route=model_route,
             limits=limits,
@@ -1430,6 +1661,7 @@ class EmbeddedAgent:
             id_factory=id_factory,
         )
         await job_supervisor.start()
+        await routine_supervisor.start()
         embedded._start_followup_driver()
         return embedded
 
@@ -1879,7 +2111,7 @@ class EmbeddedAgent:
                         raise
                     except Exception:
                         # The durable claim or terminal run remains recoverable. One
-                        # item must not stop unrelated Stage C progress.
+                        # item must not stop unrelated durable-job follow-ups.
                         pass
                     continue
                 timeout = _STAGE_C_SAFETY_WAKE_SECONDS
@@ -2019,6 +2251,7 @@ class EmbeddedAgent:
                     ),
                     start=RunStartEnvelope(
                         origin=RunOrigin.JOB_EVENT,
+                        instruction_authority=InstructionAuthority.CODE_OWNED,
                         trusted_instruction_id=FOLLOWUP_INSTRUCTION_ID,
                         trusted_instruction=FOLLOWUP_INSTRUCTION,
                         instruction_digest=FOLLOWUP_INSTRUCTION_DIGEST,
@@ -2165,30 +2398,60 @@ class EmbeddedAgent:
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = 50,
-    ) -> tuple[InboxItem, ...]:
+    ) -> tuple[InboxView, ...]:
         """Inspect a bounded agent-owned durable conversation inbox."""
 
         self._require_open()
         if conversation_id is not None:
             _validate_conversation_id(conversation_id)
-        return await self._store.list_inbox(
-            self.identity.id,
+        return await self._distribution_owner.list(
             conversation_id=conversation_id,
             include_acknowledged=include_acknowledged,
             limit=limit,
         )
 
-    async def acknowledge_inbox(self, delivery_id: str) -> InboxItem | None:
+    async def distribution_destinations(
+        self,
+        conversation_id: str,
+        *,
+        sensitivity_ceiling: ModelSensitivity,
+    ) -> tuple[DistributionDestination, ...]:
+        """Discover exact current destinations for one owned conversation."""
+
+        self._require_open()
+        _validate_conversation_id(conversation_id)
+        if not isinstance(sensitivity_ceiling, ModelSensitivity):
+            raise TypeError("sensitivity_ceiling must be ModelSensitivity")
+        return await self._distribution_owner.discover_destinations(
+            conversation_id,
+            sensitivity_ceiling=sensitivity_ceiling,
+        )
+
+    async def inspect_delivery(
+        self,
+        delivery_id: str,
+    ) -> DeliveryInspection | None:
+        """Inspect one exact agent-owned logical delivery."""
+
+        self._require_open()
+        if not isinstance(delivery_id, str) or not delivery_id.strip():
+            raise ValueError("delivery_id must be non-empty text")
+        return await self._distribution_owner.inspect(delivery_id.strip())
+
+    async def acknowledge_inbox(self, delivery_id: str) -> InboxView | None:
         """Idempotently acknowledge one exact agent-owned inbox result."""
 
         self._require_open()
         if not isinstance(delivery_id, str) or not delivery_id.strip():
             raise ValueError("delivery_id must be non-empty text")
-        return await self._store.acknowledge_inbox(
-            self.identity.id,
+        acknowledged = await self._distribution_owner.acknowledge(
             delivery_id.strip(),
             acknowledged_at=self._clock(),
         )
+        if acknowledged is not None:
+            self._followup_wake.set()
+            self._routine_supervisor.wake()
+        return acknowledged
 
     async def conversation_runs(
         self,
@@ -2237,6 +2500,193 @@ class EmbeddedAgent:
         self._require_open()
         return await self._job_owner.cancel(job_id)
 
+    async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
+        """Build and revalidate one non-persisted exact routine proposal."""
+
+        self._require_open()
+        return await self._prepare_routine_proposal(draft, basis_run_id=None)
+
+    async def promote_routine(
+        self,
+        draft: ScheduledRoutineDraft,
+        *,
+        basis_run_id: str,
+    ) -> ScheduledRoutine:
+        """Build a proposal with exact evidence from one completed prior run."""
+
+        self._require_open()
+        return await self._prepare_routine_proposal(
+            draft,
+            basis_run_id=basis_run_id,
+        )
+
+    async def create_routine(self, proposal: ScheduledRoutine) -> ScheduledRoutine:
+        """Persist one previously inspected exact proposal."""
+
+        async with self._mutation_lock:
+            self._require_open()
+            if proposal.agent_id != self.identity.id:
+                raise ValueError("routine proposal belongs to another agent")
+            return await self._routine_owner.admit(proposal)
+
+    async def list_routines(
+        self,
+        *,
+        states: frozenset[RoutineState] = frozenset(),
+        limit: int = 50,
+    ) -> tuple[ScheduledRoutineSummary, ...]:
+        self._require_open()
+        return await self._routine_owner.list(states=states, limit=limit)
+
+    async def inspect_routine(
+        self, routine_id: str
+    ) -> ScheduledRoutineInspection | None:
+        self._require_open()
+        return await self._routine_owner.inspect(routine_id)
+
+    async def update_routine(
+        self,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        draft: ScheduledRoutineDraft,
+        basis_run_id: str | None = None,
+    ) -> ScheduledRoutine:
+        """Conditionally replace one routine with a newly authorized definition."""
+
+        async with self._mutation_lock:
+            self._require_open()
+            inspection = await self._routine_owner.inspect(routine_id)
+            if inspection is None or inspection.routine.revision != expected_revision:
+                raise RoutineError(
+                    "routine_revision_changed",
+                    "The routine changed or is no longer owned by this agent.",
+                )
+            proposal = await self._prepare_routine_revision(
+                inspection.routine,
+                draft,
+                basis_run_id=basis_run_id,
+            )
+            return await self._routine_owner.revise(
+                proposal,
+                expected_revision=expected_revision,
+            )
+
+    async def pause_routine(
+        self, routine_id: str, *, expected_revision: int
+    ) -> ScheduledRoutine:
+        return await self._control_routine(
+            routine_id,
+            expected_revision=expected_revision,
+            action=RoutineControlAction.PAUSE,
+        )
+
+    async def resume_routine(
+        self, routine_id: str, *, expected_revision: int
+    ) -> ScheduledRoutine:
+        return await self._control_routine(
+            routine_id,
+            expected_revision=expected_revision,
+            action=RoutineControlAction.RESUME,
+        )
+
+    async def run_routine_now(
+        self, routine_id: str, *, expected_revision: int
+    ) -> ScheduledRoutine:
+        return await self._control_routine(
+            routine_id,
+            expected_revision=expected_revision,
+            action=RoutineControlAction.RUN_NOW,
+        )
+
+    async def disable_routine(
+        self, routine_id: str, *, expected_revision: int
+    ) -> ScheduledRoutine:
+        return await self._control_routine(
+            routine_id,
+            expected_revision=expected_revision,
+            action=RoutineControlAction.DISABLE,
+        )
+
+    async def _prepare_routine_proposal(
+        self,
+        draft: ScheduledRoutineDraft,
+        *,
+        basis_run_id: str | None,
+    ) -> ScheduledRoutine:
+        if not isinstance(draft, ScheduledRoutineDraft):
+            raise TypeError("draft must be ScheduledRoutineDraft")
+        transcript = await self._store.load(draft.origin_run_id)
+        if transcript.run.conversation_id is None:
+            raise ValueError("routine origin run has no conversation")
+        self._validate_routine_draft_distribution(
+            draft,
+            transcript.run.conversation_id,
+        )
+        return await self._routine_owner.prepare_create(
+            run_id=draft.origin_run_id,
+            conversation_id=transcript.run.conversation_id,
+            call_id=self._id_factory("routine-proposal"),
+            basis_run_id=basis_run_id,
+            **_routine_draft_values(draft),
+        )
+
+    async def _prepare_routine_revision(
+        self,
+        current: ScheduledRoutine,
+        draft: ScheduledRoutineDraft,
+        *,
+        basis_run_id: str | None,
+    ) -> ScheduledRoutine:
+        if not isinstance(draft, ScheduledRoutineDraft):
+            raise TypeError("draft must be ScheduledRoutineDraft")
+        transcript = await self._store.load(draft.origin_run_id)
+        if transcript.run.conversation_id is None:
+            raise ValueError("routine origin run has no conversation")
+        self._validate_routine_draft_distribution(
+            draft,
+            transcript.run.conversation_id,
+        )
+        return await self._routine_owner.prepare_revision(
+            current,
+            run_id=draft.origin_run_id,
+            conversation_id=transcript.run.conversation_id,
+            basis_run_id=basis_run_id,
+            **_routine_draft_values(draft),
+        )
+
+    def _validate_routine_draft_distribution(
+        self,
+        draft: ScheduledRoutineDraft,
+        conversation_id: str,
+    ) -> None:
+        try:
+            self._distribution_owner.resolve_plan(
+                conversation_id,
+                destination_id=draft.distribution_destination_id,
+                sensitivity_ceiling=draft.sensitivity_ceiling,
+            )
+        except ValueError as error:
+            raise ValueError(
+                "routine distribution destination is not currently selectable"
+            ) from error
+
+    async def _control_routine(
+        self,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        action: RoutineControlAction,
+    ) -> ScheduledRoutine:
+        async with self._mutation_lock:
+            self._require_open()
+            return await self._routine_owner.control(
+                routine_id,
+                expected_revision=expected_revision,
+                action=action,
+                authorized_control_call_id=self._id_factory("routine-control"),
+            )
+
     async def clear_conversations(self) -> int:
         """Delete transcripts and candidate records, not approved knowledge."""
 
@@ -2246,7 +2696,7 @@ class EmbeddedAgent:
             cancelled = False
             try:
                 _, cancelled = await _await_async_completion(
-                    self._artifact_store.remove_all_run_artifacts
+                    self._artifact_store.remove_unreferenced_run_artifacts
                 )
             except Exception:
                 # SQLite deletion is already authoritative. A private orphan is
@@ -3670,6 +4120,10 @@ class EmbeddedAgent:
                 pass
             except BaseException as error:
                 first_error = error
+        try:
+            await self._routine_supervisor.close()
+        except BaseException as error:
+            first_error = error
         try:
             await self._job_supervisor.close()
         except BaseException as error:

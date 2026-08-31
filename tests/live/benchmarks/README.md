@@ -1,4 +1,4 @@
-# Stage B live benchmarks
+# Durable-job live benchmarks
 
 This directory separates paid model variability from deterministic failure and
 load mechanics. All paid modules are skipped unless their exact authorization
@@ -17,7 +17,7 @@ release-reviewed model matrix. Supply credentials through the generic
 | `test_stage_b_paraphrases_live.py` | Natural user phrasing for reads, starts, global status, result recovery, and cancellation | `DAITA_RUN_LIVE_STAGE_B_PARAPHRASE_BENCHMARK=1` | 16 for the default model |
 | `test_stage_b_catalog_scale_live.py` | Exact resource selection among 16, 64, and 128 look-alike tables | `DAITA_RUN_LIVE_STAGE_B_CATALOG_BENCHMARK=1` | 6 for the default model |
 | `test_stage_b_model_matrix_live.py` | Per-model immediate, cross-conversation result, start, and cancel certification | `DAITA_RUN_LIVE_STAGE_B_MODEL_MATRIX=1` | 4 per configured model |
-| `test_stage_b_provider_failures.py` | Stage B job independence after deterministic provider failures | none; no paid calls | 0 |
+| `test_stage_b_provider_failures.py` | Job independence after deterministic provider failures | none; no paid calls | 0 |
 | `test_stage_b_concurrency_soak.py` | Concurrent admission, claims, source limits, cancellation, fencing, and reopen | `DAITA_RUN_STAGE_B_CONCURRENCY_SOAK=1` | 0 |
 
 Run collection without paid calls:

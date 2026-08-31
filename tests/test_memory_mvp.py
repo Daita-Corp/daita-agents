@@ -393,7 +393,7 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
         }
         assert tables == {
             "autonomous_followups",
-            "conversation_inbox",
+            "deliveries",
             "database_write_receipts",
             "learning_candidates",
             "job_runs",
@@ -401,12 +401,14 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
             "messages",
             "metadata",
             "postgresql_update_scopes",
+            "routine_occurrences",
             "runs",
             "semantic_annotations",
             "snapshots",
             "source_read_scopes",
             "sources",
             "state_migrations",
+            "scheduled_routines",
             "syncs",
         }
         for table in tables:

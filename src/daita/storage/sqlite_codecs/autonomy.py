@@ -1,17 +1,13 @@
-"""Encode the current codec-v1 Stage C follow-up and inbox record families."""
+"""Encode the current codec-v1 follow-up and shared delivery families."""
 
 from __future__ import annotations
 
 from ...autonomy import (
     AutonomousFollowup,
-    DeliveryState,
-    DeliverySubject,
-    DeliverySubjectKind,
     FollowupConclusionEvidence,
     FollowupDisposition,
     FollowupGrant,
     FollowupObservationSource,
-    InboxItem,
 )
 from ...capabilities import AccessMode, OperationalEffect
 from ...llm.models import ModelSensitivity
@@ -33,10 +29,15 @@ from .common import (
     sequence,
     text,
 )
+from .distribution import (
+    decode_distribution_plan,
+    decode_outcome_contract,
+    encode_distribution_plan,
+    encode_outcome_contract,
+)
 from .execution_scope import decode_execution_scope, encode_execution_scope
 
 _FOLLOWUP_VERSION = 1
-_INBOX_VERSION = 1
 
 
 def encode_autonomous_followup(value: AutonomousFollowup) -> str:
@@ -190,133 +191,6 @@ def decode_autonomous_followup(
     )
 
 
-def encode_inbox_item(value: InboxItem) -> str:
-    if not isinstance(value, InboxItem):
-        raise TypeError("inbox codec requires InboxItem")
-    return dump_payload(
-        record(
-            "InboxItem",
-            {
-                "version": _INBOX_VERSION,
-                "conversation_id": value.conversation_id,
-                "subject": _encode_delivery_subject(value.subject),
-                "resulting_run_id": value.resulting_run_id,
-                "grant_id": value.grant_id,
-                "logical_key": value.logical_key,
-                "conclusion_digest": value.conclusion_digest,
-                "payload": plain_encode(value.payload),
-                "sensitivity": value.sensitivity.value,
-                "destination": value.destination,
-                "destination_sensitivity_ceiling": (
-                    value.destination_sensitivity_ceiling.value
-                ),
-                "state": value.state.value,
-                "created_at": datetime_encode(value.created_at),
-                "updated_at": datetime_encode(value.updated_at),
-                "attempt_count": value.attempt_count,
-                "acknowledged_at": optional_datetime_encode(value.acknowledged_at),
-                "terminal_error": value.terminal_error,
-            },
-        )
-    )
-
-
-def decode_inbox_item(
-    value: str,
-    *,
-    agent_id: str,
-    delivery_id: str,
-) -> InboxItem:
-    fields = record_fields(
-        load_payload(value),
-        "InboxItem",
-        (
-            "version",
-            "conversation_id",
-            "subject",
-            "resulting_run_id",
-            "grant_id",
-            "logical_key",
-            "conclusion_digest",
-            "payload",
-            "sensitivity",
-            "destination",
-            "destination_sensitivity_ceiling",
-            "state",
-            "created_at",
-            "updated_at",
-            "attempt_count",
-            "acknowledged_at",
-            "terminal_error",
-        ),
-    )
-    if integer(fields["version"], "inbox version") != _INBOX_VERSION:
-        raise ValueError("stored inbox version is unsupported")
-    try:
-        sensitivity = ModelSensitivity(text(fields["sensitivity"], "inbox sensitivity"))
-        ceiling = ModelSensitivity(
-            text(
-                fields["destination_sensitivity_ceiling"],
-                "inbox destination sensitivity ceiling",
-            )
-        )
-        state = DeliveryState(text(fields["state"], "inbox state"))
-    except ValueError:
-        raise ValueError("stored inbox enum is invalid") from None
-    payload = plain_decode(fields["payload"])
-    if not isinstance(payload, dict):
-        raise ValueError("stored inbox payload must be an object")
-    return InboxItem(
-        delivery_id=delivery_id,
-        agent_id=agent_id,
-        conversation_id=text(fields["conversation_id"], "inbox conversation id"),
-        subject=_decode_delivery_subject(fields["subject"]),
-        resulting_run_id=text(fields["resulting_run_id"], "inbox run id"),
-        grant_id=text(fields["grant_id"], "inbox grant id"),
-        logical_key=text(fields["logical_key"], "inbox logical key"),
-        conclusion_digest=text(
-            fields["conclusion_digest"],
-            "inbox conclusion digest",
-        ),
-        payload=payload,
-        sensitivity=sensitivity,
-        destination=text(fields["destination"], "inbox destination"),
-        destination_sensitivity_ceiling=ceiling,
-        state=state,
-        created_at=datetime_decode(fields["created_at"]),
-        updated_at=datetime_decode(fields["updated_at"]),
-        attempt_count=integer(fields["attempt_count"], "inbox attempt count"),
-        acknowledged_at=optional_datetime_decode(fields["acknowledged_at"]),
-        terminal_error=optional_text(fields["terminal_error"], "inbox terminal error"),
-    )
-
-
-def _encode_delivery_subject(value: DeliverySubject):
-    return record(
-        "DeliverySubject",
-        {
-            "kind": value.kind.value,
-            "subject_id": value.subject_id,
-        },
-    )
-
-
-def _decode_delivery_subject(value) -> DeliverySubject:
-    fields = record_fields(
-        value,
-        "DeliverySubject",
-        ("kind", "subject_id"),
-    )
-    try:
-        kind = DeliverySubjectKind(text(fields["kind"], "delivery subject kind"))
-    except ValueError:
-        raise ValueError("stored delivery subject kind is invalid") from None
-    return DeliverySubject(
-        kind=kind,
-        subject_id=text(fields["subject_id"], "delivery subject id"),
-    )
-
-
 def _encode_conclusion_evidence(value: FollowupConclusionEvidence):
     return record(
         "FollowupConclusionEvidence",
@@ -408,9 +282,9 @@ def _encode_grant(value: FollowupGrant):
             "instruction_id": value.instruction_id,
             "instruction_digest": value.instruction_digest,
             "sensitivity_ceiling": value.sensitivity_ceiling.value,
-            "delivery_sensitivity_ceiling": (value.delivery_sensitivity_ceiling.value),
+            "outcome_contract": encode_outcome_contract(value.outcome_contract),
+            "distribution_plan": encode_distribution_plan(value.distribution_plan),
             "eligible_model_routes": list(value.eligible_model_routes),
-            "delivery_destination": value.delivery_destination,
             "max_successful_runs": value.max_successful_runs,
             "max_attempts": value.max_attempts,
             "per_run_max_cost_usd": decimal_encode(value.per_run_max_cost_usd),
@@ -441,9 +315,9 @@ def _decode_grant(value) -> FollowupGrant:
             "instruction_id",
             "instruction_digest",
             "sensitivity_ceiling",
-            "delivery_sensitivity_ceiling",
+            "outcome_contract",
+            "distribution_plan",
             "eligible_model_routes",
-            "delivery_destination",
             "max_successful_runs",
             "max_attempts",
             "per_run_max_cost_usd",
@@ -469,12 +343,6 @@ def _decode_grant(value) -> FollowupGrant:
         )
         sensitivity = ModelSensitivity(
             text(fields["sensitivity_ceiling"], "follow-up sensitivity")
-        )
-        delivery_sensitivity = ModelSensitivity(
-            text(
-                fields["delivery_sensitivity_ceiling"],
-                "follow-up delivery sensitivity",
-            )
         )
     except ValueError:
         raise ValueError("stored follow-up grant enum is invalid") from None
@@ -507,13 +375,10 @@ def _decode_grant(value) -> FollowupGrant:
             fields["instruction_digest"], "follow-up instruction digest"
         ),
         sensitivity_ceiling=sensitivity,
-        delivery_sensitivity_ceiling=delivery_sensitivity,
+        outcome_contract=decode_outcome_contract(fields["outcome_contract"]),
+        distribution_plan=decode_distribution_plan(fields["distribution_plan"]),
         eligible_model_routes=_text_sequence(
             fields["eligible_model_routes"], "model route"
-        ),
-        delivery_destination=text(
-            fields["delivery_destination"],
-            "follow-up delivery destination",
         ),
         max_successful_runs=integer(
             fields["max_successful_runs"], "follow-up successful runs"
@@ -537,7 +402,5 @@ def _text_sequence(value, name: str) -> tuple[str, ...]:
 
 __all__ = [
     "decode_autonomous_followup",
-    "decode_inbox_item",
     "encode_autonomous_followup",
-    "encode_inbox_item",
 ]

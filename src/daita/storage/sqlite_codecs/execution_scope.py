@@ -30,7 +30,11 @@ def encode_execution_scope(value: ExecutionScope):
             "grant_id": value.grant_id,
             "job_id": value.job_id,
             "job_revision": value.job_revision,
+            "routine_id": value.routine_id,
+            "routine_revision": value.routine_revision,
+            "occurrence_id": value.occurrence_id,
             "allowed_source_ids": list(value.allowed_source_ids),
+            "allowed_connector_binding_ids": list(value.allowed_connector_binding_ids),
             "allowed_resource_ids": list(value.allowed_resource_ids),
             "allowed_capability_ids": list(value.allowed_capability_ids),
             "allowed_access_modes": plain_encode(
@@ -43,7 +47,7 @@ def encode_execution_scope(value: ExecutionScope):
             "eligible_model_routes": list(value.eligible_model_routes),
             "per_run_max_cost_usd": decimal_encode(value.per_run_max_cost_usd),
             "per_run_max_tokens": value.per_run_max_tokens,
-            "delivery_destination": value.delivery_destination,
+            "distribution_plan_digest": value.distribution_plan_digest,
         },
     )
 
@@ -60,7 +64,11 @@ def decode_execution_scope(value) -> ExecutionScope:
             "grant_id",
             "job_id",
             "job_revision",
+            "routine_id",
+            "routine_revision",
+            "occurrence_id",
             "allowed_source_ids",
+            "allowed_connector_binding_ids",
             "allowed_resource_ids",
             "allowed_capability_ids",
             "allowed_access_modes",
@@ -69,7 +77,7 @@ def decode_execution_scope(value) -> ExecutionScope:
             "eligible_model_routes",
             "per_run_max_cost_usd",
             "per_run_max_tokens",
-            "delivery_destination",
+            "distribution_plan_digest",
         ),
     )
     try:
@@ -104,10 +112,27 @@ def decode_execution_scope(value) -> ExecutionScope:
             if fields["job_revision"] is None
             else integer(fields["job_revision"], "execution scope job revision")
         ),
+        routine_id=optional_text(fields["routine_id"], "execution scope routine id"),
+        routine_revision=(
+            None
+            if fields["routine_revision"] is None
+            else integer(fields["routine_revision"], "execution scope routine revision")
+        ),
+        occurrence_id=optional_text(
+            fields["occurrence_id"],
+            "execution scope occurrence id",
+        ),
         allowed_source_ids=tuple(
             text(item, "execution scope source id")
             for item in sequence(
                 fields["allowed_source_ids"], "execution scope source ids"
+            )
+        ),
+        allowed_connector_binding_ids=tuple(
+            text(item, "execution scope connector binding id")
+            for item in sequence(
+                fields["allowed_connector_binding_ids"],
+                "execution scope connector binding ids",
             )
         ),
         allowed_resource_ids=tuple(
@@ -138,9 +163,9 @@ def decode_execution_scope(value) -> ExecutionScope:
             fields["per_run_max_tokens"],
             "execution scope per-run tokens",
         ),
-        delivery_destination=text(
-            fields["delivery_destination"],
-            "execution scope delivery destination",
+        distribution_plan_digest=text(
+            fields["distribution_plan_digest"],
+            "execution scope distribution plan digest",
         ),
     )
 

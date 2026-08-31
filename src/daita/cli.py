@@ -10,8 +10,9 @@ import shlex
 import subprocess
 import sys
 import tempfile
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol
@@ -20,9 +21,13 @@ from . import (
     Agent,
     AgentConfig,
     AgentEvent,
+    AmbiguousTimePolicy,
     ApprovalDecision,
     ApprovalRequest,
     ArtifactError,
+    CalendarDaySelector,
+    CalendarSchedule,
+    IntervalSchedule,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningCandidateView,
@@ -32,14 +37,26 @@ from . import (
     MCPBindingStatus,
     MCPServerInspection,
     MCPToolSelection,
+    MisfirePolicy,
+    NonexistentTimePolicy,
+    OnceSchedule,
     PostgreSQLSource,
+    ReportingMode,
+    ResidentReady,
+    ResourceRevisionPrecheck,
+    RoutineState,
+    ScheduledRoutine,
+    ScheduledRoutineDraft,
+    ScheduledRoutineInspection,
     Skill,
     SkillSummary,
     SQLiteSource,
     __version__,
     create_llm_provider,
+    run_resident_host,
 )
 from .artifacts.models import (
+    ArtifactAuthorship,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
@@ -52,6 +69,15 @@ from .cli_text import (
     _write_learning_review_result,
     _write_memory_surface,
     _write_semantic_view,
+)
+from .distribution import (
+    ArtifactRequirement,
+    OutcomeContract,
+    delivery_inspection_projection,
+    distribution_destination_projection,
+    distribution_plan_projection,
+    inbox_view_projection,
+    outcome_contract_projection,
 )
 from .errors import StateCompatibilityError
 from .learning_candidates import (
@@ -90,6 +116,7 @@ _BUILTIN_CHAT_COMMANDS = frozenset(
         "/model",
         "/new",
         "/resume",
+        "/routines",
         "/settings",
         "/source",
         "/sources",
@@ -408,6 +435,12 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("--model", help="ignored; model setup happens inside the app")
     chat.add_argument("--conversation")
 
+    host = commands.add_parser(
+        "host",
+        help="hold one agent open so scheduled routines can make progress",
+    )
+    host.add_argument("--agent", dest="host_agent", required=True)
+
     memory = commands.add_parser("memory", help="manage agent memory")
     memory_commands = memory.add_subparsers(dest="memory_command", required=True)
     for command in ("read", "edit"):
@@ -481,6 +514,67 @@ def build_parser() -> argparse.ArgumentParser:
     skill_delete = skill_commands.add_parser("delete")
     skill_delete.add_argument("name")
     skill_delete.add_argument("skill_name")
+
+    routines = commands.add_parser(
+        "routines",
+        help="inspect and manage scheduled read routines",
+    )
+    routine_commands = routines.add_subparsers(
+        dest="routines_command",
+        required=True,
+    )
+    routine_list = routine_commands.add_parser("list")
+    routine_list.add_argument("name")
+    routine_list.add_argument(
+        "--state",
+        action="append",
+        choices=tuple(item.value for item in RoutineState),
+    )
+    routine_inspect = routine_commands.add_parser("inspect")
+    routine_inspect.add_argument("name")
+    routine_inspect.add_argument("routine_id")
+    for command in ("create", "promote"):
+        action = routine_commands.add_parser(command)
+        action.add_argument("name")
+        action.add_argument("--spec", type=Path, required=True)
+        if command == "promote":
+            action.add_argument("--basis-run-id", required=True)
+    routine_update = routine_commands.add_parser("update")
+    routine_update.add_argument("name")
+    routine_update.add_argument("routine_id")
+    routine_update.add_argument("expected_revision", type=int)
+    routine_update.add_argument("--spec", type=Path, required=True)
+    routine_update.add_argument("--basis-run-id")
+    for command in ("pause", "resume", "run-now", "disable"):
+        action = routine_commands.add_parser(command)
+        action.add_argument("name")
+        action.add_argument("routine_id")
+        action.add_argument("expected_revision", type=int)
+
+    inbox = commands.add_parser(
+        "inbox",
+        help="discover destinations and inspect logical deliveries",
+    )
+    inbox_commands = inbox.add_subparsers(dest="inbox_command", required=True)
+    inbox_destinations = inbox_commands.add_parser("destinations")
+    inbox_destinations.add_argument("name")
+    inbox_destinations.add_argument("conversation_id")
+    inbox_destinations.add_argument(
+        "--sensitivity-ceiling",
+        choices=tuple(item.value for item in ModelSensitivity),
+        default=ModelSensitivity.RESTRICTED.value,
+    )
+    inbox_list = inbox_commands.add_parser("list")
+    inbox_list.add_argument("name")
+    inbox_list.add_argument("--conversation-id")
+    inbox_list.add_argument("--include-acknowledged", action="store_true")
+    inbox_list.add_argument("--limit", type=int, default=50)
+    inbox_inspect = inbox_commands.add_parser("inspect")
+    inbox_inspect.add_argument("name")
+    inbox_inspect.add_argument("delivery_id")
+    inbox_acknowledge = inbox_commands.add_parser("acknowledge")
+    inbox_acknowledge.add_argument("name")
+    inbox_acknowledge.add_argument("delivery_id")
     return parser
 
 
@@ -1206,6 +1300,335 @@ def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
     return LocalWorkspace(fallback, sensitivity=sensitivity)
 
 
+def _write_resident_ready(ready: object) -> None:
+    if not isinstance(ready, ResidentReady):
+        raise TypeError("resident readiness record is invalid")
+    print(
+        json.dumps(
+            {
+                "agent_id": ready.agent_id,
+                "agent_name": ready.agent_name,
+                "agent_home": str(ready.agent_home),
+                "host": "ready",
+                "handoff": (
+                    "This process owns the agent-home writer lock. Stop it before "
+                    "opening the same agent in another CLI or TUI process."
+                ),
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def _routine_draft_from_file(path: Path) -> ScheduledRoutineDraft:
+    try:
+        value = json.loads(_read_input_document(str(path)))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"routine spec is not valid JSON: {error.msg}") from error
+    document = _object_mapping(value, "routine spec")
+    schedule_document = _object_mapping(document.get("schedule"), "routine schedule")
+    schedule_kind = _required_text(schedule_document, "kind")
+    schedule: OnceSchedule | IntervalSchedule | CalendarSchedule
+    if schedule_kind == "once":
+        schedule = OnceSchedule(
+            _routine_datetime(_required_text(schedule_document, "exact_at"))
+        )
+    elif schedule_kind == "interval":
+        schedule = IntervalSchedule(
+            _required_integer(schedule_document, "interval_seconds"),
+            _routine_datetime(_required_text(schedule_document, "anchor_at")),
+        )
+    elif schedule_kind == "calendar":
+        schedule = CalendarSchedule(
+            timezone=_required_text(schedule_document, "timezone"),
+            hour=_required_integer(schedule_document, "hour"),
+            minute=_required_integer(schedule_document, "minute"),
+            day_selector=CalendarDaySelector(
+                _required_text(schedule_document, "day_selector")
+            ),
+            weekdays=_integer_tuple(schedule_document.get("weekdays", ()), "weekdays"),
+            month_days=_integer_tuple(
+                schedule_document.get("month_days", ()), "month_days"
+            ),
+            months=_integer_tuple(schedule_document.get("months", ()), "months"),
+            nonexistent_time_policy=NonexistentTimePolicy(
+                str(schedule_document.get("nonexistent_time_policy", "skip"))
+            ),
+            ambiguous_time_policy=AmbiguousTimePolicy(
+                str(schedule_document.get("ambiguous_time_policy", "first"))
+            ),
+        )
+    else:
+        raise ValueError("routine schedule kind must be once, interval, or calendar")
+    precheck_value = document.get("precheck")
+    precheck = (
+        None
+        if precheck_value is None
+        else _routine_precheck(_object_mapping(precheck_value, "routine precheck"))
+    )
+    return ScheduledRoutineDraft(
+        origin_run_id=_required_text(document, "origin_run_id"),
+        title=_required_text(document, "title"),
+        authorized_instruction=_required_text(document, "authorized_instruction"),
+        schedule=schedule,
+        misfire_policy=MisfirePolicy(_required_text(document, "misfire_policy")),
+        reporting_mode=ReportingMode(_required_text(document, "reporting_mode")),
+        precheck=precheck,
+        allowed_source_ids=_string_tuple(document, "allowed_source_ids"),
+        allowed_connector_binding_ids=_string_tuple(
+            document, "allowed_connector_binding_ids"
+        ),
+        allowed_resource_ids=_string_tuple(document, "allowed_resource_ids"),
+        allowed_capability_ids=_string_tuple(document, "allowed_capability_ids"),
+        sensitivity_ceiling=ModelSensitivity(
+            _required_text(document, "sensitivity_ceiling")
+        ),
+        outcome_contract=_routine_outcome_contract(
+            _object_mapping(document.get("outcome_contract"), "outcome contract")
+        ),
+        distribution_destination_id=_required_text(
+            document,
+            "distribution_destination_id",
+        ),
+        eligible_model_routes=_string_tuple(document, "eligible_model_routes"),
+        per_run_max_tokens=_required_integer(document, "per_run_max_tokens"),
+        per_run_max_cost_usd=_routine_decimal(document, "per_run_max_cost_usd"),
+        cumulative_max_tokens=_required_integer(document, "cumulative_max_tokens"),
+        cumulative_max_cost_usd=_routine_decimal(document, "cumulative_max_cost_usd"),
+        cumulative_max_attempts=_required_integer(document, "cumulative_max_attempts"),
+        cumulative_max_occurrences=_required_integer(
+            document, "cumulative_max_occurrences"
+        ),
+        maximum_consecutive_failures=_required_integer(
+            document, "maximum_consecutive_failures"
+        ),
+        expires_at=_routine_datetime(_required_text(document, "expires_at")),
+        skill_names=_string_tuple(document, "skill_names", default=()),
+    )
+
+
+def _routine_precheck(value: Mapping[str, object]) -> ResourceRevisionPrecheck:
+    return ResourceRevisionPrecheck(
+        capability_id=_required_text(value, "capability_id"),
+        contract_digest=_required_text(value, "contract_digest"),
+        source_id=_required_text(value, "source_id"),
+        resource_id=_required_text(value, "resource_id"),
+    )
+
+
+def _routine_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
+    raw_requirements = value.get("artifact_requirements")
+    if not isinstance(raw_requirements, (list, tuple)):
+        raise ValueError("artifact_requirements must be an array")
+    requirements: list[ArtifactRequirement] = []
+    for raw_requirement in raw_requirements:
+        requirement = _object_mapping(raw_requirement, "artifact requirement")
+        requirements.append(
+            ArtifactRequirement(
+                required=_required_boolean(requirement, "required"),
+                minimum_count=_required_integer(requirement, "minimum_count"),
+                maximum_count=_required_integer(requirement, "maximum_count"),
+                allowed_media_types=_string_tuple(
+                    requirement,
+                    "allowed_media_types",
+                ),
+                allowed_authorships=tuple(
+                    ArtifactAuthorship(item)
+                    for item in _string_tuple(
+                        requirement,
+                        "allowed_authorships",
+                    )
+                ),
+                allowed_producer_capability_ids=_string_tuple(
+                    requirement,
+                    "allowed_producer_capability_ids",
+                ),
+                maximum_artifact_bytes=_required_integer(
+                    requirement,
+                    "maximum_artifact_bytes",
+                ),
+                maximum_total_bytes=_required_integer(
+                    requirement,
+                    "maximum_total_bytes",
+                ),
+                maximum_sensitivity=ModelSensitivity(
+                    _required_text(requirement, "maximum_sensitivity")
+                ),
+            )
+        )
+    return OutcomeContract(
+        require_terminal_conclusion=_required_boolean(
+            value,
+            "require_terminal_conclusion",
+        ),
+        artifact_requirements=tuple(requirements),
+        maximum_total_artifact_bytes=_required_integer(
+            value,
+            "maximum_total_artifact_bytes",
+        ),
+        maximum_effective_sensitivity=ModelSensitivity(
+            _required_text(value, "maximum_effective_sensitivity")
+        ),
+        require_current_run_provenance=_required_boolean(
+            value,
+            "require_current_run_provenance",
+        ),
+        require_exact_source_bindings=_required_boolean(
+            value,
+            "require_exact_source_bindings",
+        ),
+    )
+
+
+def _object_mapping(value: object, name: str) -> Mapping[str, object]:
+    if not isinstance(value, dict) or any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{name} must be a JSON object")
+    return value
+
+
+def _required_text(value: Mapping[str, object], name: str) -> str:
+    item = value.get(name)
+    if not isinstance(item, str) or not item.strip():
+        raise ValueError(f"{name} must be non-empty text")
+    return item
+
+
+def _required_integer(value: Mapping[str, object], name: str) -> int:
+    item = value.get(name)
+    if not isinstance(item, int) or isinstance(item, bool):
+        raise ValueError(f"{name} must be an integer")
+    return item
+
+
+def _required_boolean(value: Mapping[str, object], name: str) -> bool:
+    item = value.get(name)
+    if not isinstance(item, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return item
+
+
+def _string_tuple(
+    value: Mapping[str, object],
+    name: str,
+    *,
+    default: tuple[str, ...] | None = None,
+) -> tuple[str, ...]:
+    item = value.get(name, default)
+    if not isinstance(item, (list, tuple)) or any(
+        not isinstance(entry, str) for entry in item
+    ):
+        raise ValueError(f"{name} must be an array of strings")
+    return tuple(item)
+
+
+def _integer_tuple(value: object, name: str) -> tuple[int, ...]:
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(entry, int) or isinstance(entry, bool) for entry in value
+    ):
+        raise ValueError(f"{name} must be an array of integers")
+    return tuple(value)
+
+
+def _routine_decimal(value: Mapping[str, object], name: str) -> Decimal:
+    item = value.get(name)
+    if isinstance(item, bool) or not isinstance(item, (str, int, float)):
+        raise ValueError(f"{name} must be a decimal string or number")
+    try:
+        return Decimal(str(item))
+    except InvalidOperation as error:
+        raise ValueError(f"{name} is not a decimal") from error
+
+
+def _routine_datetime(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise ValueError("routine datetime must be ISO 8601") from error
+
+
+def _routine_mapping(routine: ScheduledRoutine) -> dict[str, object]:
+    schedule: dict[str, object]
+    if isinstance(routine.schedule, OnceSchedule):
+        schedule = {"kind": "once", "exact_at": routine.schedule.exact_at.isoformat()}
+    elif isinstance(routine.schedule, IntervalSchedule):
+        schedule = {
+            "kind": "interval",
+            "interval_seconds": routine.schedule.interval_seconds,
+            "anchor_at": routine.schedule.anchor_at.isoformat(),
+        }
+    else:
+        schedule = {
+            "kind": "calendar",
+            "timezone": routine.schedule.timezone,
+            "hour": routine.schedule.hour,
+            "minute": routine.schedule.minute,
+            "day_selector": routine.schedule.day_selector.value,
+            "weekdays": routine.schedule.weekdays,
+            "month_days": routine.schedule.month_days,
+            "months": routine.schedule.months,
+            "nonexistent_time_policy": routine.schedule.nonexistent_time_policy.value,
+            "ambiguous_time_policy": routine.schedule.ambiguous_time_policy.value,
+        }
+    return {
+        "routine_id": routine.routine_id,
+        "title": routine.title,
+        "state": routine.state.value,
+        "revision": routine.revision,
+        "authorized_instruction": routine.authorized_instruction,
+        "instruction_digest": routine.instruction_digest,
+        "schedule": schedule,
+        "misfire_policy": routine.misfire_policy.value,
+        "reporting_mode": routine.reporting_mode.value,
+        "allowed_source_ids": routine.allowed_source_ids,
+        "allowed_connector_binding_ids": routine.allowed_connector_binding_ids,
+        "allowed_resource_ids": routine.allowed_resource_ids,
+        "allowed_capability_ids": routine.allowed_capability_ids,
+        "skill_bindings": tuple(
+            {
+                "name": item.skill_name,
+                "revision": item.skill_revision,
+                "content_digest": item.content_digest,
+            }
+            for item in routine.skill_bindings
+        ),
+        "next_due_at": (
+            None if routine.next_due_at is None else routine.next_due_at.isoformat()
+        ),
+        "expires_at": routine.expires_at.isoformat(),
+        "occurrence_count": routine.occurrence_count,
+        "attempt_count": routine.attempt_count,
+        "consecutive_failures": routine.consecutive_failures,
+        "charged_tokens": routine.charged_tokens,
+        "charged_cost_usd": str(routine.charged_cost_usd),
+        "last_occurrence_id": routine.last_occurrence_id,
+        "outcome_contract": outcome_contract_projection(routine.outcome_contract),
+        "distribution_plan": distribution_plan_projection(routine.distribution_plan),
+        "last_delivery_ids": routine.last_delivery_ids,
+    }
+
+
+def _routine_inspection_mapping(
+    inspection: ScheduledRoutineInspection,
+) -> dict[str, object]:
+    return {
+        "routine": _routine_mapping(inspection.routine),
+        "recent_occurrences": tuple(
+            {
+                "occurrence_id": item.occurrence_id,
+                "slot_key": item.slot_key,
+                "scheduled_for": item.scheduled_for.isoformat(),
+                "disposition": item.disposition.value,
+                "reserved_run_id": item.reserved_run_id,
+                "terminal_run_id": item.terminal_run_id,
+                "delivery_ids": item.delivery_ids,
+                "failure_code": item.failure_code,
+            }
+            for item in inspection.recent_occurrences
+        ),
+    }
+
+
 async def _execute(args: argparse.Namespace) -> object:
     if args.command == "delete":
         if not args.yes:
@@ -1219,6 +1642,14 @@ async def _execute(args: argparse.Namespace) -> object:
             return {"agent_id": agent.id, "name": agent.name, "home": str(agent.home)}
         finally:
             await agent.close()
+    if args.command == "host":
+        await run_resident_host(
+            agent_name=args.host_agent,
+            workspace=workspace,
+            root=args.root,
+            on_ready=_write_resident_ready,
+        )
+        return {"agent": args.host_agent, "host": "stopped"}
     if args.command == "detach":
         if not args.yes:
             raise ValueError("detach requires --yes")
@@ -1553,6 +1984,90 @@ async def _execute(args: argparse.Namespace) -> object:
                 return {"name": args.skill_name, "changed": changed}
             deleted = await agent.delete_skill(args.skill_name)
             return {"name": args.skill_name, "deleted": deleted}
+        if args.command == "inbox":
+            if args.inbox_command == "destinations":
+                return [
+                    distribution_destination_projection(item)
+                    for item in await agent.distribution_destinations(
+                        args.conversation_id,
+                        sensitivity_ceiling=ModelSensitivity(args.sensitivity_ceiling),
+                    )
+                ]
+            if args.inbox_command == "list":
+                return [
+                    inbox_view_projection(item)
+                    for item in await agent.inbox(
+                        conversation_id=args.conversation_id,
+                        include_acknowledged=args.include_acknowledged,
+                        limit=args.limit,
+                    )
+                ]
+            if args.inbox_command == "inspect":
+                delivery_inspection = await agent.inspect_delivery(args.delivery_id)
+                if delivery_inspection is None:
+                    raise ValueError("delivery not found")
+                return delivery_inspection_projection(delivery_inspection)
+            acknowledged = await agent.acknowledge_inbox(args.delivery_id)
+            if acknowledged is None:
+                raise ValueError("delivery not found")
+            return inbox_view_projection(acknowledged)
+        if args.command == "routines":
+            if args.routines_command == "list":
+                states = frozenset(RoutineState(item) for item in (args.state or ()))
+                return [
+                    {
+                        "routine_id": item.routine_id,
+                        "title": item.title,
+                        "state": item.state.value,
+                        "schedule_kind": item.schedule_kind.value,
+                        "next_due_at": (
+                            None
+                            if item.next_due_at is None
+                            else item.next_due_at.isoformat()
+                        ),
+                        "revision": item.revision,
+                        "occurrence_count": item.occurrence_count,
+                        "consecutive_failures": item.consecutive_failures,
+                    }
+                    for item in await agent.list_routines(states=states)
+                ]
+            if args.routines_command == "inspect":
+                routine_inspection = await agent.inspect_routine(args.routine_id)
+                if routine_inspection is None:
+                    raise ValueError("routine not found")
+                return _routine_inspection_mapping(routine_inspection)
+            if args.routines_command in {"create", "promote"}:
+                draft = _routine_draft_from_file(args.spec)
+                proposal = (
+                    await agent.promote_routine(
+                        draft,
+                        basis_run_id=args.basis_run_id,
+                    )
+                    if args.routines_command == "promote"
+                    else await agent.propose_routine(draft)
+                )
+                return _routine_mapping(await agent.create_routine(proposal))
+            if args.routines_command == "update":
+                return _routine_mapping(
+                    await agent.update_routine(
+                        args.routine_id,
+                        expected_revision=args.expected_revision,
+                        draft=_routine_draft_from_file(args.spec),
+                        basis_run_id=args.basis_run_id,
+                    )
+                )
+            control = {
+                "pause": agent.pause_routine,
+                "resume": agent.resume_routine,
+                "run-now": agent.run_routine_now,
+                "disable": agent.disable_routine,
+            }[args.routines_command]
+            return _routine_mapping(
+                await control(
+                    args.routine_id,
+                    expected_revision=args.expected_revision,
+                )
+            )
         return [
             {
                 "source_id": item.id,

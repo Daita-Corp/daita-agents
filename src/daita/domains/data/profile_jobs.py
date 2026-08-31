@@ -17,6 +17,7 @@ from ...artifacts.models import (
 from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -722,8 +723,10 @@ def data_profile_declarations(
         executor_id=DATA_PROFILE_EXECUTION_EXECUTOR_ID,
         access_mode=AccessMode.READ,
         operational_effect=OperationalEffect.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"application/json"}),
+            allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),
             allowed_extensions=(("application/json", (".json",)),),
             artifact_required=True,
             max_artifact_count=1,
@@ -749,6 +752,7 @@ def data_profile_declarations(
         executor_id=START_DATA_PROFILE_EXECUTOR_ID,
         access_mode=AccessMode.READ,
         operational_effect=OperationalEffect.START_JOB,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     executors: tuple[Executor, ...] = (
         StartDataProfileExecutor(owner=owner, admission=admission, clock=clock),

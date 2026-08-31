@@ -1,24 +1,23 @@
-# Daita MVP examples
+# Offline examples
 
-These examples use only the package in `src` and the completed public
-`Agent` API. Unless `--root` is provided, each walkthrough creates a fresh
+These examples use the package in `src` and the current public `Agent` API.
+Unless `--root` is provided, each walkthrough creates a fresh
 temporary root and removes it on exit. A supplied root should be dedicated to
 that example. The shared helper also admits a separate sibling workspace,
 matching the required local `Agent.create(..., workspace=LocalWorkspace(...))`
 contract.
 
-The data walkthroughs exercise the MVP's read-only catalog and data tools with
-a tiny scripted provider, so they are deterministic, offline, and free of
+The data walkthroughs exercise the read-only catalog and data tools with a tiny
+scripted provider, so they are deterministic, offline, and free of
 credentials. Production providers are configured through
 `daita.create_llm_provider()` and secret providers or provider SDK environment
 configuration; no example contains an API key.
 
-The same public `Agent` also supports explicit conversation IDs with bounded
+The public `Agent` also supports explicit conversation IDs with bounded
 cold continuation, bounded `MEMORY.md`/`USER.md` context, bounded Markdown
 skills loaded through `skill_view`, foreground approval-gated memory/skill
-learning, and best-effort non-persisted events. These examples do not enable a
-session runtime, external data writes, background learning, telemetry
-collection, or live services.
+learning, and best-effort non-persisted events. These walkthroughs stay offline
+and do not perform external data writes or live model calls.
 
 Run a walkthrough from the repository root:
 

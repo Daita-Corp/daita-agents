@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -133,6 +134,7 @@ def memory_set_declarations(store: MemoryStore) -> MemoryDeclarations:
         executor_id=executor.executor_id,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     return MemoryDeclarations(
         capabilities=(capability,),

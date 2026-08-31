@@ -14,7 +14,7 @@ from types import MappingProxyType
 from typing import Protocol, TypeVar
 
 from ._json import FrozenJsonObject, canonical_json
-from .artifacts.models import ArtifactDraft
+from .artifacts.models import ArtifactAuthorship, ArtifactDraft
 from .llm.models import ModelSensitivity, ToolDefinition
 
 _T = TypeVar("_T")
@@ -52,6 +52,14 @@ class OperationalEffect(str, Enum):
     CANCEL_EXECUTION_GRAPH = "cancel_execution_graph"
     MUTATE_DATA = "mutate_data"
     CHANGE_INFRASTRUCTURE = "change_infrastructure"
+    MANAGE_SCHEDULED_ROUTINE = "manage_scheduled_routine"
+
+
+class AutomationEligibility(str, Enum):
+    """Code-owned unattended-execution eligibility, orthogonal to effect."""
+
+    INTERACTIVE_ONLY = "interactive_only"
+    SCHEDULED_DIRECT = "scheduled_direct"
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +82,11 @@ class ExecutionScope:
     eligible_model_routes: tuple[str, ...]
     per_run_max_cost_usd: Decimal
     per_run_max_tokens: int
-    delivery_destination: str
+    distribution_plan_digest: str
+    routine_id: str | None = None
+    routine_revision: int | None = None
+    occurrence_id: str | None = None
+    allowed_connector_binding_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for identity_value, identity_name in (
@@ -82,13 +94,18 @@ class ExecutionScope:
             (self.agent_id, "execution scope agent_id"),
             (self.principal_id, "execution scope principal_id"),
             (self.grant_id, "execution scope grant_id"),
-            (self.delivery_destination, "execution scope delivery_destination"),
+            (
+                self.distribution_plan_digest,
+                "execution scope distribution_plan_digest",
+            ),
         ):
             _text(identity_value, identity_name)
             if len(identity_value) > 512 or any(
                 character in "\r\n\x00" for character in identity_value
             ):
                 raise ValueError(f"{identity_name} must be bounded single-line text")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.distribution_plan_digest) is None:
+            raise ValueError("execution scope distribution plan digest is invalid")
         if self.job_id is not None:
             _text(self.job_id, "execution scope job_id")
             if len(self.job_id) > 512 or any(
@@ -101,9 +118,27 @@ class ExecutionScope:
             raise ValueError(
                 "execution scope job identity and revision must be present together"
             )
+        routine_identity = (
+            self.routine_id,
+            self.routine_revision,
+            self.occurrence_id,
+        )
+        if any(item is not None for item in routine_identity) and any(
+            item is None for item in routine_identity
+        ):
+            raise ValueError(
+                "execution scope routine identity must be present together"
+            )
+        if self.routine_id is not None:
+            _text(self.routine_id, "execution scope routine_id")
+            _text(self.occurrence_id or "", "execution scope occurrence_id")
         revision_values = [(self.revision, "execution scope revision")]
         if self.job_revision is not None:
             revision_values.append((self.job_revision, "execution scope job_revision"))
+        if self.routine_revision is not None:
+            revision_values.append(
+                (self.routine_revision, "execution scope routine_revision")
+            )
         for revision_value, revision_name in revision_values:
             if (
                 not isinstance(revision_value, int)
@@ -120,12 +155,33 @@ class ExecutionScope:
             self.allowed_capability_ids,
             "allowed_capability_ids",
         )
+        connector_bindings = _scope_identities(
+            self.allowed_connector_binding_ids,
+            "allowed_connector_binding_ids",
+        )
         routes = _scope_identities(
             self.eligible_model_routes,
             "eligible_model_routes",
         )
-        if not sources or not resources or not capabilities or not routes:
-            raise ValueError("execution scope identity ceilings cannot be empty")
+        if not capabilities or not routes:
+            raise ValueError(
+                "execution scope capability and route ceilings cannot be empty"
+            )
+        if self.routine_id is None:
+            if not sources or not resources or connector_bindings:
+                raise ValueError(
+                    "non-routine execution scope requires source/resource ceilings "
+                    "and cannot contain connector bindings"
+                )
+        else:
+            if not sources and not connector_bindings:
+                raise ValueError(
+                    "scheduled execution scope requires a source or connector ceiling"
+                )
+            if bool(sources) != bool(resources):
+                raise ValueError(
+                    "scheduled source and resource ceilings must be present together"
+                )
         access_modes = frozenset(self.allowed_access_modes)
         effects = frozenset(self.allowed_operational_effects)
         if not access_modes or any(
@@ -156,6 +212,11 @@ class ExecutionScope:
         object.__setattr__(self, "allowed_resource_ids", resources)
         object.__setattr__(self, "allowed_capability_ids", capabilities)
         object.__setattr__(self, "eligible_model_routes", routes)
+        object.__setattr__(
+            self,
+            "allowed_connector_binding_ids",
+            connector_bindings,
+        )
         object.__setattr__(self, "allowed_access_modes", access_modes)
         object.__setattr__(self, "allowed_operational_effects", effects)
 
@@ -173,7 +234,13 @@ class ExecutionScope:
                         "grant_id": self.grant_id,
                         "job_id": self.job_id,
                         "job_revision": self.job_revision,
+                        "routine_id": self.routine_id,
+                        "routine_revision": self.routine_revision,
+                        "occurrence_id": self.occurrence_id,
                         "allowed_source_ids": self.allowed_source_ids,
+                        "allowed_connector_binding_ids": (
+                            self.allowed_connector_binding_ids
+                        ),
                         "allowed_resource_ids": self.allowed_resource_ids,
                         "allowed_capability_ids": self.allowed_capability_ids,
                         "allowed_access_modes": tuple(
@@ -188,7 +255,7 @@ class ExecutionScope:
                         "eligible_model_routes": self.eligible_model_routes,
                         "per_run_max_cost_usd": str(self.per_run_max_cost_usd),
                         "per_run_max_tokens": self.per_run_max_tokens,
-                        "delivery_destination": self.delivery_destination,
+                        "distribution_plan_digest": self.distribution_plan_digest,
                     }
                 ).encode("utf-8")
             ).hexdigest()
@@ -228,6 +295,7 @@ class ToolboxId(str, Enum):
     ARTIFACTS = "artifacts"
     KNOWLEDGE = "knowledge"
     JOBS = "jobs"
+    ROUTINES = "routines"
 
 
 class ToolLoadMode(str, Enum):
@@ -289,6 +357,11 @@ TOOLBOX_DEFINITIONS = (
         ToolboxId.JOBS,
         "Jobs",
         "Start, inspect, read results from, or cancel durable work.",
+    ),
+    ToolboxDefinition(
+        ToolboxId.ROUTINES,
+        "Routines",
+        "Create, inspect, update, and control bounded scheduled read routines.",
     ),
 )
 
@@ -423,6 +496,7 @@ class ArtifactPolicy:
     """Stable capability metadata for its one optional artifact draft."""
 
     allowed_media_types: frozenset[str]
+    allowed_authorships: frozenset[ArtifactAuthorship]
     allowed_extensions: tuple[tuple[str, tuple[str, ...]], ...]
     artifact_required: bool
     max_artifact_count: int
@@ -435,6 +509,11 @@ class ArtifactPolicy:
             not isinstance(item, str) or not item.strip() for item in media_types
         ):
             raise ValueError("artifact policy media types must be non-empty text")
+        authorships = frozenset(self.allowed_authorships)
+        if not authorships or any(
+            not isinstance(item, ArtifactAuthorship) for item in authorships
+        ):
+            raise ValueError("artifact policy authorships must be non-empty")
         extensions = tuple(
             (media_type, tuple(values))
             for media_type, values in self.allowed_extensions
@@ -470,6 +549,7 @@ class ArtifactPolicy:
         if self.max_total_bytes_per_call < self.max_bytes_per_artifact:
             raise ValueError("per-call bytes cannot be below per-artifact bytes")
         object.__setattr__(self, "allowed_media_types", media_types)
+        object.__setattr__(self, "allowed_authorships", authorships)
         object.__setattr__(self, "allowed_extensions", extensions)
 
 
@@ -483,6 +563,9 @@ class Capability:
     executor_id: str
     access_mode: AccessMode = AccessMode.NONE
     operational_effect: OperationalEffect = OperationalEffect.NONE
+    automation_eligibility: AutomationEligibility = (
+        AutomationEligibility.INTERACTIVE_ONLY
+    )
     artifact_policy: ArtifactPolicy | None = None
 
     def __post_init__(self) -> None:
@@ -497,6 +580,13 @@ class Capability:
             raise TypeError("access_mode must be AccessMode")
         if not isinstance(self.operational_effect, OperationalEffect):
             raise TypeError("operational_effect must be OperationalEffect")
+        if not isinstance(self.automation_eligibility, AutomationEligibility):
+            raise TypeError("automation_eligibility must be AutomationEligibility")
+        if (
+            self.automation_eligibility is AutomationEligibility.SCHEDULED_DIRECT
+            and self.operational_effect is not OperationalEffect.NONE
+        ):
+            raise ValueError("scheduled_direct capability must be effect-free")
         if self.artifact_policy is not None and not isinstance(
             self.artifact_policy, ArtifactPolicy
         ):
@@ -529,6 +619,7 @@ def capability_contract_digest(
         "executor_id": capability.executor_id,
         "access_mode": capability.access_mode.value,
         "operational_effect": capability.operational_effect.value,
+        "automation_eligibility": capability.automation_eligibility.value,
         "artifact_policy": (
             None
             if capability.artifact_policy is None
@@ -756,6 +847,9 @@ class CapabilityRegistry:
                                         "operational_effect": (
                                             capability.operational_effect.value
                                         ),
+                                        "automation_eligibility": (
+                                            capability.automation_eligibility.value
+                                        ),
                                         "artifact_policy": (
                                             None
                                             if capability.artifact_policy is None
@@ -851,6 +945,22 @@ class CapabilityRegistry:
             return self._domain_owners[capability_id]
         except KeyError as error:
             raise KeyError(f"unknown capability: {capability_id}") from error
+
+    def capability(self, capability_id: str) -> Capability:
+        """Return immutable capability metadata without resolving an executor."""
+
+        try:
+            return self._capabilities[capability_id]
+        except KeyError as error:
+            raise KeyError(f"unknown capability: {capability_id}") from error
+
+    def tool_capability(self, name: str) -> Capability:
+        """Return immutable metadata for one exact model-visible tool name."""
+
+        try:
+            return self._capabilities[self._views[name].capability_id]
+        except KeyError as error:
+            raise KeyError(f"unknown tool: {name}") from error
 
     def resolve_tool_owner(self, name: str) -> tuple[ToolView, Capability, str]:
         view, capability = self.resolve_tool(name)

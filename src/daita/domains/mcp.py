@@ -22,6 +22,8 @@ from ..adapters.mcp import (
     mcp_binding_drift_reason,
 )
 from ..capabilities import (
+    AccessMode,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -269,6 +271,13 @@ class MCPCapabilityDomain:
             for binding in bindings.values()
         }
         for capability_id, (binding, _tool) in self._binding_by_capability.items():
+            if (
+                run.execution_scope is not None
+                and run.execution_scope.routine_id is not None
+                and binding.binding_id
+                not in run.execution_scope.allowed_connector_binding_ids
+            ):
+                continue
             if _binding_revision_is_active(current[binding.binding_id], binding):
                 projected.append(self._local_name_by_capability[capability_id])
         return tuple(sorted(projected))
@@ -303,6 +312,17 @@ class MCPCapabilityDomain:
                 "The MCP capability is not admitted in this runtime.",
             )
         binding, tool = admitted
+        scope = run.execution_scope
+        if (
+            scope is not None
+            and scope.routine_id is not None
+            and binding.binding_id not in scope.allowed_connector_binding_ids
+        ):
+            raise CapabilityInputError(
+                "execution_scope_violation",
+                "The MCP binding is outside this run's immutable connector ceiling.",
+                {"binding_id": binding.binding_id},
+            )
         current = await self._store.load_mcp_binding(
             self._agent_id,
             binding.binding_id,
@@ -335,7 +355,7 @@ class MCPCapabilityDomain:
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
         del run, call, capability, execution, fingerprint
-        raise ValueError("MCP Stage M2 capabilities are never side-effecting")
+        raise ValueError("MCP capabilities cannot be side-effecting")
 
     async def finalize_output(
         self,
@@ -436,6 +456,8 @@ async def activate_mcp_domain(
             output_kind=MCP_OUTPUT_KIND,
             output_schema=_MCP_OUTPUT_SCHEMA,
             executor_id=tool.executor_id,
+            access_mode=AccessMode.READ,
+            automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
         )
         for item in activated
         for tool in item.binding.tools

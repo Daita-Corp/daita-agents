@@ -31,6 +31,7 @@ from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import ArtifactPolicy, Capability, ToolOutput
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import Sensitivity
+from daita.distribution import OutcomeArtifactReference
 from daita.domains.data.export_capabilities import _resolved_sensitivity
 from daita.domains.data.file_capabilities import LocalFileReadExecutor
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
@@ -70,6 +71,16 @@ class _References:
             and (conversation_id is None or item.conversation_id == conversation_id)
         )
 
+    async def list_delivery_artifact_references(
+        self,
+        agent_id: str,
+        *,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[OutcomeArtifactReference, ...]:
+        del agent_id, run_id, conversation_id
+        return ()
+
 
 class _Catalog:
     async def source_routing_facts(self, *args, **kwargs):
@@ -92,6 +103,7 @@ def _artifact_ids():
 def _policy(*, maximum: int = 256 * 1024) -> ArtifactPolicy:
     return ArtifactPolicy(
         allowed_media_types=frozenset({"text/markdown", "text/plain"}),
+        allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
         allowed_extensions=DOCUMENT_ALLOWED_EXTENSIONS,
         artifact_required=True,
         max_artifact_count=1,
@@ -168,12 +180,13 @@ async def test_artifact_store_open_cancellation_finishes_admission_cleanup(
     def blocked_cleanup(
         store: AgentHomeArtifactStore,
         refs: tuple[ArtifactRef, ...],
+        delivery_refs: tuple[OutcomeArtifactReference, ...],
         reservations: frozenset[tuple[str, str]],
     ) -> None:
         started.set()
         assert release.wait(2)
         try:
-            original(store, refs, reservations)
+            original(store, refs, delivery_refs, reservations)
         finally:
             finished.set()
 
@@ -208,9 +221,10 @@ async def test_artifact_store_open_preserves_admission_failure_as_unavailable(
     def fail_cleanup(
         store: AgentHomeArtifactStore,
         refs: tuple[ArtifactRef, ...],
+        delivery_refs: tuple[OutcomeArtifactReference, ...],
         reservations: frozenset[tuple[str, str]],
     ) -> None:
-        del store, refs, reservations
+        del store, refs, delivery_refs, reservations
         raise ArtifactError(
             "artifact_storage_failed",
             "Injected admission failure.",
@@ -287,6 +301,7 @@ def test_artifact_policy_rejects_media_extension_count_and_byte_violations() -> 
     with pytest.raises(ValueError, match="zero or one"):
         ArtifactPolicy(
             allowed_media_types=frozenset({"text/plain"}),
+            allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
             allowed_extensions=(("text/plain", (".txt",)),),
             artifact_required=True,
             max_artifact_count=2,
@@ -350,6 +365,16 @@ async def test_unreleased_pre_lineage_artifact_reference_is_rejected_exactly(
             ):
                 return ()
             return (decoded,)
+
+        async def list_delivery_artifact_references(
+            self,
+            agent_id: str,
+            *,
+            run_id: str | None = None,
+            conversation_id: str | None = None,
+        ) -> tuple[OutcomeArtifactReference, ...]:
+            del agent_id, run_id, conversation_id
+            return ()
 
     reopened = await AgentHomeArtifactStore.open(
         agent_id="agent-one",
@@ -639,7 +664,7 @@ async def test_clear_conversations_cancellation_never_leaves_a_persisted_danglin
 
         monkeypatch.setattr(
             agent._embedded._artifact_store,
-            "remove_all_run_artifacts",
+            "remove_unreferenced_run_artifacts",
             delayed_cleanup,
         )
         clearing = asyncio.create_task(agent.clear_conversations())

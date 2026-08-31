@@ -11,6 +11,7 @@ from ...artifacts.models import (
     ArtifactProvenance,
     ArtifactRef,
     ArtifactResourceBinding,
+    ArtifactResultBinding,
     ArtifactTextChangeSummary,
     artifact_text_change_summary_to_mapping,
 )
@@ -25,6 +26,7 @@ from .common import (
     integer,
     optional_integer,
     optional_text,
+    plain_encode,
     record,
     record_fields,
     sequence,
@@ -57,6 +59,68 @@ def decode_artifact_binding(value: JsonValue) -> ArtifactResourceBinding:
         resource_revision=text(
             fields["resource_revision"], "artifact resource_revision"
         ),
+    )
+
+
+def encode_artifact_result_binding(
+    value: ArtifactResultBinding,
+) -> dict[str, JsonValue]:
+    return record(
+        "ArtifactResultBinding",
+        {
+            "capability_id": value.capability_id,
+            "executor_id": value.executor_id,
+            "call_id": value.call_id,
+            "capability_contract_digest": value.capability_contract_digest,
+            "output_schema_digest": value.output_schema_digest,
+            "arguments_sha256": value.arguments_sha256,
+            "result_sha256": value.result_sha256,
+            "observed_at": datetime_encode(value.observed_at),
+            "result_sensitivity": enum_encode(value.result_sensitivity, "Sensitivity"),
+            "producer_provenance": plain_encode(value.producer_provenance),
+        },
+    )
+
+
+def decode_artifact_result_binding(value: JsonValue) -> ArtifactResultBinding:
+    fields = record_fields(
+        value,
+        "ArtifactResultBinding",
+        (
+            "capability_id",
+            "executor_id",
+            "call_id",
+            "capability_contract_digest",
+            "output_schema_digest",
+            "arguments_sha256",
+            "result_sha256",
+            "observed_at",
+            "result_sensitivity",
+            "producer_provenance",
+        ),
+    )
+    raw_provenance = fields["producer_provenance"]
+    if not isinstance(raw_provenance, dict):
+        raise ValueError("artifact result producer provenance must be an object")
+    return ArtifactResultBinding(
+        capability_id=text(fields["capability_id"], "artifact result capability id"),
+        executor_id=text(fields["executor_id"], "artifact result executor id"),
+        call_id=text(fields["call_id"], "artifact result call id"),
+        capability_contract_digest=text(
+            fields["capability_contract_digest"], "artifact result contract digest"
+        ),
+        output_schema_digest=text(
+            fields["output_schema_digest"], "artifact result schema digest"
+        ),
+        arguments_sha256=text(
+            fields["arguments_sha256"], "artifact result arguments digest"
+        ),
+        result_sha256=text(fields["result_sha256"], "artifact result digest"),
+        observed_at=datetime_decode(fields["observed_at"]),
+        result_sensitivity=enum_decode(
+            fields["result_sensitivity"], Sensitivity, "Sensitivity"
+        ),
+        producer_provenance=raw_provenance,
     )
 
 
@@ -159,6 +223,11 @@ def encode_artifact_provenance(value: ArtifactProvenance) -> dict[str, JsonValue
                 if value.local_file_binding is None
                 else encode_local_file_binding(value.local_file_binding)
             ),
+            "result_binding": (
+                None
+                if value.result_binding is None
+                else encode_artifact_result_binding(value.result_binding)
+            ),
             "sql_fingerprint": value.sql_fingerprint,
             "parameters_sha256": value.parameters_sha256,
             "columns": list(value.columns),
@@ -177,6 +246,7 @@ def decode_artifact_provenance(value: JsonValue) -> ArtifactProvenance:
             "derived_from_artifact_id",
             "resource_bindings",
             "local_file_binding",
+            "result_binding",
             "sql_fingerprint",
             "parameters_sha256",
             "columns",
@@ -206,6 +276,11 @@ def decode_artifact_provenance(value: JsonValue) -> ArtifactProvenance:
             None
             if fields["local_file_binding"] is None
             else decode_local_file_binding(fields["local_file_binding"])
+        ),
+        result_binding=(
+            None
+            if fields["result_binding"] is None
+            else decode_artifact_result_binding(fields["result_binding"])
         ),
         sql_fingerprint=optional_text(
             fields["sql_fingerprint"], "artifact SQL fingerprint"

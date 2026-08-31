@@ -387,8 +387,10 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
             "artifacts",
             "data",
             "data_profile_jobs",
+            "distribution",
             "jobs",
             "memory",
+            "routines",
             "semantics",
             "skills",
         }
@@ -416,6 +418,10 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["artifact_create_document"] == "artifacts"
         assert resolved["start_data_profile"] == "data_profile_jobs"
         assert resolved["job_list"] == "jobs"
+        assert resolved["routine_list"] == "routines"
+        assert resolved["distribution_destination_list"] == "distribution"
+        assert resolved["delivery_list"] == "distribution"
+        assert resolved["delivery_inspect"] == "distribution"
     finally:
         await agent.close()
 
@@ -451,15 +457,24 @@ def test_public_surface_is_focused():
         "ArtifactError",
         "ArtifactPayload",
         "ArtifactRef",
+        "ArtifactRequirement",
         "ApprovalDecision",
         "ApprovalHandler",
         "ApprovalRequest",
+        "AmbiguousTimePolicy",
+        "CalendarDaySelector",
+        "CalendarSchedule",
+        "ConversationInboxTarget",
         "ConversationRun",
         "CatalogSummary",
         "DocumentCandidateContent",
-        "DeliverySubject",
+        "Delivery",
+        "DeliveryInspection",
         "DeliverySubjectKind",
         "DeliveryState",
+        "DistributionDestination",
+        "DistributionPlan",
+        "DistributionTargetBinding",
         "LearningCandidate",
         "LearningCandidateAction",
         "LearningCandidateError",
@@ -470,7 +485,8 @@ def test_public_surface_is_focused():
         "LearningReviewResult",
         "LearningReviewStatus",
         "JobExecutionMode",
-        "InboxItem",
+        "InboxView",
+        "IntervalSchedule",
         "JobInspection",
         "JobResultView",
         "JobStatus",
@@ -496,11 +512,23 @@ def test_public_surface_is_focused():
         "MCPServerInspection",
         "MCPToolBinding",
         "MCPToolSelection",
+        "MisfirePolicy",
         "ModelRoute",
         "ModelRouteCandidate",
+        "NonexistentTimePolicy",
+        "OnceSchedule",
+        "OutcomeConclusionKind",
+        "OutcomeArtifactReference",
+        "OutcomeContract",
+        "OutcomeReference",
+        "OutcomeState",
         "PostgreSQLSource",
         "PostgreSQLUpdateReadiness",
         "RetryPolicy",
+        "ReportingMode",
+        "ResidentReady",
+        "ResourceRevisionPrecheck",
+        "RoutineState",
         "ResourceRevisionBinding",
         "SQLiteSource",
         "SemanticAnnotation",
@@ -517,9 +545,14 @@ def test_public_surface_is_focused():
         "Skill",
         "SkillCandidateContent",
         "SkillSummary",
+        "ScheduledRoutineDraft",
+        "ScheduledRoutineInspection",
+        "ScheduledRoutineSummary",
+        "ScheduledRoutine",
         "Transcript",
         "__version__",
         "create_llm_provider",
+        "run_resident_host",
     }
 
 
@@ -542,17 +575,28 @@ def test_stage_b_has_one_job_aggregate_and_no_parallel_execution_system():
         assert f"CREATE TABLE {parallel_table}" not in schema
 
 
-def test_stage_c_has_one_followup_aggregate_and_one_inbox_without_parallel_runtime():
+def test_stage_c_and_d2_have_one_followup_and_distribution_owner_without_parallel_runtime():
     assert _class_owners("AutonomousFollowup") == {"autonomy.py"}
-    assert _class_owners("InboxItem") == {"autonomy.py"}
+    assert _class_owners("Delivery") == {"distribution/models.py"}
+    assert _class_owners("DistributionOwner") == {"distribution/owner.py"}
     assert _class_owners("RunStartEnvelope") == {"loop/models.py"}
     assert _class_owners("InboxScreen") == {"tui/screens/inbox.py"}
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     assert schema.count("CREATE TABLE autonomous_followups") == 1
-    assert schema.count("CREATE TABLE conversation_inbox") == 1
+    assert schema.count("CREATE TABLE deliveries") == 1
     production = _python_text(PACKAGE)
+    assert "InboxItem" not in production
+    assert "conversation_inbox" not in schema
     assert "allowed_read_capabilities" not in production
     assert "mark_job_terminal_observed" not in production
+    sqlite = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    distribution_owner = (PACKAGE / "distribution" / "owner.py").read_text(
+        encoding="utf-8"
+    )
+    assert "OutcomeReference(" not in sqlite
+    assert "logical_delivery_key(" not in sqlite
+    assert sqlite.count("construct_logical_delivery(") == 2
+    assert "def construct_logical_delivery(" in distribution_owner
     for table in (
         "completion_events",
         "followup_attempts",
@@ -598,6 +642,30 @@ def test_stage_c_has_one_followup_aggregate_and_one_inbox_without_parallel_runti
         "class ResidentDaemon",
     ):
         assert forbidden not in production
+
+
+def test_stage_d1_has_one_routine_owner_and_one_production_capability_registry():
+    assert _class_owners("ScheduledRoutine") == {"routines/models.py"}
+    assert _class_owners("RoutineOccurrence") == {"routines/models.py"}
+    assert _class_owners("RoutineOwner") == {"routines/owner.py"}
+    assert _class_owners("RoutineSupervisor") == {"routines/supervisor.py"}
+
+    production = _python_text(PACKAGE)
+    assert production.count("CapabilityRegistry(") == 1
+    assert "base_capabilities" not in production
+
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    assert schema.count("CREATE TABLE scheduled_routines") == 1
+    assert schema.count("CREATE TABLE routine_occurrences") == 1
+
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    finalizer = storage.split("async def finalize_routine_occurrence(", 1)[1].split(
+        "async def recover_stale_routine_occurrences(", 1
+    )[0]
+    assert finalizer.count("if current.slot_kind is RoutineSlotKind.MANUAL:") == 1
+    assert finalizer.count("routine.consecutive_failures + 1") == 1
+    assert finalizer.count("completed_occurrence = replace(") == 1
+    assert finalizer.count("completed_routine = replace(") == 1
 
 
 def test_stage_seven_exports_records_without_exporting_their_owners():
@@ -948,6 +1016,9 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
             "data_update_postgresql",
             "job_cancel",
             "memory_set",
+            "routine_control",
+            "routine_create",
+            "routine_update",
             "semantic_delete",
             "semantic_save",
             "skill_save",
@@ -1852,12 +1923,14 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "learning_candidates",
             "job_runs",
             "autonomous_followups",
-            "conversation_inbox",
+            "deliveries",
             "mcp_server_bindings",
             "messages",
             "metadata",
             "postgresql_update_scopes",
             "runs",
+            "routine_occurrences",
+            "scheduled_routines",
             "semantic_annotations",
             "snapshots",
             "source_read_scopes",
@@ -1882,13 +1955,17 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
                 "event_id",
                 "data",
             ),
-            "conversation_inbox": (
+            "deliveries": (
                 "agent_id",
                 "delivery_id",
                 "conversation_id",
                 "subject_kind",
                 "subject_id",
                 "logical_key",
+                "target_kind",
+                "target_fingerprint",
+                "state",
+                "created_at_us",
                 "data",
             ),
             "messages": ("run_id", "position", "data"),
@@ -1909,6 +1986,25 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
                 "input",
                 "result",
             ),
+            "routine_occurrences": (
+                "agent_id",
+                "occurrence_id",
+                "routine_id",
+                "routine_revision",
+                "slot_key",
+                "state",
+                "lease_expires_at_us",
+                "reserved_run_id",
+                "data",
+            ),
+            "scheduled_routines": (
+                "agent_id",
+                "routine_id",
+                "conversation_id",
+                "state",
+                "next_due_at_us",
+                "data",
+            ),
             "semantic_annotations": ("agent_id", "id", "data"),
             "snapshots": ("agent_id", "source_id", "sync_id", "data"),
             "source_read_scopes": ("agent_id", "source_id", "data"),
@@ -1916,7 +2012,12 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "state_migrations": ("ordinal", "migration_id", "checksum"),
             "syncs": ("agent_id", "id", "source_id", "data"),
         }
-        assert named_indexes == {"runs_conversation_turn": "runs"}
+        assert named_indexes == {
+            "deliveries_conversation_history": "deliveries",
+            "routine_occurrences_stale": "routine_occurrences",
+            "runs_conversation_turn": "runs",
+            "scheduled_routines_due": "scheduled_routines",
+        }
         run_indexes = {
             row[1]: bool(row[2])
             for row in connection.execute("PRAGMA index_list(runs)")

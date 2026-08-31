@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
 
-from .._json import FrozenJsonObject
+from .._json import FrozenJsonObject, canonical_json
 from ..catalog.models import Sensitivity
 from ..errors import DaitaError, ErrorRetryability
 
@@ -125,6 +125,7 @@ class ArtifactError(DaitaError):
 class ArtifactAuthorship(str, Enum):
     EXACT_SOURCE_DATA = "exact_source_data"
     MODEL_AUTHORED_ANALYSIS = "model_authored_analysis"
+    VALIDATED_TOOL_RESULT = "validated_tool_result"
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,12 +251,56 @@ class ArtifactResourceBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ArtifactResultBinding:
+    """Exact lineage for one validated current-run structured tool result."""
+
+    capability_id: str
+    executor_id: str
+    call_id: str
+    capability_contract_digest: str
+    output_schema_digest: str
+    arguments_sha256: str
+    result_sha256: str
+    observed_at: datetime
+    result_sensitivity: Sensitivity
+    producer_provenance: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.capability_id, "artifact result capability_id"),
+            (self.executor_id, "artifact result executor_id"),
+            (self.call_id, "artifact result call_id"),
+        ):
+            _required_text(value, name, maximum=256)
+        for value, name in (
+            (self.capability_contract_digest, "artifact result contract digest"),
+            (self.output_schema_digest, "artifact result schema digest"),
+            (self.arguments_sha256, "artifact result arguments digest"),
+            (self.result_sha256, "artifact result digest"),
+        ):
+            _digest(value, name)
+        _utc(self.observed_at, "artifact result observed_at")
+        if (
+            not isinstance(self.result_sensitivity, Sensitivity)
+            or self.result_sensitivity is Sensitivity.UNKNOWN
+        ):
+            raise ValueError("artifact result sensitivity must be resolved")
+        provenance = FrozenJsonObject.from_mapping(self.producer_provenance)
+        if not provenance:
+            raise ValueError("artifact result producer provenance is required")
+        if len(canonical_json(provenance).encode("utf-8")) > 256 * 1_024:
+            raise ValueError("artifact result producer provenance exceeds its bound")
+        object.__setattr__(self, "producer_provenance", provenance)
+
+
+@dataclass(frozen=True, slots=True)
 class ArtifactProvenance:
     authorship: ArtifactAuthorship
     evidence_call_ids: tuple[str, ...] = ()
     derived_from_artifact_id: str | None = None
     resource_bindings: tuple[ArtifactResourceBinding, ...] = ()
     local_file_binding: ArtifactLocalFileBinding | None = None
+    result_binding: ArtifactResultBinding | None = None
     sql_fingerprint: str | None = None
     parameters_sha256: str | None = None
     columns: tuple[str, ...] = ()
@@ -307,6 +352,7 @@ class ArtifactProvenance:
             _digest(self.parameters_sha256, "artifact parameters_sha256")
         if self.authorship is ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS and (
             self.derived_from_artifact_id is not None
+            or self.result_binding is not None
             or self.sql_fingerprint is not None
             or self.parameters_sha256 is not None
             or bool(columns)
@@ -323,6 +369,7 @@ class ArtifactProvenance:
                 or evidence
                 or bindings
                 or self.derived_from_artifact_id is not None
+                or self.result_binding is not None
                 or self.sql_fingerprint is not None
                 or self.parameters_sha256 is not None
                 or columns
@@ -346,11 +393,28 @@ class ArtifactProvenance:
             )
             if (
                 evidence
+                or self.result_binding is not None
                 or not 1 <= len(bindings) <= 64
                 or (has_query_facts and not query_facts_complete)
             ):
                 raise ValueError(
                     "exact-source provenance requires complete runtime facts"
+                )
+        if self.authorship is ArtifactAuthorship.VALIDATED_TOOL_RESULT:
+            binding = self.result_binding
+            if (
+                not isinstance(binding, ArtifactResultBinding)
+                or evidence != (binding.call_id,)
+                or self.derived_from_artifact_id is not None
+                or bindings
+                or self.local_file_binding is not None
+                or self.sql_fingerprint is not None
+                or self.parameters_sha256 is not None
+                or columns
+                or self.row_count is not None
+            ):
+                raise ValueError(
+                    "validated-result provenance requires one exact result binding"
                 )
         object.__setattr__(self, "evidence_call_ids", evidence)
         object.__setattr__(self, "resource_bindings", bindings)
@@ -745,6 +809,24 @@ def artifact_provenance_to_mapping(value: ArtifactProvenance) -> dict[str, objec
                 ),
             }
         ),
+        "result_binding": (
+            None
+            if value.result_binding is None
+            else {
+                "capability_id": value.result_binding.capability_id,
+                "executor_id": value.result_binding.executor_id,
+                "call_id": value.result_binding.call_id,
+                "capability_contract_digest": (
+                    value.result_binding.capability_contract_digest
+                ),
+                "output_schema_digest": value.result_binding.output_schema_digest,
+                "arguments_sha256": value.result_binding.arguments_sha256,
+                "result_sha256": value.result_binding.result_sha256,
+                "observed_at": _datetime_text(value.result_binding.observed_at),
+                "result_sensitivity": value.result_binding.result_sensitivity.value,
+                "producer_provenance": value.result_binding.producer_provenance,
+            }
+        ),
         "sql_fingerprint": value.sql_fingerprint,
         "parameters_sha256": value.parameters_sha256,
         "columns": value.columns,
@@ -760,6 +842,7 @@ def artifact_provenance_from_mapping(value: Mapping[str, object]) -> ArtifactPro
             "derived_from_artifact_id",
             "resource_bindings",
             "local_file_binding",
+            "result_binding",
             "sql_fingerprint",
             "parameters_sha256",
             "columns",
@@ -907,12 +990,78 @@ def artifact_provenance_from_mapping(value: Mapping[str, object]) -> ArtifactPro
                 ),
             ),
         )
+    raw_result_binding = value.get("result_binding")
+    result_binding = None
+    if raw_result_binding is not None:
+        if not isinstance(raw_result_binding, Mapping):
+            raise ValueError("artifact result_binding must be an object")
+        _exact_keys(
+            raw_result_binding,
+            frozenset(
+                {
+                    "capability_id",
+                    "executor_id",
+                    "call_id",
+                    "capability_contract_digest",
+                    "output_schema_digest",
+                    "arguments_sha256",
+                    "result_sha256",
+                    "observed_at",
+                    "result_sensitivity",
+                    "producer_provenance",
+                }
+            ),
+            "artifact result binding",
+        )
+        raw_producer_provenance = raw_result_binding.get("producer_provenance")
+        if not isinstance(raw_producer_provenance, Mapping):
+            raise ValueError("artifact result producer provenance must be an object")
+        result_binding = ArtifactResultBinding(
+            capability_id=_mapping_text(
+                raw_result_binding, "capability_id", "artifact result binding"
+            ),
+            executor_id=_mapping_text(
+                raw_result_binding, "executor_id", "artifact result binding"
+            ),
+            call_id=_mapping_text(
+                raw_result_binding, "call_id", "artifact result binding"
+            ),
+            capability_contract_digest=_mapping_text(
+                raw_result_binding,
+                "capability_contract_digest",
+                "artifact result binding",
+            ),
+            output_schema_digest=_mapping_text(
+                raw_result_binding,
+                "output_schema_digest",
+                "artifact result binding",
+            ),
+            arguments_sha256=_mapping_text(
+                raw_result_binding, "arguments_sha256", "artifact result binding"
+            ),
+            result_sha256=_mapping_text(
+                raw_result_binding, "result_sha256", "artifact result binding"
+            ),
+            observed_at=_datetime_value(
+                raw_result_binding.get("observed_at"),
+                "artifact result observed_at",
+            ),
+            result_sensitivity=Sensitivity(
+                _mapping_text(
+                    raw_result_binding,
+                    "result_sensitivity",
+                    "artifact result binding",
+                )
+            ),
+            producer_provenance=raw_producer_provenance,
+        )
     return ArtifactProvenance(
         authorship=ArtifactAuthorship(value.get("authorship")),
         evidence_call_ids=tuple(evidence),
         derived_from_artifact_id=derived_from_artifact_id,
         resource_bindings=tuple(bindings),
         local_file_binding=local_binding,
+        result_binding=result_binding,
         sql_fingerprint=sql_fingerprint,
         parameters_sha256=parameters_sha256,
         columns=tuple(columns),

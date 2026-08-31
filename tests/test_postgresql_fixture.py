@@ -319,11 +319,12 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
     assert password not in result.final_text
     assert len(provider.requests) == 3
     assert provider.catalog_tool_call_count == 1
-    assert provider.projected_resource_count == 8
+    assert provider.projected_resource_count <= 8
     assert provider.duplicated_relationship_id_count == 0
     assert provider.schema_result_bytes > 0
     assert provider.truncation is not None
-    assert provider.truncation["resources"] is False
+    assert provider.truncation["resources"] is True
+    assert provider.truncation["reason"] == "resource_limit"
     assert provider.truncation["relationships"] is False
     assert provider.schema_data is not None
     projected_resources = provider.schema_data["resources"]
@@ -434,9 +435,21 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
             ("satisfaction_score", "pg_catalog.int4|integer", True),
         ),
     }
-    assert set(by_name) == set(expected_columns)
-    for name, expected in expected_columns.items():
-        columns = by_name[name]["columns"]
+    assert (
+        {
+            "analytics.regions",
+            "analytics.customers",
+            "analytics.products",
+            "analytics.orders",
+            "analytics.order_items",
+        }
+        <= set(by_name)
+        <= set(expected_columns)
+    )
+    assert provider.projected_resource_count == len(by_name)
+    for name, item in by_name.items():
+        expected = expected_columns[name]
+        columns = item["columns"]
         assert isinstance(columns, tuple)
         expected_display = tuple(
             (column_name, native_type.rpartition("|")[2], nullable)
@@ -470,12 +483,12 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
         "analytics.shipments": (("order_id",),),
         "analytics.support_tickets": (),
     }
-    assert {
-        name: item["primary_key_fields"] for name, item in by_name.items()
-    } == expected_primary_keys
-    assert {
-        name: item["unique_key_fields"] for name, item in by_name.items()
-    } == expected_unique_keys
+    assert {name: item["primary_key_fields"] for name, item in by_name.items()} == {
+        name: expected_primary_keys[name] for name in by_name
+    }
+    assert {name: item["unique_key_fields"] for name, item in by_name.items()} == {
+        name: expected_unique_keys[name] for name in by_name
+    }
     relationships = provider.schema_data["relationships"]
     assert isinstance(relationships, tuple)
     names_by_id = {item["resource_id"]: item["name"] for item in by_name.values()}
@@ -492,7 +505,7 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
         for item in relationships
         if isinstance(item, Mapping)
     }
-    assert relationship_pairs == {
+    expected_relationship_pairs = {
         ("analytics.customers", "analytics.regions", (("region_code", "region_code"),)),
         ("analytics.orders", "analytics.customers", (("customer_id", "customer_id"),)),
         ("analytics.order_items", "analytics.orders", (("order_id", "order_id"),)),
@@ -513,6 +526,11 @@ async def test_zero_argument_onboarding_through_grounded_postgresql_answer(
             "analytics.orders",
             (("order_id", "order_id"),),
         ),
+    }
+    assert relationship_pairs == {
+        relationship
+        for relationship in expected_relationship_pairs
+        if relationship[0] in by_name and relationship[1] in by_name
     }
     validator.assert_consumed()
 

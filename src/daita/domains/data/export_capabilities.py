@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from typing import Protocol
 
@@ -23,6 +23,7 @@ from ...artifacts.models import (
     ArtifactProvenance,
     ArtifactRef,
     ArtifactResourceBinding,
+    ArtifactResultBinding,
     artifact_delivery_receipt_to_mapping,
     artifact_destination_to_mapping,
     artifact_text_change_summary_to_mapping,
@@ -51,13 +52,21 @@ from ...artifacts.renderers import (
     render_model_document,
     text_edit_media_type,
 )
+from ...artifacts.result_snapshot import (
+    MAX_RESULT_SNAPSHOT_BYTES,
+    RESULT_SNAPSHOT_ALLOWED_EXTENSIONS,
+    RESULT_SNAPSHOT_MEDIA_TYPE,
+    serialize_result_snapshot,
+)
 from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
+    CapabilityRegistry,
     Executor,
     OperationalEffect,
     ToolboxId,
@@ -87,6 +96,11 @@ DOCUMENT_CREATE_CAPABILITY_ID = "artifact.create_document"
 DOCUMENT_CREATE_EXECUTOR_ID = "artifact.create_document.executor"
 DOCUMENT_CREATE_TOOL_NAME = "artifact_create_document"
 DOCUMENT_CREATE_OUTPUT_KIND = "artifact.document"
+
+RESULT_SNAPSHOT_CAPABILITY_ID = "artifact.snapshot_result"
+RESULT_SNAPSHOT_EXECUTOR_ID = "artifact.snapshot_result.executor"
+RESULT_SNAPSHOT_TOOL_NAME = "artifact_snapshot_result"
+RESULT_SNAPSHOT_OUTPUT_KIND = "artifact.result_snapshot"
 
 SQLITE_TABULAR_EXPORT_CAPABILITY_ID = "data.sqlite.export_tabular"
 SQLITE_TABULAR_EXPORT_EXECUTOR_ID = "data.sqlite.export_tabular.executor"
@@ -271,6 +285,75 @@ class DocumentArtifactExecutor:
             kind=DOCUMENT_CREATE_OUTPUT_KIND,
             data={"format": format_name, "character_count": len(content)},
             artifact=draft,
+        )
+
+
+class ResultSnapshotExecutor:
+    executor_id = RESULT_SNAPSHOT_EXECUTOR_ID
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        filename = request.arguments.get("filename")
+        result_data = request.arguments["_result_data"]
+        producer_provenance = request.arguments["_producer_provenance"]
+        assert filename is None or isinstance(filename, str)
+        assert isinstance(result_data, Mapping)
+        assert isinstance(producer_provenance, Mapping)
+        snapshot = serialize_result_snapshot(result_data)
+        expected_digest = request.arguments["_result_sha256"]
+        if snapshot.sha256 != expected_digest:
+            raise ToolOutputValidationError(
+                "result snapshot content changed after evidence validation"
+            )
+        observed_at = request.arguments["_observed_at"]
+        sensitivity = request.arguments["_result_sensitivity"]
+        assert isinstance(observed_at, str)
+        assert isinstance(sensitivity, str)
+        binding = ArtifactResultBinding(
+            capability_id=str(request.arguments["_producer_capability_id"]),
+            executor_id=str(request.arguments["_producer_executor_id"]),
+            call_id=str(request.arguments["call_id"]),
+            capability_contract_digest=str(
+                request.arguments["_capability_contract_digest"]
+            ),
+            output_schema_digest=str(request.arguments["_output_schema_digest"]),
+            arguments_sha256=str(request.arguments["_arguments_sha256"]),
+            result_sha256=snapshot.sha256,
+            observed_at=datetime.fromisoformat(observed_at).astimezone(UTC),
+            result_sensitivity=Sensitivity(sensitivity),
+            producer_provenance=producer_provenance,
+        )
+        safe_filename = canonical_artifact_filename(
+            filename or "result.json",
+            RESULT_SNAPSHOT_MEDIA_TYPE,
+            RESULT_SNAPSHOT_ALLOWED_EXTENSIONS,
+        )
+        draft = ArtifactDraft(
+            content=snapshot.content,
+            suggested_filename=safe_filename,
+            media_type=RESULT_SNAPSHOT_MEDIA_TYPE,
+            sensitivity=binding.result_sensitivity,
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.VALIDATED_TOOL_RESULT,
+                evidence_call_ids=(binding.call_id,),
+                result_binding=binding,
+            ),
+        )
+        return ToolOutput(
+            kind=RESULT_SNAPSHOT_OUTPUT_KIND,
+            data={
+                "filename": safe_filename,
+                "byte_size": len(snapshot.content),
+                "source_call_id": binding.call_id,
+                "result_sha256": snapshot.sha256,
+            },
+            artifact=draft,
+            sensitivity=ModelSensitivity(sensitivity),
+            sensitivity_provenance={
+                "authority": "validated_current_run_tool_result",
+                "source_call_id": binding.call_id,
+                "producer_capability_id": binding.capability_id,
+                "result_sha256": binding.result_sha256,
+            },
         )
 
 
@@ -760,6 +843,7 @@ def artifact_declarations(
         capabilities=declarations.capabilities,
         executors=(
             DocumentArtifactExecutor(),
+            ResultSnapshotExecutor(),
             SQLiteTabularExportExecutor(agent_id, sqlite_backend, clock=clock),
             PostgreSQLTabularExportExecutor(agent_id, postgresql_backend, clock=clock),
             ArtifactListExecutor(artifacts),
@@ -810,13 +894,66 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=DOCUMENT_CREATE_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/markdown", "text/plain"}),
+            allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
             allowed_extensions=DOCUMENT_ALLOWED_EXTENSIONS,
             artifact_required=True,
             max_artifact_count=1,
             max_bytes_per_artifact=MAX_DOCUMENT_BYTES,
             max_total_bytes_per_call=MAX_DOCUMENT_BYTES,
+        ),
+    )
+    result_snapshot = Capability(
+        id=RESULT_SNAPSHOT_CAPABILITY_ID,
+        description=(
+            "Create one canonical JSON artifact from the exact validated output "
+            "data of one earlier successful tool call in the current run."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "call_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "filename": {"type": "string", "minLength": 1, "maxLength": 120},
+            },
+            "required": ["call_id"],
+            "additionalProperties": False,
+        },
+        output_kind=RESULT_SNAPSHOT_OUTPUT_KIND,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string"},
+                "byte_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_RESULT_SNAPSHOT_BYTES,
+                },
+                "source_call_id": {"type": "string"},
+                "result_sha256": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                },
+            },
+            "required": [
+                "filename",
+                "byte_size",
+                "source_call_id",
+                "result_sha256",
+            ],
+            "additionalProperties": False,
+        },
+        executor_id=RESULT_SNAPSHOT_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        artifact_policy=ArtifactPolicy(
+            allowed_media_types=frozenset({RESULT_SNAPSHOT_MEDIA_TYPE}),
+            allowed_authorships=frozenset({ArtifactAuthorship.VALIDATED_TOOL_RESULT}),
+            allowed_extensions=RESULT_SNAPSHOT_ALLOWED_EXTENSIONS,
+            artifact_required=True,
+            max_artifact_count=1,
+            max_bytes_per_artifact=MAX_RESULT_SNAPSHOT_BYTES,
+            max_total_bytes_per_call=MAX_RESULT_SNAPSHOT_BYTES,
         ),
     )
     sqlite_tabular = _tabular_export_capability(
@@ -856,6 +993,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_LIST_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     artifact_read = Capability(
         id=ARTIFACT_READ_CAPABILITY_ID,
@@ -897,6 +1035,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_READ_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     artifact_convert = Capability(
         id=ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -941,8 +1080,10 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_CONVERT_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/csv"}),
+            allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),
             allowed_extensions=CSV_ALLOWED_EXTENSIONS,
             artifact_required=True,
             max_artifact_count=1,
@@ -1029,8 +1170,10 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=ARTIFACT_EDIT_TEXT_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=TEXT_EDIT_MEDIA_TYPES,
+            allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
             allowed_extensions=TEXT_EDIT_ALLOWED_EXTENSIONS,
             artifact_required=True,
             max_artifact_count=1,
@@ -1076,6 +1219,7 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     set_location = Capability(
         id=ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
@@ -1100,9 +1244,11 @@ def artifact_capability_declarations(
         executor_id=ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.CHANGE_INFRASTRUCTURE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
     capabilities = (
         document,
+        result_snapshot,
         sqlite_tabular,
         postgresql_tabular,
         artifact_list,
@@ -1123,6 +1269,22 @@ def artifact_capability_declarations(
                 summary="Create a bounded Markdown or text document artifact.",
                 when_to_use="Use when the requested deliverable is a document.",
                 keywords=("artifact", "document", "markdown", "text"),
+            ),
+        ),
+        ToolView(
+            name=RESULT_SNAPSHOT_TOOL_NAME,
+            capability_id=result_snapshot.id,
+            description=result_snapshot.description,
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
+                summary="Snapshot one earlier structured result as canonical JSON.",
+                when_to_use=(
+                    "Use after a successful current-run tool call when its complete "
+                    "validated structured result should become an artifact."
+                ),
+                keywords=("artifact", "snapshot", "result", "json"),
             ),
         ),
         ToolView(
@@ -1268,6 +1430,7 @@ _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
 _ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
+        RESULT_SNAPSHOT_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -1281,6 +1444,7 @@ _ARTIFACT_ADAPTER_CAPABILITIES = {
 _BASE_ARTIFACT_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
+        RESULT_SNAPSHOT_CAPABILITY_ID,
         SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
         POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_LIST_CAPABILITY_ID,
@@ -1355,6 +1519,7 @@ class ArtifactCapabilityDomain:
         workspace: LocalWorkspaceBackend | None,
         learning: LearningCandidateGuard,
         *,
+        clock: Callable[[], datetime],
         files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
@@ -1380,6 +1545,8 @@ class ArtifactCapabilityDomain:
         self._delivery = delivery
         self._workspace = workspace
         self._learning = learning
+        self._clock = clock
+        self._registry: CapabilityRegistry | None = None
         self._files_only_run_ids = (
             files_only_run_ids if files_only_run_ids is not None else set()
         )
@@ -1389,6 +1556,16 @@ class ArtifactCapabilityDomain:
     @property
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
+
+    def bind_capability_registry(self, registry: CapabilityRegistry) -> None:
+        """Bind the one immutable registry used to revalidate snapshot evidence."""
+
+        if not isinstance(registry, CapabilityRegistry):
+            raise TypeError("artifact capability registry is invalid")
+        registry.validate_declarations(self._declarations)
+        if self._registry is not None and self._registry is not registry:
+            raise ValueError("artifact capability registry is already bound")
+        self._registry = registry
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
         facts = (
@@ -1489,6 +1666,13 @@ class ArtifactCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
+        if capability.id == RESULT_SNAPSHOT_CAPABILITY_ID:
+            return await self._prepare_result_snapshot(
+                run,
+                call,
+                arguments,
+                request_sensitivity=request_sensitivity,
+            )
         del request_sensitivity
         if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
             if (
@@ -1623,6 +1807,192 @@ class ArtifactCapabilityDomain:
             await self._validate_sql(run, capability, arguments)
         return arguments
 
+    async def _prepare_result_snapshot(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        arguments: FrozenJsonObject,
+        *,
+        request_sensitivity: ModelSensitivity,
+    ) -> FrozenJsonObject:
+        registry = self._registry
+        if registry is None:
+            raise CapabilityInputError(
+                "artifact_snapshot_unavailable",
+                "Result snapshot validation is unavailable in this runtime.",
+            )
+        evidence_call_id = arguments.get("call_id")
+        if not isinstance(evidence_call_id, str):
+            raise CapabilityInputError(
+                "artifact_snapshot_evidence_invalid",
+                "A result snapshot requires one exact earlier call ID.",
+            )
+        try:
+            transcript = await self._transcripts.load(run.id)
+        except KeyError as error:
+            raise CapabilityInputError(
+                "artifact_snapshot_evidence_invalid",
+                "Result snapshot evidence must belong to the current run.",
+            ) from error
+        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
+            raise CapabilityInputError(
+                "artifact_snapshot_evidence_invalid",
+                "Result snapshot evidence belongs to another agent or run.",
+            )
+        current_calls = tuple(
+            (message_index, candidate)
+            for message_index, message in enumerate(transcript.messages)
+            if message.role is MessageRole.ASSISTANT
+            for candidate in message.tool_calls
+            if candidate.id == call.id
+        )
+        evidence_calls = tuple(
+            (message_index, candidate)
+            for message_index, message in enumerate(transcript.messages)
+            if message.role is MessageRole.ASSISTANT
+            for candidate in message.tool_calls
+            if candidate.id == evidence_call_id
+        )
+        evidence_results = tuple(
+            (message_index, block)
+            for message_index, message in enumerate(transcript.messages)
+            if message.role is MessageRole.TOOL
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.call_id == evidence_call_id
+        )
+        current_valid = (
+            len(current_calls) == 1
+            and current_calls[0][1].name == call.name
+            and current_calls[0][1].arguments == call.arguments
+        )
+        ordered_evidence = (
+            current_valid
+            and len(evidence_calls) == 1
+            and len(evidence_results) == 1
+            and evidence_calls[0][0] < evidence_results[0][0] < current_calls[0][0]
+        )
+        if not ordered_evidence or evidence_results[0][1].is_error:
+            raise CapabilityInputError(
+                "artifact_snapshot_evidence_invalid",
+                "Result snapshot evidence must be one earlier successful current-run call.",
+                {"call_id": evidence_call_id},
+            )
+        producer_call = evidence_calls[0][1]
+        block = evidence_results[0][1]
+        if (
+            block.capability_id is None
+            or block.executor_id is None
+            or block.output_sha256 is None
+            or block.sensitivity is None
+            or not block.sensitivity_provenance
+        ):
+            raise CapabilityInputError(
+                "artifact_snapshot_evidence_invalid",
+                "The selected result lacks validated execution lineage.",
+                {"call_id": evidence_call_id},
+            )
+        try:
+            _view, producer_capability = registry.resolve_tool(producer_call.name)
+            if (
+                producer_capability.id != block.capability_id
+                or producer_capability.executor_id != block.executor_id
+                or block.output_sha256 != _sha256_json(block.output)
+            ):
+                raise ValueError("result execution lineage differs")
+            registry.validate_arguments(
+                producer_capability.id,
+                producer_call.arguments,
+            )
+            if set(block.output) not in (
+                {"kind", "data"},
+                {"kind", "data", "artifact", "delivery_status"},
+            ):
+                raise ValueError("result envelope shape differs")
+            output_kind = block.output.get("kind")
+            result_data = block.output.get("data")
+            if not isinstance(output_kind, str) or not isinstance(result_data, Mapping):
+                raise ValueError("result data is unavailable")
+            registry.validate_output(
+                producer_capability.id,
+                ToolOutput(
+                    kind=output_kind,
+                    data=result_data,
+                    sensitivity=block.sensitivity,
+                    sensitivity_provenance=block.sensitivity_provenance,
+                ),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise CapabilityInputError(
+                "artifact_snapshot_evidence_invalid",
+                "The selected tool result no longer matches its declared contract.",
+                {"call_id": evidence_call_id},
+            ) from error
+        output_provenance = result_data.get("provenance")
+        if output_kind == "mcp.read.result" and (
+            not isinstance(output_provenance, Mapping)
+            or output_provenance.get("output_schema_digest") == "none"
+            or not isinstance(result_data.get("structured"), Mapping)
+        ):
+            raise CapabilityInputError(
+                "artifact_snapshot_schema_unavailable",
+                "The selected remote result has no admitted structured output schema.",
+                {"call_id": evidence_call_id},
+            )
+        snapshot = serialize_result_snapshot(result_data)
+        observed_at = self._clock().astimezone(UTC)
+        raw_observed_at = (
+            output_provenance.get("observed_at")
+            if isinstance(output_provenance, Mapping)
+            else result_data.get("observed_at")
+        )
+        if raw_observed_at is not None:
+            if not isinstance(raw_observed_at, str):
+                raise CapabilityInputError(
+                    "artifact_snapshot_evidence_invalid",
+                    "The selected result has an invalid observation time.",
+                )
+            try:
+                observed_at = datetime.fromisoformat(raw_observed_at).astimezone(UTC)
+            except ValueError as error:
+                raise CapabilityInputError(
+                    "artifact_snapshot_evidence_invalid",
+                    "The selected result has an invalid observation time.",
+                ) from error
+        effective_sensitivity = max(
+            block.sensitivity,
+            request_sensitivity,
+            key=lambda item: item.routing_rank,
+        )
+        prepared: dict[str, object] = dict(arguments)
+        prepared.update(
+            {
+                "_result_data": result_data,
+                "_producer_capability_id": producer_capability.id,
+                "_producer_executor_id": producer_capability.executor_id,
+                "_capability_contract_digest": registry.contract_digest(
+                    producer_capability.id
+                ),
+                "_output_schema_digest": _sha256_json(
+                    producer_capability.output_schema
+                ),
+                "_arguments_sha256": _sha256_json(producer_call.arguments),
+                "_result_sha256": snapshot.sha256,
+                "_observed_at": observed_at.isoformat(),
+                "_result_sensitivity": effective_sensitivity.value,
+                "_producer_provenance": {
+                    "agent_id": run.agent_id,
+                    "run_id": run.id,
+                    "result_sensitivity_provenance": block.sensitivity_provenance,
+                    "result_output_provenance": (
+                        output_provenance
+                        if isinstance(output_provenance, Mapping)
+                        else {}
+                    ),
+                },
+            }
+        )
+        return FrozenJsonObject.from_mapping(prepared)
+
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -1725,6 +2095,8 @@ class ArtifactCapabilityDomain:
             elif code in {"file_too_large", "file_edit_timeout"}:
                 code = "artifact_edit_limited"
             return CapabilityFailure(code, error.message, error.details)
+        if isinstance(error, ArtifactError):
+            return CapabilityFailure(error.code, error.message, error.details)
         return None
 
     def _validate_artifact_summary(
@@ -1734,22 +2106,42 @@ class ArtifactCapabilityDomain:
     ) -> None:
         draft = output.artifact
         assert draft is not None
+        if draft.provenance.authorship is ArtifactAuthorship.VALIDATED_TOOL_RESULT:
+            result_binding = draft.provenance.result_binding
+            valid = (
+                capability.id == RESULT_SNAPSHOT_CAPABILITY_ID
+                and result_binding is not None
+                and output.data.get("filename") == draft.suggested_filename
+                and output.data.get("byte_size") == len(draft.content)
+                and output.data.get("source_call_id") == result_binding.call_id
+                and output.data.get("result_sha256") == result_binding.result_sha256
+                and "sha256:" + sha256(draft.content).hexdigest()
+                == result_binding.result_sha256
+            )
+            if not valid:
+                raise ToolOutputValidationError(
+                    "result snapshot summary differs from its execution provenance"
+                )
+            return
         if draft.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA:
             if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
-                binding = draft.provenance.local_file_binding
+                local_binding = draft.provenance.local_file_binding
                 valid = (
-                    binding is not None
-                    and output.data.get("relative_path") == binding.relative_path
+                    local_binding is not None
+                    and output.data.get("relative_path") == local_binding.relative_path
                     and output.data.get("filename") == draft.suggested_filename
                     and output.data.get("original_physical_revision")
-                    == binding.original_physical_revision
+                    == local_binding.original_physical_revision
                     and output.data.get("observed_content_sha256")
-                    == binding.observed_content_sha256
-                    and output.data.get("source_byte_size") == binding.source_byte_size
+                    == local_binding.observed_content_sha256
+                    and output.data.get("source_byte_size")
+                    == local_binding.source_byte_size
                     and output.data.get("result_byte_size") == len(draft.content)
                     and output.data.get("change_summary")
                     == FrozenJsonObject.from_mapping(
-                        artifact_text_change_summary_to_mapping(binding.change_summary)
+                        artifact_text_change_summary_to_mapping(
+                            local_binding.change_summary
+                        )
                     )
                 )
                 if not valid:
@@ -1792,6 +2184,38 @@ class ArtifactCapabilityDomain:
         provenance = draft.provenance
         if capability.id == ARTIFACT_EDIT_TEXT_CAPABILITY_ID:
             return self._bind_local_edit(run, arguments, draft)
+        if provenance.authorship is ArtifactAuthorship.VALIDATED_TOOL_RESULT:
+            if capability.id != RESULT_SNAPSHOT_CAPABILITY_ID:
+                raise ToolOutputValidationError(
+                    "validated-result artifact came from another capability"
+                )
+            binding = provenance.result_binding
+            result_data = arguments.get("_result_data")
+            producer_provenance = arguments.get("_producer_provenance")
+            if (
+                binding is None
+                or not isinstance(result_data, Mapping)
+                or not isinstance(producer_provenance, Mapping)
+                or draft.content != canonical_json(result_data).encode("utf-8")
+                or draft.sensitivity is not binding.result_sensitivity
+                or binding.call_id != arguments.get("call_id")
+                or binding.capability_id != arguments.get("_producer_capability_id")
+                or binding.executor_id != arguments.get("_producer_executor_id")
+                or binding.capability_contract_digest
+                != arguments.get("_capability_contract_digest")
+                or binding.output_schema_digest
+                != arguments.get("_output_schema_digest")
+                or binding.arguments_sha256 != arguments.get("_arguments_sha256")
+                or binding.result_sha256 != arguments.get("_result_sha256")
+                or binding.result_sensitivity.value
+                != arguments.get("_result_sensitivity")
+                or binding.producer_provenance
+                != FrozenJsonObject.from_mapping(producer_provenance)
+            ):
+                raise ToolOutputValidationError(
+                    "result snapshot differs from its validated evidence binding"
+                )
+            return draft
         if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
             if capability.id in _EXACT_TABULAR_CAPABILITIES:
                 return await self._bind_exact_export(
@@ -1912,20 +2336,20 @@ class ArtifactCapabilityDomain:
                         "Artifact evidence is no longer current in the catalog.",
                         {"name": "evidence_call_ids", "call_id": call_id},
                     )
-                binding = ArtifactResourceBinding(
+                resource_binding = ArtifactResourceBinding(
                     source_id=source_id,
                     source_revision=source_revision,
                     resource_id=resource_id,
                     resource_revision=resource_revision,
                 )
                 key = (source_id, resource_id)
-                if key in bindings and bindings[key] != binding:
+                if key in bindings and bindings[key] != resource_binding:
                     raise CapabilityInputError(
                         "invalid_argument_value",
                         "Artifact evidence contains conflicting resource revisions.",
                         {"name": "evidence_call_ids", "call_id": call_id},
                     )
-                bindings[key] = binding
+                bindings[key] = resource_binding
                 try:
                     sensitivities.append(Sensitivity(schema.sensitivity_class))
                 except ValueError:
@@ -2019,6 +2443,8 @@ class ArtifactCapabilityDomain:
             )
         except SourcePermissionStateError as error:
             raise _incomplete_export(draft, "permission_state_invalid") from error
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
             validate_postgresql_read
             if expected_adapter == "postgresql"
@@ -2191,6 +2617,8 @@ class ArtifactCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
             validate_postgresql_read
             if expected == "postgresql"
@@ -2255,6 +2683,10 @@ def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:
     return Sensitivity.RESTRICTED if selected is Sensitivity.UNKNOWN else selected
 
 
+def _sha256_json(value: object) -> str:
+    return "sha256:" + sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
 def _tabular_export_capability(
     *,
     capability_id: str,
@@ -2304,8 +2736,11 @@ def _tabular_export_capability(
             "additionalProperties": False,
         },
         executor_id=executor_id,
+        access_mode=AccessMode.READ,
+        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/csv", XLSX_MEDIA_TYPE}),
+            allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),
             allowed_extensions=CSV_ALLOWED_EXTENSIONS + XLSX_ALLOWED_EXTENSIONS,
             artifact_required=True,
             max_artifact_count=1,
@@ -2443,6 +2878,11 @@ __all__ = [
     "POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID",
     "POSTGRESQL_TABULAR_EXPORT_TOOL_NAME",
     "PostgreSQLTabularExportExecutor",
+    "RESULT_SNAPSHOT_CAPABILITY_ID",
+    "RESULT_SNAPSHOT_EXECUTOR_ID",
+    "RESULT_SNAPSHOT_OUTPUT_KIND",
+    "RESULT_SNAPSHOT_TOOL_NAME",
+    "ResultSnapshotExecutor",
     "SQLITE_TABULAR_EXPORT_CAPABILITY_ID",
     "SQLITE_TABULAR_EXPORT_EXECUTOR_ID",
     "SQLITE_TABULAR_EXPORT_TOOL_NAME",

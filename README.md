@@ -2,27 +2,22 @@
 
 # Daita
 
-**The data agent that learns how your business works.**
-
-Daita connects to a data source, catalogs your data, and
-returns grounded answers to questions asked in plain language.
-
-Daita learns recurring query patterns, business semantics,
-and important operational context. It carries that knowledge into future
-conversations through inspectable memory and reusable skills. The more you use
-it, the better it understands your data and the way your project works.
+Daita connects to a data source, catalogs its structure, and returns grounded
+answers to questions asked in plain language. Inspectable memory and reusable
+skills carry approved business semantics and operating context into later
+conversations.
 
 ```text
 You:   Which region led paid revenue last quarter?
 Daita: EMEA led with $4.2M, followed by North America with $3.7M.
 ```
 
-Daita begins every source read only and keeps learned context transparent. An
-explicitly opt-in PostgreSQL source can additionally expose the narrow,
-previewed, once approved structured update described below; other source access
-remains read only.
+Every source starts read-only, and learned context remains inspectable. An
+explicitly opted-in PostgreSQL source can expose the narrow, previewed,
+once-approved structured update described below; all other source access
+remains read-only.
 
-## Why Daita?
+## Capabilities
 
 | | |
 | --- | --- |
@@ -32,9 +27,6 @@ remains read only.
 | **Stay in control** | Validate reads against the current catalog and require resource scoped readiness, preview, and exact approval for the limited PostgreSQL update. |
 
 ## Quick start
-
-The first managed installer release targets macOS on Apple Silicon and Intel,
-plus glibc Linux on x86_64 and arm64.
 
 You need Python 3.11 or 3.12 and
 [pipx](https://pipx.pypa.io/stable/installation/).
@@ -53,7 +45,7 @@ pipx install --python python3.12 daita-agents
 
 The first launch admits one local workspace, then guides you through creating
 an agent, choosing a model, and optionally attaching a read-only source inside
-our Textual application; setup,
+the Textual application; setup,
 chat, pickers, secret entry, confirmations, and approvals never fall back to a
 second line oriented interface. API backed models store their key in the OS
 keychain; local Ollama models need no key. Choosing **Codex subscription** starts
@@ -103,11 +95,11 @@ for a files-only turn, `/workspace` to inspect the admitted root, and ordinary
 questions when Daita may use both workspace files and the selected source.
 Workspace file names and content are always treated as untrusted data.
 
-`/memory edit`, `/user edit`, `/memory edit <candidate-id>`, and `/skills
-create` or `/skills edit` use the configured `$EDITOR`. Textual temporarily
-restores the ordinary terminal while that external editor runs, then reacquires
-the full-screen UI. Source configuration, passwords, selection, and approval
-remain inside Textual.
+`/memory edit`, `/user edit`, `/memory edit <candidate-id>`, `/skills create`,
+and `/skills edit` use the configured `$EDITOR`. Textual temporarily restores
+the ordinary terminal while that external editor runs, then reacquires the
+full-screen UI. Source configuration, passwords, selection, and approval remain
+inside Textual.
 
 ## How it works
 
@@ -146,8 +138,33 @@ provide bounded lifecycle access. The model-facing lifecycle tools use the same
 agent ownership boundary, so a new conversation can list the agent's jobs,
 inspect one, read its result, or cancel it. The originating conversation remains
 visible as provenance rather than acting as an access gate. Work pauses while no
-agent host is open and safe stale attempts are fenced on reopen; Daita does not
-run a resident daemon.
+agent host is open and safe stale attempts are fenced on reopen. Daita does not
+self-install or silently fork a daemon; the explicit resident host described
+below is the only way to keep an agent open after the foreground process exits.
+
+Scheduled routines freeze one self-contained foreground-authorized read
+instruction, canonical one-shot/interval/calendar schedule, exact source,
+resource, connector and capability ceilings, typed outcome contract, immutable
+conversation-inbox distribution plan, budgets, expiration, and optional skill
+content digests. Every due slot enters the same
+`AgentLoop` and `CapabilityRuntime` used by foreground work. `/routines` shows
+record-owned lifecycle truth and supports pause, resume, run-now, and disable.
+An optional exact resource-revision check can advance an unchanged occurrence
+without a model call. Certified scheduled artifact producers can create a
+model-authored document, exact SQLite/PostgreSQL CSV or XLSX export, or a
+validated canonical JSON result snapshot. Admission rejects outcome media,
+authorship, producer, source-binding, sensitivity, or byte requirements that
+the frozen producer ceiling cannot satisfy. Scheduled execution is read-only:
+it cannot update data,
+start or cancel a job, manage another routine, deliver externally, or submit a
+graph. Repeated pre-run or execution failures move the routine to
+`needs_attention` at its configured threshold and create one conversation-inbox
+escalation; a pre-run escalation truthfully records that no model run started.
+Every terminal occurrence, including a no-change result, converges atomically
+with one immutable logical Delivery. `/inbox` and `daita inbox` provide bounded
+list, inspect, destination-discovery, and acknowledgment operations; the
+conversation inbox remains the only destination.
+See [Scheduled read routines](docs/SCHEDULED_ROUTINES.md).
 
 The external-executor contract currently has deterministic offline conformance
 coverage only. No real external job profile ships, and no connected service is
@@ -203,9 +220,12 @@ current-file pointer, or prompt keyword router.
 Local files are normally delivered automatically to the authorized default
 destination and reported with the verified saved path. Public recovery remains
 known-ID only through `Agent.read_artifact`, `Agent.save_artifact`, and
-`daita artifacts save`. Clearing conversations invalidates the corresponding
-internal artifact IDs but never deletes copies already delivered to user-owned
-directories.
+`daita artifacts save`. Clearing conversations invalidates ordinary
+transcript-only internal artifact IDs. Artifacts rooted by a durable job result
+or retained logical Delivery remain available by known ID; Daita resolves their
+complete immutable identity from the canonical artifact manifest and verifies
+it against the durable bounded reference. Copies already delivered to
+user-owned directories are never deleted.
 
 For the complete implementation boundaries, see [AGENTS.md](AGENTS.md).
 For workspace selection and read guarantees, see
@@ -222,6 +242,7 @@ daita --root /private/tmp/daita --workspace /absolute/path/project attach atlas 
 daita --root /private/tmp/daita --workspace /absolute/path/project run atlas "Summarize sales" \
   --model openai:gpt-4.1-mini
 daita --root /private/tmp/daita --workspace /absolute/path/project run atlas "Summarize the notes" --files-only
+daita --root /private/tmp/daita --workspace /absolute/path/project host --agent atlas
 ```
 
 `run` writes one JSON record. Provider credentials and PostgreSQL passwords
@@ -234,6 +255,7 @@ Discover all commands and options with:
 daita --help
 daita memory --help
 daita skills --help
+daita routines --help
 ```
 
 ## Manage jobs and local data
@@ -245,6 +267,9 @@ The terminal provides confirmed lifecycle commands:
 /jobs inspect <id>
 /jobs results <id>
 /jobs cancel <id>
+/routines
+/routines create <self-contained instruction>
+/routines promote <basis-run-id> <self-contained instruction>
 /source edit
 /source permissions
 /source detach <source>
@@ -257,7 +282,17 @@ owned by the agent and provides direct refresh, lifecycle details, validated
 results, exact artifact references, and confirmed cancellation without using a
 model turn. The inspect, results, and cancel forms are equivalent power-user
 commands for a known job ID. Jobs still run only while that agent host is open;
-the manager does not add a daemon, scheduler, retry path, or generic job starter.
+the manager does not add another daemon, scheduler, retry path, or generic job
+starter.
+
+`/routines` opens the bounded routine manager. Direct headless lifecycle
+operations are available under `daita routines` for create/promote from an
+exact JSON specification, list, inspect, update, pause, resume, run-now, and
+disable. To continue due work after closing the TUI, run
+`daita host --agent atlas` with the same `--root` and `--workspace`. The
+resident process owns the ordinary agent-home writer lock, so it must be
+stopped before another TUI or CLI process opens that agent. No schedule
+progresses while no admitted host is open.
 
 `/source edit` changes the active source connection without dropping the
 working connection first. Daita validates and catalogs the edited connection,
@@ -276,8 +311,10 @@ and the flow never changes PostgreSQL roles or grants.
 
 Source detachment disables access and deletes a Daita-owned PostgreSQL
 credential. Its non-secret registration remains as inactive lifecycle history
-until the agent is deleted. Clearing conversations deletes all transcripts,
-learning candidate records, and review stamps while preserving separately
+until the agent is deleted. Clearing conversations deletes terminal transcripts,
+learning candidate records, and review stamps except for the minimum run state
+still required by active jobs, follow-ups, or routine occurrences. Durable job
+results and logical Deliveries remain independent roots, as do separately
 approved memory, user profile, semantics, and skills. Agent deletion removes
 the complete agent home and its Daita-owned keychain credentials; it never
 changes the attached source data itself.
@@ -317,15 +354,15 @@ pipx reinstall daita-agents
 pipx uninstall daita-agents
 ```
 
-The first production state format has not been frozen. During active North Star
-development, local agent homes have no backward-compatibility guarantee and may
-need to be recreated after a state-shape change. Daita keeps one current schema,
-one current shape per persisted record family, and one mutable checksummed
-development baseline; it does not migrate between unreleased formats.
+The first production state format has not been frozen. Local development agent
+homes have no backward-compatibility guarantee and may need to be recreated
+after a state-shape change. Daita keeps one current schema, one current shape
+per persisted record family, and one mutable checksummed development baseline;
+it does not migrate between unreleased formats.
 
-At the explicitly approved first production release, that complete state shape
-will become the first immutable baseline. Subsequent package upgrades will use
-the existing staged-copy migration engine automatically on first open. See
+The first production state freeze establishes the first immutable baseline.
+Later durable changes use the existing verified copy-and-swap migration engine
+on first open. See
 [local state during development](docs/LOCAL_STATE_UPGRADES.md).
 
 Use `pipx reinstall daita-agents` to repair missing or damaged application
@@ -334,17 +371,10 @@ homes or credentials stored in the OS keychain.
 
 The managed installer owns only `~/.local/bin/daita` and
 `~/.local/share/daita`; application data remains separately owned under
-`~/.daita`. Its install, verify, repair, rollback, and uninstall actions never
-roll back or delete application data or OS-keychain entries. Once published,
-the stable command will be:
-
-```bash
-curl -fsSL --proto '=https' --tlsv1.2 https://daita-tech.io/install.sh | bash
-```
-
-The managed installer has not been promoted to the public endpoint, which is
-not live yet. See
-[the managed installer release status](docs/MANAGED_INSTALLER_RELEASE.md).
+`~/.daita`. Install, verification, repair, rollback, and uninstall never roll
+back or delete application data or OS-keychain entries. The managed installer
+has not been promoted to `https://daita-tech.io/install.sh`; that endpoint is
+not live. See [managed installer status](docs/MANAGED_INSTALLER_RELEASE.md).
 
 Daita 0.19.0 and earlier belong to a different legacy framework family. A
 0.x-to-1.0 migration is unsupported. Preserve or archive legacy `~/.daita`

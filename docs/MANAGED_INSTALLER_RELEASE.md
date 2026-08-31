@@ -1,47 +1,37 @@
-# Managed installer release status
+# Managed installer
 
-`scripts/install.sh` is the sole repository-owned implementation of Daita's
-managed application delivery contract. It installs the canonical
-`daita-agents` wheel into isolated generations beneath
-`~/.local/share/daita`, publishes `~/.local/bin/daita`, and leaves application
-data under `~/.daita` separately owned.
+`scripts/install.sh` is the repository implementation of Daita's managed
+application delivery contract. It installs the canonical `daita-agents` wheel
+into isolated generations under `~/.local/share/daita`, publishes
+`~/.local/bin/daita`, and leaves application data under `~/.daita` separately
+owned.
 
-The checked-in installer is intentionally not publishable. Its release
-literals remain explicit `UNRESOLVED_*` sentinels for:
+## Current availability
+
+The checked-in installer is not publishable. Its release literals contain
+explicit `UNRESOLVED_*` sentinels for:
 
 - installer version and release sequence;
 - the immutable `daita-agents` wheel URL and SHA-256;
 - the official `uv` version; and
-- each intended target's official `uv` archive URL/SHA-256 and exact managed
-  CPython 3.12 build identity.
+- each packaged target's `uv` archive URL, checksum, and managed CPython 3.12
+  identity.
 
-Normal installation and repair fail before mutation while any sentinel
-remains. `--help`, `--version`, and `--dry-run` remain available for review.
-Deterministic tests render local fixture-pinned copies of the same script;
-those fixture artifacts are not release evidence.
+Installation and repair stop before mutation while any sentinel remains.
+`--help`, `--version`, and `--dry-run` remain available for review. The public
+`https://daita-tech.io/install.sh` endpoint is not live, and support is not
+claimed for any managed-installer target.
 
-## Intended, not yet claimed, targets
+Deterministic tests render fixture-pinned copies of the same script. Those
+tests validate installer mechanics but do not establish public artifact,
+clean-machine, operating-system, or terminal support.
 
-| Target | Intended baseline | Status |
-| --- | --- | --- |
-| macOS arm64 | macOS 13+, Terminal.app | Real bootstrap lifecycle passed on macOS 26.4.1 arm64 in a temporary home; clean-machine and real-terminal evidence remain unverified, so support is not claimed |
-| macOS x86_64 | macOS 13+, Terminal.app | Unverified; not claimed |
-| Linux x86_64 glibc | Ubuntu 22.04/24.04, reviewed local terminal | Unverified; not claimed |
-| Linux arm64 glibc | Ubuntu 24.04, GNOME Terminal | Unverified; not claimed |
-| WSL2 | Deferred | Not claimed |
-| Native Windows | Deferred | Not implemented or claimed |
-
-Automated lifecycle results prove installer mechanics only. Every claimed
-entry still requires the specified clean ordinary-user machine and real local
-terminal evidence. Other Linux distributions, musl/Alpine, SSH, tmux, VS
-Code, and third-party terminals remain unverified.
-
-## Pre-publication candidate certification
+## Candidate verification
 
 The managed lifecycle smoke can exercise an unpublished local wheel with an
-already-downloaded official `uv` archive, a real uv-managed Python, and
-production dependencies resolved from PyPI. Supply all five `--real-*`
-arguments together:
+already downloaded official `uv` archive, a real uv-managed Python, and
+production dependencies resolved from PyPI. Supply all verification arguments
+together:
 
 ```bash
 .venv/bin/python tests/managed_installer_lifecycle_smoke.py \
@@ -53,41 +43,30 @@ arguments together:
   --real-python-identity <exact-resolved-identity>
 ```
 
-The candidate wheel and `uv` archive are copied into a temporary fixture
-transport; they are not uploaded. The canonical installer still verifies both
-checksums and wheel metadata. The selected real `uv` binary downloads the
-managed Python and resolves the wheel's declared production dependencies from
-PyPI. This proves the selected host/bootstrap combination but does not prove
-public artifact delivery, another target, a clean machine, or real-terminal
-behavior.
+The smoke copies the candidate wheel and `uv` archive into a temporary fixture
+transport; it does not upload them. The installer verifies both checksums and
+the wheel metadata. The selected `uv` binary downloads the managed Python and
+resolves the wheel's declared production dependencies from PyPI.
 
-On 2026-08-06, the exact 1.0.0 candidate wheel with SHA-256
-`4c485f4587f179fd4a632e0d2c80da4511aa9a4a0cfb475f4da77936b2b0bfc5`
-passed this lifecycle on macOS 26.4.1 arm64 with official `uv` 0.12.2 archive
-SHA-256
-`fa909fea3bc06f460db79017030a221fdbc43ec4478f089cb554d8335c090817`
-and `cpython-3.12.13-macos-aarch64-none`. Install, repeat, read-only verify,
-repair, rollback, damaged-generation repair, uninstall, production-dependency
-imports, and application-data/sentinel preservation all passed. This is local
-candidate evidence, not a final release pin or support claim.
+Run the same once-built candidate wheel through
+`tests/pipx_lifecycle_smoke.py`. Release verification also includes syntax,
+shellcheck, deterministic tests, architecture checks, formatting, typing, and
+clean-machine tests on every platform for which support will be claimed.
 
-## Publication gate
+## Publication responsibilities
 
-The release owner must close Daita, then:
+Publishing is an external release operation. The release process must:
 
-1. build the candidate wheel exactly once in an isolated environment;
-2. pass that absolute wheel path to both lifecycle smoke scripts, including
-   the real-bootstrap managed mode on each intended target before publication;
-3. publish those exact wheel bytes to the canonical package host;
-4. record the immutable wheel URL and published SHA-256;
-5. replace every installer sentinel with reviewed official artifact evidence;
-6. run syntax, shellcheck, deterministic, managed, pipx, architecture,
-   formatting, typing, clean-machine, and real-terminal gates;
-7. publish the reviewed installer bytes and checksum at the immutable
-   versioned endpoint; and
-8. only then promote those same bytes to
-   `https://daita-tech.io/install.sh`.
+1. build the candidate wheel once in an isolated environment;
+2. verify those exact bytes with both lifecycle smoke scripts on each claimed
+   target;
+3. publish the same wheel bytes to the canonical package host;
+4. record the immutable wheel URL and SHA-256;
+5. replace every installer sentinel with reviewed official artifact values;
+6. rerun the complete verification set against the resolved installer; and
+7. publish the reviewed versioned installer before updating the stable
+   endpoint.
 
-No step in this repository change publishes, uploads, promotes, or modifies
-that endpoint. Binary rollback only changes the active verified generation; it
-does not roll back application data.
+The repository installer cannot publish, upload, or promote artifacts. Binary
+rollback changes only the active verified generation; it never rolls back
+application data or OS-keychain entries.

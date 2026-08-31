@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -862,9 +863,12 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "delete",
         "run",
         "chat",
+        "host",
         "memory",
         "mcp",
         "skills",
+        "routines",
+        "inbox",
     }
     assert _surface(commands["detach"]) == (
         ("name", "source_id"),
@@ -932,6 +936,107 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name", "skill_name"),
         frozenset({"-h", "--help", "--description", "--instructions-file"}),
     )
+
+    assert _surface(commands["host"]) == (
+        (),
+        frozenset({"-h", "--help", "--agent"}),
+    )
+    routines = _subcommands(commands["routines"])
+    assert set(routines) == {
+        "list",
+        "inspect",
+        "create",
+        "promote",
+        "update",
+        "pause",
+        "resume",
+        "run-now",
+        "disable",
+    }
+    assert _surface(routines["list"]) == (
+        ("name",),
+        frozenset({"-h", "--help", "--state"}),
+    )
+    assert _surface(routines["inspect"]) == (
+        ("name", "routine_id"),
+        frozenset({"-h", "--help"}),
+    )
+    inbox = _subcommands(commands["inbox"])
+    assert set(inbox) == {"destinations", "list", "inspect", "acknowledge"}
+    assert _surface(inbox["destinations"]) == (
+        ("name", "conversation_id"),
+        frozenset({"-h", "--help", "--sensitivity-ceiling"}),
+    )
+    assert _surface(inbox["list"]) == (
+        ("name",),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--conversation-id",
+                "--include-acknowledged",
+                "--limit",
+            }
+        ),
+    )
+    for command in ("inspect", "acknowledge"):
+        assert _surface(inbox[command]) == (
+            ("name", "delivery_id"),
+            frozenset({"-h", "--help"}),
+        )
+
+
+def test_cli_routine_list_uses_public_agent_surface(tmp_path: Path) -> None:
+    now = datetime(2026, 8, 28, 12, tzinfo=UTC)
+    fake = SimpleNamespace(
+        list_routines=AsyncMock(
+            return_value=(
+                SimpleNamespace(
+                    routine_id="routine-1",
+                    title="Current value",
+                    state=SimpleNamespace(value="active"),
+                    schedule_kind=SimpleNamespace(value="interval"),
+                    next_due_at=now,
+                    revision=2,
+                    occurrence_count=1,
+                    consecutive_failures=0,
+                ),
+            )
+        ),
+        close=AsyncMock(),
+    )
+    args = cli.build_parser().parse_args(
+        ["--root", str(tmp_path), "routines", "list", "atlas"]
+    )
+    with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
+        result = asyncio.run(cli._execute(args))
+    assert result == [
+        {
+            "routine_id": "routine-1",
+            "title": "Current value",
+            "state": "active",
+            "schedule_kind": "interval",
+            "next_due_at": now.isoformat(),
+            "revision": 2,
+            "occurrence_count": 1,
+            "consecutive_failures": 0,
+        }
+    ]
+    fake.list_routines.assert_awaited_once()
+    fake.close.assert_awaited_once()
+
+
+def test_cli_host_dispatches_one_resident_composition(tmp_path: Path) -> None:
+    args = cli.build_parser().parse_args(
+        ["--root", str(tmp_path), "host", "--agent", "atlas"]
+    )
+    with patch.object(cli, "run_resident_host", new=AsyncMock()) as hosted:
+        result = asyncio.run(cli._execute(args))
+    assert result == {"agent": "atlas", "host": "stopped"}
+    hosted.assert_awaited_once()
+    await_args = hosted.await_args
+    assert await_args is not None
+    assert await_args.kwargs["agent_name"] == "atlas"
 
 
 def test_future_cli_4_direct_knowledge_commands_survive_reopen():

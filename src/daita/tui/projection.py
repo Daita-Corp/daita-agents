@@ -367,7 +367,7 @@ def artifact_delivery_messages(
 ) -> tuple[str, ...]:
     messages: list[str] = []
     created_artifact_ids: list[str] = []
-    delivery_attempts: set[str] = set()
+    local_save_artifact_ids: set[str] = set()
     for call, result in pairs:
         if result is not None and not result.is_error:
             artifact = result.output.get("artifact")
@@ -382,7 +382,7 @@ def artifact_delivery_messages(
             continue
         artifact_id = call.arguments.get("artifact_id")
         if isinstance(artifact_id, str):
-            delivery_attempts.add(artifact_id)
+            local_save_artifact_ids.add(artifact_id)
         if not result.is_error:
             data = result.output.get("data")
             if not isinstance(data, Mapping):
@@ -431,7 +431,7 @@ def artifact_delivery_messages(
             f"{code}: {detail}"
         )
     for artifact_id in created_artifact_ids:
-        if artifact_id in delivery_attempts:
+        if artifact_id in local_save_artifact_ids:
             continue
         safe_id = sanitize_terminal_text(
             artifact_id,

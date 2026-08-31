@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import sqlite3
+import threading
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -19,6 +23,7 @@ from _workspace_support import workspace_for
 import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
 from daita._json import FrozenJsonObject
+from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
 from daita.domains.data.context import DataContextBuilder
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
@@ -27,7 +32,12 @@ from daita.domains.data.export_capabilities import (
     ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
+    DOCUMENT_CREATE_CAPABILITY_ID,
     DOCUMENT_CREATE_TOOL_NAME,
+    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+    RESULT_SNAPSHOT_CAPABILITY_ID,
+    RESULT_SNAPSHOT_TOOL_NAME,
+    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
     artifact_capability_declarations,
 )
 from daita.llm.models import (
@@ -43,7 +53,8 @@ from daita.llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from daita.loop.models import RunInput
+from daita.loop.models import RunInput, Transcript
+from daita.storage.sqlite_codecs import decode_message, encode_message
 
 
 async def _prepared_request(
@@ -114,6 +125,17 @@ def _result_error_code(result: ToolResultBlock) -> str:
     return code
 
 
+def _tool_result(transcript: Transcript, call_id: str) -> ToolResultBlock:
+    matches = tuple(
+        block
+        for message in transcript.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.call_id == call_id
+    )
+    assert len(matches) == 1
+    return matches[0]
+
+
 def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -> None:
     assert not hasattr(data_controller, "_explicit_artifact_request")
     assert not hasattr(data_controller, "_explicit_default_location_request")
@@ -146,6 +168,406 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
     }
     for schema in schemas.values():
         assert schema["additionalProperties"] is False
+
+
+def test_d2_certifies_only_the_four_accepted_scheduled_artifact_capabilities() -> None:
+    declarations = artifact_capability_declarations()
+    by_id = {capability.id: capability for capability in declarations.capabilities}
+    scheduled = {
+        capability.id
+        for capability in declarations.capabilities
+        if capability.automation_eligibility is AutomationEligibility.SCHEDULED_DIRECT
+    }
+
+    assert scheduled == {
+        DOCUMENT_CREATE_CAPABILITY_ID,
+        RESULT_SNAPSHOT_CAPABILITY_ID,
+        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+    }
+    assert by_id[SQLITE_TABULAR_EXPORT_CAPABILITY_ID].access_mode is AccessMode.READ
+    assert by_id[POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID].access_mode is AccessMode.READ
+    assert by_id[DOCUMENT_CREATE_CAPABILITY_ID].access_mode is AccessMode.NONE
+    assert by_id[RESULT_SNAPSHOT_CAPABILITY_ID].access_mode is AccessMode.NONE
+    assert all(
+        by_id[capability_id].operational_effect is OperationalEffect.NONE
+        for capability_id in scheduled
+    )
+
+
+async def test_result_snapshot_commits_exact_current_run_result_with_lineage(
+    tmp_path: Path,
+) -> None:
+    provider = MockModelProvider(
+        (
+            _document_call(),
+            _call(
+                "snapshot",
+                RESULT_SNAPSHOT_TOOL_NAME,
+                {"call_id": "create", "filename": "result.json"},
+            ),
+            _stop(),
+        ),
+        provider_id="mock:result-snapshot",
+    )
+    agent = await Agent.create(
+        "result-snapshot",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        result = await agent.run("Create a document, then snapshot its tool result.")
+        assert len(result.artifacts) == 2
+        snapshot_ref = result.artifacts[1]
+    finally:
+        await agent.close()
+    reopened = await Agent.open(
+        "result-snapshot",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        payload = await reopened.read_artifact(snapshot_ref.artifact_id)
+    finally:
+        await reopened.close()
+
+    assert payload.content == b'{"character_count":7,"format":"txt"}'
+    assert snapshot_ref.capability_id == RESULT_SNAPSHOT_CAPABILITY_ID
+    assert snapshot_ref.media_type == "application/json"
+    binding = snapshot_ref.provenance.result_binding
+    assert binding is not None
+    assert binding.call_id == "create"
+    assert binding.capability_id == DOCUMENT_CREATE_CAPABILITY_ID
+    assert binding.executor_id == "artifact.create_document.executor"
+    assert binding.result_sha256 == snapshot_ref.sha256
+    assert binding.producer_provenance["run_id"] == snapshot_ref.run_id
+
+
+async def test_result_snapshot_rejects_cross_run_evidence(tmp_path: Path) -> None:
+    provider = MockModelProvider(
+        (
+            _document_call(),
+            _stop("first run complete"),
+            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "create"}),
+            _stop("second run complete"),
+        ),
+        provider_id="mock:result-snapshot-cross-run",
+    )
+    agent = await Agent.create(
+        "result-snapshot-cross-run",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        first = await agent.run("Create one artifact.")
+        second = await agent.run(
+            "Try to snapshot the result from the preceding run.",
+            conversation_id=first.conversation_id,
+        )
+        snapshot = _tool_result(await agent.transcript(second.run_id), "snapshot")
+    finally:
+        await agent.close()
+
+    assert second.artifacts == ()
+    assert snapshot.is_error is True
+    assert _result_error_code(snapshot) == "artifact_snapshot_evidence_invalid"
+
+
+async def test_result_snapshot_rejects_cross_agent_evidence(tmp_path: Path) -> None:
+    producer = MockModelProvider(
+        (_document_call(), _stop()),
+        provider_id="mock:result-snapshot-agent-one",
+    )
+    first = await Agent.create(
+        "result-snapshot-agent-one",
+        root=tmp_path,
+        model=producer,
+        model_profile=_profile(producer),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        await first.run("Create one artifact in the first agent.")
+    finally:
+        await first.close()
+
+    consumer = MockModelProvider(
+        (
+            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "create"}),
+            _stop(),
+        ),
+        provider_id="mock:result-snapshot-agent-two",
+    )
+    second = await Agent.create(
+        "result-snapshot-agent-two",
+        root=tmp_path,
+        model=consumer,
+        model_profile=_profile(consumer),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        result = await second.run("Try to snapshot another agent's result.")
+        snapshot = _tool_result(await second.transcript(result.run_id), "snapshot")
+    finally:
+        await second.close()
+
+    assert result.artifacts == ()
+    assert snapshot.is_error is True
+    assert _result_error_code(snapshot) == "artifact_snapshot_evidence_invalid"
+
+
+async def test_result_snapshot_rejects_failed_call_evidence(tmp_path: Path) -> None:
+    provider = MockModelProvider(
+        (
+            _call(
+                "failed",
+                DOCUMENT_CREATE_TOOL_NAME,
+                {"format": "pdf", "content": "not admitted"},
+            ),
+            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "failed"}),
+            _stop(),
+        ),
+        provider_id="mock:result-snapshot-failed-call",
+    )
+    agent = await Agent.create(
+        "result-snapshot-failed-call",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        result = await agent.run("Try to snapshot a failed tool call.")
+        transcript = await agent.transcript(result.run_id)
+    finally:
+        await agent.close()
+
+    assert _tool_result(transcript, "failed").is_error is True
+    snapshot = _tool_result(transcript, "snapshot")
+    assert snapshot.is_error is True
+    assert _result_error_code(snapshot) == "artifact_snapshot_evidence_invalid"
+    assert result.artifacts == ()
+
+
+class _TranscriptTamperingProvider(MockModelProvider):
+    def __init__(
+        self,
+        tamper: Callable[[ToolResultBlock], ToolResultBlock],
+        *,
+        provider_id: str,
+    ) -> None:
+        super().__init__(
+            (
+                _document_call(),
+                _call(
+                    "snapshot",
+                    RESULT_SNAPSHOT_TOOL_NAME,
+                    {"call_id": "create"},
+                ),
+                _stop(),
+            ),
+            provider_id=provider_id,
+        )
+        self._tamper = tamper
+        self.state_path: Path | None = None
+        self.tampered = False
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        if not self.tampered and any(
+            isinstance(block, ToolResultBlock) and block.call_id == "create"
+            for message in request.messages
+            for block in message.content
+        ):
+            assert self.state_path is not None
+            with sqlite3.connect(self.state_path) as connection:
+                rows = connection.execute(
+                    "SELECT run_id, position, data FROM messages ORDER BY run_id, position"
+                ).fetchall()
+                for run_id, position, data in rows:
+                    message = decode_message(data)
+                    if not any(
+                        isinstance(block, ToolResultBlock) and block.call_id == "create"
+                        for block in message.content
+                    ):
+                        continue
+                    tampered = replace(
+                        message,
+                        content=tuple(
+                            (
+                                self._tamper(block)
+                                if isinstance(block, ToolResultBlock)
+                                and block.call_id == "create"
+                                else block
+                            )
+                            for block in message.content
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE messages SET data = ? WHERE run_id = ? AND position = ?",
+                        (encode_message(tampered), run_id, position),
+                    )
+                    self.tampered = True
+                    break
+            assert self.tampered
+        return await super().generate(request)
+
+
+async def test_result_snapshot_rejects_tampered_execution_lineage(
+    tmp_path: Path,
+) -> None:
+    provider = _TranscriptTamperingProvider(
+        lambda block: replace(block, executor_id="tampered.executor"),
+        provider_id="mock:result-snapshot-lineage-tampered",
+    )
+    agent = await Agent.create(
+        "result-snapshot-tampered",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    provider.state_path = agent._embedded._store.path
+    try:
+        result = await agent.run("Create a document and snapshot its exact result.")
+        snapshot = _tool_result(await agent.transcript(result.run_id), "snapshot")
+    finally:
+        await agent.close()
+
+    assert provider.tampered is True
+    assert len(result.artifacts) == 1
+    assert snapshot.is_error is True
+    assert _result_error_code(snapshot) == "artifact_snapshot_evidence_invalid"
+
+
+def _tamper_result_data(block: ToolResultBlock) -> ToolResultBlock:
+    output = dict(block.output)
+    data = output.get("data")
+    assert isinstance(data, Mapping)
+    changed = dict(data)
+    changed["character_count"] = 8
+    output["data"] = changed
+    return replace(block, output=output)
+
+
+async def test_result_snapshot_rejects_schema_valid_result_data_tampering(
+    tmp_path: Path,
+) -> None:
+    provider = _TranscriptTamperingProvider(
+        _tamper_result_data,
+        provider_id="mock:result-snapshot-data-tampered",
+    )
+    agent = await Agent.create(
+        "result-snapshot-data-tampered",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    provider.state_path = agent._embedded._store.path
+    try:
+        result = await agent.run("Create a document and snapshot its exact result.")
+        snapshot = _tool_result(await agent.transcript(result.run_id), "snapshot")
+    finally:
+        await agent.close()
+
+    assert provider.tampered is True
+    assert len(result.artifacts) == 1
+    assert snapshot.is_error is True
+    assert _result_error_code(snapshot) == "artifact_snapshot_evidence_invalid"
+
+
+async def test_result_snapshot_obeys_the_existing_artifact_quota(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import daita.artifacts.store as artifact_store_module
+
+    monkeypatch.setattr(artifact_store_module, "MAX_ARTIFACTS_PER_RUN", 1)
+    provider = MockModelProvider(
+        (
+            _document_call(),
+            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "create"}),
+            _stop(),
+        ),
+        provider_id="mock:result-snapshot-quota",
+    )
+    agent = await Agent.create(
+        "result-snapshot-quota",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        result = await agent.run("Create and snapshot one result.")
+        snapshot = _tool_result(await agent.transcript(result.run_id), "snapshot")
+    finally:
+        await agent.close()
+
+    assert len(result.artifacts) == 1
+    assert snapshot.is_error is True
+    assert _result_error_code(snapshot) == "artifact_quota_exceeded"
+
+
+async def test_result_snapshot_cancellation_cannot_publish_a_partial_artifact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = MockModelProvider(
+        (
+            _document_call(),
+            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "create"}),
+            _stop(),
+        ),
+        provider_id="mock:result-snapshot-cancelled",
+    )
+    agent = await Agent.create(
+        "result-snapshot-cancelled",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        id_factory=_ids(),
+        workspace=workspace_for(tmp_path),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    store = agent._embedded._artifact_store
+    original_commit = store._commit_sync
+
+    def blocked_snapshot_commit(*args: object, **kwargs: object):
+        capability_id = args[5]
+        if capability_id == RESULT_SNAPSHOT_CAPABILITY_ID:
+            entered.set()
+            release.wait(timeout=5)
+        return original_commit(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "_commit_sync", blocked_snapshot_commit)
+    run = asyncio.create_task(agent.run("Create and snapshot one result."))
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        run.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+        refs = await store.list_refs()
+        assert len(refs) == 1
+        assert refs[0].capability_id == DOCUMENT_CREATE_CAPABILITY_ID
+        assert not tuple(store.staging.iterdir())
+    finally:
+        release.set()
+        await agent.close()
 
 
 def test_artifact_save_local_schema_rejects_bytes_paths_commands_and_overwrite() -> (

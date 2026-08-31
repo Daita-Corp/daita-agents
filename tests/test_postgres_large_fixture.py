@@ -128,13 +128,32 @@ class _BulkUpdateProvider:
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
                     ToolCall(
+                        id="bulk-load-update-tools",
+                        name="toolbox_load",
+                        arguments={
+                            "tool_names": [
+                                "data_preview_postgresql_update",
+                                "data_update_postgresql",
+                            ]
+                        },
+                    ),
+                ),
+            )
+        if self._phase == 1:
+            loaded = self._latest_result(request, "bulk-load-update-tools")
+            assert loaded.is_error is False
+            self._phase = 2
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
                         id="bulk-preview",
                         name="data_preview_postgresql_update",
                         arguments=self._plan(),
                     ),
                 ),
             )
-        if self._phase == 1:
+        if self._phase == 2:
             preview = self._latest_result(request, "bulk-preview")
             assert preview.is_error is False
             data = preview.output["data"]
@@ -145,7 +164,7 @@ class _BulkUpdateProvider:
             assert matched_rows > 1
             assert isinstance(preview_fingerprint, str)
             self._matched_rows = matched_rows
-            self._phase = 2
+            self._phase = 3
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
@@ -160,14 +179,14 @@ class _BulkUpdateProvider:
                     ),
                 ),
             )
-        if self._phase == 2:
+        if self._phase == 3:
             update = self._latest_result(request, "bulk-update")
             assert update.is_error is False
             data = update.output["data"]
             assert isinstance(data, Mapping)
             assert data["outcome"] == "committed"
             assert data["affected_rows"] == self._matched_rows
-            self._phase = 3
+            self._phase = 4
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
@@ -187,7 +206,7 @@ class _BulkUpdateProvider:
                     ),
                 ),
             )
-        if self._phase == 3:
+        if self._phase == 4:
             readback = self._latest_result(request, "bulk-readback")
             assert readback.is_error is False
             data = readback.output["data"]
@@ -199,7 +218,7 @@ class _BulkUpdateProvider:
             assert isinstance(row, Mapping)
             assert row["priority"] == self._desired_priority
             assert row["matched_rows"] == self._matched_rows
-            self._phase = 4
+            self._phase = 5
             return ModelResponse(
                 finish_reason=FinishReason.STOP,
                 text=(f"Committed and verified {self._matched_rows} ticket updates."),

@@ -24,6 +24,7 @@ from .capabilities import (
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -56,6 +57,7 @@ from .llm.models import (
 from .loop.models import (
     LoopLimits,
     RunInput,
+    RunOrigin,
     ToolBatchCertainty,
     ToolBatchInterruption,
     ToolBatchOutcome,
@@ -380,6 +382,10 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
                     },
                     "operational_effect": {
                         "type": "string",
+                        "description": (
+                            "External operational-effect filter; Daita-owned "
+                            "artifact creation remains none. Omit when uncertain."
+                        ),
                         "enum": [item.value for item in OperationalEffect],
                     },
                     "limit": {
@@ -499,7 +505,7 @@ class CapabilityRuntime:
         )
         if capability.operational_effect is not OperationalEffect.NONE:
             raise ValueError(
-                "Phase B internal execution cannot bypass operational-effect governance"
+                "internal execution cannot bypass operational-effect governance"
             )
         domain = self._domains[owner_id]
         call = ToolCall(
@@ -602,6 +608,12 @@ class CapabilityRuntime:
                     raise ValueError(f"tool projected by the wrong domain: {name}")
                 if run.execution_scope is not None and not run.execution_scope.allows(
                     capability
+                ):
+                    continue
+                if (
+                    run.origin is RunOrigin.SCHEDULED_ROUTINE
+                    and capability.automation_eligibility
+                    is not AutomationEligibility.SCHEDULED_DIRECT
                 ):
                     continue
                 schema_digest = _sha256_digest(capability.input_schema)
@@ -1777,6 +1789,10 @@ class CapabilityRuntime:
             raise ToolOutputValidationError(
                 "artifact draft media type is outside the capability policy"
             )
+        if draft.provenance.authorship not in policy.allowed_authorships:
+            raise ToolOutputValidationError(
+                "artifact draft authorship is outside the capability policy"
+            )
         if (
             len(draft.content) > policy.max_bytes_per_artifact
             or len(draft.content) > policy.max_total_bytes_per_call
@@ -2722,8 +2738,21 @@ def _validate_run_execution_scope(
     if scope is None:
         return
     if (
+        run.origin is RunOrigin.SCHEDULED_ROUTINE
+        and capability.automation_eligibility
+        is not AutomationEligibility.SCHEDULED_DIRECT
+    ):
+        raise CapabilityInputError(
+            "scheduled_capability_ineligible",
+            "The requested capability is not admitted for scheduled execution.",
+            {"capability_id": capability.id},
+        )
+    source_identity_allowed = run.source_id in scope.allowed_source_ids
+    if scope.routine_id is not None and run.source_id is None:
+        source_identity_allowed = True
+    if (
         scope.agent_id != run.agent_id
-        or run.source_id not in scope.allowed_source_ids
+        or not source_identity_allowed
         or not scope.allows(capability)
     ):
         raise CapabilityInputError(
@@ -2852,6 +2881,12 @@ def _with_execution_lineage(
         result,
         capability_id=capability.id,
         executor_id=capability.executor_id,
+        output_sha256=(
+            None
+            if result.is_error
+            else "sha256:"
+            + sha256(canonical_json(result.output).encode("utf-8")).hexdigest()
+        ),
     )
 
 

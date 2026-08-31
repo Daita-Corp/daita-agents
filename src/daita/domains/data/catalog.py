@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
 from typing import TYPE_CHECKING, Protocol
 
 from ..._json import FrozenJsonObject
@@ -397,6 +398,31 @@ class CatalogDataView:
             resource.source_id,
             resource.kind.value,
             resource.current_revision,
+        )
+
+    async def resource_revision_fact(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> tuple[str, str, ModelSensitivity] | None:
+        """Return one exact current readable resource-revision observation fact."""
+
+        readable = await self.readable_resource_ids(agent_id, (source_id,))
+        if resource_id not in readable:
+            return None
+        resource = await self._store.load_resource(agent_id, resource_id)
+        if (
+            resource is None
+            or resource.agent_id != agent_id
+            or resource.source_id != source_id
+            or resource.sensitivity is Sensitivity.UNKNOWN
+        ):
+            return None
+        return (
+            resource.current_revision,
+            "sha256:" + sha256(resource.current_sync_id.encode("utf-8")).hexdigest(),
+            ModelSensitivity(resource.sensitivity.value),
         )
 
     async def semantic_resource_facts(

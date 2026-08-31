@@ -56,6 +56,7 @@ from .screens.onboarding import (
     SourceSetupScreen,
 )
 from .screens.permissions import PermissionsScreen
+from .screens.routines import RoutinesScreen
 from .screens.selection import SelectionScreen
 from .screens.source_edit import SourceEditScreen
 from .widgets.composer import (
@@ -699,6 +700,10 @@ class DaitaApp(App[int]):
                     initial_view=str(payload.get("view", "details")),
                 )
             )
+            return
+        if screen_name == "routines":
+            await self._await_modal(RoutinesScreen())
+            await self.refresh_background_status(notify_new=False)
             return
         if screen_name == "inbox":
             await self._await_modal(InboxScreen())
