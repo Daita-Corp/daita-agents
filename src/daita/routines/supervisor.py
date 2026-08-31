@@ -114,13 +114,13 @@ class RoutineSupervisor:
     async def _drive(self) -> None:
         try:
             while not self._closing:
+                self._wake.clear()
                 if self._execute_run is not None and (
                     self._worker is None or self._worker.done()
                 ):
                     await self._recover()
                     if self._worker is None or self._worker.done():
                         await self._claim_one_due()
-                self._wake.clear()
                 timeout = self._poll_seconds
                 try:
                     deadline = await self._store.next_routine_deadline(self._agent_id)

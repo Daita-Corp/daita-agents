@@ -196,6 +196,7 @@ class JobSupervisor:
     async def _drive(self) -> None:
         try:
             while not self._closing:
+                self._wake.clear()
                 expired = await self._store.expire_due_jobs(
                     self._agent_id,
                     expired_at=self._clock(),
@@ -204,7 +205,6 @@ class JobSupervisor:
                     self._notify_terminal(job)
                 await self._adopt_external_claims()
                 await self._claim_available()
-                self._wake.clear()
                 try:
                     await asyncio.wait_for(
                         self._wake.wait(),
