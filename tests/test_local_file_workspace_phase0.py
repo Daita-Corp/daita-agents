@@ -22,7 +22,6 @@ from daita.domains.data.export_capabilities import (
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
 )
-from daita.hosting.embedded import EmbeddedAgent
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -75,8 +74,10 @@ def _database(path: Path, table: str) -> None:
 def test_local_workspace_is_required_and_removed_source_surface_is_absent() -> None:
     create = inspect.signature(Agent.create)
     opened = inspect.signature(Agent.open)
-    assert create.parameters["workspace"].default is inspect.Parameter.empty
-    assert opened.parameters["workspace"].default is inspect.Parameter.empty
+    assert create.parameters["workspace"].default is None
+    assert opened.parameters["workspace"].default is None
+    assert create.parameters["hosted"].default is False
+    assert opened.parameters["hosted"].default is False
     assert not hasattr(daita, "LocalDirectorySource")
     assert not hasattr(Agent, "attach_local_directory")
     assert not hasattr(Agent, "edit_local_directory_source")
@@ -247,32 +248,37 @@ async def test_hosted_composition_has_no_local_file_authority(tmp_path: Path) ->
             _stop(),
         )
     )
-    hosted = await EmbeddedAgent.create(
+    hosted = await Agent.create(
         "hosted",
+        workspace=None,
         hosted=True,
         root=tmp_path,
         model=provider,
         model_profile=_profile(provider),
     )
     try:
-        assert "file_search" not in hosted._capabilities.tool_names
-        assert "file_read" not in hosted._capabilities.tool_names
-        assert ARTIFACT_EDIT_TEXT_TOOL_NAME not in hosted._capabilities.tool_names
-        assert "artifact_save_local" not in hosted._capabilities.tool_names
-        assert hosted._workspace_backend is None
-        assert hosted._artifact_delivery is None
-        assert not (set(hosted._capabilities._capabilities) & LOCAL_FILE_CAPABILITY_IDS)
-        assert not (set(hosted._capabilities._executors) & LOCAL_FILE_EXECUTOR_IDS)
+        embedded = hosted._embedded
+        assert "file_search" not in embedded._capabilities.tool_names
+        assert "file_read" not in embedded._capabilities.tool_names
+        assert ARTIFACT_EDIT_TEXT_TOOL_NAME not in embedded._capabilities.tool_names
+        assert "artifact_save_local" not in embedded._capabilities.tool_names
+        assert embedded._workspace_backend is None
+        assert embedded._artifact_delivery is None
         assert not (
-            set(hosted._capabilities._capabilities) & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
+            set(embedded._capabilities._capabilities) & LOCAL_FILE_CAPABILITY_IDS
+        )
+        assert not (set(embedded._capabilities._executors) & LOCAL_FILE_EXECUTOR_IDS)
+        assert not (
+            set(embedded._capabilities._capabilities)
+            & LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS
         )
         assert not (
-            set(hosted._capabilities._executors) & LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS
+            set(embedded._capabilities._executors) & LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS
         )
         assert {
             ARTIFACT_SAVE_LOCAL_EXECUTOR_ID,
             ARTIFACT_SET_EXPORT_LOCATION_EXECUTOR_ID,
-        }.isdisjoint(hosted._capabilities._executors)
+        }.isdisjoint(embedded._capabilities._executors)
         result = await hosted.run("Attempt a forged local file call")
         transcript = await hosted.transcript(result.run_id)
         rejected = {
@@ -290,7 +296,7 @@ async def test_hosted_composition_has_no_local_file_authority(tmp_path: Path) ->
             assert isinstance(error, Mapping)
             assert error["code"] == "tool_not_available"
         with pytest.raises(ValueError, match="hosted"):
-            await EmbeddedAgent.open(
+            await Agent.open(
                 "hosted",
                 hosted=True,
                 workspace=LocalWorkspace(tmp_path.parent),
@@ -298,6 +304,21 @@ async def test_hosted_composition_has_no_local_file_authority(tmp_path: Path) ->
             )
     finally:
         await hosted.close()
+
+    reopened = await Agent.open(
+        "hosted",
+        workspace=None,
+        hosted=True,
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+    )
+    try:
+        restored = await reopened.transcript(result.run_id)
+        assert restored.run.id == result.run_id
+        assert restored.run.conversation_id == result.conversation_id
+    finally:
+        await reopened.close()
 
 
 async def test_files_only_cannot_be_combined_with_a_selected_source(
