@@ -13,8 +13,8 @@ from _mcp_fixtures import (
     mock_transport,
 )
 
-from daita._json import canonical_json
 from daita import __version__
+from daita._json import canonical_json
 from daita.adapters.mcp import (
     MCP_MAX_REQUEST_BYTES,
     MCP_MAX_RESPONSE_BYTES,
