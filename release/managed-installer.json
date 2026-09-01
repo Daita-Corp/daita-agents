@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "installer": {
-    "version": "1.0.0",
-    "release_sequence": 1
+    "version": "1.0.1",
+    "release_sequence": 2
   },
   "runtime": {
     "uv_version": "0.12.7",
