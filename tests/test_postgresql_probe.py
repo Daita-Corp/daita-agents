@@ -72,12 +72,12 @@ class _Asyncpg:
         return self.connection
 
 
-def _source(secret_provider: Any) -> PostgreSQLSource:
+def _source(secret_provider: Any, *, username: str = "reader") -> PostgreSQLSource:
     return PostgreSQLSource(
         host="db.example.test",
         port=5432,
         database="warehouse",
-        username="reader",
+        username=username,
         credential=SecretReference.keychain("agent:postgresql:credential"),
         schemas=("placeholder",),
         ssl_mode="require",
@@ -120,6 +120,18 @@ async def test_postgresql_probe_uses_fixed_bounded_sql_and_always_closes(
     assert arguments == (101,)
     assert connection.close_calls == 1
     assert connection.terminate_calls == 0
+
+
+async def test_postgresql_probe_accepts_supabase_pooler_role_names(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    connection = _Connection(())
+    driver = _Asyncpg(connection)
+    monkeypatch.setattr("daita.adapters.postgresql._load_asyncpg", lambda: driver)
+
+    await _source(_Secrets(), username="postgres.project_ref").probe()
+
+    assert driver.connects[0]["user"] == "postgres.project_ref"
 
 
 async def test_postgresql_probe_accepts_asyncpg_record_shaped_rows(

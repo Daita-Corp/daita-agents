@@ -55,6 +55,7 @@ from .protocols import (
 )
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]{0,62}\Z")
+_ROLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.$]{0,127}\Z")
 _SSL_MODES = frozenset(
     {"disable", "prefer", "allow", "require", "verify-ca", "verify-full"}
 )
@@ -331,8 +332,8 @@ class PostgreSQLSource:
         _bounded_text(self.username, "username", maximum=128)
         if _IDENTIFIER.fullmatch(self.database) is None:
             raise ValueError("database must be a safe PostgreSQL identifier")
-        if _IDENTIFIER.fullmatch(self.username) is None:
-            raise ValueError("username must be a safe PostgreSQL identifier")
+        if _ROLE_NAME.fullmatch(self.username) is None:
+            raise ValueError("username must be a safe PostgreSQL role name")
         if (
             not isinstance(self.port, int)
             or isinstance(self.port, bool)
