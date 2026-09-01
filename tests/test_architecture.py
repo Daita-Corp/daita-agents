@@ -703,22 +703,22 @@ def test_stage_seven_exports_records_without_exporting_their_owners():
 
 def test_survivor_docs_and_examples_describe_only_the_mvp():
     root = PACKAGE.parents[1]
-    readme = (root / "README.md").read_text(encoding="utf-8")
+    architecture = (root / "AGENTS.md").read_text(encoding="utf-8")
     examples_readme = (root / "examples" / "README.md").read_text(encoding="utf-8")
-    normalized_readme = " ".join(readme.split())
-    normalized_readme_words = normalized_readme.replace("-", " ")
+    normalized_architecture = " ".join(architecture.split())
+    normalized_architecture_words = normalized_architecture.replace("-", " ")
     normalized_examples_readme = " ".join(examples_readme.split())
 
     for required in (
-        "at most 8 runs, 40 messages, and 24,000 UTF-8 bytes",
-        "Data access is read first",
-        "explicitly scoped PostgreSQL update",
-        "foreground",
-        "in-process approve-once callback",
-        "does not persist events, collect telemetry",
+        "bounded projection of completed runs",
+        "Data capabilities are reads except",
+        "structured PostgreSQL update",
+        "foreground-authorized content",
+        "Approval is once-only, in-process",
+        "does not create durable events, telemetry",
         "session runtime",
     ):
-        assert required.replace("-", " ") in normalized_readme_words
+        assert required.replace("-", " ") in normalized_architecture_words
     assert "bounded cold continuation" in normalized_examples_readme
     assert "best-effort non-persisted events" in normalized_examples_readme
 
