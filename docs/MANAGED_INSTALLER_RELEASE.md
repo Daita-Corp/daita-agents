@@ -73,11 +73,12 @@ clean-machine tests on every platform for which support will be claimed.
 `.github/workflows/managed-release.yml` is the publication control plane. A
 manual run with **Publish** disabled builds and verifies a release candidate
 without publishing it. Pushing a tag matching the project version, such as
-`v1.0.1`, runs the same verification without publishing. To publish, manually
-run the workflow on that exact tag with **Publish** enabled. The GitHub
-publication job names the `managed-installer-release` environment, and the
-PyPI job names the separate `pypi` environment. Configure both with required
-reviewers before the first joint release.
+`v1.0.1`, runs the same verification without publishing. The successful tag
+run retains the exact verified wheel in its `managed-release` workflow
+artifact. Download and publish that wheel to PyPI locally, then manually run
+the workflow on the same tag with **Publish** enabled. The GitHub publication
+job names the `managed-installer-release` environment; configure it with the
+required reviewers.
 
 The workflow:
 
@@ -89,34 +90,63 @@ The workflow:
 5. downloads and verifies the pinned official uv archive, installs the exact
    managed Python, and runs the real managed lifecycle on all four native
    target runners;
-6. records `SHA256SUMS` and GitHub artifact attestations;
-7. requires an explicit publish run, enforces a forward-only sequence, and
-   refuses to replace an existing release; and
-8. refuses a version already present on PyPI, creates the versioned GitHub
-   release, and downloads every public asset again to prove that the published
-   bytes match the verified bytes;
-9. publishes the exact once-built wheel through PyPI Trusted Publishing with
-   no stored API token; and
-10. reads the version-specific PyPI JSON API and verifies the public wheel's
-    filename and SHA-256 against the candidate artifact.
+6. records `SHA256SUMS` and retains the verified release artifacts;
+7. requires the exact once-built wheel to be published locally to PyPI before
+   the protected GitHub publication run can proceed;
+8. reads the version-specific PyPI JSON API and verifies that it contains only
+   the expected wheel with the candidate artifact's SHA-256;
+9. refuses to replace an existing GitHub release and enforces a forward-only
+   release sequence; and
+10. attests the exact artifacts, creates the versioned GitHub release, and
+    downloads every public asset again to prove that the published bytes match
+    the verified bytes.
 
-Before the first PyPI run, configure the existing `daita-agents` project with
-this GitHub Actions Trusted Publisher:
+## Local PyPI publication
+
+PyPI publication intentionally uses the project API key on a release operator's
+machine. The workflow stores no PyPI credential, requests no PyPI OIDC token,
+and does not require a `pypi` GitHub environment or Trusted Publisher. Keep the
+key only in the ignored repository-root `.env` file:
 
 ```text
-Owner: Daita-Corp
-Repository: daita-agents
-Workflow: managed-release.yml
-Environment: pypi
+PYPI_API_KEY=pypi-...
 ```
 
-The protected manual publish run is the only PyPI upload path. A tag push or a
-candidate run with **Publish** disabled cannot upload. The PyPI job receives
-only `id-token: write`, downloads the already verified workflow artifact, and
-uploads only the wheel staged in `pypi-dist`. It does not rebuild or tolerate
-an existing version. If the upload job fails after the GitHub release succeeds,
-fix the publisher configuration and use GitHub's **Re-run failed jobs** action;
-the successful build and GitHub publication jobs remain unchanged.
+Use this order for every release:
+
+1. merge the reviewed version and installer-sequence change;
+2. create and push the annotated `vX.Y.Z` tag;
+3. wait for the tag-triggered **Daita managed release** workflow to pass on all
+   four native targets;
+4. download and extract that run's `managed-release` artifact into a clean
+   local directory;
+5. verify `SHA256SUMS`, then upload only its wheel with Twine and the local API
+   key; and
+6. manually run **Daita managed release** on the same tag with **Publish**
+   enabled and approve the `managed-installer-release` environment.
+
+From the repository root, with the downloaded files in
+`/absolute/path/to/managed-release`, run:
+
+```bash
+cd /absolute/path/to/managed-release
+shasum -a 256 -c SHA256SUMS
+
+(
+  set -eu
+  PYPI_API_KEY="$(sed -n 's/^PYPI_API_KEY=//p' /absolute/path/to/daita-agents/.env)"
+  test -n "$PYPI_API_KEY"
+  TWINE_USERNAME=__token__ TWINE_PASSWORD="$PYPI_API_KEY" \
+    /absolute/path/to/daita-agents/.venv/bin/python -m twine upload \
+    --non-interactive --disable-progress-bar \
+    daita_agents-X.Y.Z-py3-none-any.whl
+)
+```
+
+The final workflow run fails closed unless PyPI returns exactly that wheel
+filename and SHA-256. PyPI versions are immutable, so never rebuild or retry
+with different bytes under the same version. Rotate the API key immediately if
+the local `.env` file or release machine is exposed.
 
 Before tagging a later release, increment `installer.release_sequence` in the
 reviewed policy. An older installer refuses to replace a newer installed
