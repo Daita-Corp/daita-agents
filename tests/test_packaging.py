@@ -45,7 +45,7 @@ def test_default_distribution_contains_every_supported_production_dependency():
         "asyncpg>=0.30.0,<1.0.0",
         "google-genai>=1.73.1,<2.0.0",
         "keyring>=25.0.0,<26.0.0",
-        "openai>=1.99.9,<2.0.0",
+        "openai>=2.45.0,<3.0.0",
         "rich>=15.0.0,<16.0.0",
         "textual>=8.2.8,<9.0.0",
         "sqlglot>=30.14.0,<30.15.0",
@@ -61,19 +61,27 @@ def test_customer_and_fixture_documentation_use_the_complete_pipx_install():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     fixture = (ROOT / "tests/fixtures/postgresql/README.md").read_text(encoding="utf-8")
     instructions = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    state_guide = (ROOT / "docs" / "LOCAL_STATE_UPGRADES.md").read_text(
+        encoding="utf-8"
+    )
+    installer_guide = (ROOT / "docs" / "MANAGED_INSTALLER_RELEASE.md").read_text(
+        encoding="utf-8"
+    )
 
     assert "pipx install daita-agents" in readme
     assert "pipx upgrade daita-agents" in readme
     assert PIPX_REPAIR in readme
     assert "pipx uninstall daita-agents" in readme
-    assert "first production state format has not been frozen" in readme
-    assert "no backward-compatibility guarantee" in readme
-    assert "one mutable checksummed" in readme
-    assert "development baseline" in readme
-    assert "does not migrate between unreleased formats" in readme
-    assert "first immutable baseline" in readme
     assert "\ndaita\n" in readme
-    assert "## Advanced/headless CLI" in readme
+    assert "docs/LOCAL_STATE_UPGRADES.md" in readme
+    assert "docs/MANAGED_INSTALLER_RELEASE.md" in readme
+    assert "examples/README.md" in readme
+    assert "CONTRIBUTING.md" in readme
+    assert "SECURITY.md" in readme
+    assert "has not frozen its first production state format" in state_guide
+    assert "no backward-compatibility guarantee" in state_guide
+    assert "development_baseline" in state_guide
+    assert "first production state freeze" in state_guide
     assert "pipx install daita-agents" in fixture
     assert "\ndaita --root /private/tmp/daita-live" in fixture
     assert "↑/↓" in fixture
@@ -82,7 +90,7 @@ def test_customer_and_fixture_documentation_use_the_complete_pipx_install():
     assert "Escape" in fixture
     assert "live provider call" in fixture
     assert "developer-operated" in fixture
-    assert "tests/pipx_lifecycle_smoke.py" in readme
+    assert "tests/pipx_lifecycle_smoke.py" in installer_guide
     assert "first launch" in readme
     assert "returning launch" in readme
     assert "default production dependencies" in instructions
@@ -177,7 +185,7 @@ def test_managed_installer_documentation_describes_the_gated_release_pipeline():
         encoding="utf-8"
     )
 
-    assert "has not been promoted" in readme
+    assert "docs/MANAGED_INSTALLER_RELEASE.md" in readme
     assert "UNRESOLVED_*" in status
     assert "release/managed-installer.json" in status
     assert "scripts/render_managed_installer.py" in status
@@ -188,7 +196,6 @@ def test_managed_installer_documentation_describes_the_gated_release_pipeline():
     assert "Stable endpoint promotion" in status
     assert "installer.sha256" in status
     assert "0.x-to-1.0 migration is unsupported" in readme
-    assert "does not adopt, migrate, delete, or overwrite" in readme
 
 
 def _missing_import(module: str, action: Callable[[], object]) -> ImportError:

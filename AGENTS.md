@@ -334,8 +334,11 @@ session runtime or resumable loop.
 text. They are not catalog truth, evidence, policy, authorization, executors,
 or plugins. Semantic annotations are also advisory and must remain grounded in
 current resource identity and evidence. Learning uses the ordinary foreground
-loop and explicit capabilities; candidate review is an opt-in bounded request,
-not a background agent.
+loop and explicit capabilities. Candidate review is disabled by default. When
+explicitly requested, it uses one tool-free model request outside `AgentLoop`
+and places proposals in an inactive inbox. `/memory accept <id>` handles exactly
+one candidate through a fresh foreground run; there is no bulk acceptance or
+background learning agent.
 
 Operational effects use the fixed governance branch immediately before the
 effect in `CapabilityRuntime`. Approval is once-only, in-process, and bound to

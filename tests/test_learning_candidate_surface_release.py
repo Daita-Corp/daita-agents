@@ -380,13 +380,12 @@ def test_candidate_review_measurement_rejects_values_above_fixed_bounds(
         CandidateReviewMeasurement(**cast(Any, {field_name: value}))
 
 
-def test_readme_documents_explicit_inactive_review_lifecycle() -> None:
-    readme = (Path(__file__).parents[1] / "README.md").read_text(encoding="utf-8")
-    normalized = " ".join(readme.split())
+def test_architecture_guide_documents_explicit_inactive_review_lifecycle() -> None:
+    guide = (Path(__file__).parents[1] / "AGENTS.md").read_text(encoding="utf-8")
+    normalized = " ".join(guide.split())
     normalized_words = normalized.replace("-", " ")
 
-    assert "Candidate review is disabled by default." in readme
+    assert "Candidate review is disabled by default." in guide
     assert "one tool free model request outside `AgentLoop`" in normalized_words
-    assert "`/memory accept <id>` handles exactly one candidate" in readme
-    assert "There is no bulk acceptance." in normalized
-    assert "Daita performs no post-run review, auxiliary model call" not in readme
+    assert "`/memory accept <id>` handles exactly" in guide
+    assert "there is no bulk acceptance" in normalized
