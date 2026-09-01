@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from daita import terminal
+from daita import __version__, terminal
 from daita._installation import (
     MANAGED_REPAIR_GUIDANCE,
     PIPX_REPAIR_GUIDANCE,
@@ -38,7 +38,8 @@ def _project_metadata() -> dict[str, Any]:
 def test_default_distribution_contains_every_supported_production_dependency():
     project = _project_metadata()
 
-    assert project["version"] == "1.0.0"
+    assert project["version"] == "1.0.1"
+    assert __version__ == project["version"]
     assert project["requires-python"] == ">=3.11,<3.13"
     assert set(project["dependencies"]) == {
         "anthropic>=0.116.0,<1.0.0",
@@ -191,6 +192,9 @@ def test_managed_installer_documentation_describes_the_gated_release_pipeline():
     assert "scripts/render_managed_installer.py" in status
     assert ".github/workflows/managed-release.yml" in status
     assert "managed-installer-release" in status
+    assert "Environment: pypi" in status
+    assert "Trusted Publisher" in status
+    assert "exact once-built wheel" in status
     assert "all four native\n   target runners" in status
     assert "refuses to replace an existing release" in status
     assert "Stable endpoint promotion" in status

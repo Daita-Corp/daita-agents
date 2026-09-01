@@ -122,7 +122,7 @@ from .semantics import (
 from .skills import Skill, SkillSummary
 from .workspace import LocalWorkspace
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 __all__ = [
     "Agent",

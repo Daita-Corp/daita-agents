@@ -24,6 +24,7 @@ class MCPFixtureIdentity:
     block_calls: asyncio.Event | None = None
     malformed_method: str | None = None
     initialized_notification_failures: int = 0
+    initialize_client_info: dict[str, object] | None = None
 
     @property
     def endpoint(self) -> str:
@@ -65,6 +66,11 @@ class MCPConformanceTransport:
                 return httpx.Response(500, request=request)
             return httpx.Response(202, request=request)
         if method == "initialize":
+            params = payload.get("params")
+            assert isinstance(params, dict)
+            client_info = params.get("clientInfo")
+            assert isinstance(client_info, dict)
+            identity.initialize_client_info = dict(client_info)
             return _json_response(
                 request,
                 payload["id"],

@@ -73,11 +73,11 @@ clean-machine tests on every platform for which support will be claimed.
 `.github/workflows/managed-release.yml` is the publication control plane. A
 manual run with **Publish** disabled builds and verifies a release candidate
 without publishing it. Pushing a tag matching the project version, such as
-`v1.0.0`, runs the same verification without publishing. To publish, manually
-run the workflow on that exact tag with **Publish** enabled. The publication
-job also names the `managed-installer-release` GitHub environment; configure
-that environment with required reviewers before the first release for a
-second approval boundary.
+`v1.0.1`, runs the same verification without publishing. To publish, manually
+run the workflow on that exact tag with **Publish** enabled. The GitHub
+publication job names the `managed-installer-release` environment, and the
+PyPI job names the separate `pypi` environment. Configure both with required
+reviewers before the first joint release.
 
 The workflow:
 
@@ -92,8 +92,31 @@ The workflow:
 6. records `SHA256SUMS` and GitHub artifact attestations;
 7. requires an explicit publish run, enforces a forward-only sequence, and
    refuses to replace an existing release; and
-8. creates the versioned GitHub release and downloads every public asset again
-   to prove that the published bytes match the verified bytes.
+8. refuses a version already present on PyPI, creates the versioned GitHub
+   release, and downloads every public asset again to prove that the published
+   bytes match the verified bytes;
+9. publishes the exact once-built wheel through PyPI Trusted Publishing with
+   no stored API token; and
+10. reads the version-specific PyPI JSON API and verifies the public wheel's
+    filename and SHA-256 against the candidate artifact.
+
+Before the first PyPI run, configure the existing `daita-agents` project with
+this GitHub Actions Trusted Publisher:
+
+```text
+Owner: Daita-Corp
+Repository: daita-agents
+Workflow: managed-release.yml
+Environment: pypi
+```
+
+The protected manual publish run is the only PyPI upload path. A tag push or a
+candidate run with **Publish** disabled cannot upload. The PyPI job receives
+only `id-token: write`, downloads the already verified workflow artifact, and
+uploads only the wheel staged in `pypi-dist`. It does not rebuild or tolerate
+an existing version. If the upload job fails after the GitHub release succeeds,
+fix the publisher configuration and use GitHub's **Re-run failed jobs** action;
+the successful build and GitHub publication jobs remain unchanged.
 
 Before tagging a later release, increment `installer.release_sequence` in the
 reviewed policy. An older installer refuses to replace a newer installed

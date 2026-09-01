@@ -22,9 +22,10 @@ from scripts.render_managed_installer import (
 
 ROOT = Path(__file__).parents[1]
 RENDERER = ROOT / "scripts" / "render_managed_installer.py"
+RELEASE_VERSION = "1.0.1"
 WHEEL_URL = (
-    "https://github.com/Daita-Corp/daita-agents/releases/download/v1.0.0/"
-    "daita_agents-1.0.0-py3-none-any.whl"
+    f"https://github.com/Daita-Corp/daita-agents/releases/download/v{RELEASE_VERSION}/"
+    f"daita_agents-{RELEASE_VERSION}-py3-none-any.whl"
 )
 
 
@@ -38,7 +39,7 @@ def _write_policy(path: Path, document: dict[str, Any]) -> Path:
 
 
 def test_reviewed_policy_renders_one_deterministic_release(tmp_path: Path):
-    wheel = build_minimal_wheel(tmp_path)
+    wheel = build_minimal_wheel(tmp_path, version=RELEASE_VERSION)
     policy = load_release_policy(DEFAULT_POLICY)
 
     first = render_managed_installer(
@@ -54,10 +55,10 @@ def test_reviewed_policy_renders_one_deterministic_release(tmp_path: Path):
 
     assert first == second
     assert "UNRESOLVED_" not in first.installer
-    assert 'readonly DAITA_VERSION="1.0.0"' in first.installer
+    assert f'readonly DAITA_VERSION="{RELEASE_VERSION}"' in first.installer
     assert 'readonly UV_VERSION="0.12.7"' in first.installer
     assert 'readonly PYTHON_REQUEST="cpython-3.12.14"' in first.installer
-    assert first.manifest["installer"]["release_sequence"] == 1
+    assert first.manifest["installer"]["release_sequence"] == 2
     assert first.manifest["wheel"]["url"] == WHEEL_URL
     assert (
         first.manifest["installer"]["sha256"]
@@ -136,7 +137,7 @@ def test_policy_rejects_mutable_or_untrusted_transport_shape(tmp_path: Path, url
 
 
 def test_renderer_rejects_mutable_or_mistagged_wheel_urls(tmp_path: Path):
-    wheel = build_minimal_wheel(tmp_path)
+    wheel = build_minimal_wheel(tmp_path, version=RELEASE_VERSION)
     policy = load_release_policy(DEFAULT_POLICY)
 
     with pytest.raises(ReleaseInputError, match="mutable latest"):
@@ -148,7 +149,10 @@ def test_renderer_rejects_mutable_or_mistagged_wheel_urls(tmp_path: Path):
                 f"{wheel.name}"
             ),
         )
-    with pytest.raises(ReleaseInputError, match="immutable release tag v1.0.0"):
+    with pytest.raises(
+        ReleaseInputError,
+        match=f"immutable release tag v{RELEASE_VERSION}",
+    ):
         render_managed_installer(
             policy=policy,
             wheel=wheel,
@@ -222,6 +226,7 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "managed-installer-release" in workflow
     assert "needs:\n      - build\n      - native-installer-smoke" in workflow
     assert "Refuse an existing mutable release" in workflow
+    assert "Refuse an existing PyPI release" in workflow
     assert "Require a forward-only release sequence" in workflow
     assert "current <= previous" in workflow
     assert "inputs.publish == true" in workflow
@@ -230,6 +235,19 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "gh release create" in workflow
     assert "Verify published bytes" in workflow
     assert 'cmp "release-artifacts/$artifact"' in workflow
+    assert "pypi-publish:" in workflow
+    assert "name: pypi" in workflow
+    assert "url: https://pypi.org/p/daita-agents" in workflow
+    assert "sha256sum --check SHA256SUMS" in workflow
+    assert "pypi-dist/" in workflow
+    assert (
+        "pypa/gh-action-pypi-publish@" "dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
+    ) in workflow
+    assert "packages-dir: pypi-dist/" in workflow
+    assert "skip-existing" not in workflow
+    assert "Verify the public PyPI wheel" in workflow
+    assert 'item.get("filename") == wheel' in workflow
+    assert 'matches[0].get("digests", {}).get("sha256")' in workflow
     assert "Resolve the reviewed target policy" in workflow
     assert 'policy = json.load(open("release/managed-installer.json"' in workflow
     assert "steps.runtime.outputs.uv_sha256" in workflow

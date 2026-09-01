@@ -14,6 +14,7 @@ from _mcp_fixtures import (
 )
 
 from daita._json import canonical_json
+from daita import __version__
 from daita.adapters.mcp import (
     MCP_MAX_REQUEST_BYTES,
     MCP_MAX_RESPONSE_BYTES,
@@ -75,6 +76,10 @@ async def test_two_fixture_identities_use_one_production_streamable_http_boundar
         assert alpha_result.structured is not None
         assert alpha_result.structured.to_dict() == {"answer": "alpha"}
         assert beta_result.text == ("beta",)
+        assert alpha.initialize_client_info == {
+            "name": "daita",
+            "version": __version__,
+        }
         assert secrets.resolutions
         assert set(beta.request_methods) >= {
             "initialize",

@@ -712,7 +712,7 @@ class StreamableHTTPMCPClient:
                     "params": {
                         "protocolVersion": MCP_SUPPORTED_PROTOCOL_VERSIONS[0],
                         "capabilities": {},
-                        "clientInfo": {"name": "daita", "version": "1.0.0"},
+                        "clientInfo": {"name": "daita", "version": "1.0.1"},
                     },
                 },
                 include_protocol=False,
