@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: Publish the verified tag as an immutable managed release
+        description: Publish the verified tag after its exact wheel is on PyPI
         required: true
         type: boolean
         default: false
@@ -188,25 +188,37 @@ jobs:
             echo "Release $GITHUB_REF_NAME already exists; refusing to replace assets." >&2
             exit 1
           fi
-      - name: Refuse an existing PyPI release
+      - name: Require the exact public PyPI wheel
         env:
           VERSION: ${{ needs.build.outputs.version }}
+          WHEEL: ${{ needs.build.outputs.wheel }}
         shell: bash
         run: |
-          status="$(curl --silent --show-error --location \
+          cd release-artifacts
+          sha256sum --check SHA256SUMS
+          expected="$(sha256sum "$WHEEL" | cut -d' ' -f1)"
+          response="$RUNNER_TEMP/pypi-release.json"
+          curl --fail --silent --show-error --location \
             --proto '=https' --tlsv1.2 \
-            --output "$RUNNER_TEMP/pypi-release.json" \
-            --write-out '%{http_code}' \
-            "https://pypi.org/pypi/daita-agents/$VERSION/json")"
-          if [[ "$status" == "404" ]]; then
-            exit 0
-          fi
-          if [[ "$status" == "200" ]]; then
-            echo "PyPI release $VERSION already exists; refusing to publish different bytes." >&2
-            exit 1
-          fi
-          echo "Unexpected PyPI release lookup status: $status" >&2
-          exit 1
+            --retry 10 --retry-all-errors --retry-delay 3 \
+            --output "$response" \
+            "https://pypi.org/pypi/daita-agents/$VERSION/json"
+          python - "$response" "$VERSION" "$WHEEL" "$expected" <<'PY'
+          import json
+          import sys
+
+          response, version, wheel, expected = sys.argv[1:]
+          with open(response, encoding="utf-8") as source:
+              document = json.load(source)
+          if document.get("info", {}).get("version") != version:
+              raise SystemExit("PyPI returned the wrong release version")
+          files = document.get("urls", [])
+          if len(files) != 1 or files[0].get("filename") != wheel:
+              raise SystemExit("PyPI does not contain exactly the expected wheel")
+          actual = files[0].get("digests", {}).get("sha256")
+          if actual != expected:
+              raise SystemExit("PyPI wheel SHA-256 does not match the release artifact")
+          PY
       - name: Require a forward-only release sequence
         env:
           GH_TOKEN: ${{ github.token }}
@@ -259,78 +271,3 @@ jobs:
               --output "$RUNNER_TEMP/$artifact" "$base/$artifact"
             cmp "release-artifacts/$artifact" "$RUNNER_TEMP/$artifact"
           done
-
-  pypi-publish:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref_type == 'tag'
-    needs:
-      - build
-      - publish
-    runs-on: ubuntu-24.04
-    environment:
-      name: pypi
-      url: https://pypi.org/p/daita-agents
-    permissions:
-      id-token: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: managed-release
-          path: release-artifacts
-      - name: Stage the exact verified wheel
-        shell: bash
-        run: |
-          cd release-artifacts
-          sha256sum --check SHA256SUMS
-          test -f "${{ needs.build.outputs.wheel }}"
-          mkdir ../pypi-dist
-          cp "${{ needs.build.outputs.wheel }}" ../pypi-dist/
-          test "$(find ../pypi-dist -type f | wc -l)" -eq 1
-      - name: Publish exact wheel to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
-        with:
-          packages-dir: pypi-dist/
-
-  verify-pypi:
-    if: github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref_type == 'tag'
-    needs:
-      - build
-      - pypi-publish
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: managed-release
-          path: release-artifacts
-      - name: Verify the public PyPI wheel
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
-          WHEEL: ${{ needs.build.outputs.wheel }}
-        shell: bash
-        run: |
-          expected="$(sha256sum "release-artifacts/$WHEEL" | cut -d' ' -f1)"
-          response="$RUNNER_TEMP/pypi-release.json"
-          curl --fail --silent --show-error --location \
-            --proto '=https' --tlsv1.2 \
-            --retry 10 --retry-all-errors --retry-delay 3 \
-            --output "$response" \
-            "https://pypi.org/pypi/daita-agents/$VERSION/json"
-          python - "$response" "$VERSION" "$WHEEL" "$expected" <<'PY'
-          import json
-          import sys
-
-          response, version, wheel, expected = sys.argv[1:]
-          with open(response, encoding="utf-8") as source:
-              document = json.load(source)
-          if document.get("info", {}).get("version") != version:
-              raise SystemExit("PyPI returned the wrong release version")
-          matches = [
-              item
-              for item in document.get("urls", [])
-              if item.get("filename") == wheel
-          ]
-          if len(matches) != 1:
-              raise SystemExit("PyPI did not return exactly one expected wheel")
-          actual = matches[0].get("digests", {}).get("sha256")
-          if actual != expected:
-              raise SystemExit("PyPI wheel SHA-256 does not match the release artifact")
-          PY

@@ -226,7 +226,7 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "managed-installer-release" in workflow
     assert "needs:\n      - build\n      - native-installer-smoke" in workflow
     assert "Refuse an existing mutable release" in workflow
-    assert "Refuse an existing PyPI release" in workflow
+    assert "Require the exact public PyPI wheel" in workflow
     assert "Require a forward-only release sequence" in workflow
     assert "current <= previous" in workflow
     assert "inputs.publish == true" in workflow
@@ -235,19 +235,15 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "gh release create" in workflow
     assert "Verify published bytes" in workflow
     assert 'cmp "release-artifacts/$artifact"' in workflow
-    assert "pypi-publish:" in workflow
-    assert "name: pypi" in workflow
-    assert "url: https://pypi.org/p/daita-agents" in workflow
+    assert workflow.index("Require the exact public PyPI wheel") < workflow.index(
+        "gh release create"
+    )
     assert "sha256sum --check SHA256SUMS" in workflow
-    assert "pypi-dist/" in workflow
-    assert (
-        "pypa/gh-action-pypi-publish@" "dc37677b2e1c63e2034f94d8a5b11f265b73ba33"
-    ) in workflow
-    assert "packages-dir: pypi-dist/" in workflow
-    assert "skip-existing" not in workflow
-    assert "Verify the public PyPI wheel" in workflow
-    assert 'item.get("filename") == wheel' in workflow
-    assert 'matches[0].get("digests", {}).get("sha256")' in workflow
+    assert 'len(files) != 1 or files[0].get("filename") != wheel' in workflow
+    assert 'files[0].get("digests", {}).get("sha256")' in workflow
+    assert "gh-action-pypi-publish" not in workflow
+    assert "environment:\n      name: pypi" not in workflow
+    assert "PYPI_API_KEY" not in workflow
     assert "Resolve the reviewed target policy" in workflow
     assert 'policy = json.load(open("release/managed-installer.json"' in workflow
     assert "steps.runtime.outputs.uv_sha256" in workflow

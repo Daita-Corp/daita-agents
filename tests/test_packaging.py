@@ -192,11 +192,12 @@ def test_managed_installer_documentation_describes_the_gated_release_pipeline():
     assert "scripts/render_managed_installer.py" in status
     assert ".github/workflows/managed-release.yml" in status
     assert "managed-installer-release" in status
-    assert "Environment: pypi" in status
-    assert "Trusted Publisher" in status
+    assert "does not require a `pypi` GitHub environment or Trusted Publisher" in status
+    assert "PYPI_API_KEY=pypi-..." in status
+    assert "python -m twine upload" in status
     assert "exact once-built wheel" in status
     assert "all four native\n   target runners" in status
-    assert "refuses to replace an existing release" in status
+    assert "refuses to replace an existing GitHub release" in status
     assert "Stable endpoint promotion" in status
     assert "installer.sha256" in status
     assert "0.x-to-1.0 migration is unsupported" in readme
