@@ -23,7 +23,6 @@ from daita import (
     SemanticFieldReference,
     SemanticKind,
     SemanticSubject,
-    cli,
 )
 from daita.llm.models import (
     FinishReason,
@@ -292,10 +291,7 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         await reopened.close()
 
 
-async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states(
-    tmp_path,
-    capsys,
-):
+async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
     database = tmp_path / "semantic-memory-surface.db"
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -456,12 +452,6 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert "Current SHA-256:" in detail
         assert "Evidence:" in detail
         assert "user_assertion" in detail
-
-        assert await cli._handle_knowledge_chat_command(["/memory"], agent)
-        cli_rendered = capsys.readouterr().out
-        assert "Active data semantics:" in cli_rendered
-        assert "Stale definitions:" in cli_rendered
-        assert "Conflicts:" in cli_rendered
 
         memory_completion = next(
             item for item in SLASH_COMMAND_COMPLETIONS if item[0] == "/memory"

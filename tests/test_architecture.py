@@ -556,6 +556,53 @@ def test_public_surface_is_focused():
     }
 
 
+def test_confirmed_dead_error_and_learning_candidate_apis_do_not_return():
+    errors_tree = ast.parse((PACKAGE / "errors.py").read_text(encoding="utf-8"))
+    error_classes = {
+        node.name for node in errors_tree.body if isinstance(node, ast.ClassDef)
+    }
+    assert {
+        "SkillError",
+        "RetryableError",
+        "ValidationError",
+        "FocusDSLError",
+        "DataQualityError",
+    }.isdisjoint(error_classes)
+    daita_error = next(
+        node
+        for node in errors_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DaitaError"
+    )
+    daita_error_methods = {
+        node.name
+        for node in daita_error.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {
+        "retry_hint",
+        "is_transient",
+        "is_retryable",
+        "is_permanent",
+    }.isdisjoint(daita_error_methods)
+
+    learning_tree = ast.parse(
+        (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
+    )
+    learning_functions = {
+        node.name
+        for node in learning_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "candidate_matches_successful_mutation" not in learning_functions
+    assert {
+        "SkillError",
+        "RetryableError",
+        "ValidationError",
+        "FocusDSLError",
+        "DataQualityError",
+    }.isdisjoint(daita.__all__)
+
+
 def test_stage_b_has_one_job_aggregate_and_no_parallel_execution_system():
     assert _class_owners("JobRun") == {"jobs/models.py"}
     assert _class_owners("JobOwner") == {"jobs/owner.py"}
@@ -1502,6 +1549,43 @@ def test_textual_and_rich_stay_behind_the_interactive_entry_boundary():
         and node.name == "_load_textual_app"
         for node in tree.body
     )
+
+
+def test_cli_has_no_legacy_interactive_chat_controller():
+    tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
+    top_level_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    top_level_names.update(
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    )
+    assert {
+        "_SKILL_DESCRIPTION_PLACEHOLDER",
+        "_SKILL_INSTRUCTIONS_PLACEHOLDER",
+        "_BUILTIN_CHAT_COMMANDS",
+        "_SourceSummary",
+        "_source_lines",
+        "_resume_command",
+        "_write_sources",
+        "_write_resume",
+        "_ChatTotals",
+        "_write_startup",
+        "_write_help",
+        "_write_memory",
+        "_write_skills",
+        "_write_skill",
+        "_create_skill",
+        "_create_skill_wizard",
+        "_confirm_skill_deletion",
+        "_handle_knowledge_chat_command",
+        "_skill_invocation_message",
+    }.isdisjoint(top_level_names)
 
 
 def test_textual_presentation_has_one_owner_per_concern():

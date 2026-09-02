@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-from typing import TypeVar
+from typing import TypeVar, cast
 
 from .._json import FrozenJsonObject, canonical_json
 
@@ -114,6 +114,29 @@ def _record_tuple(
     if any(not isinstance(value, expected_type) for value in result):
         raise TypeError(f"{field_name} must contain {expected_type.__name__} records")
     return result
+
+
+def _exact_payload_fields(
+    payload: Mapping[str, object],
+    expected: frozenset[str],
+    field_name: str,
+) -> Mapping[str, object]:
+    if not isinstance(payload, Mapping):
+        raise TypeError(f"{field_name} must be an object")
+    actual = frozenset(payload)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        details: list[str] = []
+        if missing:
+            details.append("missing " + ", ".join(missing))
+        if extra:
+            details.append("unexpected " + ", ".join(extra))
+        raise ValueError(
+            f"{field_name} must contain the exact current fields"
+            + (f" ({'; '.join(details)})" if details else "")
+        )
+    return payload
 
 
 def _text_tuple(
@@ -325,6 +348,46 @@ class TabularColumn:
             "updatable": self.updatable,
         }
 
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> TabularColumn:
+        """Strictly decode one current tabular-column payload."""
+
+        value = _exact_payload_fields(
+            payload,
+            frozenset(
+                {
+                    "default_expression",
+                    "generated",
+                    "identity",
+                    "name",
+                    "native_type",
+                    "native_type_name",
+                    "native_type_namespace",
+                    "nullable",
+                    "ordinal",
+                    "primary_key_ordinal",
+                    "updatable",
+                }
+            ),
+            "tabular column payload",
+        )
+        return cls(
+            name=cast(str, value["name"]),
+            native_type=cast(str, value["native_type"]),
+            ordinal=cast(int, value["ordinal"]),
+            nullable=cast(bool, value["nullable"]),
+            primary_key_ordinal=cast(int | None, value["primary_key_ordinal"]),
+            default_expression=cast(str | None, value["default_expression"]),
+            native_type_namespace=cast(
+                str | None,
+                value["native_type_namespace"],
+            ),
+            native_type_name=cast(str | None, value["native_type_name"]),
+            identity=cast(bool, value["identity"]),
+            generated=cast(bool, value["generated"]),
+            updatable=cast(bool, value["updatable"]),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class TabularIndex:
@@ -356,6 +419,26 @@ class TabularIndex:
             "predicate": self.predicate,
             "unique": self.unique,
         }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> TabularIndex:
+        """Strictly decode one current tabular-index payload."""
+
+        value = _exact_payload_fields(
+            payload,
+            frozenset({"columns", "kind", "name", "predicate", "unique"}),
+            "tabular index payload",
+        )
+        raw_columns = value["columns"]
+        if not isinstance(raw_columns, tuple):
+            raise TypeError("tabular index payload columns must be an array")
+        return cls(
+            name=cast(str, value["name"]),
+            kind=cast(str, value["kind"]),
+            columns=cast(tuple[str, ...], raw_columns),
+            unique=cast(bool, value["unique"]),
+            predicate=cast(str | None, value["predicate"]),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -428,6 +511,37 @@ class TabularFacet:
             **self.structural_payload(),
             "row_count_estimate": self.row_count_estimate,
         }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, object]) -> TabularFacet:
+        """Strictly decode one current catalog tabular-facet payload."""
+
+        value = _exact_payload_fields(
+            payload,
+            frozenset({"columns", "indexes", "row_count_estimate"}),
+            "tabular facet payload",
+        )
+        raw_columns = value["columns"]
+        raw_indexes = value["indexes"]
+        if not isinstance(raw_columns, tuple):
+            raise TypeError("tabular facet payload columns must be an array")
+        if not isinstance(raw_indexes, tuple):
+            raise TypeError("tabular facet payload indexes must be an array")
+        if any(not isinstance(item, Mapping) for item in raw_columns):
+            raise TypeError("tabular facet payload columns must contain objects")
+        if any(not isinstance(item, Mapping) for item in raw_indexes):
+            raise TypeError("tabular facet payload indexes must contain objects")
+        return cls(
+            columns=tuple(
+                TabularColumn.from_payload(cast(Mapping[str, object], item))
+                for item in raw_columns
+            ),
+            indexes=tuple(
+                TabularIndex.from_payload(cast(Mapping[str, object], item))
+                for item in raw_indexes
+            ),
+            row_count_estimate=cast(int | None, value["row_count_estimate"]),
+        )
 
 
 @dataclass(frozen=True, slots=True)

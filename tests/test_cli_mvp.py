@@ -21,11 +21,14 @@ from _workspace_support import workspace_for
 
 from daita import (
     Agent,
+    ApprovalDecision,
+    ApprovalRequest,
     PostgreSQLSource,
     Skill,
     SkillSummary,
     cli,
 )
+from daita._json import FrozenJsonObject
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -317,6 +320,7 @@ def test_zero_argument_cli_dispatches_to_the_terminal_application():
     assert call is not None
     assert call.kwargs["root"] is None
     assert call.kwargs["agent_name"] is None
+    assert call.kwargs["conversation_id"] is None
 
 
 def test_zero_argument_cli_rejects_non_tty_before_terminal_dispatch():
@@ -409,7 +413,14 @@ def test_chat_subcommand_is_a_strict_alias_of_the_textual_app():
         new=AsyncMock(return_value=0),
     ) as run_terminal:
         code, stdout, stderr = _invoke(
-            ["chat", "atlas", "--model", "mock:scripted"],
+            [
+                "chat",
+                "atlas",
+                "--model",
+                "mock:scripted",
+                "--conversation",
+                "conversation-1",
+            ],
             tty=True,
         )
 
@@ -420,6 +431,7 @@ def test_chat_subcommand_is_a_strict_alias_of_the_textual_app():
     await_args = run_terminal.await_args
     assert await_args is not None
     assert await_args.kwargs["agent_name"] == "atlas"
+    assert await_args.kwargs["conversation_id"] == "conversation-1"
 
 
 def test_attach_parser_builds_postgresql_source_with_secret_reference():
@@ -802,6 +814,75 @@ def test_cli_2_chat_rejects_non_tty_streams_before_provider_or_agent_open():
     )
     provider_factory.assert_not_called()
     agent_open.assert_not_awaited()
+
+
+def _approval_request(arguments: dict[str, object]) -> ApprovalRequest:
+    return ApprovalRequest(
+        run_id="run-1",
+        call_id="call-1",
+        tool_name="data_update_postgresql",
+        capability_id="data.postgresql.update",
+        arguments=FrozenJsonObject.from_mapping(arguments),
+        reason="update one row",
+    )
+
+
+def test_cli_approval_displays_the_exact_canonical_review_document():
+    request = _approval_request({"city": "Montréal", "count": 1})
+    rendered = request.render_arguments_for_review()
+    assert rendered is not None
+    stdout = io.StringIO()
+
+    with (
+        redirect_stdout(stdout),
+        patch("builtins.input", return_value="y") as prompt,
+    ):
+        decision = asyncio.run(cli._prompt_for_exact_approval(request))
+
+    assert decision is ApprovalDecision.APPROVE
+    assert stdout.getvalue() == (
+        "Approval required\n\n"
+        "Tool:       data_update_postgresql\n"
+        "Capability: data.postgresql.update\n"
+        "Change:     update one row\n"
+        "Arguments:\n"
+        f"{rendered}\n"
+    )
+    assert "Montr\\u00e9al" in stdout.getvalue()
+    assert "Montréal" not in stdout.getvalue()
+    prompt.assert_called_once_with("Approve this exact change once? [y/n]")
+
+
+def test_cli_approval_denies_unreviewable_arguments_without_prompting():
+    request = _approval_request({"blob": "x" * (70 * 1024)})
+    assert request.render_arguments_for_review() is None
+    stdout = io.StringIO()
+
+    with (
+        redirect_stdout(stdout),
+        patch("builtins.input") as prompt,
+    ):
+        decision = asyncio.run(cli._prompt_for_exact_approval(request))
+
+    assert decision is ApprovalDecision.DENY
+    assert stdout.getvalue() == ""
+    prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("answer", ["n", EOFError()])
+def test_cli_approval_explicit_no_and_eof_still_deny(answer: object):
+    request = _approval_request({"count": 1})
+    stdout = io.StringIO()
+    input_kwargs = (
+        {"side_effect": answer}
+        if isinstance(answer, EOFError)
+        else {"return_value": answer}
+    )
+
+    with redirect_stdout(stdout), patch("builtins.input", **input_kwargs):
+        decision = asyncio.run(cli._prompt_for_exact_approval(request))
+
+    assert decision is ApprovalDecision.DENY
 
 
 def test_cli_3_run_still_installs_no_approval_handler():

@@ -309,9 +309,9 @@ async def test_headless_review_uses_bounded_reviewer_configuration(
 
 
 @pytest.mark.unit
-async def test_candidate_acceptance_output_is_bounded_and_sanitized(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
+async def test_candidate_acceptance_controller_output_is_bounded_and_sanitized() -> (
+    None
+):
     unsafe = "accepted\x1b[31m\x00\n" + ("x" * 20_000)
     result = SimpleNamespace(
         final_text=unsafe,
@@ -323,15 +323,6 @@ async def test_candidate_acceptance_output_is_bounded_and_sanitized(
         async def accept_learning_candidate(self, candidate_id: str):
             assert candidate_id == "candidate-1"
             return result
-
-    assert await cli._handle_knowledge_chat_command(
-        ["/memory", "accept", "candidate-1"],
-        Agent(),  # type: ignore[arg-type]
-    )
-    legacy_output = capsys.readouterr().out
-    assert "\x1b" not in legacy_output
-    assert "\x00" not in legacy_output
-    assert len(legacy_output) <= 16_400
 
     controller = PresentationController(root=None, workspace=workspace_for(None))
     controller.agent = Agent()  # type: ignore[assignment]

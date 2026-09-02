@@ -64,24 +64,6 @@ class DaitaError(RuntimeError):
         self.retryability = retryability
         super().__init__(_required_message(message))
 
-    @property
-    def retry_hint(self) -> str:
-        """String form retained for logging and boundary serialization."""
-
-        return self.retryability.value
-
-    def is_transient(self) -> bool:
-        return self.retryability is ErrorRetryability.TRANSIENT
-
-    def is_retryable(self) -> bool:
-        return self.retryability in {
-            ErrorRetryability.TRANSIENT,
-            ErrorRetryability.RETRYABLE,
-        }
-
-    def is_permanent(self) -> bool:
-        return self.retryability is ErrorRetryability.PERMANENT
-
 
 class AgentError(DaitaError):
     """Normalized public agent lifecycle or operation failure."""
@@ -193,25 +175,6 @@ class LLMError(DaitaError):
         )
 
 
-class SkillError(DaitaError):
-    """Failure owned by skill discovery, selection, or lifecycle."""
-
-    def __init__(
-        self,
-        message: str = "Skill operation failed.",
-        *,
-        skill_id: str | None = None,
-        error_code: str = "skill_error",
-        retryability: ErrorRetryability = ErrorRetryability.UNKNOWN,
-    ) -> None:
-        self.skill_id = _optional_identifier(skill_id, "skill_id")
-        super().__init__(
-            message,
-            error_code=error_code,
-            retryability=retryability,
-        )
-
-
 class TransientError(DaitaError):
     """Temporary failure that may clear without changing the request."""
 
@@ -225,22 +188,6 @@ class TransientError(DaitaError):
             message,
             error_code=error_code,
             retryability=ErrorRetryability.TRANSIENT,
-        )
-
-
-class RetryableError(DaitaError):
-    """Failure for which a bounded retry or alternate route may succeed."""
-
-    def __init__(
-        self,
-        message: str = "The operation may be retried.",
-        *,
-        error_code: str = "retryable_error",
-    ) -> None:
-        super().__init__(
-            message,
-            error_code=error_code,
-            retryability=ErrorRetryability.RETRYABLE,
         )
 
 
@@ -291,55 +238,16 @@ class AuthenticationError(PermanentError):
         )
 
 
-class ValidationError(PermanentError):
-    """A normalized validation failure that never retains the rejected value."""
-
-    def __init__(self, *, field: str | None = None) -> None:
-        self.field = _optional_identifier(field, "field")
-        super().__init__(
-            "Validation failed.",
-            error_code="validation_error",
-        )
-
-
-class FocusDSLError(ValidationError):
-    """Typed migration failure for the deferred standalone Focus DSL."""
-
-    def __init__(self) -> None:
-        super().__init__(field="focus_expression")
-        self.error_code = "focus_dsl_error"
-
-
-class DataQualityError(ValidationError):
-    """Typed data-quality failure containing counts, never rejected rows."""
-
-    def __init__(self, *, violation_count: int = 0) -> None:
-        if (
-            not isinstance(violation_count, int)
-            or isinstance(violation_count, bool)
-            or violation_count < 0
-        ):
-            raise ValueError("violation_count must be a non-negative integer")
-        self.violation_count = violation_count
-        super().__init__(field=None)
-        self.error_code = "data_quality_error"
-
-
 __all__ = [
     "AgentError",
     "AuthenticationError",
     "ConfigError",
     "DaitaError",
-    "DataQualityError",
     "ErrorRetryability",
-    "FocusDSLError",
     "LLMError",
     "PermanentError",
     "RateLimitError",
-    "RetryableError",
-    "SkillError",
     "StateCompatibilityCode",
     "StateCompatibilityError",
     "TransientError",
-    "ValidationError",
 ]

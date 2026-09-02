@@ -2387,33 +2387,6 @@ def learning_candidate_content_from_mapping(
     return proposal.content
 
 
-def candidate_matches_successful_mutation(
-    candidate: LearningCandidate,
-    transcript: Transcript,
-) -> bool:
-    """Return whether the transcript contains one exact successful target mutation."""
-
-    if not isinstance(candidate, LearningCandidate):
-        raise TypeError("candidate matching requires LearningCandidate")
-    if not isinstance(transcript, Transcript):
-        raise TypeError("candidate matching requires Transcript")
-    calls: dict[str, ToolCall] = {}
-    for message in transcript.messages:
-        if message.role is MessageRole.ASSISTANT:
-            calls.update({call.id: call for call in message.tool_calls})
-        if message.role is not MessageRole.TOOL:
-            continue
-        for block in message.content:
-            if (
-                isinstance(block, ToolResultBlock)
-                and not block.is_error
-                and (call := calls.get(block.call_id)) is not None
-                and candidate_matches_mutation_call(candidate, call)
-            ):
-                return True
-    return False
-
-
 def candidate_matches_mutation_call(
     candidate: LearningCandidate,
     call: ToolCall,
@@ -2945,7 +2918,6 @@ __all__ = [
     "OneShotCandidateReviewer",
     "SemanticCandidateContent",
     "SkillCandidateContent",
-    "candidate_matches_successful_mutation",
     "candidate_matches_mutation_call",
     "learning_candidate_content_from_mapping",
     "learning_candidate_content_to_mapping",

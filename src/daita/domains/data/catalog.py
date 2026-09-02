@@ -250,89 +250,53 @@ class CatalogDataView:
         schemas: list[ResourceSchema] = []
         for item in tabular_resources:
             resource = item.resource
-            tabular = item.facet
-            raw_columns = tabular.payload.get("columns", ())
-            if not isinstance(raw_columns, tuple):
-                continue
-            columns: tuple[str, ...] = tuple(
-                name
-                for column in raw_columns
-                if isinstance(column, FrozenJsonObject)
-                and isinstance((name := column.get("name")), str)
+            tabular = item.tabular
+            columns = tuple(column.name for column in tabular.columns)
+            column_declared_types = tuple(
+                (column.name, column.native_type) for column in tabular.columns
             )
-            column_declared_types: tuple[tuple[str, str], ...] = tuple(
-                (name, native_type)
-                for column in raw_columns
-                if isinstance(column, FrozenJsonObject)
-                and isinstance((name := column.get("name")), str)
-                and isinstance((native_type := column.get("native_type")), str)
-            )
-            primary_key_columns: tuple[tuple[int, str], ...] = tuple(
-                (ordinal, name)
-                for column in raw_columns
-                if isinstance(column, FrozenJsonObject)
-                and isinstance((name := column.get("name")), str)
-                and isinstance(
-                    (ordinal := column.get("primary_key_ordinal")),
-                    int,
-                )
-                and not isinstance(ordinal, bool)
-                and ordinal > 0
+            primary_key_columns = tuple(
+                (column.primary_key_ordinal, column.name)
+                for column in tabular.columns
+                if column.primary_key_ordinal is not None
             )
             ordered_primary_key_columns = tuple(
                 name for _, name in sorted(primary_key_columns)
             )
-            column_nullability: tuple[tuple[str, bool], ...] = tuple(
-                (name, nullable)
-                for column in raw_columns
-                if isinstance(column, FrozenJsonObject)
-                and isinstance((name := column.get("name")), str)
-                and isinstance((nullable := column.get("nullable")), bool)
+            column_nullability = tuple(
+                (column.name, column.nullable) for column in tabular.columns
             )
-            column_type_provenance: tuple[tuple[str, str, str], ...] = tuple(
-                (name, namespace, native_name)
-                for column in raw_columns
-                if isinstance(column, FrozenJsonObject)
-                and isinstance((name := column.get("name")), str)
-                and isinstance((namespace := column.get("native_type_namespace")), str)
-                and isinstance((native_name := column.get("native_type_name")), str)
+            column_type_provenance = tuple(
+                (
+                    column.name,
+                    column.native_type_namespace,
+                    column.native_type_name,
+                )
+                for column in tabular.columns
+                if column.native_type_namespace is not None
+                and column.native_type_name is not None
             )
-            identity_column_names: list[str] = []
-            generated_column_names: list[str] = []
-            updatable_column_names: list[str] = []
-            for column in raw_columns:
-                if not isinstance(column, FrozenJsonObject):
-                    continue
-                name = column.get("name")
-                if not isinstance(name, str):
-                    continue
-                if column.get("identity") is True:
-                    identity_column_names.append(name)
-                if column.get("generated") is True:
-                    generated_column_names.append(name)
-                if column.get("updatable") is True:
-                    updatable_column_names.append(name)
+            identity_column_names = [
+                column.name for column in tabular.columns if column.identity
+            ]
+            generated_column_names = [
+                column.name for column in tabular.columns if column.generated
+            ]
+            updatable_column_names = [
+                column.name for column in tabular.columns if column.updatable
+            ]
             unique_key_columns: list[str] = []
             if len(primary_key_columns) == 1 and primary_key_columns[0][0] == 1:
                 unique_key_columns.append(primary_key_columns[0][1])
-            raw_indexes = tabular.payload.get("indexes", ())
-            if isinstance(raw_indexes, tuple):
-                for index in raw_indexes:
-                    if (
-                        not isinstance(index, FrozenJsonObject)
-                        or index.get("unique") is not True
-                        or index.get("predicate") is not None
-                    ):
-                        continue
-                    index_columns = index.get("columns")
-                    if (
-                        isinstance(index_columns, tuple)
-                        and len(index_columns) == 1
-                        and isinstance(index_columns[0], str)
-                        and index_columns[0] in columns
-                        and index_columns[0] not in unique_key_columns
-                    ):
-                        unique_key_columns.append(index_columns[0])
+            for index in tabular.indexes:
+                if not index.unique or index.predicate is not None:
+                    continue
+                if (
+                    len(index.columns) == 1
+                    and index.columns[0] in columns
+                    and index.columns[0] not in unique_key_columns
+                ):
+                    unique_key_columns.append(index.columns[0])
             aliases = (
                 ()
                 if resource.native_identity == resource.name
