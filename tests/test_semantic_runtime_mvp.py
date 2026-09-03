@@ -603,9 +603,10 @@ async def test_tool_result_evidence_is_valid_and_save_is_recalled_after_reopen(
     _, source, resource = await _seed_source(tmp_path, "semantic-tool-evidence")
     query = ToolCall(
         id="query-1",
-        name="data_query_sqlite",
+        name="data_query",
         arguments={
             "source_id": source.id,
+            "resource_ids": (resource.id,),
             "sql": "SELECT booked_at, refund_state FROM invoices LIMIT 1",
             "parameters": [],
         },

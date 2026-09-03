@@ -46,10 +46,9 @@ from daita.artifacts.renderers import (
 )
 from daita.catalog.models import Sensitivity
 from daita.domains.data.export_capabilities import (
-    POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-    SQLITE_TABULAR_EXPORT_TOOL_NAME,
-    artifact_capability_declarations,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    DATA_EXPORT_TABULAR_TOOL_NAME,
+    data_export_tabular_capability_declarations,
 )
 from daita.llm.models import (
     FinishReason,
@@ -443,17 +442,13 @@ def test_exact_xlsx_source_failure_never_returns_a_partial_workbook() -> None:
 def test_tabular_tool_schemas_add_xlsx_without_accepting_rows_bytes_or_workbook_control() -> (
     None
 ):
-    declarations = artifact_capability_declarations()
+    declarations = data_export_tabular_capability_declarations()
     views = {
         item.name: item
         for item in declarations.tool_views
-        if item.name
-        in {SQLITE_TABULAR_EXPORT_TOOL_NAME, POSTGRESQL_TABULAR_EXPORT_TOOL_NAME}
+        if item.name == DATA_EXPORT_TABULAR_TOOL_NAME
     }
-    assert set(views) == {
-        SQLITE_TABULAR_EXPORT_TOOL_NAME,
-        POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-    }
+    assert set(views) == {DATA_EXPORT_TABULAR_TOOL_NAME}
     for view in views.values():
         capability = next(
             item for item in declarations.capabilities if item.id == view.capability_id
@@ -462,6 +457,7 @@ def test_tabular_tool_schemas_add_xlsx_without_accepting_rows_bytes_or_workbook_
         assert isinstance(properties, Mapping)
         assert set(properties) == {
             "source_id",
+            "resource_ids",
             "sql",
             "parameters",
             "format",
@@ -495,7 +491,7 @@ async def _sqlite_export_agent(
     name: str,
     downloads: Path,
     rows: tuple[tuple[str, int], ...] = (("row", 1),),
-) -> tuple[Agent, MockModelProvider, str, Path]:
+) -> tuple[Agent, MockModelProvider, str, str, Path]:
     database = tmp_path / f"{name}.db"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE records(label TEXT, number INTEGER)")
@@ -512,7 +508,8 @@ async def _sqlite_export_agent(
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
-    return agent, provider, source.id, database
+    resource = (await agent.list_catalog_resources(source_id=source.id))[0]
+    return agent, provider, source.id, resource.id, database
 
 
 async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
@@ -521,7 +518,7 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
     downloads = tmp_path / "downloads-public-xlsx"
     downloads.mkdir()
     secret = "XLSX_ROW_SECRET_72a3d3"
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="xlsx-public",
         downloads=downloads,
@@ -532,9 +529,10 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
             _tools(
                 ToolCall(
                     id="export",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label, number FROM records ORDER BY number",
                         "format": "xlsx",
                         "filename": "records.xlsx",
@@ -561,7 +559,7 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
         assert len(result.artifacts) == len(result.artifact_deliveries) == 1
         ref = result.artifacts[0]
         assert ref.call_id == "export"
-        assert ref.capability_id == SQLITE_TABULAR_EXPORT_CAPABILITY_ID
+        assert ref.capability_id == DATA_EXPORT_TABULAR_CAPABILITY_ID
         assert ref.media_type == XLSX_MEDIA_TYPE
         assert ref.filename == "records.xlsx"
         assert ref.sensitivity is Sensitivity.INTERNAL
@@ -611,10 +609,7 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
             for block in message.content
             if isinstance(block, TextBlock)
         )
-        assert (
-            "data_export_sqlite or data_export_postgresql for exact CSV/XLSX"
-            in first_request
-        )
+        assert "data_export_tabular for exact CSV/XLSX" in first_request
         assert "Never put source rows or artifact bytes in arguments" in first_request
     finally:
         await agent.close()
@@ -745,7 +740,7 @@ async def test_concurrent_csv_xlsx_exports_keep_order_and_failed_siblings(
 ) -> None:
     downloads = tmp_path / "downloads-mixed-order"
     downloads.mkdir()
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="mixed-order",
         downloads=downloads,
@@ -764,9 +759,10 @@ async def test_concurrent_csv_xlsx_exports_keep_order_and_failed_siblings(
             _tools(
                 ToolCall(
                     id="first-xlsx",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
                         "format": "xlsx",
                         "filename": "first.xlsx",
@@ -774,9 +770,10 @@ async def test_concurrent_csv_xlsx_exports_keep_order_and_failed_siblings(
                 ),
                 ToolCall(
                     id="failed",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
                         "format": "xlsx",
                         "filename": "failed.xlsx",
@@ -784,9 +781,10 @@ async def test_concurrent_csv_xlsx_exports_keep_order_and_failed_siblings(
                 ),
                 ToolCall(
                     id="third-csv",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT number FROM records ORDER BY number",
                         "format": "csv",
                         "filename": "third.csv",
@@ -829,7 +827,7 @@ async def test_delivery_failure_after_xlsx_commit_retains_verified_artifact(
 ) -> None:
     downloads = tmp_path / "downloads-xlsx-failure"
     downloads.mkdir()
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="xlsx-delivery-failure",
         downloads=downloads,
@@ -840,9 +838,10 @@ async def test_delivery_failure_after_xlsx_commit_retains_verified_artifact(
             _tools(
                 ToolCall(
                     id="export",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label, number FROM records",
                         "format": "xlsx",
                         "filename": "retained.xlsx",
@@ -888,7 +887,7 @@ async def test_xlsx_cancellation_emits_no_artifact_bytes_reference_or_delivery(
 ) -> None:
     downloads = tmp_path / "downloads-xlsx-cancel"
     downloads.mkdir()
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="xlsx-cancel",
         downloads=downloads,
@@ -908,9 +907,10 @@ async def test_xlsx_cancellation_emits_no_artifact_bytes_reference_or_delivery(
             _tools(
                 ToolCall(
                     id="cancelled-export",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label FROM records",
                         "format": "xlsx",
                     },

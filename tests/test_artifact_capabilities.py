@@ -34,11 +34,11 @@ from daita.domains.data.export_capabilities import (
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     DOCUMENT_CREATE_CAPABILITY_ID,
     DOCUMENT_CREATE_TOOL_NAME,
-    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
     RESULT_SNAPSHOT_CAPABILITY_ID,
     RESULT_SNAPSHOT_TOOL_NAME,
-    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
     artifact_capability_declarations,
+    data_export_tabular_capability_declarations,
 )
 from daita.llm.models import (
     CanonicalMessage,
@@ -172,21 +172,21 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
 
 def test_d2_certifies_only_the_four_accepted_scheduled_artifact_capabilities() -> None:
     declarations = artifact_capability_declarations()
-    by_id = {capability.id: capability for capability in declarations.capabilities}
+    data_declarations = data_export_tabular_capability_declarations()
+    capabilities = (*declarations.capabilities, *data_declarations.capabilities)
+    by_id = {capability.id: capability for capability in capabilities}
     scheduled = {
         capability.id
-        for capability in declarations.capabilities
+        for capability in capabilities
         if capability.automation_eligibility is AutomationEligibility.SCHEDULED_DIRECT
     }
 
     assert scheduled == {
         DOCUMENT_CREATE_CAPABILITY_ID,
         RESULT_SNAPSHOT_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+        DATA_EXPORT_TABULAR_CAPABILITY_ID,
     }
-    assert by_id[SQLITE_TABULAR_EXPORT_CAPABILITY_ID].access_mode is AccessMode.READ
-    assert by_id[POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID].access_mode is AccessMode.READ
+    assert by_id[DATA_EXPORT_TABULAR_CAPABILITY_ID].access_mode is AccessMode.READ
     assert by_id[DOCUMENT_CREATE_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert by_id[RESULT_SNAPSHOT_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert all(

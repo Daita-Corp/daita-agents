@@ -214,7 +214,7 @@ def _successful_query(
         call.id: call
         for message in transcript.messages
         for call in message.tool_calls
-        if call.name == "data_query_sqlite"
+        if call.name == "data_query"
     }
     results = {
         block.call_id: block

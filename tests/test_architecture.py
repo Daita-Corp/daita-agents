@@ -406,8 +406,7 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
             resolved[name] = owner_id
 
         assert resolved["catalog_search"] == "data"
-        assert resolved["data_query_sqlite"] == "data"
-        assert resolved["data_query_postgresql"] == "data"
+        assert resolved["data_query"] == "data"
         assert resolved["file_search"] == "data"
         assert resolved["file_read"] == "data"
         assert resolved["file_query"] == "data"
@@ -1017,8 +1016,7 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     assert "tools=()" in candidates
     assert "AgentLoop" not in candidates
     assert "CapabilityRuntime" not in candidates
-    assert "data_query_sqlite" not in candidates
-    assert "data_query_postgresql" not in candidates
+    assert "data_query" not in candidates
     assert "evaluation" not in storage.lower()
     assert "telemetry" not in storage.lower()
     assert "from .storage" not in evaluation
@@ -2226,28 +2224,29 @@ def test_exact_tabular_extends_existing_adapter_capability_and_renderer_owners()
         "_execute_exact_csv",
         "SQLITE_CSV_EXPORT_CAPABILITY_ID",
         "POSTGRESQL_CSV_EXPORT_CAPABILITY_ID",
+        "data_query_" + "sqlite",
+        "data_query_" + "postgresql",
+        "data_export_" + "sqlite",
+        "data_export_" + "postgresql",
     ):
         assert obsolete not in package_text
 
 
 def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
     from daita.domains.data.export_capabilities import (
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        artifact_capability_declarations,
+        DATA_EXPORT_TABULAR_CAPABILITY_ID,
+        data_export_tabular_capability_declarations,
     )
 
-    declarations = artifact_capability_declarations()
+    declarations = data_export_tabular_capability_declarations()
     for capability in declarations.capabilities:
-        if capability.id not in {
-            SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        }:
+        if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:
             continue
         properties = capability.input_schema["properties"]
         assert isinstance(properties, Mapping)
         assert set(properties) == {
             "source_id",
+            "resource_ids",
             "sql",
             "parameters",
             "format",

@@ -84,12 +84,11 @@ from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlo
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
+from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
     ResourceSchema,
-    validate_postgresql_read,
-    validate_sqlite_read,
 )
 
 DOCUMENT_CREATE_CAPABILITY_ID = "artifact.create_document"
@@ -102,12 +101,8 @@ RESULT_SNAPSHOT_EXECUTOR_ID = "artifact.snapshot_result.executor"
 RESULT_SNAPSHOT_TOOL_NAME = "artifact_snapshot_result"
 RESULT_SNAPSHOT_OUTPUT_KIND = "artifact.result_snapshot"
 
-SQLITE_TABULAR_EXPORT_CAPABILITY_ID = "data.sqlite.export_tabular"
-SQLITE_TABULAR_EXPORT_EXECUTOR_ID = "data.sqlite.export_tabular.executor"
-SQLITE_TABULAR_EXPORT_TOOL_NAME = "data_export_sqlite"
-POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID = "data.postgresql.export_tabular"
-POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID = "data.postgresql.export_tabular.executor"
-POSTGRESQL_TABULAR_EXPORT_TOOL_NAME = "data_export_postgresql"
+DATA_EXPORT_TABULAR_EXECUTOR_ID = "data.export_tabular.executor"
+DATA_EXPORT_TABULAR_TOOL_NAME = "data_export_tabular"
 TABULAR_EXPORT_OUTPUT_KIND = "artifact.tabular_export"
 
 ARTIFACT_LIST_CAPABILITY_ID = "artifact.list"
@@ -153,10 +148,18 @@ class ArtifactCapabilityDeclarations:
 
 
 @dataclass(frozen=True, slots=True)
+class DataExportTabularDeclarations:
+    capabilities: tuple[Capability, ...]
+    executors: tuple[Executor, ...]
+    tool_views: tuple[ToolView, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ExactTabularExportResult:
     """One complete typed-source export after its selected fixed renderer."""
 
     format: str
+    adapter_id: str
     source_id: str
     source_revision: str
     sql_fingerprint: str
@@ -169,6 +172,8 @@ class ExactTabularExportResult:
     def __post_init__(self) -> None:
         if self.format not in {"csv", "xlsx"}:
             raise ValueError("exact tabular format is invalid")
+        if self.adapter_id not in {"sqlite", "postgresql"}:
+            raise ValueError("exact tabular adapter_id is invalid")
         for value, name in (
             (self.source_id, "source_id"),
             (self.source_revision, "source_revision"),
@@ -357,19 +362,25 @@ class ResultSnapshotExecutor:
         )
 
 
-class _TabularExportExecutor:
-    executor_id: str
+class DataExportTabularExecutor:
+    """Dispatch one trusted catalog-bound relational export to one backend."""
+
+    executor_id = DATA_EXPORT_TABULAR_EXECUTOR_ID
 
     def __init__(
         self,
         agent_id: str,
-        backend: ExactTabularExportBackend,
+        sqlite_backend: ExactTabularExportBackend,
+        postgresql_backend: ExactTabularExportBackend,
         *,
         clock: Callable[[], datetime],
         max_seconds: float = MAX_CSV_SECONDS,
     ) -> None:
         self._agent_id = agent_id
-        self._backend = backend
+        self._backends = {
+            "sqlite": sqlite_backend,
+            "postgresql": postgresql_backend,
+        }
         self._clock = clock
         self._max_seconds = max_seconds
 
@@ -377,14 +388,21 @@ class _TabularExportExecutor:
         source_id = request.arguments["source_id"]
         sql = request.arguments["sql"]
         parameters = request.arguments.get("parameters", ())
+        resource_ids = request.arguments["resource_ids"]
+        adapter_id = request.arguments["_adapter_id"]
         format_name = request.arguments["format"]
         filename = request.arguments.get("filename")
         assert isinstance(source_id, str)
         assert isinstance(sql, str)
         assert isinstance(parameters, tuple)
+        assert isinstance(resource_ids, tuple)
+        assert isinstance(adapter_id, str)
         assert isinstance(format_name, str) and format_name in {"csv", "xlsx"}
         assert filename is None or isinstance(filename, str)
         completed = {"rows": 0, "columns": 0, "bytes": 0}
+        backend = self._backends.get(adapter_id)
+        if backend is None:
+            raise ValueError("relational export adapter binding is unsupported")
 
         def progress(rows: int, columns: int, byte_count: int) -> None:
             completed.update(rows=rows, columns=columns, bytes=byte_count)
@@ -394,7 +412,7 @@ class _TabularExportExecutor:
         )
         try:
             async with asyncio.timeout(self._max_seconds):
-                result = await self._backend.execute_exact_tabular(
+                result = await backend.execute_exact_tabular(
                     agent_id=self._agent_id,
                     source_id=source_id,
                     sql=sql,
@@ -419,7 +437,13 @@ class _TabularExportExecutor:
                     "completed_bytes": completed["bytes"],
                 },
             ) from error
-        if result.source_id != source_id or result.format != format_name:
+        if (
+            result.adapter_id != adapter_id
+            or result.source_id != source_id
+            or result.format != format_name
+            or frozenset(item[0] for item in result.resource_revisions)
+            != frozenset(resource_ids)
+        ):
             raise ValueError("exact tabular backend returned different execution facts")
         media_type = "text/csv" if format_name == "csv" else XLSX_MEDIA_TYPE
         extensions = (
@@ -456,21 +480,20 @@ class _TabularExportExecutor:
         return ToolOutput(
             kind=TABULAR_EXPORT_OUTPUT_KIND,
             data={
+                "adapter_id": adapter_id,
                 "format": format_name,
                 "filename": safe_filename,
+                "source_id": result.source_id,
+                "source_revision": result.source_revision,
+                "resource_revisions": tuple(
+                    {"resource_id": resource_id, "revision": revision}
+                    for resource_id, revision in result.resource_revisions
+                ),
                 "row_count": result.row_count,
                 "column_count": len(result.columns),
             },
             artifact=draft,
         )
-
-
-class SQLiteTabularExportExecutor(_TabularExportExecutor):
-    executor_id = SQLITE_TABULAR_EXPORT_EXECUTOR_ID
-
-
-class PostgreSQLTabularExportExecutor(_TabularExportExecutor):
-    executor_id = POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID
 
 
 class ArtifactListExecutor:
@@ -574,11 +597,7 @@ class ArtifactConvertExecutor:
         )
         if (
             payload.ref.media_type != XLSX_MEDIA_TYPE
-            or payload.ref.capability_id
-            not in {
-                SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-                POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-            }
+            or payload.ref.capability_id != DATA_EXPORT_TABULAR_CAPABILITY_ID
             or payload.ref.provenance.authorship
             is not ArtifactAuthorship.EXACT_SOURCE_DATA
         ):
@@ -818,15 +837,32 @@ class ArtifactSetExportLocationExecutor:
         )
 
 
+def data_export_tabular_declarations(
+    agent_id: str,
+    sqlite_backend: ExactTabularExportBackend,
+    postgresql_backend: ExactTabularExportBackend,
+    clock: Callable[[], datetime],
+) -> DataExportTabularDeclarations:
+    declarations = data_export_tabular_capability_declarations()
+    return DataExportTabularDeclarations(
+        capabilities=declarations.capabilities,
+        executors=(
+            DataExportTabularExecutor(
+                agent_id,
+                sqlite_backend,
+                postgresql_backend,
+                clock=clock,
+            ),
+        ),
+        tool_views=declarations.tool_views,
+    )
+
+
 def artifact_declarations(
     delivery: LocalArtifactDelivery | None,
     artifacts: AgentHomeArtifactStore,
     *,
     workspace: LocalWorkspaceBackend | None,
-    agent_id: str,
-    sqlite_backend: ExactTabularExportBackend,
-    postgresql_backend: ExactTabularExportBackend,
-    clock: Callable[[], datetime],
 ) -> ArtifactCapabilityDeclarations:
     include_local_delivery = delivery is not None
     declarations = artifact_capability_declarations(
@@ -844,8 +880,6 @@ def artifact_declarations(
         executors=(
             DocumentArtifactExecutor(),
             ResultSnapshotExecutor(),
-            SQLiteTabularExportExecutor(agent_id, sqlite_backend, clock=clock),
-            PostgreSQLTabularExportExecutor(agent_id, postgresql_backend, clock=clock),
             ArtifactListExecutor(artifacts),
             ArtifactReadExecutor(artifacts),
             ArtifactConvertExecutor(artifacts),
@@ -853,6 +887,31 @@ def artifact_declarations(
             *delivery_executors,
         ),
         tool_views=declarations.tool_views,
+    )
+
+
+def data_export_tabular_capability_declarations() -> CapabilityDeclarations:
+    capability = _tabular_export_capability()
+    view = ToolView(
+        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+        capability_id=capability.id,
+        description=capability.description,
+        presentation=ToolPresentation(
+            toolbox_id=ToolboxId.ARTIFACTS,
+            load_mode=ToolLoadMode.ON_DEMAND,
+            text_trust=ToolTextTrust.CODE,
+            summary="Export one exact relational query result as CSV or XLSX.",
+            when_to_use=(
+                "Use after catalog_schema provides the exact source and resource IDs."
+            ),
+            keywords=("artifact", "data", "export", "relational", "csv", "xlsx"),
+        ),
+    )
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(capability,),
+        executor_ids=(DATA_EXPORT_TABULAR_EXECUTOR_ID,),
+        tool_views=(view,),
     )
 
 
@@ -955,16 +1014,6 @@ def artifact_capability_declarations(
             max_bytes_per_artifact=MAX_RESULT_SNAPSHOT_BYTES,
             max_total_bytes_per_call=MAX_RESULT_SNAPSHOT_BYTES,
         ),
-    )
-    sqlite_tabular = _tabular_export_capability(
-        capability_id=SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        executor_id=SQLITE_TABULAR_EXPORT_EXECUTOR_ID,
-        adapter_name="SQLite",
-    )
-    postgresql_tabular = _tabular_export_capability(
-        capability_id=POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        executor_id=POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID,
-        adapter_name="PostgreSQL",
     )
     artifact_list = Capability(
         id=ARTIFACT_LIST_CAPABILITY_ID,
@@ -1249,8 +1298,6 @@ def artifact_capability_declarations(
     capabilities = (
         document,
         result_snapshot,
-        sqlite_tabular,
-        postgresql_tabular,
         artifact_list,
         artifact_read,
         artifact_convert,
@@ -1285,32 +1332,6 @@ def artifact_capability_declarations(
                     "validated structured result should become an artifact."
                 ),
                 keywords=("artifact", "snapshot", "result", "json"),
-            ),
-        ),
-        ToolView(
-            name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-            capability_id=sqlite_tabular.id,
-            description=sqlite_tabular.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Export an exact SQLite query result as CSV or XLSX.",
-                when_to_use="Use for a downloadable tabular SQLite result.",
-                keywords=("artifact", "export", "sqlite", "csv", "xlsx"),
-            ),
-        ),
-        ToolView(
-            name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-            capability_id=postgresql_tabular.id,
-            description=postgresql_tabular.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Export an exact PostgreSQL query result as CSV or XLSX.",
-                when_to_use="Use for a downloadable tabular PostgreSQL result.",
-                keywords=("artifact", "export", "postgresql", "csv", "xlsx"),
             ),
         ),
         ToolView(
@@ -1418,9 +1439,7 @@ def artifact_capability_declarations(
     )
 
 
-_EXACT_TABULAR_CAPABILITIES = frozenset(
-    {SQLITE_TABULAR_EXPORT_CAPABILITY_ID, POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}
-)
+_EXACT_TABULAR_CAPABILITIES = frozenset({DATA_EXPORT_TABULAR_CAPABILITY_ID})
 _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
     {
         ARTIFACT_LIST_CAPABILITY_ID,
@@ -1431,22 +1450,14 @@ _ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
         RESULT_SNAPSHOT_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
         ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
     }
 )
-_ARTIFACT_ADAPTER_CAPABILITIES = {
-    "sqlite": frozenset({SQLITE_TABULAR_EXPORT_CAPABILITY_ID}),
-    "postgresql": frozenset({POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}),
-}
 _BASE_ARTIFACT_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
         RESULT_SNAPSHOT_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_LIST_CAPABILITY_ID,
         ARTIFACT_READ_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -1460,14 +1471,6 @@ LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS = frozenset({ARTIFACT_EDIT_TEXT_EXECUTOR_ID})
 
 
 class ArtifactDomainCatalog(Protocol):
-    async def source_routing_facts(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...] = (),
-    ) -> tuple[Mapping[str, object], ...]: ...
-
-    async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
-
     async def resource_schemas(
         self,
         agent_id: str,
@@ -1520,7 +1523,6 @@ class ArtifactCapabilityDomain:
         learning: LearningCandidateGuard,
         *,
         clock: Callable[[], datetime],
-        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("artifact declarations have the wrong domain owner")
@@ -1547,9 +1549,6 @@ class ArtifactCapabilityDomain:
         self._learning = learning
         self._clock = clock
         self._registry: CapabilityRegistry | None = None
-        self._files_only_run_ids = (
-            files_only_run_ids if files_only_run_ids is not None else set()
-        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -1568,19 +1567,6 @@ class ArtifactCapabilityDomain:
         self._registry = registry
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
-        facts = (
-            ()
-            if run.id in self._files_only_run_ids
-            else await self._catalog.source_routing_facts(
-                run.agent_id,
-                (() if run.source_id is None else (run.source_id,)),
-            )
-        )
-        adapters = {
-            adapter_id
-            for fact in facts
-            if isinstance((adapter_id := fact.get("adapter_id")), str)
-        }
         all_refs = await self._artifacts.list_refs()
         conversation_id = run.conversation_id or run.id
         refs = tuple(
@@ -1596,16 +1582,6 @@ class ArtifactCapabilityDomain:
                 view.name,
                 effectful=capability.operational_effect is not OperationalEffect.NONE,
             ):
-                continue
-            required_adapter = next(
-                (
-                    adapter_id
-                    for adapter_id, ids in _ARTIFACT_ADAPTER_CAPABILITIES.items()
-                    if capability.id in ids
-                ),
-                None,
-            )
-            if required_adapter is not None and required_adapter not in adapters:
                 continue
             candidates.append(view)
         may_have_current_artifact = (
@@ -1803,8 +1779,6 @@ class ArtifactCapabilityDomain:
                 raise CapabilityInputError(
                     "artifact_delivery_invalid", "Artifact delivery mode is invalid."
                 )
-        if capability.id in _EXACT_TABULAR_CAPABILITIES:
-            await self._validate_sql(run, capability, arguments)
         return arguments
 
     async def _prepare_result_snapshot(
@@ -2149,14 +2123,7 @@ class ArtifactCapabilityDomain:
                         "artifact edit summary differs from its execution provenance"
                     )
             return
-        if capability.id in _EXACT_TABULAR_CAPABILITIES:
-            valid = (
-                output.data.get("format") in {"csv", "xlsx"}
-                and output.data.get("filename") == draft.suggested_filename
-                and output.data.get("row_count") == draft.provenance.row_count
-                and output.data.get("column_count") == len(draft.provenance.columns)
-            )
-        elif capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
+        if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
             valid = (
                 output.data.get("source_artifact_id")
                 == draft.provenance.derived_from_artifact_id
@@ -2217,13 +2184,6 @@ class ArtifactCapabilityDomain:
                 )
             return draft
         if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
-            if capability.id in _EXACT_TABULAR_CAPABILITIES:
-                return await self._bind_exact_export(
-                    run,
-                    capability,
-                    arguments,
-                    draft,
-                )
             if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
                 return await self._bind_conversion(run, arguments, draft)
             raise ToolOutputValidationError(
@@ -2278,8 +2238,7 @@ class ArtifactCapabilityDomain:
                 )
             block = results[0]
             if block.output.get("kind") not in {
-                "data.sqlite.query_result",
-                "data.postgresql.query_result",
+                "data.query_result",
                 "data.local_file.read_result",
             }:
                 raise CapabilityInputError(
@@ -2404,107 +2363,6 @@ class ArtifactCapabilityDomain:
             )
         return draft
 
-    async def _bind_exact_export(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-        draft: ArtifactDraft,
-    ) -> ArtifactDraft:
-        source_id = arguments.get("source_id")
-        sql = arguments.get("sql")
-        parameters = arguments.get("parameters", ())
-        if (
-            not isinstance(source_id, str)
-            or not isinstance(sql, str)
-            or not isinstance(parameters, tuple)
-        ):
-            raise ToolOutputValidationError(
-                "exact export execution arguments are unavailable"
-            )
-        expected_adapter = (
-            "postgresql"
-            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
-            else "sqlite"
-        )
-        if (
-            await self._catalog.source_adapter_id(
-                run.agent_id,
-                source_id,
-            )
-            != expected_adapter
-        ):
-            raise _incomplete_export(draft, "catalog_changed")
-        resources = await self._catalog.resource_schemas(run.agent_id, source_id)
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError as error:
-            raise _incomplete_export(draft, "permission_state_invalid") from error
-        if run.execution_scope is not None:
-            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = (
-            validate_postgresql_read
-            if expected_adapter == "postgresql"
-            else validate_sqlite_read
-        )
-        validation = validator(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if (
-            not validation.valid
-            or validation.analysis is None
-            or validation.source_revision is None
-            or not validation.resource_ids
-            or len(validation.resource_revisions) != len(validation.resource_ids)
-        ):
-            raise _incomplete_export(draft, "catalog_changed")
-        bindings = tuple(
-            ArtifactResourceBinding(
-                source_id=source_id,
-                source_revision=validation.source_revision,
-                resource_id=resource_id,
-                resource_revision=revision,
-            )
-            for resource_id, revision in sorted(validation.resource_revisions)
-        )
-        parameters_sha256 = (
-            "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
-        )
-        provenance = draft.provenance
-        if (
-            provenance.resource_bindings != bindings
-            or provenance.sql_fingerprint != validation.analysis.sql_fingerprint
-            or provenance.parameters_sha256 != parameters_sha256
-        ):
-            raise ToolOutputValidationError(
-                "exact artifact provenance differs from current runtime facts"
-            )
-        schemas = {item.resource_id: item for item in resources}
-        current: list[Sensitivity] = []
-        for resource_id in validation.resource_ids:
-            schema = schemas.get(resource_id)
-            if schema is None:
-                raise ToolOutputValidationError(
-                    "exact artifact resource is absent from current catalog facts"
-                )
-            try:
-                current.append(Sensitivity(schema.sensitivity_class))
-            except ValueError:
-                current.append(Sensitivity.RESTRICTED)
-        if draft.sensitivity is not _resolved_sensitivity(tuple(current)):
-            raise _incomplete_export(draft, "catalog_changed")
-        return replace(
-            draft,
-            provenance=replace(provenance, resource_bindings=bindings),
-        )
-
     async def _bind_conversion(
         self,
         run: RunInput,
@@ -2575,101 +2433,6 @@ class ArtifactCapabilityDomain:
                 "The requested resource is not available for reading.",
             )
 
-    async def _validate_sql(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-    ) -> None:
-        source_id = arguments.get("source_id")
-        sql = arguments.get("sql")
-        parameters = arguments.get("parameters", ())
-        if (
-            not isinstance(source_id, str)
-            or not isinstance(sql, str)
-            or not sql.strip()
-            or not isinstance(parameters, tuple)
-        ):
-            raise CapabilityInputError(
-                "sql_invalid_input",
-                "SQL reads require source_id, non-empty sql, and an array of "
-                "parameters.",
-            )
-        expected = (
-            "postgresql"
-            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
-            else "sqlite"
-        )
-        if await self._catalog.source_adapter_id(run.agent_id, source_id) != expected:
-            raise CapabilityInputError(
-                "sql_source_adapter_mismatch",
-                "The selected SQL tool does not match the source adapter.",
-                {"expected_adapter": expected, "source_id": source_id},
-            )
-        schemas = await self._catalog.resource_schemas(run.agent_id, source_id)
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError as error:
-            raise CapabilityInputError(
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-            ) from error
-        if run.execution_scope is not None:
-            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = (
-            validate_postgresql_read
-            if expected == "postgresql"
-            else validate_sqlite_read
-        )
-        result = validator(
-            sql,
-            source_id=source_id,
-            resources=schemas,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if not result.valid:
-            if {item.code for item in result.issues} & {
-                "resource_out_of_scope",
-                "unknown_resource",
-            }:
-                raise CapabilityInputError(
-                    "resource_read_not_allowed",
-                    "One or more requested resources are not available for reading.",
-                )
-            raise CapabilityInputError(
-                "sql_validation_failed",
-                "The SQL read is invalid. Correct all reported issues before "
-                "retrying.",
-                {
-                    "issues": tuple(
-                        {
-                            "code": item.code,
-                            "message": item.message,
-                            "details": item.details,
-                        }
-                        for item in result.issues
-                    ),
-                    "source_id": source_id,
-                },
-            )
-
-
-def _incomplete_export(draft: ArtifactDraft, reason: str) -> ArtifactError:
-    return ArtifactError(
-        "artifact_incomplete_export",
-        "Current catalog facts no longer prove the exact artifact.",
-        {
-            "reason": reason,
-            "completed_rows": draft.provenance.row_count or 0,
-            "completed_columns": len(draft.provenance.columns),
-            "completed_bytes": len(draft.content),
-        },
-    )
-
 
 def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:
     ordered = {
@@ -2687,16 +2450,11 @@ def _sha256_json(value: object) -> str:
     return "sha256:" + sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _tabular_export_capability(
-    *,
-    capability_id: str,
-    executor_id: str,
-    adapter_name: str,
-) -> Capability:
+def _tabular_export_capability() -> Capability:
     return Capability(
-        id=capability_id,
+        id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
         description=(
-            f"Run one fresh validated read-only {adapter_name} query and create one "
+            "Run one fresh validated read-only relational query and create one "
             "complete exact CSV or XLSX artifact without routing rows through the "
             "model."
         ),
@@ -2704,6 +2462,13 @@ def _tabular_export_capability(
             "type": "object",
             "properties": {
                 "source_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "resource_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "uniqueItems": True,
+                },
                 "sql": {
                     "type": "string",
                     "minLength": 1,
@@ -2716,7 +2481,7 @@ def _tabular_export_capability(
                 "format": {"type": "string", "enum": ["csv", "xlsx"]},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
-            "required": ["source_id", "sql", "format"],
+            "required": ["source_id", "resource_ids", "sql", "format"],
             "additionalProperties": False,
         },
         output_kind=TABULAR_EXPORT_OUTPUT_KIND,
@@ -2724,7 +2489,27 @@ def _tabular_export_capability(
             "type": "object",
             "properties": {
                 "format": {"type": "string", "enum": ["csv", "xlsx"]},
+                "adapter_id": {
+                    "type": "string",
+                    "enum": ["sqlite", "postgresql"],
+                },
                 "filename": {"type": "string"},
+                "source_id": {"type": "string"},
+                "source_revision": {"type": "string"},
+                "resource_revisions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "resource_id": {"type": "string"},
+                            "revision": {"type": "string"},
+                        },
+                        "required": ["resource_id", "revision"],
+                        "additionalProperties": False,
+                    },
+                },
                 "row_count": {"type": "integer", "minimum": 0},
                 "column_count": {
                     "type": "integer",
@@ -2732,10 +2517,19 @@ def _tabular_export_capability(
                     "maximum": MAX_CSV_COLUMNS,
                 },
             },
-            "required": ["format", "filename", "row_count", "column_count"],
+            "required": [
+                "adapter_id",
+                "format",
+                "filename",
+                "source_id",
+                "source_revision",
+                "resource_revisions",
+                "row_count",
+                "column_count",
+            ],
             "additionalProperties": False,
         },
-        executor_id=executor_id,
+        executor_id=DATA_EXPORT_TABULAR_EXECUTOR_ID,
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
         artifact_policy=ArtifactPolicy(
@@ -2866,6 +2660,10 @@ __all__ = [
     "ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME",
     "ArtifactCapabilityDomain",
     "ArtifactDomainCatalog",
+    "DATA_EXPORT_TABULAR_EXECUTOR_ID",
+    "DATA_EXPORT_TABULAR_TOOL_NAME",
+    "DataExportTabularDeclarations",
+    "DataExportTabularExecutor",
     "TABULAR_EXPORT_OUTPUT_KIND",
     "DOCUMENT_CREATE_CAPABILITY_ID",
     "DOCUMENT_CREATE_EXECUTOR_ID",
@@ -2874,20 +2672,14 @@ __all__ = [
     "ExactTabularExportBackend",
     "ExactTabularProgress",
     "ExactTabularExportResult",
-    "POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID",
-    "POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID",
-    "POSTGRESQL_TABULAR_EXPORT_TOOL_NAME",
-    "PostgreSQLTabularExportExecutor",
     "RESULT_SNAPSHOT_CAPABILITY_ID",
     "RESULT_SNAPSHOT_EXECUTOR_ID",
     "RESULT_SNAPSHOT_OUTPUT_KIND",
     "RESULT_SNAPSHOT_TOOL_NAME",
     "ResultSnapshotExecutor",
-    "SQLITE_TABULAR_EXPORT_CAPABILITY_ID",
-    "SQLITE_TABULAR_EXPORT_EXECUTOR_ID",
-    "SQLITE_TABULAR_EXPORT_TOOL_NAME",
-    "SQLiteTabularExportExecutor",
     "artifact_capability_declarations",
     "artifact_declarations",
+    "data_export_tabular_capability_declarations",
+    "data_export_tabular_declarations",
     "resolved_exact_export_sensitivity",
 ]

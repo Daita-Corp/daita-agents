@@ -52,7 +52,7 @@ from daita.capabilities import (
     ToolOutput,
 )
 from daita.distribution import OutcomeState, conversation_inbox_destination_id
-from daita.domains.data import SQLITE_QUERY_CAPABILITY_ID
+from daita.domains.data import DATA_QUERY_CAPABILITY_ID
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -420,7 +420,7 @@ async def _run_live_routine(
             allowed_source_ids=(scenario.source_id,),
             allowed_connector_binding_ids=(),
             allowed_resource_ids=(scenario.resource_id,),
-            allowed_capability_ids=(SQLITE_QUERY_CAPABILITY_ID,),
+            allowed_capability_ids=(DATA_QUERY_CAPABILITY_ID,),
             sensitivity_ceiling=ModelSensitivity.INTERNAL,
             outcome_contract=no_artifact_outcome_contract(),
             distribution_destination_id=conversation_inbox_destination_id(
@@ -479,7 +479,7 @@ async def _run_live_routine(
     assert scope.occurrence_id == item.subject_id
     assert scope.allowed_source_ids == (scenario.source_id,)
     assert scope.allowed_resource_ids == (scenario.resource_id,)
-    assert scope.allowed_capability_ids == (SQLITE_QUERY_CAPABILITY_ID,)
+    assert scope.allowed_capability_ids == (DATA_QUERY_CAPABILITY_ID,)
     assert scope.allowed_access_modes == frozenset({AccessMode.READ})
     assert scope.allowed_operational_effects == frozenset({OperationalEffect.NONE})
 
@@ -500,7 +500,7 @@ async def _run_live_routine(
     called_tools = {
         call.name for message in transcript.messages for call in message.tool_calls
     }
-    assert "data_query_sqlite" in requested_tools
+    assert "data_query" in requested_tools
     assert not requested_tools & _FORBIDDEN_TOOL_NAMES
     assert not called_tools & _FORBIDDEN_TOOL_NAMES
     return _CompletedRoutine(
@@ -518,7 +518,7 @@ def _query_results(completed: _CompletedRoutine) -> tuple[ToolResultBlock, ...]:
         for message in completed.transcript.messages
         for block in message.content
         if isinstance(block, ToolResultBlock)
-        and block.capability_id == SQLITE_QUERY_CAPABILITY_ID
+        and block.capability_id == DATA_QUERY_CAPABILITY_ID
     )
 
 
@@ -607,7 +607,7 @@ async def test_live_scheduled_read_recovers_after_one_model_visible_query_error(
         resource_name=_TABLE,
     )
     _, executor = scenario.agent._embedded._capabilities.resolve_execution(
-        SQLITE_QUERY_CAPABILITY_ID
+        DATA_QUERY_CAPABILITY_ID
     )
     original_execute = executor.execute
     execution_count = 0

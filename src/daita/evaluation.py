@@ -25,7 +25,7 @@ _CASE_ID = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}\Z")
 _CATALOG_TOOLS = frozenset(
     {"catalog_search", "catalog_schema", "catalog_inspect", "catalog_traverse"}
 )
-_SQL_TOOLS = frozenset({"data_query_sqlite", "data_query_postgresql"})
+_SQL_TOOLS = frozenset({"data_query"})
 _LEARNING_WRITE_TOOLS = frozenset(
     {"memory_set", "semantic_save", "semantic_delete", "skill_save", "skill_delete"}
 )

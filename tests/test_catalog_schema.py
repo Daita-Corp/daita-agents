@@ -648,9 +648,18 @@ class _RegionalMarginProvider:
                 tool_calls=(
                     ToolCall(
                         id="regional-query",
-                        name="data_query_sqlite",
+                        name="data_query",
                         arguments={
                             "source_id": source["source_id"],
+                            "resource_ids": tuple(
+                                by_name[name]["resource_id"]
+                                for name in (
+                                    "main.customers",
+                                    "main.orders",
+                                    "main.order_items",
+                                    "main.products",
+                                )
+                            ),
                             "sql": (
                                 "SELECT c.region_code, "
                                 "SUM(o.total_amount) AS paid_revenue, "
@@ -761,9 +770,12 @@ class _BridgePlanningProvider:
                 tool_calls=(
                     ToolCall(
                         id="bridge-query",
-                        name="data_query_sqlite",
+                        name="data_query",
                         arguments={
                             "source_id": source["source_id"],
+                            "resource_ids": tuple(
+                                resource["resource_id"] for resource in resources
+                            ),
                             "sql": (
                                 "SELECT c.segment, "
                                 "SUM(oi.line_total - (oi.quantity * p.unit_cost)) "
@@ -3300,7 +3312,7 @@ async def test_regional_margin_plan_uses_one_schema_slice_before_querying(
         }
         assert tuple(calls_by_id.values()) == (
             "catalog_schema",
-            "data_query_sqlite",
+            "data_query",
         )
     finally:
         await agent.close()
@@ -3336,7 +3348,7 @@ async def test_one_connected_schema_call_supplies_bridges_before_one_data_query(
             for message in request.messages
             for call in message.tool_calls
         }
-        assert tuple(calls.values()) == ("catalog_schema", "data_query_sqlite")
+        assert tuple(calls.values()) == ("catalog_schema", "data_query")
     finally:
         await agent.close()
 

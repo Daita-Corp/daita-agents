@@ -1225,6 +1225,7 @@ async def test_reviewer_redacts_secret_values_inside_bounded_tool_results(tmp_pa
     )
     try:
         source = await agent.attach_sqlite(database, name="credentials")
+        (resource,) = await agent.list_catalog_resources(source_id=source.id)
         foreground.replace_script(
             (
                 ModelResponse(
@@ -1232,9 +1233,10 @@ async def test_reviewer_redacts_secret_values_inside_bounded_tool_results(tmp_pa
                     tool_calls=(
                         ToolCall(
                             id="secret-row",
-                            name="data_query_sqlite",
+                            name="data_query",
                             arguments={
                                 "source_id": source.id,
+                                "resource_ids": (resource.id,),
                                 "sql": "SELECT api_key FROM credentials",
                             },
                         ),

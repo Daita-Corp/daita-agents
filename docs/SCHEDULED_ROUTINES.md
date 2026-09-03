@@ -37,8 +37,7 @@ byte bounds. Impossible contracts fail before the routine is created.
 The certified scheduled artifact surface is deliberately small:
 
 - `artifact.create_document` for model-authored text or Markdown;
-- `data.sqlite.export_tabular` and `data.postgresql.export_tabular` for exact
-  source-data CSV or XLSX;
+- `data.export_tabular` for exact source-data CSV or XLSX;
 - `artifact.snapshot_result` for canonical JSON from an exact earlier
   successful result in the current scheduled run.
 
@@ -130,7 +129,7 @@ definition. For example:
   "allowed_source_ids": ["source:..."],
   "allowed_connector_binding_ids": [],
   "allowed_resource_ids": ["catalog-resource:..."],
-  "allowed_capability_ids": ["catalog.inspect", "data.sqlite.query"],
+  "allowed_capability_ids": ["catalog.inspect", "data.query"],
   "sensitivity_ceiling": "internal",
   "outcome_contract": {
     "require_terminal_conclusion": true,

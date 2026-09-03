@@ -70,12 +70,10 @@ from daita.distribution import OutcomeState
 from daita.domains.data.export_capabilities import (
     DOCUMENT_CREATE_CAPABILITY_ID,
     DOCUMENT_CREATE_TOOL_NAME,
-    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-    POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    DATA_EXPORT_TABULAR_TOOL_NAME,
     RESULT_SNAPSHOT_CAPABILITY_ID,
     RESULT_SNAPSHOT_TOOL_NAME,
-    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-    SQLITE_TABULAR_EXPORT_TOOL_NAME,
 )
 from daita.llm.models import (
     FinishReason,
@@ -278,20 +276,21 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
             source_ids=(source.id,),
             connector_binding_ids=(),
             resource_ids=(resource.id,),
-            capability_ids=(SQLITE_TABULAR_EXPORT_CAPABILITY_ID,),
+            capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
             outcome_contract=_artifact_contract(
                 media_type="text/csv",
                 authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                producer_capability_id=SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+                producer_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
                 exact_source=True,
             ),
             script=(
                 _tools(
                     ToolCall(
                         id="sqlite-csv",
-                        name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
                         arguments={
                             "source_id": source.id,
+                            "resource_ids": (resource.id,),
                             "sql": "SELECT value FROM current_value",
                             "format": "csv",
                             "filename": "current-value.csv",
@@ -376,20 +375,21 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
             source_ids=(source.id,),
             connector_binding_ids=(),
             resource_ids=(resources["allowed_value"].id,),
-            capability_ids=(SQLITE_TABULAR_EXPORT_CAPABILITY_ID,),
+            capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
             outcome_contract=_artifact_contract(
                 media_type="text/csv",
                 authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                producer_capability_id=SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+                producer_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
                 exact_source=True,
             ),
             script=(
                 _tools(
                     ToolCall(
                         id="outside-export",
-                        name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
                         arguments={
                             "source_id": source.id,
+                            "resource_ids": (resources["outside_value"].id,),
                             "sql": "SELECT value FROM outside_value",
                             "format": "csv",
                         },
@@ -411,7 +411,7 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
         assert block.is_error is True
         error = block.output.get("error")
         assert isinstance(error, Mapping)
-        assert error.get("code") == "resource_read_not_allowed"
+        assert error.get("code") == "execution_scope_resource_violation"
     finally:
         await agent.close()
 
@@ -466,20 +466,21 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
             source_ids=(source.id,),
             connector_binding_ids=(),
             resource_ids=(resource.id,),
-            capability_ids=(SQLITE_TABULAR_EXPORT_CAPABILITY_ID,),
+            capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
             outcome_contract=_artifact_contract(
                 media_type="text/csv",
                 authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                producer_capability_id=SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+                producer_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
                 exact_source=True,
             ),
             script=(
                 _tools(
                     ToolCall(
                         id="recoverable-csv",
-                        name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
                         arguments={
                             "source_id": source.id,
+                            "resource_ids": (resource.id,),
                             "sql": "SELECT value FROM current_value",
                             "format": "csv",
                             "filename": "recoverable.csv",
@@ -768,20 +769,21 @@ async def test_scheduled_postgresql_xlsx_uses_the_same_inbox_path(
             source_ids=(source.id,),
             connector_binding_ids=(),
             resource_ids=(resource.id,),
-            capability_ids=(POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,),
+            capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
             outcome_contract=_artifact_contract(
                 media_type=XLSX_MEDIA_TYPE,
                 authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
-                producer_capability_id=POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+                producer_capability_id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
                 exact_source=True,
             ),
             script=(
                 _tools(
                     ToolCall(
                         id="postgresql-xlsx",
-                        name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
                         arguments={
                             "source_id": source.id,
+                            "resource_ids": (resource.id,),
                             "sql": "SELECT amount FROM public.orders",
                             "format": "xlsx",
                             "filename": "orders.xlsx",

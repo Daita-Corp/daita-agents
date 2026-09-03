@@ -325,7 +325,15 @@ def test_tool_projection_and_approval_document():
     assert CAPABILITY_LABELS["artifact_edit_text"] == "Prepare workspace edit"
     assert CAPABILITY_LABELS["artifact_save_local"] == "Save artifact locally"
     details = project_tool_details(
-        ToolCall(id="c1", name="data_query_sqlite", arguments={"sql": "SELECT 1"}),
+        ToolCall(
+            id="c1",
+            name="data_query",
+            arguments={
+                "source_id": "source-1",
+                "resource_ids": ("resource-1",),
+                "sql": "SELECT 1",
+            },
+        ),
         ToolResultBlock(
             call_id="c1",
             output={
@@ -672,8 +680,8 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                 conversation_id="conversation-live",
                 data=FrozenJsonObject.from_mapping(
                     {
-                        "tool_name": "data_query_postgresql",
-                        "capability_id": "data.postgresql.query",
+                        "tool_name": "data_query",
+                        "capability_id": "data.query",
                         "call_id": "call-live",
                         "duration_ms": 10,
                         "is_error": False,

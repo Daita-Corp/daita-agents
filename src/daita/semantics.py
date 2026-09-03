@@ -2134,8 +2134,7 @@ class SemanticCapabilityDomain:
                 or result.is_error
                 or result.output.get("kind")
                 not in {
-                    "data.sqlite.query_result",
-                    "data.postgresql.query_result",
+                    "data.query_result",
                 }
             ):
                 return (

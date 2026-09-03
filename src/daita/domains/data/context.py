@@ -69,16 +69,17 @@ from ...skills.capabilities import (
     SKILL_VIEW_OUTPUT_KIND,
 )
 from .capabilities import (
+    DATA_QUERY_TOOL_NAME,
     POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
     POSTGRESQL_UPDATE_TOOL_NAME,
 )
 from .controller import (
-    POSTGRESQL_QUERY_EVIDENCE_KIND,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    DATA_QUERY_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_CAPABILITY_ID,
     POSTGRESQL_UPDATE_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
     POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
-    SQLITE_QUERY_EVIDENCE_KIND,
 )
 from .export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -90,8 +91,7 @@ from .export_capabilities import (
     ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
     DOCUMENT_CREATE_CAPABILITY_ID,
-    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
+    DATA_EXPORT_TABULAR_TOOL_NAME,
 )
 from .file_capabilities import (
     LOCAL_FILE_READ_CAPABILITY_ID,
@@ -124,14 +124,12 @@ _CATALOG_EVIDENCE_KINDS = frozenset(
 )
 _QUERY_EVIDENCE_KINDS = frozenset(
     {
-        SQLITE_QUERY_EVIDENCE_KIND,
-        POSTGRESQL_QUERY_EVIDENCE_KIND,
+        DATA_QUERY_EVIDENCE_KIND,
         POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
     }
 )
 _QUERY_TOOL_EVIDENCE_KINDS = {
-    "data_query_sqlite": SQLITE_QUERY_EVIDENCE_KIND,
-    "data_query_postgresql": POSTGRESQL_QUERY_EVIDENCE_KIND,
+    DATA_QUERY_TOOL_NAME: DATA_QUERY_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME: POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_TOOL_NAME: POSTGRESQL_UPDATE_EVIDENCE_KIND,
 }
@@ -538,8 +536,7 @@ class DataContextBuilder:
             capability_ids
             & {
                 DOCUMENT_CREATE_CAPABILITY_ID,
-                SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-                POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+                DATA_EXPORT_TABULAR_CAPABILITY_ID,
                 ARTIFACT_LIST_CAPABILITY_ID,
                 ARTIFACT_READ_CAPABILITY_ID,
                 ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -1862,8 +1859,7 @@ def _system_prompt(
             DOCUMENT_CREATE_CAPABILITY_ID,
             LOCAL_FILE_SEARCH_CAPABILITY_ID,
             LOCAL_FILE_READ_CAPABILITY_ID,
-            SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
+            DATA_EXPORT_TABULAR_CAPABILITY_ID,
             ARTIFACT_LIST_CAPABILITY_ID,
             ARTIFACT_READ_CAPABILITY_ID,
             ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -2074,7 +2070,7 @@ def _system_prompt(
             instructions.append(
                 (
                     "File tools: artifact_create_document for Markdown/TXT; "
-                    "data_export_sqlite or data_export_postgresql for exact CSV/XLSX; "
+                    f"{DATA_EXPORT_TABULAR_TOOL_NAME} for exact CSV/XLSX; "
                     "for earlier generated files in the current conversation use "
                     "artifact_list, then artifact_read only if needed. An exact artifact "
                     "ID returned by job_read_results may be read directly across this "

@@ -148,14 +148,28 @@ class _GroundedFixtureProvider:
             source_id = sources[0]["source_id"]
             if not isinstance(source_id, str):
                 raise AssertionError("schema slice did not expose the source ID")
+            resource_ids_by_name = {
+                item["name"]: item["resource_id"]
+                for item in resources
+                if isinstance(item, Mapping)
+            }
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
                     ToolCall(
                         id="paid-revenue",
-                        name="data_query_postgresql",
+                        name="data_query",
                         arguments={
                             "source_id": source_id,
+                            "resource_ids": tuple(
+                                resource_ids_by_name[name]
+                                for name in (
+                                    "analytics.customers",
+                                    "analytics.orders",
+                                    "analytics.order_items",
+                                    "analytics.products",
+                                )
+                            ),
                             "sql": (
                                 "SELECT c.region_code, "
                                 "SUM(o.total_amount) AS paid_revenue, "

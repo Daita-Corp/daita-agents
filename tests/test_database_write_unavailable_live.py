@@ -132,7 +132,7 @@ class _GuardedRecordingProvider:
         if any(
             isinstance(block, ToolResultBlock)
             and not block.is_error
-            and calls.get(block.call_id) == "data_query_postgresql"
+            and calls.get(block.call_id) == "data_query"
             for message in request.messages
             for block in message.content
         ):

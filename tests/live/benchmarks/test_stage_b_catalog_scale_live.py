@@ -62,7 +62,7 @@ async def test_immediate_target_survives_catalog_distractors(
         assert_completed(capture)
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
         names = logical_names(capture.transcript)
-        assert "data_query_sqlite" in names
+        assert "data_query" in names
         assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
         assert capture.result.usage.total_tokens <= 30_000

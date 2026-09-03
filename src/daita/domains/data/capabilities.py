@@ -23,14 +23,12 @@ from ...capabilities import (
     ToolView,
 )
 from .controller import (
-    POSTGRESQL_QUERY_CAPABILITY_ID,
-    POSTGRESQL_QUERY_EVIDENCE_KIND,
+    DATA_QUERY_CAPABILITY_ID,
+    DATA_QUERY_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_CAPABILITY_ID,
     POSTGRESQL_UPDATE_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
     POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
-    SQLITE_QUERY_CAPABILITY_ID,
-    SQLITE_QUERY_EVIDENCE_KIND,
 )
 from .results import BoundedResultProjection
 from .sql import (
@@ -42,8 +40,8 @@ from .sql import (
     PostgreSQLUpdateIntent,
 )
 
-SQLITE_QUERY_EXECUTOR_ID = "data.sqlite.query.executor"
-POSTGRESQL_QUERY_EXECUTOR_ID = "data.postgresql.query.executor"
+DATA_QUERY_EXECUTOR_ID = "data.query.executor"
+DATA_QUERY_TOOL_NAME = "data_query"
 POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID = "data.postgresql.update_impact.executor"
 POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME = "data_preview_postgresql_update"
 POSTGRESQL_UPDATE_EXECUTOR_ID = "data.postgresql.update.executor"
@@ -406,14 +404,7 @@ class PostgreSQLUpdateBackend(PostgreSQLUpdatePreviewBackend, Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class SQLiteQueryDeclarations:
-    capabilities: tuple[Capability, ...]
-    executors: tuple[Executor, ...]
-    tool_views: tuple[ToolView, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class PostgreSQLQueryDeclarations:
+class DataQueryDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
     tool_views: tuple[ToolView, ...]
@@ -433,20 +424,25 @@ class PostgreSQLUpdateDeclarations:
     tool_views: tuple[ToolView, ...]
 
 
-class _SqlQueryExecutor:
-    executor_id: str
-    output_kind: str
+class DataQueryExecutor:
+    """Dispatch one trusted catalog-bound relational read to one backend."""
+
+    executor_id = DATA_QUERY_EXECUTOR_ID
 
     def __init__(
         self,
         agent_id: str,
-        backend: SqlReadBackend,
+        sqlite_backend: SQLiteReadBackend,
+        postgresql_backend: PostgreSQLReadBackend,
         *,
         max_rows: int = 100,
         max_bytes: int = 65_536,
     ) -> None:
         self._agent_id = agent_id
-        self._backend = backend
+        self._backends: dict[str, SqlReadBackend] = {
+            "sqlite": sqlite_backend,
+            "postgresql": postgresql_backend,
+        }
         self._max_rows = max_rows
         self._max_bytes = max_bytes
 
@@ -454,10 +450,17 @@ class _SqlQueryExecutor:
         source_id = request.arguments["source_id"]
         sql = request.arguments["sql"]
         parameters = request.arguments.get("parameters", ())
+        resource_ids = request.arguments["resource_ids"]
+        adapter_id = request.arguments["_adapter_id"]
         assert isinstance(source_id, str)
         assert isinstance(sql, str)
         assert isinstance(parameters, tuple)
-        result = await self._backend.execute_read(
+        assert isinstance(resource_ids, tuple)
+        assert isinstance(adapter_id, str)
+        backend = self._backends.get(adapter_id)
+        if backend is None:
+            raise ValueError("relational query adapter binding is unsupported")
+        result = await backend.execute_read(
             agent_id=self._agent_id,
             source_id=source_id,
             sql=sql,
@@ -465,19 +468,18 @@ class _SqlQueryExecutor:
             max_rows=self._max_rows,
             max_bytes=self._max_bytes,
         )
-        if result.source_id != source_id:
-            raise ValueError("SQL backend returned a different source")
-        return ToolOutput(kind=self.output_kind, data=result.tool_data())
-
-
-class SQLiteQueryExecutor(_SqlQueryExecutor):
-    executor_id = SQLITE_QUERY_EXECUTOR_ID
-    output_kind = SQLITE_QUERY_EVIDENCE_KIND
-
-
-class PostgreSQLQueryExecutor(_SqlQueryExecutor):
-    executor_id = POSTGRESQL_QUERY_EXECUTOR_ID
-    output_kind = POSTGRESQL_QUERY_EVIDENCE_KIND
+        expected_type = (
+            PostgreSQLReadResult if adapter_id == "postgresql" else SQLiteReadResult
+        )
+        if (
+            not isinstance(result, expected_type)
+            or result.source_id != source_id
+            or frozenset(result.resource_ids) != frozenset(resource_ids)
+        ):
+            raise ValueError("SQL backend returned different catalog binding facts")
+        data = result.tool_data().to_dict()
+        data["adapter_id"] = adapter_id
+        return ToolOutput(kind=DATA_QUERY_EVIDENCE_KIND, data=data)
 
 
 class PostgreSQLUpdatePreviewExecutor:
@@ -576,22 +578,14 @@ class PostgreSQLUpdateExecutor:
         return ToolOutput(kind=POSTGRESQL_UPDATE_EVIDENCE_KIND, data=result.tool_data())
 
 
-def sqlite_query_declarations(
-    agent_id: str, backend: SQLiteReadBackend
-) -> SQLiteQueryDeclarations:
-    executor = SQLiteQueryExecutor(agent_id, backend)
-    declarations = sqlite_query_capability_declarations()
-    return SQLiteQueryDeclarations(
-        declarations.capabilities, (executor,), declarations.tool_views
-    )
-
-
-def postgresql_query_declarations(
-    agent_id: str, backend: PostgreSQLReadBackend
-) -> PostgreSQLQueryDeclarations:
-    executor = PostgreSQLQueryExecutor(agent_id, backend)
-    declarations = postgresql_query_capability_declarations()
-    return PostgreSQLQueryDeclarations(
+def data_query_declarations(
+    agent_id: str,
+    sqlite_backend: SQLiteReadBackend,
+    postgresql_backend: PostgreSQLReadBackend,
+) -> DataQueryDeclarations:
+    executor = DataQueryExecutor(agent_id, sqlite_backend, postgresql_backend)
+    declarations = data_query_capability_declarations()
+    return DataQueryDeclarations(
         declarations.capabilities, (executor,), declarations.tool_views
     )
 
@@ -622,38 +616,17 @@ def postgresql_update_declarations(
     )
 
 
-def sqlite_query_capability_declarations() -> CapabilityDeclarations:
+def data_query_capability_declarations() -> CapabilityDeclarations:
     return _query_declarations(
-        SQLITE_QUERY_CAPABILITY_ID,
-        SQLITE_QUERY_EVIDENCE_KIND,
-        SQLITE_QUERY_EXECUTOR_ID,
-        "SQLite",
-        "data_query_sqlite",
         ToolPresentation(
             toolbox_id=ToolboxId.SOURCES,
             load_mode=ToolLoadMode.PINNED,
             text_trust=ToolTextTrust.CODE,
-            summary="Run one bounded validated read-only SQLite query.",
-            when_to_use="Use after catalog_schema provides the exact SQLite structure.",
-            keywords=("data", "query", "sqlite", "sql"),
-        ),
-    )
-
-
-def postgresql_query_capability_declarations() -> CapabilityDeclarations:
-    return _query_declarations(
-        POSTGRESQL_QUERY_CAPABILITY_ID,
-        POSTGRESQL_QUERY_EVIDENCE_KIND,
-        POSTGRESQL_QUERY_EXECUTOR_ID,
-        "PostgreSQL",
-        "data_query_postgresql",
-        ToolPresentation(
-            toolbox_id=ToolboxId.SOURCES,
-            load_mode=ToolLoadMode.PINNED,
-            text_trust=ToolTextTrust.CODE,
-            summary="Run one bounded validated read-only PostgreSQL query.",
-            when_to_use="Use after catalog_schema provides the exact PostgreSQL structure.",
-            keywords=("data", "query", "postgresql", "sql"),
+            summary="Run one bounded validated read-only relational query.",
+            when_to_use=(
+                "Use after catalog_schema provides the exact source and resource IDs."
+            ),
+            keywords=("data", "query", "relational", "sql"),
         ),
     )
 
@@ -863,20 +836,25 @@ def postgresql_update_capability_declarations() -> CapabilityDeclarations:
 
 
 def _query_declarations(
-    capability_id: str,
-    output_kind: str,
-    executor_id: str,
-    adapter_name: str,
-    tool_name: str,
     presentation: ToolPresentation,
 ) -> CapabilityDeclarations:
     capability = Capability(
-        id=capability_id,
-        description=f"Run one validated, read-only, bounded {adapter_name} query.",
+        id=DATA_QUERY_CAPABILITY_ID,
+        description=(
+            "Run one validated, read-only, bounded relational query against exact "
+            "current catalog resources."
+        ),
         input_schema={
             "type": "object",
             "properties": {
                 "source_id": {"type": "string"},
+                "resource_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "uniqueItems": True,
+                },
                 "sql": {
                     "type": "string",
                     "minLength": 1,
@@ -887,17 +865,17 @@ def _query_declarations(
                     "maxItems": MAX_SQL_PARAMETERS,
                 },
             },
-            "required": ["source_id", "sql"],
+            "required": ["source_id", "resource_ids", "sql"],
             "additionalProperties": False,
         },
-        output_kind=output_kind,
+        output_kind=DATA_QUERY_EVIDENCE_KIND,
         output_schema=_query_output_schema(),
-        executor_id=executor_id,
+        executor_id=DATA_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
     )
     view = ToolView(
-        name=tool_name,
+        name=DATA_QUERY_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
         presentation=presentation,
@@ -905,7 +883,7 @@ def _query_declarations(
     return CapabilityDeclarations(
         domain_owner_id="data",
         capabilities=(capability,),
-        executor_ids=(executor_id,),
+        executor_ids=(DATA_QUERY_EXECUTOR_ID,),
         tool_views=(view,),
     )
 
@@ -913,6 +891,7 @@ def _query_declarations(
 def _query_output_schema() -> dict[str, object]:
     names = (
         "byte_limit",
+        "adapter_id",
         "canonical_sql",
         "columns",
         "resource_ids",
@@ -931,6 +910,7 @@ def _query_output_schema() -> dict[str, object]:
     )
     types = {
         "byte_limit": "integer",
+        "adapter_id": "string",
         "canonical_sql": "string",
         "columns": "array",
         "resource_ids": "array",
@@ -1068,13 +1048,14 @@ def _postgresql_update_output_schema() -> dict[str, object]:
 
 
 __all__ = [
-    "POSTGRESQL_QUERY_EXECUTOR_ID",
+    "DATA_QUERY_EXECUTOR_ID",
+    "DATA_QUERY_TOOL_NAME",
+    "DataQueryDeclarations",
+    "DataQueryExecutor",
     "POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID",
     "POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME",
     "POSTGRESQL_UPDATE_EXECUTOR_ID",
     "POSTGRESQL_UPDATE_TOOL_NAME",
-    "PostgreSQLQueryDeclarations",
-    "PostgreSQLQueryExecutor",
     "PostgreSQLReadBackend",
     "PostgreSQLReadResult",
     "PostgreSQLPreviewFingerprint",
@@ -1088,17 +1069,12 @@ __all__ = [
     "PostgreSQLUpdateExecutor",
     "PostgreSQLUpdateResult",
     "PostgreSQLUpdateSample",
-    "SQLITE_QUERY_EXECUTOR_ID",
-    "SQLiteQueryDeclarations",
-    "SQLiteQueryExecutor",
     "SQLiteReadBackend",
     "SQLiteReadResult",
-    "postgresql_query_declarations",
-    "postgresql_query_capability_declarations",
+    "data_query_declarations",
+    "data_query_capability_declarations",
     "postgresql_update_preview_declarations",
     "postgresql_update_preview_capability_declarations",
     "postgresql_update_declarations",
     "postgresql_update_capability_declarations",
-    "sqlite_query_declarations",
-    "sqlite_query_capability_declarations",
 ]

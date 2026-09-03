@@ -33,8 +33,8 @@ from daita import (
 )
 from daita.artifacts.models import ArtifactAuthorship
 from daita.domains.data.export_capabilities import (
-    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-    SQLITE_TABULAR_EXPORT_TOOL_NAME,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    DATA_EXPORT_TABULAR_TOOL_NAME,
 )
 from daita.llm.models import (
     FinishReason,
@@ -87,7 +87,7 @@ def _artifact_contract() -> OutcomeContract:
         maximum_count=1,
         allowed_media_types=("text/csv",),
         allowed_authorships=(ArtifactAuthorship.EXACT_SOURCE_DATA,),
-        allowed_producer_capability_ids=(SQLITE_TABULAR_EXPORT_CAPABILITY_ID,),
+        allowed_producer_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
         maximum_artifact_bytes=8 * 1024 * 1024,
         maximum_total_bytes=8 * 1024 * 1024,
         maximum_sensitivity=ModelSensitivity.INTERNAL,
@@ -198,7 +198,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
                 allowed_source_ids=(source.id,),
                 allowed_connector_binding_ids=(),
                 allowed_resource_ids=(resource.id,),
-                allowed_capability_ids=(SQLITE_TABULAR_EXPORT_CAPABILITY_ID,),
+                allowed_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
                 sensitivity_ceiling=ModelSensitivity.INTERNAL,
                 outcome_contract=_artifact_contract(),
                 distribution_destination_id=destination.destination_id,
@@ -229,7 +229,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         delivery = inbox[0]
         assert delivery.failure_code is None
         (reference,) = delivery.artifact_references
-        assert reference.producer_capability_id == (SQLITE_TABULAR_EXPORT_CAPABILITY_ID)
+        assert reference.producer_capability_id == (DATA_EXPORT_TABULAR_CAPABILITY_ID)
         assert reference.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA
         assert reference.media_type == "text/csv"
         assert delivery.resulting_run_id is not None
@@ -239,12 +239,12 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         assert scope is not None
         assert scope.allowed_source_ids == (source.id,)
         assert scope.allowed_resource_ids == (resource.id,)
-        assert scope.allowed_capability_ids == (SQLITE_TABULAR_EXPORT_CAPABILITY_ID,)
+        assert scope.allowed_capability_ids == (DATA_EXPORT_TABULAR_CAPABILITY_ID,)
         calls = tuple(
             call for message in transcript.messages for call in message.tool_calls
         )
         export_calls = tuple(
-            call for call in calls if call.name == SQLITE_TABULAR_EXPORT_TOOL_NAME
+            call for call in calls if call.name == DATA_EXPORT_TABULAR_TOOL_NAME
         )
         assert len(export_calls) == 1
         assert export_calls[0].arguments["source_id"] == source.id

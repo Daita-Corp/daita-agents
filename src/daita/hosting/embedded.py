@@ -101,19 +101,18 @@ from ..domains.data import (
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
     LOCAL_FILE_CAPABILITY_IDS,
     LOCAL_FILE_EXECUTOR_IDS,
-    POSTGRESQL_QUERY_CAPABILITY_ID,
-    SQLITE_QUERY_CAPABILITY_ID,
+    DATA_QUERY_CAPABILITY_ID,
     ArtifactCapabilityDomain,
     CatalogDataView,
     DataCapabilityDomain,
     DataContextBuilder,
     artifact_declarations,
+    data_export_tabular_declarations,
     local_file_declarations,
-    postgresql_query_declarations,
+    data_query_declarations,
     postgresql_update_declarations,
     postgresql_update_preview_declarations,
     resource_revision_observation_declarations,
-    sqlite_query_declarations,
 )
 from ..domains.data.context import _project_completed_history
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
@@ -344,8 +343,7 @@ _T = TypeVar("_T")
 _STAGE_C_ALLOWED_CAPABILITY_IDS = (
     CATALOG_INSPECT_CAPABILITY_ID,
     CATALOG_SCHEMA_CAPABILITY_ID,
-    POSTGRESQL_QUERY_CAPABILITY_ID,
-    SQLITE_QUERY_CAPABILITY_ID,
+    DATA_QUERY_CAPABILITY_ID,
     JOB_INSPECT_CAPABILITY_ID,
     JOB_READ_RESULTS_CAPABILITY_ID,
 )
@@ -1112,10 +1110,20 @@ class EmbeddedAgent:
         postgresql_backend = PostgreSQLQueryBackend(
             store, data_view, secret_provider or keychain
         )
-        sqlite = sqlite_query_declarations(identity.id, sqlite_backend)
-        postgresql = postgresql_query_declarations(
+        relational_query = data_query_declarations(
             identity.id,
+            sqlite_backend,
             postgresql_backend,
+        )
+        relational_export = (
+            data_export_tabular_declarations(
+                identity.id,
+                sqlite_backend,
+                postgresql_backend,
+                clock,
+            )
+            if artifact_store.available
+            else None
         )
         postgresql_preview_backend = PostgreSQLUpdatePreviewBackend(
             store,
@@ -1189,10 +1197,6 @@ class EmbeddedAgent:
                 artifact_delivery,
                 artifact_store,
                 workspace=workspace_backend,
-                agent_id=identity.id,
-                sqlite_backend=sqlite_backend,
-                postgresql_backend=postgresql_backend,
-                clock=clock,
             )
             if artifact_store.available
             else None
@@ -1218,8 +1222,12 @@ class EmbeddedAgent:
             domain_owner_id=DATA_DOMAIN_OWNER_ID,
             capabilities=(
                 *catalog.capabilities,
-                *sqlite.capabilities,
-                *postgresql.capabilities,
+                *relational_query.capabilities,
+                *(
+                    relational_export.capabilities
+                    if relational_export is not None
+                    else ()
+                ),
                 *postgresql_preview.capabilities,
                 *postgresql_update.capabilities,
                 *routine_precheck.capabilities,
@@ -1229,8 +1237,12 @@ class EmbeddedAgent:
                 item.executor_id
                 for item in (
                     *catalog.capabilities,
-                    *sqlite.capabilities,
-                    *postgresql.capabilities,
+                    *relational_query.capabilities,
+                    *(
+                        relational_export.capabilities
+                        if relational_export is not None
+                        else ()
+                    ),
                     *postgresql_preview.capabilities,
                     *postgresql_update.capabilities,
                     *routine_precheck.capabilities,
@@ -1239,8 +1251,12 @@ class EmbeddedAgent:
             ),
             tool_views=(
                 *catalog.tool_views,
-                *sqlite.tool_views,
-                *postgresql.tool_views,
+                *relational_query.tool_views,
+                *(
+                    relational_export.tool_views
+                    if relational_export is not None
+                    else ()
+                ),
                 *postgresql_preview.tool_views,
                 *postgresql_update.tool_views,
                 *(local_files.tool_views if local_files is not None else ()),
@@ -1292,6 +1308,7 @@ class EmbeddedAgent:
             data_declarations,
             data_view,
             learning_candidate_guard,
+            relational_export_available=relational_export is not None,
             workspace_id=(
                 None if workspace_backend is None else workspace_backend.workspace_id
             ),
@@ -1327,7 +1344,6 @@ class EmbeddedAgent:
                 workspace_backend,
                 learning_candidate_guard,
                 clock=clock,
-                files_only_run_ids=files_only_run_ids,
             )
         )
         job_domain = JobCapabilityDomain(job_declaration_bundle, job_owner)
@@ -1367,8 +1383,8 @@ class EmbeddedAgent:
         )
         base_executors = (
             *catalog.executors,
-            *sqlite.executors,
-            *postgresql.executors,
+            *relational_query.executors,
+            *(relational_export.executors if relational_export is not None else ()),
             *postgresql_preview.executors,
             *postgresql_update.executors,
             *routine_precheck.executors,

@@ -300,8 +300,7 @@ capabilities with `OperationalEffect.NONE` and read/none data access. It can
 create only these artifacts:
 
 - `artifact.create_document`;
-- `data.sqlite.export_tabular`;
-- `data.postgresql.export_tabular`; and
+- `data.export_tabular`;
 - `artifact.snapshot_result`.
 
 `artifact.snapshot_result` produces bounded canonical `application/json` from

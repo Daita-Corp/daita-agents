@@ -280,6 +280,7 @@ class SQLiteQueryBackend:
         )
         return ExactTabularExportResult(
             format=format_name,
+            adapter_id="sqlite",
             source_id=source_id,
             source_revision=live_source_revision,
             sql_fingerprint=validation.analysis.sql_fingerprint,

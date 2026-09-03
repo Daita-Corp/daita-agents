@@ -142,7 +142,7 @@ def _tool_results(transcript: Transcript) -> dict[str, ToolResultBlock]:
 
 def _successful_sql_call(transcript: Transcript) -> ToolCall | None:
     results = _tool_results(transcript)
-    for call in reversed(_tool_calls(transcript, "data_query_postgresql")):
+    for call in reversed(_tool_calls(transcript, "data_query")):
         result = results.get(call.id)
         if result is not None and not result.is_error:
             return call

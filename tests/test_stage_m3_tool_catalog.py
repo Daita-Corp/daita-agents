@@ -453,8 +453,7 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
             "catalog_inspect",
             "catalog_schema",
             "catalog_search",
-            "data_query_postgresql",
-            "data_query_sqlite",
+            "data_query",
             "delivery_list",
             "distribution_destination_list",
             "file_read",
@@ -490,8 +489,7 @@ async def test_production_inventory_has_exact_membership_and_phase1_loading_poli
             "artifact_save_local",
             "artifact_set_export_location",
             "artifact_snapshot_result",
-            "data_export_postgresql",
-            "data_export_sqlite",
+            "data_export_tabular",
         }
         assert {
             name

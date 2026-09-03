@@ -33,7 +33,7 @@ from daita.domains.data.export_capabilities import (
     ARTIFACT_READ_TOOL_NAME,
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     DOCUMENT_CREATE_TOOL_NAME,
-    SQLITE_TABULAR_EXPORT_TOOL_NAME,
+    DATA_EXPORT_TABULAR_TOOL_NAME,
     ArtifactListExecutor,
     ArtifactReadExecutor,
 )
@@ -163,6 +163,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
+    resource = (await agent.list_catalog_resources(source_id=source.id))[0]
     xlsx_id = "artifact-00000000000000000000000000000001"
     other_id = "artifact-00000000000000000000000000000002"
     csv_id = "artifact-00000000000000000000000000000003"
@@ -171,9 +172,10 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
             _tools(
                 ToolCall(
                     id="xlsx-export",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source.id,
+                        "resource_ids": (resource.id,),
                         "sql": "SELECT label, number FROM records ORDER BY number",
                         "format": "xlsx",
                         "filename": "records.xlsx",
@@ -456,15 +458,17 @@ async def test_artifact_conversion_cancellation_leaves_no_child_or_staging(
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
+    resource = (await agent.list_catalog_resources(source_id=source.id))[0]
     xlsx_id = "artifact-00000000000000000000000000000001"
     provider.replace_script(
         (
             _tools(
                 ToolCall(
                     id="export",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source.id,
+                        "resource_ids": (resource.id,),
                         "sql": "SELECT label FROM records",
                         "format": "xlsx",
                     },

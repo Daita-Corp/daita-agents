@@ -71,8 +71,7 @@ SEED_LIMITS = LoopLimits()
 ALLOWED_CAPABILITIES = (
     "catalog.inspect",
     "catalog.schema",
-    "data.postgresql.query",
-    "data.sqlite.query",
+    "data.query",
     "jobs.inspect",
     "jobs.read_results",
 )

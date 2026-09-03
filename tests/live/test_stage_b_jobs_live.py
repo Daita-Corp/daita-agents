@@ -395,7 +395,7 @@ async def test_live_model_chooses_direct_query_instead_of_durable_job(
         assert result.final_text is not None
         assert _IMMEDIATE_EXPECTATION in result.final_text
         logical_names = _all_logical_names(transcript)
-        assert "data_query_sqlite" in logical_names
+        assert "data_query" in logical_names
         assert "start_data_profile" not in logical_names
         assert await agent.list_jobs() == ()
     finally:
@@ -439,7 +439,7 @@ async def test_live_model_starts_detaches_and_later_reads_profile_result(
         )
         assert len(_all_logical_names(start_transcript)) >= 3
         assert not (_LIFECYCLE_TOOLS & set(_all_logical_names(start_transcript)))
-        assert "data_query_sqlite" not in _all_logical_names(start_transcript)
+        assert "data_query" not in _all_logical_names(start_transcript)
         job_id = _job_id_from_start(start_transcript)
         assert started.final_text is not None
         assert "STAGE_B_JOB_STARTED" in started.final_text
@@ -478,7 +478,7 @@ async def test_live_model_starts_detaches_and_later_reads_profile_result(
         assert "job_inspect" not in recovered_names
         assert "toolbox_search" not in recovered_names
         assert "toolbox_load" not in recovered_names
-        assert "data_query_sqlite" not in recovered_names
+        assert "data_query" not in recovered_names
         assert (
             recovered_names.index("job_list")
             < recovered_names.index("job_read_results")

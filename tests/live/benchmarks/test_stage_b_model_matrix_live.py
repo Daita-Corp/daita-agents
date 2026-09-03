@@ -68,7 +68,7 @@ async def test_model_certification_immediate_selection(
         assert_completed(capture)
         record_metrics(record_property, model_id, capture)
         names = logical_names(capture.transcript)
-        assert "data_query_sqlite" in names
+        assert "data_query" in names
         assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
         assert capture.result.final_text is not None
@@ -101,7 +101,7 @@ async def test_model_certification_cross_conversation_result(
         assert "job_list" in names
         assert "job_read_results" in names
         assert "artifact_read" in names
-        assert "data_query_sqlite" not in names
+        assert "data_query" not in names
         assert "toolbox_search" not in names
         assert "toolbox_load" not in names
         result_reads = results_for(capture.transcript, "job_read_results")

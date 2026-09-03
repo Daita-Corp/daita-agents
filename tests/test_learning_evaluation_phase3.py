@@ -335,9 +335,10 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
                 tool_calls=(
                     ToolCall(
                         id="baseline-query",
-                        name="data_query_sqlite",
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
+                            "resource_ids": (resources["orders"].id,),
                             "sql": "SELECT SUM(total_amount) AS margin FROM orders",
                         },
                     ),
@@ -442,9 +443,19 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
                 tool_calls=(
                     ToolCall(
                         id="learned-query",
-                        name="data_query_sqlite",
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
+                            "resource_ids": tuple(
+                                resources[name].id
+                                for name in (
+                                    "orders",
+                                    "customers",
+                                    "regions",
+                                    "order_items",
+                                    "products",
+                                )
+                            ),
                             "sql": (
                                 "SELECT r.region_code, r.currency_code, "
                                 "SUM(oi.line_total - "
@@ -718,15 +729,15 @@ def test_observer_measurement_is_bounded_content_free_and_counts_corrections():
             AgentEventKind.TOOL_STARTED,
             {
                 "call_id": "sql-failed",
-                "tool_name": "data_query_sqlite",
-                "capability_id": "data.sqlite.query",
+                "tool_name": "data_query",
+                "capability_id": "data.query",
             },
         ),
         _event(
             AgentEventKind.TOOL_COMPLETED,
             {
                 "call_id": "sql-failed",
-                "tool_name": "data_query_sqlite",
+                "tool_name": "data_query",
                 "duration_ms": 1,
                 "success": False,
                 "error_code": "sql_validation_failed",
@@ -736,15 +747,15 @@ def test_observer_measurement_is_bounded_content_free_and_counts_corrections():
             AgentEventKind.TOOL_STARTED,
             {
                 "call_id": "sql-corrected",
-                "tool_name": "data_query_sqlite",
-                "capability_id": "data.sqlite.query",
+                "tool_name": "data_query",
+                "capability_id": "data.query",
             },
         ),
         _event(
             AgentEventKind.TOOL_COMPLETED,
             {
                 "call_id": "sql-corrected",
-                "tool_name": "data_query_sqlite",
+                "tool_name": "data_query",
                 "duration_ms": 1,
                 "success": True,
                 "error_code": None,
