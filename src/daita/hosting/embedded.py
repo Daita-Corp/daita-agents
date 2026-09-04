@@ -3555,6 +3555,7 @@ class EmbeddedAgent:
         credential: SecretReference,
         port: int = 5432,
         ssl_mode: str = "require",
+        public_network_only: bool = False,
     ) -> PostgreSQLProbeResult:
         """Run the adapter-owned read-only schema probe without persistence."""
 
@@ -3567,6 +3568,7 @@ class EmbeddedAgent:
             credential=credential,
             schemas=("public",),
             ssl_mode=ssl_mode,
+            public_network_only=public_network_only,
             secret_provider=self._secret_provider or self._keychain,
         )
         return await source.probe()
@@ -3581,6 +3583,7 @@ class EmbeddedAgent:
         schemas: tuple[str, ...],
         port: int = 5432,
         ssl_mode: str = "require",
+        public_network_only: bool = False,
         name: str | None = None,
     ) -> SourceRegistration:
         """Construct and attach one ordinary selected-schema PostgreSQL source."""
@@ -3594,6 +3597,7 @@ class EmbeddedAgent:
                 credential=credential,
                 schemas=schemas,
                 ssl_mode=ssl_mode,
+                public_network_only=public_network_only,
                 name=name,
                 secret_provider=self._secret_provider or self._keychain,
             )
@@ -3611,6 +3615,7 @@ class EmbeddedAgent:
         confirmation_handler: SourceEditConfirmationHandler,
         port: int = 5432,
         ssl_mode: str = "require",
+        public_network_only: bool = False,
         name: str | None = None,
     ) -> SourceEditResult | None:
         """Edit PostgreSQL through the ordinary validated source boundary."""
@@ -3625,6 +3630,7 @@ class EmbeddedAgent:
                 credential=credential,
                 schemas=schemas,
                 ssl_mode=ssl_mode,
+                public_network_only=public_network_only,
                 name=name,
                 secret_provider=self._secret_provider or self._keychain,
             ),
@@ -4231,7 +4237,7 @@ def _source_from_registration(
             "ssl_mode",
             "username",
         }
-        allowed = required | {"credential_ref"}
+        allowed = required | {"credential_ref", "public_network_only"}
         fields = set(configuration)
         if not required <= fields or not fields <= allowed:
             raise AgentHomeError("PostgreSQL source configuration is invalid")
@@ -4255,6 +4261,9 @@ def _source_from_registration(
                 credential=reference,
                 schemas=cast(tuple[str, ...], raw_schemas),
                 ssl_mode=_configuration_text(configuration, "ssl_mode"),
+                public_network_only=_configuration_boolean(
+                    configuration, "public_network_only", default=False
+                ),
                 name=registration.display_name,
                 secret_provider=secret_provider,
             )
@@ -4354,6 +4363,18 @@ def _configuration_integer(
     value = configuration[name]
     if not isinstance(value, int) or isinstance(value, bool):
         raise AgentHomeError("source configuration integer is invalid")
+    return value
+
+
+def _configuration_boolean(
+    configuration: Mapping[str, object],
+    name: str,
+    *,
+    default: bool,
+) -> bool:
+    value = configuration.get(name, default)
+    if not isinstance(value, bool):
+        raise AgentHomeError("source configuration boolean is invalid")
     return value
 
 

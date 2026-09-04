@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import re
+import socket
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,8 +68,8 @@ _DEFAULT_MAX_RELATIONSHIPS = 2_000
 _MAX_PROBE_SCHEMAS = 100
 _PROBE_QUERY_LIMIT = _MAX_PROBE_SCHEMAS + 1
 _MAX_PROBE_ROW_FIELDS = 16
-_CONNECT_TIMEOUT_SECONDS = 10.0
-_COMMAND_TIMEOUT_SECONDS = 10.0
+_CONNECT_TIMEOUT_SECONDS = 8.0
+_COMMAND_TIMEOUT_SECONDS = 8.0
 _CLEANUP_TIMEOUT_SECONDS = 1.0
 _SUPPORTED_QUERY_TYPE_NAMES = frozenset(
     {
@@ -312,6 +314,7 @@ class PostgreSQLSource:
     port: int = 5432
     schemas: tuple[str, ...] = ("public",)
     ssl_mode: str = "require"
+    public_network_only: bool = False
     name: str | None = None
     secret_provider: SecretProvider = field(
         default_factory=default_secret_provider,
@@ -343,6 +346,8 @@ class PostgreSQLSource:
         schemas = _schemas(self.schemas)
         if self.ssl_mode not in _SSL_MODES:
             raise ValueError("ssl_mode is not supported")
+        if not isinstance(self.public_network_only, bool):
+            raise TypeError("public_network_only must be a boolean")
         if self.credential is not None and not isinstance(
             self.credential, SecretReference
         ):
@@ -1019,6 +1024,8 @@ def _source_configuration(source: PostgreSQLSource) -> dict[str, object]:
         "ssl_mode": source.ssl_mode,
         "username": source.username,
     }
+    if source.public_network_only:
+        configuration["public_network_only"] = True
     if source.credential is not None:
         configuration["credential_ref"] = source.credential.to_uri()
     return configuration
@@ -1108,6 +1115,15 @@ async def _connect_configuration(
     error_type: type[PostgreSQLSourceError],
 ) -> Any:
     asyncpg = _load_asyncpg()
+    host = _configuration_text(configuration, "host")
+    port = _configuration_port(configuration)
+    public_network_only = configuration.get("public_network_only", False)
+    if not isinstance(public_network_only, bool):
+        raise error_type(
+            "postgresql_configuration_invalid",
+            "PostgreSQL source network policy is invalid.",
+            source_id=source_id,
+        )
     credential_ref = configuration.get("credential_ref")
     password = None
     if credential_ref is not None:
@@ -1144,17 +1160,27 @@ async def _connect_configuration(
     ssl_mode = _configuration_text(configuration, "ssl_mode")
     connect_failed = False
     try:
-        return await asyncpg.connect(
-            host=_configuration_text(configuration, "host"),
-            port=_configuration_port(configuration),
-            database=_configuration_text(configuration, "database"),
-            user=_configuration_text(configuration, "username"),
-            password=password,
-            ssl=False if ssl_mode == "disable" else ssl_mode,
-            timeout=_CONNECT_TIMEOUT_SECONDS,
-            command_timeout=_COMMAND_TIMEOUT_SECONDS,
-        )
+        async with asyncio.timeout(_CONNECT_TIMEOUT_SECONDS):
+            if public_network_only:
+                await _require_public_network_destination(
+                    host,
+                    port,
+                    source_id=source_id,
+                    error_type=error_type,
+                )
+            return await asyncpg.connect(
+                host=host,
+                port=port,
+                database=_configuration_text(configuration, "database"),
+                user=_configuration_text(configuration, "username"),
+                password=password,
+                ssl=False if ssl_mode == "disable" else ssl_mode,
+                timeout=_CONNECT_TIMEOUT_SECONDS,
+                command_timeout=_COMMAND_TIMEOUT_SECONDS,
+            )
     except asyncio.CancelledError:
+        raise
+    except error_type:
         raise
     except Exception:
         # Connector exceptions can include DSNs, credentials, server banners,
@@ -1168,6 +1194,53 @@ async def _connect_configuration(
             source_id=source_id,
         )
     raise AssertionError("PostgreSQL connection attempt returned no result")
+
+
+async def _require_public_network_destination(
+    host: str,
+    port: int,
+    *,
+    source_id: str,
+    error_type: type[PostgreSQLSourceError],
+) -> None:
+    resolution_failed = False
+    try:
+        addresses = await asyncio.to_thread(
+            socket.getaddrinfo,
+            host,
+            port,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+            proto=socket.IPPROTO_TCP,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        resolution_failed = True
+        addresses = []
+    if resolution_failed or not addresses:
+        raise error_type(
+            "postgresql_host_resolution_failed",
+            "PostgreSQL host could not be resolved.",
+            source_id=source_id,
+        )
+    if any(not _is_public_ip(str(item[4][0])) for item in addresses):
+        raise error_type(
+            "postgresql_network_disallowed",
+            "PostgreSQL host must resolve only to public network addresses.",
+            source_id=source_id,
+        )
+
+
+def _is_public_ip(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return address.is_global and not address.is_multicast
 
 
 async def _rollback_postgresql_transaction(
