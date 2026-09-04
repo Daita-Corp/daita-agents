@@ -8,11 +8,11 @@ import pytest
 from _workspace_support import workspace_for
 
 from daita import Agent
-from daita.adapters import postgresql
 from daita.adapters import (
     PostgreSQLProbeResult,
     PostgreSQLSource,
     PostgreSQLSourceError,
+    postgresql,
 )
 from daita.security import EmptySecretProvider, SecretReference
 
