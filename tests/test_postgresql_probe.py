@@ -12,6 +12,7 @@ from daita.adapters import (
     PostgreSQLProbeResult,
     PostgreSQLSource,
     PostgreSQLSourceError,
+    postgresql,
 )
 from daita.security import EmptySecretProvider, SecretReference
 
@@ -72,7 +73,12 @@ class _Asyncpg:
         return self.connection
 
 
-def _source(secret_provider: Any, *, username: str = "reader") -> PostgreSQLSource:
+def _source(
+    secret_provider: Any,
+    *,
+    username: str = "reader",
+    public_network_only: bool = False,
+) -> PostgreSQLSource:
     return PostgreSQLSource(
         host="db.example.test",
         port=5432,
@@ -81,6 +87,7 @@ def _source(secret_provider: Any, *, username: str = "reader") -> PostgreSQLSour
         credential=SecretReference.keychain("agent:postgresql:credential"),
         schemas=("placeholder",),
         ssl_mode="require",
+        public_network_only=public_network_only,
         secret_provider=secret_provider,
     )
 
@@ -110,8 +117,8 @@ async def test_postgresql_probe_uses_fixed_bounded_sql_and_always_closes(
     ]
     assert len(driver.connects) == 1
     assert driver.connects[0]["password"] == "database-password"
-    assert driver.connects[0]["timeout"] == 10.0
-    assert driver.connects[0]["command_timeout"] == 10.0
+    assert driver.connects[0]["timeout"] == 8.0
+    assert driver.connects[0]["command_timeout"] == 8.0
     assert len(connection.fetches) == 1
     sql, arguments = connection.fetches[0]
     assert "daita:postgresql.schema_probe" in sql
@@ -241,6 +248,98 @@ async def test_postgresql_probe_missing_secret_is_normalized_before_connect(
 
     assert raised.value.code == "postgresql_credential_unavailable"
     assert driver.connects == []
+
+
+async def test_public_only_postgresql_probe_rejects_private_or_mixed_dns(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    driver = _Asyncpg(_Connection())
+    monkeypatch.setattr("daita.adapters.postgresql._load_asyncpg", lambda: driver)
+    monkeypatch.setattr(
+        "daita.adapters.postgresql.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (2, 1, 6, "", ("93.184.216.34", 5432)),
+            (2, 1, 6, "", ("127.0.0.1", 5432)),
+        ],
+    )
+
+    with pytest.raises(PostgreSQLSourceError) as raised:
+        await _source(_Secrets(), public_network_only=True).probe()
+
+    assert raised.value.code == "postgresql_network_disallowed"
+    assert driver.connects == []
+
+
+async def test_public_only_postgresql_probe_connects_after_public_dns_validation(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    driver = _Asyncpg(_Connection())
+    monkeypatch.setattr("daita.adapters.postgresql._load_asyncpg", lambda: driver)
+    monkeypatch.setattr(
+        "daita.adapters.postgresql.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (2, 1, 6, "", ("93.184.216.34", 5432)),
+            (10, 1, 6, "", ("2606:2800:220:1:248:1893:25c8:1946", 5432, 0, 0)),
+        ],
+    )
+
+    await _source(_Secrets(), public_network_only=True).probe()
+
+    assert driver.connects[0]["host"] == "db.example.test"
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "0.0.0.0",
+        "10.0.0.1",
+        "100.64.0.1",
+        "127.0.0.1",
+        "169.254.1.1",
+        "172.16.0.1",
+        "192.168.0.1",
+        "203.0.113.1",
+        "224.0.0.1",
+        "::",
+        "::1",
+        "::ffff:127.0.0.1",
+        "fc00::1",
+        "fe80::1",
+        "ff02::1",
+    ],
+)
+def test_public_network_policy_rejects_non_global_ipv4_and_ipv6(address: str):
+    assert postgresql._is_public_ip(address) is False
+
+
+@pytest.mark.parametrize(
+    "address",
+    ["1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"],
+)
+def test_public_network_policy_accepts_global_unicast_addresses(address: str):
+    assert postgresql._is_public_ip(address) is True
+
+
+async def test_postgresql_dns_and_connect_share_one_eight_second_budget(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class SlowAsyncpg(_Asyncpg):
+        async def connect(self, **kwargs: object) -> _Connection:
+            await asyncio.sleep(1)
+            return await super().connect(**kwargs)
+
+    driver = SlowAsyncpg(_Connection())
+    monkeypatch.setattr("daita.adapters.postgresql._load_asyncpg", lambda: driver)
+    monkeypatch.setattr("daita.adapters.postgresql._CONNECT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        "daita.adapters.postgresql.socket.getaddrinfo",
+        lambda *_args, **_kwargs: [(2, 1, 6, "", ("93.184.216.34", 5432))],
+    )
+
+    with pytest.raises(PostgreSQLSourceError) as raised:
+        await _source(_Secrets(), public_network_only=True).probe()
+
+    assert raised.value.code == "postgresql_connect_failed"
 
 
 async def test_agent_postgresql_probe_persists_no_source_or_catalog_snapshot(

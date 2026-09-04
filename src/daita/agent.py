@@ -782,6 +782,7 @@ class Agent:
         credential: SecretReference,
         port: int = 5432,
         ssl_mode: str = "require",
+        public_network_only: bool = False,
     ) -> PostgreSQLProbeResult:
         return await self._embedded.probe_postgresql(
             host=host,
@@ -790,6 +791,7 @@ class Agent:
             credential=credential,
             port=port,
             ssl_mode=ssl_mode,
+            public_network_only=public_network_only,
         )
 
     async def attach_postgresql(
@@ -802,6 +804,7 @@ class Agent:
         schemas: tuple[str, ...],
         port: int = 5432,
         ssl_mode: str = "require",
+        public_network_only: bool = False,
         name: str | None = None,
     ) -> SourceRegistration:
         """Attach PostgreSQL with all reads and zero exact update scopes."""
@@ -814,6 +817,7 @@ class Agent:
             schemas=schemas,
             port=port,
             ssl_mode=ssl_mode,
+            public_network_only=public_network_only,
             name=name,
         )
 
@@ -829,6 +833,7 @@ class Agent:
         confirmation_handler: SourceEditConfirmationHandler,
         port: int = 5432,
         ssl_mode: str = "require",
+        public_network_only: bool = False,
         name: str | None = None,
     ) -> SourceEditResult | None:
         """Edit PostgreSQL with a reviewed atomic connection handoff."""
@@ -843,6 +848,7 @@ class Agent:
             confirmation_handler=confirmation_handler,
             port=port,
             ssl_mode=ssl_mode,
+            public_network_only=public_network_only,
             name=name,
         )
 
