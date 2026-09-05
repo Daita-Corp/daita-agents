@@ -76,10 +76,10 @@ from .learning_candidates import (
 )
 from .llm import (
     ModelProfile,
-    ModelProvider,
     ModelSensitivity,
 )
 from .llm.profiles import reviewed_model_profile
+from .llm.protocols import ManagedModelProvider
 from .security import SecretReference
 from .terminal import run_terminal_application
 from .tui.models import (
@@ -551,7 +551,7 @@ def _model_configuration(
     base_url: str | None = None,
     context_window: int | None = None,
     max_output: int | None = None,
-) -> tuple[ModelProvider, ModelProfile]:
+) -> tuple[ManagedModelProvider, ModelProfile]:
     if (context_window is None) != (max_output is None):
         raise ValueError("--context-window and --max-output must be supplied together")
     reviewed_profile = reviewed_model_profile(model_id)
@@ -569,16 +569,7 @@ def _model_configuration(
         base_url=base_url,
         max_output_tokens=provider_max_output,
     )
-    profile = reviewed_model_profile(provider.provider_id)
-    if profile is None:
-        owned_profile = getattr(provider, "model_profile", None)
-        if isinstance(owned_profile, ModelProfile):
-            profile = owned_profile
-    if profile is None or profile.id != provider.provider_id:
-        raise ValueError(
-            "unreviewed models must be configured in the interactive terminal "
-            "to prove tool support and establish explicit hard token limits"
-        )
+    profile = _provider_profile(provider)
     if context_window is None:
         return provider, profile
     assert max_output is not None
@@ -600,20 +591,57 @@ def _model_configuration(
     )
 
 
+def _provider_profile(provider: ManagedModelProvider) -> ModelProfile:
+    """Resolve only reviewed or explicit provider-owned model facts."""
+
+    profile = reviewed_model_profile(provider.provider_id)
+    if profile is None:
+        owned_profile = getattr(provider, "model_profile", None)
+        if isinstance(owned_profile, ModelProfile):
+            profile = owned_profile
+    if profile is None or profile.id != provider.provider_id:
+        raise ValueError(
+            "unreviewed models must be configured in the interactive terminal "
+            "to prove tool support and establish explicit hard token limits"
+        )
+    return profile
+
+
 def _reviewer_model_configuration(
     model_id: str,
-) -> tuple[ModelProvider, ModelProfile]:
+) -> tuple[ManagedModelProvider, ModelProfile]:
     """Construct one direct provider with the fixed candidate-review output bound."""
 
-    _, profile = _model_configuration(model_id)
-    reviewer_profile = _candidate_reviewer_profile(profile)
-    return (
-        create_llm_provider(
-            model_id,
-            max_output_tokens=reviewer_profile.max_output_tokens,
-        ),
-        reviewer_profile,
+    provider = create_llm_provider(
+        model_id,
+        max_output_tokens=_CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS,
     )
+    profile = _provider_profile(provider)
+    reviewer_profile = _candidate_reviewer_profile(profile)
+    return provider, reviewer_profile
+
+
+async def _close_cli_resources(
+    *,
+    agent: Agent | None,
+    provider: ManagedModelProvider | None,
+) -> None:
+    """Release caller-owned CLI resources while preserving the first failure."""
+
+    first_error: BaseException | None = None
+    if agent is not None:
+        try:
+            await agent.close()
+        except BaseException as error:
+            first_error = error
+    if provider is not None:
+        try:
+            await provider.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def _candidate_review_cost_limit_from_environment() -> Decimal | None:
@@ -1221,37 +1249,39 @@ async def _execute(args: argparse.Namespace) -> object:
             raise ValueError(
                 "--base-url, --context-window, and --max-output require --model"
             )
-        if args.model is None:
-            agent = await Agent.open(
-                args.name,
-                workspace=workspace,
-                root=args.root,
-                observer=_write_event_jsonl if args.events_jsonl else None,
-            )
-        else:
-            provider, profile = _model_configuration(
-                args.model,
-                base_url=args.base_url,
-                context_window=args.context_window,
-                max_output=args.max_output,
-            )
-            agent = await Agent.open(
-                args.name,
-                workspace=workspace,
-                root=args.root,
-                model=provider,
-                model_profile=profile,
-                observer=_write_event_jsonl if args.events_jsonl else None,
-            )
+        provider: ManagedModelProvider | None = None
+        run_agent: Agent | None = None
         try:
+            if args.model is None:
+                run_agent = await Agent.open(
+                    args.name,
+                    workspace=workspace,
+                    root=args.root,
+                    observer=_write_event_jsonl if args.events_jsonl else None,
+                )
+            else:
+                provider, profile = _model_configuration(
+                    args.model,
+                    base_url=args.base_url,
+                    context_window=args.context_window,
+                    max_output=args.max_output,
+                )
+                run_agent = await Agent.open(
+                    args.name,
+                    workspace=workspace,
+                    root=args.root,
+                    model=provider,
+                    model_profile=profile,
+                    observer=_write_event_jsonl if args.events_jsonl else None,
+                )
             result = (
-                await agent.run(
+                await run_agent.run(
                     args.message,
                     conversation_id=args.conversation_id,
                     files_only=True,
                 )
                 if args.files_only
-                else await agent.run(
+                else await run_agent.run(
                     args.message,
                     conversation_id=args.conversation_id,
                 )
@@ -1272,7 +1302,7 @@ async def _execute(args: argparse.Namespace) -> object:
                 ),
             }
         finally:
-            await agent.close()
+            await _close_cli_resources(agent=run_agent, provider=provider)
     if args.command == "chat":
         return await run_terminal_application(
             root=args.root,
@@ -1286,16 +1316,17 @@ async def _execute(args: argparse.Namespace) -> object:
     if args.command == "memory" and args.memory_command == "review":
         _validate_candidate_review_cost_limit(args.cost_limit)
         provider, profile = _reviewer_model_configuration(args.model)
-        agent = await Agent.open(
-            args.name,
-            workspace=workspace,
-            root=args.root,
-            reviewer_model=provider,
-            reviewer_profile=profile,
-            reviewer_max_estimated_cost_usd=args.cost_limit,
-        )
+        review_agent: Agent | None = None
         try:
-            review_result = await agent.review_learning_candidates()
+            review_agent = await Agent.open(
+                args.name,
+                workspace=workspace,
+                root=args.root,
+                reviewer_model=provider,
+                reviewer_profile=profile,
+                reviewer_max_estimated_cost_usd=args.cost_limit,
+            )
+            review_result = await review_agent.review_learning_candidates()
             return {
                 "status": review_result.status.value,
                 "reviewed_run_ids": review_result.reviewed_run_ids,
@@ -1310,19 +1341,20 @@ async def _execute(args: argparse.Namespace) -> object:
                 "total_tokens": review_result.usage.total_tokens,
             }
         finally:
-            await agent.close()
+            await _close_cli_resources(agent=review_agent, provider=provider)
     if args.command == "memory" and args.memory_command == "accept-candidate":
         provider, profile = _model_configuration(args.model)
-        agent = await Agent.open(
-            args.name,
-            workspace=workspace,
-            root=args.root,
-            model=provider,
-            model_profile=profile,
-            approval_handler=_prompt_for_exact_approval,
-        )
+        accept_agent: Agent | None = None
         try:
-            result = await agent.accept_learning_candidate(args.candidate_id)
+            accept_agent = await Agent.open(
+                args.name,
+                workspace=workspace,
+                root=args.root,
+                model=provider,
+                model_profile=profile,
+                approval_handler=_prompt_for_exact_approval,
+            )
+            result = await accept_agent.accept_learning_candidate(args.candidate_id)
             return {
                 "candidate_id": args.candidate_id,
                 "run_id": result.run_id,
@@ -1331,7 +1363,7 @@ async def _execute(args: argparse.Namespace) -> object:
                 "text": result.final_text,
             }
         finally:
-            await agent.close()
+            await _close_cli_resources(agent=accept_agent, provider=provider)
     agent = await Agent.open(args.name, workspace=workspace, root=args.root)
     try:
         if args.command == "artifacts":

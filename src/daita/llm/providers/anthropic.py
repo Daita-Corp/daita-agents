@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -13,6 +14,7 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
+from .._lifecycle import await_cleanup, closing_stream
 from ..errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -71,6 +73,8 @@ class _AnthropicClient(Protocol):
     @property
     def messages(self) -> _MessagesResource: ...
 
+    async def close(self) -> None: ...
+
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
@@ -114,6 +118,8 @@ class AnthropicMessagesProvider:
         self.max_tokens = max_tokens
         self._api_key = api_key
         self._client = client
+        self._owns_client = client is None
+        self._close_task: asyncio.Task[None] | None = None
         self._id_factory = _new_id if id_factory is None else id_factory
         self._pricing_schedules = (
             load_bundled_pricing_schedules()
@@ -141,6 +147,8 @@ class AnthropicMessagesProvider:
 
     @property
     def client(self) -> _AnthropicClient:
+        if self._close_task is not None:
+            raise RuntimeError("Anthropic provider is closed")
         if self._client is None:
             try:
                 from anthropic import AsyncAnthropic
@@ -154,6 +162,19 @@ class AnthropicMessagesProvider:
                 AsyncAnthropic(api_key=self._api_key),
             )
         return self._client
+
+    async def close(self) -> None:
+        """Join the once-only cleanup of this provider's owned SDK client."""
+
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())
+        await await_cleanup(self._close_task)
+
+    async def _finish_close(self) -> None:
+        client = self._client
+        if self._owns_client and client is not None:
+            await client.close()
+        self._client = None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
@@ -219,8 +240,9 @@ class AnthropicMessagesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            async for event in self._stream(request):
-                yield event
+            async with closing_stream(self._stream(request)) as events:
+                async for event in events:
+                    yield event
             return
         except asyncio.CancelledError:
             raise
@@ -256,7 +278,9 @@ class AnthropicMessagesProvider:
         )
         try:
             manager = self.client.messages.stream(**arguments)
-            async with manager as native_stream:
+            stack = AsyncExitStack()
+            native_stream = await stack.enter_async_context(manager)
+            async with closing_stream(native_stream, close=stack.aclose):
                 async for native_event in native_stream:
                     event_type = _safe_structural_token(
                         _safe_field(native_event, "type")

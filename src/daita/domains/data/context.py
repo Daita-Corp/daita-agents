@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from typing import Protocol, cast
@@ -83,6 +83,8 @@ from .controller import (
 )
 from .export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
+    ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
+    ARTIFACT_CREATE_TABULAR_TOOL_NAME,
     ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
     ARTIFACT_LIST_CAPABILITY_ID,
     ARTIFACT_READ_CAPABILITY_ID,
@@ -305,6 +307,7 @@ class DataContextBuilder:
         memory: MemoryContextReader | None = None,
         skills: SkillContextReader | None = None,
         semantics: SemanticContextReader | None = None,
+        explicit_learning_requested: Callable[[str], bool] | None = None,
         artifact_destinations: ArtifactDestinationContextReader | None = None,
         workspace_id: str | None = None,
         workspace_sensitivity: ModelSensitivity | None = None,
@@ -370,6 +373,11 @@ class DataContextBuilder:
         self._memory = memory
         self._skills = skills
         self._semantics = semantics
+        if explicit_learning_requested is not None and not callable(
+            explicit_learning_requested
+        ):
+            raise TypeError("explicit_learning_requested must be callable")
+        self._explicit_learning_requested = explicit_learning_requested
         self._artifact_destinations = artifact_destinations
         self._workspace_id = workspace_id
         self._workspace_sensitivity = workspace_sensitivity
@@ -529,6 +537,10 @@ class DataContextBuilder:
                 facts,
             )
         candidate_text = ""
+        explicit_learning = (
+            self._explicit_learning_requested is not None
+            and self._explicit_learning_requested(run.id)
+        )
         selected_candidate = self._selected_learning_candidates.get(run.id)
         if selected_candidate is not None:
             _selected_candidate_id, candidate_text = selected_candidate
@@ -593,6 +605,7 @@ class DataContextBuilder:
             semantic_views=semantic_views,
             semantic_query=catalog_query,
             candidate_text=candidate_text,
+            explicit_learning=explicit_learning,
             artifact_destinations=artifact_destinations,
             sensitivity=sensitivity,
         )
@@ -634,6 +647,7 @@ class DataContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
+                explicit_learning=explicit_learning,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
                 final=False,
@@ -672,6 +686,7 @@ class DataContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
+                explicit_learning=explicit_learning,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
                 final=False,
@@ -705,6 +720,7 @@ class DataContextBuilder:
             skill_index=skill_index,
             semantic_text=semantic_text,
             candidate_text=candidate_text,
+            explicit_learning=explicit_learning,
             artifact_destinations=artifact_destinations,
             sensitivity=sensitivity,
             final=False,
@@ -723,6 +739,7 @@ class DataContextBuilder:
             skill_index=skill_index,
             semantic_text=semantic_text,
             candidate_text=candidate_text,
+            explicit_learning=explicit_learning,
             artifact_destinations=(),
             sensitivity=sensitivity,
             final=True,
@@ -904,6 +921,7 @@ class DataContextBuilder:
         semantic_views: tuple[SemanticAnnotationView, ...],
         semantic_query: str,
         candidate_text: str,
+        explicit_learning: bool,
         artifact_destinations: tuple[ArtifactDestination, ...],
         sensitivity: ModelSensitivity,
     ) -> tuple[dict[str, object], str]:
@@ -970,6 +988,7 @@ class DataContextBuilder:
                 skill_index=skill_index,
                 semantic_text=semantic_text,
                 candidate_text=candidate_text,
+                explicit_learning=explicit_learning,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
                 final=False,
@@ -1793,6 +1812,7 @@ def _request(
     skill_index: str | None,
     semantic_text: str,
     candidate_text: str,
+    explicit_learning: bool,
     artifact_destinations: tuple[ArtifactDestination, ...],
     sensitivity: ModelSensitivity,
     final: bool,
@@ -1813,6 +1833,7 @@ def _request(
                     skill_index=skill_index,
                     semantic_text=semantic_text,
                     candidate_text=candidate_text,
+                    explicit_learning=explicit_learning,
                     artifact_destinations=artifact_destinations,
                     final=final,
                 )
@@ -1850,6 +1871,7 @@ def _system_prompt(
     skill_index: str | None,
     semantic_text: str,
     candidate_text: str,
+    explicit_learning: bool = False,
     artifact_destinations: tuple[ArtifactDestination, ...],
     final: bool,
 ) -> str:
@@ -1857,6 +1879,7 @@ def _system_prompt(
         capability_ids
         & {
             DOCUMENT_CREATE_CAPABILITY_ID,
+            ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
             LOCAL_FILE_SEARCH_CAPABILITY_ID,
             LOCAL_FILE_READ_CAPABILITY_ID,
             DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -1972,6 +1995,16 @@ def _system_prompt(
             "and ask if evidence remains ambiguous."
         ),
     ]
+    if explicit_learning:
+        instructions.append(
+            "This run was explicitly invoked for durable learning. Validate the "
+            "user's proposed knowledge and persist the appropriate definition, "
+            "preference, or procedure through the existing learning tools and exact "
+            "approval flow, or explain why it cannot be saved. A calculation alone "
+            "does not fulfill this learning request. Load an on-demand learning tool "
+            "before calling it. This intent is not approval and grants no additional "
+            "access. Claim persistence only after a successful mutation result."
+        )
     if {
         LOCAL_FILE_SEARCH_CAPABILITY_ID,
         LOCAL_FILE_READ_CAPABILITY_ID,
@@ -1986,9 +2019,9 @@ def _system_prompt(
     if not final and has_on_demand_tools:
         instructions.extend(
             (
-                "Pinned tools may be called immediately by their exact names. To use "
-                "an on-demand tool, call toolbox_search when needed, then call "
-                "toolbox_load with the exact names for the next model step. A successful "
+                "Pinned tools may be called immediately. For on-demand tools, describe "
+                "the task to toolbox_search, or skip search if exact names are known. "
+                "Call toolbox_load with those names for the next model step. A successful "
                 "load replaces the prior on-demand working set; call each loaded tool "
                 "normally by its exact provider-visible name and schema. Search and load "
                 "grant no authority; ordinary current validation and governance still "
@@ -2001,12 +2034,13 @@ def _system_prompt(
     if JOB_READ_RESULTS_CAPABILITY_ID in capability_ids:
         instructions.append(
             "Durable jobs are owned by this agent across conversations; an "
-            "origin_conversation_id is provenance, not an access boundary. For a "
-            "known job ID, call job_read_results first and then artifact_read for an "
-            "exact returned artifact ID. If the job ID is unknown, call job_list "
-            "before job_read_results. Use job_inspect only for lifecycle status, "
-            "attempt, execution, or failure details, and job_cancel only for an "
-            "explicit cancellation request."
+            "origin_conversation_id is provenance, not access. For a known job ID, "
+            "call job_read_results first, then artifact_read using an exact returned "
+            "ID. Otherwise call job_list. Previous/latest profiles mean stored "
+            "results. Fresh source queries cannot substitute for a stored job "
+            "result, even when the numbers happen to match. Report missing results "
+            "honestly. Use job_inspect only for lifecycle details; job_cancel only "
+            "for an explicit cancellation request."
         )
     elif job_tools_available:
         instructions.append(
@@ -2070,6 +2104,8 @@ def _system_prompt(
             instructions.append(
                 (
                     "File tools: artifact_create_document for Markdown/TXT; "
+                    f"{ARTIFACT_CREATE_TABULAR_TOOL_NAME} for a bounded derived "
+                    "CSV/XLSX/HTML table from authenticated current-run result IDs; "
                     f"{DATA_EXPORT_TABULAR_TOOL_NAME} for exact CSV/XLSX; "
                     "for earlier generated files in the current conversation use "
                     "artifact_list, then artifact_read only if needed. An exact artifact "
@@ -2077,7 +2113,10 @@ def _system_prompt(
                     "agent's conversations; there is no agent-wide artifact inventory. "
                     "artifact_convert only converts a "
                     "verified Daita XLSX Data snapshot to CSV. Never put source rows or "
-                    "artifact bytes in arguments or rerun a source for conversion; ask "
+                    "artifact bytes in arguments for exact export or conversion; "
+                    "artifact_create_tabular accepts only bounded model-authored "
+                    "derived rows tied to authenticated evidence. Never rerun a source "
+                    "for conversion; ask "
                     "if the artifact choice remains ambiguous. "
                     "A committed artifact reference proves only internal creation, not "
                     "delivery. After each creation, call "

@@ -495,7 +495,11 @@ def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
         assert create_stderr == ""
 
         provider = MockModelProvider((_stop("bounded answer"),))
-        with patch.object(cli, "create_llm_provider", return_value=provider):
+        provider_close = AsyncMock()
+        with (
+            patch.object(cli, "create_llm_provider", return_value=provider),
+            patch.object(provider, "close", new=provider_close),
+        ):
             code, stdout, stderr = _invoke(
                 [
                     "--root",
@@ -516,6 +520,29 @@ def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
     assert records[0]["text"] == "bounded answer"
     assert {"run_id", "status", "reason", "text", "steps"} <= set(records[0])
     provider.assert_consumed()
+    provider_close.assert_awaited_once()
+
+
+def test_run_closes_cli_owned_provider_when_agent_open_fails():
+    provider = MockModelProvider(())
+    provider_close = AsyncMock()
+    arguments = cli.build_parser().parse_args(
+        ["run", "runner", "question", "--model", "mock:scripted"]
+    )
+
+    with (
+        patch.object(
+            cli, "_model_configuration", return_value=(provider, provider.model_profile)
+        ),
+        patch.object(
+            Agent, "open", new=AsyncMock(side_effect=RuntimeError("open failed"))
+        ),
+        patch.object(provider, "close", new=provider_close),
+        pytest.raises(RuntimeError, match="open failed"),
+    ):
+        asyncio.run(cli._execute(arguments))
+
+    provider_close.assert_awaited_once()
 
 
 def test_run_without_model_opens_the_persisted_route_without_injection():

@@ -15,6 +15,7 @@ from ..artifacts.models import (
     artifact_delivery_receipt_from_mapping,
     artifact_ref_from_mapping,
 )
+from ..llm._lifecycle import closing_stream
 from ..llm.errors import (
     ContextEvidencePressureExceeded,
     ContextWindowExceeded,
@@ -1001,33 +1002,34 @@ class AgentLoop:
                 events = routed_stream(run_route, request)
             else:
                 events = model.stream(request)
-            async for event in events:
-                if completed is not None:
-                    raise ModelProviderError(
-                        ProviderErrorCode.MALFORMED_RESPONSE,
-                        "model stream continued after its canonical completion",
-                        provider_id=self._model.provider_id,
-                    )
-                if isinstance(event, ModelTextDelta):
-                    self._emit_model_text_delta(
-                        run,
-                        event.text,
-                        model_call_index=model_call_index,
-                    )
-                elif isinstance(event, ModelToolCallDelta):
-                    pass
-                elif isinstance(event, ModelStreamCompleted):
-                    completed = event.response
-                else:
-                    raise ModelProviderError(
-                        ProviderErrorCode.MALFORMED_RESPONSE,
-                        "model stream returned an unsupported canonical event",
-                        provider_id=self._model.provider_id,
-                    )
-                # A deterministic or local provider may have an immediately-ready
-                # iterator. Yield so presentation, input, and cancellation remain
-                # responsive even for a high-rate canonical stream.
-                await asyncio.sleep(0)
+            async with closing_stream(events):
+                async for event in events:
+                    if completed is not None:
+                        raise ModelProviderError(
+                            ProviderErrorCode.MALFORMED_RESPONSE,
+                            "model stream continued after its canonical completion",
+                            provider_id=self._model.provider_id,
+                        )
+                    if isinstance(event, ModelTextDelta):
+                        self._emit_model_text_delta(
+                            run,
+                            event.text,
+                            model_call_index=model_call_index,
+                        )
+                    elif isinstance(event, ModelToolCallDelta):
+                        pass
+                    elif isinstance(event, ModelStreamCompleted):
+                        completed = event.response
+                    else:
+                        raise ModelProviderError(
+                            ProviderErrorCode.MALFORMED_RESPONSE,
+                            "model stream returned an unsupported canonical event",
+                            provider_id=self._model.provider_id,
+                        )
+                    # A deterministic or local provider may have an immediately-ready
+                    # iterator. Yield so presentation, input, and cancellation remain
+                    # responsive even for a high-rate canonical stream.
+                    await asyncio.sleep(0)
             if completed is None:
                 raise ModelProviderError(
                     ProviderErrorCode.MALFORMED_RESPONSE,

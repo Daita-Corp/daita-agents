@@ -697,9 +697,6 @@ async def test_sqlite_export_is_discoverable_as_an_effect_free_source_read(
                     name="toolbox_search",
                     arguments={
                         "query": "exact SQLite CSV export",
-                        "toolboxes": ["artifacts"],
-                        "data_access": "read",
-                        "operational_effect": "none",
                         "limit": 5,
                     },
                 )

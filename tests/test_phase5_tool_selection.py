@@ -310,7 +310,6 @@ async def test_file_query_search_load_route_is_exact_and_grounded(
                 "toolbox_search",
                 {
                     "query": "total revenue by region sales csv",
-                    "toolboxes": ["files"],
                     "limit": 5,
                 },
             ),
@@ -559,7 +558,6 @@ async def test_mixed_file_and_source_queries_remain_separate_and_grounded(
                     "toolbox_search",
                     {
                         "query": "aggregate local sales csv",
-                        "toolboxes": ["files"],
                         "limit": 5,
                     },
                 ),
@@ -748,7 +746,6 @@ async def test_markdown_report_searches_loads_creates_and_delivers_only_on_reque
                 "toolbox_search",
                 {
                     "query": "create markdown report document",
-                    "toolboxes": ["artifacts"],
                     "limit": 5,
                 },
             ),
@@ -771,7 +768,6 @@ async def test_markdown_report_searches_loads_creates_and_delivers_only_on_reque
                 "toolbox_search",
                 {
                     "query": "save deliver local report",
-                    "toolboxes": ["artifacts"],
                     "limit": 5,
                 },
             ),
@@ -850,7 +846,6 @@ class _EditRoutingProvider:
                 "toolbox_search",
                 {
                     "query": "edit timeout config yaml text replace workspace",
-                    "toolboxes": ["artifacts"],
                     "limit": 5,
                 },
             )
@@ -884,7 +879,6 @@ class _EditRoutingProvider:
                 "toolbox_search",
                 {
                     "query": "save replace bound workspace file",
-                    "toolboxes": ["artifacts"],
                     "limit": 5,
                 },
             )
@@ -1257,7 +1251,6 @@ async def test_generated_maximum_catalog_is_bounded_searchable_and_replacing(
             name="toolbox_search",
             arguments={
                 "query": "total revenue by region sales csv",
-                "toolboxes": ["files"],
                 "limit": 5,
             },
         )

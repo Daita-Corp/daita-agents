@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import cast
 
 from ..._installation import repair_guidance
+from .._lifecycle import await_cleanup, closing_stream
 from ..errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -62,7 +63,6 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
         self._credential = oauth
         self._credential_updater = credential_updater
         self._refresh_lock = asyncio.Lock()
-        self._client_was_injected = client is not None
 
     @property
     def provider_id(self) -> str:
@@ -75,6 +75,8 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
 
     @property
     def client(self) -> _OpenAIClient:
+        if self._close_task is not None:
+            raise RuntimeError("Codex subscription provider is closed")
         if self._client is None:
             try:
                 from openai import AsyncOpenAI, Timeout
@@ -110,9 +112,10 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
             async with asyncio.timeout(_CODEX_ATTEMPT_TIMEOUT_SECONDS):
                 await self._ensure_current_credential()
                 completed: ModelResponse | None = None
-                async for event in super()._stream(request):
-                    if isinstance(event, ModelStreamCompleted):
-                        completed = event.response
+                async with closing_stream(super()._stream(request)) as events:
+                    async for event in events:
+                        if isinstance(event, ModelStreamCompleted):
+                            completed = event.response
                 if completed is None:
                     raise ModelProviderError(
                         ProviderErrorCode.MALFORMED_RESPONSE,
@@ -151,8 +154,11 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
                     ) from error
             self._credential = refreshed
             self._api_key = refreshed.access_token
-            if not self._client_was_injected:
+            if self._owns_client:
+                previous_client = self._client
                 self._client = None
+                if previous_client is not None:
+                    await await_cleanup(asyncio.create_task(previous_client.close()))
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
         arguments = super()._request_arguments(request)

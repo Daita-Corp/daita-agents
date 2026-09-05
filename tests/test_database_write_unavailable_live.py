@@ -26,7 +26,7 @@ from daita.llm.models import (
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.profiles import reviewed_model_profile
-from daita.llm.protocols import ModelProvider, provider_has_complete_pricing
+from daita.llm.protocols import ManagedModelProvider, provider_has_complete_pricing
 from daita.loop.models import LoopExitKind, Transcript
 from daita.security import EnvironmentSecretProvider, SecretReference
 
@@ -77,7 +77,7 @@ pytestmark = [
 class _GuardedRecordingProvider:
     """Capture real requests and constrain calls to the write-validation path."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.bootstrap_count = 0
@@ -149,6 +149,9 @@ class _GuardedRecordingProvider:
                 f"live write guard selected an unexpected tool: {unexpected}"
             )
         return response
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 def _required_environment(name: str) -> str:
@@ -309,7 +312,10 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
                     )
                 )
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
     after = await _customer_snapshot(password=database_password, port=port)
     assert exit.kind is LoopExitKind.COMPLETED

@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_workspace import LocalWorkspaceBackend, LocalWorkspaceError
@@ -32,10 +32,16 @@ from ...artifacts.models import (
 from ...artifacts.renderers import (
     CSV_ALLOWED_EXTENSIONS,
     DOCUMENT_ALLOWED_EXTENSIONS,
+    HTML_ALLOWED_EXTENSIONS,
+    HTML_MEDIA_TYPE,
     MAX_CSV_BYTES,
     MAX_CSV_COLUMNS,
     MAX_CSV_ROWS,
     MAX_CSV_SECONDS,
+    MAX_MODEL_TABULAR_BYTES,
+    MAX_MODEL_TABULAR_CELL_CHARACTERS,
+    MAX_MODEL_TABULAR_COLUMNS,
+    MAX_MODEL_TABULAR_ROWS,
     MAX_TEXT_EDIT_ANCHOR_BYTES,
     MAX_TEXT_EDIT_BYTES,
     MAX_TEXT_EDIT_OCCURRENCES,
@@ -50,6 +56,7 @@ from ...artifacts.renderers import (
     read_exact_xlsx_data,
     render_exact_csv,
     render_model_document,
+    render_model_tabular,
     text_edit_media_type,
 )
 from ...artifacts.result_snapshot import (
@@ -95,6 +102,11 @@ DOCUMENT_CREATE_CAPABILITY_ID = "artifact.create_document"
 DOCUMENT_CREATE_EXECUTOR_ID = "artifact.create_document.executor"
 DOCUMENT_CREATE_TOOL_NAME = "artifact_create_document"
 DOCUMENT_CREATE_OUTPUT_KIND = "artifact.document"
+
+ARTIFACT_CREATE_TABULAR_CAPABILITY_ID = "artifact.create_tabular"
+ARTIFACT_CREATE_TABULAR_EXECUTOR_ID = "artifact.create_tabular.executor"
+ARTIFACT_CREATE_TABULAR_TOOL_NAME = "artifact_create_tabular"
+ARTIFACT_CREATE_TABULAR_OUTPUT_KIND = "artifact.tabular"
 
 RESULT_SNAPSHOT_CAPABILITY_ID = "artifact.snapshot_result"
 RESULT_SNAPSHOT_EXECUTOR_ID = "artifact.snapshot_result.executor"
@@ -289,6 +301,47 @@ class DocumentArtifactExecutor:
         return ToolOutput(
             kind=DOCUMENT_CREATE_OUTPUT_KIND,
             data={"format": format_name, "character_count": len(content)},
+            artifact=draft,
+        )
+
+
+class ModelTabularArtifactExecutor:
+    executor_id = ARTIFACT_CREATE_TABULAR_EXECUTOR_ID
+
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        self._clock = clock
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        columns = request.arguments["columns"]
+        rows = request.arguments["rows"]
+        format_name = request.arguments["format"]
+        filename = request.arguments.get("filename")
+        evidence = request.arguments["evidence_call_ids"]
+        assert isinstance(columns, tuple)
+        assert isinstance(rows, tuple)
+        assert isinstance(format_name, str)
+        assert filename is None or isinstance(filename, str)
+        assert isinstance(evidence, tuple)
+        assert all(isinstance(item, str) for item in columns)
+        assert all(isinstance(row, tuple) for row in rows)
+        assert all(isinstance(item, str) for item in evidence)
+        draft = render_model_tabular(
+            columns=cast(tuple[str, ...], columns),
+            rows=cast(tuple[tuple[object, ...], ...], rows),
+            format=format_name,
+            filename=filename,
+            evidence_call_ids=cast(tuple[str, ...], evidence),
+            created_at=self._clock(),
+        )
+        return ToolOutput(
+            kind=ARTIFACT_CREATE_TABULAR_OUTPUT_KIND,
+            data={
+                "format": format_name,
+                "filename": draft.suggested_filename,
+                "row_count": len(rows),
+                "column_count": len(columns),
+                "evidence_call_ids": evidence,
+            },
             artifact=draft,
         )
 
@@ -528,7 +581,11 @@ class ArtifactReadExecutor:
         payload = await self._artifacts.read(artifact_id)
         summary = _model_artifact_summary(payload.ref)
         if payload.ref.media_type == XLSX_MEDIA_TYPE:
-            data = await asyncio.to_thread(read_exact_xlsx_data, payload.content)
+            data = await asyncio.to_thread(
+                read_exact_xlsx_data,
+                payload.content,
+                expected_authorship=payload.ref.provenance.authorship,
+            )
             rows = data.rows[:MAX_MODEL_ARTIFACT_XLSX_ROWS]
             return ToolOutput(
                 kind=ARTIFACT_READ_OUTPUT_KIND,
@@ -544,7 +601,7 @@ class ArtifactReadExecutor:
                     "truncated": len(rows) < len(data.rows),
                 },
             )
-        if payload.ref.media_type not in TEXT_EDIT_MEDIA_TYPES:
+        if payload.ref.media_type not in {*TEXT_EDIT_MEDIA_TYPES, HTML_MEDIA_TYPE}:
             raise ArtifactError(
                 "artifact_invalid_format",
                 "This artifact format does not support a model preview.",
@@ -863,6 +920,7 @@ def artifact_declarations(
     artifacts: AgentHomeArtifactStore,
     *,
     workspace: LocalWorkspaceBackend | None,
+    clock: Callable[[], datetime],
 ) -> ArtifactCapabilityDeclarations:
     include_local_delivery = delivery is not None
     declarations = artifact_capability_declarations(
@@ -879,6 +937,7 @@ def artifact_declarations(
         capabilities=declarations.capabilities,
         executors=(
             DocumentArtifactExecutor(),
+            ModelTabularArtifactExecutor(clock=clock),
             ResultSnapshotExecutor(),
             ArtifactListExecutor(artifacts),
             ArtifactReadExecutor(artifacts),
@@ -962,6 +1021,118 @@ def artifact_capability_declarations(
             max_artifact_count=1,
             max_bytes_per_artifact=MAX_DOCUMENT_BYTES,
             max_total_bytes_per_call=MAX_DOCUMENT_BYTES,
+        ),
+    )
+    tabular = Capability(
+        id=ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
+        description=(
+            "Create one bounded model-authored CSV, XLSX, or HTML table derived "
+            "from authenticated earlier successful tool results in the current "
+            "run. This does not claim an exact or complete source export."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "columns": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_MODEL_TABULAR_COLUMNS,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                    },
+                },
+                "rows": {
+                    "type": "array",
+                    "maxItems": MAX_MODEL_TABULAR_ROWS,
+                    "items": {
+                        "type": "array",
+                        "maxItems": MAX_MODEL_TABULAR_COLUMNS,
+                        "items": {
+                            "type": ["string", "number", "boolean", "null"],
+                            "maxLength": MAX_MODEL_TABULAR_CELL_CHARACTERS,
+                        },
+                    },
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["csv", "xlsx", "html"],
+                },
+                "filename": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120,
+                },
+                "evidence_call_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "uniqueItems": True,
+                },
+            },
+            "required": [
+                "columns",
+                "rows",
+                "format",
+                "evidence_call_ids",
+            ],
+            "additionalProperties": False,
+        },
+        output_kind=ARTIFACT_CREATE_TABULAR_OUTPUT_KIND,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "format": {
+                    "type": "string",
+                    "enum": ["csv", "xlsx", "html"],
+                },
+                "filename": {"type": "string"},
+                "row_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_MODEL_TABULAR_ROWS,
+                },
+                "column_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_MODEL_TABULAR_COLUMNS,
+                },
+                "evidence_call_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "uniqueItems": True,
+                    "items": {"type": "string"},
+                },
+            },
+            "required": [
+                "format",
+                "filename",
+                "row_count",
+                "column_count",
+                "evidence_call_ids",
+            ],
+            "additionalProperties": False,
+        },
+        executor_id=ARTIFACT_CREATE_TABULAR_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        artifact_policy=ArtifactPolicy(
+            allowed_media_types=frozenset(
+                {"text/csv", XLSX_MEDIA_TYPE, HTML_MEDIA_TYPE}
+            ),
+            allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
+            allowed_extensions=(
+                CSV_ALLOWED_EXTENSIONS
+                + XLSX_ALLOWED_EXTENSIONS
+                + HTML_ALLOWED_EXTENSIONS
+            ),
+            artifact_required=True,
+            max_artifact_count=1,
+            max_bytes_per_artifact=MAX_MODEL_TABULAR_BYTES,
+            max_total_bytes_per_call=MAX_MODEL_TABULAR_BYTES,
         ),
     )
     result_snapshot = Capability(
@@ -1297,6 +1468,7 @@ def artifact_capability_declarations(
     )
     capabilities = (
         document,
+        tabular,
         result_snapshot,
         artifact_list,
         artifact_read,
@@ -1313,9 +1485,33 @@ def artifact_capability_declarations(
                 toolbox_id=ToolboxId.ARTIFACTS,
                 load_mode=ToolLoadMode.ON_DEMAND,
                 text_trust=ToolTextTrust.CODE,
-                summary="Create a bounded Markdown or text document artifact.",
+                summary="Create a bounded Markdown or text report document.",
                 when_to_use="Use when the requested deliverable is a document.",
-                keywords=("artifact", "document", "markdown", "text"),
+                keywords=("artifact", "document", "markdown", "text", "report"),
+            ),
+        ),
+        ToolView(
+            name=ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+            capability_id=tabular.id,
+            description=tabular.description,
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
+                summary="Create a bounded derived findings table as CSV, XLSX, or HTML.",
+                when_to_use=(
+                    "Use to export analyzed findings from successful current-run tools, "
+                    "not a complete exact source export."
+                ),
+                keywords=(
+                    "artifact",
+                    "table",
+                    "findings",
+                    "export",
+                    "csv",
+                    "xlsx",
+                    "html",
+                ),
             ),
         ),
         ToolView(
@@ -1408,7 +1604,7 @@ def artifact_capability_declarations(
                         toolbox_id=ToolboxId.ARTIFACTS,
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
-                        summary="Deliver one committed artifact to an authorized local destination.",
+                        summary="Save a committed artifact locally or replace its bound workspace file.",
                         when_to_use="Use after artifact creation when local delivery is required.",
                         keywords=("artifact", "save", "deliver", "local"),
                     ),
@@ -1449,6 +1645,7 @@ _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
 _ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
+        ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
         RESULT_SNAPSHOT_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
         ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
@@ -1457,6 +1654,7 @@ _ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
 _BASE_ARTIFACT_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
+        ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
         RESULT_SNAPSHOT_CAPABILITY_ID,
         ARTIFACT_LIST_CAPABILITY_ID,
         ARTIFACT_READ_CAPABILITY_ID,
@@ -1505,6 +1703,15 @@ class ArtifactDomainCatalog(Protocol):
 
 class ArtifactTranscriptReader(Protocol):
     async def load(self, run_id: str) -> Transcript: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _ValidatedArtifactEvidence:
+    call: ToolCall
+    block: ToolResultBlock
+    capability: Capability
+    output_kind: str
+    data: Mapping[str, object]
 
 
 class ArtifactCapabilityDomain:
@@ -1723,6 +1930,7 @@ class ArtifactCapabilityDomain:
             if capability.id == ARTIFACT_READ_CAPABILITY_ID and ref.media_type not in {
                 *TEXT_EDIT_MEDIA_TYPES,
                 XLSX_MEDIA_TYPE,
+                HTML_MEDIA_TYPE,
             }:
                 raise CapabilityInputError(
                     "artifact_invalid_format",
@@ -1781,6 +1989,145 @@ class ArtifactCapabilityDomain:
                 )
         return arguments
 
+    async def _validated_current_run_evidence(
+        self,
+        run: RunInput,
+        current_call: ToolCall,
+        evidence_call_ids: tuple[str, ...],
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> tuple[_ValidatedArtifactEvidence, ...]:
+        registry = self._registry
+        if registry is None:
+            raise CapabilityInputError(
+                error_code,
+                "Artifact evidence validation is unavailable in this runtime.",
+            )
+        if (
+            not evidence_call_ids
+            or len(evidence_call_ids) > 16
+            or len(evidence_call_ids) != len(set(evidence_call_ids))
+        ):
+            raise CapabilityInputError(
+                error_code,
+                error_message,
+                {"evidence_call_ids": evidence_call_ids},
+            )
+        try:
+            transcript = await self._transcripts.load(run.id)
+        except KeyError as error:
+            raise CapabilityInputError(
+                error_code,
+                error_message,
+                {"run_id": run.id},
+            ) from error
+        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
+            raise CapabilityInputError(error_code, error_message)
+
+        current_calls = tuple(
+            (message_index, candidate)
+            for message_index, message in enumerate(transcript.messages)
+            if message.role is MessageRole.ASSISTANT
+            for candidate in message.tool_calls
+            if candidate.id == current_call.id
+        )
+        if (
+            len(current_calls) != 1
+            or current_calls[0][1].name != current_call.name
+            or current_calls[0][1].arguments != current_call.arguments
+        ):
+            raise CapabilityInputError(error_code, error_message)
+        current_index = current_calls[0][0]
+
+        validated: list[_ValidatedArtifactEvidence] = []
+        for evidence_call_id in evidence_call_ids:
+            evidence_calls = tuple(
+                (message_index, candidate)
+                for message_index, message in enumerate(transcript.messages)
+                if message.role is MessageRole.ASSISTANT
+                for candidate in message.tool_calls
+                if candidate.id == evidence_call_id
+            )
+            evidence_results = tuple(
+                (message_index, block)
+                for message_index, message in enumerate(transcript.messages)
+                if message.role is MessageRole.TOOL
+                for block in message.content
+                if isinstance(block, ToolResultBlock)
+                and block.call_id == evidence_call_id
+            )
+            ordered = (
+                len(evidence_calls) == 1
+                and len(evidence_results) == 1
+                and evidence_calls[0][0] < evidence_results[0][0] < current_index
+            )
+            block = evidence_results[0][1] if len(evidence_results) == 1 else None
+            if (
+                not ordered
+                or block is None
+                or block.is_error
+                or block.capability_id is None
+                or block.executor_id is None
+                or block.output_sha256 is None
+                or block.sensitivity is None
+                or not block.sensitivity_provenance
+            ):
+                raise CapabilityInputError(
+                    error_code,
+                    error_message,
+                    {"call_id": evidence_call_id},
+                )
+            producer_call = evidence_calls[0][1]
+            try:
+                _view, producer_capability = registry.resolve_tool(producer_call.name)
+                if (
+                    producer_capability.id != block.capability_id
+                    or producer_capability.executor_id != block.executor_id
+                    or block.output_sha256 != _sha256_json(block.output)
+                ):
+                    raise ValueError("result execution lineage differs")
+                registry.validate_arguments(
+                    producer_capability.id,
+                    producer_call.arguments,
+                )
+                if set(block.output) not in (
+                    {"kind", "data"},
+                    {"kind", "data", "artifact", "delivery_status"},
+                ):
+                    raise ValueError("result envelope shape differs")
+                output_kind = block.output.get("kind")
+                result_data = block.output.get("data")
+                if not isinstance(output_kind, str) or not isinstance(
+                    result_data, Mapping
+                ):
+                    raise ValueError("result data is unavailable")
+                registry.validate_output(
+                    producer_capability.id,
+                    ToolOutput(
+                        kind=output_kind,
+                        data=result_data,
+                        sensitivity=block.sensitivity,
+                        sensitivity_provenance=block.sensitivity_provenance,
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise CapabilityInputError(
+                    error_code,
+                    error_message,
+                    {"call_id": evidence_call_id},
+                ) from error
+            validated.append(
+                _ValidatedArtifactEvidence(
+                    call=producer_call,
+                    block=block,
+                    capability=producer_capability,
+                    output_kind=output_kind,
+                    data=result_data,
+                )
+            )
+        return tuple(validated)
+
     async def _prepare_result_snapshot(
         self,
         run: RunInput,
@@ -1801,106 +2148,22 @@ class ArtifactCapabilityDomain:
                 "artifact_snapshot_evidence_invalid",
                 "A result snapshot requires one exact earlier call ID.",
             )
-        try:
-            transcript = await self._transcripts.load(run.id)
-        except KeyError as error:
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "Result snapshot evidence must belong to the current run.",
-            ) from error
-        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "Result snapshot evidence belongs to another agent or run.",
-            )
-        current_calls = tuple(
-            (message_index, candidate)
-            for message_index, message in enumerate(transcript.messages)
-            if message.role is MessageRole.ASSISTANT
-            for candidate in message.tool_calls
-            if candidate.id == call.id
+        (evidence,) = await self._validated_current_run_evidence(
+            run,
+            call,
+            (evidence_call_id,),
+            error_code="artifact_snapshot_evidence_invalid",
+            error_message=(
+                "Result snapshot evidence must be one earlier successful "
+                "current-run result with validated execution lineage."
+            ),
         )
-        evidence_calls = tuple(
-            (message_index, candidate)
-            for message_index, message in enumerate(transcript.messages)
-            if message.role is MessageRole.ASSISTANT
-            for candidate in message.tool_calls
-            if candidate.id == evidence_call_id
-        )
-        evidence_results = tuple(
-            (message_index, block)
-            for message_index, message in enumerate(transcript.messages)
-            if message.role is MessageRole.TOOL
-            for block in message.content
-            if isinstance(block, ToolResultBlock) and block.call_id == evidence_call_id
-        )
-        current_valid = (
-            len(current_calls) == 1
-            and current_calls[0][1].name == call.name
-            and current_calls[0][1].arguments == call.arguments
-        )
-        ordered_evidence = (
-            current_valid
-            and len(evidence_calls) == 1
-            and len(evidence_results) == 1
-            and evidence_calls[0][0] < evidence_results[0][0] < current_calls[0][0]
-        )
-        if not ordered_evidence or evidence_results[0][1].is_error:
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "Result snapshot evidence must be one earlier successful current-run call.",
-                {"call_id": evidence_call_id},
-            )
-        producer_call = evidence_calls[0][1]
-        block = evidence_results[0][1]
-        if (
-            block.capability_id is None
-            or block.executor_id is None
-            or block.output_sha256 is None
-            or block.sensitivity is None
-            or not block.sensitivity_provenance
-        ):
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "The selected result lacks validated execution lineage.",
-                {"call_id": evidence_call_id},
-            )
-        try:
-            _view, producer_capability = registry.resolve_tool(producer_call.name)
-            if (
-                producer_capability.id != block.capability_id
-                or producer_capability.executor_id != block.executor_id
-                or block.output_sha256 != _sha256_json(block.output)
-            ):
-                raise ValueError("result execution lineage differs")
-            registry.validate_arguments(
-                producer_capability.id,
-                producer_call.arguments,
-            )
-            if set(block.output) not in (
-                {"kind", "data"},
-                {"kind", "data", "artifact", "delivery_status"},
-            ):
-                raise ValueError("result envelope shape differs")
-            output_kind = block.output.get("kind")
-            result_data = block.output.get("data")
-            if not isinstance(output_kind, str) or not isinstance(result_data, Mapping):
-                raise ValueError("result data is unavailable")
-            registry.validate_output(
-                producer_capability.id,
-                ToolOutput(
-                    kind=output_kind,
-                    data=result_data,
-                    sensitivity=block.sensitivity,
-                    sensitivity_provenance=block.sensitivity_provenance,
-                ),
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "The selected tool result no longer matches its declared contract.",
-                {"call_id": evidence_call_id},
-            ) from error
+        producer_call = evidence.call
+        block = evidence.block
+        producer_capability = evidence.capability
+        output_kind = evidence.output_kind
+        result_data = evidence.data
+        assert block.sensitivity is not None
         output_provenance = result_data.get("provenance")
         if output_kind == "mcp.read.result" and (
             not isinstance(output_provenance, Mapping)
@@ -2010,15 +2273,43 @@ class ArtifactCapabilityDomain:
         del request_sensitivity
         if output.artifact is not None:
             self._validate_artifact_summary(capability, output)
+            bound_artifact = await self._bind_provenance(
+                run,
+                call,
+                capability,
+                arguments,
+                output.artifact,
+            )
             output = replace(
                 output,
-                artifact=await self._bind_provenance(
-                    run,
-                    capability,
-                    arguments,
-                    output.artifact,
-                ),
+                artifact=bound_artifact,
             )
+            if capability.id == ARTIFACT_CREATE_TABULAR_CAPABILITY_ID or (
+                capability.id == DOCUMENT_CREATE_CAPABILITY_ID
+                and bound_artifact.provenance.evidence_call_ids
+            ):
+                artifact_sensitivity = ModelSensitivity(
+                    bound_artifact.sensitivity.value
+                )
+                if output.sensitivity is None:
+                    output = replace(
+                        output,
+                        sensitivity=artifact_sensitivity,
+                        sensitivity_provenance={
+                            "authority": "artifact_domain_bound_provenance",
+                            "capability_id": capability.id,
+                            "authorship": bound_artifact.provenance.authorship.value,
+                            "evidence_call_ids": (
+                                bound_artifact.provenance.evidence_call_ids
+                            ),
+                        },
+                    )
+                elif (
+                    output.sensitivity.routing_rank < artifact_sensitivity.routing_rank
+                ):
+                    raise ToolOutputValidationError(
+                        "artifact result sensitivity is lower than its committed draft"
+                    )
         if capability.operational_effect is not OperationalEffect.NONE and not (
             capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
             and output.data.get("outcome") == "failed"
@@ -2122,6 +2413,26 @@ class ArtifactCapabilityDomain:
                     raise ToolOutputValidationError(
                         "artifact edit summary differs from its execution provenance"
                     )
+            elif capability.id == ARTIFACT_CREATE_TABULAR_CAPABILITY_ID:
+                format_name = output.data.get("format")
+                expected_media_type = (
+                    {
+                        "csv": "text/csv",
+                        "xlsx": XLSX_MEDIA_TYPE,
+                        "html": HTML_MEDIA_TYPE,
+                    }.get(format_name)
+                    if isinstance(format_name, str)
+                    else None
+                )
+                if (
+                    expected_media_type != draft.media_type
+                    or output.data.get("filename") != draft.suggested_filename
+                    or output.data.get("evidence_call_ids")
+                    != draft.provenance.evidence_call_ids
+                ):
+                    raise ToolOutputValidationError(
+                        "model-authored table summary differs from its artifact"
+                    )
             return
         if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
             valid = (
@@ -2144,6 +2455,7 @@ class ArtifactCapabilityDomain:
     async def _bind_provenance(
         self,
         run: RunInput,
+        call: ToolCall,
         capability: Capability,
         arguments: Mapping[str, object],
         draft: ArtifactDraft,
@@ -2199,63 +2511,26 @@ class ArtifactCapabilityDomain:
                     authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
                 ),
             )
-        try:
-            transcript = await self._transcripts.load(run.id)
-        except KeyError as error:
-            raise CapabilityInputError(
-                "invalid_argument_value",
-                "Artifact evidence must reference the current run.",
-                {"name": "evidence_call_ids"},
-            ) from error
-        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
-            raise CapabilityInputError(
-                "invalid_argument_value",
-                "Artifact evidence belongs to another run.",
-                {"name": "evidence_call_ids"},
-            )
+        evidence_results = await self._validated_current_run_evidence(
+            run,
+            call,
+            provenance.evidence_call_ids,
+            error_code="artifact_evidence_invalid",
+            error_message=(
+                "Artifact evidence must reference earlier successful current-run "
+                "results with validated execution lineage."
+            ),
+        )
         bindings: dict[tuple[str, str], ArtifactResourceBinding] = {}
         sensitivities = [draft.sensitivity]
         schema_cache: dict[str, dict[str, ResourceSchema]] = {}
-        for call_id in provenance.evidence_call_ids:
-            results = tuple(
-                block
-                for message in transcript.messages
-                if message.role is MessageRole.TOOL
-                for block in message.content
-                if isinstance(block, ToolResultBlock) and block.call_id == call_id
-            )
-            call_exists = any(
-                candidate.id == call_id
-                for message in transcript.messages
-                if message.role is MessageRole.ASSISTANT
-                for candidate in message.tool_calls
-            )
-            if len(results) != 1 or not call_exists or results[0].is_error:
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence must reference one earlier successful data call.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            block = results[0]
-            if block.output.get("kind") not in {
-                "data.query_result",
-                "data.local_file.read_result",
-            }:
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence must reference a validated data result.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            data = block.output.get("data")
-            if not isinstance(data, Mapping):
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence result data is unavailable.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            if block.sensitivity is not None:
-                sensitivities.append(Sensitivity(block.sensitivity.value))
-            if block.output.get("kind") == "data.local_file.read_result":
+        for evidence in evidence_results:
+            call_id = evidence.call.id
+            block = evidence.block
+            data = evidence.data
+            assert block.sensitivity is not None
+            sensitivities.append(Sensitivity(block.sensitivity.value))
+            if evidence.output_kind != "data.query_result":
                 continue
             source_id = data.get("source_id")
             source_revision = data.get("source_revision")
@@ -2637,6 +2912,10 @@ def _destination_schema() -> dict[str, object]:
 
 
 __all__ = [
+    "ARTIFACT_CREATE_TABULAR_CAPABILITY_ID",
+    "ARTIFACT_CREATE_TABULAR_EXECUTOR_ID",
+    "ARTIFACT_CREATE_TABULAR_OUTPUT_KIND",
+    "ARTIFACT_CREATE_TABULAR_TOOL_NAME",
     "ARTIFACT_CONVERT_CAPABILITY_ID",
     "ARTIFACT_CONVERT_EXECUTOR_ID",
     "ARTIFACT_CONVERT_OUTPUT_KIND",
@@ -2672,6 +2951,7 @@ __all__ = [
     "ExactTabularExportBackend",
     "ExactTabularProgress",
     "ExactTabularExportResult",
+    "ModelTabularArtifactExecutor",
     "RESULT_SNAPSHOT_CAPABILITY_ID",
     "RESULT_SNAPSHOT_EXECUTOR_ID",
     "RESULT_SNAPSHOT_OUTPUT_KIND",

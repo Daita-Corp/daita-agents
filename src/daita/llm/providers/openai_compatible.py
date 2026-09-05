@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
+from .._lifecycle import await_cleanup, closing_stream
 from ..errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -52,6 +53,10 @@ _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _CONTINUATION_KEY = "openai_compatible_continuation"
 
 
+class _NativeStream(Protocol):
+    async def close(self) -> None: ...
+
+
 class _CompletionsResource(Protocol):
     async def create(self, **kwargs: object) -> object: ...
 
@@ -64,6 +69,8 @@ class _ChatResource(Protocol):
 class _OpenAICompatibleClient(Protocol):
     @property
     def chat(self) -> _ChatResource: ...
+
+    async def close(self) -> None: ...
 
 
 def _new_id(prefix: str) -> str:
@@ -141,6 +148,8 @@ class OpenAICompatibleProvider:
         self._api_key = api_key
         self._max_tokens = max_tokens
         self._client = client
+        self._owns_client = client is None
+        self._close_task: asyncio.Task[None] | None = None
         self._id_factory = _new_id if id_factory is None else id_factory
         self._pricing_schedules = admitted_schedules
         self._pricing_qualifiers = admitted_qualifiers
@@ -176,6 +185,8 @@ class OpenAICompatibleProvider:
 
     @property
     def client(self) -> _OpenAICompatibleClient:
+        if self._close_task is not None:
+            raise RuntimeError(f"{self.provider} provider is closed")
         if self._client is None:
             try:
                 from openai import AsyncOpenAI
@@ -189,6 +200,19 @@ class OpenAICompatibleProvider:
                 AsyncOpenAI(api_key=self._api_key, base_url=self.base_url),
             )
         return self._client
+
+    async def close(self) -> None:
+        """Join the once-only cleanup of this provider's owned SDK client."""
+
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())
+        await await_cleanup(self._close_task)
+
+    async def _finish_close(self) -> None:
+        client = self._client
+        if self._owns_client and client is not None:
+            await client.close()
+        self._client = None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
@@ -253,8 +277,9 @@ class OpenAICompatibleProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            async for event in self._stream(request):
-                yield event
+            async with closing_stream(self._stream(request)) as events:
+                async for event in events:
+                    yield event
             return
         except asyncio.CancelledError:
             raise
@@ -315,146 +340,157 @@ class OpenAICompatibleProvider:
         response_model: str | None = None
         service_tier: str | None = None
         iterator = cast(AsyncIterator[object], iterator_method())
-        while True:
-            try:
-                chunk = await anext(iterator)
-            except StopAsyncIteration:
-                break
-            except asyncio.CancelledError:
-                raise
-            except ModelProviderError:
-                raise
-            except Exception as error:
-                raise _normalize_error(error, self.provider) from error
-            try:
-                chunk_id = _optional_text(_field(chunk, "id", None), "chunk id")
-                if chunk_id is not None:
-                    if response_id is not None and response_id != chunk_id:
-                        raise ValueError("stream response ID changed")
-                    response_id = chunk_id
-                chunk_model = _optional_text(
-                    _field(chunk, "model", None),
-                    "stream response model",
-                )
-                if chunk_model is not None:
-                    if response_model is not None and response_model != chunk_model:
-                        raise ValueError("stream response model changed")
-                    response_model = chunk_model
-                chunk_service_tier = _optional_text(
-                    _field(chunk, "service_tier", None),
-                    "stream service tier",
-                )
-                if chunk_service_tier is not None:
-                    if service_tier is not None and service_tier != chunk_service_tier:
-                        raise ValueError("stream service tier changed")
-                    service_tier = chunk_service_tier
-                chunk_usage = _field(chunk, "usage", None)
-                if chunk_usage is not None:
-                    usage_value = chunk_usage
-                choices = _sequence(
-                    _field(chunk, "choices", ()),
-                    "stream choices",
-                )
-                if len(choices) > 1:
-                    raise ValueError("stream must contain at most one choice")
-                if not choices:
-                    # OpenAI-compatible servers may emit metadata-only or
-                    # heartbeat chunks. Terminal validity is checked below.
-                    continue
-                choice = choices[0]
-                choice_index = _field(choice, "index", 0)
-                if choice_index != 0:
-                    raise ValueError("stream choice index must be zero")
-                delta = _field(choice, "delta")
-                refusal = _optional_text(
-                    _field(delta, "refusal", None),
-                    "stream refusal",
-                )
-                if refusal is not None:
-                    raise ModelProviderError(
-                        ProviderErrorCode.CONTENT_BLOCKED,
-                        f"{self.provider} blocked the response",
+        async with closing_stream(
+            iterator, close=cast(_NativeStream, raw_stream).close
+        ):
+            while True:
+                try:
+                    chunk = await anext(iterator)
+                except StopAsyncIteration:
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except ModelProviderError:
+                    raise
+                except Exception as error:
+                    raise _normalize_error(error, self.provider) from error
+                try:
+                    chunk_id = _optional_text(_field(chunk, "id", None), "chunk id")
+                    if chunk_id is not None:
+                        if response_id is not None and response_id != chunk_id:
+                            raise ValueError("stream response ID changed")
+                        response_id = chunk_id
+                    chunk_model = _optional_text(
+                        _field(chunk, "model", None),
+                        "stream response model",
                     )
-                content = _field(delta, "content", None)
-                if content is not None:
-                    if not isinstance(content, str):
-                        raise ValueError("stream content must be text")
-                    text_fragments.append(content)
-                    if content:
-                        yield ModelTextDelta(content)
-                raw_calls = _field(delta, "tool_calls", ())
-                if raw_calls is None:
-                    raw_calls = ()
-                for item in _sequence(raw_calls, "stream tool calls"):
-                    index = _nonnegative_int(
-                        _field(item, "index"),
-                        "stream tool index",
+                    if chunk_model is not None:
+                        if response_model is not None and response_model != chunk_model:
+                            raise ValueError("stream response model changed")
+                        response_model = chunk_model
+                    chunk_service_tier = _optional_text(
+                        _field(chunk, "service_tier", None),
+                        "stream service tier",
                     )
-                    state = tool_states.get(index)
-                    is_first = state is None
-                    if state is None:
-                        state = _StreamedToolCall(self._id_factory("call"))
-                        tool_states[index] = state
-                    native_id = _optional_text(
-                        _field(item, "id", None),
-                        "stream provider call ID",
-                    )
-                    if native_id is not None:
+                    if chunk_service_tier is not None:
                         if (
-                            state.provider_call_id is not None
-                            and state.provider_call_id != native_id
+                            service_tier is not None
+                            and service_tier != chunk_service_tier
                         ):
-                            raise ValueError("stream provider call ID changed")
-                        state.provider_call_id = native_id
-                    function = _field(item, "function", None)
-                    name: str | None = None
-                    argument_delta = ""
-                    if function is not None:
-                        name = _optional_text(
-                            _field(function, "name", None),
-                            "stream tool name",
+                            raise ValueError("stream service tier changed")
+                        service_tier = chunk_service_tier
+                    chunk_usage = _field(chunk, "usage", None)
+                    if chunk_usage is not None:
+                        usage_value = chunk_usage
+                    choices = _sequence(
+                        _field(chunk, "choices", ()),
+                        "stream choices",
+                    )
+                    if len(choices) > 1:
+                        raise ValueError("stream must contain at most one choice")
+                    if not choices:
+                        # OpenAI-compatible servers may emit metadata-only or
+                        # heartbeat chunks. Terminal validity is checked below.
+                        continue
+                    choice = choices[0]
+                    choice_index = _field(choice, "index", 0)
+                    if choice_index != 0:
+                        raise ValueError("stream choice index must be zero")
+                    delta = _field(choice, "delta")
+                    refusal = _optional_text(
+                        _field(delta, "refusal", None),
+                        "stream refusal",
+                    )
+                    if refusal is not None:
+                        raise ModelProviderError(
+                            ProviderErrorCode.CONTENT_BLOCKED,
+                            f"{self.provider} blocked the response",
                         )
-                        if name is not None:
-                            if state.name is not None and state.name != name:
-                                raise ValueError("stream tool name changed")
-                            state.name = name
-                        raw_arguments = _field(function, "arguments", None)
-                        if raw_arguments is not None:
-                            if not isinstance(raw_arguments, str):
-                                raise ValueError("stream tool arguments must be text")
-                            argument_delta = raw_arguments
-                    state.argument_fragments.append(argument_delta)
-                    yield ModelToolCallDelta(
-                        index=index,
-                        arguments_delta=argument_delta,
-                        id=state.canonical_id if is_first else None,
-                        name=name,
-                        provider_call_id=native_id,
-                    )
-                native_finish = _field(choice, "finish_reason", None)
-                if native_finish is not None:
-                    decoded_finish = _required_text(
-                        native_finish,
-                        "stream finish reason",
-                    )
-                    if finish_reason is not None and finish_reason != decoded_finish:
-                        raise ValueError("stream finish reason changed")
-                    finish_reason = decoded_finish
-            except asyncio.CancelledError:
-                raise
-            except ModelProviderError:
-                raise
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise ModelProviderError(
-                    ProviderErrorCode.MALFORMED_RESPONSE,
-                    f"{self.provider} returned a malformed stream",
-                    provider_id=self.provider_id,
-                    diagnostic=ProviderFailureDiagnostic(
-                        phase=ProviderFailurePhase.STREAM_EVENT,
-                        code="event_decode_failed",
-                        terminal_status=_safe_structural_token(finish_reason),
-                    ),
-                ) from error
+                    content = _field(delta, "content", None)
+                    if content is not None:
+                        if not isinstance(content, str):
+                            raise ValueError("stream content must be text")
+                        text_fragments.append(content)
+                        if content:
+                            yield ModelTextDelta(content)
+                    raw_calls = _field(delta, "tool_calls", ())
+                    if raw_calls is None:
+                        raw_calls = ()
+                    for item in _sequence(raw_calls, "stream tool calls"):
+                        index = _nonnegative_int(
+                            _field(item, "index"),
+                            "stream tool index",
+                        )
+                        state = tool_states.get(index)
+                        is_first = state is None
+                        if state is None:
+                            state = _StreamedToolCall(self._id_factory("call"))
+                            tool_states[index] = state
+                        native_id = _optional_text(
+                            _field(item, "id", None),
+                            "stream provider call ID",
+                        )
+                        if native_id is not None:
+                            if (
+                                state.provider_call_id is not None
+                                and state.provider_call_id != native_id
+                            ):
+                                raise ValueError("stream provider call ID changed")
+                            state.provider_call_id = native_id
+                        function = _field(item, "function", None)
+                        name: str | None = None
+                        argument_delta = ""
+                        if function is not None:
+                            name = _optional_text(
+                                _field(function, "name", None),
+                                "stream tool name",
+                            )
+                            if name is not None:
+                                if state.name is not None and state.name != name:
+                                    raise ValueError("stream tool name changed")
+                                state.name = name
+                            raw_arguments = _field(function, "arguments", None)
+                            if raw_arguments is not None:
+                                if not isinstance(raw_arguments, str):
+                                    raise ValueError(
+                                        "stream tool arguments must be text"
+                                    )
+                                argument_delta = raw_arguments
+                        state.argument_fragments.append(argument_delta)
+                        yield ModelToolCallDelta(
+                            index=index,
+                            arguments_delta=argument_delta,
+                            id=state.canonical_id if is_first else None,
+                            name=name,
+                            provider_call_id=native_id,
+                        )
+                    native_finish = _field(choice, "finish_reason", None)
+                    if native_finish is not None:
+                        decoded_finish = _required_text(
+                            native_finish,
+                            "stream finish reason",
+                        )
+                        if (
+                            finish_reason is not None
+                            and finish_reason != decoded_finish
+                        ):
+                            raise ValueError("stream finish reason changed")
+                        finish_reason = decoded_finish
+                except asyncio.CancelledError:
+                    raise
+                except ModelProviderError:
+                    raise
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                    raise ModelProviderError(
+                        ProviderErrorCode.MALFORMED_RESPONSE,
+                        f"{self.provider} returned a malformed stream",
+                        provider_id=self.provider_id,
+                        diagnostic=ProviderFailureDiagnostic(
+                            phase=ProviderFailurePhase.STREAM_EVENT,
+                            code="event_decode_failed",
+                            terminal_status=_safe_structural_token(finish_reason),
+                        ),
+                    ) from error
 
         if finish_reason is None:
             raise ModelProviderError(

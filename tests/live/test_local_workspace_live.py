@@ -19,6 +19,7 @@ from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, create_llm_provider
 from daita._json import canonical_json
+from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     ModelProfile,
     ModelRequest,
@@ -31,7 +32,7 @@ from daita.llm.models import (
 )
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
-    ModelProvider,
+    ManagedModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
@@ -76,7 +77,7 @@ pytestmark = [
 class _RecordingProvider:
     """Capture canonical requests and responses around one real provider."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.responses: list[ModelResponse] = []
@@ -101,10 +102,14 @@ class _RecordingProvider:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live delegate must support canonical streaming")
         self.requests.append(request)
-        async for event in self._delegate.stream(request):
-            if isinstance(event, ModelStreamCompleted):
-                self.responses.append(event.response)
-            yield event
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                if isinstance(event, ModelStreamCompleted):
+                    self.responses.append(event.response)
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 def _required_environment(name: str) -> str:
@@ -210,7 +215,10 @@ async def test_live_model_finds_latest_log_and_reads_its_end(
         result = await agent.run(_PROMPT)
         transcript = await agent.transcript(result.run_id)
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
     assert result.kind is LoopExitKind.COMPLETED, (
         result.reason,

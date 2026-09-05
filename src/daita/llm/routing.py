@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 from decimal import Decimal
 
 from ..security import SecretReference
+from ._lifecycle import await_cleanup, closing_stream
 from .errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -25,6 +26,7 @@ from .models import (
 )
 from .pricing import aggregate_cost_estimates
 from .protocols import (
+    ManagedModelProvider,
     ModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
@@ -68,10 +70,17 @@ class ModelProviderRegistration:
     allowed_sensitivities: frozenset[ModelSensitivity] = frozenset(
         {ModelSensitivity.PUBLIC, ModelSensitivity.INTERNAL}
     )
+    close_with_router: bool = False
 
     def __post_init__(self) -> None:
         if self.provider.provider_id != self.profile.id:
             raise ValueError("provider and profile identities differ")
+        if not isinstance(self.close_with_router, bool):
+            raise TypeError("close_with_router must be a boolean")
+        if self.close_with_router and not isinstance(
+            self.provider, ManagedModelProvider
+        ):
+            raise TypeError("a router-owned provider must support managed close")
         allowed = frozenset(self.allowed_sensitivities)
         if not allowed or any(
             not isinstance(item, ModelSensitivity) for item in allowed
@@ -195,6 +204,7 @@ class ModelRouter:
         self._candidates = registrations
         self._retry_policy = retry_policy
         self._sleep = sleep
+        self._close_task: asyncio.Task[None] | None = None
 
     @property
     def provider_id(self) -> str:
@@ -222,6 +232,35 @@ class ModelRouter:
             self._retry_policy,
         ).model_profile
 
+    async def close(self) -> None:
+        """Join once-only cleanup without activating unused delegates."""
+
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())
+        await await_cleanup(self._close_task)
+
+    async def _finish_close(self) -> None:
+        first_error: BaseException | None = None
+        for registration in reversed(self._candidates):
+            if not registration.close_with_router:
+                continue
+            provider = registration.provider
+            assert isinstance(provider, ManagedModelProvider)
+            try:
+                await provider.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
+
+    def _require_open(self) -> None:
+        if self._close_task is not None:
+            raise ModelProviderError(
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                "model router is closed",
+            )
+
     def supports_request_policy(self, request: ModelRequest) -> bool:
         return any(_eligible(item, request) for item in self._candidates)
 
@@ -234,6 +273,7 @@ class ModelRouter:
     def begin_run(self, sensitivity: ModelSensitivity) -> RunRoute:
         """Freeze the eligible initial candidate order for one run."""
 
+        self._require_open()
         if not isinstance(sensitivity, ModelSensitivity):
             raise TypeError("run route sensitivity must be ModelSensitivity")
         candidates = tuple(
@@ -280,6 +320,7 @@ class ModelRouter:
         request: ModelRequest,
         route: RunRoute | None,
     ) -> ModelResponse:
+        self._require_open()
         last_error: ModelProviderError | None = None
         attempt_usage: list[ModelUsage] = []
         candidates = self._candidates if route is None else self._run_candidates(route)
@@ -329,16 +370,18 @@ class ModelRouter:
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         """Route one canonical stream without retrying after visible progress."""
 
-        async for event in self._stream(request, None):
-            yield event
+        async with closing_stream(self._stream(request, None)) as events:
+            async for event in events:
+                yield event
 
     async def stream_for_run(
         self,
         route: RunRoute,
         request: ModelRequest,
     ) -> AsyncIterator[ModelStreamEvent]:
-        async for event in self._stream(request, route):
-            yield event
+        async with closing_stream(self._stream(request, route)) as events:
+            async for event in events:
+                yield event
 
     async def _stream(
         self,
@@ -347,6 +390,7 @@ class ModelRouter:
     ) -> AsyncIterator[ModelStreamEvent]:
         """Route one canonical stream without retrying after visible progress."""
 
+        self._require_open()
         last_error: ModelProviderError | None = None
         attempt_usage: list[ModelUsage] = []
         candidates = self._candidates if route is None else self._run_candidates(route)
@@ -361,34 +405,37 @@ class ModelRouter:
                 emitted = False
                 try:
                     completed = False
-                    async for event in registration.provider.stream(request):
-                        if completed:
-                            raise ModelProviderError(
-                                ProviderErrorCode.MALFORMED_RESPONSE,
-                                "provider stream continued after completion",
-                                provider_id=registration.provider.provider_id,
-                                diagnostic=ProviderFailureDiagnostic(
-                                    phase=ProviderFailurePhase.STREAM_TERMINAL,
-                                    code="stream_continued_after_completion",
-                                ),
-                            )
-                        if isinstance(event, ModelStreamCompleted):
-                            completed = True
-                            attempt_usage.append(event.response.usage)
-                            if route is not None:
-                                route.selected_provider_id = (
-                                    registration.provider.provider_id
+                    async with closing_stream(
+                        registration.provider.stream(request)
+                    ) as events:
+                        async for event in events:
+                            if completed:
+                                raise ModelProviderError(
+                                    ProviderErrorCode.MALFORMED_RESPONSE,
+                                    "provider stream continued after completion",
+                                    provider_id=registration.provider.provider_id,
+                                    diagnostic=ProviderFailureDiagnostic(
+                                        phase=ProviderFailurePhase.STREAM_TERMINAL,
+                                        code="stream_continued_after_completion",
+                                    ),
                                 )
-                            yield ModelStreamCompleted(
-                                replace(
-                                    event.response,
-                                    usage=_aggregate_usage(attempt_usage),
+                            if isinstance(event, ModelStreamCompleted):
+                                completed = True
+                                attempt_usage.append(event.response.usage)
+                                if route is not None:
+                                    route.selected_provider_id = (
+                                        registration.provider.provider_id
+                                    )
+                                yield ModelStreamCompleted(
+                                    replace(
+                                        event.response,
+                                        usage=_aggregate_usage(attempt_usage),
+                                    )
                                 )
-                            )
-                            return
-                        else:
-                            emitted = True
-                            yield event
+                                return
+                            else:
+                                emitted = True
+                                yield event
                     if not completed:
                         raise ModelProviderError(
                             ProviderErrorCode.MALFORMED_RESPONSE,

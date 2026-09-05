@@ -992,3 +992,58 @@ def test_report_exposes_safety_regressions_and_never_contains_sensitive_inputs()
     assert all(value not in serialized for value in sentinel_values)
     with pytest.raises(ValueError, match="baseline and learned"):
         build_learning_effectiveness_report((baseline,))
+
+
+@pytest.mark.parametrize("phase", ("baseline", "teaching", "learned"))
+def test_live_learning_comparison_rejects_incomplete_phases(phase):
+    from test_learning_evaluation_live import _require_completed_phase
+    from daita.loop.models import LoopExit, LoopExitKind
+
+    incomplete = LoopExit(
+        run_id="run-incomplete",
+        conversation_id="conversation-evaluation",
+        kind=LoopExitKind.FAILED,
+        reason="wall_time_exhausted",
+        created_at=NOW,
+    )
+    with pytest.raises(
+        pytest.fail.Exception, match=f"inconclusive: {phase}.*wall_time_exhausted"
+    ):
+        _require_completed_phase(phase, incomplete)
+    _require_completed_phase(
+        phase,
+        LoopExit(
+            run_id="run-completed",
+            conversation_id="conversation-evaluation",
+            kind=LoopExitKind.COMPLETED,
+            reason="completed",
+            created_at=NOW,
+            final_text="Done.",
+        ),
+    )
+
+
+async def test_live_learning_recorder_preserves_streaming():
+    from test_learning_evaluation_live import _RecordingProvider
+    from daita.llm.models import (
+        CanonicalMessage,
+        MessageRole,
+        ModelRequest,
+        ModelStreamCompleted,
+    )
+    from daita.llm.providers.mock import MockStreamingModelProvider
+
+    completion = ModelStreamCompleted(
+        ModelResponse(finish_reason=FinishReason.STOP, text="Done.")
+    )
+    delegate = MockStreamingModelProvider(((completion,),))
+    recorder = _RecordingProvider(delegate)
+    request = ModelRequest(
+        messages=(
+            CanonicalMessage(role=MessageRole.USER, content=(TextBlock("Test."),)),
+        )
+    )
+    events = tuple([event async for event in recorder.stream(request)])
+    assert events == (completion,)
+    assert recorder.requests == [request]
+    assert delegate.requests == (request,)

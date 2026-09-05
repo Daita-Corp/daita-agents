@@ -75,7 +75,7 @@ async def test_model_certification_immediate_selection(
         assert IMMEDIATE_TOKEN in capture.result.final_text
         assert str(IMMEDIATE_AMOUNT) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS, ids=_MODEL_IDS)
@@ -111,7 +111,7 @@ async def test_model_certification_cross_conversation_result(
         assert str(PROFILE_SAMPLE_ROWS) in capture.result.final_text
         assert str(PROFILE_NULL_VALUES) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS, ids=_MODEL_IDS)
@@ -168,7 +168,7 @@ async def test_model_certification_start_and_cancel(
         assert terminal.summary.status is JobStatus.CANCELLED
     finally:
         release.set()
-        await fixture.agent.close()
+        await fixture.close()
 
 
 def test_model_matrix_configuration_is_bounded() -> None:

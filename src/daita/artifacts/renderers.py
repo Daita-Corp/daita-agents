@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from hashlib import sha256
+from html import escape as html_escape
 from importlib import import_module
 from io import BytesIO
 from typing import Any, NoReturn, cast
@@ -40,6 +41,8 @@ DOCUMENT_ALLOWED_EXTENSIONS = (
     ("text/plain", (".txt",)),
 )
 CSV_ALLOWED_EXTENSIONS = (("text/csv", (".csv",)),)
+HTML_MEDIA_TYPE = "text/html"
+HTML_ALLOWED_EXTENSIONS = ((HTML_MEDIA_TYPE, (".html",)),)
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 XLSX_ALLOWED_EXTENSIONS = ((XLSX_MEDIA_TYPE, (".xlsx",)),)
 TEXT_EDIT_ALLOWED_EXTENSIONS = (
@@ -90,6 +93,11 @@ MAX_CSV_ROWS = 100_000
 MAX_CSV_COLUMNS = 256
 MAX_CSV_BYTES = MAX_ARTIFACT_BYTES
 MAX_CSV_SECONDS = 60.0
+MAX_MODEL_TABULAR_ROWS = 1_000
+MAX_MODEL_TABULAR_COLUMNS = 64
+MAX_MODEL_TABULAR_CELL_CHARACTERS = 16_000
+MAX_MODEL_TABULAR_INPUT_BYTES = 2 * 1024 * 1024
+MAX_MODEL_TABULAR_BYTES = 16 * 1024 * 1024
 MAX_XLSX_ROWS = 100_000
 MAX_XLSX_COLUMNS = 256
 MAX_XLSX_BYTES = MAX_ARTIFACT_BYTES
@@ -498,6 +506,208 @@ def render_model_document(
     )
 
 
+def render_model_tabular(
+    *,
+    columns: Sequence[str],
+    rows: Sequence[Sequence[object]],
+    format: str,
+    filename: str | None,
+    evidence_call_ids: tuple[str, ...],
+    created_at: datetime,
+) -> ArtifactDraft:
+    """Render one bounded model-authored table without claiming exact-source data."""
+
+    validated_columns = _validated_tabular_columns(
+        tuple(columns),
+        MAX_MODEL_TABULAR_COLUMNS,
+        format_name="model-authored table",
+    )
+    validated_rows = _validated_model_tabular_rows(validated_columns, rows)
+    attempted_input_bytes = len(
+        canonical_json({"columns": validated_columns, "rows": validated_rows}).encode(
+            "utf-8"
+        )
+    )
+    if attempted_input_bytes > MAX_MODEL_TABULAR_INPUT_BYTES:
+        raise ArtifactError(
+            "artifact_quota_exceeded",
+            "The model-authored table exceeds its input byte limit.",
+            {
+                "scope": "call",
+                "limit_kind": "input_bytes",
+                "limit": MAX_MODEL_TABULAR_INPUT_BYTES,
+                "attempted": attempted_input_bytes,
+            },
+        )
+    if format == "csv":
+        media_type = "text/csv"
+        requested_filename = filename or "findings.csv"
+        content = render_exact_csv(
+            validated_columns,
+            validated_rows,
+            max_rows=MAX_MODEL_TABULAR_ROWS,
+            max_columns=MAX_MODEL_TABULAR_COLUMNS,
+            max_bytes=MAX_MODEL_TABULAR_BYTES,
+        )
+    elif format == "xlsx":
+        media_type = XLSX_MEDIA_TYPE
+        requested_filename = filename or "findings.xlsx"
+        content = render_exact_xlsx(
+            validated_columns,
+            validated_rows,
+            provenance=_ModelXlsxProvenance(
+                evidence_call_ids=evidence_call_ids,
+                created_at=created_at,
+            ),
+            max_rows=MAX_MODEL_TABULAR_ROWS,
+            max_columns=MAX_MODEL_TABULAR_COLUMNS,
+            max_bytes=MAX_MODEL_TABULAR_BYTES,
+        )
+    elif format == "html":
+        media_type = HTML_MEDIA_TYPE
+        requested_filename = filename or "findings.html"
+        content = _render_model_tabular_html(validated_columns, validated_rows)
+    else:
+        raise ArtifactError(
+            "artifact_invalid_format",
+            "The requested model-authored tabular format is not supported.",
+            {"allowed_extensions": (".csv", ".xlsx", ".html")},
+        )
+    if len(content) > MAX_MODEL_TABULAR_BYTES:
+        raise ArtifactError(
+            "artifact_quota_exceeded",
+            "The model-authored table exceeds its artifact byte limit.",
+            {
+                "scope": "call",
+                "limit_kind": "bytes",
+                "limit": MAX_MODEL_TABULAR_BYTES,
+                "attempted": len(content),
+            },
+        )
+    safe_filename = canonical_artifact_filename(
+        requested_filename,
+        media_type,
+        CSV_ALLOWED_EXTENSIONS + XLSX_ALLOWED_EXTENSIONS + HTML_ALLOWED_EXTENSIONS,
+    )
+    return ArtifactDraft(
+        content=content,
+        suggested_filename=safe_filename,
+        media_type=media_type,
+        sensitivity=Sensitivity.INTERNAL,
+        provenance=ArtifactProvenance(
+            authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+            evidence_call_ids=evidence_call_ids,
+        ),
+    )
+
+
+def _validated_model_tabular_rows(
+    columns: tuple[str, ...],
+    rows: Sequence[Sequence[object]],
+) -> tuple[tuple[object, ...], ...]:
+    if isinstance(rows, (str, bytes, bytearray, memoryview)) or not isinstance(
+        rows, Sequence
+    ):
+        raise ArtifactError(
+            "artifact_unsupported_value",
+            "The model-authored table rows must be a bounded array.",
+            {"reason": "not_rows"},
+        )
+    if len(rows) > MAX_MODEL_TABULAR_ROWS:
+        raise ArtifactError(
+            "artifact_quota_exceeded",
+            "The model-authored table exceeds its row limit.",
+            {
+                "scope": "call",
+                "limit_kind": "rows",
+                "limit": MAX_MODEL_TABULAR_ROWS,
+                "attempted": len(rows),
+            },
+        )
+    validated: list[tuple[object, ...]] = []
+    for row_index, row in enumerate(rows):
+        if isinstance(row, (str, bytes, bytearray, memoryview)) or not isinstance(
+            row, Sequence
+        ):
+            raise ArtifactError(
+                "artifact_unsupported_value",
+                "A model-authored table row is not an array.",
+                {"row_index": row_index, "reason": "not_row"},
+            )
+        values = tuple(row)
+        if len(values) != len(columns):
+            raise ArtifactError(
+                "artifact_unsupported_value",
+                "A model-authored table row has an invalid shape.",
+                {
+                    "row_index": row_index,
+                    "reason": "row_shape",
+                    "expected_columns": len(columns),
+                    "observed_columns": len(values),
+                },
+            )
+        for column_index, value in enumerate(values):
+            valid_type = value is None or type(value) in {str, bool, int, float}
+            valid_float = type(value) is not float or math.isfinite(value)
+            valid_text = type(value) is not str or (
+                len(value) <= MAX_MODEL_TABULAR_CELL_CHARACTERS and _valid_utf8(value)
+            )
+            if not valid_type or not valid_float or not valid_text:
+                raise ArtifactError(
+                    "artifact_unsupported_value",
+                    "A model-authored table contains an unsupported cell value.",
+                    {
+                        "row_index": row_index,
+                        "column_index": column_index,
+                        "column_name": columns[column_index],
+                        "runtime_type": _safe_runtime_type(value),
+                    },
+                )
+        validated.append(values)
+    return tuple(validated)
+
+
+def _valid_utf8(value: str) -> bool:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _render_model_tabular_html(
+    columns: tuple[str, ...],
+    rows: tuple[tuple[object, ...], ...],
+) -> bytes:
+    lines = [
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'">',
+        "<title>Daita findings</title>",
+        "</head>",
+        "<body>",
+        "<table>",
+        "<thead><tr>"
+        + "".join(f'<th scope="col">{html_escape(item)}</th>' for item in columns)
+        + "</tr></thead>",
+        "<tbody>",
+    ]
+    for row in rows:
+        cells: list[str] = []
+        for value in row:
+            if value is None:
+                cells.append('<td data-daita-null="true"></td>')
+            elif type(value) is bool:
+                cells.append(f"<td>{str(value).lower()}</td>")
+            else:
+                cells.append(f"<td>{html_escape(str(value))}</td>")
+        lines.append("<tr>" + "".join(cells) + "</tr>")
+    lines.extend(("</tbody>", "</table>", "</body>", "</html>", ""))
+    return "\n".join(lines).encode("utf-8")
+
+
 class ExactCsvRenderer:
     """Incrementally render one complete typed result into the frozen CSV dialect."""
 
@@ -696,6 +906,42 @@ class ExactXlsxProvenance:
 
 
 @dataclass(frozen=True, slots=True)
+class _ModelXlsxProvenance:
+    """Runtime-owned facts embedded in one model-authored tabular workbook."""
+
+    evidence_call_ids: tuple[str, ...]
+    created_at: datetime
+
+    def __post_init__(self) -> None:
+        evidence = tuple(self.evidence_call_ids)
+        if (
+            not evidence
+            or len(evidence) > 16
+            or len(evidence) != len(set(evidence))
+            or any(
+                not isinstance(item, str)
+                or not item
+                or len(item) > 256
+                or any(character in "\r\n\x00" for character in item)
+                for item in evidence
+            )
+        ):
+            raise ValueError("model XLSX evidence call IDs are invalid")
+        if (
+            not isinstance(self.created_at, datetime)
+            or self.created_at.tzinfo is None
+            or self.created_at.utcoffset() is None
+        ):
+            raise ValueError("model XLSX created_at must be timezone-aware")
+        object.__setattr__(self, "evidence_call_ids", evidence)
+        object.__setattr__(
+            self,
+            "created_at",
+            self.created_at.astimezone(UTC).replace(microsecond=0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class ExactXlsxData:
     """Typed values from the one fixed Daita XLSX Data worksheet."""
 
@@ -710,7 +956,7 @@ class ExactXlsxRenderer:
         self,
         columns: Sequence[str],
         *,
-        provenance: ExactXlsxProvenance,
+        provenance: ExactXlsxProvenance | _ModelXlsxProvenance,
         max_rows: int = MAX_XLSX_ROWS,
         max_columns: int = MAX_XLSX_COLUMNS,
         max_bytes: int = MAX_XLSX_BYTES,
@@ -737,8 +983,8 @@ class ExactXlsxRenderer:
             raise ValueError("max_seconds must be finite and positive")
         if not callable(clock):
             raise TypeError("clock must be callable")
-        if not isinstance(provenance, ExactXlsxProvenance):
-            raise TypeError("provenance must be ExactXlsxProvenance")
+        if not isinstance(provenance, (ExactXlsxProvenance, _ModelXlsxProvenance)):
+            raise TypeError("provenance must be a supported XLSX provenance record")
 
         self._clock = clock
         self._deadline = clock() + float(max_seconds)
@@ -765,10 +1011,20 @@ class ExactXlsxRenderer:
                 "strings_to_urls": False,
             },
         )
+        exact_source = isinstance(provenance, ExactXlsxProvenance)
+        self._authorship = (
+            ArtifactAuthorship.EXACT_SOURCE_DATA
+            if exact_source
+            else ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
+        )
         self._workbook.set_properties(
             {
-                "title": "Daita exact tabular export",
-                "subject": "Exact source data",
+                "title": (
+                    "Daita exact tabular export"
+                    if exact_source
+                    else "Daita model-authored table"
+                ),
+                "subject": "Exact source data" if exact_source else "Derived analysis",
                 "author": "Daita",
                 "company": "Daita",
                 "comments": "Deterministic literal-only workbook",
@@ -854,26 +1110,43 @@ class ExactXlsxRenderer:
         self._check_open()
         self._check_time()
         columns_json = canonical_json(self._columns)
-        provenance_rows: tuple[tuple[str, object], ...] = (
-            ("Key", "Value"),
-            ("Authorship", ArtifactAuthorship.EXACT_SOURCE_DATA.value),
-            ("Source ID", self._provenance.source_id),
-            ("Source Revision", self._provenance.source_revision),
-            (
-                "Resource Revisions",
-                canonical_json(self._provenance.resource_revisions),
-            ),
-            ("SQL Fingerprint", self._provenance.sql_fingerprint),
-            ("Parameters SHA-256", self._provenance.parameters_sha256),
-            (
-                "Columns SHA-256",
-                "sha256:" + sha256(columns_json.encode("utf-8")).hexdigest(),
-            ),
-            ("Column Count", len(self._columns)),
-            ("Row Count", self._rows),
-            ("Sensitivity", self._provenance.sensitivity.value),
-            ("Created At", _utc_z(self._provenance.created_at)),
-        )
+        if isinstance(self._provenance, ExactXlsxProvenance):
+            provenance_rows: tuple[tuple[str, object], ...] = (
+                ("Key", "Value"),
+                ("Authorship", ArtifactAuthorship.EXACT_SOURCE_DATA.value),
+                ("Source ID", self._provenance.source_id),
+                ("Source Revision", self._provenance.source_revision),
+                (
+                    "Resource Revisions",
+                    canonical_json(self._provenance.resource_revisions),
+                ),
+                ("SQL Fingerprint", self._provenance.sql_fingerprint),
+                ("Parameters SHA-256", self._provenance.parameters_sha256),
+                (
+                    "Columns SHA-256",
+                    "sha256:" + sha256(columns_json.encode("utf-8")).hexdigest(),
+                ),
+                ("Column Count", len(self._columns)),
+                ("Row Count", self._rows),
+                ("Sensitivity", self._provenance.sensitivity.value),
+                ("Created At", _utc_z(self._provenance.created_at)),
+            )
+        else:
+            provenance_rows = (
+                ("Key", "Value"),
+                ("Authorship", ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS.value),
+                (
+                    "Evidence Call IDs",
+                    canonical_json(self._provenance.evidence_call_ids),
+                ),
+                (
+                    "Columns SHA-256",
+                    "sha256:" + sha256(columns_json.encode("utf-8")).hexdigest(),
+                ),
+                ("Column Count", len(self._columns)),
+                ("Row Count", self._rows),
+                ("Created At", _utc_z(self._provenance.created_at)),
+            )
         for row_index, (key, value) in enumerate(provenance_rows):
             _write_xlsx_text(
                 self._provenance_sheet,
@@ -907,6 +1180,7 @@ class ExactXlsxRenderer:
                 max_bytes=self._max_bytes,
                 max_uncompressed_bytes=self._max_uncompressed_bytes,
                 max_members=self._max_members,
+                expected_authorship=self._authorship,
             )
         except ArtifactError as error:
             reason = error.details.get("reason")
@@ -936,7 +1210,7 @@ def render_exact_xlsx(
     columns: Sequence[str],
     rows: Iterable[Sequence[object]],
     *,
-    provenance: ExactXlsxProvenance,
+    provenance: ExactXlsxProvenance | _ModelXlsxProvenance,
     max_rows: int = MAX_XLSX_ROWS,
     max_columns: int = MAX_XLSX_COLUMNS,
     max_bytes: int = MAX_XLSX_BYTES,
@@ -969,9 +1243,15 @@ def verify_exact_xlsx(
     max_bytes: int = MAX_XLSX_BYTES,
     max_uncompressed_bytes: int = MAX_XLSX_UNCOMPRESSED_BYTES,
     max_members: int = MAX_XLSX_MEMBERS,
+    expected_authorship: ArtifactAuthorship = ArtifactAuthorship.EXACT_SOURCE_DATA,
 ) -> None:
     """Fail closed unless bytes match Daita's fixed safe XLSX package."""
 
+    if expected_authorship not in {
+        ArtifactAuthorship.EXACT_SOURCE_DATA,
+        ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+    }:
+        raise ValueError("expected XLSX authorship is unsupported")
     if not isinstance(content, bytes) or not content:
         _invalid_xlsx("invalid_package", completed_bytes=0)
     if len(content) > max_bytes:
@@ -1076,9 +1356,14 @@ def verify_exact_xlsx(
             _invalid_xlsx("unsafe_content_type", completed_bytes=len(content))
 
     core = parsed["docProps/core.xml"]
+    expected_title, expected_subject = (
+        ("Daita exact tabular export", "Exact source data")
+        if expected_authorship is ArtifactAuthorship.EXACT_SOURCE_DATA
+        else ("Daita model-authored table", "Derived analysis")
+    )
     if (
-        core.findtext(f"{{{_DC_NAMESPACE}}}title") != "Daita exact tabular export"
-        or core.findtext(f"{{{_DC_NAMESPACE}}}subject") != "Exact source data"
+        core.findtext(f"{{{_DC_NAMESPACE}}}title") != expected_title
+        or core.findtext(f"{{{_DC_NAMESPACE}}}subject") != expected_subject
         or core.findtext(f"{{{_DC_NAMESPACE}}}creator") != "Daita"
         or core.findtext(f"{{{_DC_NAMESPACE}}}description")
         != "Deterministic literal-only workbook"
@@ -1113,6 +1398,18 @@ def verify_exact_xlsx(
     if format_codes not in {(), ("yyyy-mm-dd",)}:
         _invalid_xlsx("locale_sensitive_format", completed_bytes=len(content))
 
+    shared_root = parsed["xl/sharedStrings.xml"]
+    shared_strings = tuple(
+        "".join(node.itertext())
+        for node in shared_root.findall(f"{{{_SPREADSHEET_NAMESPACE}}}si")
+    )
+    provenance_values = _xlsx_provenance_values(
+        parsed["xl/worksheets/sheet2.xml"],
+        shared_strings,
+    )
+    if provenance_values.get("Authorship") != expected_authorship.value:
+        _invalid_xlsx("authorship_mismatch", completed_bytes=len(content))
+
 
 def read_exact_xlsx_data(
     content: bytes,
@@ -1121,6 +1418,7 @@ def read_exact_xlsx_data(
     max_columns: int = MAX_XLSX_COLUMNS,
     max_seconds: float = MAX_XLSX_SECONDS,
     clock: Callable[[], float] = time_module.monotonic,
+    expected_authorship: ArtifactAuthorship = ArtifactAuthorship.EXACT_SOURCE_DATA,
 ) -> ExactXlsxData:
     """Read only the fixed, verified Daita XLSX Data worksheet."""
 
@@ -1141,7 +1439,7 @@ def read_exact_xlsx_data(
     ):
         raise ValueError("XLSX read time bound must be finite and positive")
     deadline = clock() + float(max_seconds)
-    verify_exact_xlsx(content)
+    verify_exact_xlsx(content, expected_authorship=expected_authorship)
     if clock() >= deadline:
         _xlsx_read_failed("time_limit")
     try:
@@ -1282,17 +1580,35 @@ def _xlsx_provenance_row_count(
     root: ElementTree.Element,
     shared_strings: tuple[str, ...],
 ) -> int:
+    values = _xlsx_provenance_values(root, shared_strings)
+    row_count = values.get("Row Count")
+    if type(row_count) is not int or row_count < 0:
+        _xlsx_read_failed("invalid_provenance_row_count")
+    return cast(int, row_count)
+
+
+def _xlsx_provenance_values(
+    root: ElementTree.Element,
+    shared_strings: tuple[str, ...],
+) -> dict[str, object]:
     sheet_data = root.find(f"{{{_SPREADSHEET_NAMESPACE}}}sheetData")
     if sheet_data is None:
         _xlsx_read_failed("missing_provenance_sheet")
+    values_by_key: dict[str, object] = {}
     for row in sheet_data.findall(f"{{{_SPREADSHEET_NAMESPACE}}}row"):
         cells = row.findall(f"{{{_SPREADSHEET_NAMESPACE}}}c")
         values = tuple(_xlsx_cell_value(cell, shared_strings) for cell in cells)
-        if values[:1] == ("Row Count",):
-            if len(values) != 2 or type(values[1]) is not int or values[1] < 0:
-                _xlsx_read_failed("invalid_provenance_row_count")
-            return cast(int, values[1])
-    _xlsx_read_failed("missing_provenance_row_count")
+        if values == ("Key", "Value"):
+            continue
+        if (
+            len(values) != 2
+            or not isinstance(values[0], str)
+            or not values[0]
+            or values[0] in values_by_key
+        ):
+            _xlsx_read_failed("invalid_provenance_shape")
+        values_by_key[values[0]] = values[1]
+    return values_by_key
 
 
 def _xlsx_read_failed(reason: str) -> NoReturn:
@@ -1654,10 +1970,17 @@ __all__ = [
     "ExactCsvRenderer",
     "ExactXlsxProvenance",
     "ExactXlsxRenderer",
+    "HTML_ALLOWED_EXTENSIONS",
+    "HTML_MEDIA_TYPE",
     "MAX_CSV_BYTES",
     "MAX_CSV_COLUMNS",
     "MAX_CSV_ROWS",
     "MAX_CSV_SECONDS",
+    "MAX_MODEL_TABULAR_BYTES",
+    "MAX_MODEL_TABULAR_CELL_CHARACTERS",
+    "MAX_MODEL_TABULAR_COLUMNS",
+    "MAX_MODEL_TABULAR_INPUT_BYTES",
+    "MAX_MODEL_TABULAR_ROWS",
     "MAX_XLSX_BYTES",
     "MAX_XLSX_COLUMNS",
     "MAX_XLSX_MEMBERS",
@@ -1670,5 +1993,6 @@ __all__ = [
     "render_exact_csv",
     "render_exact_xlsx",
     "render_model_document",
+    "render_model_tabular",
     "verify_exact_xlsx",
 ]

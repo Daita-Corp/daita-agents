@@ -415,6 +415,7 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["skill_view"] == "skills"
         assert resolved["semantic_list"] == "semantics"
         assert resolved["artifact_create_document"] == "artifacts"
+        assert resolved["artifact_create_tabular"] == "artifacts"
         assert resolved["start_data_profile"] == "data_profile_jobs"
         assert resolved["job_list"] == "jobs"
         assert resolved["routine_list"] == "routines"

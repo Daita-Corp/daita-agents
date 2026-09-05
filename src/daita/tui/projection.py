@@ -42,6 +42,7 @@ CAPABILITY_LABELS = {
     "file_read": "Read workspace file",
     "file_query": "Query workspace data",
     "artifact_create_document": "Create document",
+    "artifact_create_tabular": "Create findings table",
     "artifact_edit_text": "Prepare workspace edit",
     "artifact_save_local": "Save artifact locally",
     "artifact_set_export_location": "Set export location",

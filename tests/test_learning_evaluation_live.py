@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Sequence
+from contextlib import AsyncExitStack
+from collections.abc import AsyncIterator, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from html import unescape
@@ -27,17 +28,23 @@ from daita.evaluation import (
     build_learning_effectiveness_report,
     measure_observer_events,
 )
+from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     CanonicalMessage,
     ModelRequest,
     ModelResponse,
+    ModelStreamEvent,
     TextBlock,
     ToolCall,
     ToolResultBlock,
 )
 from daita.llm.profiles import reviewed_model_profile
-from daita.llm.protocols import ModelProvider, provider_has_complete_pricing
-from daita.loop.models import Transcript
+from daita.llm.protocols import (
+    ManagedModelProvider,
+    StreamingModelProvider,
+    provider_has_complete_pricing,
+)
+from daita.loop.models import LoopExit, LoopExitKind, Transcript
 from daita.observation import AgentEvent
 from daita.security import EnvironmentSecretProvider, SecretReference
 
@@ -76,7 +83,7 @@ pytestmark = [
 class _RecordingProvider:
     """Caller-owned request capture around one real provider."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
 
@@ -93,6 +100,26 @@ class _RecordingProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         return await self._delegate.generate(request)
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        if not isinstance(self._delegate, StreamingModelProvider):
+            raise TypeError("the live learning provider must support streaming")
+        self.requests.append(request)
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
+
+
+def _require_completed_phase(phase: str, result: LoopExit) -> None:
+    if result.kind is not LoopExitKind.COMPLETED:
+        pytest.fail(
+            f"Learning comparison inconclusive: {phase} run {result.run_id} "
+            f"ended {result.kind.value}/{result.reason} after {result.steps} steps. "
+            "No comparative effectiveness score was produced."
+        )
 
 
 def _required_environment(name: str) -> str:
@@ -239,118 +266,124 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
     profile = reviewed_model_profile(model_id)
     if profile is None:
         pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
+    if not profile.supports_streaming:
+        pytest.fail(f"{_MODEL_ID} must support streaming for the live learning test")
     delegate = create_llm_provider(
         model_id,
         api_key=api_key,
         max_output_tokens=min(profile.max_output_tokens, 4_096),
     )
     provider = _RecordingProvider(delegate)
-    events: list[AgentEvent] = []
-    approval_requests: list[ApprovalRequest] = []
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(provider.close)
+        events: list[AgentEvent] = []
+        approval_requests: list[ApprovalRequest] = []
 
-    async def approve_exact_definition(
-        request: ApprovalRequest,
-    ) -> ApprovalDecision:
-        approval_requests.append(request)
-        statement = request.arguments.get("statement")
-        normalized = statement.casefold() if isinstance(statement, str) else ""
-        reserve = "3%" in normalized or "0.03" in normalized
-        if (
-            request.tool_name == "semantic_save"
-            and request.arguments.get("kind") == "metric_definition"
-            and all(value in normalized for value in _STATEMENT_REQUIREMENTS)
-            and reserve
-        ):
-            return ApprovalDecision.APPROVE
-        return ApprovalDecision.DENY
+        async def approve_exact_definition(
+            request: ApprovalRequest,
+        ) -> ApprovalDecision:
+            approval_requests.append(request)
+            statement = request.arguments.get("statement")
+            normalized = statement.casefold() if isinstance(statement, str) else ""
+            reserve = "3%" in normalized or "0.03" in normalized
+            if (
+                request.tool_name == "semantic_save"
+                and request.arguments.get("kind") == "metric_definition"
+                and all(value in normalized for value in _STATEMENT_REQUIREMENTS)
+                and reserve
+            ):
+                return ApprovalDecision.APPROVE
+            return ApprovalDecision.DENY
 
-    limits = LoopLimits(
-        max_steps=16,
-        max_total_tokens=60_000,
-        max_wall_time_seconds=240,
-        max_estimated_cost_usd=_cost_limit(),
-    )
-    agent = await Agent.create(
-        "live-learning-evaluation",
-        root=tmp_path,
-        model=provider,
-        model_profile=profile,
-        observer=events.append,
-        approval_handler=approve_exact_definition,
-        secret_provider=EnvironmentSecretProvider(),
-        limits=limits,
-        workspace=workspace_for(tmp_path),
-    )
-    credential = SecretReference.environment(_DATABASE_PASSWORD)
-    source = await agent.attach_postgresql(
-        host="127.0.0.1",
-        port=int(os.environ.get(_DATABASE_PORT, "55432")),
-        database="daita_fixture",
-        username="daita_reader",
-        credential=credential,
-        schemas=("analytics",),
-        ssl_mode="disable",
-        name=_FIXTURE_SOURCE_NAME,
-    )
-    baseline_start = len(events)
-    baseline_exit = await agent.run(
-        "Using analytics.orders, analytics.order_items, analytics.products, "
-        "analytics.customers, and analytics.regions, calculate paid contribution "
-        "margin by region and currency. Keep currencies separate.",
-        source_id=source.id,
-    )
-    baseline_events = tuple(events[baseline_start:])
-    baseline_transcript = await agent.transcript(baseline_exit.run_id)
+        limits = LoopLimits(
+            max_steps=16,
+            max_total_tokens=60_000,
+            max_wall_time_seconds=240,
+            max_estimated_cost_usd=_cost_limit(),
+        )
+        async with await Agent.create(
+            "live-learning-evaluation",
+            root=tmp_path,
+            model=provider,
+            model_profile=profile,
+            observer=events.append,
+            approval_handler=approve_exact_definition,
+            secret_provider=EnvironmentSecretProvider(),
+            limits=limits,
+            workspace=workspace_for(tmp_path),
+        ) as agent:
+            credential = SecretReference.environment(_DATABASE_PASSWORD)
+            source = await agent.attach_postgresql(
+                host="127.0.0.1",
+                port=int(os.environ.get(_DATABASE_PORT, "55432")),
+                database="daita_fixture",
+                username="daita_reader",
+                credential=credential,
+                schemas=("analytics",),
+                ssl_mode="disable",
+                name=_FIXTURE_SOURCE_NAME,
+            )
+            baseline_start = len(events)
+            baseline_exit = await agent.run(
+                "Using analytics.orders, analytics.order_items, analytics.products, "
+                "analytics.customers, and analytics.regions, calculate paid contribution "
+                "margin by region and currency. Keep currencies separate.",
+                source_id=source.id,
+            )
+            baseline_events = tuple(events[baseline_start:])
+            baseline_transcript = await agent.transcript(baseline_exit.run_id)
 
-    teaching_start = len(events)
-    teaching_exit = await agent.run(
-        "When we say paid contribution margin, we mean "
-        "SUM(analytics.order_items.line_total - "
-        "analytics.order_items.quantity * analytics.products.unit_cost - "
-        "analytics.order_items.line_total * 0.03), restricted to "
-        "analytics.orders.status = paid. The 3% term is our risk reserve. Report "
-        "results by region and currency, and never compare currencies without an "
-        "explicit conversion.",
-        source_id=source.id,
-    )
-    teaching_views = await agent.list_semantic_annotations()
-    active = tuple(
-        view
-        for view in teaching_views
-        if view.state is SemanticAnnotationState.ACTIVE
-        and view.annotation.kind.value == "metric_definition"
-    )
-    await agent.close()
+            teaching_start = len(events)
+            teaching_exit = await agent.learn(
+                "When we say paid contribution margin, we mean "
+                "SUM(analytics.order_items.line_total - "
+                "analytics.order_items.quantity * analytics.products.unit_cost - "
+                "analytics.order_items.line_total * 0.03), restricted to "
+                "analytics.orders.status = paid. The 3% term is our risk reserve. Report "
+                "results by region and currency, and never compare currencies without an "
+                "explicit conversion.",
+                source_id=source.id,
+            )
+            teaching_views = await agent.list_semantic_annotations()
+            active = tuple(
+                view
+                for view in teaching_views
+                if view.state is SemanticAnnotationState.ACTIVE
+                and view.annotation.kind.value == "metric_definition"
+            )
 
-    learned_request_start = len(provider.requests)
-    reopened = await Agent.open(
-        "live-learning-evaluation",
-        root=tmp_path,
-        model=provider,
-        model_profile=profile,
-        observer=events.append,
-        approval_handler=approve_exact_definition,
-        secret_provider=EnvironmentSecretProvider(),
-        limits=limits,
-        workspace=workspace_for(tmp_path),
-    )
-    learned_exit = await reopened.run(
-        "Using analytics.orders, analytics.order_items, analytics.products, "
-        "analytics.customers, and analytics.regions, calculate paid contribution "
-        "margin by region and currency. Keep currencies separate.",
-        source_id=source.id,
-    )
-    learned_transcript = await reopened.transcript(learned_exit.run_id)
-    learned_events = tuple(events[teaching_start:])
-    learned_requests = provider.requests[learned_request_start:]
-    learned_request_text = "\n".join(
-        _text(request.messages) for request in learned_requests
-    )
-    recalled = bool(
-        active and active[0].annotation.statement in unescape(learned_request_text)
-    )
-    await reopened.close()
+        learned_request_start = len(provider.requests)
+        async with await Agent.open(
+            "live-learning-evaluation",
+            root=tmp_path,
+            model=provider,
+            model_profile=profile,
+            observer=events.append,
+            approval_handler=approve_exact_definition,
+            secret_provider=EnvironmentSecretProvider(),
+            limits=limits,
+            workspace=workspace_for(tmp_path),
+        ) as reopened:
+            learned_exit = await reopened.run(
+                "Using analytics.orders, analytics.order_items, analytics.products, "
+                "analytics.customers, and analytics.regions, calculate paid contribution "
+                "margin by region and currency. Keep currencies separate.",
+                source_id=source.id,
+            )
+            learned_transcript = await reopened.transcript(learned_exit.run_id)
+            learned_events = tuple(events[teaching_start:])
+            learned_requests = provider.requests[learned_request_start:]
+            learned_request_text = "\n".join(
+                _text(request.messages) for request in learned_requests
+            )
+            recalled = bool(
+                active
+                and active[0].annotation.statement in unescape(learned_request_text)
+            )
 
+    _require_completed_phase("baseline", baseline_exit)
+    _require_completed_phase("teaching", teaching_exit)
+    _require_completed_phase("learned", learned_exit)
     baseline_judgment = _paid_margin_judgment(
         baseline_transcript,
         final_text=baseline_exit.final_text,

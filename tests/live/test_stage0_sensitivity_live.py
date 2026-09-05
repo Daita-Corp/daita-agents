@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import AsyncExitStack
 from collections.abc import AsyncIterator
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -13,6 +14,7 @@ from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
 from daita.catalog.models import Sensitivity
+from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     ModelProfile,
     ModelRequest,
@@ -22,7 +24,7 @@ from daita.llm.models import (
 )
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
-    ModelProvider,
+    ManagedModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
@@ -57,7 +59,7 @@ pytestmark = [
 class _RecordingProvider:
     """Capture canonical requests around one real API-backed provider."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
 
@@ -79,8 +81,12 @@ class _RecordingProvider:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live delegate must support canonical streaming")
         self.requests.append(request)
-        async for event in self._delegate.stream(request):
-            yield event
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 def _required_environment(name: str) -> str:
@@ -102,7 +108,7 @@ def _cost_limit() -> Decimal:
 
 
 def _route(
-    provider: ModelProvider,
+    provider: ManagedModelProvider,
     profile: ModelProfile,
     *,
     allowed_sensitivities: frozenset[ModelSensitivity],
@@ -150,85 +156,87 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
         max_output_tokens=min(profile.max_output_tokens, 1_024),
     )
     provider = _RecordingProvider(delegate)
-    limits = LoopLimits(
-        max_steps=3,
-        max_total_tokens=8_000,
-        max_wall_time_seconds=90,
-        max_estimated_cost_usd=_cost_limit(),
-    )
-    database = tmp_path / "stage0-live.sqlite"
-    _database(database)
-
-    eligible_route = _route(
-        provider,
-        profile,
-        allowed_sensitivities=frozenset({ModelSensitivity.INTERNAL}),
-    )
-    eligible = await Agent.create(
-        "live-stage0-eligible",
-        root=tmp_path / "eligible-agent-home",
-        model=eligible_route,
-        model_profile=eligible_route.model_profile,
-        limits=limits,
-        workspace=workspace_for(tmp_path / "eligible-agent-home"),
-    )
-    try:
-        source = await eligible.attach(
-            SQLiteSource(database, name="Internal live data")
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(provider.close)
+        limits = LoopLimits(
+            max_steps=3,
+            max_total_tokens=8_000,
+            max_wall_time_seconds=90,
+            max_estimated_cost_usd=_cost_limit(),
         )
-        resources = await eligible.list_catalog_resources(source_id=source.id)
-        assert resources
-        assert {resource.sensitivity for resource in resources} == {
-            Sensitivity.INTERNAL
-        }
+        database = tmp_path / "stage0-live.sqlite"
+        _database(database)
 
-        eligible_exit = await eligible.run(
-            "This is a live routing check. Reply with exactly LIVE_STAGE0_OK. "
-            "Do not call tools and do not inspect the attached data.",
-            source_id=source.id,
+        eligible_route = _route(
+            provider,
+            profile,
+            allowed_sensitivities=frozenset({ModelSensitivity.INTERNAL}),
         )
-    finally:
-        await eligible.close()
-
-    assert eligible_exit.kind is LoopExitKind.COMPLETED, (
-        eligible_exit.reason,
-        eligible_exit.usage.cost_estimate.code,
-        len(provider.requests),
-    )
-    assert eligible_exit.final_text is not None
-    assert "LIVE_STAGE0_OK" in eligible_exit.final_text
-    assert provider.requests
-    assert all(
-        request.sensitivity is ModelSensitivity.INTERNAL
-        for request in provider.requests
-    )
-
-    live_call_count = len(provider.requests)
-    ineligible_route = _route(
-        provider,
-        profile,
-        allowed_sensitivities=frozenset({ModelSensitivity.PUBLIC}),
-    )
-    ineligible = await Agent.create(
-        "live-stage0-ineligible",
-        root=tmp_path / "ineligible-agent-home",
-        model=ineligible_route,
-        model_profile=ineligible_route.model_profile,
-        limits=limits,
-        workspace=workspace_for(tmp_path / "ineligible-agent-home"),
-    )
-    try:
-        blocked_source = await ineligible.attach(
-            SQLiteSource(database, name="Internal blocked data")
+        eligible = await Agent.create(
+            "live-stage0-eligible",
+            root=tmp_path / "eligible-agent-home",
+            model=eligible_route,
+            model_profile=eligible_route.model_profile,
+            limits=limits,
+            workspace=workspace_for(tmp_path / "eligible-agent-home"),
         )
-        blocked_exit = await ineligible.run(
-            "Reply with LIVE_STAGE0_MUST_NOT_REACH_PROVIDER.",
-            source_id=blocked_source.id,
-        )
-    finally:
-        await ineligible.close()
+        try:
+            source = await eligible.attach(
+                SQLiteSource(database, name="Internal live data")
+            )
+            resources = await eligible.list_catalog_resources(source_id=source.id)
+            assert resources
+            assert {resource.sensitivity for resource in resources} == {
+                Sensitivity.INTERNAL
+            }
 
-    assert blocked_exit.kind is LoopExitKind.FAILED
-    assert blocked_exit.reason == "model_route_ineligible"
-    assert blocked_exit.usage.total_tokens == 0
-    assert len(provider.requests) == live_call_count
+            eligible_exit = await eligible.run(
+                "This is a live routing check. Reply with exactly LIVE_STAGE0_OK. "
+                "Do not call tools and do not inspect the attached data.",
+                source_id=source.id,
+            )
+        finally:
+            await eligible.close()
+
+        assert eligible_exit.kind is LoopExitKind.COMPLETED, (
+            eligible_exit.reason,
+            eligible_exit.usage.cost_estimate.code,
+            len(provider.requests),
+        )
+        assert eligible_exit.final_text is not None
+        assert "LIVE_STAGE0_OK" in eligible_exit.final_text
+        assert provider.requests
+        assert all(
+            request.sensitivity is ModelSensitivity.INTERNAL
+            for request in provider.requests
+        )
+
+        live_call_count = len(provider.requests)
+        ineligible_route = _route(
+            provider,
+            profile,
+            allowed_sensitivities=frozenset({ModelSensitivity.PUBLIC}),
+        )
+        ineligible = await Agent.create(
+            "live-stage0-ineligible",
+            root=tmp_path / "ineligible-agent-home",
+            model=ineligible_route,
+            model_profile=ineligible_route.model_profile,
+            limits=limits,
+            workspace=workspace_for(tmp_path / "ineligible-agent-home"),
+        )
+        try:
+            blocked_source = await ineligible.attach(
+                SQLiteSource(database, name="Internal blocked data")
+            )
+            blocked_exit = await ineligible.run(
+                "Reply with LIVE_STAGE0_MUST_NOT_REACH_PROVIDER.",
+                source_id=blocked_source.id,
+            )
+        finally:
+            await ineligible.close()
+
+        assert blocked_exit.kind is LoopExitKind.FAILED
+        assert blocked_exit.reason == "model_route_ineligible"
+        assert blocked_exit.usage.total_tokens == 0
+        assert len(provider.requests) == live_call_count

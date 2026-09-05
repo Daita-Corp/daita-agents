@@ -51,8 +51,10 @@ from daita.capabilities import (
     ToolExecution,
     ToolOutput,
 )
+from daita.catalog.capabilities import CATALOG_SCHEMA_CAPABILITY_ID
 from daita.distribution import OutcomeState, conversation_inbox_destination_id
 from daita.domains.data import DATA_QUERY_CAPABILITY_ID
+from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -68,7 +70,7 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
-    ModelProvider,
+    ManagedModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
@@ -153,7 +155,7 @@ pytestmark = [
 class _RecordingProvider:
     """Capture canonical requests and responses around one real provider."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.responses: list[ModelResponse] = []
@@ -178,10 +180,14 @@ class _RecordingProvider:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live delegate must support canonical streaming")
         self.requests.append(request)
-        async for event in self._delegate.stream(request):
-            if isinstance(event, ModelStreamCompleted):
-                self.responses.append(event.response)
-            yield event
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                if isinstance(event, ModelStreamCompleted):
+                    self.responses.append(event.response)
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,6 +198,20 @@ class _LiveScenario:
     source_id: str
     resource_id: str
     origin_run_id: str
+
+    async def close(self) -> None:
+        first_error: BaseException | None = None
+        try:
+            await self.agent.close()
+        except BaseException as error:
+            first_error = error
+        try:
+            await self.provider.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,14 +360,18 @@ async def _new_live_scenario(
     )
     profile, provider = _live_provider()
     limits = _limits()
-    agent = await Agent.open(
-        name,
-        root=root,
-        model=provider,
-        model_profile=profile,
-        limits=limits,
-        workspace=workspace_for(root),
-    )
+    try:
+        agent = await Agent.open(
+            name,
+            root=root,
+            model=provider,
+            model_profile=profile,
+            limits=limits,
+            workspace=workspace_for(root),
+        )
+    except BaseException:
+        await provider.close()
+        raise
     return _LiveScenario(
         agent=agent,
         provider=provider,
@@ -420,7 +444,10 @@ async def _run_live_routine(
             allowed_source_ids=(scenario.source_id,),
             allowed_connector_binding_ids=(),
             allowed_resource_ids=(scenario.resource_id,),
-            allowed_capability_ids=(DATA_QUERY_CAPABILITY_ID,),
+            allowed_capability_ids=(
+                CATALOG_SCHEMA_CAPABILITY_ID,
+                DATA_QUERY_CAPABILITY_ID,
+            ),
             sensitivity_ceiling=ModelSensitivity.INTERNAL,
             outcome_contract=no_artifact_outcome_contract(),
             distribution_destination_id=conversation_inbox_destination_id(
@@ -479,7 +506,10 @@ async def _run_live_routine(
     assert scope.occurrence_id == item.subject_id
     assert scope.allowed_source_ids == (scenario.source_id,)
     assert scope.allowed_resource_ids == (scenario.resource_id,)
-    assert scope.allowed_capability_ids == (DATA_QUERY_CAPABILITY_ID,)
+    assert scope.allowed_capability_ids == (
+        CATALOG_SCHEMA_CAPABILITY_ID,
+        DATA_QUERY_CAPABILITY_ID,
+    )
     assert scope.allowed_access_modes == frozenset({AccessMode.READ})
     assert scope.allowed_operational_effects == frozenset({OperationalEffect.NONE})
 
@@ -592,7 +622,7 @@ async def test_live_scheduled_read_uses_one_loop_and_delivers_grounded_report(
         )
         await _assert_occurrence_and_disable(scenario, completed)
     finally:
-        await scenario.agent.close()
+        await scenario.close()
 
 
 async def test_live_scheduled_read_recovers_after_one_model_visible_query_error(
@@ -664,7 +694,7 @@ async def test_live_scheduled_read_recovers_after_one_model_visible_query_error(
         assert len(scenario.provider.requests) >= 3
         await _assert_occurrence_and_disable(scenario, completed)
     finally:
-        await scenario.agent.close()
+        await scenario.close()
 
 
 async def test_live_scheduled_read_ignores_instruction_like_source_data(
@@ -699,7 +729,7 @@ async def test_live_scheduled_read_ignores_instruction_like_source_data(
         assert _UNTRUSTED_FALSE_AMOUNT not in completed.result.final_text
         await _assert_occurrence_and_disable(scenario, completed)
     finally:
-        await scenario.agent.close()
+        await scenario.close()
 
 
 __all__ = []

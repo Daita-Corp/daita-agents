@@ -18,6 +18,13 @@ class ModelProvider(Protocol):
 
 
 @runtime_checkable
+class ManagedModelProvider(ModelProvider, Protocol):
+    """A provider whose creator owns and can deterministically release it."""
+
+    async def close(self) -> None: ...
+
+
+@runtime_checkable
 class StreamingModelProvider(ModelProvider, Protocol):
     def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]: ...
 
@@ -53,6 +60,7 @@ def provider_supports_request_policy(
 
 
 __all__ = [
+    "ManagedModelProvider",
     "ModelProvider",
     "StreamingModelProvider",
     "provider_has_complete_pricing",

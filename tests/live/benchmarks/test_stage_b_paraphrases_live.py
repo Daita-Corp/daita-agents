@@ -162,7 +162,7 @@ async def test_paraphrased_immediate_reads_do_not_create_jobs(
         assert IMMEDIATE_TOKEN in capture.result.final_text
         assert str(IMMEDIATE_AMOUNT) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize(
@@ -203,7 +203,7 @@ async def test_paraphrased_background_requests_admit_one_exact_job(
         )
         await assert_profile_result(fixture.agent, job_id)
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize(
@@ -235,7 +235,7 @@ async def test_paraphrased_status_questions_are_agent_scoped_and_direct(
         direct_names = {tool.name for tool in capture.requests[0].tools}
         assert "job_list" in direct_names
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize(
@@ -278,7 +278,7 @@ async def test_paraphrased_result_questions_recover_exact_artifacts(
         assert str(PROFILE_SAMPLE_ROWS) in capture.result.final_text
         assert str(PROFILE_NULL_VALUES) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize(
@@ -341,7 +341,7 @@ async def test_paraphrased_cancellation_targets_one_running_job(
         assert await fixture.agent.read_job_result(job_id) is None
     finally:
         release.set()
-        await fixture.agent.close()
+        await fixture.close()
 
 
 def test_paraphrase_case_inventory_is_bounded_and_nonduplicative() -> None:

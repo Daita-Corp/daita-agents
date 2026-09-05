@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
+from .._lifecycle import await_cleanup, closing_stream
 from ..errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -59,10 +60,14 @@ class _GeminiAsyncClient(Protocol):
     @property
     def models(self) -> _GeminiModels: ...
 
+    async def aclose(self) -> None: ...
+
 
 class _GeminiClient(Protocol):
     @property
     def aio(self) -> _GeminiAsyncClient: ...
+
+    def close(self) -> None: ...
 
 
 def _new_id(prefix: str) -> str:
@@ -107,6 +112,8 @@ class GeminiProvider:
         self._api_key = api_key
         self._max_output_tokens = max_output_tokens
         self._client = client
+        self._owns_client = client is None
+        self._close_task: asyncio.Task[None] | None = None
         self._id_factory = _new_id if id_factory is None else id_factory
         self._pricing_schedules = (
             load_bundled_pricing_schedules()
@@ -144,6 +151,8 @@ class GeminiProvider:
 
     @property
     def client(self) -> _GeminiClient:
+        if self._close_task is not None:
+            raise RuntimeError("Gemini provider is closed")
         if self._client is None:
             try:
                 from google import genai
@@ -154,6 +163,30 @@ class GeminiProvider:
                 ) from error
             self._client = cast(_GeminiClient, genai.Client(api_key=self._api_key))
         return self._client
+
+    async def close(self) -> None:
+        """Join the once-only cleanup of this provider's owned SDK client."""
+
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())
+        await await_cleanup(self._close_task)
+
+    async def _finish_close(self) -> None:
+        client = self._client
+        if self._owns_client and client is not None:
+            first_error: BaseException | None = None
+            try:
+                await client.aio.aclose()
+            except BaseException as error:
+                first_error = error
+            try:
+                client.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+            if first_error is not None:
+                raise first_error
+        self._client = None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
@@ -219,8 +252,9 @@ class GeminiProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            async for event in self._stream(request):
-                yield event
+            async with closing_stream(self._stream(request)) as events:
+                async for event in events:
+                    yield event
             return
         except asyncio.CancelledError:
             raise
@@ -282,186 +316,192 @@ class GeminiProvider:
         response_id: str | None = None
         model_version: str | None = None
         iterator = cast(AsyncIterator[object], iterator_method())
-        while True:
-            try:
-                chunk = await anext(iterator)
-            except StopAsyncIteration:
-                break
-            except asyncio.CancelledError:
-                raise
-            except ModelProviderError:
-                raise
-            except Exception as error:
-                raise _normalize_error(error) from error
-            try:
-                chunk_model = _optional_text(
-                    _field(chunk, "model_version", None),
-                    "stream model version",
-                )
-                if chunk_model is not None:
-                    if model_version is not None and model_version != chunk_model:
-                        raise ValueError("stream model version changed")
-                    model_version = chunk_model
-                chunk_id = _optional_text(
-                    _field(chunk, "response_id", None),
-                    "stream response id",
-                )
-                if chunk_id is not None:
-                    if response_id is not None and response_id != chunk_id:
-                        raise ValueError("stream response ID changed")
-                    response_id = chunk_id
-                chunk_usage = _field(chunk, "usage_metadata", None)
-                if chunk_usage is not None:
-                    usage_value = chunk_usage
-                feedback = _field(chunk, "prompt_feedback", None)
-                block_reason = _enum_value(_field(feedback, "block_reason", None))
-                if block_reason not in {None, "BLOCK_REASON_UNSPECIFIED"}:
-                    raise ModelProviderError(
-                        ProviderErrorCode.CONTENT_BLOCKED,
-                        "Gemini blocked the response",
+        async with closing_stream(iterator):
+            while True:
+                try:
+                    chunk = await anext(iterator)
+                except StopAsyncIteration:
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except ModelProviderError:
+                    raise
+                except Exception as error:
+                    raise _normalize_error(error) from error
+                try:
+                    chunk_model = _optional_text(
+                        _field(chunk, "model_version", None),
+                        "stream model version",
                     )
-                candidates_value = _field(chunk, "candidates", ())
-                if candidates_value is None:
-                    candidates_value = ()
-                candidates = _sequence(candidates_value, "stream candidates")
-                if len(candidates) > 1:
-                    raise ValueError("stream must contain at most one candidate")
-                if not candidates:
-                    # Native streams may contain metadata-only or heartbeat
-                    # responses. They carry no canonical model output.
-                    continue
-                candidate = candidates[0]
-                native_finish = _field(candidate, "finish_reason", None)
-                if native_finish is not None:
-                    decoded_finish = _required_text(
-                        _enum_value(native_finish),
-                        "stream finish reason",
+                    if chunk_model is not None:
+                        if model_version is not None and model_version != chunk_model:
+                            raise ValueError("stream model version changed")
+                        model_version = chunk_model
+                    chunk_id = _optional_text(
+                        _field(chunk, "response_id", None),
+                        "stream response id",
                     )
-                    if decoded_finish in {
-                        "SAFETY",
-                        "RECITATION",
-                        "BLOCKLIST",
-                        "PROHIBITED_CONTENT",
-                        "SPII",
-                    }:
+                    if chunk_id is not None:
+                        if response_id is not None and response_id != chunk_id:
+                            raise ValueError("stream response ID changed")
+                        response_id = chunk_id
+                    chunk_usage = _field(chunk, "usage_metadata", None)
+                    if chunk_usage is not None:
+                        usage_value = chunk_usage
+                    feedback = _field(chunk, "prompt_feedback", None)
+                    block_reason = _enum_value(_field(feedback, "block_reason", None))
+                    if block_reason not in {None, "BLOCK_REASON_UNSPECIFIED"}:
                         raise ModelProviderError(
                             ProviderErrorCode.CONTENT_BLOCKED,
                             "Gemini blocked the response",
                         )
-                    if finish_reason is not None and finish_reason != decoded_finish:
-                        raise ValueError("stream finish reason changed")
-                    finish_reason = decoded_finish
-                content = _field(candidate, "content", None)
-                if content is None:
-                    continue
-                parts_value = _field(content, "parts", ())
-                if parts_value is None:
-                    parts_value = ()
-                for part in _sequence(parts_value, "stream candidate parts"):
-                    provider_part: dict[str, object] = {}
-                    signature = _field(part, "thought_signature", None)
-                    if signature is not None:
-                        provider_part["thought_signature"] = signature
-                    thought = _field(part, "thought", False)
-                    if thought is None:
-                        thought = False
-                    if thought is not False and thought is not True:
-                        raise ValueError("stream thought flag must be boolean")
-                    if thought:
-                        provider_part["thought"] = True
-                    part_text = _field(part, "text", None)
-                    if part_text is not None:
-                        if not isinstance(part_text, str):
-                            raise ValueError("stream part text must be text")
-                        provider_part["text"] = part_text
-                        if not thought:
-                            text_fragments.append(part_text)
-                            if part_text:
-                                yield ModelTextDelta(part_text)
-                    function_call = _field(part, "function_call", None)
-                    if function_call is not None:
-                        if part_text is not None:
-                            raise ValueError(
-                                "stream part cannot contain text and a function call"
+                    candidates_value = _field(chunk, "candidates", ())
+                    if candidates_value is None:
+                        candidates_value = ()
+                    candidates = _sequence(candidates_value, "stream candidates")
+                    if len(candidates) > 1:
+                        raise ValueError("stream must contain at most one candidate")
+                    if not candidates:
+                        # Native streams may contain metadata-only or heartbeat
+                        # responses. They carry no canonical model output.
+                        continue
+                    candidate = candidates[0]
+                    native_finish = _field(candidate, "finish_reason", None)
+                    if native_finish is not None:
+                        decoded_finish = _required_text(
+                            _enum_value(native_finish),
+                            "stream finish reason",
+                        )
+                        if decoded_finish in {
+                            "SAFETY",
+                            "RECITATION",
+                            "BLOCKLIST",
+                            "PROHIBITED_CONTENT",
+                            "SPII",
+                        }:
+                            raise ModelProviderError(
+                                ProviderErrorCode.CONTENT_BLOCKED,
+                                "Gemini blocked the response",
                             )
-                        arguments_value = _field(function_call, "args")
-                        if not isinstance(arguments_value, Mapping):
-                            raise ValueError(
-                                "stream function arguments must be an object"
-                            )
-                        name = _required_text(
-                            _field(function_call, "name"),
-                            "stream function name",
-                        )
-                        native_id = _optional_text(
-                            _field(function_call, "id", None),
-                            "stream function id",
-                        )
-                        native_call: dict[str, object] = {
-                            "name": name,
-                            "args": FrozenJsonObject.from_mapping(
-                                arguments_value
-                            ).to_dict(),
-                        }
-                        if native_id is not None:
-                            native_call["id"] = native_id
-                        provider_part["function_call"] = native_call
-                        canonical_id = self._id_factory("call")
-                        if canonical_id in canonical_call_ids:
-                            raise ValueError("id_factory returned a duplicate call ID")
-                        canonical_call_ids.append(canonical_id)
-                        yield ModelToolCallDelta(
-                            index=len(canonical_call_ids) - 1,
-                            arguments_delta=canonical_json(arguments_value),
-                            id=canonical_id,
-                            name=name,
-                            provider_call_id=native_id,
-                        )
-                    if not provider_part:
-                        raise ValueError("stream contains an empty part")
-                    if (
-                        set(provider_part).issubset({"text", "thought_signature"})
-                        and "text" in provider_part
-                        and not provider_part.get("thought", False)
-                        and provider_parts
-                        and set(provider_parts[-1]).issubset(
-                            {"text", "thought_signature"}
-                        )
-                        and "text" in provider_parts[-1]
-                    ):
-                        previous = provider_parts[-1]
                         if (
-                            "thought_signature" in previous
-                            and "thought_signature" in provider_part
+                            finish_reason is not None
+                            and finish_reason != decoded_finish
                         ):
-                            raise ValueError(
-                                "stream text contains multiple thought signatures"
+                            raise ValueError("stream finish reason changed")
+                        finish_reason = decoded_finish
+                    content = _field(candidate, "content", None)
+                    if content is None:
+                        continue
+                    parts_value = _field(content, "parts", ())
+                    if parts_value is None:
+                        parts_value = ()
+                    for part in _sequence(parts_value, "stream candidate parts"):
+                        provider_part: dict[str, object] = {}
+                        signature = _field(part, "thought_signature", None)
+                        if signature is not None:
+                            provider_part["thought_signature"] = signature
+                        thought = _field(part, "thought", False)
+                        if thought is None:
+                            thought = False
+                        if thought is not False and thought is not True:
+                            raise ValueError("stream thought flag must be boolean")
+                        if thought:
+                            provider_part["thought"] = True
+                        part_text = _field(part, "text", None)
+                        if part_text is not None:
+                            if not isinstance(part_text, str):
+                                raise ValueError("stream part text must be text")
+                            provider_part["text"] = part_text
+                            if not thought:
+                                text_fragments.append(part_text)
+                                if part_text:
+                                    yield ModelTextDelta(part_text)
+                        function_call = _field(part, "function_call", None)
+                        if function_call is not None:
+                            if part_text is not None:
+                                raise ValueError(
+                                    "stream part cannot contain text and a function call"
+                                )
+                            arguments_value = _field(function_call, "args")
+                            if not isinstance(arguments_value, Mapping):
+                                raise ValueError(
+                                    "stream function arguments must be an object"
+                                )
+                            name = _required_text(
+                                _field(function_call, "name"),
+                                "stream function name",
                             )
-                        previous["text"] = cast(str, previous["text"]) + cast(
-                            str,
-                            provider_part["text"],
-                        )
-                        if "thought_signature" in provider_part:
-                            previous["thought_signature"] = provider_part[
-                                "thought_signature"
-                            ]
-                    else:
-                        provider_parts.append(provider_part)
-            except asyncio.CancelledError:
-                raise
-            except ModelProviderError:
-                raise
-            except (KeyError, TypeError, ValueError) as error:
-                raise ModelProviderError(
-                    ProviderErrorCode.MALFORMED_RESPONSE,
-                    "Gemini returned a malformed stream",
-                    provider_id=self.provider_id,
-                    diagnostic=ProviderFailureDiagnostic(
-                        phase=ProviderFailurePhase.STREAM_EVENT,
-                        code="event_decode_failed",
-                        terminal_status=_safe_structural_token(finish_reason),
-                    ),
-                ) from error
+                            native_id = _optional_text(
+                                _field(function_call, "id", None),
+                                "stream function id",
+                            )
+                            native_call: dict[str, object] = {
+                                "name": name,
+                                "args": FrozenJsonObject.from_mapping(
+                                    arguments_value
+                                ).to_dict(),
+                            }
+                            if native_id is not None:
+                                native_call["id"] = native_id
+                            provider_part["function_call"] = native_call
+                            canonical_id = self._id_factory("call")
+                            if canonical_id in canonical_call_ids:
+                                raise ValueError(
+                                    "id_factory returned a duplicate call ID"
+                                )
+                            canonical_call_ids.append(canonical_id)
+                            yield ModelToolCallDelta(
+                                index=len(canonical_call_ids) - 1,
+                                arguments_delta=canonical_json(arguments_value),
+                                id=canonical_id,
+                                name=name,
+                                provider_call_id=native_id,
+                            )
+                        if not provider_part:
+                            raise ValueError("stream contains an empty part")
+                        if (
+                            set(provider_part).issubset({"text", "thought_signature"})
+                            and "text" in provider_part
+                            and not provider_part.get("thought", False)
+                            and provider_parts
+                            and set(provider_parts[-1]).issubset(
+                                {"text", "thought_signature"}
+                            )
+                            and "text" in provider_parts[-1]
+                        ):
+                            previous = provider_parts[-1]
+                            if (
+                                "thought_signature" in previous
+                                and "thought_signature" in provider_part
+                            ):
+                                raise ValueError(
+                                    "stream text contains multiple thought signatures"
+                                )
+                            previous["text"] = cast(str, previous["text"]) + cast(
+                                str,
+                                provider_part["text"],
+                            )
+                            if "thought_signature" in provider_part:
+                                previous["thought_signature"] = provider_part[
+                                    "thought_signature"
+                                ]
+                        else:
+                            provider_parts.append(provider_part)
+                except asyncio.CancelledError:
+                    raise
+                except ModelProviderError:
+                    raise
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ModelProviderError(
+                        ProviderErrorCode.MALFORMED_RESPONSE,
+                        "Gemini returned a malformed stream",
+                        provider_id=self.provider_id,
+                        diagnostic=ProviderFailureDiagnostic(
+                            phase=ProviderFailurePhase.STREAM_EVENT,
+                            code="event_decode_failed",
+                            terminal_status=_safe_structural_token(finish_reason),
+                        ),
+                    ) from error
 
         if finish_reason is None:
             raise ModelProviderError(

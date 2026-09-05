@@ -1178,6 +1178,7 @@ class DaitaApp(App[int]):
                 "catalog_schema": "Reading catalog schema",
                 "data_query": "Querying data source",
                 "artifact_create_document": "Creating document",
+                "artifact_create_tabular": "Creating findings table",
                 "artifact_edit_text": "Preparing workspace file edit",
                 "artifact_save_local": "Publishing local artifact",
             }.get(

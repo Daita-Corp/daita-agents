@@ -102,6 +102,9 @@ def _request() -> ModelRequest:
 
 
 class _Stream:
+    async def close(self) -> None:
+        pass
+
     def __init__(self, events: list[dict[str, object]]) -> None:
         self._events = events
 
@@ -170,6 +173,10 @@ class _Responses:
 class _Client:
     def __init__(self) -> None:
         self.responses = _Responses()
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
 
 
 class _HangingResponses:
@@ -183,6 +190,9 @@ class _HangingClient:
     def __init__(self) -> None:
         self.responses = _HangingResponses()
 
+    async def close(self) -> None:
+        return None
+
 
 class _EmptyResponses:
     async def create(self, **kwargs: object) -> _Stream:
@@ -193,6 +203,9 @@ class _EmptyResponses:
 class _EmptyClient:
     def __init__(self) -> None:
         self.responses = _EmptyResponses()
+
+    async def close(self) -> None:
+        return None
 
 
 async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
@@ -252,6 +265,49 @@ def test_codex_default_client_uses_bounded_transport_without_sdk_retries(monkeyp
     assert timeout.write == 30.0
     assert timeout.pool == 5.0
     assert captured["max_retries"] == 0
+
+
+async def test_codex_closes_only_its_internally_created_client(monkeypatch):
+    client = _Client()
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **_kwargs: client)
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=_credential().to_secret(),
+    )
+    assert provider.client is client
+
+    await provider.close()
+    await provider.close()
+
+    assert client.close_calls == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        _ = provider.client
+
+
+async def test_codex_refresh_closes_the_replaced_internal_client(monkeypatch):
+    original = _credential(expired=True)
+    refreshed = _credential()
+    clients = [_Client(), _Client()]
+    created = iter(clients)
+    monkeypatch.setattr(openai, "AsyncOpenAI", lambda **_kwargs: next(created))
+
+    async def refresh(value: CodexOAuthCredential) -> CodexOAuthCredential:
+        assert value == original
+        return refreshed
+
+    monkeypatch.setattr(codex_provider, "refresh_codex_subscription", refresh)
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=original.to_secret(),
+    )
+    assert provider.client is clients[0]
+
+    await provider._ensure_current_credential()
+
+    assert clients[0].close_calls == 1
+    assert provider.client is clients[1]
+    await provider.close()
+    assert clients[1].close_calls == 1
 
 
 async def test_codex_total_attempt_timeout_is_normalized(monkeypatch):

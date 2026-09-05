@@ -30,6 +30,7 @@ from .llm.models import (
     ToolResultBlock,
 )
 from .llm.pricing import CostEstimateStatus
+from .llm.protocols import ManagedModelProvider
 from .llm.protocols import ModelProvider, provider_has_complete_pricing
 from .loop.models import ConversationRun, LoopExit, LoopExitKind, Transcript
 from .memory.store import (
@@ -809,6 +810,7 @@ class OneShotCandidateReviewer:
         skills: SkillStore,
         catalog: LearningCatalogReader,
         model: ModelProvider | None,
+        owned_model: ManagedModelProvider | None = None,
         profile: ModelProfile | None,
         max_estimated_cost_usd: Decimal | None,
         clock: Callable[[], datetime],
@@ -822,6 +824,8 @@ class OneShotCandidateReviewer:
             )
         if profile is not None and not isinstance(profile, ModelProfile):
             raise TypeError("candidate reviewer profile must be ModelProfile")
+        if owned_model is not None and owned_model is not model:
+            raise ValueError("owned reviewer model must be the configured model")
         if max_estimated_cost_usd is not None and (
             not isinstance(max_estimated_cost_usd, Decimal)
             or not max_estimated_cost_usd.is_finite()
@@ -836,6 +840,7 @@ class OneShotCandidateReviewer:
         self._skills = skills
         self._catalog = catalog
         self._model = model
+        self._owned_model = owned_model
         self._profile = profile
         self._max_estimated_cost_usd = max_estimated_cost_usd
         self._clock = clock
@@ -964,7 +969,10 @@ class OneShotCandidateReviewer:
 
         self._closed = True
         async with self._review_lock:
-            return None
+            owned_model = self._owned_model
+            if owned_model is not None:
+                await owned_model.close()
+                self._owned_model = None
 
     async def clear_conversations(self) -> int:
         """Clear transcript-derived records while excluding approved knowledge."""

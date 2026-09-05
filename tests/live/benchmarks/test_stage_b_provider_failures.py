@@ -8,6 +8,7 @@ cancel, or corrupt the independently admitted job.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,7 @@ from daita.llm.routing import (
 )
 from daita.loop.models import LoopExitKind
 
+from . import _support
 from ._support import (
     OFFLINE_EAGER_LIMITS,
     TARGET_PROFILE_TABLE,
@@ -37,6 +39,35 @@ from ._support import (
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.acceptance]
+
+
+async def test_completed_profile_seed_differs_from_current_source(
+    tmp_path, monkeypatch
+):
+    provider = MockModelProvider((stop_response(),))
+    monkeypatch.setattr(
+        _support,
+        "live_provider",
+        lambda _model_id: (
+            provider.model_profile,
+            _support.RecordingProvider(provider),
+        ),
+    )
+    fixture, job_id = await _support.seed_completed_profile_agent(
+        tmp_path,
+        "historical-profile",
+        provider.provider_id,
+    )
+    try:
+        await _support.assert_profile_result(fixture.agent, job_id)
+        with sqlite3.connect(tmp_path / "historical-profile.sqlite") as connection:
+            current = connection.execute(
+                f"SELECT count(*), sum(nullable_code IS NULL) FROM {TARGET_PROFILE_TABLE}"
+            ).fetchone()
+        assert current == (7, 4)
+        assert current != (_support.PROFILE_SAMPLE_ROWS, _support.PROFILE_NULL_VALUES)
+    finally:
+        await fixture.close()
 
 
 def _registration(provider):

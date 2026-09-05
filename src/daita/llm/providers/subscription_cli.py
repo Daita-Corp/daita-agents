@@ -1025,6 +1025,11 @@ class ClaudeCodeSubscriptionProvider:
             raise TypeError("request must be a canonical ModelRequest")
         return False
 
+    async def close(self) -> None:
+        """The provider retains no process or transport between requests."""
+
+        return None
+
     async def generate(self, request: ModelRequest) -> ModelResponse:
         return await self._generate_bounded(request)
 
@@ -1185,6 +1190,11 @@ class GrokBuildSubscriptionProvider:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         return False
+
+    async def close(self) -> None:
+        """The provider retains no process or transport between requests."""
+
+        return None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):

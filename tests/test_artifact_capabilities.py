@@ -27,6 +27,7 @@ from daita.capabilities import AccessMode, AutomationEligibility, OperationalEff
 from daita.domains.data.context import DataContextBuilder
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
+    ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
     ARTIFACT_EDIT_TEXT_TOOL_NAME,
     ARTIFACT_LIST_TOOL_NAME,
     ARTIFACT_READ_TOOL_NAME,
@@ -170,7 +171,7 @@ def test_artifact_intent_classifiers_are_removed_and_model_tools_stay_narrow() -
         assert schema["additionalProperties"] is False
 
 
-def test_d2_certifies_only_the_four_accepted_scheduled_artifact_capabilities() -> None:
+def test_d2_certifies_only_the_three_accepted_scheduled_artifact_capabilities() -> None:
     declarations = artifact_capability_declarations()
     data_declarations = data_export_tabular_capability_declarations()
     capabilities = (*declarations.capabilities, *data_declarations.capabilities)
@@ -187,6 +188,11 @@ def test_d2_certifies_only_the_four_accepted_scheduled_artifact_capabilities() -
         DATA_EXPORT_TABULAR_CAPABILITY_ID,
     }
     assert by_id[DATA_EXPORT_TABULAR_CAPABILITY_ID].access_mode is AccessMode.READ
+    assert (
+        by_id[ARTIFACT_CREATE_TABULAR_CAPABILITY_ID].automation_eligibility
+        is AutomationEligibility.INTERACTIVE_ONLY
+    )
+    assert by_id[ARTIFACT_CREATE_TABULAR_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert by_id[DOCUMENT_CREATE_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert by_id[RESULT_SNAPSHOT_CAPABILITY_ID].access_mode is AccessMode.NONE
     assert all(

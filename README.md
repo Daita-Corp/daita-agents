@@ -10,6 +10,7 @@ approved memory, and reusable skills persist across sessions so useful business
 context does not have to be explained again.
 
 [Quick start](#quick-start) ·
+[Artifacts](docs/ARTIFACTS.md) ·
 [Local workspaces](docs/LOCAL_WORKSPACES.md) ·
 [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) ·
 [Remote MCP](docs/MCP_CONNECTIVITY.md) ·
@@ -115,6 +116,7 @@ For the full implementation boundaries, see the
 
 | Topic | Guide |
 | --- | --- |
+| Exact exports and evidence-bound derived files | [Artifacts](docs/ARTIFACTS.md) |
 | Workspace selection, file reads, queries, and edits | [Local workspaces](docs/LOCAL_WORKSPACES.md) |
 | Codex, Claude Code, and Grok Build subscriptions | [Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
 | Read-only remote tools | [Remote MCP connectivity](docs/MCP_CONNECTIVITY.md) |

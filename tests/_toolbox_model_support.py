@@ -138,6 +138,9 @@ class ToolboxAwareMockModelProvider:
             self._logical_cursor += 1
             self._toolbox_load_attempt = None
 
+    async def close(self) -> None:
+        await self._scripted.close()
+
     def assert_consumed(self) -> None:
         self._scripted.assert_consumed()
 

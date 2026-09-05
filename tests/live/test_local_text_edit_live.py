@@ -27,7 +27,7 @@ from daita import (
 from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from daita.llm.profiles import reviewed_model_profile
-from daita.llm.protocols import ModelProvider
+from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import (
     LoopExitKind,
     Transcript,
@@ -98,7 +98,7 @@ def _cost_limit() -> Decimal:
     return value
 
 
-def _live_model() -> tuple[ModelProfile, ModelProvider]:
+def _live_model() -> tuple[ModelProfile, ManagedModelProvider]:
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
     profile = reviewed_model_profile(model_id)
     if profile is None or not profile.supports_tools:
@@ -160,6 +160,9 @@ async def test_live_model_reads_edits_approves_and_replaces_exact_bound_file(
     target = workspace.root / _RELATIVE_PATH
     target.parent.mkdir(parents=True)
     target.write_text(_ORIGINAL_CONTENT, encoding="utf-8")
+    # Temporary directories can inherit a group outside the runner's groups.
+    # The successful-publication fixture must satisfy the existing metadata guard.
+    os.chown(target, -1, os.getegid())
     approvals: list[ApprovalRequest] = []
     content_at_approval: list[str] = []
 
@@ -181,7 +184,10 @@ async def test_live_model_reads_edits_approves_and_replaces_exact_bound_file(
         result = await agent.run(_PROMPT)
         transcript = await agent.transcript(result.run_id)
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
     assert result.kind is LoopExitKind.COMPLETED, (
         result.reason,

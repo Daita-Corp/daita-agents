@@ -16,6 +16,7 @@ from _workspace_support import workspace_for
 
 from daita import Agent, JobStatus, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
+from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -29,7 +30,7 @@ from daita.llm.models import (
 )
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
-    ModelProvider,
+    ManagedModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
@@ -84,6 +85,20 @@ class LiveAgentFixture:
     source_id: str
     resource_ids: Mapping[str, str]
 
+    async def close(self) -> None:
+        first_error: BaseException | None = None
+        try:
+            await self.agent.close()
+        except BaseException as error:
+            first_error = error
+        try:
+            await self.provider.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+        if first_error is not None:
+            raise first_error
+
 
 @dataclass(frozen=True, slots=True)
 class RunCapture:
@@ -95,7 +110,7 @@ class RunCapture:
 class RecordingProvider:
     """Capture canonical requests and responses around one real provider."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.responses: list[ModelResponse] = []
@@ -120,10 +135,14 @@ class RecordingProvider:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live benchmark provider must support streaming")
         self.requests.append(request)
-        async for event in self._delegate.stream(request):
-            if isinstance(event, ModelStreamCompleted):
-                self.responses.append(event.response)
-            yield event
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                if isinstance(event, ModelStreamCompleted):
+                    self.responses.append(event.response)
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 def benchmark_marks(
@@ -297,19 +316,24 @@ async def create_live_agent(
         )
     except BaseException:
         await agent.close()
+        await provider.close()
         raise
 
 
 async def open_live_home(home: ProbeHome, model_id: str) -> LiveAgentFixture:
     profile, provider = live_provider(model_id)
-    agent = await Agent.open(
-        home.name,
-        root=home.root,
-        model=provider,
-        model_profile=profile,
-        limits=benchmark_limits(),
-        workspace=workspace_for(home.root),
-    )
+    try:
+        agent = await Agent.open(
+            home.name,
+            root=home.root,
+            model=provider,
+            model_profile=profile,
+            limits=benchmark_limits(),
+            workspace=workspace_for(home.root),
+        )
+    except BaseException:
+        await provider.close()
+        raise
     return LiveAgentFixture(
         agent=agent,
         provider=provider,
@@ -334,6 +358,7 @@ async def seed_completed_profile_agent(
     )
     provider = MockModelProvider(
         (
+            toolbox_load_response("start_data_profile"),
             start_profile_response(
                 home.resource_ids[TARGET_PROFILE_TABLE],
                 call_id="seed-profile",
@@ -360,6 +385,15 @@ async def seed_completed_profile_agent(
         job_id = jobs[0].job_id
         terminal = await wait_for_terminal(agent, job_id)
         assert terminal.summary.status is JobStatus.SUCCEEDED
+        await assert_profile_result(agent, job_id)
+        # A fresh query must not accidentally answer a historical-result question.
+        # Change only this disposable source after the verified snapshot is complete.
+        with sqlite3.connect(home.database) as connection:
+            connection.executemany(
+                f"INSERT INTO {TARGET_PROFILE_TABLE} VALUES (?, ?, ?)",
+                ((6, None, 15.5), (7, None, 16.5)),
+            )
+        await agent.refresh_source(home.source_id)
         await assert_profile_result(agent, job_id)
     finally:
         await agent.close()
@@ -406,11 +440,26 @@ def assert_on_demand_invocation(capture: RunCapture, tool_name: str) -> None:
     visible_names = {tool.name for tool in capture.requests[0].tools}
     assert {"toolbox_search", "toolbox_load"} <= visible_names
     assert tool_name not in visible_names
-    names = logical_names(capture.transcript)
-    assert "toolbox_search" in names
-    assert "toolbox_load" in names
-    assert tool_name in names
-    assert results_for(capture.transcript, tool_name)
+    # Search is optional when the exact name is known. A successful load of
+    # that name must still precede its successful invocation.
+    calls: dict[str, ToolCall] = {}
+    loaded = False
+    for message in capture.transcript.messages:
+        calls.update((call.id, call) for call in message.tool_calls)
+        for block in message.content:
+            if not isinstance(block, ToolResultBlock) or block.is_error:
+                continue
+            call = calls.get(block.call_id)
+            if call is None:
+                continue
+            if call.name == "toolbox_load":
+                requested = call.arguments.get("tool_names")
+                if isinstance(requested, (list, tuple)) and tool_name in requested:
+                    loaded = True
+            elif call.name == tool_name:
+                assert loaded, f"{tool_name} succeeded before its exact successful load"
+                return
+    raise AssertionError(f"No successful invocation of {tool_name}")
 
 
 def logical_names(transcript: Transcript) -> tuple[str, ...]:

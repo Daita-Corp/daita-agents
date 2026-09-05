@@ -28,6 +28,7 @@ from _workspace_support import workspace_for
 from daita import Agent, JobStatus, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
+from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     ModelProfile,
     ModelRequest,
@@ -38,7 +39,7 @@ from daita.llm.models import (
 )
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
-    ModelProvider,
+    ManagedModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
@@ -89,7 +90,7 @@ pytestmark = [
 class _RecordingProvider:
     """Capture canonical requests and responses around one real provider."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.responses: list[ModelResponse] = []
@@ -114,10 +115,14 @@ class _RecordingProvider:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live delegate must support canonical streaming")
         self.requests.append(request)
-        async for event in self._delegate.stream(request):
-            if isinstance(event, ModelStreamCompleted):
-                self.responses.append(event.response)
-            yield event
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                if isinstance(event, ModelStreamCompleted):
+                    self.responses.append(event.response)
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 def _required_environment(name: str) -> str:
@@ -399,7 +404,10 @@ async def test_live_model_chooses_direct_query_instead_of_durable_job(
         assert "start_data_profile" not in logical_names
         assert await agent.list_jobs() == ()
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
 
 async def test_live_model_starts_detaches_and_later_reads_profile_result(
@@ -512,7 +520,10 @@ async def test_live_model_starts_detaches_and_later_reads_profile_result(
         )
         assert nullable["null_values"] == 2
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
 
 async def test_live_model_requests_cancellation_of_running_profile_job(
@@ -603,4 +614,7 @@ async def test_live_model_requests_cancellation_of_running_profile_job(
         assert await agent.read_job_result(job_id) is None
     finally:
         release.set()
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()

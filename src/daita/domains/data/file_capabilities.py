@@ -286,7 +286,7 @@ def local_file_capability_declarations() -> CapabilityDeclarations:
                 toolbox_id=ToolboxId.FILES,
                 load_mode=ToolLoadMode.ON_DEMAND,
                 text_trust=ToolTextTrust.CODE,
-                summary="Analyze one bounded structured workspace dataset.",
+                summary="Filter, group, or total a bounded CSV or other structured workspace dataset.",
                 when_to_use=(
                     "Use for filtering, grouping, and aggregation across one "
                     "homogeneous CSV, TSV, JSON/NDJSON, or Parquet dataset."

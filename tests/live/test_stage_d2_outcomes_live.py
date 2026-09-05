@@ -32,6 +32,7 @@ from daita import (
     create_llm_provider,
 )
 from daita.artifacts.models import ArtifactAuthorship
+from daita.catalog.capabilities import CATALOG_SCHEMA_CAPABILITY_ID
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     DATA_EXPORT_TABULAR_TOOL_NAME,
@@ -188,7 +189,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
                 authorized_instruction=(
                     "Create one exact CSV artifact from the admitted SQLite table "
                     "stage_d2_probe. Read the scheduled row and include probe_name "
-                    "and token. Use the admitted exact SQLite export capability; do "
+                    "and token. Use the admitted exact relational export capability; do "
                     "not answer from schema or copy source rows through model text."
                 ),
                 schedule=IntervalSchedule(3_600, now + timedelta(hours=1)),
@@ -198,7 +199,10 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
                 allowed_source_ids=(source.id,),
                 allowed_connector_binding_ids=(),
                 allowed_resource_ids=(resource.id,),
-                allowed_capability_ids=(DATA_EXPORT_TABULAR_CAPABILITY_ID,),
+                allowed_capability_ids=(
+                    CATALOG_SCHEMA_CAPABILITY_ID,
+                    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+                ),
                 sensitivity_ceiling=ModelSensitivity.INTERNAL,
                 outcome_contract=_artifact_contract(),
                 distribution_destination_id=destination.destination_id,
@@ -239,7 +243,10 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         assert scope is not None
         assert scope.allowed_source_ids == (source.id,)
         assert scope.allowed_resource_ids == (resource.id,)
-        assert scope.allowed_capability_ids == (DATA_EXPORT_TABULAR_CAPABILITY_ID,)
+        assert scope.allowed_capability_ids == (
+            CATALOG_SCHEMA_CAPABILITY_ID,
+            DATA_EXPORT_TABULAR_CAPABILITY_ID,
+        )
         calls = tuple(
             call for message in transcript.messages for call in message.tool_calls
         )
@@ -252,4 +259,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         payload = await agent.read_artifact(reference.artifact_id)
         assert _TOKEN.encode("utf-8") in payload.content
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await live.close()

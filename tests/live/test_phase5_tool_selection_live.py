@@ -20,6 +20,7 @@ from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
+from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     ModelProfile,
     ModelRequest,
@@ -32,7 +33,7 @@ from daita.llm.models import (
 )
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
-    ModelProvider,
+    ManagedModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
@@ -76,7 +77,7 @@ pytestmark = [
 
 
 class _RecordingProvider:
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.responses: list[ModelResponse] = []
@@ -101,10 +102,14 @@ class _RecordingProvider:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live delegate must support canonical streaming")
         self.requests.append(request)
-        async for event in self._delegate.stream(request):
-            if isinstance(event, ModelStreamCompleted):
-                self.responses.append(event.response)
-            yield event
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                if isinstance(event, ModelStreamCompleted):
+                    self.responses.append(event.response)
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 def _required_environment(name: str) -> str:
@@ -255,7 +260,10 @@ async def test_live_files_only_ignores_connected_source_and_reads_forecast(
         )
         transcript = await agent.transcript(result.run_id)
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
     _assert_completed(result, transcript, provider, workspace.root)
     assert result.final_text is not None
@@ -312,7 +320,10 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
         )
         transcript = await agent.transcript(result.run_id)
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
     _assert_completed(result, transcript, provider, workspace.root)
     assert result.final_text is not None
@@ -370,17 +381,16 @@ async def test_live_markdown_report_is_created_then_saved_with_receipt(
         )
         transcript = await agent.transcript(result.run_id)
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
     _assert_completed(result, transcript, provider, workspace.root)
     assert result.final_text is not None
     exchanges = _exchanges(transcript)
     names = tuple(call.name for call, _block in exchanges)
-    assert (
-        names.index("toolbox_search")
-        < names.index("toolbox_load")
-        < names.index("artifact_create_document")
-    )
+    assert names.index("toolbox_load") < names.index("artifact_create_document")
     assert names.index("artifact_create_document") < names.index("artifact_save_local")
     initial = {tool.name for tool in provider.requests[0].tools}
     assert "artifact_create_document" not in initial

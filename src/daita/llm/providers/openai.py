@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json, thaw_json
+from .._lifecycle import await_cleanup, closing_stream
 from ..errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -47,6 +48,10 @@ from ..pricing import (
 )
 
 
+class _NativeStream(Protocol):
+    async def close(self) -> None: ...
+
+
 class _ResponsesResource(Protocol):
     async def create(self, **kwargs: object) -> object: ...
 
@@ -54,6 +59,8 @@ class _ResponsesResource(Protocol):
 class _OpenAIClient(Protocol):
     @property
     def responses(self) -> _ResponsesResource: ...
+
+    async def close(self) -> None: ...
 
 
 class _OpenAIResponseDecodeFailure(ValueError):
@@ -127,6 +134,8 @@ class OpenAIResponsesProvider:
         self._api_key = api_key
         self._max_output_tokens = max_output_tokens
         self._client = client
+        self._owns_client = client is None
+        self._close_task: asyncio.Task[None] | None = None
         self._id_factory = _new_id if id_factory is None else id_factory
         self._service_tier = service_tier
         self._region = region
@@ -170,6 +179,8 @@ class OpenAIResponsesProvider:
 
     @property
     def client(self) -> _OpenAIClient:
+        if self._close_task is not None:
+            raise RuntimeError("OpenAI provider is closed")
         if self._client is None:
             try:
                 from openai import AsyncOpenAI
@@ -180,6 +191,19 @@ class OpenAIResponsesProvider:
                 ) from error
             self._client = cast(_OpenAIClient, AsyncOpenAI(api_key=self._api_key))
         return self._client
+
+    async def close(self) -> None:
+        """Join the once-only cleanup of this provider's owned SDK client."""
+
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())
+        await await_cleanup(self._close_task)
+
+    async def _finish_close(self) -> None:
+        client = self._client
+        if self._owns_client and client is not None:
+            await client.close()
+        self._client = None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
@@ -248,8 +272,9 @@ class OpenAIResponsesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            async for event in self._stream(request):
-                yield event
+            async with closing_stream(self._stream(request)) as events:
+                async for event in events:
+                    yield event
             return
         except asyncio.CancelledError:
             raise
@@ -299,170 +324,182 @@ class OpenAIResponsesProvider:
         completed = False
         current_event_type: str | None = None
         terminal_diagnostic: ProviderFailureDiagnostic | None = None
-        try:
-            async for event in cast(AsyncIterator[object], stream):
-                current_event_type = None
-                event_type = _required_text(_field(event, "type"), "stream event type")
-                current_event_type = _safe_structural_token(event_type)
-                if event_type == "response.output_text.delta":
-                    delta = _stream_fragment(_field(event, "delta"), "text delta")
-                    if delta:
-                        yield ModelTextDelta(delta)
-                elif event_type == "response.output_item.added":
-                    item = _field(event, "item")
-                    if _field(item, "type", None) != "function_call":
-                        continue
-                    index = _nonnegative_int(
-                        _field(event, "output_index"), "output index"
+        async with closing_stream(
+            cast(AsyncIterator[object], stream),
+            close=cast(_NativeStream, stream).close,
+        ):
+            try:
+                async for event in cast(AsyncIterator[object], stream):
+                    current_event_type = None
+                    event_type = _required_text(
+                        _field(event, "type"), "stream event type"
                     )
-                    provider_call_id = _optional_stream_identity(
-                        _field(item, "call_id", None), "provider call_id"
-                    )
-                    name = _optional_stream_identity(
-                        _field(item, "name", None), "function name"
-                    )
-                    canonical_id = canonical_ids_by_index.get(index)
-                    if canonical_id is None:
-                        canonical_id = self._id_factory("call")
-                        if canonical_id in allocated_ids:
-                            raise ValueError("id_factory returned a duplicate call ID")
-                        allocated_ids.add(canonical_id)
-                        canonical_ids_by_index[index] = canonical_id
-                    if provider_call_id is not None:
-                        canonical_ids_by_provider_call_id[provider_call_id] = (
-                            canonical_id
+                    current_event_type = _safe_structural_token(event_type)
+                    if event_type == "response.output_text.delta":
+                        delta = _stream_fragment(_field(event, "delta"), "text delta")
+                        if delta:
+                            yield ModelTextDelta(delta)
+                    elif event_type == "response.output_item.added":
+                        item = _field(event, "item")
+                        if _field(item, "type", None) != "function_call":
+                            continue
+                        index = _nonnegative_int(
+                            _field(event, "output_index"), "output index"
                         )
-                        provider_call_ids_by_index[index] = provider_call_id
-                    if name is not None:
-                        names_by_index[index] = name
-                    yield ModelToolCallDelta(
-                        index=index,
-                        arguments_delta="",
-                        id=canonical_id,
-                        name=name,
-                        provider_call_id=provider_call_id,
-                    )
-                elif event_type == "response.function_call_arguments.delta":
-                    index = _nonnegative_int(
-                        _field(event, "output_index"), "output index"
-                    )
-                    arguments_delta = _stream_fragment(
-                        _field(event, "delta"), "function arguments delta"
-                    )
-                    if not arguments_delta:
-                        continue
-                    canonical_id = canonical_ids_by_index.get(index)
-                    if canonical_id is None:
-                        canonical_id = self._id_factory("call")
-                        if canonical_id in allocated_ids:
-                            raise ValueError("id_factory returned a duplicate call ID")
-                        allocated_ids.add(canonical_id)
-                        canonical_ids_by_index[index] = canonical_id
-                    yield ModelToolCallDelta(
-                        index=index,
-                        arguments_delta=arguments_delta,
-                        id=canonical_id,
-                        name=names_by_index.get(index),
-                        provider_call_id=provider_call_ids_by_index.get(index),
-                    )
-                elif event_type == "response.output_item.done":
-                    index = _nonnegative_int(
-                        _field(event, "output_index"), "output index"
-                    )
-                    completed_items_by_index[index] = _field(event, "item")
-                elif event_type in {
-                    "response.completed",
-                    "response.incomplete",
-                    "response.failed",
-                }:
-                    native_response = _field(event, "response")
-                    terminal_diagnostic = _openai_failure_diagnostic(
-                        native_response,
-                        phase=ProviderFailurePhase.STREAM_TERMINAL,
-                        code="terminal_response_decode_failed",
-                        event_type=event_type,
-                    )
-                    native_output = _field(native_response, "output", ())
-                    if (
-                        isinstance(native_output, Sequence)
-                        and not isinstance(native_output, (str, bytes))
-                        and completed_items_by_index
-                    ):
-                        output_count = max(
-                            len(native_output),
-                            max(completed_items_by_index) + 1,
+                        provider_call_id = _optional_stream_identity(
+                            _field(item, "call_id", None), "provider call_id"
                         )
-                        completed_output: list[object] = []
-                        for output_index in range(output_count):
-                            completed_item = completed_items_by_index.get(output_index)
-                            if completed_item is not None:
-                                completed_output.append(completed_item)
-                            elif output_index < len(native_output):
-                                completed_output.append(native_output[output_index])
-                            else:
-                                terminal_diagnostic = _openai_failure_diagnostic(
-                                    native_response,
-                                    phase=ProviderFailurePhase.STREAM_TERMINAL,
-                                    code="terminal_output_reconstruction_invalid",
-                                    event_type=event_type,
-                                )
+                        name = _optional_stream_identity(
+                            _field(item, "name", None), "function name"
+                        )
+                        canonical_id = canonical_ids_by_index.get(index)
+                        if canonical_id is None:
+                            canonical_id = self._id_factory("call")
+                            if canonical_id in allocated_ids:
                                 raise ValueError(
-                                    "completed stream output contains an index gap"
+                                    "id_factory returned a duplicate call ID"
                                 )
-                        native_response = _ResponseOutputOverride(
-                            native_response,
-                            tuple(completed_output),
+                            allocated_ids.add(canonical_id)
+                            canonical_ids_by_index[index] = canonical_id
+                        if provider_call_id is not None:
+                            canonical_ids_by_provider_call_id[provider_call_id] = (
+                                canonical_id
+                            )
+                            provider_call_ids_by_index[index] = provider_call_id
+                        if name is not None:
+                            names_by_index[index] = name
+                        yield ModelToolCallDelta(
+                            index=index,
+                            arguments_delta="",
+                            id=canonical_id,
+                            name=name,
+                            provider_call_id=provider_call_id,
                         )
-                    try:
-                        response = self._decode_response(
-                            native_response,
-                            requested_at=requested_at,
-                            canonical_ids_by_index=canonical_ids_by_index,
-                            canonical_ids_by_provider_call_id=(
-                                canonical_ids_by_provider_call_id
-                            ),
+                    elif event_type == "response.function_call_arguments.delta":
+                        index = _nonnegative_int(
+                            _field(event, "output_index"), "output index"
                         )
-                    except _OpenAIResponseDecodeFailure as error:
+                        arguments_delta = _stream_fragment(
+                            _field(event, "delta"), "function arguments delta"
+                        )
+                        if not arguments_delta:
+                            continue
+                        canonical_id = canonical_ids_by_index.get(index)
+                        if canonical_id is None:
+                            canonical_id = self._id_factory("call")
+                            if canonical_id in allocated_ids:
+                                raise ValueError(
+                                    "id_factory returned a duplicate call ID"
+                                )
+                            allocated_ids.add(canonical_id)
+                            canonical_ids_by_index[index] = canonical_id
+                        yield ModelToolCallDelta(
+                            index=index,
+                            arguments_delta=arguments_delta,
+                            id=canonical_id,
+                            name=names_by_index.get(index),
+                            provider_call_id=provider_call_ids_by_index.get(index),
+                        )
+                    elif event_type == "response.output_item.done":
+                        index = _nonnegative_int(
+                            _field(event, "output_index"), "output index"
+                        )
+                        completed_items_by_index[index] = _field(event, "item")
+                    elif event_type in {
+                        "response.completed",
+                        "response.incomplete",
+                        "response.failed",
+                    }:
+                        native_response = _field(event, "response")
                         terminal_diagnostic = _openai_failure_diagnostic(
                             native_response,
                             phase=ProviderFailurePhase.STREAM_TERMINAL,
-                            code=error.diagnostic_code,
+                            code="terminal_response_decode_failed",
                             event_type=event_type,
                         )
-                        raise
-                    yield ModelStreamCompleted(response)
-                    completed = True
-                    return
-                elif event_type == "error":
-                    code = _optional_text(
-                        _field(event, "code", None), "stream error code"
-                    )
-                    raise ModelProviderError(
-                        _code_from_provider_value(code),
-                        "OpenAI stream failed",
-                    )
-        except asyncio.CancelledError:
-            raise
-        except ImportError:
-            raise
-        except ModelProviderError:
-            raise
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "OpenAI returned a malformed stream",
-                provider_id=self.provider_id,
-                diagnostic=(
-                    terminal_diagnostic
-                    or ProviderFailureDiagnostic(
-                        phase=ProviderFailurePhase.STREAM_EVENT,
-                        code="event_decode_failed",
-                        event_type=current_event_type,
-                    )
-                ),
-            ) from error
-        except Exception as error:
-            raise _normalize_error(error) from error
+                        native_output = _field(native_response, "output", ())
+                        if (
+                            isinstance(native_output, Sequence)
+                            and not isinstance(native_output, (str, bytes))
+                            and completed_items_by_index
+                        ):
+                            output_count = max(
+                                len(native_output),
+                                max(completed_items_by_index) + 1,
+                            )
+                            completed_output: list[object] = []
+                            for output_index in range(output_count):
+                                completed_item = completed_items_by_index.get(
+                                    output_index
+                                )
+                                if completed_item is not None:
+                                    completed_output.append(completed_item)
+                                elif output_index < len(native_output):
+                                    completed_output.append(native_output[output_index])
+                                else:
+                                    terminal_diagnostic = _openai_failure_diagnostic(
+                                        native_response,
+                                        phase=ProviderFailurePhase.STREAM_TERMINAL,
+                                        code="terminal_output_reconstruction_invalid",
+                                        event_type=event_type,
+                                    )
+                                    raise ValueError(
+                                        "completed stream output contains an index gap"
+                                    )
+                            native_response = _ResponseOutputOverride(
+                                native_response,
+                                tuple(completed_output),
+                            )
+                        try:
+                            response = self._decode_response(
+                                native_response,
+                                requested_at=requested_at,
+                                canonical_ids_by_index=canonical_ids_by_index,
+                                canonical_ids_by_provider_call_id=(
+                                    canonical_ids_by_provider_call_id
+                                ),
+                            )
+                        except _OpenAIResponseDecodeFailure as error:
+                            terminal_diagnostic = _openai_failure_diagnostic(
+                                native_response,
+                                phase=ProviderFailurePhase.STREAM_TERMINAL,
+                                code=error.diagnostic_code,
+                                event_type=event_type,
+                            )
+                            raise
+                        yield ModelStreamCompleted(response)
+                        completed = True
+                        return
+                    elif event_type == "error":
+                        code = _optional_text(
+                            _field(event, "code", None), "stream error code"
+                        )
+                        raise ModelProviderError(
+                            _code_from_provider_value(code),
+                            "OpenAI stream failed",
+                        )
+            except asyncio.CancelledError:
+                raise
+            except ImportError:
+                raise
+            except ModelProviderError:
+                raise
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ModelProviderError(
+                    ProviderErrorCode.MALFORMED_RESPONSE,
+                    "OpenAI returned a malformed stream",
+                    provider_id=self.provider_id,
+                    diagnostic=(
+                        terminal_diagnostic
+                        or ProviderFailureDiagnostic(
+                            phase=ProviderFailurePhase.STREAM_EVENT,
+                            code="event_decode_failed",
+                            event_type=current_event_type,
+                        )
+                    ),
+                ) from error
+            except Exception as error:
+                raise _normalize_error(error) from error
         if not completed:
             raise ModelProviderError(
                 ProviderErrorCode.MALFORMED_RESPONSE,
