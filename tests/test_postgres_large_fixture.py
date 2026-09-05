@@ -192,9 +192,10 @@ class _BulkUpdateProvider:
                 tool_calls=(
                     ToolCall(
                         id="bulk-readback",
-                        name="data_query_postgresql",
+                        name="data_query",
                         arguments={
                             "source_id": self._source_id,
+                            "resource_ids": (self._resource_id,),
                             "sql": (
                                 "SELECT priority, COUNT(*) AS matched_rows "
                                 "FROM support.tickets "
@@ -370,9 +371,19 @@ async def test_daita_catalogs_and_queries_large_multi_schema_postgresql(tmp_path
                 tool_calls=(
                     ToolCall(
                         id="regional-invoiced-revenue",
-                        name="data_query_postgresql",
+                        name="data_query",
                         arguments={
                             "source_id": source.id,
+                            "resource_ids": tuple(
+                                by_native_identity[name].id
+                                for name in (
+                                    "core.customers",
+                                    "core.organizations",
+                                    "core.regions",
+                                    "sales.orders",
+                                    "billing.invoices",
+                                )
+                            ),
                             "sql": (
                                 "SELECT r.region_code, "
                                 "COUNT(DISTINCT o.order_id) AS paid_order_count, "

@@ -24,12 +24,14 @@ async def run() -> None:
         agent = await create_offline_agent("quickstart", root, model)
         try:
             source = await agent.attach(SQLiteSource(database, name="Sales"))
+            resources = await agent.list_catalog_resources(source_id=source.id)
             model.extend(
                 tool_response(
                     "count-orders",
-                    "data_query_sqlite",
+                    "data_query",
                     {
                         "source_id": source.id,
+                        "resource_ids": (resources[0].id,),
                         "sql": "SELECT COUNT(*) AS order_count FROM orders",
                         "parameters": [],
                     },

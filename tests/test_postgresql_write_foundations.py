@@ -547,6 +547,13 @@ async def test_catalog_projection_round_trips_ordered_keys_and_column_write_fact
     await agent._embedded._store.commit_snapshot(snapshot)
 
     try:
+        tabular_resource = (
+            await agent._embedded._catalog_service.tabular_resources(
+                agent.id,
+                registration.id,
+            )
+        )[0]
+        assert tabular_resource.tabular == TabularFacet(columns=columns)
         schema = (
             await agent._embedded._data_view.resource_schemas(agent.id, registration.id)
         )[0]

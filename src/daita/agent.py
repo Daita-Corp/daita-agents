@@ -154,6 +154,8 @@ class Agent:
         downloads_directory: Path | None = None,
         connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
+        """Create an agent; injected model providers remain caller-owned."""
+
         _validate_downloads_directory(downloads_directory)
         return cls(
             await EmbeddedAgent.create(
@@ -207,6 +209,8 @@ class Agent:
         downloads_directory: Path | None = None,
         connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
+        """Open an agent; injected model providers remain caller-owned."""
+
         _validate_downloads_directory(downloads_directory)
         return cls(
             await EmbeddedAgent.open(

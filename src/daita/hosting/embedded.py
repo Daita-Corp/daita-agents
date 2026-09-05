@@ -97,23 +97,22 @@ from ..distribution import (
 )
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
+    DATA_QUERY_CAPABILITY_ID,
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
     LOCAL_FILE_CAPABILITY_IDS,
     LOCAL_FILE_EXECUTOR_IDS,
-    POSTGRESQL_QUERY_CAPABILITY_ID,
-    SQLITE_QUERY_CAPABILITY_ID,
     ArtifactCapabilityDomain,
     CatalogDataView,
     DataCapabilityDomain,
     DataContextBuilder,
     artifact_declarations,
+    data_export_tabular_declarations,
+    data_query_declarations,
     local_file_declarations,
-    postgresql_query_declarations,
     postgresql_update_declarations,
     postgresql_update_preview_declarations,
     resource_revision_observation_declarations,
-    sqlite_query_declarations,
 )
 from ..domains.data.context import _project_completed_history
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
@@ -170,7 +169,7 @@ from ..llm.models import (
     ToolDefinition,
 )
 from ..llm.profiles import reviewed_model_profile
-from ..llm.protocols import ModelProvider
+from ..llm.protocols import ManagedModelProvider, ModelProvider
 from ..llm.routing import (
     ModelProviderRegistration,
     ModelRoute,
@@ -344,8 +343,7 @@ _T = TypeVar("_T")
 _STAGE_C_ALLOWED_CAPABILITY_IDS = (
     CATALOG_INSPECT_CAPABILITY_ID,
     CATALOG_SCHEMA_CAPABILITY_ID,
-    POSTGRESQL_QUERY_CAPABILITY_ID,
-    SQLITE_QUERY_CAPABILITY_ID,
+    DATA_QUERY_CAPABILITY_ID,
     JOB_INSPECT_CAPABILITY_ID,
     JOB_READ_RESULTS_CAPABILITY_ID,
 )
@@ -593,6 +591,7 @@ class EmbeddedAgent:
         run_lock: asyncio.Lock,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
+        owned_model_provider: ManagedModelProvider | None,
         limits: LoopLimits,
         secret_provider: SecretProvider,
         keychain: CredentialSession,
@@ -609,6 +608,7 @@ class EmbeddedAgent:
         self._workspace_backend = workspace_backend
         self.model_profile = model_profile
         self.model_route = model_route
+        self._owned_model_provider = owned_model_provider
         self._limits = limits
         self._secret_provider = secret_provider
         self._keychain = keychain
@@ -1105,6 +1105,13 @@ class EmbeddedAgent:
         artifact_delivery: LocalArtifactDelivery | None,
         connected_job_profiles: tuple[ConnectedJobProfile, ...],
     ) -> Self:
+        owned_model_provider: ManagedModelProvider | None = None
+        if model_route is not None:
+            if model is None or not isinstance(model, ManagedModelProvider):
+                raise AgentNotConfiguredError(
+                    "configured model route did not produce a managed provider"
+                )
+            owned_model_provider = model
         catalog_service = CatalogService(store, store)
         data_view = CatalogDataView(store, catalog_service, store)
         catalog = catalog_declarations(identity.id, data_view)
@@ -1112,10 +1119,20 @@ class EmbeddedAgent:
         postgresql_backend = PostgreSQLQueryBackend(
             store, data_view, secret_provider or keychain
         )
-        sqlite = sqlite_query_declarations(identity.id, sqlite_backend)
-        postgresql = postgresql_query_declarations(
+        relational_query = data_query_declarations(
             identity.id,
+            sqlite_backend,
             postgresql_backend,
+        )
+        relational_export = (
+            data_export_tabular_declarations(
+                identity.id,
+                sqlite_backend,
+                postgresql_backend,
+                clock,
+            )
+            if artifact_store.available
+            else None
         )
         postgresql_preview_backend = PostgreSQLUpdatePreviewBackend(
             store,
@@ -1153,6 +1170,7 @@ class EmbeddedAgent:
         skill_store = SkillStore(home, mutation_lock)
         resolved_reviewer_model = reviewer_model
         resolved_reviewer_profile = reviewer_profile
+        owned_reviewer_model: ManagedModelProvider | None = None
         if (
             resolved_reviewer_model is None
             and resolved_reviewer_profile is None
@@ -1166,6 +1184,7 @@ class EmbeddedAgent:
                 model_route,
                 secret_provider=secret_provider or keychain,
             )
+            owned_reviewer_model = resolved_reviewer_model
         resolved_reviewer_profile = _resolve_candidate_reviewer_profile(
             resolved_reviewer_model,
             resolved_reviewer_profile,
@@ -1177,6 +1196,7 @@ class EmbeddedAgent:
             skills=skill_store,
             catalog=data_view,
             model=resolved_reviewer_model,
+            owned_model=owned_reviewer_model,
             profile=resolved_reviewer_profile,
             max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
             clock=clock,
@@ -1189,9 +1209,6 @@ class EmbeddedAgent:
                 artifact_delivery,
                 artifact_store,
                 workspace=workspace_backend,
-                agent_id=identity.id,
-                sqlite_backend=sqlite_backend,
-                postgresql_backend=postgresql_backend,
                 clock=clock,
             )
             if artifact_store.available
@@ -1218,8 +1235,12 @@ class EmbeddedAgent:
             domain_owner_id=DATA_DOMAIN_OWNER_ID,
             capabilities=(
                 *catalog.capabilities,
-                *sqlite.capabilities,
-                *postgresql.capabilities,
+                *relational_query.capabilities,
+                *(
+                    relational_export.capabilities
+                    if relational_export is not None
+                    else ()
+                ),
                 *postgresql_preview.capabilities,
                 *postgresql_update.capabilities,
                 *routine_precheck.capabilities,
@@ -1229,8 +1250,12 @@ class EmbeddedAgent:
                 item.executor_id
                 for item in (
                     *catalog.capabilities,
-                    *sqlite.capabilities,
-                    *postgresql.capabilities,
+                    *relational_query.capabilities,
+                    *(
+                        relational_export.capabilities
+                        if relational_export is not None
+                        else ()
+                    ),
                     *postgresql_preview.capabilities,
                     *postgresql_update.capabilities,
                     *routine_precheck.capabilities,
@@ -1239,8 +1264,12 @@ class EmbeddedAgent:
             ),
             tool_views=(
                 *catalog.tool_views,
-                *sqlite.tool_views,
-                *postgresql.tool_views,
+                *relational_query.tool_views,
+                *(
+                    relational_export.tool_views
+                    if relational_export is not None
+                    else ()
+                ),
                 *postgresql_preview.tool_views,
                 *postgresql_update.tool_views,
                 *(local_files.tool_views if local_files is not None else ()),
@@ -1292,6 +1321,7 @@ class EmbeddedAgent:
             data_declarations,
             data_view,
             learning_candidate_guard,
+            relational_export_available=relational_export is not None,
             workspace_id=(
                 None if workspace_backend is None else workspace_backend.workspace_id
             ),
@@ -1327,7 +1357,6 @@ class EmbeddedAgent:
                 workspace_backend,
                 learning_candidate_guard,
                 clock=clock,
-                files_only_run_ids=files_only_run_ids,
             )
         )
         job_domain = JobCapabilityDomain(job_declaration_bundle, job_owner)
@@ -1367,8 +1396,8 @@ class EmbeddedAgent:
         )
         base_executors = (
             *catalog.executors,
-            *sqlite.executors,
-            *postgresql.executors,
+            *relational_query.executors,
+            *(relational_export.executors if relational_export is not None else ()),
             *postgresql_preview.executors,
             *postgresql_update.executors,
             *routine_precheck.executors,
@@ -1498,6 +1527,7 @@ class EmbeddedAgent:
                 memory=memory_store,
                 skills=skill_store,
                 semantics=store,
+                explicit_learning_requested=semantic_domain.explicit_learning_requested,
                 artifact_destinations=(
                     artifact_delivery if artifacts is not None else None
                 ),
@@ -1650,6 +1680,7 @@ class EmbeddedAgent:
             run_lock=run_lock,
             model_profile=model_profile,
             model_route=model_route,
+            owned_model_provider=owned_model_provider,
             limits=limits,
             secret_provider=secret_provider,
             keychain=keychain,
@@ -2836,11 +2867,21 @@ class EmbeddedAgent:
                 self.model_route,
                 secret_provider=self._secret_provider or self._keychain,
             )
-            return await self._candidate_reviewer.review_with_model(
-                model=model,
-                profile=profile,
-                max_estimated_cost_usd=max_estimated_cost_usd,
-            )
+            try:
+                result = await self._candidate_reviewer.review_with_model(
+                    model=model,
+                    profile=profile,
+                    max_estimated_cost_usd=max_estimated_cost_usd,
+                )
+            except BaseException:
+                try:
+                    await model.close()
+                except BaseException:
+                    pass
+                raise
+            else:
+                await model.close()
+                return result
 
     async def list_learning_candidates(
         self,
@@ -4137,6 +4178,14 @@ class EmbeddedAgent:
         async with self._run_lock:
             async with self._mutation_lock:
                 pass
+        owned_model_provider = self._owned_model_provider
+        self._owned_model_provider = None
+        if owned_model_provider is not None:
+            try:
+                await owned_model_provider.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
         activated_bindings = tuple(self._mcp_activated_bindings.values())
         self._mcp_activated_bindings.clear()
         for activated in activated_bindings:
@@ -4306,7 +4355,7 @@ def _candidate_reviewer_from_route(
     route: ModelRoute,
     *,
     secret_provider: SecretProvider | None,
-) -> tuple[ModelProvider, ModelProfile]:
+) -> tuple[ManagedModelProvider, ModelProfile]:
     """Derive one bounded, direct reviewer from the persisted primary route."""
 
     primary = route.candidates[0]
@@ -4742,12 +4791,14 @@ async def _validate_model_route(
         for candidate in route.candidates
     )
     validation_route = ModelRoute(validation_candidates, route.retry_policy)
-    if injected_provider is None:
+    owns_provider = injected_provider is None
+    if owns_provider:
         provider = create_model_route_provider(
             validation_route,
             secret_provider=secret_provider,
         )
     else:
+        assert injected_provider is not None
         if len(validation_candidates) != 1:
             raise AgentNotConfiguredError(
                 "an injected validation provider requires one route candidate"
@@ -4767,6 +4818,23 @@ async def _validate_model_route(
             ),
             retry_policy=validation_route.retry_policy,
         )
+    try:
+        await _require_validated_model_provider(provider)
+    except BaseException:
+        if owns_provider:
+            assert isinstance(provider, ManagedModelProvider)
+            try:
+                await provider.close()
+            except BaseException:
+                pass
+        raise
+    else:
+        if owns_provider:
+            assert isinstance(provider, ManagedModelProvider)
+            await provider.close()
+
+
+async def _require_validated_model_provider(provider: ModelProvider) -> None:
     response = await provider.generate(
         ModelRequest(
             messages=(

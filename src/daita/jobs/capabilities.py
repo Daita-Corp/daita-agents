@@ -304,7 +304,7 @@ class JobCapabilityDomain:
 def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
     list_capability = Capability(
         id=JOB_LIST_CAPABILITY_ID,
-        description="List bounded jobs owned by this agent.",
+        description="List bounded jobs and past profiles owned by this agent.",
         input_schema={
             "type": "object",
             "properties": {
@@ -338,7 +338,9 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
     )
     result_capability = Capability(
         id=JOB_READ_RESULTS_CAPABILITY_ID,
-        description="Read the bounded validated result of one successful durable job.",
+        description=(
+            "Read a successful job's bounded validated stored result and artifact references."
+        ),
         input_schema=_job_id_schema(),
         output_kind="job.result",
         output_schema=_object_output_schema(),
@@ -371,9 +373,9 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
     )
     summaries = {
         JOB_LIST_CAPABILITY_ID: (
-            "List durable jobs owned by this agent.",
-            "Use for job inventory or when the exact job ID is unknown.",
-            ("job", "list", "status"),
+            "List this agent's jobs.",
+            "Find prior profiles or an unknown job ID.",
+            ("job", "list", "status", "profile"),
         ),
         JOB_INSPECT_CAPABILITY_ID: (
             "Inspect one durable job lifecycle.",
@@ -382,8 +384,8 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
         ),
         JOB_READ_RESULTS_CAPABILITY_ID: (
             "Read one successful durable job result.",
-            "Use first when a known job ID needs its validated result references.",
-            ("job", "result", "artifact"),
+            "Use first for a known job ID's stored result, not a fresh recomputation.",
+            ("job", "result", "artifact", "profile", "previous"),
         ),
         JOB_CANCEL_CAPABILITY_ID: (
             "Cancel one exact durable job.",

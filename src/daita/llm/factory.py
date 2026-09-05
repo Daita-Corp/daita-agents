@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import cast
 
 from ..security import (
     KeychainStore,
@@ -11,9 +13,11 @@ from ..security import (
     SecretResolutionError,
     default_secret_provider,
 )
+from ._lifecycle import await_cleanup, closing_stream
 from .errors import ModelProviderError, ProviderErrorCode
 from .models import ModelRequest, ModelResponse, ModelStreamEvent
 from .protocols import (
+    ManagedModelProvider,
     ModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
@@ -48,7 +52,7 @@ def create_llm_provider(
     credential_updater: Callable[[str], Awaitable[None]] | None = None,
     base_url: str | None = None,
     max_output_tokens: int = 1_024,
-) -> ModelProvider:
+) -> ManagedModelProvider:
     provider_name, separator, model = model_id.partition(":")
     if not separator or not _PROVIDER.fullmatch(provider_name) or not model:
         raise ValueError("model_id must use provider:model form")
@@ -138,6 +142,7 @@ class _LazyProvider:
         self._candidate = candidate
         self._secrets = secrets
         self._provider: ModelProvider | None = None
+        self._close_task: asyncio.Task[None] | None = None
 
     @property
     def provider_id(self) -> str:
@@ -190,10 +195,17 @@ class _LazyProvider:
                 "configured provider route does not support streaming",
                 provider_id=self.provider_id,
             )
-        async for event in provider.stream(request):
-            yield event
+        async with closing_stream(provider.stream(request)) as events:
+            async for event in events:
+                yield event
 
     async def _resolve(self, request: ModelRequest) -> ModelProvider:
+        if self._close_task is not None:
+            raise ModelProviderError(
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                "configured provider route is closed",
+                provider_id=self.provider_id,
+            )
         if not self.supports_request_policy(request):
             raise ModelProviderError(
                 ProviderErrorCode.INVALID_REQUEST,
@@ -226,17 +238,41 @@ class _LazyProvider:
                     await self._secrets.set(reference, value)
 
                 credential_updater = update_credential
-            self._provider = create_llm_provider(
-                self._candidate.provider_id,
-                api_key=(credential if provider_name != "codex" else None),
-                subscription_credential=(
-                    credential if provider_name == "codex" else None
-                ),
-                credential_updater=credential_updater,
-                base_url=self._candidate.base_url,
-                max_output_tokens=self._candidate.profile.max_output_tokens,
-            )
+            # Secret resolution yields: another caller may have initialized or
+            # closed this owner while it was suspended. Never replace a live
+            # delegate or activate a new one after shutdown starts.
+            if self._close_task is not None:
+                raise ModelProviderError(
+                    ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                    "configured provider route is closed",
+                    provider_id=self.provider_id,
+                )
+            if self._provider is None:
+                self._provider = create_llm_provider(
+                    self._candidate.provider_id,
+                    api_key=(credential if provider_name != "codex" else None),
+                    subscription_credential=(
+                        credential if provider_name == "codex" else None
+                    ),
+                    credential_updater=credential_updater,
+                    base_url=self._candidate.base_url,
+                    max_output_tokens=self._candidate.profile.max_output_tokens,
+                )
         return self._provider
+
+    async def close(self) -> None:
+        """Join once-only cleanup without activating unused delegates."""
+
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._finish_close())
+        await await_cleanup(self._close_task)
+
+    async def _finish_close(self) -> None:
+        provider = self._provider
+        if provider is not None:
+            assert isinstance(provider, ManagedModelProvider)
+            await provider.close()
+        self._provider = None
 
 
 def _secret_provider_error_code(
@@ -253,7 +289,7 @@ def create_model_route_provider(
     route: ModelRoute,
     *,
     secret_provider: SecretProvider | None = None,
-) -> ModelProvider:
+) -> ManagedModelProvider:
     if not isinstance(route, ModelRoute):
         raise TypeError("route must be ModelRoute")
     secrets = default_secret_provider(secret_provider)
@@ -262,11 +298,12 @@ def create_model_route_provider(
             provider=_LazyProvider(candidate, secrets),
             profile=candidate.profile,
             allowed_sensitivities=candidate.allowed_sensitivities,
+            close_with_router=True,
         )
         for candidate in route.candidates
     )
     if len(registrations) == 1 and route.retry_policy.attempts == 1:
-        return registrations[0].provider
+        return cast(ManagedModelProvider, registrations[0].provider)
     return ModelRouter(registrations, retry_policy=route.retry_policy)
 
 

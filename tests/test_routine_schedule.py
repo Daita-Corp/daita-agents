@@ -112,6 +112,7 @@ def test_weekly_calendar_keeps_local_wall_clock_across_dst() -> None:
         not_before=_utc("2026-03-01T00:00:00+00:00"),
         expires_at=_utc("2026-04-01T00:00:00+00:00"),
     )
+    assert before is not None
     assert before == _utc("2026-03-05T14:00:00+00:00")
     assert next_slot(
         schedule,
@@ -203,6 +204,7 @@ def test_pause_resume_and_schedule_revision_choose_future_identity() -> None:
         after=_utc("2026-08-27T04:30:00+00:00"),
         expires_at=_utc("2026-08-28T00:00:00+00:00"),
     )
+    assert resumed is not None
     assert resumed == _utc("2026-08-27T05:00:00+00:00")
     old = scheduled_slot_key("routine-1", 1, resumed)
     revised = scheduled_slot_key("routine-1", 2, resumed)

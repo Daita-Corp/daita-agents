@@ -155,14 +155,14 @@ async def test_paraphrased_immediate_reads_do_not_create_jobs(
         assert_completed(capture)
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
         names = logical_names(capture.transcript)
-        assert "data_query_sqlite" in names
+        assert "data_query" in names
         assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
         assert capture.result.final_text is not None
         assert IMMEDIATE_TOKEN in capture.result.final_text
         assert str(IMMEDIATE_AMOUNT) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize(
@@ -192,7 +192,7 @@ async def test_paraphrased_background_requests_admit_one_exact_job(
         assert_on_demand_invocation(capture, "start_data_profile")
         names = logical_names(capture.transcript)
         assert not (LIFECYCLE_TOOLS & set(names))
-        assert "data_query_sqlite" not in names
+        assert "data_query" not in names
         job_id = job_id_from_start(capture.transcript)
         jobs = await fixture.agent.list_jobs()
         assert len(jobs) == 1 and jobs[0].job_id == job_id
@@ -203,7 +203,7 @@ async def test_paraphrased_background_requests_admit_one_exact_job(
         )
         await assert_profile_result(fixture.agent, job_id)
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize(
@@ -235,7 +235,7 @@ async def test_paraphrased_status_questions_are_agent_scoped_and_direct(
         direct_names = {tool.name for tool in capture.requests[0].tools}
         assert "job_list" in direct_names
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize(
@@ -262,7 +262,7 @@ async def test_paraphrased_result_questions_recover_exact_artifacts(
         assert "job_list" in names
         assert "job_read_results" in names
         assert "artifact_read" in names
-        assert "data_query_sqlite" not in names
+        assert "data_query" not in names
         assert "toolbox_search" not in names
         assert "toolbox_load" not in names
         result_reads = results_for(capture.transcript, "job_read_results")
@@ -278,7 +278,7 @@ async def test_paraphrased_result_questions_recover_exact_artifacts(
         assert str(PROFILE_SAMPLE_ROWS) in capture.result.final_text
         assert str(PROFILE_NULL_VALUES) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize(
@@ -341,7 +341,7 @@ async def test_paraphrased_cancellation_targets_one_running_job(
         assert await fixture.agent.read_job_result(job_id) is None
     finally:
         release.set()
-        await fixture.agent.close()
+        await fixture.close()
 
 
 def test_paraphrase_case_inventory_is_bounded_and_nonduplicative() -> None:

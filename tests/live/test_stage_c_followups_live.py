@@ -46,6 +46,7 @@ from daita.jobs.capabilities import (
     JOB_INSPECT_CAPABILITY_ID,
     JOB_READ_RESULTS_CAPABILITY_ID,
 )
+from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -63,7 +64,7 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
-    ModelProvider,
+    ManagedModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
@@ -114,7 +115,7 @@ pytestmark = [
 class _RecordingProvider:
     """Capture canonical requests and responses around one real provider."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.responses: list[ModelResponse] = []
@@ -139,10 +140,14 @@ class _RecordingProvider:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live delegate must support canonical streaming")
         self.requests.append(request)
-        async for event in self._delegate.stream(request):
-            if isinstance(event, ModelStreamCompleted):
-                self.responses.append(event.response)
-            yield event
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                if isinstance(event, ModelStreamCompleted):
+                    self.responses.append(event.response)
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 class _UnavailableStreamingProvider:
@@ -436,7 +441,10 @@ async def _seed_terminal_job(
         assert result is not None
         assert result.summary["sampled_rows"] == _PROFILE_ROWS
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
     return root, source_id, job_id
 
 
@@ -556,7 +564,10 @@ async def test_live_model_runs_stage_b_start_through_stage_c_inbox(
         assert acknowledged.state is DeliveryState.ACKNOWLEDGED
         assert 2 <= len(provider.requests) <= 24
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
 
 async def test_live_terminal_run_is_finalized_after_reopen_without_reasoning_again(
@@ -617,7 +628,10 @@ async def test_live_terminal_run_is_finalized_after_reopen_without_reasoning_aga
             assert 2 <= live_request_count <= 12
             assert await agent.inbox() == ()
         finally:
-            await agent.close()
+            try:
+                await agent.close()
+            finally:
+                await provider.close()
 
     recovery = MockModelProvider((), complete_pricing=True)
     agent = await Agent.open(
@@ -702,7 +716,10 @@ async def test_live_failed_terminal_job_is_reported_without_inventing_a_result(
         )
         assert len(provider.requests) >= 2
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await provider.close()
 
 
 async def test_live_followup_uses_sticky_fallback_and_delivers_exactly_once(
@@ -748,7 +765,10 @@ async def test_live_followup_uses_sticky_fallback_and_delivers_exactly_once(
         assert followups[0].reserved_run_id == item.resulting_run_id
         assert followups[0].attempt_count == 1
     finally:
-        await agent.close()
+        try:
+            await agent.close()
+        finally:
+            await live.close()
 
 
 __all__ = []

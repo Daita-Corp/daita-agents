@@ -124,6 +124,7 @@ class DaitaApp(App[int]):
         root: str | Path | None = None,
         workspace: LocalWorkspace,
         agent_name: str | None = None,
+        conversation_id: str | None = None,
         keychain: KeychainStore | None = None,
         model_validator: Any = None,
         reviewer_max_estimated_cost_usd: Decimal | None = None,
@@ -145,6 +146,7 @@ class DaitaApp(App[int]):
         self.controller.model = model
         self.controller.model_profile = model_profile
         self._requested_agent = agent_name
+        self._requested_conversation_id = conversation_id
         self._observer = RunObserver(self)
         self._run_task: asyncio.Task[None] | None = None
         self._pending_user_identity: str | None = None
@@ -251,6 +253,14 @@ class DaitaApp(App[int]):
         names = await self.controller.list_agents()
         if self._requested_agent:
             await self._open(self._requested_agent)
+            if self._requested_conversation_id is not None:
+                if not await self.controller.require_agent().conversation_exists(
+                    self._requested_conversation_id
+                ):
+                    raise ValueError("unknown conversation for requested agent")
+                self.controller.conversation_id = self._requested_conversation_id
+        elif self._requested_conversation_id is not None:
+            raise ValueError("conversation_id requires a requested agent")
         elif len(names) == 1:
             await self._open(names[0])
         elif names:
@@ -1166,9 +1176,9 @@ class DaitaApp(App[int]):
                 "file_query": "Querying workspace data",
                 "catalog_search": "Searching catalog",
                 "catalog_schema": "Reading catalog schema",
-                "data_query_sqlite": "Querying SQLite source",
-                "data_query_postgresql": "Querying PostgreSQL source",
+                "data_query": "Querying data source",
                 "artifact_create_document": "Creating document",
+                "artifact_create_tabular": "Creating findings table",
                 "artifact_edit_text": "Preparing workspace file edit",
                 "artifact_save_local": "Publishing local artifact",
             }.get(
@@ -1229,6 +1239,7 @@ async def run_daita_app(
     root: str | Path | None = None,
     workspace: LocalWorkspace,
     agent_name: str | None = None,
+    conversation_id: str | None = None,
     keychain: KeychainStore | None = None,
     model_validator: Any = None,
     reviewer_max_estimated_cost_usd: Decimal | None = None,
@@ -1237,6 +1248,7 @@ async def run_daita_app(
         root=root,
         workspace=workspace,
         agent_name=agent_name,
+        conversation_id=conversation_id,
         keychain=keychain,
         model_validator=model_validator,
         reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,

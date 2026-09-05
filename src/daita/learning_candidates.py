@@ -30,7 +30,11 @@ from .llm.models import (
     ToolResultBlock,
 )
 from .llm.pricing import CostEstimateStatus
-from .llm.protocols import ModelProvider, provider_has_complete_pricing
+from .llm.protocols import (
+    ManagedModelProvider,
+    ModelProvider,
+    provider_has_complete_pricing,
+)
 from .loop.models import ConversationRun, LoopExit, LoopExitKind, Transcript
 from .memory.store import (
     MEMORY_MAX_CHARACTERS,
@@ -809,6 +813,7 @@ class OneShotCandidateReviewer:
         skills: SkillStore,
         catalog: LearningCatalogReader,
         model: ModelProvider | None,
+        owned_model: ManagedModelProvider | None = None,
         profile: ModelProfile | None,
         max_estimated_cost_usd: Decimal | None,
         clock: Callable[[], datetime],
@@ -822,6 +827,8 @@ class OneShotCandidateReviewer:
             )
         if profile is not None and not isinstance(profile, ModelProfile):
             raise TypeError("candidate reviewer profile must be ModelProfile")
+        if owned_model is not None and owned_model is not model:
+            raise ValueError("owned reviewer model must be the configured model")
         if max_estimated_cost_usd is not None and (
             not isinstance(max_estimated_cost_usd, Decimal)
             or not max_estimated_cost_usd.is_finite()
@@ -836,6 +843,7 @@ class OneShotCandidateReviewer:
         self._skills = skills
         self._catalog = catalog
         self._model = model
+        self._owned_model = owned_model
         self._profile = profile
         self._max_estimated_cost_usd = max_estimated_cost_usd
         self._clock = clock
@@ -964,7 +972,10 @@ class OneShotCandidateReviewer:
 
         self._closed = True
         async with self._review_lock:
-            return None
+            owned_model = self._owned_model
+            if owned_model is not None:
+                await owned_model.close()
+                self._owned_model = None
 
     async def clear_conversations(self) -> int:
         """Clear transcript-derived records while excluding approved knowledge."""
@@ -2387,33 +2398,6 @@ def learning_candidate_content_from_mapping(
     return proposal.content
 
 
-def candidate_matches_successful_mutation(
-    candidate: LearningCandidate,
-    transcript: Transcript,
-) -> bool:
-    """Return whether the transcript contains one exact successful target mutation."""
-
-    if not isinstance(candidate, LearningCandidate):
-        raise TypeError("candidate matching requires LearningCandidate")
-    if not isinstance(transcript, Transcript):
-        raise TypeError("candidate matching requires Transcript")
-    calls: dict[str, ToolCall] = {}
-    for message in transcript.messages:
-        if message.role is MessageRole.ASSISTANT:
-            calls.update({call.id: call for call in message.tool_calls})
-        if message.role is not MessageRole.TOOL:
-            continue
-        for block in message.content:
-            if (
-                isinstance(block, ToolResultBlock)
-                and not block.is_error
-                and (call := calls.get(block.call_id)) is not None
-                and candidate_matches_mutation_call(candidate, call)
-            ):
-                return True
-    return False
-
-
 def candidate_matches_mutation_call(
     candidate: LearningCandidate,
     call: ToolCall,
@@ -2945,7 +2929,6 @@ __all__ = [
     "OneShotCandidateReviewer",
     "SemanticCandidateContent",
     "SkillCandidateContent",
-    "candidate_matches_successful_mutation",
     "candidate_matches_mutation_call",
     "learning_candidate_content_from_mapping",
     "learning_candidate_content_to_mapping",

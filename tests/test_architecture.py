@@ -406,8 +406,7 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
             resolved[name] = owner_id
 
         assert resolved["catalog_search"] == "data"
-        assert resolved["data_query_sqlite"] == "data"
-        assert resolved["data_query_postgresql"] == "data"
+        assert resolved["data_query"] == "data"
         assert resolved["file_search"] == "data"
         assert resolved["file_read"] == "data"
         assert resolved["file_query"] == "data"
@@ -416,6 +415,7 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["skill_view"] == "skills"
         assert resolved["semantic_list"] == "semantics"
         assert resolved["artifact_create_document"] == "artifacts"
+        assert resolved["artifact_create_tabular"] == "artifacts"
         assert resolved["start_data_profile"] == "data_profile_jobs"
         assert resolved["job_list"] == "jobs"
         assert resolved["routine_list"] == "routines"
@@ -554,6 +554,53 @@ def test_public_surface_is_focused():
         "create_llm_provider",
         "run_resident_host",
     }
+
+
+def test_confirmed_dead_error_and_learning_candidate_apis_do_not_return():
+    errors_tree = ast.parse((PACKAGE / "errors.py").read_text(encoding="utf-8"))
+    error_classes = {
+        node.name for node in errors_tree.body if isinstance(node, ast.ClassDef)
+    }
+    assert {
+        "SkillError",
+        "RetryableError",
+        "ValidationError",
+        "FocusDSLError",
+        "DataQualityError",
+    }.isdisjoint(error_classes)
+    daita_error = next(
+        node
+        for node in errors_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DaitaError"
+    )
+    daita_error_methods = {
+        node.name
+        for node in daita_error.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {
+        "retry_hint",
+        "is_transient",
+        "is_retryable",
+        "is_permanent",
+    }.isdisjoint(daita_error_methods)
+
+    learning_tree = ast.parse(
+        (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
+    )
+    learning_functions = {
+        node.name
+        for node in learning_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "candidate_matches_successful_mutation" not in learning_functions
+    assert {
+        "SkillError",
+        "RetryableError",
+        "ValidationError",
+        "FocusDSLError",
+        "DataQualityError",
+    }.isdisjoint(daita.__all__)
 
 
 def test_stage_b_has_one_job_aggregate_and_no_parallel_execution_system():
@@ -970,8 +1017,7 @@ def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only()
     assert "tools=()" in candidates
     assert "AgentLoop" not in candidates
     assert "CapabilityRuntime" not in candidates
-    assert "data_query_sqlite" not in candidates
-    assert "data_query_postgresql" not in candidates
+    assert "data_query" not in candidates
     assert "evaluation" not in storage.lower()
     assert "telemetry" not in storage.lower()
     assert "from .storage" not in evaluation
@@ -1502,6 +1548,43 @@ def test_textual_and_rich_stay_behind_the_interactive_entry_boundary():
         and node.name == "_load_textual_app"
         for node in tree.body
     )
+
+
+def test_cli_has_no_legacy_interactive_chat_controller():
+    tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
+    top_level_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    top_level_names.update(
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    )
+    assert {
+        "_SKILL_DESCRIPTION_PLACEHOLDER",
+        "_SKILL_INSTRUCTIONS_PLACEHOLDER",
+        "_BUILTIN_CHAT_COMMANDS",
+        "_SourceSummary",
+        "_source_lines",
+        "_resume_command",
+        "_write_sources",
+        "_write_resume",
+        "_ChatTotals",
+        "_write_startup",
+        "_write_help",
+        "_write_memory",
+        "_write_skills",
+        "_write_skill",
+        "_create_skill",
+        "_create_skill_wizard",
+        "_confirm_skill_deletion",
+        "_handle_knowledge_chat_command",
+        "_skill_invocation_message",
+    }.isdisjoint(top_level_names)
 
 
 def test_textual_presentation_has_one_owner_per_concern():
@@ -2142,28 +2225,29 @@ def test_exact_tabular_extends_existing_adapter_capability_and_renderer_owners()
         "_execute_exact_csv",
         "SQLITE_CSV_EXPORT_CAPABILITY_ID",
         "POSTGRESQL_CSV_EXPORT_CAPABILITY_ID",
+        "data_query_" + "sqlite",
+        "data_query_" + "postgresql",
+        "data_export_" + "sqlite",
+        "data_export_" + "postgresql",
     ):
         assert obsolete not in package_text
 
 
 def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
     from daita.domains.data.export_capabilities import (
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        artifact_capability_declarations,
+        DATA_EXPORT_TABULAR_CAPABILITY_ID,
+        data_export_tabular_capability_declarations,
     )
 
-    declarations = artifact_capability_declarations()
+    declarations = data_export_tabular_capability_declarations()
     for capability in declarations.capabilities:
-        if capability.id not in {
-            SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        }:
+        if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:
             continue
         properties = capability.input_schema["properties"]
         assert isinstance(properties, Mapping)
         assert set(properties) == {
             "source_id",
+            "resource_ids",
             "sql",
             "parameters",
             "format",

@@ -277,6 +277,7 @@ async def test_runtime_injects_catalog_scope_and_rejects_cross_source_query(
     )
     first_source = await agent.attach(SQLiteSource(first_path, name="First Source"))
     second_source = await agent.attach(SQLiteSource(second_path, name="Second Source"))
+    (second_resource,) = await agent.list_catalog_resources(source_id=second_source.id)
     provider._script = (
         ModelResponse(
             finish_reason=FinishReason.TOOL_CALLS,
@@ -293,9 +294,10 @@ async def test_runtime_injects_catalog_scope_and_rejects_cross_source_query(
             tool_calls=(
                 ToolCall(
                     id="cross-source",
-                    name="data_query_sqlite",
+                    name="data_query",
                     arguments={
                         "source_id": second_source.id,
+                        "resource_ids": (second_resource.id,),
                         "sql": "SELECT id FROM shared_second",
                     },
                 ),
@@ -349,6 +351,6 @@ async def test_selected_source_still_projects_source_independent_file_tools(
         await agent.run("What data and workspace files are available?")
 
         tool_names = {tool.name for tool in provider.requests[0].tools}
-        assert {"file_search", "file_read", "data_query_sqlite"} <= tool_names
+        assert {"file_search", "file_read", "data_query"} <= tool_names
     finally:
         await agent.close()

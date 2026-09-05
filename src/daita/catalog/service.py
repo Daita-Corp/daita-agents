@@ -42,6 +42,8 @@ from .models import (
     RelationshipProvenance,
     ResourceKind,
     SourceCatalogSnapshot,
+    TabularFacet,
+    catalog_facet_revision,
 )
 from .protocols import CatalogResourceNotFoundError, CatalogStore, CatalogStoreError
 
@@ -132,6 +134,26 @@ class _SourceCatalogIndex:
     postings_by_resource_id: Mapping[str, tuple[_IndexedPosting, ...]]
 
 
+def _decode_tabular_facet(facet: CatalogFacet) -> TabularFacet:
+    if facet.kind is not FacetKind.TABULAR:
+        raise CatalogStoreError("catalog facet is not tabular")
+    try:
+        decoded = TabularFacet.from_payload(facet.payload)
+        expected_revision = catalog_facet_revision(
+            FacetKind.TABULAR,
+            decoded.structural_payload(),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise CatalogStoreError(
+            "catalog tabular facet has invalid structure"
+        ) from error
+    if facet.revision != expected_revision:
+        raise CatalogStoreError(
+            "catalog tabular facet revision does not match its structure"
+        )
+    return decoded
+
+
 @dataclass(frozen=True, slots=True)
 class CatalogTabularResource:
     """Exact current catalog records needed for one validation schema."""
@@ -140,6 +162,7 @@ class CatalogTabularResource:
     resource: CatalogResource
     revision: CatalogResourceRevision
     facet: CatalogFacet
+    tabular: TabularFacet
 
     def __post_init__(self) -> None:
         if not isinstance(self.sync, CatalogSync):
@@ -152,6 +175,8 @@ class CatalogTabularResource:
             )
         if not isinstance(self.facet, CatalogFacet):
             raise TypeError("tabular resource facet must be a CatalogFacet")
+        if not isinstance(self.tabular, TabularFacet):
+            raise TypeError("tabular resource decoded facet must be a TabularFacet")
         if self.resource.kind not in {
             ResourceKind.TABLE,
             ResourceKind.VIEW,
@@ -160,6 +185,13 @@ class CatalogTabularResource:
             raise ValueError("tabular resource has a non-tabular resource kind")
         if self.facet.kind is not FacetKind.TABULAR:
             raise ValueError("tabular resource requires a tabular facet")
+        if self.facet.revision != catalog_facet_revision(
+            FacetKind.TABULAR,
+            self.tabular.structural_payload(),
+        ):
+            raise ValueError(
+                "tabular resource facet revision does not match decoded structure"
+            )
         if (
             self.resource.agent_id != self.sync.agent_id
             or self.resource.source_id != self.sync.source_id
@@ -353,6 +385,7 @@ class CatalogService:
                                 resource=resource,
                                 revision=revision,
                                 facet=tabular_facets[0],
+                                tabular=_decode_tabular_facet(tabular_facets[0]),
                             )
                         )
                     except (TypeError, ValueError) as exc:
@@ -2085,56 +2118,27 @@ class CatalogService:
                 False,
                 False,
             )
-        raw_columns = tabular.payload.get("columns", ())
-        raw_indexes = tabular.payload.get("indexes", ())
-        if not isinstance(raw_columns, tuple) or not isinstance(raw_indexes, tuple):
-            raise CatalogStoreError("catalog tabular facet has invalid structure")
-
+        decoded = _decode_tabular_facet(tabular)
         columns: list[dict[str, object]] = []
         primary_fields: list[tuple[int, str]] = []
-        for raw_column in raw_columns:
-            if not isinstance(raw_column, FrozenJsonObject):
-                raise CatalogStoreError("catalog tabular column has invalid structure")
-            name = raw_column.get("name")
-            native_type = raw_column.get("native_type")
-            nullable = raw_column.get("nullable")
-            if (
-                not isinstance(name, str)
-                or not isinstance(native_type, str)
-                or not isinstance(nullable, bool)
-            ):
-                raise CatalogStoreError("catalog tabular column is incomplete")
+        for column in decoded.columns:
             columns.append(
                 {
-                    "name": name,
-                    "nullable": nullable,
-                    "type": native_type,
+                    "name": column.name,
+                    "nullable": column.nullable,
+                    "type": column.native_type,
                 }
             )
-            primary_ordinal = raw_column.get("primary_key_ordinal")
-            if (
-                isinstance(primary_ordinal, int)
-                and not isinstance(primary_ordinal, bool)
-                and primary_ordinal > 0
-            ):
-                primary_fields.append((primary_ordinal, name))
+            if column.primary_key_ordinal is not None:
+                primary_fields.append((column.primary_key_ordinal, column.name))
         ordered_primary = tuple(
             name for _, name in sorted(primary_fields, key=lambda item: item)
         )
         unique_keys: set[tuple[str, ...]] = set()
-        for raw_index in raw_indexes:
-            if not isinstance(raw_index, FrozenJsonObject):
-                raise CatalogStoreError("catalog tabular index has invalid structure")
-            raw_fields = raw_index.get("columns")
-            if (
-                raw_index.get("unique") is not True
-                or raw_index.get("predicate") is not None
-                or not isinstance(raw_fields, tuple)
-                or not raw_fields
-                or any(not isinstance(field, str) for field in raw_fields)
-            ):
+        for index in decoded.indexes:
+            if not index.unique or index.predicate is not None:
                 continue
-            fields = tuple(field for field in raw_fields if isinstance(field, str))
+            fields = index.columns
             if fields != ordered_primary:
                 unique_keys.add(fields)
         ordered_unique_keys = tuple(sorted(unique_keys))
@@ -2387,18 +2391,7 @@ def _tabular_field_names(facets: tuple[CatalogFacet, ...]) -> frozenset[str]:
     )
     if tabular is None:
         return frozenset()
-    raw_columns = tabular.payload.get("columns", ())
-    if not isinstance(raw_columns, tuple):
-        raise CatalogStoreError("catalog tabular facet has invalid structure")
-    fields: set[str] = set()
-    for raw_column in raw_columns:
-        if not isinstance(raw_column, FrozenJsonObject):
-            raise CatalogStoreError("catalog tabular column has invalid structure")
-        name = raw_column.get("name")
-        if not isinstance(name, str) or not name:
-            raise CatalogStoreError("catalog tabular column is incomplete")
-        fields.add(name)
-    return frozenset(fields)
+    return frozenset(column.name for column in _decode_tabular_facet(tabular).columns)
 
 
 def _ordered_schema_unresolved_reasons(
@@ -2503,36 +2496,16 @@ def _compile_source_index(snapshot: SourceCatalogSnapshot) -> _SourceCatalogInde
         ):
             if facet.kind is not FacetKind.TABULAR:
                 continue
-            raw_columns = facet.payload.get("columns", ())
-            raw_indexes = facet.payload.get("indexes", ())
-            if not isinstance(raw_columns, tuple) or not isinstance(
-                raw_indexes,
-                tuple,
-            ):
-                raise CatalogStoreError("catalog tabular facet has invalid structure")
-            for raw_column in raw_columns:
-                if not isinstance(raw_column, FrozenJsonObject):
-                    raise CatalogStoreError(
-                        "catalog tabular column has invalid structure"
-                    )
-                name = raw_column.get("name")
-                if not isinstance(name, str) or not name:
-                    raise CatalogStoreError("catalog tabular column is incomplete")
-                add_posting(resource.id, "column", f"column:{name}", name)
-            for raw_index in raw_indexes:
-                if not isinstance(raw_index, FrozenJsonObject):
-                    raise CatalogStoreError(
-                        "catalog tabular index has invalid structure"
-                    )
-                raw_fields = raw_index.get("columns")
-                if not isinstance(raw_fields, tuple) or any(
-                    not isinstance(field, str) or not field for field in raw_fields
-                ):
-                    raise CatalogStoreError(
-                        "catalog tabular index fields have invalid structure"
-                    )
-                for field in raw_fields:
-                    assert isinstance(field, str)
+            tabular = _decode_tabular_facet(facet)
+            for column in tabular.columns:
+                add_posting(
+                    resource.id,
+                    "column",
+                    f"column:{column.name}",
+                    column.name,
+                )
+            for index in tabular.indexes:
+                for field in index.columns:
                     add_posting(
                         resource.id,
                         "index_field",

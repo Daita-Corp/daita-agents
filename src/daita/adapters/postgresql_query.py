@@ -500,6 +500,7 @@ class PostgreSQLQueryBackend:
             )
         return ExactTabularExportResult(
             format=format_name,
+            adapter_id="postgresql",
             source_id=source_id,
             source_revision=validation.source_revision,
             sql_fingerprint=validation.analysis.sql_fingerprint,

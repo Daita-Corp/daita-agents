@@ -73,6 +73,8 @@ from daita.tui.clipboard import (
     osc52_sequence,
 )
 from daita.tui.commands import (
+    BUILTIN_SLASH_COMMAND_ROOTS,
+    BUILTIN_SLASH_COMMANDS,
     SLASH_COMMAND_COMPLETIONS,
     learning_invocation_message,
     parse_postgresql_connection_url,
@@ -145,6 +147,16 @@ def test_source_override_and_learning_parse():
     assert parse_source_override("hello") is None
     assert parse_source_override("@sales how many") == ("sales", "how many")
     assert parse_source_override('@"north west" total') == ("north west", "total")
+
+
+def test_every_advertised_slash_root_is_the_recognized_builtin_set():
+    advertised_roots = frozenset(
+        display.split(maxsplit=1)[0]
+        for _insertion, display, _description in SLASH_COMMAND_COMPLETIONS
+    )
+
+    assert BUILTIN_SLASH_COMMAND_ROOTS == advertised_roots
+    assert BUILTIN_SLASH_COMMANDS == advertised_roots
 
 
 async def test_routines_command_opens_records_and_routes_create_through_agent_loop():
@@ -313,7 +325,15 @@ def test_tool_projection_and_approval_document():
     assert CAPABILITY_LABELS["artifact_edit_text"] == "Prepare workspace edit"
     assert CAPABILITY_LABELS["artifact_save_local"] == "Save artifact locally"
     details = project_tool_details(
-        ToolCall(id="c1", name="data_query_sqlite", arguments={"sql": "SELECT 1"}),
+        ToolCall(
+            id="c1",
+            name="data_query",
+            arguments={
+                "source_id": "source-1",
+                "resource_ids": ("resource-1",),
+                "sql": "SELECT 1",
+            },
+        ),
         ToolResultBlock(
             call_id="c1",
             output={
@@ -660,8 +680,8 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                 conversation_id="conversation-live",
                 data=FrozenJsonObject.from_mapping(
                     {
-                        "tool_name": "data_query_postgresql",
-                        "capability_id": "data.postgresql.query",
+                        "tool_name": "data_query",
+                        "capability_id": "data.query",
                         "call_id": "call-live",
                         "duration_ms": 10,
                         "is_error": False,

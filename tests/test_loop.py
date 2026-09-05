@@ -916,7 +916,17 @@ async def test_stream_failure_and_cancellation_never_persist_partial_text():
         MessageRole.USER,
     )
 
-    cancelled_provider = MockStreamingModelProvider(
+    stream_closed = asyncio.Event()
+
+    class ClosingStreamingProvider(MockStreamingModelProvider):
+        async def stream(self, request):
+            try:
+                async for event in super().stream(request):
+                    yield event
+            finally:
+                stream_closed.set()
+
+    cancelled_provider = ClosingStreamingProvider(
         ((*(ModelTextDelta(str(index)) for index in range(5_000)),),)
     )
     cancelled_store = InMemoryTranscriptStore()
@@ -953,6 +963,7 @@ async def test_stream_failure_and_cancellation_never_persist_partial_text():
         pass
     else:
         raise AssertionError("streaming run should propagate cancellation")
+    assert stream_closed.is_set()
 
     cancelled_transcript = await cancelled_store.load("run-stream-cancelled")
     assert tuple(message.role for message in cancelled_transcript.messages) == (

@@ -1526,9 +1526,17 @@ def semantic_declarations(
                         toolbox_id=ToolboxId.KNOWLEDGE,
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
-                        summary="Create or supersede one evidence-bound semantic annotation.",
-                        when_to_use="Use only for validated current resource or field meaning.",
-                        keywords=("semantic", "meaning", "annotation", "save"),
+                        summary="Save one evidence-bound business metric or field definition.",
+                        when_to_use="Use to remember validated resource meaning after exact approval.",
+                        keywords=(
+                            "semantic",
+                            "meaning",
+                            "annotation",
+                            "save",
+                            "metric",
+                            "definition",
+                            "remember",
+                        ),
                     ),
                     ToolPresentation(
                         toolbox_id=ToolboxId.KNOWLEDGE,
@@ -1631,6 +1639,11 @@ class SemanticCapabilityDomain:
     def clear_explicit_learning_run(self, run_id: str) -> None:
         self._explicit_learning_runs.discard(run_id)
 
+    def explicit_learning_requested(self, run_id: str) -> bool:
+        """Read the existing host-owned selection without deriving intent from text."""
+
+        return run_id in self._explicit_learning_runs
+
     async def validate_annotation(
         self,
         agent_id: str,
@@ -1651,7 +1664,7 @@ class SemanticCapabilityDomain:
         )
         if not facts:
             return ()
-        requested = run.id in self._explicit_learning_runs
+        requested = self.explicit_learning_requested(run.id)
         if not requested:
             requested = await self._maintenance_requested(run)
         selected_tool = self._learning.selected_mutation_tool(run.id)
@@ -2134,8 +2147,7 @@ class SemanticCapabilityDomain:
                 or result.is_error
                 or result.output.get("kind")
                 not in {
-                    "data.sqlite.query_result",
-                    "data.postgresql.query_result",
+                    "data.query_result",
                 }
             ):
                 return (

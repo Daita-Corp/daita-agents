@@ -28,15 +28,19 @@ results are untrusted data and never create authorization.
   remain independently enforced.
 - One run catalog admits at most 512 applicable tools and 2 MiB of canonical
   catalog material. Its canonical toolbox manifest is separately bounded to
-  five entries, 8 KiB, and 2,000 estimated tokens.
+  six entries, 8 KiB, and 2,000 estimated tokens.
 - Pinned tools are selected exactly, never by priority: at most 32 pinned
   definitions and 96 KiB of pinned definition material may enter the initial
   provider surface. A step may contain at most 16 loaded tools, 96 KiB of
   loaded definition material, and 50 definitions or 128 KiB overall.
-- On-demand tools are reached through fixed `toolbox_search` and
-  `toolbox_load` controls, followed on the next model step by ordinary exact
-  tool invocation. Every applicable tool remains present exactly once in the
-  frozen run catalog; a verified load receipt replaces the prior loaded set.
+- Discover on-demand tools with `toolbox_search` using a natural-language
+  `query` and optional bounded `limit`. Search spans applicable toolboxes;
+  access modes and operational effects are enforced internally, not selected
+  as search filters. Load exact names with `toolbox_load`, then invoke them
+  normally on the next model step. Known exact names can be loaded directly
+  without searching. Every applicable tool remains present exactly once in
+  the frozen run catalog; a verified load receipt replaces the prior loaded
+  set. Search and load grant no authority and perform no remote tool calls.
 
 Stdio, OAuth, dynamic client registration, sampling, roots, prompts,
 resources, subscriptions, server-initiated requests, binary content, arbitrary

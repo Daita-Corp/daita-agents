@@ -178,7 +178,7 @@ class FreshQueryTools:
         self._projection = ContextToolProjectionAdapter(
             (
                 ToolDefinition(
-                    name="data_query_postgresql",
+                    name="data_query",
                     description="Run a fresh read-only PostgreSQL query.",
                     input_schema={"type": "object"},
                 ),
@@ -199,7 +199,7 @@ class FreshQueryTools:
                 ToolResultBlock(
                     call_id=call.id,
                     output={
-                        "kind": "data.postgresql.query_result",
+                        "kind": "data.query_result",
                         "data": {
                             "columns": ["segment", "paid_revenue"],
                             "rows": [{"segment": "enterprise", "paid_revenue": 321}],
@@ -355,9 +355,10 @@ def _analytical_conversation_record(
     )
     query_call = ToolCall(
         id="query-native-call",
-        name="data_query_postgresql",
+        name="data_query",
         arguments={
             "source_id": "warehouse",
+            "resource_ids": ("warehouse:captured_payments",),
             "sql": (
                 "SELECT region, "
                 "SUM(quantity * merchandise_unit_price) AS paid_revenue, "
@@ -418,7 +419,7 @@ def _analytical_conversation_record(
                 ToolResultBlock(
                     call_id=query_call.id,
                     output={
-                        "kind": "data.postgresql.query_result",
+                        "kind": "data.query_result",
                         "data": {
                             "columns": [
                                 "region",
@@ -897,12 +898,12 @@ async def test_oversized_analytical_history_keeps_compact_contract_and_requeries
         if isinstance(block, ToolResultBlock)
     ]
     assert len(historical_calls) == len(historical_results) == 1
-    assert historical_calls[0].name == "data_query_postgresql"
+    assert historical_calls[0].name == "data_query"
     assert historical_calls[0].id.startswith("hist_")
     assert historical_calls[0].provider_call_id is None
     assert historical_results[0].call_id == historical_calls[0].id
     receipt = historical_results[0].output
-    assert receipt["kind"] == "data.postgresql.query_result"
+    assert receipt["kind"] == "data.query_result"
     assert receipt["historical_projection"] == "continuity"
     assert receipt["state"] == "success"
     data = receipt["data"]
@@ -977,9 +978,10 @@ async def test_oversized_analytical_history_keeps_compact_contract_and_requeries
                 tool_calls=(
                     ToolCall(
                         id="fresh-enterprise-query",
-                        name="data_query_postgresql",
+                        name="data_query",
                         arguments={
                             "source_id": "warehouse",
+                            "resource_ids": ("warehouse:captured_payments",),
                             "sql": (
                                 "SELECT customer_segment, region, "
                                 "SUM(net_merchandise_revenue) AS paid_revenue "
@@ -1091,9 +1093,10 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
     )
     query_call = ToolCall(
         id="query-error-call",
-        name="data_query_sqlite",
+        name="data_query",
         arguments={
             "source_id": "local-db",
+            "resource_ids": ("local-db:customers",),
             "sql": "SELECT region, COUNT(*) FROM customers GROUP BY region",
         },
     )
@@ -1168,7 +1171,7 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
     ]
     assert [call.name for call in calls] == [
         "file_read",
-        "data_query_sqlite",
+        "data_query",
     ]
     assert [result.call_id for result in results] == [call.id for call in calls]
     file_receipt = results[0].output
@@ -1183,7 +1186,7 @@ def test_compact_file_and_sql_error_receipts_keep_shape_state_and_order():
     assert "binding" not in file_data
     assert "cursor" not in file_data
     error_receipt = results[1].output
-    assert error_receipt["kind"] == "data.sqlite.query_result"
+    assert error_receipt["kind"] == "data.query_result"
     assert error_receipt["state"] == "error"
     projected_error = error_receipt["error"]
     assert isinstance(projected_error, Mapping)

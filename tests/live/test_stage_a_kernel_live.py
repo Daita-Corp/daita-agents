@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import sqlite3
 from collections.abc import AsyncIterator, Mapping
+from contextlib import AsyncExitStack
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -19,6 +20,7 @@ from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
+from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -35,7 +37,7 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
-    ModelProvider,
+    ManagedModelProvider,
     StreamingModelProvider,
     provider_has_complete_pricing,
 )
@@ -81,7 +83,7 @@ pytestmark = [
 class _RecordingProvider:
     """Capture canonical requests and responses around one real provider."""
 
-    def __init__(self, delegate: ModelProvider) -> None:
+    def __init__(self, delegate: ManagedModelProvider) -> None:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.responses: list[ModelResponse] = []
@@ -106,10 +108,14 @@ class _RecordingProvider:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live delegate must support canonical streaming")
         self.requests.append(request)
-        async for event in self._delegate.stream(request):
-            if isinstance(event, ModelStreamCompleted):
-                self.responses.append(event.response)
-            yield event
+        async with closing_stream(self._delegate.stream(request)) as events:
+            async for event in events:
+                if isinstance(event, ModelStreamCompleted):
+                    self.responses.append(event.response)
+                yield event
+
+    async def close(self) -> None:
+        await self._delegate.close()
 
 
 class _UnavailableStreamingProvider:
@@ -214,7 +220,7 @@ def _successful_query(
         call.id: call
         for message in transcript.messages
         for call in message.tool_calls
-        if call.name == "data_query_sqlite"
+        if call.name == "data_query"
     }
     results = {
         block.call_id: block
@@ -244,92 +250,94 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
     """Exercise a real tool turn, then validate the exact reopened run record."""
 
     profile, provider = _live_provider(max_output_tokens=1_024)
-    limits = _limits()
-    root = tmp_path / "round-trip-root"
-    database = tmp_path / "stage-a-round-trip.sqlite"
-    _database(database)
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(provider.close)
+        limits = _limits()
+        root = tmp_path / "round-trip-root"
+        database = tmp_path / "stage-a-round-trip.sqlite"
+        _database(database)
 
-    agent = await Agent.create(
-        "live-stage-a-round-trip",
-        root=root,
-        model=provider,
-        model_profile=profile,
-        limits=limits,
-        workspace=workspace_for(root),
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database, name="Stage A probe"))
-        result = await agent.run(_PROBE_PROMPT, source_id=source.id)
-        transcript = await agent.transcript(result.run_id)
-    finally:
-        await agent.close()
-
-    assert result.kind is LoopExitKind.COMPLETED, (
-        result.reason,
-        result.usage.cost_estimate.code,
-        len(provider.requests),
-    )
-    assert result.final_text is not None
-    assert _PROBE_TOKEN in result.final_text
-    assert "73" in result.final_text
-    validate_completed_transcript(transcript, result)
-
-    call, query_result = _successful_query(transcript)
-    assert _PROBE_TOKEN in canonical_json(query_result.output)
-    assert query_result.sensitivity is ModelSensitivity.INTERNAL
-    assert query_result.sensitivity_provenance["authority"] == (
-        "current_admitted_resource_scope"
-    )
-
-    assert len(provider.requests) >= 2
-    digests = {
-        request.sensitivity_provenance["static_context_sha256"]
-        for request in provider.requests
-    }
-    assert len(digests) == 1
-    assert all(
-        request.sensitivity is ModelSensitivity.INTERNAL
-        for request in provider.requests
-    )
-    assert all(
-        request.messages[0] == provider.requests[0].messages[0]
-        for request in provider.requests
-    )
-    assert all(
-        tuple(tool.name for tool in request.tools)
-        == tuple(tool.name for tool in provider.requests[0].tools)
-        for request in provider.requests
-    )
-    classified_call_ids: set[object] = set()
-    for request in provider.requests:
-        classified = request.sensitivity_provenance["classified_results"]
-        assert isinstance(classified, tuple)
-        classified_call_ids.update(
-            item["call_id"] for item in classified if isinstance(item, Mapping)
+        agent = await Agent.create(
+            "live-stage-a-round-trip",
+            root=root,
+            model=provider,
+            model_profile=profile,
+            limits=limits,
+            workspace=workspace_for(root),
         )
-    assert call.id in classified_call_ids
+        try:
+            source = await agent.attach(SQLiteSource(database, name="Stage A probe"))
+            result = await agent.run(_PROBE_PROMPT, source_id=source.id)
+            transcript = await agent.transcript(result.run_id)
+        finally:
+            await agent.close()
 
-    reopened = await Agent.open(
-        "live-stage-a-round-trip",
-        root=root,
-        model=provider,
-        model_profile=profile,
-        limits=limits,
-        workspace=workspace_for(root),
-    )
-    try:
-        reopened_transcript = await reopened.transcript(result.run_id)
-        conversation = await reopened.conversation_runs(result.conversation_id)
-    finally:
-        await reopened.close()
+        assert result.kind is LoopExitKind.COMPLETED, (
+            result.reason,
+            result.usage.cost_estimate.code,
+            len(provider.requests),
+        )
+        assert result.final_text is not None
+        assert _PROBE_TOKEN in result.final_text
+        assert "73" in result.final_text
+        validate_completed_transcript(transcript, result)
 
-    persisted = next(
-        item for item in conversation if item.transcript.run.id == result.run_id
-    )
-    assert persisted.result == result
-    assert reopened_transcript == transcript
-    assert persisted.result is not None
-    validate_completed_transcript(reopened_transcript, persisted.result)
+        call, query_result = _successful_query(transcript)
+        assert _PROBE_TOKEN in canonical_json(query_result.output)
+        assert query_result.sensitivity is ModelSensitivity.INTERNAL
+        assert query_result.sensitivity_provenance["authority"] == (
+            "current_admitted_resource_scope"
+        )
+
+        assert len(provider.requests) >= 2
+        digests = {
+            request.sensitivity_provenance["static_context_sha256"]
+            for request in provider.requests
+        }
+        assert len(digests) == 1
+        assert all(
+            request.sensitivity is ModelSensitivity.INTERNAL
+            for request in provider.requests
+        )
+        assert all(
+            request.messages[0] == provider.requests[0].messages[0]
+            for request in provider.requests
+        )
+        assert all(
+            tuple(tool.name for tool in request.tools)
+            == tuple(tool.name for tool in provider.requests[0].tools)
+            for request in provider.requests
+        )
+        classified_call_ids: set[object] = set()
+        for request in provider.requests:
+            classified = request.sensitivity_provenance["classified_results"]
+            assert isinstance(classified, tuple)
+            classified_call_ids.update(
+                item["call_id"] for item in classified if isinstance(item, Mapping)
+            )
+        assert call.id in classified_call_ids
+
+        reopened = await Agent.open(
+            "live-stage-a-round-trip",
+            root=root,
+            model=provider,
+            model_profile=profile,
+            limits=limits,
+            workspace=workspace_for(root),
+        )
+        try:
+            reopened_transcript = await reopened.transcript(result.run_id)
+            conversation = await reopened.conversation_runs(result.conversation_id)
+        finally:
+            await reopened.close()
+
+        persisted = next(
+            item for item in conversation if item.transcript.run.id == result.run_id
+        )
+        assert persisted.result == result
+        assert reopened_transcript == transcript
+        assert persisted.result is not None
+        validate_completed_transcript(reopened_transcript, persisted.result)
 
 
 async def test_live_output_exhaustion_never_becomes_normal_completion(
@@ -338,40 +346,42 @@ async def test_live_output_exhaustion_never_becomes_normal_completion(
     """Force a live provider output limit and require an explicit failed exit."""
 
     profile, provider = _live_provider(max_output_tokens=64)
-    agent = await Agent.create(
-        "live-stage-a-output-limit",
-        root=tmp_path / "output-limit-root",
-        model=provider,
-        model_profile=profile,
-        limits=_limits(),
-        workspace=workspace_for(tmp_path / "output-limit-root"),
-    )
-    try:
-        result = await agent.run(
-            "Do not call tools. Output exactly 800 numbered lines. Every line must "
-            "contain its number and the phrase STAGE_A_OUTPUT_LIMIT_PROBE. Do not "
-            "abbreviate, summarize, omit lines, or stop before line 800."
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(provider.close)
+        agent = await Agent.create(
+            "live-stage-a-output-limit",
+            root=tmp_path / "output-limit-root",
+            model=provider,
+            model_profile=profile,
+            limits=_limits(),
+            workspace=workspace_for(tmp_path / "output-limit-root"),
         )
-        transcript = await agent.transcript(result.run_id)
-    finally:
-        await agent.close()
+        try:
+            result = await agent.run(
+                "Do not call tools. Output exactly 800 numbered lines. Every line must "
+                "contain its number and the phrase STAGE_A_OUTPUT_LIMIT_PROBE. Do not "
+                "abbreviate, summarize, omit lines, or stop before line 800."
+            )
+            transcript = await agent.transcript(result.run_id)
+        finally:
+            await agent.close()
 
-    assert result.kind is LoopExitKind.FAILED, (
-        result.kind,
-        result.reason,
-        result.final_text,
-    )
-    assert result.reason in {
-        "model_output_limit",
-        ProviderErrorCode.OUTPUT_LIMIT.value,
-    }
-    assert result.final_text is None
-    assert provider.requests
-    assert all(
-        response.finish_reason is not FinishReason.STOP
-        for response in provider.responses
-    )
-    assert transcript.messages[0].content
+        assert result.kind is LoopExitKind.FAILED, (
+            result.kind,
+            result.reason,
+            result.final_text,
+        )
+        assert result.reason in {
+            "model_output_limit",
+            ProviderErrorCode.OUTPUT_LIMIT.value,
+        }
+        assert result.final_text is None
+        assert provider.requests
+        assert all(
+            response.finish_reason is not FinishReason.STOP
+            for response in provider.responses
+        )
+        assert transcript.messages[0].content
 
 
 async def test_live_fallback_provider_stays_sticky_through_tool_completion(
@@ -380,56 +390,58 @@ async def test_live_fallback_provider_stays_sticky_through_tool_completion(
     """Select a live fallback once and keep it for the later model request."""
 
     profile, live = _live_provider(max_output_tokens=1_024)
-    unavailable_profile = ModelProfile(
-        id="mock:stage-a-unavailable",
-        context_window_tokens=profile.context_window_tokens,
-        max_output_tokens=profile.max_output_tokens,
-        supports_tools=True,
-        supports_parallel_tools=profile.supports_parallel_tools,
-        supports_structured_output=profile.supports_structured_output,
-        supports_streaming=True,
-    )
-    unavailable = _UnavailableStreamingProvider(unavailable_profile)
-    router = ModelRouter(
-        (
-            ModelProviderRegistration(
-                provider=unavailable,
-                profile=unavailable_profile,
-                allowed_sensitivities=frozenset(ModelSensitivity),
+    async with AsyncExitStack() as resources:
+        resources.push_async_callback(live.close)
+        unavailable_profile = ModelProfile(
+            id="mock:stage-a-unavailable",
+            context_window_tokens=profile.context_window_tokens,
+            max_output_tokens=profile.max_output_tokens,
+            supports_tools=True,
+            supports_parallel_tools=profile.supports_parallel_tools,
+            supports_structured_output=profile.supports_structured_output,
+            supports_streaming=True,
+        )
+        unavailable = _UnavailableStreamingProvider(unavailable_profile)
+        router = ModelRouter(
+            (
+                ModelProviderRegistration(
+                    provider=unavailable,
+                    profile=unavailable_profile,
+                    allowed_sensitivities=frozenset(ModelSensitivity),
+                ),
+                ModelProviderRegistration(
+                    provider=live,
+                    profile=profile,
+                    allowed_sensitivities=frozenset(ModelSensitivity),
+                ),
             ),
-            ModelProviderRegistration(
-                provider=live,
-                profile=profile,
-                allowed_sensitivities=frozenset(ModelSensitivity),
-            ),
-        ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
-    )
-    database = tmp_path / "stage-a-fallback.sqlite"
-    _database(database)
+            retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        )
+        database = tmp_path / "stage-a-fallback.sqlite"
+        _database(database)
 
-    agent = await Agent.create(
-        "live-stage-a-fallback",
-        root=tmp_path / "fallback-root",
-        model=router,
-        model_profile=router.model_profile,
-        limits=_limits(),
-        workspace=workspace_for(tmp_path / "fallback-root"),
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database, name="Fallback probe"))
-        result = await agent.run(_PROBE_PROMPT, source_id=source.id)
-        transcript = await agent.transcript(result.run_id)
-    finally:
-        await agent.close()
+        agent = await Agent.create(
+            "live-stage-a-fallback",
+            root=tmp_path / "fallback-root",
+            model=router,
+            model_profile=router.model_profile,
+            limits=_limits(),
+            workspace=workspace_for(tmp_path / "fallback-root"),
+        )
+        try:
+            source = await agent.attach(SQLiteSource(database, name="Fallback probe"))
+            result = await agent.run(_PROBE_PROMPT, source_id=source.id)
+            transcript = await agent.transcript(result.run_id)
+        finally:
+            await agent.close()
 
-    assert result.kind is LoopExitKind.COMPLETED, (
-        result.reason,
-        result.usage.cost_estimate.code,
-        len(live.requests),
-    )
-    validate_completed_transcript(transcript, result)
-    _successful_query(transcript)
-    assert len(unavailable.requests) == 1
-    assert len(live.requests) >= 2
-    assert result.final_text is not None and _PROBE_TOKEN in result.final_text
+        assert result.kind is LoopExitKind.COMPLETED, (
+            result.reason,
+            result.usage.cost_estimate.code,
+            len(live.requests),
+        )
+        validate_completed_transcript(transcript, result)
+        _successful_query(transcript)
+        assert len(unavailable.requests) == 1
+        assert len(live.requests) >= 2
+        assert result.final_text is not None and _PROBE_TOKEN in result.final_text

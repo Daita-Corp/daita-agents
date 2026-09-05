@@ -68,14 +68,14 @@ async def test_model_certification_immediate_selection(
         assert_completed(capture)
         record_metrics(record_property, model_id, capture)
         names = logical_names(capture.transcript)
-        assert "data_query_sqlite" in names
+        assert "data_query" in names
         assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
         assert capture.result.final_text is not None
         assert IMMEDIATE_TOKEN in capture.result.final_text
         assert str(IMMEDIATE_AMOUNT) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS, ids=_MODEL_IDS)
@@ -101,7 +101,7 @@ async def test_model_certification_cross_conversation_result(
         assert "job_list" in names
         assert "job_read_results" in names
         assert "artifact_read" in names
-        assert "data_query_sqlite" not in names
+        assert "data_query" not in names
         assert "toolbox_search" not in names
         assert "toolbox_load" not in names
         result_reads = results_for(capture.transcript, "job_read_results")
@@ -111,7 +111,7 @@ async def test_model_certification_cross_conversation_result(
         assert str(PROFILE_SAMPLE_ROWS) in capture.result.final_text
         assert str(PROFILE_NULL_VALUES) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize("model_id", _MODEL_IDS, ids=_MODEL_IDS)
@@ -168,7 +168,7 @@ async def test_model_certification_start_and_cancel(
         assert terminal.summary.status is JobStatus.CANCELLED
     finally:
         release.set()
-        await fixture.agent.close()
+        await fixture.close()
 
 
 def test_model_matrix_configuration_is_bounded() -> None:

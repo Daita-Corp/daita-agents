@@ -42,11 +42,9 @@ from daita.artifacts.renderers import (
 )
 from daita.catalog.models import Sensitivity
 from daita.domains.data.export_capabilities import (
-    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-    POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-    SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-    SQLITE_TABULAR_EXPORT_TOOL_NAME,
-    artifact_capability_declarations,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    DATA_EXPORT_TABULAR_TOOL_NAME,
+    data_export_tabular_capability_declarations,
 )
 from daita.domains.data.sql import ResourceSchema
 from daita.llm.models import (
@@ -616,26 +614,16 @@ async def test_postgresql_backend_contract_revalidates_and_executes_once_without
     assert result.source_revision == source_revision
 
 
-def test_source_specific_csv_tool_schemas_cannot_accept_rows_bytes_or_provenance() -> (
-    None
-):
-    extension = artifact_capability_declarations()
+def test_semantic_csv_tool_schema_cannot_accept_rows_bytes_or_provenance() -> None:
+    extension = data_export_tabular_capability_declarations()
     views = {
         item.name: item
         for item in extension.tool_views
-        if item.name
-        in {SQLITE_TABULAR_EXPORT_TOOL_NAME, POSTGRESQL_TABULAR_EXPORT_TOOL_NAME}
+        if item.name == DATA_EXPORT_TABULAR_TOOL_NAME
     }
-    assert set(views) == {
-        SQLITE_TABULAR_EXPORT_TOOL_NAME,
-        POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-    }
+    assert set(views) == {DATA_EXPORT_TABULAR_TOOL_NAME}
     for name, expected_capability in (
-        (SQLITE_TABULAR_EXPORT_TOOL_NAME, SQLITE_TABULAR_EXPORT_CAPABILITY_ID),
-        (
-            POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-            POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        ),
+        (DATA_EXPORT_TABULAR_TOOL_NAME, DATA_EXPORT_TABULAR_CAPABILITY_ID),
     ):
         view = views[name]
         assert view.capability_id == expected_capability
@@ -646,6 +634,7 @@ def test_source_specific_csv_tool_schemas_cannot_accept_rows_bytes_or_provenance
         assert isinstance(properties, Mapping)
         assert set(properties) == {
             "source_id",
+            "resource_ids",
             "sql",
             "parameters",
             "format",
@@ -666,7 +655,7 @@ async def _sqlite_export_agent(
     downloads: Path,
     script: tuple[ModelResponse, ...] = (),
     observer=None,
-) -> tuple[Agent, MockModelProvider, str, Path]:
+) -> tuple[Agent, MockModelProvider, str, str, Path]:
     database = tmp_path / f"{name}.db"
     connection = sqlite3.connect(database)
     connection.execute("CREATE TABLE records(label TEXT, number INTEGER)")
@@ -685,7 +674,8 @@ async def _sqlite_export_agent(
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
-    return agent, provider, source.id, database
+    resource = (await agent.list_catalog_resources(source_id=source.id))[0]
+    return agent, provider, source.id, resource.id, database
 
 
 async def test_sqlite_export_is_discoverable_as_an_effect_free_source_read(
@@ -693,7 +683,7 @@ async def test_sqlite_export_is_discoverable_as_an_effect_free_source_read(
 ) -> None:
     downloads = tmp_path / "downloads-discovery"
     downloads.mkdir()
-    agent, provider, _source_id, _database = await _sqlite_export_agent(
+    agent, provider, _source_id, _resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="csv-discovery",
         rows=(("row", 1),),
@@ -707,9 +697,6 @@ async def test_sqlite_export_is_discoverable_as_an_effect_free_source_read(
                     name="toolbox_search",
                     arguments={
                         "query": "exact SQLite CSV export",
-                        "toolboxes": ["artifacts"],
-                        "data_access": "read",
-                        "operational_effect": "none",
                         "limit": 5,
                     },
                 )
@@ -728,7 +715,7 @@ async def test_sqlite_export_is_discoverable_as_an_effect_free_source_read(
         export_matches = tuple(
             item
             for item in matches
-            if item.get("tool_name") == SQLITE_TABULAR_EXPORT_TOOL_NAME
+            if item.get("tool_name") == DATA_EXPORT_TABULAR_TOOL_NAME
         )
         assert len(export_matches) == 1
         assert export_matches[0].get("data_access") == "read"
@@ -745,7 +732,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
     downloads.mkdir()
     secret_row = "ROW_SECRET_7d0bda20"
     events: list[object] = []
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="csv-public",
         rows=((secret_row, 1), ("=formula", 2)),
@@ -757,9 +744,10 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
             _tools(
                 ToolCall(
                     id="export",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": (
                             "SELECT label, number FROM records "
                             "WHERE number >= ? ORDER BY number"
@@ -796,7 +784,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         assert len(result.artifacts) == len(result.artifact_deliveries) == 1
         ref = result.artifacts[0]
         assert ref.call_id == "export"
-        assert ref.capability_id == SQLITE_TABULAR_EXPORT_CAPABILITY_ID
+        assert ref.capability_id == DATA_EXPORT_TABULAR_CAPABILITY_ID
         assert ref.media_type == "text/csv"
         assert ref.sensitivity is Sensitivity.INTERNAL
         assert ref.sensitivity is not Sensitivity.PUBLIC
@@ -818,6 +806,10 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         export_data = export_result.output["data"]
         assert isinstance(export_data, Mapping)
         assert set(export_data) == {
+            "adapter_id",
+            "source_id",
+            "source_revision",
+            "resource_revisions",
             "format",
             "filename",
             "row_count",
@@ -855,7 +847,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
             for block in message.content
             if isinstance(block, TextBlock)
         )
-        assert "data_export_sqlite" in first_request_text
+        assert "data_export_tabular" in first_request_text
         assert "artifact_save_local" in first_request_text
         assert (
             "Never put source rows or artifact bytes in arguments" in first_request_text
@@ -904,7 +896,7 @@ async def test_csv_export_reuses_current_sql_and_catalog_validation(
 ) -> None:
     downloads = tmp_path / f"downloads-{abs(hash(sql))}"
     downloads.mkdir()
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name=f"invalid-{abs(hash(sql))}",
         rows=(("row", 1),),
@@ -915,9 +907,10 @@ async def test_csv_export_reuses_current_sql_and_catalog_validation(
             _tools(
                 ToolCall(
                     id="invalid",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": sql,
                         "parameters": list(parameters),
                         "format": "csv",
@@ -942,21 +935,29 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
 ) -> None:
     downloads = tmp_path / "downloads-source-validation"
     downloads.mkdir()
-    agent, provider, source_id, database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, database = await _sqlite_export_agent(
         tmp_path,
         name="source-validation",
         rows=(("row", 1),),
         downloads=downloads,
     )
     try:
+        other_database = tmp_path / "source-validation-other.db"
+        with sqlite3.connect(other_database) as connection:
+            connection.execute("CREATE TABLE other_records(label TEXT)")
+        other_source = await agent.attach(SQLiteSource(other_database))
+        (other_resource,) = await agent.list_catalog_resources(
+            source_id=other_source.id
+        )
         provider.replace_script(
             (
                 _tools(
                     ToolCall(
                         id="mismatch",
-                        name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
+                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
                         arguments={
                             "source_id": source_id,
+                            "resource_ids": (other_resource.id,),
                             "sql": "SELECT label FROM records",
                             "format": "csv",
                         },
@@ -969,16 +970,17 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         mismatch_block = _result_for_call(
             await agent.transcript(mismatch.run_id), "mismatch"
         )
-        assert _error_code(mismatch_block) == "tool_not_available"
+        assert _error_code(mismatch_block) == "source_scope_violation"
 
         provider.replace_script(
             (
                 _tools(
                     ToolCall(
                         id="stale",
-                        name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
                         arguments={
                             "source_id": source_id,
+                            "resource_ids": (resource_id,),
                             "sql": "SELECT label FROM records",
                             "format": "csv",
                         },
@@ -1000,9 +1002,10 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
                 _tools(
                     ToolCall(
                         id="detached",
-                        name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                        name=DATA_EXPORT_TABULAR_TOOL_NAME,
                         arguments={
                             "source_id": source_id,
+                            "resource_ids": (resource_id,),
                             "sql": "SELECT label FROM records",
                             "format": "csv",
                         },
@@ -1015,7 +1018,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         detached_block = _result_for_call(
             await agent.transcript(detached.run_id), "detached"
         )
-        assert _error_code(detached_block) == "tool_not_available"
+        assert _error_code(detached_block) == "source_scope_violation"
     finally:
         await agent.close()
 
@@ -1026,7 +1029,7 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
 ) -> None:
     downloads = tmp_path / "downloads-order"
     downloads.mkdir()
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="csv-order",
         rows=(("one", 1), ("two", 2)),
@@ -1045,9 +1048,10 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
             _tools(
                 ToolCall(
                     id="first",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label FROM records /* slow_export */ ORDER BY number",
                         "format": "csv",
                         "filename": "first.csv",
@@ -1055,9 +1059,10 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
                 ),
                 ToolCall(
                     id="failed",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label AS duplicate, number AS duplicate FROM records",
                         "format": "csv",
                         "filename": "failed.csv",
@@ -1065,9 +1070,10 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
                 ),
                 ToolCall(
                     id="third",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT number FROM records ORDER BY number",
                         "format": "csv",
                         "filename": "third.csv",
@@ -1102,7 +1108,7 @@ async def test_exact_csv_cancellation_emits_no_artifact_or_partial_reference(
 ) -> None:
     downloads = tmp_path / "downloads-cancel"
     downloads.mkdir()
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="csv-cancel",
         rows=(("row", 1),),
@@ -1129,9 +1135,10 @@ async def test_exact_csv_cancellation_emits_no_artifact_or_partial_reference(
             _tools(
                 ToolCall(
                     id="cancelled-export",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label FROM records",
                         "format": "csv",
                     },
@@ -1158,7 +1165,7 @@ async def test_delivery_failure_after_csv_commit_retains_valid_internal_artifact
 ) -> None:
     downloads = tmp_path / "downloads-failure"
     downloads.mkdir()
-    agent, provider, source_id, _database = await _sqlite_export_agent(
+    agent, provider, source_id, resource_id, _database = await _sqlite_export_agent(
         tmp_path,
         name="csv-delivery-failure",
         rows=(("retained", 1),),
@@ -1169,9 +1176,10 @@ async def test_delivery_failure_after_csv_commit_retains_valid_internal_artifact
             _tools(
                 ToolCall(
                     id="export",
-                    name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
+                    name=DATA_EXPORT_TABULAR_TOOL_NAME,
                     arguments={
                         "source_id": source_id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT label, number FROM records",
                         "format": "csv",
                         "filename": "retained.csv",

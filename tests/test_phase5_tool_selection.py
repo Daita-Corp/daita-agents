@@ -83,7 +83,7 @@ PHASE5_ROUTES = {
     ),
     "postgres_query": (
         "Run SELECT customer_id FROM customers against Postgres",
-        ("data_query_postgresql",),
+        ("data_query",),
     ),
     "mixed_compare": (
         "Compare local sales.csv to the connected customer table",
@@ -92,7 +92,7 @@ PHASE5_ROUTES = {
             "toolbox_load",
             "file_query",
             "catalog_schema",
-            "data_query_sqlite",
+            "data_query",
         ),
     ),
     "files_only": (
@@ -310,7 +310,6 @@ async def test_file_query_search_load_route_is_exact_and_grounded(
                 "toolbox_search",
                 {
                     "query": "total revenue by region sales csv",
-                    "toolboxes": ["files"],
                     "limit": 5,
                 },
             ),
@@ -497,7 +496,7 @@ async def test_postgresql_query_is_direct_and_structured_failure_has_no_fallback
             (
                 _tool(
                     "postgres-query",
-                    "data_query_postgresql",
+                    "data_query",
                     {
                         "source_id": source.id,
                         "sql": "SELECT customer_id FROM customers",
@@ -515,9 +514,7 @@ async def test_postgresql_query_is_direct_and_structured_failure_has_no_fallback
         )
         transcript = await agent.transcript(result.run_id)
         _assert_route(transcript, "postgres_query")
-        assert "data_query_postgresql" in {
-            tool.name for tool in provider.requests[0].tools
-        }
+        assert "data_query" in {tool.name for tool in provider.requests[0].tools}
         failure = _results(transcript)["postgres-query"]
         assert failure.is_error
         error = failure.output.get("error")
@@ -553,6 +550,7 @@ async def test_mixed_file_and_source_queries_remain_separate_and_grounded(
     )
     try:
         source = await agent.attach(SQLiteSource(database, name="Customers"))
+        (resource,) = await agent.list_catalog_resources(source_id=source.id)
         provider.replace_script(
             (
                 _tool(
@@ -560,7 +558,6 @@ async def test_mixed_file_and_source_queries_remain_separate_and_grounded(
                     "toolbox_search",
                     {
                         "query": "aggregate local sales csv",
-                        "toolboxes": ["files"],
                         "limit": 5,
                     },
                 ),
@@ -591,9 +588,10 @@ async def test_mixed_file_and_source_queries_remain_separate_and_grounded(
                 ),
                 _tool(
                     "mixed-source-query",
-                    "data_query_sqlite",
+                    "data_query",
                     {
                         "source_id": source.id,
+                        "resource_ids": (resource.id,),
                         "sql": (
                             "SELECT segment, COUNT(*) AS customer_count FROM customers "
                             "GROUP BY segment ORDER BY segment"
@@ -615,6 +613,7 @@ async def test_mixed_file_and_source_queries_remain_separate_and_grounded(
         assert set(calls["mixed-file-query"].arguments) == {"path_pattern", "sql"}
         assert set(calls["mixed-source-query"].arguments) == {
             "source_id",
+            "resource_ids",
             "sql",
             "parameters",
         }
@@ -747,7 +746,6 @@ async def test_markdown_report_searches_loads_creates_and_delivers_only_on_reque
                 "toolbox_search",
                 {
                     "query": "create markdown report document",
-                    "toolboxes": ["artifacts"],
                     "limit": 5,
                 },
             ),
@@ -770,7 +768,6 @@ async def test_markdown_report_searches_loads_creates_and_delivers_only_on_reque
                 "toolbox_search",
                 {
                     "query": "save deliver local report",
-                    "toolboxes": ["artifacts"],
                     "limit": 5,
                 },
             ),
@@ -849,7 +846,6 @@ class _EditRoutingProvider:
                 "toolbox_search",
                 {
                     "query": "edit timeout config yaml text replace workspace",
-                    "toolboxes": ["artifacts"],
                     "limit": 5,
                 },
             )
@@ -883,7 +879,6 @@ class _EditRoutingProvider:
                 "toolbox_search",
                 {
                     "query": "save replace bound workspace file",
-                    "toolboxes": ["artifacts"],
                     "limit": 5,
                 },
             )
@@ -1256,7 +1251,6 @@ async def test_generated_maximum_catalog_is_bounded_searchable_and_replacing(
             name="toolbox_search",
             arguments={
                 "query": "total revenue by region sales csv",
-                "toolboxes": ["files"],
                 "limit": 5,
             },
         )

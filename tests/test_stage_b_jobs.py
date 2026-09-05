@@ -511,16 +511,18 @@ async def test_job_context_is_agent_scoped_and_result_first(tmp_path: Path) -> N
         assert "owned by this agent across conversations" in system.text
         assert "origin_conversation_id is provenance" in system.text
         assert "known job ID, call job_read_results first" in system.text
+        assert (
+            "Fresh source queries cannot substitute for a stored job result"
+            in system.text
+        )
+        assert "even when the numbers happen to match" in system.text
         assert "Use job_inspect only" in system.text
         search = next(
             item for item in provider.requests[0].tools if item.name == "toolbox_search"
         )
         properties = search.input_schema["properties"]
         assert isinstance(properties, Mapping)
-        data_access = properties["data_access"]
-        assert isinstance(data_access, Mapping)
-        assert "External/source-data filter" in data_access["description"]
-        assert "Omit when uncertain" in data_access["description"]
+        assert set(properties) == {"query", "limit"}
     finally:
         await agent.close()
 

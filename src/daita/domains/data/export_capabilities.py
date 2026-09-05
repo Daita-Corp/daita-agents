@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime
 from hashlib import sha256
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_workspace import LocalWorkspaceBackend, LocalWorkspaceError
@@ -32,10 +32,16 @@ from ...artifacts.models import (
 from ...artifacts.renderers import (
     CSV_ALLOWED_EXTENSIONS,
     DOCUMENT_ALLOWED_EXTENSIONS,
+    HTML_ALLOWED_EXTENSIONS,
+    HTML_MEDIA_TYPE,
     MAX_CSV_BYTES,
     MAX_CSV_COLUMNS,
     MAX_CSV_ROWS,
     MAX_CSV_SECONDS,
+    MAX_MODEL_TABULAR_BYTES,
+    MAX_MODEL_TABULAR_CELL_CHARACTERS,
+    MAX_MODEL_TABULAR_COLUMNS,
+    MAX_MODEL_TABULAR_ROWS,
     MAX_TEXT_EDIT_ANCHOR_BYTES,
     MAX_TEXT_EDIT_BYTES,
     MAX_TEXT_EDIT_OCCURRENCES,
@@ -50,6 +56,7 @@ from ...artifacts.renderers import (
     read_exact_xlsx_data,
     render_exact_csv,
     render_model_document,
+    render_model_tabular,
     text_edit_media_type,
 )
 from ...artifacts.result_snapshot import (
@@ -84,12 +91,11 @@ from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlo
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
+from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
     ResourceSchema,
-    validate_postgresql_read,
-    validate_sqlite_read,
 )
 
 DOCUMENT_CREATE_CAPABILITY_ID = "artifact.create_document"
@@ -97,17 +103,18 @@ DOCUMENT_CREATE_EXECUTOR_ID = "artifact.create_document.executor"
 DOCUMENT_CREATE_TOOL_NAME = "artifact_create_document"
 DOCUMENT_CREATE_OUTPUT_KIND = "artifact.document"
 
+ARTIFACT_CREATE_TABULAR_CAPABILITY_ID = "artifact.create_tabular"
+ARTIFACT_CREATE_TABULAR_EXECUTOR_ID = "artifact.create_tabular.executor"
+ARTIFACT_CREATE_TABULAR_TOOL_NAME = "artifact_create_tabular"
+ARTIFACT_CREATE_TABULAR_OUTPUT_KIND = "artifact.tabular"
+
 RESULT_SNAPSHOT_CAPABILITY_ID = "artifact.snapshot_result"
 RESULT_SNAPSHOT_EXECUTOR_ID = "artifact.snapshot_result.executor"
 RESULT_SNAPSHOT_TOOL_NAME = "artifact_snapshot_result"
 RESULT_SNAPSHOT_OUTPUT_KIND = "artifact.result_snapshot"
 
-SQLITE_TABULAR_EXPORT_CAPABILITY_ID = "data.sqlite.export_tabular"
-SQLITE_TABULAR_EXPORT_EXECUTOR_ID = "data.sqlite.export_tabular.executor"
-SQLITE_TABULAR_EXPORT_TOOL_NAME = "data_export_sqlite"
-POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID = "data.postgresql.export_tabular"
-POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID = "data.postgresql.export_tabular.executor"
-POSTGRESQL_TABULAR_EXPORT_TOOL_NAME = "data_export_postgresql"
+DATA_EXPORT_TABULAR_EXECUTOR_ID = "data.export_tabular.executor"
+DATA_EXPORT_TABULAR_TOOL_NAME = "data_export_tabular"
 TABULAR_EXPORT_OUTPUT_KIND = "artifact.tabular_export"
 
 ARTIFACT_LIST_CAPABILITY_ID = "artifact.list"
@@ -153,10 +160,18 @@ class ArtifactCapabilityDeclarations:
 
 
 @dataclass(frozen=True, slots=True)
+class DataExportTabularDeclarations:
+    capabilities: tuple[Capability, ...]
+    executors: tuple[Executor, ...]
+    tool_views: tuple[ToolView, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ExactTabularExportResult:
     """One complete typed-source export after its selected fixed renderer."""
 
     format: str
+    adapter_id: str
     source_id: str
     source_revision: str
     sql_fingerprint: str
@@ -169,6 +184,8 @@ class ExactTabularExportResult:
     def __post_init__(self) -> None:
         if self.format not in {"csv", "xlsx"}:
             raise ValueError("exact tabular format is invalid")
+        if self.adapter_id not in {"sqlite", "postgresql"}:
+            raise ValueError("exact tabular adapter_id is invalid")
         for value, name in (
             (self.source_id, "source_id"),
             (self.source_revision, "source_revision"),
@@ -288,6 +305,47 @@ class DocumentArtifactExecutor:
         )
 
 
+class ModelTabularArtifactExecutor:
+    executor_id = ARTIFACT_CREATE_TABULAR_EXECUTOR_ID
+
+    def __init__(self, *, clock: Callable[[], datetime]) -> None:
+        self._clock = clock
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        columns = request.arguments["columns"]
+        rows = request.arguments["rows"]
+        format_name = request.arguments["format"]
+        filename = request.arguments.get("filename")
+        evidence = request.arguments["evidence_call_ids"]
+        assert isinstance(columns, tuple)
+        assert isinstance(rows, tuple)
+        assert isinstance(format_name, str)
+        assert filename is None or isinstance(filename, str)
+        assert isinstance(evidence, tuple)
+        assert all(isinstance(item, str) for item in columns)
+        assert all(isinstance(row, tuple) for row in rows)
+        assert all(isinstance(item, str) for item in evidence)
+        draft = render_model_tabular(
+            columns=cast(tuple[str, ...], columns),
+            rows=cast(tuple[tuple[object, ...], ...], rows),
+            format=format_name,
+            filename=filename,
+            evidence_call_ids=cast(tuple[str, ...], evidence),
+            created_at=self._clock(),
+        )
+        return ToolOutput(
+            kind=ARTIFACT_CREATE_TABULAR_OUTPUT_KIND,
+            data={
+                "format": format_name,
+                "filename": draft.suggested_filename,
+                "row_count": len(rows),
+                "column_count": len(columns),
+                "evidence_call_ids": evidence,
+            },
+            artifact=draft,
+        )
+
+
 class ResultSnapshotExecutor:
     executor_id = RESULT_SNAPSHOT_EXECUTOR_ID
 
@@ -357,19 +415,25 @@ class ResultSnapshotExecutor:
         )
 
 
-class _TabularExportExecutor:
-    executor_id: str
+class DataExportTabularExecutor:
+    """Dispatch one trusted catalog-bound relational export to one backend."""
+
+    executor_id = DATA_EXPORT_TABULAR_EXECUTOR_ID
 
     def __init__(
         self,
         agent_id: str,
-        backend: ExactTabularExportBackend,
+        sqlite_backend: ExactTabularExportBackend,
+        postgresql_backend: ExactTabularExportBackend,
         *,
         clock: Callable[[], datetime],
         max_seconds: float = MAX_CSV_SECONDS,
     ) -> None:
         self._agent_id = agent_id
-        self._backend = backend
+        self._backends = {
+            "sqlite": sqlite_backend,
+            "postgresql": postgresql_backend,
+        }
         self._clock = clock
         self._max_seconds = max_seconds
 
@@ -377,14 +441,21 @@ class _TabularExportExecutor:
         source_id = request.arguments["source_id"]
         sql = request.arguments["sql"]
         parameters = request.arguments.get("parameters", ())
+        resource_ids = request.arguments["resource_ids"]
+        adapter_id = request.arguments["_adapter_id"]
         format_name = request.arguments["format"]
         filename = request.arguments.get("filename")
         assert isinstance(source_id, str)
         assert isinstance(sql, str)
         assert isinstance(parameters, tuple)
+        assert isinstance(resource_ids, tuple)
+        assert isinstance(adapter_id, str)
         assert isinstance(format_name, str) and format_name in {"csv", "xlsx"}
         assert filename is None or isinstance(filename, str)
         completed = {"rows": 0, "columns": 0, "bytes": 0}
+        backend = self._backends.get(adapter_id)
+        if backend is None:
+            raise ValueError("relational export adapter binding is unsupported")
 
         def progress(rows: int, columns: int, byte_count: int) -> None:
             completed.update(rows=rows, columns=columns, bytes=byte_count)
@@ -394,7 +465,7 @@ class _TabularExportExecutor:
         )
         try:
             async with asyncio.timeout(self._max_seconds):
-                result = await self._backend.execute_exact_tabular(
+                result = await backend.execute_exact_tabular(
                     agent_id=self._agent_id,
                     source_id=source_id,
                     sql=sql,
@@ -419,7 +490,13 @@ class _TabularExportExecutor:
                     "completed_bytes": completed["bytes"],
                 },
             ) from error
-        if result.source_id != source_id or result.format != format_name:
+        if (
+            result.adapter_id != adapter_id
+            or result.source_id != source_id
+            or result.format != format_name
+            or frozenset(item[0] for item in result.resource_revisions)
+            != frozenset(resource_ids)
+        ):
             raise ValueError("exact tabular backend returned different execution facts")
         media_type = "text/csv" if format_name == "csv" else XLSX_MEDIA_TYPE
         extensions = (
@@ -456,21 +533,20 @@ class _TabularExportExecutor:
         return ToolOutput(
             kind=TABULAR_EXPORT_OUTPUT_KIND,
             data={
+                "adapter_id": adapter_id,
                 "format": format_name,
                 "filename": safe_filename,
+                "source_id": result.source_id,
+                "source_revision": result.source_revision,
+                "resource_revisions": tuple(
+                    {"resource_id": resource_id, "revision": revision}
+                    for resource_id, revision in result.resource_revisions
+                ),
                 "row_count": result.row_count,
                 "column_count": len(result.columns),
             },
             artifact=draft,
         )
-
-
-class SQLiteTabularExportExecutor(_TabularExportExecutor):
-    executor_id = SQLITE_TABULAR_EXPORT_EXECUTOR_ID
-
-
-class PostgreSQLTabularExportExecutor(_TabularExportExecutor):
-    executor_id = POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID
 
 
 class ArtifactListExecutor:
@@ -505,7 +581,11 @@ class ArtifactReadExecutor:
         payload = await self._artifacts.read(artifact_id)
         summary = _model_artifact_summary(payload.ref)
         if payload.ref.media_type == XLSX_MEDIA_TYPE:
-            data = await asyncio.to_thread(read_exact_xlsx_data, payload.content)
+            data = await asyncio.to_thread(
+                read_exact_xlsx_data,
+                payload.content,
+                expected_authorship=payload.ref.provenance.authorship,
+            )
             rows = data.rows[:MAX_MODEL_ARTIFACT_XLSX_ROWS]
             return ToolOutput(
                 kind=ARTIFACT_READ_OUTPUT_KIND,
@@ -521,7 +601,7 @@ class ArtifactReadExecutor:
                     "truncated": len(rows) < len(data.rows),
                 },
             )
-        if payload.ref.media_type not in TEXT_EDIT_MEDIA_TYPES:
+        if payload.ref.media_type not in {*TEXT_EDIT_MEDIA_TYPES, HTML_MEDIA_TYPE}:
             raise ArtifactError(
                 "artifact_invalid_format",
                 "This artifact format does not support a model preview.",
@@ -574,11 +654,7 @@ class ArtifactConvertExecutor:
         )
         if (
             payload.ref.media_type != XLSX_MEDIA_TYPE
-            or payload.ref.capability_id
-            not in {
-                SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-                POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-            }
+            or payload.ref.capability_id != DATA_EXPORT_TABULAR_CAPABILITY_ID
             or payload.ref.provenance.authorship
             is not ArtifactAuthorship.EXACT_SOURCE_DATA
         ):
@@ -818,14 +894,32 @@ class ArtifactSetExportLocationExecutor:
         )
 
 
+def data_export_tabular_declarations(
+    agent_id: str,
+    sqlite_backend: ExactTabularExportBackend,
+    postgresql_backend: ExactTabularExportBackend,
+    clock: Callable[[], datetime],
+) -> DataExportTabularDeclarations:
+    declarations = data_export_tabular_capability_declarations()
+    return DataExportTabularDeclarations(
+        capabilities=declarations.capabilities,
+        executors=(
+            DataExportTabularExecutor(
+                agent_id,
+                sqlite_backend,
+                postgresql_backend,
+                clock=clock,
+            ),
+        ),
+        tool_views=declarations.tool_views,
+    )
+
+
 def artifact_declarations(
     delivery: LocalArtifactDelivery | None,
     artifacts: AgentHomeArtifactStore,
     *,
     workspace: LocalWorkspaceBackend | None,
-    agent_id: str,
-    sqlite_backend: ExactTabularExportBackend,
-    postgresql_backend: ExactTabularExportBackend,
     clock: Callable[[], datetime],
 ) -> ArtifactCapabilityDeclarations:
     include_local_delivery = delivery is not None
@@ -843,9 +937,8 @@ def artifact_declarations(
         capabilities=declarations.capabilities,
         executors=(
             DocumentArtifactExecutor(),
+            ModelTabularArtifactExecutor(clock=clock),
             ResultSnapshotExecutor(),
-            SQLiteTabularExportExecutor(agent_id, sqlite_backend, clock=clock),
-            PostgreSQLTabularExportExecutor(agent_id, postgresql_backend, clock=clock),
             ArtifactListExecutor(artifacts),
             ArtifactReadExecutor(artifacts),
             ArtifactConvertExecutor(artifacts),
@@ -853,6 +946,31 @@ def artifact_declarations(
             *delivery_executors,
         ),
         tool_views=declarations.tool_views,
+    )
+
+
+def data_export_tabular_capability_declarations() -> CapabilityDeclarations:
+    capability = _tabular_export_capability()
+    view = ToolView(
+        name=DATA_EXPORT_TABULAR_TOOL_NAME,
+        capability_id=capability.id,
+        description=capability.description,
+        presentation=ToolPresentation(
+            toolbox_id=ToolboxId.ARTIFACTS,
+            load_mode=ToolLoadMode.ON_DEMAND,
+            text_trust=ToolTextTrust.CODE,
+            summary="Export one exact relational query result as CSV or XLSX.",
+            when_to_use=(
+                "Use after catalog_schema provides the exact source and resource IDs."
+            ),
+            keywords=("artifact", "data", "export", "relational", "csv", "xlsx"),
+        ),
+    )
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(capability,),
+        executor_ids=(DATA_EXPORT_TABULAR_EXECUTOR_ID,),
+        tool_views=(view,),
     )
 
 
@@ -905,6 +1023,118 @@ def artifact_capability_declarations(
             max_total_bytes_per_call=MAX_DOCUMENT_BYTES,
         ),
     )
+    tabular = Capability(
+        id=ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
+        description=(
+            "Create one bounded model-authored CSV, XLSX, or HTML table derived "
+            "from authenticated earlier successful tool results in the current "
+            "run. This does not claim an exact or complete source export."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "columns": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": MAX_MODEL_TABULAR_COLUMNS,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                    },
+                },
+                "rows": {
+                    "type": "array",
+                    "maxItems": MAX_MODEL_TABULAR_ROWS,
+                    "items": {
+                        "type": "array",
+                        "maxItems": MAX_MODEL_TABULAR_COLUMNS,
+                        "items": {
+                            "type": ["string", "number", "boolean", "null"],
+                            "maxLength": MAX_MODEL_TABULAR_CELL_CHARACTERS,
+                        },
+                    },
+                },
+                "format": {
+                    "type": "string",
+                    "enum": ["csv", "xlsx", "html"],
+                },
+                "filename": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 120,
+                },
+                "evidence_call_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "uniqueItems": True,
+                },
+            },
+            "required": [
+                "columns",
+                "rows",
+                "format",
+                "evidence_call_ids",
+            ],
+            "additionalProperties": False,
+        },
+        output_kind=ARTIFACT_CREATE_TABULAR_OUTPUT_KIND,
+        output_schema={
+            "type": "object",
+            "properties": {
+                "format": {
+                    "type": "string",
+                    "enum": ["csv", "xlsx", "html"],
+                },
+                "filename": {"type": "string"},
+                "row_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_MODEL_TABULAR_ROWS,
+                },
+                "column_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": MAX_MODEL_TABULAR_COLUMNS,
+                },
+                "evidence_call_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "uniqueItems": True,
+                    "items": {"type": "string"},
+                },
+            },
+            "required": [
+                "format",
+                "filename",
+                "row_count",
+                "column_count",
+                "evidence_call_ids",
+            ],
+            "additionalProperties": False,
+        },
+        executor_id=ARTIFACT_CREATE_TABULAR_EXECUTOR_ID,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        artifact_policy=ArtifactPolicy(
+            allowed_media_types=frozenset(
+                {"text/csv", XLSX_MEDIA_TYPE, HTML_MEDIA_TYPE}
+            ),
+            allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
+            allowed_extensions=(
+                CSV_ALLOWED_EXTENSIONS
+                + XLSX_ALLOWED_EXTENSIONS
+                + HTML_ALLOWED_EXTENSIONS
+            ),
+            artifact_required=True,
+            max_artifact_count=1,
+            max_bytes_per_artifact=MAX_MODEL_TABULAR_BYTES,
+            max_total_bytes_per_call=MAX_MODEL_TABULAR_BYTES,
+        ),
+    )
     result_snapshot = Capability(
         id=RESULT_SNAPSHOT_CAPABILITY_ID,
         description=(
@@ -955,16 +1185,6 @@ def artifact_capability_declarations(
             max_bytes_per_artifact=MAX_RESULT_SNAPSHOT_BYTES,
             max_total_bytes_per_call=MAX_RESULT_SNAPSHOT_BYTES,
         ),
-    )
-    sqlite_tabular = _tabular_export_capability(
-        capability_id=SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        executor_id=SQLITE_TABULAR_EXPORT_EXECUTOR_ID,
-        adapter_name="SQLite",
-    )
-    postgresql_tabular = _tabular_export_capability(
-        capability_id=POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-        executor_id=POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID,
-        adapter_name="PostgreSQL",
     )
     artifact_list = Capability(
         id=ARTIFACT_LIST_CAPABILITY_ID,
@@ -1248,9 +1468,8 @@ def artifact_capability_declarations(
     )
     capabilities = (
         document,
+        tabular,
         result_snapshot,
-        sqlite_tabular,
-        postgresql_tabular,
         artifact_list,
         artifact_read,
         artifact_convert,
@@ -1266,9 +1485,33 @@ def artifact_capability_declarations(
                 toolbox_id=ToolboxId.ARTIFACTS,
                 load_mode=ToolLoadMode.ON_DEMAND,
                 text_trust=ToolTextTrust.CODE,
-                summary="Create a bounded Markdown or text document artifact.",
+                summary="Create a bounded Markdown or text report document.",
                 when_to_use="Use when the requested deliverable is a document.",
-                keywords=("artifact", "document", "markdown", "text"),
+                keywords=("artifact", "document", "markdown", "text", "report"),
+            ),
+        ),
+        ToolView(
+            name=ARTIFACT_CREATE_TABULAR_TOOL_NAME,
+            capability_id=tabular.id,
+            description=tabular.description,
+            presentation=ToolPresentation(
+                toolbox_id=ToolboxId.ARTIFACTS,
+                load_mode=ToolLoadMode.ON_DEMAND,
+                text_trust=ToolTextTrust.CODE,
+                summary="Create a bounded derived findings table as CSV, XLSX, or HTML.",
+                when_to_use=(
+                    "Use to export analyzed findings from successful current-run tools, "
+                    "not a complete exact source export."
+                ),
+                keywords=(
+                    "artifact",
+                    "table",
+                    "findings",
+                    "export",
+                    "csv",
+                    "xlsx",
+                    "html",
+                ),
             ),
         ),
         ToolView(
@@ -1285,32 +1528,6 @@ def artifact_capability_declarations(
                     "validated structured result should become an artifact."
                 ),
                 keywords=("artifact", "snapshot", "result", "json"),
-            ),
-        ),
-        ToolView(
-            name=SQLITE_TABULAR_EXPORT_TOOL_NAME,
-            capability_id=sqlite_tabular.id,
-            description=sqlite_tabular.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Export an exact SQLite query result as CSV or XLSX.",
-                when_to_use="Use for a downloadable tabular SQLite result.",
-                keywords=("artifact", "export", "sqlite", "csv", "xlsx"),
-            ),
-        ),
-        ToolView(
-            name=POSTGRESQL_TABULAR_EXPORT_TOOL_NAME,
-            capability_id=postgresql_tabular.id,
-            description=postgresql_tabular.description,
-            presentation=ToolPresentation(
-                toolbox_id=ToolboxId.ARTIFACTS,
-                load_mode=ToolLoadMode.ON_DEMAND,
-                text_trust=ToolTextTrust.CODE,
-                summary="Export an exact PostgreSQL query result as CSV or XLSX.",
-                when_to_use="Use for a downloadable tabular PostgreSQL result.",
-                keywords=("artifact", "export", "postgresql", "csv", "xlsx"),
             ),
         ),
         ToolView(
@@ -1387,7 +1604,7 @@ def artifact_capability_declarations(
                         toolbox_id=ToolboxId.ARTIFACTS,
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
-                        summary="Deliver one committed artifact to an authorized local destination.",
+                        summary="Save a committed artifact locally or replace its bound workspace file.",
                         when_to_use="Use after artifact creation when local delivery is required.",
                         keywords=("artifact", "save", "deliver", "local"),
                     ),
@@ -1418,9 +1635,7 @@ def artifact_capability_declarations(
     )
 
 
-_EXACT_TABULAR_CAPABILITIES = frozenset(
-    {SQLITE_TABULAR_EXPORT_CAPABILITY_ID, POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}
-)
+_EXACT_TABULAR_CAPABILITIES = frozenset({DATA_EXPORT_TABULAR_CAPABILITY_ID})
 _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
     {
         ARTIFACT_LIST_CAPABILITY_ID,
@@ -1430,23 +1645,17 @@ _CONVERSATION_ARTIFACT_CAPABILITIES = frozenset(
 _ARTIFACT_PRODUCER_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
+        ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
         RESULT_SNAPSHOT_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
         ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
     }
 )
-_ARTIFACT_ADAPTER_CAPABILITIES = {
-    "sqlite": frozenset({SQLITE_TABULAR_EXPORT_CAPABILITY_ID}),
-    "postgresql": frozenset({POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID}),
-}
 _BASE_ARTIFACT_CAPABILITIES = frozenset(
     {
         DOCUMENT_CREATE_CAPABILITY_ID,
+        ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
         RESULT_SNAPSHOT_CAPABILITY_ID,
-        SQLITE_TABULAR_EXPORT_CAPABILITY_ID,
-        POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
         ARTIFACT_LIST_CAPABILITY_ID,
         ARTIFACT_READ_CAPABILITY_ID,
         ARTIFACT_CONVERT_CAPABILITY_ID,
@@ -1460,14 +1669,6 @@ LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS = frozenset({ARTIFACT_EDIT_TEXT_EXECUTOR_ID})
 
 
 class ArtifactDomainCatalog(Protocol):
-    async def source_routing_facts(
-        self,
-        agent_id: str,
-        source_ids: tuple[str, ...] = (),
-    ) -> tuple[Mapping[str, object], ...]: ...
-
-    async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
-
     async def resource_schemas(
         self,
         agent_id: str,
@@ -1504,6 +1705,15 @@ class ArtifactTranscriptReader(Protocol):
     async def load(self, run_id: str) -> Transcript: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _ValidatedArtifactEvidence:
+    call: ToolCall
+    block: ToolResultBlock
+    capability: Capability
+    output_kind: str
+    data: Mapping[str, object]
+
+
 class ArtifactCapabilityDomain:
     """Own artifact availability, provenance, conversion, and delivery rules."""
 
@@ -1520,7 +1730,6 @@ class ArtifactCapabilityDomain:
         learning: LearningCandidateGuard,
         *,
         clock: Callable[[], datetime],
-        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("artifact declarations have the wrong domain owner")
@@ -1547,9 +1756,6 @@ class ArtifactCapabilityDomain:
         self._learning = learning
         self._clock = clock
         self._registry: CapabilityRegistry | None = None
-        self._files_only_run_ids = (
-            files_only_run_ids if files_only_run_ids is not None else set()
-        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -1568,19 +1774,6 @@ class ArtifactCapabilityDomain:
         self._registry = registry
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
-        facts = (
-            ()
-            if run.id in self._files_only_run_ids
-            else await self._catalog.source_routing_facts(
-                run.agent_id,
-                (() if run.source_id is None else (run.source_id,)),
-            )
-        )
-        adapters = {
-            adapter_id
-            for fact in facts
-            if isinstance((adapter_id := fact.get("adapter_id")), str)
-        }
         all_refs = await self._artifacts.list_refs()
         conversation_id = run.conversation_id or run.id
         refs = tuple(
@@ -1596,16 +1789,6 @@ class ArtifactCapabilityDomain:
                 view.name,
                 effectful=capability.operational_effect is not OperationalEffect.NONE,
             ):
-                continue
-            required_adapter = next(
-                (
-                    adapter_id
-                    for adapter_id, ids in _ARTIFACT_ADAPTER_CAPABILITIES.items()
-                    if capability.id in ids
-                ),
-                None,
-            )
-            if required_adapter is not None and required_adapter not in adapters:
                 continue
             candidates.append(view)
         may_have_current_artifact = (
@@ -1747,6 +1930,7 @@ class ArtifactCapabilityDomain:
             if capability.id == ARTIFACT_READ_CAPABILITY_ID and ref.media_type not in {
                 *TEXT_EDIT_MEDIA_TYPES,
                 XLSX_MEDIA_TYPE,
+                HTML_MEDIA_TYPE,
             }:
                 raise CapabilityInputError(
                     "artifact_invalid_format",
@@ -1803,9 +1987,146 @@ class ArtifactCapabilityDomain:
                 raise CapabilityInputError(
                     "artifact_delivery_invalid", "Artifact delivery mode is invalid."
                 )
-        if capability.id in _EXACT_TABULAR_CAPABILITIES:
-            await self._validate_sql(run, capability, arguments)
         return arguments
+
+    async def _validated_current_run_evidence(
+        self,
+        run: RunInput,
+        current_call: ToolCall,
+        evidence_call_ids: tuple[str, ...],
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> tuple[_ValidatedArtifactEvidence, ...]:
+        registry = self._registry
+        if registry is None:
+            raise CapabilityInputError(
+                error_code,
+                "Artifact evidence validation is unavailable in this runtime.",
+            )
+        if (
+            not evidence_call_ids
+            or len(evidence_call_ids) > 16
+            or len(evidence_call_ids) != len(set(evidence_call_ids))
+        ):
+            raise CapabilityInputError(
+                error_code,
+                error_message,
+                {"evidence_call_ids": evidence_call_ids},
+            )
+        try:
+            transcript = await self._transcripts.load(run.id)
+        except KeyError as error:
+            raise CapabilityInputError(
+                error_code,
+                error_message,
+                {"run_id": run.id},
+            ) from error
+        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
+            raise CapabilityInputError(error_code, error_message)
+
+        current_calls = tuple(
+            (message_index, candidate)
+            for message_index, message in enumerate(transcript.messages)
+            if message.role is MessageRole.ASSISTANT
+            for candidate in message.tool_calls
+            if candidate.id == current_call.id
+        )
+        if (
+            len(current_calls) != 1
+            or current_calls[0][1].name != current_call.name
+            or current_calls[0][1].arguments != current_call.arguments
+        ):
+            raise CapabilityInputError(error_code, error_message)
+        current_index = current_calls[0][0]
+
+        validated: list[_ValidatedArtifactEvidence] = []
+        for evidence_call_id in evidence_call_ids:
+            evidence_calls = tuple(
+                (message_index, candidate)
+                for message_index, message in enumerate(transcript.messages)
+                if message.role is MessageRole.ASSISTANT
+                for candidate in message.tool_calls
+                if candidate.id == evidence_call_id
+            )
+            evidence_results = tuple(
+                (message_index, block)
+                for message_index, message in enumerate(transcript.messages)
+                if message.role is MessageRole.TOOL
+                for block in message.content
+                if isinstance(block, ToolResultBlock)
+                and block.call_id == evidence_call_id
+            )
+            ordered = (
+                len(evidence_calls) == 1
+                and len(evidence_results) == 1
+                and evidence_calls[0][0] < evidence_results[0][0] < current_index
+            )
+            block = evidence_results[0][1] if len(evidence_results) == 1 else None
+            if (
+                not ordered
+                or block is None
+                or block.is_error
+                or block.capability_id is None
+                or block.executor_id is None
+                or block.output_sha256 is None
+                or block.sensitivity is None
+                or not block.sensitivity_provenance
+            ):
+                raise CapabilityInputError(
+                    error_code,
+                    error_message,
+                    {"call_id": evidence_call_id},
+                )
+            producer_call = evidence_calls[0][1]
+            try:
+                _view, producer_capability = registry.resolve_tool(producer_call.name)
+                if (
+                    producer_capability.id != block.capability_id
+                    or producer_capability.executor_id != block.executor_id
+                    or block.output_sha256 != _sha256_json(block.output)
+                ):
+                    raise ValueError("result execution lineage differs")
+                registry.validate_arguments(
+                    producer_capability.id,
+                    producer_call.arguments,
+                )
+                if set(block.output) not in (
+                    {"kind", "data"},
+                    {"kind", "data", "artifact", "delivery_status"},
+                ):
+                    raise ValueError("result envelope shape differs")
+                output_kind = block.output.get("kind")
+                result_data = block.output.get("data")
+                if not isinstance(output_kind, str) or not isinstance(
+                    result_data, Mapping
+                ):
+                    raise ValueError("result data is unavailable")
+                registry.validate_output(
+                    producer_capability.id,
+                    ToolOutput(
+                        kind=output_kind,
+                        data=result_data,
+                        sensitivity=block.sensitivity,
+                        sensitivity_provenance=block.sensitivity_provenance,
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise CapabilityInputError(
+                    error_code,
+                    error_message,
+                    {"call_id": evidence_call_id},
+                ) from error
+            validated.append(
+                _ValidatedArtifactEvidence(
+                    call=producer_call,
+                    block=block,
+                    capability=producer_capability,
+                    output_kind=output_kind,
+                    data=result_data,
+                )
+            )
+        return tuple(validated)
 
     async def _prepare_result_snapshot(
         self,
@@ -1827,106 +2148,22 @@ class ArtifactCapabilityDomain:
                 "artifact_snapshot_evidence_invalid",
                 "A result snapshot requires one exact earlier call ID.",
             )
-        try:
-            transcript = await self._transcripts.load(run.id)
-        except KeyError as error:
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "Result snapshot evidence must belong to the current run.",
-            ) from error
-        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "Result snapshot evidence belongs to another agent or run.",
-            )
-        current_calls = tuple(
-            (message_index, candidate)
-            for message_index, message in enumerate(transcript.messages)
-            if message.role is MessageRole.ASSISTANT
-            for candidate in message.tool_calls
-            if candidate.id == call.id
+        (evidence,) = await self._validated_current_run_evidence(
+            run,
+            call,
+            (evidence_call_id,),
+            error_code="artifact_snapshot_evidence_invalid",
+            error_message=(
+                "Result snapshot evidence must be one earlier successful "
+                "current-run result with validated execution lineage."
+            ),
         )
-        evidence_calls = tuple(
-            (message_index, candidate)
-            for message_index, message in enumerate(transcript.messages)
-            if message.role is MessageRole.ASSISTANT
-            for candidate in message.tool_calls
-            if candidate.id == evidence_call_id
-        )
-        evidence_results = tuple(
-            (message_index, block)
-            for message_index, message in enumerate(transcript.messages)
-            if message.role is MessageRole.TOOL
-            for block in message.content
-            if isinstance(block, ToolResultBlock) and block.call_id == evidence_call_id
-        )
-        current_valid = (
-            len(current_calls) == 1
-            and current_calls[0][1].name == call.name
-            and current_calls[0][1].arguments == call.arguments
-        )
-        ordered_evidence = (
-            current_valid
-            and len(evidence_calls) == 1
-            and len(evidence_results) == 1
-            and evidence_calls[0][0] < evidence_results[0][0] < current_calls[0][0]
-        )
-        if not ordered_evidence or evidence_results[0][1].is_error:
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "Result snapshot evidence must be one earlier successful current-run call.",
-                {"call_id": evidence_call_id},
-            )
-        producer_call = evidence_calls[0][1]
-        block = evidence_results[0][1]
-        if (
-            block.capability_id is None
-            or block.executor_id is None
-            or block.output_sha256 is None
-            or block.sensitivity is None
-            or not block.sensitivity_provenance
-        ):
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "The selected result lacks validated execution lineage.",
-                {"call_id": evidence_call_id},
-            )
-        try:
-            _view, producer_capability = registry.resolve_tool(producer_call.name)
-            if (
-                producer_capability.id != block.capability_id
-                or producer_capability.executor_id != block.executor_id
-                or block.output_sha256 != _sha256_json(block.output)
-            ):
-                raise ValueError("result execution lineage differs")
-            registry.validate_arguments(
-                producer_capability.id,
-                producer_call.arguments,
-            )
-            if set(block.output) not in (
-                {"kind", "data"},
-                {"kind", "data", "artifact", "delivery_status"},
-            ):
-                raise ValueError("result envelope shape differs")
-            output_kind = block.output.get("kind")
-            result_data = block.output.get("data")
-            if not isinstance(output_kind, str) or not isinstance(result_data, Mapping):
-                raise ValueError("result data is unavailable")
-            registry.validate_output(
-                producer_capability.id,
-                ToolOutput(
-                    kind=output_kind,
-                    data=result_data,
-                    sensitivity=block.sensitivity,
-                    sensitivity_provenance=block.sensitivity_provenance,
-                ),
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise CapabilityInputError(
-                "artifact_snapshot_evidence_invalid",
-                "The selected tool result no longer matches its declared contract.",
-                {"call_id": evidence_call_id},
-            ) from error
+        producer_call = evidence.call
+        block = evidence.block
+        producer_capability = evidence.capability
+        output_kind = evidence.output_kind
+        result_data = evidence.data
+        assert block.sensitivity is not None
         output_provenance = result_data.get("provenance")
         if output_kind == "mcp.read.result" and (
             not isinstance(output_provenance, Mapping)
@@ -2036,15 +2273,43 @@ class ArtifactCapabilityDomain:
         del request_sensitivity
         if output.artifact is not None:
             self._validate_artifact_summary(capability, output)
+            bound_artifact = await self._bind_provenance(
+                run,
+                call,
+                capability,
+                arguments,
+                output.artifact,
+            )
             output = replace(
                 output,
-                artifact=await self._bind_provenance(
-                    run,
-                    capability,
-                    arguments,
-                    output.artifact,
-                ),
+                artifact=bound_artifact,
             )
+            if capability.id == ARTIFACT_CREATE_TABULAR_CAPABILITY_ID or (
+                capability.id == DOCUMENT_CREATE_CAPABILITY_ID
+                and bound_artifact.provenance.evidence_call_ids
+            ):
+                artifact_sensitivity = ModelSensitivity(
+                    bound_artifact.sensitivity.value
+                )
+                if output.sensitivity is None:
+                    output = replace(
+                        output,
+                        sensitivity=artifact_sensitivity,
+                        sensitivity_provenance={
+                            "authority": "artifact_domain_bound_provenance",
+                            "capability_id": capability.id,
+                            "authorship": bound_artifact.provenance.authorship.value,
+                            "evidence_call_ids": (
+                                bound_artifact.provenance.evidence_call_ids
+                            ),
+                        },
+                    )
+                elif (
+                    output.sensitivity.routing_rank < artifact_sensitivity.routing_rank
+                ):
+                    raise ToolOutputValidationError(
+                        "artifact result sensitivity is lower than its committed draft"
+                    )
         if capability.operational_effect is not OperationalEffect.NONE and not (
             capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
             and output.data.get("outcome") == "failed"
@@ -2148,15 +2413,28 @@ class ArtifactCapabilityDomain:
                     raise ToolOutputValidationError(
                         "artifact edit summary differs from its execution provenance"
                     )
+            elif capability.id == ARTIFACT_CREATE_TABULAR_CAPABILITY_ID:
+                format_name = output.data.get("format")
+                expected_media_type = (
+                    {
+                        "csv": "text/csv",
+                        "xlsx": XLSX_MEDIA_TYPE,
+                        "html": HTML_MEDIA_TYPE,
+                    }.get(format_name)
+                    if isinstance(format_name, str)
+                    else None
+                )
+                if (
+                    expected_media_type != draft.media_type
+                    or output.data.get("filename") != draft.suggested_filename
+                    or output.data.get("evidence_call_ids")
+                    != draft.provenance.evidence_call_ids
+                ):
+                    raise ToolOutputValidationError(
+                        "model-authored table summary differs from its artifact"
+                    )
             return
-        if capability.id in _EXACT_TABULAR_CAPABILITIES:
-            valid = (
-                output.data.get("format") in {"csv", "xlsx"}
-                and output.data.get("filename") == draft.suggested_filename
-                and output.data.get("row_count") == draft.provenance.row_count
-                and output.data.get("column_count") == len(draft.provenance.columns)
-            )
-        elif capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
+        if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
             valid = (
                 output.data.get("source_artifact_id")
                 == draft.provenance.derived_from_artifact_id
@@ -2177,6 +2455,7 @@ class ArtifactCapabilityDomain:
     async def _bind_provenance(
         self,
         run: RunInput,
+        call: ToolCall,
         capability: Capability,
         arguments: Mapping[str, object],
         draft: ArtifactDraft,
@@ -2217,13 +2496,6 @@ class ArtifactCapabilityDomain:
                 )
             return draft
         if provenance.authorship is ArtifactAuthorship.EXACT_SOURCE_DATA:
-            if capability.id in _EXACT_TABULAR_CAPABILITIES:
-                return await self._bind_exact_export(
-                    run,
-                    capability,
-                    arguments,
-                    draft,
-                )
             if capability.id == ARTIFACT_CONVERT_CAPABILITY_ID:
                 return await self._bind_conversion(run, arguments, draft)
             raise ToolOutputValidationError(
@@ -2239,64 +2511,26 @@ class ArtifactCapabilityDomain:
                     authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
                 ),
             )
-        try:
-            transcript = await self._transcripts.load(run.id)
-        except KeyError as error:
-            raise CapabilityInputError(
-                "invalid_argument_value",
-                "Artifact evidence must reference the current run.",
-                {"name": "evidence_call_ids"},
-            ) from error
-        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
-            raise CapabilityInputError(
-                "invalid_argument_value",
-                "Artifact evidence belongs to another run.",
-                {"name": "evidence_call_ids"},
-            )
+        evidence_results = await self._validated_current_run_evidence(
+            run,
+            call,
+            provenance.evidence_call_ids,
+            error_code="artifact_evidence_invalid",
+            error_message=(
+                "Artifact evidence must reference earlier successful current-run "
+                "results with validated execution lineage."
+            ),
+        )
         bindings: dict[tuple[str, str], ArtifactResourceBinding] = {}
         sensitivities = [draft.sensitivity]
         schema_cache: dict[str, dict[str, ResourceSchema]] = {}
-        for call_id in provenance.evidence_call_ids:
-            results = tuple(
-                block
-                for message in transcript.messages
-                if message.role is MessageRole.TOOL
-                for block in message.content
-                if isinstance(block, ToolResultBlock) and block.call_id == call_id
-            )
-            call_exists = any(
-                candidate.id == call_id
-                for message in transcript.messages
-                if message.role is MessageRole.ASSISTANT
-                for candidate in message.tool_calls
-            )
-            if len(results) != 1 or not call_exists or results[0].is_error:
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence must reference one earlier successful data call.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            block = results[0]
-            if block.output.get("kind") not in {
-                "data.sqlite.query_result",
-                "data.postgresql.query_result",
-                "data.local_file.read_result",
-            }:
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence must reference a validated data result.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            data = block.output.get("data")
-            if not isinstance(data, Mapping):
-                raise CapabilityInputError(
-                    "invalid_argument_value",
-                    "Artifact evidence result data is unavailable.",
-                    {"name": "evidence_call_ids", "call_id": call_id},
-                )
-            if block.sensitivity is not None:
-                sensitivities.append(Sensitivity(block.sensitivity.value))
-            if block.output.get("kind") == "data.local_file.read_result":
+        for evidence in evidence_results:
+            call_id = evidence.call.id
+            block = evidence.block
+            data = evidence.data
+            assert block.sensitivity is not None
+            sensitivities.append(Sensitivity(block.sensitivity.value))
+            if evidence.output_kind != "data.query_result":
                 continue
             source_id = data.get("source_id")
             source_revision = data.get("source_revision")
@@ -2404,107 +2638,6 @@ class ArtifactCapabilityDomain:
             )
         return draft
 
-    async def _bind_exact_export(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-        draft: ArtifactDraft,
-    ) -> ArtifactDraft:
-        source_id = arguments.get("source_id")
-        sql = arguments.get("sql")
-        parameters = arguments.get("parameters", ())
-        if (
-            not isinstance(source_id, str)
-            or not isinstance(sql, str)
-            or not isinstance(parameters, tuple)
-        ):
-            raise ToolOutputValidationError(
-                "exact export execution arguments are unavailable"
-            )
-        expected_adapter = (
-            "postgresql"
-            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
-            else "sqlite"
-        )
-        if (
-            await self._catalog.source_adapter_id(
-                run.agent_id,
-                source_id,
-            )
-            != expected_adapter
-        ):
-            raise _incomplete_export(draft, "catalog_changed")
-        resources = await self._catalog.resource_schemas(run.agent_id, source_id)
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError as error:
-            raise _incomplete_export(draft, "permission_state_invalid") from error
-        if run.execution_scope is not None:
-            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = (
-            validate_postgresql_read
-            if expected_adapter == "postgresql"
-            else validate_sqlite_read
-        )
-        validation = validator(
-            sql,
-            source_id=source_id,
-            resources=resources,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if (
-            not validation.valid
-            or validation.analysis is None
-            or validation.source_revision is None
-            or not validation.resource_ids
-            or len(validation.resource_revisions) != len(validation.resource_ids)
-        ):
-            raise _incomplete_export(draft, "catalog_changed")
-        bindings = tuple(
-            ArtifactResourceBinding(
-                source_id=source_id,
-                source_revision=validation.source_revision,
-                resource_id=resource_id,
-                resource_revision=revision,
-            )
-            for resource_id, revision in sorted(validation.resource_revisions)
-        )
-        parameters_sha256 = (
-            "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
-        )
-        provenance = draft.provenance
-        if (
-            provenance.resource_bindings != bindings
-            or provenance.sql_fingerprint != validation.analysis.sql_fingerprint
-            or provenance.parameters_sha256 != parameters_sha256
-        ):
-            raise ToolOutputValidationError(
-                "exact artifact provenance differs from current runtime facts"
-            )
-        schemas = {item.resource_id: item for item in resources}
-        current: list[Sensitivity] = []
-        for resource_id in validation.resource_ids:
-            schema = schemas.get(resource_id)
-            if schema is None:
-                raise ToolOutputValidationError(
-                    "exact artifact resource is absent from current catalog facts"
-                )
-            try:
-                current.append(Sensitivity(schema.sensitivity_class))
-            except ValueError:
-                current.append(Sensitivity.RESTRICTED)
-        if draft.sensitivity is not _resolved_sensitivity(tuple(current)):
-            raise _incomplete_export(draft, "catalog_changed")
-        return replace(
-            draft,
-            provenance=replace(provenance, resource_bindings=bindings),
-        )
-
     async def _bind_conversion(
         self,
         run: RunInput,
@@ -2575,101 +2708,6 @@ class ArtifactCapabilityDomain:
                 "The requested resource is not available for reading.",
             )
 
-    async def _validate_sql(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: Mapping[str, object],
-    ) -> None:
-        source_id = arguments.get("source_id")
-        sql = arguments.get("sql")
-        parameters = arguments.get("parameters", ())
-        if (
-            not isinstance(source_id, str)
-            or not isinstance(sql, str)
-            or not sql.strip()
-            or not isinstance(parameters, tuple)
-        ):
-            raise CapabilityInputError(
-                "sql_invalid_input",
-                "SQL reads require source_id, non-empty sql, and an array of "
-                "parameters.",
-            )
-        expected = (
-            "postgresql"
-            if capability.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
-            else "sqlite"
-        )
-        if await self._catalog.source_adapter_id(run.agent_id, source_id) != expected:
-            raise CapabilityInputError(
-                "sql_source_adapter_mismatch",
-                "The selected SQL tool does not match the source adapter.",
-                {"expected_adapter": expected, "source_id": source_id},
-            )
-        schemas = await self._catalog.resource_schemas(run.agent_id, source_id)
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError as error:
-            raise CapabilityInputError(
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-            ) from error
-        if run.execution_scope is not None:
-            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
-        validator = (
-            validate_postgresql_read
-            if expected == "postgresql"
-            else validate_sqlite_read
-        )
-        result = validator(
-            sql,
-            source_id=source_id,
-            resources=schemas,
-            parameters=parameters,
-            allowed_resource_ids=readable,
-        )
-        if not result.valid:
-            if {item.code for item in result.issues} & {
-                "resource_out_of_scope",
-                "unknown_resource",
-            }:
-                raise CapabilityInputError(
-                    "resource_read_not_allowed",
-                    "One or more requested resources are not available for reading.",
-                )
-            raise CapabilityInputError(
-                "sql_validation_failed",
-                "The SQL read is invalid. Correct all reported issues before "
-                "retrying.",
-                {
-                    "issues": tuple(
-                        {
-                            "code": item.code,
-                            "message": item.message,
-                            "details": item.details,
-                        }
-                        for item in result.issues
-                    ),
-                    "source_id": source_id,
-                },
-            )
-
-
-def _incomplete_export(draft: ArtifactDraft, reason: str) -> ArtifactError:
-    return ArtifactError(
-        "artifact_incomplete_export",
-        "Current catalog facts no longer prove the exact artifact.",
-        {
-            "reason": reason,
-            "completed_rows": draft.provenance.row_count or 0,
-            "completed_columns": len(draft.provenance.columns),
-            "completed_bytes": len(draft.content),
-        },
-    )
-
 
 def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:
     ordered = {
@@ -2687,16 +2725,11 @@ def _sha256_json(value: object) -> str:
     return "sha256:" + sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _tabular_export_capability(
-    *,
-    capability_id: str,
-    executor_id: str,
-    adapter_name: str,
-) -> Capability:
+def _tabular_export_capability() -> Capability:
     return Capability(
-        id=capability_id,
+        id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
         description=(
-            f"Run one fresh validated read-only {adapter_name} query and create one "
+            "Run one fresh validated read-only relational query and create one "
             "complete exact CSV or XLSX artifact without routing rows through the "
             "model."
         ),
@@ -2704,6 +2737,13 @@ def _tabular_export_capability(
             "type": "object",
             "properties": {
                 "source_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "resource_ids": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "uniqueItems": True,
+                },
                 "sql": {
                     "type": "string",
                     "minLength": 1,
@@ -2716,7 +2756,7 @@ def _tabular_export_capability(
                 "format": {"type": "string", "enum": ["csv", "xlsx"]},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
-            "required": ["source_id", "sql", "format"],
+            "required": ["source_id", "resource_ids", "sql", "format"],
             "additionalProperties": False,
         },
         output_kind=TABULAR_EXPORT_OUTPUT_KIND,
@@ -2724,7 +2764,27 @@ def _tabular_export_capability(
             "type": "object",
             "properties": {
                 "format": {"type": "string", "enum": ["csv", "xlsx"]},
+                "adapter_id": {
+                    "type": "string",
+                    "enum": ["sqlite", "postgresql"],
+                },
                 "filename": {"type": "string"},
+                "source_id": {"type": "string"},
+                "source_revision": {"type": "string"},
+                "resource_revisions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "resource_id": {"type": "string"},
+                            "revision": {"type": "string"},
+                        },
+                        "required": ["resource_id", "revision"],
+                        "additionalProperties": False,
+                    },
+                },
                 "row_count": {"type": "integer", "minimum": 0},
                 "column_count": {
                     "type": "integer",
@@ -2732,10 +2792,19 @@ def _tabular_export_capability(
                     "maximum": MAX_CSV_COLUMNS,
                 },
             },
-            "required": ["format", "filename", "row_count", "column_count"],
+            "required": [
+                "adapter_id",
+                "format",
+                "filename",
+                "source_id",
+                "source_revision",
+                "resource_revisions",
+                "row_count",
+                "column_count",
+            ],
             "additionalProperties": False,
         },
-        executor_id=executor_id,
+        executor_id=DATA_EXPORT_TABULAR_EXECUTOR_ID,
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
         artifact_policy=ArtifactPolicy(
@@ -2843,6 +2912,10 @@ def _destination_schema() -> dict[str, object]:
 
 
 __all__ = [
+    "ARTIFACT_CREATE_TABULAR_CAPABILITY_ID",
+    "ARTIFACT_CREATE_TABULAR_EXECUTOR_ID",
+    "ARTIFACT_CREATE_TABULAR_OUTPUT_KIND",
+    "ARTIFACT_CREATE_TABULAR_TOOL_NAME",
     "ARTIFACT_CONVERT_CAPABILITY_ID",
     "ARTIFACT_CONVERT_EXECUTOR_ID",
     "ARTIFACT_CONVERT_OUTPUT_KIND",
@@ -2866,6 +2939,10 @@ __all__ = [
     "ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME",
     "ArtifactCapabilityDomain",
     "ArtifactDomainCatalog",
+    "DATA_EXPORT_TABULAR_EXECUTOR_ID",
+    "DATA_EXPORT_TABULAR_TOOL_NAME",
+    "DataExportTabularDeclarations",
+    "DataExportTabularExecutor",
     "TABULAR_EXPORT_OUTPUT_KIND",
     "DOCUMENT_CREATE_CAPABILITY_ID",
     "DOCUMENT_CREATE_EXECUTOR_ID",
@@ -2874,20 +2951,15 @@ __all__ = [
     "ExactTabularExportBackend",
     "ExactTabularProgress",
     "ExactTabularExportResult",
-    "POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID",
-    "POSTGRESQL_TABULAR_EXPORT_EXECUTOR_ID",
-    "POSTGRESQL_TABULAR_EXPORT_TOOL_NAME",
-    "PostgreSQLTabularExportExecutor",
+    "ModelTabularArtifactExecutor",
     "RESULT_SNAPSHOT_CAPABILITY_ID",
     "RESULT_SNAPSHOT_EXECUTOR_ID",
     "RESULT_SNAPSHOT_OUTPUT_KIND",
     "RESULT_SNAPSHOT_TOOL_NAME",
     "ResultSnapshotExecutor",
-    "SQLITE_TABULAR_EXPORT_CAPABILITY_ID",
-    "SQLITE_TABULAR_EXPORT_EXECUTOR_ID",
-    "SQLITE_TABULAR_EXPORT_TOOL_NAME",
-    "SQLiteTabularExportExecutor",
     "artifact_capability_declarations",
     "artifact_declarations",
+    "data_export_tabular_capability_declarations",
+    "data_export_tabular_declarations",
     "resolved_exact_export_sensitivity",
 ]

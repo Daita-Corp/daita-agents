@@ -196,7 +196,7 @@ async def test_scheduled_scope_cannot_discover_or_inspect_distribution() -> None
         job_revision=None,
         allowed_source_ids=("source-1",),
         allowed_resource_ids=("resource-1",),
-        allowed_capability_ids=("data.sqlite.query",),
+        allowed_capability_ids=("data.query",),
         allowed_access_modes=frozenset({AccessMode.READ}),
         allowed_operational_effects=frozenset({OperationalEffect.NONE}),
         sensitivity_ceiling=ModelSensitivity.INTERNAL,

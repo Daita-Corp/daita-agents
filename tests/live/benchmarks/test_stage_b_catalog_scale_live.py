@@ -62,7 +62,7 @@ async def test_immediate_target_survives_catalog_distractors(
         assert_completed(capture)
         record_metrics(record_property, DEFAULT_MODEL_ID, capture)
         names = logical_names(capture.transcript)
-        assert "data_query_sqlite" in names
+        assert "data_query" in names
         assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
         assert capture.result.usage.total_tokens <= 30_000
@@ -70,7 +70,7 @@ async def test_immediate_target_survives_catalog_distractors(
         assert IMMEDIATE_TOKEN in capture.result.final_text
         assert str(IMMEDIATE_AMOUNT) in capture.result.final_text
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 @pytest.mark.parametrize("distractor_tables", _CATALOG_SIZES)
@@ -108,7 +108,7 @@ async def test_profile_target_survives_catalog_distractors(
         await assert_profile_result(fixture.agent, job_id)
         assert capture.result.usage.total_tokens <= 30_000
     finally:
-        await fixture.agent.close()
+        await fixture.close()
 
 
 def test_catalog_scale_inventory_is_strictly_increasing_and_bounded() -> None:

@@ -291,25 +291,31 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
         calls = (
             ToolCall(
                 id="denied-name",
-                name="data_query_sqlite",
+                name="data_query",
                 arguments={
                     "source_id": source_id,
+                    "resource_ids": (resources["child"].id,),
                     "sql": "SELECT * FROM child",
                 },
             ),
             ToolCall(
                 id="missing-name",
-                name="data_query_sqlite",
+                name="data_query",
                 arguments={
                     "source_id": source_id,
+                    "resource_ids": (f"{source_id}:main.guessed_secret",),
                     "sql": "SELECT * FROM guessed_secret",
                 },
             ),
             ToolCall(
                 id="mixed-read",
-                name="data_query_sqlite",
+                name="data_query",
                 arguments={
                     "source_id": source_id,
+                    "resource_ids": (
+                        resources["parent"].id,
+                        resources["child"].id,
+                    ),
                     "sql": "SELECT * FROM parent JOIN child ON parent.id = child.parent_id",
                 },
             ),

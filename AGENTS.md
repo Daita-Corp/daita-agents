@@ -147,6 +147,14 @@ executor, and domain identities. It projects tool schemas and validates model
 arguments and executor output. A tool is a model-facing view of a capability,
 not another execution path.
 
+`toolbox_search` accepts only a natural-language `query` and optional bounded
+`limit` over the run's applicable catalog. Toolbox grouping, access modes, and
+operational effects are metadata, not model-selected search filters. Improve
+discovery vocabulary in existing `ToolPresentation` records without changing
+capability execution contracts. `toolbox_load` accepts exact on-demand names
+directly; search is unnecessary when those names are known. Neither control
+grants authority or bypasses current admission and approval checks.
+
 `daita.capability_runtime.CapabilityRuntime` is the sole production boundary
 between model tool calls and execution. For each call it:
 
@@ -231,6 +239,15 @@ records the parent artifact. There is no public agent-wide inventory, hidden
 current-file pointer, raw model path/byte interface, or alternate artifact
 execution path.
 
+`artifact_create_tabular` creates one bounded model-authored CSV, XLSX, or
+HTML table from exact earlier successful tool-call IDs in the current run. The
+artifact domain authenticates each result against the immutable registry and
+persisted transcript, rejects failed, stale, reordered, cross-run, or tampered
+lineage, inherits the highest result sensitivity, and preserves current
+relational resource revisions where present. The artifact remains explicitly
+derived analysis rather than exact or complete source data. Exact complete
+relational export remains the separate `data_export_tabular` capability.
+
 ## Remote MCP reads
 
 Remote MCP support uses one bounded server-neutral Streamable HTTP client.
@@ -300,8 +317,7 @@ capabilities with `OperationalEffect.NONE` and read/none data access. It can
 create only these artifacts:
 
 - `artifact.create_document`;
-- `data.sqlite.export_tabular`;
-- `data.postgresql.export_tabular`; and
+- `data.export_tabular`;
 - `artifact.snapshot_result`.
 
 `artifact.snapshot_result` produces bounded canonical `application/json` from
@@ -388,9 +404,26 @@ payloads end inside provider adapters. `daita.llm.routing` handles retry and
 fallback decisions from normalized failures; `AgentLoop` does not retry a
 whole run or inspect provider-specific failures.
 
+Provider lifecycle follows explicit ownership. Providers constructed from an
+agent's persisted model route are closed by `EmbeddedAgent` after runs and
+supervisors drain. Providers injected by a caller remain caller-owned and may
+be reused across agent instances. Each provider closes only SDK clients it
+created; injected SDK clients remain borrowed. Temporary validation and
+candidate-review providers are closed by the component that creates them.
+
+Owners stop new work and drain active calls before closing a provider. Close
+callers join one cancellation-safe cleanup task; repeated calls observe the
+same completion or failure without retrying SDK cleanup. Adapters scope
+request-stream cleanup to completion, failure, cancellation, or early exit.
+Canonical stream wrappers finalize in the iteration context and propagate
+closure to their delegate; releasing a request stream never closes a borrowed
+provider or SDK client. Verify underlying transport release with actual-SDK
+tests rather than assuming that closing a public SDK generator releases it.
+
 To add a provider:
 
-1. implement `ModelProvider` under `src/daita/llm/providers/`;
+1. implement `ManagedModelProvider` under `src/daita/llm/providers/` with an
+   idempotent `close()` method;
 2. keep native wire models and translation inside that adapter;
 3. import the SDK lazily and provide normalized pipx repair guidance;
 4. register construction in `src/daita/llm/factory.py`;

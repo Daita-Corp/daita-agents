@@ -24,6 +24,10 @@ async def run() -> None:
         agent = await create_offline_agent("catalog-joins", root, model)
         try:
             source = await agent.attach(SQLiteSource(database, name="Sales"))
+            resources = {
+                resource.name: resource
+                for resource in await agent.list_catalog_resources(source_id=source.id)
+            }
             model.extend(
                 tool_response(
                     "find-orders",
@@ -32,9 +36,13 @@ async def run() -> None:
                 ),
                 tool_response(
                     "join-orders",
-                    "data_query_sqlite",
+                    "data_query",
                     {
                         "source_id": source.id,
+                        "resource_ids": (
+                            resources["orders"].id,
+                            resources["customers"].id,
+                        ),
                         "sql": (
                             "SELECT o.id, c.name, o.status, o.amount "
                             "FROM orders AS o JOIN customers AS c "

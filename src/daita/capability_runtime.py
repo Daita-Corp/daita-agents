@@ -20,7 +20,6 @@ from .artifacts.models import (
 from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
     TOOLBOX_DEFINITIONS,
-    AccessMode,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
@@ -351,8 +350,8 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
         ToolDefinition(
             name="toolbox_search",
             description=(
-                "Search bounded metadata for applicable tools. Search does not load "
-                "a tool or grant execution authority."
+                "Find applicable tools by describing the task in query. Returns "
+                "bounded metadata; does not load tools or grant authority."
             ),
             input_schema={
                 "type": "object",
@@ -361,32 +360,6 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": limits.max_toolbox_search_query_characters,
-                    },
-                    "toolboxes": {
-                        "type": "array",
-                        "description": "Optional canonical toolbox filter.",
-                        "items": {
-                            "type": "string",
-                            "enum": [item.value for item in ToolboxId],
-                        },
-                        "maxItems": limits.max_toolbox_manifest_entries,
-                        "uniqueItems": True,
-                    },
-                    "data_access": {
-                        "type": "string",
-                        "description": (
-                            "External/source-data filter; lifecycle reads use none. "
-                            "Omit when uncertain."
-                        ),
-                        "enum": [item.value for item in AccessMode],
-                    },
-                    "operational_effect": {
-                        "type": "string",
-                        "description": (
-                            "External operational-effect filter; Daita-owned "
-                            "artifact creation remains none. Omit when uncertain."
-                        ),
-                        "enum": [item.value for item in OperationalEffect],
                     },
                     "limit": {
                         "type": "integer",
@@ -1168,15 +1141,11 @@ class CapabilityRuntime:
         sensitivity: ModelSensitivity,
     ) -> ToolResultBlock:
         query = call.arguments.get("query")
-        toolboxes_value = call.arguments.get("toolboxes", ())
-        access_value = call.arguments.get("data_access")
-        operational_effect = call.arguments.get("operational_effect")
         limit_value = call.arguments.get(
             "limit", min(5, self._limits.max_toolbox_search_results)
         )
         if (
             not isinstance(query, str)
-            or not isinstance(toolboxes_value, (tuple, list))
             or not isinstance(limit_value, int)
             or isinstance(limit_value, bool)
         ):
@@ -1185,22 +1154,9 @@ class CapabilityRuntime:
                 "toolbox_search_invalid",
                 "The toolbox search arguments are invalid.",
             )
-        toolboxes = frozenset(item for item in toolboxes_value if isinstance(item, str))
         loaded_names = {entry.view.name for entry in projection.loaded_entries}
         scored: list[tuple[int, str, str, RunToolCatalogEntry]] = []
         for entry in projection.catalog_entries:
-            if toolboxes and entry.toolbox_id.value not in toolboxes:
-                continue
-            if (
-                access_value is not None
-                and entry.capability.access_mode.value != access_value
-            ):
-                continue
-            if (
-                operational_effect is not None
-                and entry.capability.operational_effect.value != operational_effect
-            ):
-                continue
             score = _toolbox_search_score(query, entry)
             if score > 0:
                 scored.append((score, entry.toolbox_id.value, entry.view.name, entry))

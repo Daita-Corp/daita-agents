@@ -106,33 +106,7 @@ BUILTIN_SLASH_COMMAND_ROOTS = frozenset(
     display.split(maxsplit=1)[0]
     for _insertion, display, _description in SLASH_COMMAND_COMPLETIONS
 )
-BUILTIN_SLASH_COMMANDS = frozenset(
-    {
-        "/agent",
-        "/catalog",
-        "/conversation",
-        "/exit",
-        "/files",
-        "/help",
-        "/inbox",
-        "/jobs",
-        "/learn",
-        "/memory",
-        "/mcp",
-        "/model",
-        "/new",
-        "/review",
-        "/resume",
-        "/routines",
-        "/settings",
-        "/source",
-        "/sources",
-        "/skills",
-        "/status",
-        "/user",
-        "/workspace",
-    }
-)
+BUILTIN_SLASH_COMMANDS = BUILTIN_SLASH_COMMAND_ROOTS
 HELP_TEXT = (
     "Type / to browse commands and their descriptions.\n"
     'Use @"source name" <question> to ask another source directly.\n'

@@ -21,11 +21,14 @@ from _workspace_support import workspace_for
 
 from daita import (
     Agent,
+    ApprovalDecision,
+    ApprovalRequest,
     PostgreSQLSource,
     Skill,
     SkillSummary,
     cli,
 )
+from daita._json import FrozenJsonObject
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -317,6 +320,7 @@ def test_zero_argument_cli_dispatches_to_the_terminal_application():
     assert call is not None
     assert call.kwargs["root"] is None
     assert call.kwargs["agent_name"] is None
+    assert call.kwargs["conversation_id"] is None
 
 
 def test_zero_argument_cli_rejects_non_tty_before_terminal_dispatch():
@@ -409,7 +413,14 @@ def test_chat_subcommand_is_a_strict_alias_of_the_textual_app():
         new=AsyncMock(return_value=0),
     ) as run_terminal:
         code, stdout, stderr = _invoke(
-            ["chat", "atlas", "--model", "mock:scripted"],
+            [
+                "chat",
+                "atlas",
+                "--model",
+                "mock:scripted",
+                "--conversation",
+                "conversation-1",
+            ],
             tty=True,
         )
 
@@ -420,6 +431,7 @@ def test_chat_subcommand_is_a_strict_alias_of_the_textual_app():
     await_args = run_terminal.await_args
     assert await_args is not None
     assert await_args.kwargs["agent_name"] == "atlas"
+    assert await_args.kwargs["conversation_id"] == "conversation-1"
 
 
 def test_attach_parser_builds_postgresql_source_with_secret_reference():
@@ -483,7 +495,11 @@ def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
         assert create_stderr == ""
 
         provider = MockModelProvider((_stop("bounded answer"),))
-        with patch.object(cli, "create_llm_provider", return_value=provider):
+        provider_close = AsyncMock()
+        with (
+            patch.object(cli, "create_llm_provider", return_value=provider),
+            patch.object(provider, "close", new=provider_close),
+        ):
             code, stdout, stderr = _invoke(
                 [
                     "--root",
@@ -504,6 +520,29 @@ def test_current_run_writes_exactly_one_terminal_json_record_to_stdout():
     assert records[0]["text"] == "bounded answer"
     assert {"run_id", "status", "reason", "text", "steps"} <= set(records[0])
     provider.assert_consumed()
+    provider_close.assert_awaited_once()
+
+
+def test_run_closes_cli_owned_provider_when_agent_open_fails():
+    provider = MockModelProvider(())
+    provider_close = AsyncMock()
+    arguments = cli.build_parser().parse_args(
+        ["run", "runner", "question", "--model", "mock:scripted"]
+    )
+
+    with (
+        patch.object(
+            cli, "_model_configuration", return_value=(provider, provider.model_profile)
+        ),
+        patch.object(
+            Agent, "open", new=AsyncMock(side_effect=RuntimeError("open failed"))
+        ),
+        patch.object(provider, "close", new=provider_close),
+        pytest.raises(RuntimeError, match="open failed"),
+    ):
+        asyncio.run(cli._execute(arguments))
+
+    provider_close.assert_awaited_once()
 
 
 def test_run_without_model_opens_the_persisted_route_without_injection():
@@ -802,6 +841,75 @@ def test_cli_2_chat_rejects_non_tty_streams_before_provider_or_agent_open():
     )
     provider_factory.assert_not_called()
     agent_open.assert_not_awaited()
+
+
+def _approval_request(arguments: dict[str, object]) -> ApprovalRequest:
+    return ApprovalRequest(
+        run_id="run-1",
+        call_id="call-1",
+        tool_name="data_update_postgresql",
+        capability_id="data.postgresql.update",
+        arguments=FrozenJsonObject.from_mapping(arguments),
+        reason="update one row",
+    )
+
+
+def test_cli_approval_displays_the_exact_canonical_review_document():
+    request = _approval_request({"city": "Montréal", "count": 1})
+    rendered = request.render_arguments_for_review()
+    assert rendered is not None
+    stdout = io.StringIO()
+
+    with (
+        redirect_stdout(stdout),
+        patch("builtins.input", return_value="y") as prompt,
+    ):
+        decision = asyncio.run(cli._prompt_for_exact_approval(request))
+
+    assert decision is ApprovalDecision.APPROVE
+    assert stdout.getvalue() == (
+        "Approval required\n\n"
+        "Tool:       data_update_postgresql\n"
+        "Capability: data.postgresql.update\n"
+        "Change:     update one row\n"
+        "Arguments:\n"
+        f"{rendered}\n"
+    )
+    assert "Montr\\u00e9al" in stdout.getvalue()
+    assert "Montréal" not in stdout.getvalue()
+    prompt.assert_called_once_with("Approve this exact change once? [y/n]")
+
+
+def test_cli_approval_denies_unreviewable_arguments_without_prompting():
+    request = _approval_request({"blob": "x" * (70 * 1024)})
+    assert request.render_arguments_for_review() is None
+    stdout = io.StringIO()
+
+    with (
+        redirect_stdout(stdout),
+        patch("builtins.input") as prompt,
+    ):
+        decision = asyncio.run(cli._prompt_for_exact_approval(request))
+
+    assert decision is ApprovalDecision.DENY
+    assert stdout.getvalue() == ""
+    prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("answer", ["n", EOFError()])
+def test_cli_approval_explicit_no_and_eof_still_deny(answer: str | EOFError):
+    request = _approval_request({"count": 1})
+    stdout = io.StringIO()
+    input_patch = (
+        patch("builtins.input", side_effect=answer)
+        if isinstance(answer, EOFError)
+        else patch("builtins.input", return_value=answer)
+    )
+
+    with redirect_stdout(stdout), input_patch:
+        decision = asyncio.run(cli._prompt_for_exact_approval(request))
+
+    assert decision is ApprovalDecision.DENY
 
 
 def test_cli_3_run_still_installs_no_approval_handler():

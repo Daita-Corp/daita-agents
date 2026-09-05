@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 
+import pytest
 from _capability_runtime_support import execute_projected
 from _toolbox_model_support import (
     ToolboxAwareMockModelProvider as MockModelProvider,
@@ -23,10 +24,11 @@ from daita import (
     SemanticFieldReference,
     SemanticKind,
     SemanticSubject,
-    cli,
 )
+from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
+    MessageRole,
     ModelProfile,
     ModelResponse,
     TextBlock,
@@ -40,6 +42,63 @@ from daita.tui.controller import PresentationController
 
 NOW = datetime(2026, 7, 28, 16, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits()
+
+
+@pytest.mark.parametrize("fail_learning", (False, True))
+async def test_explicit_learning_intent_is_host_owned_and_cleared(
+    tmp_path, fail_learning
+):
+    stop = ModelResponse(finish_reason=FinishReason.STOP, text="No durable change.")
+    provider = MockModelProvider(
+        (
+            (
+                ModelProviderError(ProviderErrorCode.INVALID_REQUEST)
+                if fail_learning
+                else stop
+            ),
+            stop,
+        )
+    )
+    agent = await Agent.create(
+        "learning-intent",
+        root=tmp_path,
+        model=provider,
+        model_profile=provider.model_profile,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        learning = await agent.learn(
+            "When we say contribution margin, subtract the risk reserve."
+        )
+        await agent.run("This run was explicitly invoked for durable learning.")
+        system_texts = [
+            "\n".join(
+                block.text
+                for message in request.messages
+                if message.role is MessageRole.SYSTEM
+                for block in message.content
+                if isinstance(block, TextBlock)
+            )
+            for request in provider.requests
+        ]
+        assert (
+            "This run was explicitly invoked for durable learning." in system_texts[0]
+        )
+        assert (
+            "This run was explicitly invoked for durable learning."
+            not in system_texts[1]
+        )
+        assert (
+            "A calculation alone does not fulfill this learning request"
+            in system_texts[0]
+        )
+        assert "approval" in system_texts[0]
+        transcript = await agent.transcript(learning.run_id)
+        assert transcript.messages[0].content == (
+            TextBlock("When we say contribution margin, subtract the risk reserve."),
+        )
+    finally:
+        await agent.close()
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -193,6 +252,26 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         (
             ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="find-definition",
+                        name="toolbox_search",
+                        arguments={"query": "remember metric"},
+                    ),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="load-definition",
+                        name="toolbox_load",
+                        arguments={"tool_names": ["semantic_save"]},
+                    ),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(create,),
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="definition saved"),
@@ -234,6 +313,27 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
     try:
         first = await agent.learn("When we say booked revenue, use invoices.booked_at.")
         assert first.final_text == "definition saved"
+        first_transcript = await agent.transcript(first.run_id)
+        assert tuple(
+            call.name
+            for message in first_transcript.messages
+            for call in message.tool_calls
+        ) == (
+            "toolbox_search",
+            "toolbox_load",
+            "semantic_save",
+        )
+        search_result = next(
+            block
+            for message in first_transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.call_id == "find-definition"
+        )
+        search_data = search_result.output["data"]
+        assert isinstance(search_data, Mapping)
+        matches = search_data["matches"]
+        assert isinstance(matches, tuple)
+        assert matches[0]["tool_name"] == "semantic_save"
         teaching = learning_invocation_message(
             "/learn Correct booked revenue to exclude completed refunds."
         )
@@ -292,10 +392,7 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         await reopened.close()
 
 
-async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states(
-    tmp_path,
-    capsys,
-):
+async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
     database = tmp_path / "semantic-memory-surface.db"
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -456,12 +553,6 @@ async def test_memory_terminal_surface_is_shared_by_cli_and_tui_and_shows_states
         assert "Current SHA-256:" in detail
         assert "Evidence:" in detail
         assert "user_assertion" in detail
-
-        assert await cli._handle_knowledge_chat_command(["/memory"], agent)
-        cli_rendered = capsys.readouterr().out
-        assert "Active data semantics:" in cli_rendered
-        assert "Stale definitions:" in cli_rendered
-        assert "Conflicts:" in cli_rendered
 
         memory_completion = next(
             item for item in SLASH_COMMAND_COMPLETIONS if item[0] == "/memory"

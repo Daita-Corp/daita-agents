@@ -2,10 +2,10 @@ from collections.abc import Mapping
 
 import pytest
 
-from daita.domains.data.capabilities import postgresql_query_capability_declarations
+from daita.domains.data.capabilities import data_query_capability_declarations
 from daita.domains.data.export_capabilities import (
-    POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID,
-    artifact_capability_declarations,
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    data_export_tabular_capability_declarations,
 )
 from daita.domains.data.sql import (
     MAX_SQL_CHARACTERS,
@@ -475,11 +475,11 @@ def test_sql_and_parameter_inputs_are_bounded_before_execution() -> None:
 
 
 def test_model_facing_sql_capabilities_publish_the_same_input_bounds() -> None:
-    query_capability = postgresql_query_capability_declarations().capabilities[0]
+    query_capability = data_query_capability_declarations().capabilities[0]
     export_capability = next(
         item
-        for item in artifact_capability_declarations().capabilities
-        if item.id == POSTGRESQL_TABULAR_EXPORT_CAPABILITY_ID
+        for item in data_export_tabular_capability_declarations().capabilities
+        if item.id == DATA_EXPORT_TABULAR_CAPABILITY_ID
     )
 
     for capability in (query_capability, export_capability):

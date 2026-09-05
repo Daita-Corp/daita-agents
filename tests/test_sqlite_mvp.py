@@ -300,15 +300,17 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
+    resource_id = (await agent.list_catalog_resources(source_id=source.id))[0].id
     provider._script = (
         ModelResponse(
             finish_reason=FinishReason.TOOL_CALLS,
             tool_calls=(
                 ToolCall(
                     id="query-1",
-                    name="data_query_sqlite",
+                    name="data_query",
                     arguments={
                         "source_id": source.id,
+                        "resource_ids": (resource_id,),
                         "sql": "SELECT product, revenue FROM sales ORDER BY revenue DESC",
                     },
                 ),
@@ -356,7 +358,7 @@ async def test_invalid_sql_is_a_model_visible_tool_error(tmp_path):
     provider = MockModelProvider(())
     profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=20_000,
+        context_window_tokens=32_000,
         max_output_tokens=1_000,
         supports_tools=True,
     )
@@ -368,15 +370,17 @@ async def test_invalid_sql_is_a_model_visible_tool_error(tmp_path):
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database))
+    resource_id = (await agent.list_catalog_resources(source_id=source.id))[0].id
     provider._script = (
         ModelResponse(
             finish_reason=FinishReason.TOOL_CALLS,
             tool_calls=(
                 ToolCall(
                     id="bad-query",
-                    name="data_query_sqlite",
+                    name="data_query",
                     arguments={
                         "source_id": source.id,
+                        "resource_ids": (resource_id,),
                         "sql": "DELETE FROM sales",
                     },
                 ),

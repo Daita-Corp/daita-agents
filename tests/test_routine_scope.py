@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -20,12 +21,13 @@ from daita.capabilities import (
     ExecutionScope,
     OperationalEffect,
     ToolExecution,
+    ToolLoadMode,
     ToolOutput,
     ToolView,
     capability_contract_digest,
 )
 from daita.capability_runtime import CapabilityRuntime
-from daita.llm.models import MessageRole, ModelSensitivity, TextBlock
+from daita.llm.models import MessageRole, ModelSensitivity, TextBlock, ToolCall
 from daita.loop.models import (
     InstructionAuthority,
     RunInput,
@@ -192,17 +194,20 @@ async def test_scheduled_catalog_projects_only_explicit_scheduled_direct_tools()
         "test.interactive",
         AutomationEligibility.INTERACTIVE_ONLY,
     )
+    outside = _capability("test.outside", AutomationEligibility.SCHEDULED_DIRECT)
     views = tuple(
         ToolView(
             name=f"tool_{item.id.split('.')[-1]}",
             capability_id=item.id,
             description=item.description,
-            presentation=presentation_metadata(),
+            presentation=presentation_metadata(load_mode=ToolLoadMode.ON_DEMAND),
         )
-        for item in (scheduled, interactive)
+        for item in (scheduled, interactive, outside)
     )
-    executors = tuple(_Executor(item.executor_id) for item in (scheduled, interactive))
-    domain = StaticTestDomain((scheduled, interactive), views)
+    executors = tuple(
+        _Executor(item.executor_id) for item in (scheduled, interactive, outside)
+    )
+    domain = StaticTestDomain((scheduled, interactive, outside), views)
     runtime = CapabilityRuntime(static_registry(domain, executors), (domain,))
 
     catalog = await runtime.prepare_run(
@@ -210,6 +215,43 @@ async def test_scheduled_catalog_projects_only_explicit_scheduled_direct_tools()
     )
 
     assert tuple(item.capability.id for item in catalog.entries) == (scheduled.id,)
+    run = _scheduled_run(_scheduled_scope((scheduled.id, interactive.id)))
+    result = await runtime.execute_all(
+        run,
+        (
+            ToolCall(id="search", name="toolbox_search", arguments={"query": "tool"}),
+            ToolCall(
+                id="exact-denied",
+                name="toolbox_search",
+                arguments={"query": "tool_interactive"},
+            ),
+            ToolCall(
+                id="load-denied",
+                name="toolbox_load",
+                arguments={"tool_names": ["tool_interactive"]},
+            ),
+            ToolCall(
+                id="scope-denied",
+                name="toolbox_load",
+                arguments={"tool_names": ["tool_outside"]},
+            ),
+        ),
+        projection=runtime.project(catalog, ()),
+        messages=(),
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
+    search_data = result.ordered_results[0].output["data"]
+    assert isinstance(search_data, Mapping)
+    matches = search_data["matches"]
+    assert isinstance(matches, tuple)
+    assert tuple(match["tool_name"] for match in matches) == ("tool_scheduled",)
+    denied_search_data = result.ordered_results[1].output["data"]
+    assert isinstance(denied_search_data, Mapping)
+    denied_matches = denied_search_data["matches"]
+    assert isinstance(denied_matches, tuple)
+    assert all(match["tool_name"] != "tool_interactive" for match in denied_matches)
+    assert result.ordered_results[2].is_error
+    assert result.ordered_results[3].is_error
 
 
 def test_scheduled_instruction_is_system_content_without_new_user_speech() -> None:

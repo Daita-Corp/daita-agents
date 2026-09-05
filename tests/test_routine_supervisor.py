@@ -108,7 +108,7 @@ def _routine(
         allowed_source_ids=("source-1",),
         allowed_connector_binding_ids=(),
         allowed_resource_ids=("resource-1",),
-        allowed_capability_ids=("data.sqlite.query",),
+        allowed_capability_ids=("data.query",),
         allowed_access_modes=frozenset({AccessMode.READ}),
         allowed_operational_effects=frozenset({OperationalEffect.NONE}),
         sensitivity_ceiling=ModelSensitivity.INTERNAL,

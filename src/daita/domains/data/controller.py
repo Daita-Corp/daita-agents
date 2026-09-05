@@ -4,11 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from hashlib import sha256
 from typing import Protocol, cast
 
-from ..._json import FrozenJsonObject
+from ..._json import FrozenJsonObject, canonical_json
 from ...adapters.local_file_query import LocalFileQueryError
 from ...adapters.local_workspace import LocalWorkspaceError
+from ...artifacts.models import (
+    ArtifactAuthorship,
+    ArtifactDraft,
+    ArtifactError,
+    ArtifactResourceBinding,
+)
 from ...capabilities import (
     AccessMode,
     Capability,
@@ -17,6 +24,7 @@ from ...capabilities import (
     OperationalEffect,
     ToolExecution,
     ToolOutput,
+    ToolOutputValidationError,
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.capabilities import (
@@ -25,6 +33,7 @@ from ...catalog.capabilities import (
     CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
+from ...catalog.models import Sensitivity
 from ...llm.models import ModelSensitivity, ToolCall
 from ...loop.models import RunInput, RunOrigin
 from ...storage.sqlite_records import SourcePermissionStateError
@@ -47,10 +56,9 @@ from .sql import (
 )
 
 DATA_DOMAIN_OWNER_ID = "data"
-SQLITE_QUERY_CAPABILITY_ID = "data.sqlite.query"
-SQLITE_QUERY_EVIDENCE_KIND = "data.sqlite.query_result"
-POSTGRESQL_QUERY_CAPABILITY_ID = "data.postgresql.query"
-POSTGRESQL_QUERY_EVIDENCE_KIND = "data.postgresql.query_result"
+DATA_QUERY_CAPABILITY_ID = "data.query"
+DATA_QUERY_EVIDENCE_KIND = "data.query_result"
+DATA_EXPORT_TABULAR_CAPABILITY_ID = "data.export_tabular"
 POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID = "data.postgresql.update_impact"
 POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.postgresql.update_impact"
 POSTGRESQL_UPDATE_CAPABILITY_ID = "data.postgresql.update"
@@ -65,8 +73,8 @@ _CATALOG_CAPABILITIES = frozenset(
         RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
     }
 )
-_QUERY_CAPABILITIES = frozenset(
-    {SQLITE_QUERY_CAPABILITY_ID, POSTGRESQL_QUERY_CAPABILITY_ID}
+_RELATIONAL_READ_CAPABILITIES = frozenset(
+    {DATA_QUERY_CAPABILITY_ID, DATA_EXPORT_TABULAR_CAPABILITY_ID}
 )
 _UPDATE_CAPABILITIES = frozenset(
     {POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID, POSTGRESQL_UPDATE_CAPABILITY_ID}
@@ -79,11 +87,11 @@ _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
         POSTGRESQL_UPDATE_CAPABILITY_ID,
     }
 )
+_RESOURCE_LIST_ARGUMENT_CAPABILITIES = _RELATIONAL_READ_CAPABILITIES
+_RELATIONAL_ADAPTER_IDS = frozenset({"sqlite", "postgresql"})
 _ADAPTER_CAPABILITIES = {
-    "sqlite": frozenset({SQLITE_QUERY_CAPABILITY_ID}),
     "postgresql": frozenset(
         {
-            POSTGRESQL_QUERY_CAPABILITY_ID,
             POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
             POSTGRESQL_UPDATE_CAPABILITY_ID,
         }
@@ -91,9 +99,9 @@ _ADAPTER_CAPABILITIES = {
 }
 _SOURCE_CAPABILITIES = frozenset().union(
     _CATALOG_CAPABILITIES,
+    _RELATIONAL_READ_CAPABILITIES,
     *_ADAPTER_CAPABILITIES.values(),
 )
-_OWNED_CAPABILITIES = _SOURCE_CAPABILITIES | LOCAL_FILE_CAPABILITY_IDS
 
 
 class CatalogSchemaReader(Protocol):
@@ -170,6 +178,7 @@ class DataCapabilityDomain:
         catalog: DataDomainCatalog,
         learning: LearningCandidateGuard,
         *,
+        relational_export_available: bool = True,
         workspace_id: str | None = None,
         workspace_sensitivity: ModelSensitivity | None = None,
         files_only_run_ids: set[str] | None = None,
@@ -177,9 +186,11 @@ class DataCapabilityDomain:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data declarations have the wrong domain owner")
         declared_ids = {item.id for item in declarations.capabilities}
-        expected_ids = (
-            _SOURCE_CAPABILITIES if workspace_id is None else _OWNED_CAPABILITIES
-        )
+        expected_ids = _SOURCE_CAPABILITIES
+        if not relational_export_available:
+            expected_ids -= {DATA_EXPORT_TABULAR_CAPABILITY_ID}
+        if workspace_id is not None:
+            expected_ids |= LOCAL_FILE_CAPABILITY_IDS
         if declared_ids != expected_ids:
             raise ValueError(
                 "data declarations must exactly match supported native capabilities"
@@ -266,6 +277,10 @@ class DataCapabilityDomain:
                 continue
             if capability.id in LOCAL_FILE_CAPABILITY_IDS:
                 if self._workspace_id is not None and run.origin is RunOrigin.USER:
+                    names.append(name)
+                continue
+            if capability.id in _RELATIONAL_READ_CAPABILITIES:
+                if active_adapter_ids & _RELATIONAL_ADAPTER_IDS:
                     names.append(name)
                 continue
             required_adapter = next(
@@ -387,8 +402,8 @@ class DataCapabilityDomain:
                     "Catalog schema requires a non-empty query or explicit resource "
                     "IDs and an optional non-empty current source scope.",
                 )
-        if capability.id in _QUERY_CAPABILITIES:
-            await self._validate_sql(run, capability, arguments)
+        if capability.id in _RELATIONAL_READ_CAPABILITIES:
+            arguments = await self._validate_sql(run, arguments)
         if capability.id in _UPDATE_CAPABILITIES:
             await self._validate_postgresql_update_call(
                 run,
@@ -423,9 +438,141 @@ class DataCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
         del request_sensitivity
+        if capability.id == DATA_EXPORT_TABULAR_CAPABILITY_ID:
+            self._validate_export_summary(output)
+            assert output.artifact is not None
+            output = replace(
+                output,
+                artifact=await self._bind_exact_export(
+                    run,
+                    arguments,
+                    output.artifact,
+                ),
+            )
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.mark_effect_succeeded(run.id)
         return await self._classify(run, call, capability, output)
+
+    @staticmethod
+    def _validate_export_summary(output: ToolOutput) -> None:
+        draft = output.artifact
+        if (
+            draft is None
+            or draft.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA
+        ):
+            raise ToolOutputValidationError(
+                "relational export did not return one exact-source artifact"
+            )
+        valid = (
+            bool(draft.provenance.resource_bindings)
+            and output.data.get("adapter_id") in _RELATIONAL_ADAPTER_IDS
+            and output.data.get("format") in {"csv", "xlsx"}
+            and output.data.get("filename") == draft.suggested_filename
+            and output.data.get("source_id")
+            == draft.provenance.resource_bindings[0].source_id
+            and output.data.get("row_count") == draft.provenance.row_count
+            and output.data.get("column_count") == len(draft.provenance.columns)
+        )
+        if not valid:
+            raise ToolOutputValidationError(
+                "relational export summary differs from its execution provenance"
+            )
+
+    async def _bind_exact_export(
+        self,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        draft: ArtifactDraft,
+    ) -> ArtifactDraft:
+        source_id = arguments.get("source_id")
+        resource_ids = arguments.get("resource_ids")
+        sql = arguments.get("sql")
+        parameters = arguments.get("parameters", ())
+        adapter_id = arguments.get("_adapter_id")
+        if (
+            not isinstance(source_id, str)
+            or not isinstance(resource_ids, tuple)
+            or not resource_ids
+            or any(not isinstance(item, str) for item in resource_ids)
+            or not isinstance(sql, str)
+            or not isinstance(parameters, tuple)
+            or adapter_id not in _RELATIONAL_ADAPTER_IDS
+        ):
+            raise ToolOutputValidationError(
+                "relational export execution arguments are unavailable"
+            )
+        if await self._catalog.source_adapter_id(run.agent_id, source_id) != adapter_id:
+            raise _incomplete_export(draft, "catalog_changed")
+        resources = await self._catalog.resource_schemas(run.agent_id, source_id)
+        try:
+            readable = await self._catalog.readable_resource_ids(
+                run.agent_id,
+                (source_id,),
+            )
+        except SourcePermissionStateError as error:
+            raise _incomplete_export(draft, "permission_state_invalid") from error
+        if run.execution_scope is not None:
+            readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
+        validator = (
+            validate_postgresql_read
+            if adapter_id == "postgresql"
+            else validate_sqlite_read
+        )
+        validation = validator(
+            sql,
+            source_id=source_id,
+            resources=resources,
+            parameters=parameters,
+            allowed_resource_ids=readable,
+        )
+        if (
+            not validation.valid
+            or validation.analysis is None
+            or validation.source_revision is None
+            or not validation.resource_ids
+            or frozenset(validation.resource_ids) != frozenset(resource_ids)
+            or len(validation.resource_revisions) != len(validation.resource_ids)
+        ):
+            raise _incomplete_export(draft, "catalog_changed")
+        bindings = tuple(
+            ArtifactResourceBinding(
+                source_id=source_id,
+                source_revision=validation.source_revision,
+                resource_id=resource_id,
+                resource_revision=revision,
+            )
+            for resource_id, revision in sorted(validation.resource_revisions)
+        )
+        parameters_sha256 = (
+            "sha256:" + sha256(canonical_json(parameters).encode("utf-8")).hexdigest()
+        )
+        provenance = draft.provenance
+        if (
+            provenance.resource_bindings != bindings
+            or provenance.sql_fingerprint != validation.analysis.sql_fingerprint
+            or provenance.parameters_sha256 != parameters_sha256
+        ):
+            raise ToolOutputValidationError(
+                "exact artifact provenance differs from current runtime facts"
+            )
+        schemas = {item.resource_id: item for item in resources}
+        current: list[Sensitivity] = []
+        for resource_id in validation.resource_ids:
+            schema = schemas.get(resource_id)
+            if schema is None:
+                raise ToolOutputValidationError(
+                    "exact artifact resource is absent from current catalog facts"
+                )
+            try:
+                current.append(Sensitivity(schema.sensitivity_class))
+            except ValueError:
+                current.append(Sensitivity.RESTRICTED)
+        if draft.sensitivity is not _resolved_sensitivity(tuple(current)):
+            raise _incomplete_export(draft, "catalog_changed")
+        return replace(
+            draft,
+            provenance=replace(provenance, resource_bindings=bindings),
+        )
 
     def normalize_error(
         self,
@@ -478,6 +625,9 @@ class DataCapabilityDomain:
         resource_ids: tuple[object, ...] = ()
         if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
             resource_ids = (arguments.get("resource_id"),)
+        elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
+            raw = arguments.get("resource_ids", ())
+            resource_ids = raw if isinstance(raw, tuple) else ()
         elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
@@ -514,6 +664,9 @@ class DataCapabilityDomain:
         resource_ids: tuple[object, ...] = ()
         if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
             resource_ids = (arguments.get("resource_id"),)
+        elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
+            raw = arguments.get("resource_ids", ())
+            resource_ids = raw if isinstance(raw, tuple) else ()
         elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
@@ -550,42 +703,55 @@ class DataCapabilityDomain:
     async def _validate_sql(
         self,
         run: RunInput,
-        capability: Capability,
         arguments: Mapping[str, object],
-    ) -> None:
+    ) -> FrozenJsonObject:
         source_id = arguments.get("source_id")
+        requested_resource_ids = arguments.get("resource_ids")
         sql = arguments.get("sql")
         parameters = arguments.get("parameters", ())
         if (
             not isinstance(source_id, str)
+            or not isinstance(requested_resource_ids, tuple)
+            or not requested_resource_ids
+            or any(not isinstance(item, str) for item in requested_resource_ids)
             or not isinstance(sql, str)
             or not sql.strip()
             or not isinstance(parameters, tuple)
         ):
             raise CapabilityInputError(
                 "sql_invalid_input",
-                "SQL reads require source_id, non-empty sql, and an array of "
-                "parameters.",
+                "SQL reads require an exact source_id, one or more resource_ids, "
+                "non-empty sql, and an array of parameters.",
             )
-        expected_adapter = (
-            "postgresql"
-            if capability.id == POSTGRESQL_QUERY_CAPABILITY_ID
-            else "sqlite"
-        )
-        actual_adapter = await self._catalog.source_adapter_id(
+        adapter_id = await self._catalog.source_adapter_id(
             run.agent_id,
             source_id,
         )
-        if actual_adapter != expected_adapter:
+        if adapter_id is None:
             raise CapabilityInputError(
-                "sql_source_adapter_mismatch",
-                "The selected SQL tool does not match the source adapter.",
-                {
-                    "actual_adapter": actual_adapter,
-                    "expected_adapter": expected_adapter,
-                    "source_id": source_id,
-                },
+                "sql_source_not_available",
+                "The selected source is not active for this agent.",
+                {"source_id": source_id},
             )
+        if adapter_id not in _RELATIONAL_ADAPTER_IDS:
+            raise CapabilityInputError(
+                "sql_source_adapter_unsupported",
+                "The selected source does not support relational SQL reads.",
+                {"source_id": source_id},
+            )
+        for resource_id in requested_resource_ids:
+            identity = await self._catalog.resource_identity(run.agent_id, resource_id)
+            if identity is None:
+                raise CapabilityInputError(
+                    "resource_read_not_allowed",
+                    "The requested resource is not available for reading.",
+                )
+            if identity[0] != source_id:
+                raise CapabilityInputError(
+                    "sql_resource_source_mismatch",
+                    "Every requested resource must belong to the selected source.",
+                    {"resource_id": resource_id, "source_id": source_id},
+                )
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
         try:
             readable = await self._catalog.readable_resource_ids(
@@ -601,7 +767,7 @@ class DataCapabilityDomain:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
             validate_postgresql_read
-            if expected_adapter == "postgresql"
+            if adapter_id == "postgresql"
             else validate_sqlite_read
         )
         result = validator(
@@ -612,7 +778,18 @@ class DataCapabilityDomain:
             allowed_resource_ids=readable,
         )
         if result.valid:
-            return
+            if frozenset(result.resource_ids) != frozenset(requested_resource_ids):
+                raise CapabilityInputError(
+                    "sql_resource_target_mismatch",
+                    "The SQL query must reference exactly the selected catalog resources.",
+                    {
+                        "source_id": source_id,
+                        "requested_resource_ids": requested_resource_ids,
+                    },
+                )
+            prepared = dict(arguments)
+            prepared["_adapter_id"] = adapter_id
+            return FrozenJsonObject.from_mapping(prepared)
         if {item.code for item in result.issues} & {
             "resource_out_of_scope",
             "unknown_resource",
@@ -657,6 +834,9 @@ class DataCapabilityDomain:
         resource_ids: tuple[object, ...] = ()
         if capability.id in _RESOURCE_ARGUMENT_CAPABILITIES:
             resource_ids = (arguments.get("resource_id"),)
+        elif capability.id in _RESOURCE_LIST_ARGUMENT_CAPABILITIES:
+            raw = arguments.get("resource_ids", ())
+            resource_ids = raw if isinstance(raw, tuple) else ()
         elif capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             raw = arguments.get("resource_ids", ())
             resource_ids = raw if isinstance(raw, tuple) else ()
@@ -807,7 +987,11 @@ class DataCapabilityDomain:
             output,
             sensitivity=sensitivity,
             sensitivity_provenance={
-                "authority": "current_admitted_resource_scope",
+                "authority": (
+                    "artifact_domain_current_scope"
+                    if capability.id == DATA_EXPORT_TABULAR_CAPABILITY_ID
+                    else "current_admitted_resource_scope"
+                ),
                 "capability_id": capability.id,
                 "source_ids": source_ids,
                 "resource_ids": tuple(sorted(readable)),
@@ -815,19 +999,43 @@ class DataCapabilityDomain:
         )
 
 
+def _incomplete_export(draft: ArtifactDraft, reason: str) -> ArtifactError:
+    return ArtifactError(
+        "artifact_incomplete_export",
+        "Current catalog facts no longer prove the exact artifact.",
+        {
+            "reason": reason,
+            "completed_rows": draft.provenance.row_count or 0,
+            "completed_columns": len(draft.provenance.columns),
+            "completed_bytes": len(draft.content),
+        },
+    )
+
+
+def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:
+    ordered = {
+        Sensitivity.PUBLIC: 0,
+        Sensitivity.INTERNAL: 1,
+        Sensitivity.CONFIDENTIAL: 2,
+        Sensitivity.RESTRICTED: 3,
+        Sensitivity.UNKNOWN: 3,
+    }
+    selected = max(values, key=lambda item: ordered[item])
+    return Sensitivity.RESTRICTED if selected is Sensitivity.UNKNOWN else selected
+
+
 __all__ = [
     "CatalogSchemaReader",
     "DATA_DOMAIN_OWNER_ID",
     "DataCapabilityDomain",
     "DataDomainCatalog",
-    "POSTGRESQL_QUERY_CAPABILITY_ID",
-    "POSTGRESQL_QUERY_EVIDENCE_KIND",
+    "DATA_QUERY_CAPABILITY_ID",
+    "DATA_QUERY_EVIDENCE_KIND",
+    "DATA_EXPORT_TABULAR_CAPABILITY_ID",
     "POSTGRESQL_UPDATE_CAPABILITY_ID",
     "POSTGRESQL_UPDATE_EVIDENCE_KIND",
     "POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID",
     "POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND",
     "PostgreSQLUpdateCatalogReader",
     "ReadScopedCatalogReader",
-    "SQLITE_QUERY_CAPABILITY_ID",
-    "SQLITE_QUERY_EVIDENCE_KIND",
 ]

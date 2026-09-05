@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import aclosing
 from typing import Any, cast
 
 import pytest
@@ -34,23 +36,36 @@ from daita.llm.providers.openai_compatible import OpenAICompatibleProvider
 class _NativeStream(AsyncIterator[object]):
     def __init__(self, events: Sequence[object]) -> None:
         self._events = iter(events)
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+    async def aclose(self) -> None:
+        self.closed = True
 
     def __aiter__(self) -> _NativeStream:
         return self
 
     async def __anext__(self) -> object:
         try:
-            return next(self._events)
+            value = next(self._events)
         except StopIteration:
             raise StopAsyncIteration from None
+        if isinstance(value, BaseException):
+            raise value
+        if isinstance(value, asyncio.Event):
+            value.set()
+            await asyncio.Event().wait()
+        return value
 
 
 class _AnthropicStreamManager:
     def __init__(self, events: Sequence[object]) -> None:
-        self._events = events
+        self._stream = _NativeStream(events)
 
     async def __aenter__(self) -> AsyncIterator[object]:
-        return _NativeStream(self._events)
+        return self._stream
 
     async def __aexit__(
         self,
@@ -58,6 +73,7 @@ class _AnthropicStreamManager:
         _exc_value: object,
         _traceback: object,
     ) -> bool | None:
+        await self._stream.close()
         return None
 
 
@@ -181,6 +197,101 @@ def _openai_text_response(text: str) -> dict[str, object]:
         ],
         "usage": None,
     }
+
+
+@pytest.mark.parametrize(
+    "kind", ("openai", "anthropic", "gemini", "custom", "grok", "ollama")
+)
+@pytest.mark.parametrize("mode", ("complete", "failure", "cancel", "early_exit"))
+async def test_native_streams_release_resources_on_every_exit(monkeypatch, kind, mode):
+    opened: list[_NativeStream] = []
+    original_init = _NativeStream.__init__
+
+    def track(self, events):
+        original_init(self, events)
+        opened.append(self)
+
+    monkeypatch.setattr(_NativeStream, "__init__", track)
+    prefix: tuple[object, ...]
+    tail: tuple[object, ...]
+    make: Callable[[Sequence[object]], Any]
+    if kind == "openai":
+        prefix = ({"type": "response.output_text.delta", "delta": "Hello"},)
+        tail = (
+            {"type": "response.completed", "response": _openai_text_response("Hello")},
+        )
+        make = lambda events: OpenAIResponsesProvider(
+            "test-model", client=cast(Any, _OpenAIClient(events))
+        )
+    elif kind == "anthropic":
+        prefix = (
+            _anthropic_message_start(),
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            },
+            {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "text_delta", "text": "Hello"},
+            },
+        )
+        tail = (
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 1},
+            },
+            {"type": "message_stop"},
+        )
+        make = lambda events: AnthropicMessagesProvider(
+            "test-model", client=cast(Any, _AnthropicClient(events))
+        )
+    elif kind == "gemini":
+        prefix = ({"candidates": [{"content": {"parts": [{"text": "Hello"}]}}]},)
+        tail = ({"candidates": [{"finish_reason": "STOP", "content": None}]},)
+        make = lambda events: GeminiProvider(
+            "test-model", client=cast(Any, _GeminiClient(events))
+        )
+    else:
+        prefix = (
+            {
+                "id": "response-1",
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {"content": "Hello"}}],
+            },
+        )
+        tail = ({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},)
+        make = lambda events: _compatible_provider(kind, events)
+    blocked = asyncio.Event()
+    failure = ModelProviderError(
+        ProviderErrorCode.PROVIDER_UNAVAILABLE, "offline stream failure"
+    )
+    if mode == "failure":
+        tail = (failure,)
+    elif mode == "cancel":
+        tail = (blocked,)
+    provider = make(prefix + tail)
+    async with aclosing(cast(Any, provider.stream(_request()))) as stream:
+        assert isinstance(await anext(stream), ModelTextDelta)
+        if mode == "failure":
+            with pytest.raises(ModelProviderError) as caught:
+                await anext(stream)
+            assert caught.value.code is ProviderErrorCode.PROVIDER_UNAVAILABLE
+        elif mode == "cancel":
+            pending = asyncio.ensure_future(anext(stream))
+            await blocked.wait()
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        elif mode == "complete":
+            assert isinstance(await anext(stream), ModelStreamCompleted)
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+    assert len(opened) == 1
+    assert opened[0].closed
 
 
 async def test_openai_native_stream_ignores_empty_deltas_and_uses_terminal_response():

@@ -1,3 +1,4 @@
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -61,6 +62,50 @@ def registration(provider, *, streaming=False, allowed_sensitivities=None):
             else allowed_sensitivities
         ),
     )
+
+
+async def test_router_close_attempts_all_owned_delegates_and_retains_failure():
+    attempts = []
+
+    class Provider(MockModelProvider):
+        async def close(self):
+            attempts.append(self.provider_id)
+            if self.provider_id == "mock:last":
+                raise RuntimeError("offline cleanup failure")
+
+    first = Provider((), provider_id="mock:first")
+    borrowed = Provider((), provider_id="mock:borrowed")
+    last = Provider((), provider_id="mock:last")
+    router = ModelRouter(
+        (
+            replace(registration(first), close_with_router=True),
+            registration(borrowed),
+            replace(registration(last), close_with_router=True),
+        )
+    )
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="offline cleanup failure"):
+            await router.close()
+    assert attempts == ["mock:last", "mock:first"]
+
+
+async def test_closed_router_cannot_call_a_borrowed_provider():
+    delegate = MockStreamingModelProvider(
+        (
+            (
+                ModelStreamCompleted(
+                    ModelResponse(finish_reason=FinishReason.STOP, text="unused")
+                ),
+            ),
+        )
+    )
+    router = ModelRouter((registration(delegate, streaming=True),))
+    await router.close()
+    with pytest.raises(ModelProviderError):
+        await router.generate(request())
+    with pytest.raises(ModelProviderError):
+        await anext(router.stream(request()))
+    assert delegate.requests == ()
 
 
 async def test_route_admission_uses_request_sensitivity_before_provider_io():

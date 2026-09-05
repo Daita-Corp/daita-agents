@@ -108,7 +108,6 @@ from ..learning_candidates import (
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
-    ModelSensitivity,
     ToolResultBlock,
 )
 from ..llm.pricing import CostEstimateStatus
@@ -2804,6 +2803,7 @@ class SQLiteStateStore:
             run_input = decode_run_input(run_row[0])
             if (
                 run_input.origin is not RunOrigin.JOB_EVENT
+                or run_input.execution_scope is None
                 or run_input.execution_scope != current.execution_scope
                 or run_input.execution_scope.distribution_plan_digest
                 != current.grant.distribution_plan.plan_digest

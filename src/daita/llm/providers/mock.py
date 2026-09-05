@@ -90,6 +90,11 @@ class MockModelProvider:
             raise item
         return item
 
+    async def close(self) -> None:
+        """Release no resources; deterministic mock instances retain none."""
+
+        return None
+
     def assert_consumed(self) -> None:
         remaining = len(self._script) - self._cursor
         if remaining:
@@ -194,6 +199,11 @@ class MockStreamingModelProvider:
             if isinstance(event, Exception):
                 raise event
             yield event
+
+    async def close(self) -> None:
+        """Release no resources; deterministic mock instances retain none."""
+
+        return None
 
     def _start(self, request: ModelRequest) -> tuple[StreamScriptEvent, ...]:
         if not isinstance(request, ModelRequest):
