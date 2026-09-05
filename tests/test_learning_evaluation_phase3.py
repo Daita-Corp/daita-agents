@@ -997,6 +997,7 @@ def test_report_exposes_safety_regressions_and_never_contains_sensitive_inputs()
 @pytest.mark.parametrize("phase", ("baseline", "teaching", "learned"))
 def test_live_learning_comparison_rejects_incomplete_phases(phase):
     from test_learning_evaluation_live import _require_completed_phase
+
     from daita.loop.models import LoopExit, LoopExitKind
 
     incomplete = LoopExit(
@@ -1025,6 +1026,7 @@ def test_live_learning_comparison_rejects_incomplete_phases(phase):
 
 async def test_live_learning_recorder_preserves_streaming():
     from test_learning_evaluation_live import _RecordingProvider
+
     from daita.llm.models import (
         CanonicalMessage,
         MessageRole,

@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from contextlib import AsyncExitStack
 from collections.abc import AsyncIterator, Mapping
+from contextlib import AsyncExitStack
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -20,8 +20,8 @@ from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm._lifecycle import closing_stream
+from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
     ModelProfile,

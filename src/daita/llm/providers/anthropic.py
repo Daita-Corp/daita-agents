@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
 import json
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal

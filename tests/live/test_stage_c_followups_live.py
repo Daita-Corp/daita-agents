@@ -46,8 +46,8 @@ from daita.jobs.capabilities import (
     JOB_INSPECT_CAPABILITY_ID,
     JOB_READ_RESULTS_CAPABILITY_ID,
 )
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm._lifecycle import closing_stream
+from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
     MessageRole,

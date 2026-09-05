@@ -8,8 +8,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-import pytest
 import httpx
+import pytest
 from _mcp_fixtures import MCPConformanceTransport, conformance_identities
 from _toolbox_model_support import ToolboxAwareMockModelProvider
 from _workspace_support import workspace_for
@@ -40,8 +40,8 @@ from daita.domains.data.export_capabilities import (
 from daita.llm.models import (
     FinishReason,
     MessageRole,
-    ModelRequest,
     ModelProfile,
+    ModelRequest,
     ModelResponse,
     ModelSensitivity,
     ToolCall,

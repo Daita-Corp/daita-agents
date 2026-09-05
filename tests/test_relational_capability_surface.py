@@ -16,11 +16,11 @@ from daita.capabilities import (
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
 from daita.catalog.models import Sensitivity
 from daita.domains.data import (
+    DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    DATA_EXPORT_TABULAR_TOOL_NAME,
     DATA_QUERY_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
     DATA_QUERY_TOOL_NAME,
-    DATA_EXPORT_TABULAR_CAPABILITY_ID,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
     DataCapabilityDomain,
     DataDomainCatalog,
     DataExportTabularExecutor,
@@ -29,15 +29,15 @@ from daita.domains.data import (
     PostgreSQLReadResult,
     ResourceSchema,
     SQLiteReadResult,
+    data_export_tabular_capability_declarations,
+    data_query_capability_declarations,
     postgresql_update_capability_declarations,
     postgresql_update_preview_capability_declarations,
-    data_query_capability_declarations,
-    data_export_tabular_capability_declarations,
     project_result_rows,
     resource_revision_observation_declarations,
 )
-from daita.domains.learning import LearningCandidateGuard
 from daita.domains.data.routine_precheck import ResourceRevisionCatalog
+from daita.domains.learning import LearningCandidateGuard
 from daita.loop.models import RunInput
 
 

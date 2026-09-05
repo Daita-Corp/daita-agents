@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import importlib
+import json
 from collections.abc import AsyncGenerator
 from contextvars import ContextVar
 from dataclasses import replace
@@ -17,13 +17,22 @@ from google import genai
 
 import daita.hosting.embedded as embedded_module
 import daita.llm.factory as factory_module
-from daita.llm._lifecycle import closing_stream
 from daita import Agent, AgentConfig
-from daita.llm.models import FinishReason, ModelRequest, ModelResponse, ToolCall
-from daita.llm.models import ModelStreamCompleted, ModelTextDelta, ModelStreamEvent
+from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import ModelProviderError
-from daita.llm.models import CanonicalMessage, MessageRole, TextBlock
 from daita.llm.factory import create_model_route_provider
+from daita.llm.models import (
+    CanonicalMessage,
+    FinishReason,
+    MessageRole,
+    ModelRequest,
+    ModelResponse,
+    ModelStreamCompleted,
+    ModelStreamEvent,
+    ModelTextDelta,
+    TextBlock,
+    ToolCall,
+)
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.providers.anthropic import AnthropicMessagesProvider
 from daita.llm.providers.gemini import GeminiProvider

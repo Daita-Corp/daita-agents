@@ -68,10 +68,10 @@ from daita.catalog.models import (
 )
 from daita.distribution import OutcomeState
 from daita.domains.data.export_capabilities import (
-    DOCUMENT_CREATE_CAPABILITY_ID,
-    DOCUMENT_CREATE_TOOL_NAME,
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     DATA_EXPORT_TABULAR_TOOL_NAME,
+    DOCUMENT_CREATE_CAPABILITY_ID,
+    DOCUMENT_CREATE_TOOL_NAME,
     RESULT_SNAPSHOT_CAPABILITY_ID,
     RESULT_SNAPSHOT_TOOL_NAME,
 )

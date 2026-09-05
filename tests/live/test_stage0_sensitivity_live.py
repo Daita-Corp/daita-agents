@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from contextlib import AsyncExitStack
 from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 

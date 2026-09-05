@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
-from contextlib import AsyncExitStack
 from collections.abc import AsyncIterator, Sequence
+from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from html import unescape
