@@ -8,13 +8,12 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime
 from hashlib import sha256
 
-from .._json import FrozenJsonObject, canonical_json
+from .._json import canonical_json
 from ..artifacts.models import ArtifactError
 from ..artifacts.store import AgentHomeArtifactStore
 from ..capabilities import ExecutionScope
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
 from ..distribution import DistributionOwner, OutcomeArtifactReference
-from ..llm.models import ModelSensitivity
 from ..loop.models import (
     InstructionAuthority,
     LoopExit,

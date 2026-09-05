@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import aclosing
 from typing import Any, cast
 
 import pytest
-import httpx
-import openai
 
 from daita.llm.errors import (
     ModelProviderError,

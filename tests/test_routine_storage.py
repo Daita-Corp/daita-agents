@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256

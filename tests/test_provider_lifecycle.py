@@ -638,7 +638,7 @@ async def test_lazy_resolution_cannot_duplicate_or_reactivate_a_closed_owner(
     created: list[_ManagedProvider] = []
 
     class Secrets:
-        async def resolve(self, _reference):
+        async def resolve(self, reference: SecretReference) -> str:
             started.set()
             await release.wait()
             return "offline"

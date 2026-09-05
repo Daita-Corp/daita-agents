@@ -897,16 +897,16 @@ def test_cli_approval_denies_unreviewable_arguments_without_prompting():
 
 
 @pytest.mark.parametrize("answer", ["n", EOFError()])
-def test_cli_approval_explicit_no_and_eof_still_deny(answer: object):
+def test_cli_approval_explicit_no_and_eof_still_deny(answer: str | EOFError):
     request = _approval_request({"count": 1})
     stdout = io.StringIO()
-    input_kwargs = (
-        {"side_effect": answer}
+    input_patch = (
+        patch("builtins.input", side_effect=answer)
         if isinstance(answer, EOFError)
-        else {"return_value": answer}
+        else patch("builtins.input", return_value=answer)
     )
 
-    with redirect_stdout(stdout), patch("builtins.input", **input_kwargs):
+    with redirect_stdout(stdout), input_patch:
         decision = asyncio.run(cli._prompt_for_exact_approval(request))
 
     assert decision is ApprovalDecision.DENY

@@ -20,7 +20,6 @@ from .artifacts.models import (
 from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
     TOOLBOX_DEFINITIONS,
-    AccessMode,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,

@@ -303,6 +303,7 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
         )
         assert delivery.conclusion_preview_truncated is False
         followup_run_id = delivery.resulting_run_id
+        assert followup_run_id is not None
         transcript = await agent.transcript(followup_run_id)
         assert transcript.run.origin is RunOrigin.JOB_EVENT
         assert transcript.messages[0].role is MessageRole.SYSTEM
@@ -416,6 +417,7 @@ async def test_failed_terminal_job_delivers_grounded_no_result_report(
         assert items[0].conclusion_preview == (
             "The profile job failed and has no successful result."
         )
+        assert items[0].resulting_run_id is not None
         transcript = await agent.transcript(items[0].resulting_run_id)
         result_reads = tuple(
             block
@@ -1679,6 +1681,7 @@ async def test_inbox_uses_bounded_report_preview_and_run_reference(
         assert item.conclusion_digest == (
             "sha256:" + sha256(report.encode("utf-8")).hexdigest()
         )
+        assert item.resulting_run_id is not None
         transcript = await agent.transcript(item.resulting_run_id)
         final_block = transcript.messages[-1].content[0]
         assert isinstance(final_block, TextBlock)

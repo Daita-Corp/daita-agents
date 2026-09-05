@@ -33,7 +33,6 @@ from daita import (
     MCPBindingStatus,
     MCPServerInspection,
     MCPToolSelection,
-    RoutineState,
     ScheduledRoutine,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
