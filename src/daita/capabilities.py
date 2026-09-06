@@ -7,6 +7,7 @@ import math
 import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
@@ -16,6 +17,7 @@ from typing import Protocol, TypeVar
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import ArtifactAuthorship, ArtifactDraft
 from .llm.models import ModelSensitivity, ToolDefinition
+from .scope import EffectiveSourceScope
 
 _T = TypeVar("_T")
 
@@ -51,6 +53,7 @@ class OperationalEffect(str, Enum):
     CANCEL_JOB = "cancel_job"
     CANCEL_EXECUTION_GRAPH = "cancel_execution_graph"
     MUTATE_DATA = "mutate_data"
+    EXTERNAL_ACTION = "external_action"
     CHANGE_INFRASTRUCTURE = "change_infrastructure"
     MANAGE_SCHEDULED_ROUTINE = "manage_scheduled_routine"
 
@@ -59,7 +62,295 @@ class AutomationEligibility(str, Enum):
     """Code-owned unattended-execution eligibility, orthogonal to effect."""
 
     INTERACTIVE_ONLY = "interactive_only"
-    SCHEDULED_DIRECT = "scheduled_direct"
+    AUTOMATION_DIRECT = "automation_direct"
+
+
+class EffectOutcome(str, Enum):
+    STARTED = "started"
+    SUCCEEDED = "succeeded"
+    NOT_APPLIED = "not_applied"
+    UNCERTAIN = "uncertain"
+
+
+class EffectEvidenceBasis(str, Enum):
+    ADAPTER_VERIFIED = "adapter_verified"
+    SERVER_REPORTED = "server_reported"
+    LOCAL_NOT_DISPATCHED = "local_not_dispatched"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True, slots=True)
+class EffectObservation:
+    """Code-owned terminal evidence, independent of persistence and model JSON."""
+
+    outcome: EffectOutcome
+    evidence_basis: EffectEvidenceBasis
+    payload: FrozenJsonObject | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.outcome, EffectOutcome)
+            or self.outcome is EffectOutcome.STARTED
+        ):
+            raise ValueError("an effect observation requires a terminal outcome")
+        if not isinstance(self.evidence_basis, EffectEvidenceBasis):
+            raise TypeError("effect evidence basis is invalid")
+        if self.outcome is EffectOutcome.SUCCEEDED and self.evidence_basis not in {
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+            EffectEvidenceBasis.SERVER_REPORTED,
+        }:
+            raise ValueError("successful effects require adapter or server evidence")
+        if self.outcome is EffectOutcome.NOT_APPLIED and self.evidence_basis not in {
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+            EffectEvidenceBasis.LOCAL_NOT_DISPATCHED,
+        }:
+            raise ValueError(
+                "non-application requires positive local or adapter evidence"
+            )
+        if self.payload is not None:
+            payload = FrozenJsonObject.from_mapping(self.payload)
+            if len(canonical_json(payload).encode("utf-8")) > 32 * 1024:
+                raise ValueError("effect observation payload exceeds its byte bound")
+            object.__setattr__(self, "payload", payload)
+        elif not (
+            self.outcome is EffectOutcome.UNCERTAIN
+            or self.evidence_basis is EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+        ):
+            raise ValueError("domain observations require bounded evidence payloads")
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationGrantPolicy:
+    constraints_kind: str
+    constraints_schema: Mapping[str, object]
+
+    def __post_init__(self) -> None:
+        _scope_identities((self.constraints_kind,), "constraints kind")
+        schema = FrozenJsonObject.from_mapping(self.constraints_schema)
+        _check_schema(schema)
+        if (
+            schema.get("type") != "object"
+            or len(canonical_json(schema).encode("utf-8")) > 32 * 1024
+        ):
+            raise ValueError("grant constraints require a bounded object schema")
+        object.__setattr__(self, "constraints_schema", schema)
+
+
+@dataclass(frozen=True, slots=True)
+class EffectReceiptPolicy:
+    receipt_kind: str
+    payload_schema: Mapping[str, object]
+    success_evidence_basis: EffectEvidenceBasis
+
+    def __post_init__(self) -> None:
+        _scope_identities((self.receipt_kind,), "receipt kind")
+        if self.success_evidence_basis not in {
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+            EffectEvidenceBasis.SERVER_REPORTED,
+        } or not isinstance(self.success_evidence_basis, EffectEvidenceBasis):
+            raise ValueError("receipt success basis must be adapter or server evidence")
+        schema = FrozenJsonObject.from_mapping(self.payload_schema)
+        _check_schema(schema)
+        if (
+            schema.get("type") != "object"
+            or len(canonical_json(schema).encode("utf-8")) > 32 * 1024
+        ):
+            raise ValueError("receipt payload requires a bounded object schema")
+        object.__setattr__(self, "payload_schema", schema)
+
+
+@dataclass(frozen=True, slots=True)
+class CapabilityGrant:
+    """One domain-normalized authorization embedded in an approved revision."""
+
+    grant_id: str
+    domain_owner_id: str
+    capability_id: str
+    capability_contract_digest: str
+    constraints_kind: str
+    constraints: FrozenJsonObject
+    max_calls_per_occurrence: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "grant_id",
+            "domain_owner_id",
+            "capability_id",
+            "constraints_kind",
+        ):
+            _scope_identities((getattr(self, name),), name)
+        if (
+            re.fullmatch(r"sha256:[0-9a-f]{64}", self.capability_contract_digest)
+            is None
+        ):
+            raise ValueError("grant capability contract digest is invalid")
+        if (
+            type(self.max_calls_per_occurrence) is not int
+            or not 1 <= self.max_calls_per_occurrence <= 256
+        ):
+            raise ValueError("grant call ceiling must be between one and 256")
+        constraints = FrozenJsonObject.from_mapping(self.constraints)
+        if len(canonical_json(constraints).encode("utf-8")) > 32 * 1024:
+            raise ValueError("grant constraints exceed their byte bound")
+        object.__setattr__(self, "constraints", constraints)
+
+    def material(self) -> dict[str, object]:
+        return {
+            "grant_id": self.grant_id,
+            "domain_owner_id": self.domain_owner_id,
+            "capability_id": self.capability_id,
+            "capability_contract_digest": self.capability_contract_digest,
+            "constraints_kind": self.constraints_kind,
+            "constraints": self.constraints,
+            "max_calls_per_occurrence": self.max_calls_per_occurrence,
+        }
+
+    @property
+    def grant_digest(self) -> str:
+        return (
+            "sha256:"
+            + sha256(canonical_json(self.material()).encode("utf-8")).hexdigest()
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionContractBindings:
+    """Exact approval-time references, without copied schemas or source values."""
+
+    capability_contracts: Mapping[str, str] = field(default_factory=dict)
+    tool_origins: Mapping[str, str] = field(default_factory=dict)
+    resource_revisions: Mapping[str, str] = field(default_factory=dict)
+    model_routes: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for name in (
+            "capability_contracts",
+            "tool_origins",
+            "resource_revisions",
+            "model_routes",
+        ):
+            values = dict(getattr(self, name))
+            _scope_identities(values, name)
+            if any(
+                not isinstance(value, str)
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None
+                for value in values.values()
+            ):
+                raise ValueError(f"{name} must map exact identities to sha256 digests")
+            object.__setattr__(
+                self, name, MappingProxyType(dict(sorted(values.items())))
+            )
+        if not set(self.tool_origins) <= set(self.capability_contracts):
+            raise ValueError("tool origins must refer to bound capabilities")
+
+    def material(self) -> dict[str, object]:
+        return {
+            name: dict(getattr(self, name))
+            for name in (
+                "capability_contracts",
+                "tool_origins",
+                "resource_revisions",
+                "model_routes",
+            )
+        }
+
+    def validate_coverage(
+        self,
+        *,
+        capability_ids: Iterable[str],
+        resource_ids: Iterable[str],
+        route_ids: Iterable[str],
+        mcp_capability_ids: Iterable[str],
+    ) -> None:
+        for expected, actual in (
+            (capability_ids, self.capability_contracts),
+            (resource_ids, self.resource_revisions),
+            (route_ids, self.model_routes),
+            (mcp_capability_ids, self.tool_origins),
+        ):
+            if set(expected) != set(actual):
+                raise ValueError("execution contract bindings require exact coverage")
+
+    @property
+    def digest(self) -> str:
+        return (
+            "sha256:"
+            + sha256(canonical_json(self.material()).encode("utf-8")).hexdigest()
+        )
+
+
+class ExecutionContractReader(Protocol):
+    """Bound composition read of current contracts; cannot grant or execute work."""
+
+    async def __call__(
+        self,
+        *,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+        resource_ids: tuple[str, ...],
+        capability_ids: tuple[str, ...],
+        connector_binding_ids: tuple[str, ...],
+        model_route_ids: tuple[str, ...],
+    ) -> ExecutionContractBindings: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationScopeProposal:
+    """Immutable proposed ceilings for read-only grant preparation; grants nothing."""
+
+    agent_id: str
+    principal_id: str
+    allowed_source_ids: tuple[str, ...]
+    allowed_resource_ids: tuple[str, ...]
+    allowed_connector_binding_ids: tuple[str, ...]
+    allowed_capability_ids: tuple[str, ...]
+    allowed_access_modes: frozenset[AccessMode]
+    allowed_operational_effects: frozenset[OperationalEffect]
+    sensitivity_ceiling: ModelSensitivity
+    eligible_model_routes: tuple[str, ...]
+    per_run_max_cost_usd: Decimal
+    per_run_max_tokens: int
+    expires_at: datetime
+    distribution_plan_digest: str
+
+    def __post_init__(self) -> None:
+        for name in ("agent_id", "principal_id"):
+            _scope_identities((getattr(self, name),), name)
+        for name in (
+            "allowed_source_ids",
+            "allowed_resource_ids",
+            "allowed_connector_binding_ids",
+            "allowed_capability_ids",
+            "eligible_model_routes",
+        ):
+            object.__setattr__(self, name, _scope_identities(getattr(self, name), name))
+        if not self.allowed_capability_ids or not self.eligible_model_routes:
+            raise ValueError("automation proposal needs capability and model ceilings")
+        for name, enum in (
+            ("allowed_access_modes", AccessMode),
+            ("allowed_operational_effects", OperationalEffect),
+        ):
+            items = frozenset(getattr(self, name))
+            if not items or any(not isinstance(item, enum) for item in items):
+                raise ValueError("automation proposal access/effect ceiling is invalid")
+            object.__setattr__(self, name, items)
+        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
+            raise TypeError("automation proposal sensitivity is invalid")
+        if (
+            not isinstance(self.per_run_max_cost_usd, Decimal)
+            or not self.per_run_max_cost_usd.is_finite()
+            or self.per_run_max_cost_usd < 0
+        ):
+            raise ValueError("automation proposal cost ceiling is invalid")
+        if type(self.per_run_max_tokens) is not int or self.per_run_max_tokens < 1:
+            raise ValueError("automation proposal token ceiling is invalid")
+        if (
+            not isinstance(self.expires_at, datetime)
+            or self.expires_at.utcoffset() is None
+        ):
+            raise ValueError("automation proposal expiry must be timezone-aware")
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.distribution_plan_digest) is None:
+            raise ValueError("automation proposal distribution digest is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +374,12 @@ class ExecutionScope:
     per_run_max_cost_usd: Decimal
     per_run_max_tokens: int
     distribution_plan_digest: str
+    contract_bindings: ExecutionContractBindings
     routine_id: str | None = None
     routine_revision: int | None = None
     occurrence_id: str | None = None
     allowed_connector_binding_ids: tuple[str, ...] = ()
+    capability_grants: tuple[CapabilityGrant, ...] = ()
 
     def __post_init__(self) -> None:
         for identity_value, identity_name in (
@@ -174,16 +467,22 @@ class ExecutionScope:
                     "and cannot contain connector bindings"
                 )
         else:
-            if not sources and not connector_bindings:
-                raise ValueError(
-                    "scheduled execution scope requires a source or connector ceiling"
-                )
             if bool(sources) != bool(resources):
                 raise ValueError(
                     "scheduled source and resource ceilings must be present together"
                 )
         access_modes = frozenset(self.allowed_access_modes)
         effects = frozenset(self.allowed_operational_effects)
+        if not isinstance(self.contract_bindings, ExecutionContractBindings):
+            raise TypeError(
+                "execution scope requires frozen execution contract bindings"
+            )
+        self.contract_bindings.validate_coverage(
+            capability_ids=capabilities,
+            resource_ids=resources,
+            route_ids=routes,
+            mcp_capability_ids=self.contract_bindings.tool_origins,
+        )
         if not access_modes or any(
             not isinstance(item, AccessMode) for item in access_modes
         ):
@@ -219,6 +518,28 @@ class ExecutionScope:
         )
         object.__setattr__(self, "allowed_access_modes", access_modes)
         object.__setattr__(self, "allowed_operational_effects", effects)
+        grants = tuple(self.capability_grants)
+        if len(grants) > MAX_EXECUTION_SCOPE_IDENTITIES or any(
+            not isinstance(grant, CapabilityGrant) for grant in grants
+        ):
+            raise ValueError("execution scope grants are invalid or exceed their bound")
+        if len({grant.capability_id for grant in grants}) != len(grants):
+            raise ValueError("execution scope permits only one grant per capability")
+        if any(grant.capability_id not in capabilities for grant in grants) or (
+            grants and self.routine_id is None
+        ):
+            raise ValueError("standing grants must be embedded in their routine scope")
+        if any(
+            self.contract_bindings.capability_contracts[grant.capability_id]
+            != grant.capability_contract_digest
+            for grant in grants
+        ):
+            raise ValueError("scope grants must match its frozen capability contracts")
+        object.__setattr__(
+            self,
+            "capability_grants",
+            tuple(sorted(grants, key=lambda grant: grant.capability_id)),
+        )
 
     @property
     def digest(self) -> str:
@@ -256,6 +577,10 @@ class ExecutionScope:
                         "per_run_max_cost_usd": str(self.per_run_max_cost_usd),
                         "per_run_max_tokens": self.per_run_max_tokens,
                         "distribution_plan_digest": self.distribution_plan_digest,
+                        "contract_bindings": self.contract_bindings.material(),
+                        "capability_grants": tuple(
+                            grant.material() for grant in self.capability_grants
+                        ),
                     }
                 ).encode("utf-8")
             ).hexdigest()
@@ -369,6 +694,55 @@ if tuple(item.id for item in TOOLBOX_DEFINITIONS) != tuple(ToolboxId):
     raise RuntimeError("canonical toolbox definitions must cover ToolboxId exactly")
 
 
+def validate_discovery_hints(
+    summary: str,
+    when_to_use: str,
+    keywords: tuple[str, ...],
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, ...]:
+    """Apply the shared bounds for tool, source, and MCP discovery hints."""
+    for value, name, maximum in (
+        (
+            summary,
+            "tool presentation summary",
+            MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS,
+        ),
+        (
+            when_to_use,
+            "tool presentation when_to_use",
+            MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS,
+        ),
+    ):
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or (not allow_empty and not value)
+        ):
+            raise ValueError(f"{name} must be bounded trimmed text")
+        if len(value) > maximum:
+            raise ValueError(f"{name} exceeds its character bound")
+    if isinstance(keywords, (str, bytes)):
+        raise TypeError("discovery keywords must be a sequence of normalized terms")
+    keywords = tuple(keywords)
+    if len(keywords) > MAX_TOOL_PRESENTATION_KEYWORDS:
+        raise ValueError("tool presentation has too many keywords")
+    if len(keywords) != len(set(keywords)):
+        raise ValueError("tool presentation keywords must be distinct")
+    for keyword in keywords:
+        if (
+            not isinstance(keyword, str)
+            or not keyword
+            or keyword != keyword.strip().lower()
+            or len(keyword) > MAX_TOOL_PRESENTATION_KEYWORD_CHARACTERS
+            or re.fullmatch(r"[a-z0-9][a-z0-9 _.-]*", keyword) is None
+        ):
+            raise ValueError(
+                "tool presentation keywords must be bounded normalized text"
+            )
+    return keywords
+
+
 @dataclass(frozen=True, slots=True)
 class ToolPresentation:
     """Bounded presentation metadata; never execution authority."""
@@ -387,38 +761,11 @@ class ToolPresentation:
             raise TypeError("tool presentation load_mode must be ToolLoadMode")
         if not isinstance(self.text_trust, ToolTextTrust):
             raise TypeError("tool presentation text_trust must be ToolTextTrust")
-        for value, name, maximum in (
-            (
-                self.summary,
-                "tool presentation summary",
-                MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS,
-            ),
-            (
-                self.when_to_use,
-                "tool presentation when_to_use",
-                MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS,
-            ),
-        ):
-            _text(value, name)
-            if len(value) > maximum:
-                raise ValueError(f"{name} exceeds its character bound")
-        keywords = tuple(self.keywords)
-        if len(keywords) > MAX_TOOL_PRESENTATION_KEYWORDS:
-            raise ValueError("tool presentation has too many keywords")
-        if len(keywords) != len(set(keywords)):
-            raise ValueError("tool presentation keywords must be distinct")
-        for keyword in keywords:
-            if (
-                not isinstance(keyword, str)
-                or not keyword
-                or keyword != keyword.strip().lower()
-                or len(keyword) > MAX_TOOL_PRESENTATION_KEYWORD_CHARACTERS
-                or re.fullmatch(r"[a-z0-9][a-z0-9 _.-]*", keyword) is None
-            ):
-                raise ValueError(
-                    "tool presentation keywords must be bounded normalized text"
-                )
-        object.__setattr__(self, "keywords", keywords)
+        object.__setattr__(
+            self,
+            "keywords",
+            validate_discovery_hints(self.summary, self.when_to_use, self.keywords),
+        )
 
 
 class ApprovalDecision(str, Enum):
@@ -567,6 +914,8 @@ class Capability:
         AutomationEligibility.INTERACTIVE_ONLY
     )
     artifact_policy: ArtifactPolicy | None = None
+    automation_grant_policy: AutomationGrantPolicy | None = None
+    effect_receipt_policy: EffectReceiptPolicy | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -582,11 +931,38 @@ class Capability:
             raise TypeError("operational_effect must be OperationalEffect")
         if not isinstance(self.automation_eligibility, AutomationEligibility):
             raise TypeError("automation_eligibility must be AutomationEligibility")
-        if (
-            self.automation_eligibility is AutomationEligibility.SCHEDULED_DIRECT
-            and self.operational_effect is not OperationalEffect.NONE
+        if self.automation_grant_policy is not None and not isinstance(
+            self.automation_grant_policy, AutomationGrantPolicy
         ):
-            raise ValueError("scheduled_direct capability must be effect-free")
+            raise TypeError("automation_grant_policy must be AutomationGrantPolicy")
+        if self.effect_receipt_policy is not None and not isinstance(
+            self.effect_receipt_policy, EffectReceiptPolicy
+        ):
+            raise TypeError("effect_receipt_policy must be EffectReceiptPolicy")
+        external_effect = self.operational_effect in {
+            OperationalEffect.MUTATE_DATA,
+            OperationalEffect.EXTERNAL_ACTION,
+        }
+        if external_effect and self.effect_receipt_policy is None:
+            raise ValueError("external effects require a receipt policy")
+        if not external_effect and (
+            self.automation_grant_policy is not None
+            or self.effect_receipt_policy is not None
+        ):
+            raise ValueError("effect policies are only supported for external effects")
+        if self.automation_eligibility is AutomationEligibility.INTERACTIVE_ONLY:
+            if self.automation_grant_policy is not None:
+                raise ValueError(
+                    "interactive capabilities cannot declare a standing grant"
+                )
+        elif self.operational_effect is not OperationalEffect.NONE:
+            if (
+                self.automation_grant_policy is None
+                or self.effect_receipt_policy is None
+            ):
+                raise ValueError(
+                    "effectful automation requires grant and receipt policies"
+                )
         if self.artifact_policy is not None and not isinstance(
             self.artifact_policy, ArtifactPolicy
         ):
@@ -620,12 +996,33 @@ def capability_contract_digest(
         "access_mode": capability.access_mode.value,
         "operational_effect": capability.operational_effect.value,
         "automation_eligibility": capability.automation_eligibility.value,
+        "automation_grant_policy": (
+            None
+            if capability.automation_grant_policy is None
+            else {
+                "constraints_kind": capability.automation_grant_policy.constraints_kind,
+                "constraints_schema": capability.automation_grant_policy.constraints_schema,
+            }
+        ),
+        "effect_receipt_policy": (
+            None
+            if capability.effect_receipt_policy is None
+            else {
+                "receipt_kind": capability.effect_receipt_policy.receipt_kind,
+                "payload_schema": capability.effect_receipt_policy.payload_schema,
+                "success_evidence_basis": capability.effect_receipt_policy.success_evidence_basis.value,
+            }
+        ),
         "artifact_policy": (
             None
             if capability.artifact_policy is None
             else {
                 "allowed_media_types": sorted(
                     capability.artifact_policy.allowed_media_types
+                ),
+                "allowed_authorships": sorted(
+                    item.value
+                    for item in capability.artifact_policy.allowed_authorships
                 ),
                 "allowed_extensions": capability.artifact_policy.allowed_extensions,
                 "artifact_required": capability.artifact_policy.artifact_required,
@@ -649,6 +1046,8 @@ class ToolView:
     description: str
     presentation: ToolPresentation
     origin_revision_digest: str | None = None
+    presentation_sensitivity: ModelSensitivity = ModelSensitivity.PUBLIC
+    connector_presentation: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -661,6 +1060,45 @@ class ToolView:
             raise ValueError(f"reserved runtime control tool name: {self.name}")
         if not isinstance(self.presentation, ToolPresentation):
             raise TypeError("tool presentation metadata is required")
+        if not isinstance(self.presentation_sensitivity, ModelSensitivity):
+            raise TypeError("tool presentation sensitivity must be classified")
+        if self.connector_presentation is not None:
+            presentation = FrozenJsonObject.from_mapping(self.connector_presentation)
+            if (
+                set(presentation)
+                != {
+                    "kind",
+                    "id",
+                    "label",
+                    "summary",
+                    "when_to_use",
+                    "keywords",
+                    "tool_count",
+                }
+                or len(canonical_json(presentation).encode("utf-8")) > 4096
+            ):
+                raise ValueError(
+                    "connector presentation must have its exact bounded shape"
+                )
+            if presentation["kind"] != "mcp_binding":
+                raise ValueError(
+                    "tool connector presentation requires an admitted MCP binding"
+                )
+            for name in ("id", "label", "summary", "when_to_use"):
+                if not isinstance(presentation[name], str):
+                    raise TypeError("connector presentation text is invalid")
+            if not presentation["id"] or not presentation["label"]:
+                raise ValueError(
+                    "connector presentation requires exact identity and label"
+                )
+            count = presentation["tool_count"]
+            if (
+                not isinstance(count, int)
+                or isinstance(count, bool)
+                or not 1 <= count <= 384
+            ):
+                raise ValueError("connector presentation tool count is invalid")
+            object.__setattr__(self, "connector_presentation", presentation)
         if (
             self.origin_revision_digest is not None
             and re.fullmatch(r"sha256:[0-9a-f]{64}", self.origin_revision_digest)
@@ -676,13 +1114,26 @@ class ToolExecution:
     capability_id: str
     arguments: Mapping[str, object] = field(default_factory=dict)
     conversation_id: str | None = None
+    source_scope: EffectiveSourceScope | None = None
+    request_sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    effect_receipt_id: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
         _text(self.call_id, "tool call_id")
         _text(self.capability_id, "tool capability_id")
+        if not isinstance(self.request_sensitivity, ModelSensitivity):
+            raise TypeError("request_sensitivity must be ModelSensitivity")
         if self.conversation_id is not None:
             _text(self.conversation_id, "tool conversation_id")
+        if (
+            self.effect_receipt_id is not None
+            and re.fullmatch(
+                r"effect-receipt:sha256:[0-9a-f]{64}", self.effect_receipt_id
+            )
+            is None
+        ):
+            raise ValueError("tool effect receipt ID is invalid")
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )
@@ -695,9 +1146,14 @@ class ToolOutput:
     artifact: ArtifactDraft | None = None
     sensitivity: ModelSensitivity | None = None
     sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
+    effect_observation: EffectObservation | None = None
 
     def __post_init__(self) -> None:
         _text(self.kind, "tool output kind")
+        if self.effect_observation is not None and not isinstance(
+            self.effect_observation, EffectObservation
+        ):
+            raise TypeError("effect_observation must be EffectObservation or None")
         if self.artifact is not None and not isinstance(self.artifact, ArtifactDraft):
             raise TypeError("artifact must be ArtifactDraft or None")
         if self.sensitivity is not None and not isinstance(
@@ -838,6 +1294,10 @@ class CapabilityRegistry:
                                 "capabilities": [
                                     {
                                         "id": capability.id,
+                                        "contract_digest": capability_contract_digest(
+                                            capability,
+                                            domain_owner_id=declaration.domain_owner_id,
+                                        ),
                                         "description": capability.description,
                                         "input_schema": capability.input_schema,
                                         "output_kind": capability.output_kind,
@@ -885,6 +1345,8 @@ class CapabilityRegistry:
                                         "name": view.name,
                                         "capability_id": view.capability_id,
                                         "description": view.description,
+                                        "presentation_sensitivity": view.presentation_sensitivity.value,
+                                        "connector_presentation": view.connector_presentation,
                                         "presentation": {
                                             "toolbox_id": view.presentation.toolbox_id.value,
                                             "load_mode": view.presentation.load_mode.value,
@@ -1050,7 +1512,52 @@ class CapabilityRegistry:
                 f"output kind {output.kind} does not match {capability.output_kind}"
             )
         _validate(capability.output_schema, output.data, ToolOutputValidationError)
+        if (
+            capability.effect_receipt_policy is None
+            and output.effect_observation is not None
+        ):
+            raise ToolOutputValidationError(
+                "only receipt-bearing executions may return effect observations"
+            )
         return output
+
+    def validate_grant_constraints(
+        self, capability_id: str, constraints: Mapping[str, object]
+    ) -> FrozenJsonObject:
+        policy = self._capabilities[capability_id].automation_grant_policy
+        if policy is None:
+            raise CapabilityInputError(
+                "automation_grant_unsupported",
+                "This capability does not support standing grants.",
+            )
+        value = FrozenJsonObject.from_mapping(constraints)
+        if len(canonical_json(value).encode("utf-8")) > 32 * 1024:
+            raise CapabilityInputError(
+                "automation_grant_invalid", "Grant constraints exceed their byte bound."
+            )
+        _validate(policy.constraints_schema, value, CapabilityInputError)
+        return value
+
+    def validate_effect_observation(
+        self, capability_id: str, observation: EffectObservation
+    ) -> EffectObservation:
+        policy = self._capabilities[capability_id].effect_receipt_policy
+        if policy is None or not isinstance(observation, EffectObservation):
+            raise ToolOutputValidationError(
+                "effect observation has no matching receipt policy"
+            )
+        if observation.payload is not None:
+            _validate(
+                policy.payload_schema, observation.payload, ToolOutputValidationError
+            )
+        if (
+            observation.outcome is EffectOutcome.SUCCEEDED
+            and observation.evidence_basis is not policy.success_evidence_basis
+        ):
+            raise ToolOutputValidationError(
+                "effect success evidence does not match its policy"
+            )
+        return observation
 
     def validate_declarations(self, declarations: CapabilityDeclarations) -> None:
         if self._declarations.get(declarations.domain_owner_id) != declarations:

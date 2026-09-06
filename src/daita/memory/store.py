@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
+from ..llm.models import ModelSensitivity
+
 MEMORY_MAX_CHARACTERS = 2_200
 MEMORY_MAX_UTF8_BYTES = 8_800
 USER_MAX_CHARACTERS = 1_375
@@ -18,6 +20,8 @@ USER_MAX_UTF8_BYTES = 5_500
 
 _MEMORY_NAME = "MEMORY.md"
 _USER_NAME = "USER.md"
+_LABEL_PREFIX = "<!-- daita-sensitivity: "
+_LABEL_MAX_BYTES = 80
 _T = TypeVar("_T")
 
 
@@ -64,12 +68,15 @@ class MemoryStore:
             MEMORY_MAX_UTF8_BYTES,
         )
 
-    async def set_memory(self, text: str) -> None:
+    async def set_memory(
+        self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    ) -> None:
         await self._write(
             _MEMORY_NAME,
             text,
             MEMORY_MAX_CHARACTERS,
             MEMORY_MAX_UTF8_BYTES,
+            sensitivity,
         )
 
     async def read_user_profile(self) -> str:
@@ -79,13 +86,46 @@ class MemoryStore:
             USER_MAX_UTF8_BYTES,
         )
 
-    async def set_user_profile(self, text: str) -> None:
+    async def set_user_profile(
+        self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    ) -> None:
         await self._write(
             _USER_NAME,
             text,
             USER_MAX_CHARACTERS,
             USER_MAX_UTF8_BYTES,
+            sensitivity,
         )
+
+    async def read_context(self) -> tuple[str, str, ModelSensitivity]:
+        """Read both documents and their owner labels in one bounded snapshot."""
+
+        def read() -> tuple[str, str, ModelSensitivity]:
+            directory = self._open_home()
+            try:
+                memory, _, memory_floor = _read_owned(
+                    directory,
+                    _MEMORY_NAME,
+                    MEMORY_MAX_CHARACTERS,
+                    MEMORY_MAX_UTF8_BYTES,
+                )
+                user, _, user_floor = _read_owned(
+                    directory, _USER_NAME, USER_MAX_CHARACTERS, USER_MAX_UTF8_BYTES
+                )
+                return (
+                    memory,
+                    user,
+                    max(memory_floor, user_floor, key=lambda item: item.routing_rank),
+                )
+            finally:
+                os.close(directory)
+
+        async with self._mutation_lock:
+            self._require_open()
+            value, cancelled = await _await_sync_completion(read)
+        if cancelled:
+            raise asyncio.CancelledError
+        return value
 
     async def preflight_replacement(
         self,
@@ -104,13 +144,15 @@ class MemoryStore:
             max_bytes,
         )
 
-    async def replace_from_tool(self, target: str, content: str) -> None:
+    async def replace_from_tool(
+        self, target: str, content: str, *, sensitivity: ModelSensitivity
+    ) -> None:
         """Replace after runtime authorization while the shared lock is held."""
 
         if not self._mutation_lock.locked():
             raise MemoryStoreError("tool replacement requires the mutation lock")
         name, max_characters, max_bytes = _target_contract(target)
-        data = _validate_text(content, max_characters, max_bytes)
+        data = _render_document(content, max_characters, max_bytes, sensitivity)
         self._require_open()
         await asyncio.to_thread(
             self._write_sync,
@@ -141,8 +183,9 @@ class MemoryStore:
         text: str,
         max_characters: int,
         max_bytes: int,
+        sensitivity: ModelSensitivity,
     ) -> None:
-        data = _validate_text(text, max_characters, max_bytes)
+        data = _render_document(text, max_characters, max_bytes, sensitivity)
         async with self._mutation_lock:
             self._require_open()
             _, cancelled = await _await_sync_completion(
@@ -164,7 +207,7 @@ class MemoryStore:
     def _read_sync(self, name: str, max_characters: int, max_bytes: int) -> str:
         directory = self._open_home()
         try:
-            text, _ = _read_owned(directory, name, max_characters, max_bytes)
+            text, _, _ = _read_owned(directory, name, max_characters, max_bytes)
             return text
         finally:
             os.close(directory)
@@ -181,7 +224,7 @@ class MemoryStore:
         temporary = f".{name}.{uuid4().hex}.tmp"
         temporary_created = False
         try:
-            prior_text, prior_state = _read_owned(
+            prior_text, prior_state, _ = _read_owned(
                 directory,
                 name,
                 max_characters,
@@ -214,7 +257,7 @@ class MemoryStore:
                 dst_dir_fd=directory,
             )
             temporary_created = False
-            written, _ = _read_owned(directory, name, max_characters, max_bytes)
+            written, _, _ = _read_owned(directory, name, max_characters, max_bytes)
             if written != text:
                 raise MemoryStoreError("memory replacement did not round-trip exactly")
         except (MemoryStoreError, MemoryValidationError):
@@ -239,7 +282,7 @@ class MemoryStore:
     ) -> tuple[bool, str, str]:
         directory = self._open_home()
         try:
-            current, state = _read_owned(
+            current, state, _ = _read_owned(
                 directory,
                 name,
                 max_characters,
@@ -320,15 +363,24 @@ def _target_contract(target: str) -> tuple[str, int, int]:
     raise MemoryValidationError("memory target must be memory or user")
 
 
+def _render_document(
+    text: str, max_characters: int, max_bytes: int, sensitivity: ModelSensitivity
+) -> bytes:
+    if not isinstance(sensitivity, ModelSensitivity):
+        raise TypeError("memory sensitivity must be ModelSensitivity")
+    content = _validate_text(text, max_characters, max_bytes)
+    return f"{_LABEL_PREFIX}{sensitivity.value} -->\n".encode() + content
+
+
 def _read_owned(
     directory: int,
     name: str,
     max_characters: int,
     max_bytes: int,
-) -> tuple[str, os.stat_result | None]:
+) -> tuple[str, os.stat_result | None, ModelSensitivity]:
     state = _target_state(directory, name)
     if state is None:
-        return "", None
+        return "", None, ModelSensitivity.PUBLIC
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -339,21 +391,32 @@ def _read_owned(
         opened = os.fstat(descriptor)
         _require_same_state(state, opened, name)
         with os.fdopen(descriptor, "rb") as file:
-            data = file.read(max_bytes + 1)
+            data = file.read(max_bytes + _LABEL_MAX_BYTES + 1)
             final = os.fstat(file.fileno())
         descriptor = -1
         _require_same_state(state, final, name)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-    if len(data) > max_bytes:
+    if len(data) > max_bytes + _LABEL_MAX_BYTES:
         raise MemoryValidationError(f"{name} exceeds the {max_bytes} UTF-8 byte limit")
     try:
         text = data.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise MemoryValidationError(f"{name} is not strict UTF-8") from error
+    sensitivity = ModelSensitivity.RESTRICTED
+    if text.startswith(_LABEL_PREFIX):
+        label, separator, text = text.partition("\n")
+        try:
+            if not separator or not label.endswith(" -->"):
+                raise ValueError
+            sensitivity = ModelSensitivity(label[len(_LABEL_PREFIX) : -4])
+        except ValueError as error:
+            raise MemoryValidationError(
+                "memory sensitivity label is invalid"
+            ) from error
     _validate_text(text, max_characters, max_bytes)
-    return text, state
+    return text, state, sensitivity
 
 
 def _target_state(directory: int, name: str) -> os.stat_result | None:

@@ -532,8 +532,29 @@ def validate_postgresql_update_intent(
         "capability_id": _POSTGRESQL_UPDATE_CAPABILITY_ID,
         "source_id": intent.source_id,
         "resource_id": intent.resource_id,
-        "where": tuple(item.to_payload() for item in intent.where),
-        "assignments": tuple(item.to_payload() for item in assignments),
+        "where": tuple(
+            sorted(
+                (
+                    (
+                        {
+                            **item.to_payload(),
+                            "value": sorted(
+                                (thaw_json(value) for value in item.value),
+                                key=canonical_json,
+                            ),
+                        }
+                        if item.operator == "in" and isinstance(item.value, tuple)
+                        else item.to_payload()
+                    )
+                    for item in intent.where
+                ),
+                key=canonical_json,
+            )
+        ),
+        "assignments": tuple(
+            item.to_payload()
+            for item in sorted(assignments, key=lambda item: item.column)
+        ),
     }
     required_columns = tuple(
         dict.fromkeys(

@@ -388,7 +388,7 @@ async def test_live_model_chooses_direct_query_instead_of_durable_job(
             "Do not start a job. End with exactly this format using only tool-returned "
             "values: STAGE_B_IMMEDIATE_CHECK token=<verification_token> "
             "amount=<amount>.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
         )
         transcript = await agent.transcript(result.run_id)
         requests = _requests_for_transcript(
@@ -431,7 +431,7 @@ async def test_live_model_starts_detaches_and_later_reads_profile_result(
             "Do not use a synchronous SQL query, and do not list, inspect, poll, cancel, "
             "or read the job in this interaction. Once the durable start receipt is "
             "returned, end with: STAGE_B_JOB_STARTED <actual job id>.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
         )
         start_transcript = await agent.transcript(started.run_id)
         start_requests = _requests_for_transcript(
@@ -559,7 +559,7 @@ async def test_live_model_requests_cancellation_of_running_profile_job(
             "exactly one durable background profile for stage_b_profile_probe with "
             "a sample bound of 5 rows. Use toolbox search and load. Once the start "
             "receipt is returned, end with: STAGE_B_JOB_STARTED <actual job id>.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
         )
         start_transcript = await agent.transcript(started.run_id)
         start_requests = _requests_for_transcript(

@@ -11,7 +11,12 @@ from enum import Enum
 from hashlib import sha256
 
 from ._json import FrozenJsonObject, canonical_json
-from .capabilities import AccessMode, ExecutionScope, OperationalEffect
+from .capabilities import (
+    AccessMode,
+    ExecutionContractBindings,
+    ExecutionScope,
+    OperationalEffect,
+)
 from .distribution.models import (
     CONVERSATION_INBOX_DESTINATION_REVISION,
     ConversationInboxTarget,
@@ -676,6 +681,7 @@ def create_terminal_job_followup(
     allowed_capability_ids: tuple[str, ...],
     eligible_model_routes: tuple[str, ...],
     limits: LoopLimits,
+    contract_bindings: ExecutionContractBindings,
 ) -> AutonomousFollowup:
     """Create the sole code-authored follow-up grant for a terminal Daita job."""
 
@@ -756,6 +762,7 @@ def create_terminal_job_followup(
         expires_at=expires_at,
     )
     scope = ExecutionScope(
+        contract_bindings=contract_bindings,
         scope_id=scope_id,
         revision=1,
         agent_id=job.agent_id,

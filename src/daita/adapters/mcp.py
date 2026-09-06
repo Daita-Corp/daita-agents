@@ -20,6 +20,7 @@ from ..capabilities import (
     ToolLoadMode,
     ToolPresentation,
     ToolTextTrust,
+    validate_discovery_hints,
 )
 from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
@@ -344,6 +345,9 @@ class MCPServerBinding:
     last_checked_at: datetime
     revoked_at: datetime | None = None
     stale_reason: str | None = None
+    summary: str = ""
+    when_to_use: str = ""
+    keywords: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -360,6 +364,13 @@ class MCPServerBinding:
         _server_identity(self.server_name, "MCP server name")
         _server_identity(self.server_version, "MCP server version")
         _bounded_text(self.local_label, "MCP local server label", maximum=128)
+        object.__setattr__(
+            self,
+            "keywords",
+            validate_discovery_hints(
+                self.summary, self.when_to_use, self.keywords, allow_empty=True
+            ),
+        )
         if not isinstance(self.maximum_outbound_sensitivity, ModelSensitivity):
             raise TypeError("MCP outbound sensitivity ceiling is invalid")
         tools = tuple(self.tools)
@@ -436,6 +447,39 @@ class MCPServerBinding:
             revoked_at=revoked_at,
             stale_reason=None,
         )
+
+
+def mcp_execution_origin_digest(binding: MCPServerBinding, tool: MCPToolBinding) -> str:
+    """Identify execution admission independently of editable local hints."""
+
+    material = {
+        "agent_id": binding.agent_id,
+        "binding_id": binding.binding_id,
+        "binding_revision": binding.revision,
+        "endpoint": binding.endpoint,
+        "protocol_version": binding.protocol_version,
+        "server_name": binding.server_name,
+        "server_version": binding.server_version,
+        "authentication_mode": binding.authentication.mode.value,
+        "secret_reference": (
+            binding.authentication.secret_reference.to_uri()
+            if binding.authentication.secret_reference is not None
+            else None
+        ),
+        "maximum_outbound_sensitivity": binding.maximum_outbound_sensitivity.value,
+        "capability_id": tool.capability_id,
+        "executor_id": tool.executor_id,
+        "local_name": tool.local_name,
+        "remote_name": tool.remote_name,
+        "input_schema": tool.input_schema,
+        "input_schema_digest": tool.input_schema_digest,
+        "output_schema": tool.output_schema,
+        "output_schema_digest": tool.output_schema_digest,
+        "result_sensitivity": tool.result_sensitivity.value,
+        "access_mode": "read",
+        "operational_effect": "none",
+    }
+    return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1162,6 +1206,9 @@ def mcp_binding_from_inspection(
         revision=revision,
         admitted_at=admitted_at,
         last_checked_at=inspection.observed_at,
+        summary="" if prior is None else prior.summary,
+        when_to_use="" if prior is None else prior.when_to_use,
+        keywords=() if prior is None else prior.keywords,
     )
 
 

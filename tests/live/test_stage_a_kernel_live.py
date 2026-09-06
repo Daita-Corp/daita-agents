@@ -267,7 +267,7 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
         )
         try:
             source = await agent.attach(SQLiteSource(database, name="Stage A probe"))
-            result = await agent.run(_PROBE_PROMPT, source_id=source.id)
+            result = await agent.run(_PROBE_PROMPT, source_scope_ids=(source.id,))
             transcript = await agent.transcript(result.run_id)
         finally:
             await agent.close()
@@ -430,7 +430,7 @@ async def test_live_fallback_provider_stays_sticky_through_tool_completion(
         )
         try:
             source = await agent.attach(SQLiteSource(database, name="Fallback probe"))
-            result = await agent.run(_PROBE_PROMPT, source_id=source.id)
+            result = await agent.run(_PROBE_PROMPT, source_scope_ids=(source.id,))
             transcript = await agent.transcript(result.run_id)
         finally:
             await agent.close()

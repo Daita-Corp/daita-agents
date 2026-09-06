@@ -43,7 +43,6 @@ from daita.agent import (
     AgentModelConfigurationError,
     AgentNameError,
     SourceRefreshError,
-    SourceSelectionError,
 )
 from daita.learning_candidates import (
     learning_candidate_content_from_mapping,
@@ -339,9 +338,6 @@ class PresentationController:
 
     async def source_summary(self) -> str:
         agent = self.require_agent()
-        active = await agent.active_source(conversation_id=self.conversation_id)
-        if active is not None:
-            return safe_display(active.display_name, fallback="source")
         sources = tuple(
             source for source in await agent.list_sources() if source.active
         )
@@ -489,11 +485,6 @@ class PresentationController:
 
     async def attach_postgresql(self, **kwargs: Any) -> Any:
         return await self.require_agent().attach_postgresql(**kwargs)
-
-    async def active_source(self) -> Any:
-        return await self.require_agent().active_source(
-            conversation_id=self.conversation_id
-        )
 
     def source_edit_defaults(self, source: Any) -> dict[str, Any]:
         """Return safe editable connection fields from one public registration."""
@@ -682,16 +673,10 @@ class PresentationController:
             raise ValueError("unknown routine control action") from None
         return await operation(routine_id, expected_revision=expected_revision)
 
-    async def select_source(self, selector: str) -> Any:
-        try:
-            return await self.require_agent().select_source(selector)
-        except SourceSelectionError as error:
-            raise UserInputError(str(error)) from error
-
     async def resolve_source(self, selector: str) -> Any:
         try:
             return await self.require_agent().resolve_source(selector)
-        except SourceSelectionError as error:
+        except ValueError as error:
             raise UserInputError(str(error)) from error
 
     async def refresh_source(self, source_id: str) -> Any:
@@ -867,14 +852,10 @@ class PresentationController:
                 screen="confirm_delete_agent",
                 payload={"name": self.require_agent().name},
             )
-        if name == "/source" and (len(parts) == 1 or parts[1:] == ["use"]):
+        if name == "/source" and len(parts) == 1:
             return CommandOutcome(
-                "screen",
-                screen="source_picker",
-                conversation_id=conversation_id,
+                "screen", screen="catalog", conversation_id=conversation_id
             )
-        if name == "/source" and len(parts) >= 3 and parts[1] == "use":
-            return await self._use_source(" ".join(parts[2:]))
         if name == "/source" and parts[1:] == ["add"]:
             return CommandOutcome(
                 "screen",
@@ -950,7 +931,7 @@ class PresentationController:
         if name == "/source":
             return CommandOutcome(
                 "notice",
-                "Usage: /source | /source use <name> | /source add | /source edit | "
+                "Usage: /source | /source add | /source edit | "
                 "/source refresh <source-id> | /source detach <source> | "
                 "/source permissions",
             )
@@ -1237,19 +1218,6 @@ class PresentationController:
             + safe_display(status.binding.binding_id, fallback="binding")
             + " revoked."
         )
-
-    async def _use_source(self, selector: str) -> CommandOutcome:
-        prior = await self.require_agent().active_source(
-            conversation_id=self.conversation_id
-        )
-        selected = await self.select_source(selector)
-        conversation_id = self.conversation_id
-        message = f"Source  {safe_display(selected.display_name, fallback='source')}"
-        if (prior is None or prior.id != selected.id) and conversation_id is not None:
-            self.conversation_id = None
-            conversation_id = None
-            message += "\nStarted a new conversation to keep source context isolated."
-        return CommandOutcome("notice", message, conversation_id=conversation_id)
 
     async def clear_conversations(self) -> CommandOutcome:
         cleared = await self.require_agent().clear_conversations()

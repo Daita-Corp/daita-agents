@@ -21,7 +21,12 @@ from .._json import (
     freeze_json,
     thaw_json,
 )
-from ..capabilities import ToolExecution
+from ..capabilities import (
+    EffectEvidenceBasis,
+    EffectObservation,
+    EffectOutcome,
+    ToolExecution,
+)
 from ..domains.data.capabilities import (
     PostgreSQLPreviewFingerprint,
     PostgreSQLUpdatePreview,
@@ -45,11 +50,6 @@ from ..domains.data.sql import (
 )
 from ..errors import DaitaError
 from ..security import SecretProvider, default_secret_provider
-from ..storage.sqlite import (
-    DatabaseWriteOutcome,
-    DatabaseWriteReceipt,
-    DatabaseWriteReceiptConflictError,
-)
 from ..storage.sqlite_records import SourcePermissionStateError
 from .postgresql import (
     _DEFAULT_MAX_COLUMNS,
@@ -180,9 +180,18 @@ class PostgreSQLUpdateExecutionError(DaitaError):
         code: str,
         message: str,
         details: Mapping[str, object] | None = None,
+        *,
+        effect_observation: EffectObservation | None = None,
     ) -> None:
+        self.effect_observation = effect_observation
         self.details = FrozenJsonObject.from_mapping(details or {})
         super().__init__(message, error_code=code)
+
+
+class PostgreSQLUpdateExecutionCancelled(asyncio.CancelledError):
+    def __init__(self, observation: EffectObservation) -> None:
+        self.effect_observation = observation
+        super().__init__("native update cancelled after bounded transaction cleanup")
 
 
 @dataclass(frozen=True, slots=True)
@@ -277,20 +286,6 @@ class PostgreSQLUpdateReadiness:
         }
 
 
-class DatabaseWriteReceiptStore(Protocol):
-    async def load_database_write_receipt_for_call(
-        self, agent_id: str, run_id: str, call_id: str
-    ) -> DatabaseWriteReceipt | None: ...
-
-    async def start_database_write_receipt(
-        self, receipt: DatabaseWriteReceipt
-    ) -> DatabaseWriteReceipt: ...
-
-    async def finish_database_write_receipt(
-        self, receipt: DatabaseWriteReceipt
-    ) -> DatabaseWriteReceipt: ...
-
-
 class PostgreSQLUpdatePreviewBackend:
     """Validate, compile, and inspect one update plan without mutating."""
 
@@ -300,7 +295,6 @@ class PostgreSQLUpdatePreviewBackend:
         catalog: PostgreSQLUpdateCatalogReader,
         secret_provider: SecretProvider | None = None,
         *,
-        receipt_store: DatabaseWriteReceiptStore | None = None,
         clock: Callable[[], datetime] | None = None,
         statement_timeout_seconds: float = 5.0,
         lock_timeout_seconds: float = 1.0,
@@ -331,16 +325,6 @@ class PostgreSQLUpdatePreviewBackend:
         self._sources = sources
         self._catalog = catalog
         self._secret_provider = provider
-        if receipt_store is not None and not all(
-            callable(getattr(receipt_store, name, None))
-            for name in (
-                "load_database_write_receipt_for_call",
-                "start_database_write_receipt",
-                "finish_database_write_receipt",
-            )
-        ):
-            raise TypeError("receipt_store must provide the database receipt contract")
-        self._receipt_store = receipt_store
         self._clock = clock or (lambda: datetime.now(UTC))
         self._statement_timeout_seconds = float(statement_timeout_seconds)
         self._lock_timeout_seconds = float(lock_timeout_seconds)
@@ -719,88 +703,65 @@ class PostgreSQLUpdatePreviewBackend:
             raise ValueError("update execution capability identity is invalid")
         if not isinstance(command, PostgreSQLUpdateCommand):
             raise TypeError("command must be PostgreSQLUpdateCommand")
-        if self._receipt_store is None:
+        if execution.effect_receipt_id is None:
             raise PostgreSQLUpdateExecutionError(
                 "write_receipt_unavailable",
-                "Durable database write receipts are unavailable.",
+                "Runtime receipt reservation is required before native execution.",
             )
 
-        intent = command.intent
-        registration = await self._sources.load_source(agent_id, intent.source_id)
-        if (
-            registration is None
-            or registration.agent_id != agent_id
-            or registration.id != intent.source_id
-            or not registration.active
-            or registration.adapter_id != "postgresql"
-        ):
-            raise PostgreSQLUpdateExecutionError(
-                "write_source_not_available",
-                "The selected source is not an active PostgreSQL source owned by this agent.",
-            )
-        await self._require_update_scope(
-            agent_id=agent_id,
-            source_id=intent.source_id,
-            resource_id=intent.resource_id,
-            assignment_columns=tuple(item.column for item in intent.assignments),
-            execution=True,
-        )
-        validation = validate_postgresql_update_intent(
-            intent,
-            resources=await self._catalog.resource_schemas(agent_id, intent.source_id),
-        )
-        if not validation.valid or validation.validated is None:
-            issue = validation.issues[0]
-            raise PostgreSQLUpdateExecutionError(issue.code, issue.message)
-        validated = validation.validated
-        statement = render_postgresql_update_statement(validated)
-        receipt = DatabaseWriteReceipt.start(
-            agent_id=agent_id,
-            run_id=execution.run_id,
-            call_id=execution.call_id,
-            capability_id=execution.capability_id,
-            source_id=validated.source_id,
-            resource_id=validated.resource_id,
-            intent_sha256=validated.intent_sha256,
-            preview_fingerprint=command.preview_fingerprint,
-            expected_affected_rows=command.expected_affected_rows,
-            started_at=self._clock(),
-        )
         try:
-            existing = await self._receipt_store.load_database_write_receipt_for_call(
-                agent_id,
-                execution.run_id,
-                execution.call_id,
+            intent = command.intent
+            registration = await self._sources.load_source(agent_id, intent.source_id)
+            if (
+                registration is None
+                or registration.agent_id != agent_id
+                or registration.id != intent.source_id
+                or not registration.active
+                or registration.adapter_id != "postgresql"
+            ):
+                raise PostgreSQLUpdateExecutionError(
+                    "write_source_not_available",
+                    "The selected source is not an active PostgreSQL source owned by this agent.",
+                )
+            await self._require_update_scope(
+                agent_id=agent_id,
+                source_id=intent.source_id,
+                resource_id=intent.resource_id,
+                assignment_columns=tuple(item.column for item in intent.assignments),
+                execution=True,
             )
-        except asyncio.CancelledError:
-            raise
+            validation = validate_postgresql_update_intent(
+                intent,
+                resources=await self._catalog.resource_schemas(
+                    agent_id, intent.source_id
+                ),
+            )
+            if not validation.valid or validation.validated is None:
+                issue = validation.issues[0]
+                raise PostgreSQLUpdateExecutionError(issue.code, issue.message)
+            validated = validation.validated
+            statement = render_postgresql_update_statement(validated)
+        except asyncio.CancelledError as error:
+            raise PostgreSQLUpdateExecutionCancelled(
+                EffectObservation(
+                    EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+                )
+            ) from error
+        except (PostgreSQLUpdateExecutionError, PostgreSQLUpdatePreviewError) as error:
+            raise PostgreSQLUpdateExecutionError(
+                error.error_code,
+                str(error),
+                effect_observation=EffectObservation(
+                    EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+                ),
+            ) from None
         except Exception:
             raise PostgreSQLUpdateExecutionError(
-                "write_receipt_unavailable",
-                "The durable receipt identity could not be checked.",
-            ) from None
-        if existing is not None:
-            _raise_duplicate_receipt(existing, receipt)
-        try:
-            await self._receipt_store.start_database_write_receipt(receipt)
-        except DatabaseWriteReceiptConflictError:
-            current = await self._receipt_store.load_database_write_receipt_for_call(
-                agent_id,
-                execution.run_id,
-                execution.call_id,
-            )
-            if current is not None:
-                _raise_duplicate_receipt(current, receipt)
-            raise PostgreSQLUpdateExecutionError(
-                "write_receipt_unavailable",
-                "The durable started receipt could not be established.",
-            ) from None
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            raise PostgreSQLUpdateExecutionError(
-                "write_receipt_unavailable",
-                "The durable started receipt could not be established.",
+                "write_not_dispatched",
+                "Native update admission failed before write dispatch.",
+                effect_observation=EffectObservation(
+                    EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+                ),
             ) from None
 
         connection = None
@@ -809,7 +770,7 @@ class PostgreSQLUpdatePreviewBackend:
         commit_attempted = False
         target_set_sha256: str | None = None
         affected_rows: int | None = None
-        terminal_outcome = DatabaseWriteOutcome.NOT_COMMITTED
+        terminal_outcome = EffectOutcome.NOT_APPLIED
         terminal_code: str | None = "write_not_committed"
         cancelled: asyncio.CancelledError | None = None
         try:
@@ -893,21 +854,21 @@ class PostgreSQLUpdatePreviewBackend:
             commit_attempted = True
             await transaction.commit()
             transaction_finished = True
-            terminal_outcome = DatabaseWriteOutcome.COMMITTED
+            terminal_outcome = EffectOutcome.SUCCEEDED
             terminal_code = None
         except asyncio.CancelledError as error:
             cancelled = error
             if commit_attempted:
-                terminal_outcome = DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                terminal_outcome = EffectOutcome.UNCERTAIN
                 terminal_code = "write_outcome_unknown"
             else:
-                terminal_outcome = DatabaseWriteOutcome.NOT_COMMITTED
+                terminal_outcome = EffectOutcome.NOT_APPLIED
                 terminal_code = "write_not_committed"
         except (PostgreSQLUpdateExecutionError, PostgreSQLUpdatePreviewError) as error:
             terminal_outcome = (
-                DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                EffectOutcome.UNCERTAIN
                 if commit_attempted
-                else DatabaseWriteOutcome.NOT_COMMITTED
+                else EffectOutcome.NOT_APPLIED
             )
             terminal_code = (
                 "write_outcome_unknown" if commit_attempted else error.error_code
@@ -917,13 +878,13 @@ class PostgreSQLUpdatePreviewBackend:
                 getattr(error, "sqlstate", None), str
             )
             terminal_outcome = (
-                DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                EffectOutcome.UNCERTAIN
                 if commit_attempted and not commit_rejected
-                else DatabaseWriteOutcome.NOT_COMMITTED
+                else EffectOutcome.NOT_APPLIED
             )
             terminal_code = (
                 "write_outcome_unknown"
-                if terminal_outcome is DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                if terminal_outcome is EffectOutcome.UNCERTAIN
                 else _normalized_update_failure(error)
             )
         finally:
@@ -942,72 +903,52 @@ class PostgreSQLUpdatePreviewBackend:
                     )
 
         completed_at = self._clock()
-        terminal = receipt.finish(
+        observation = EffectObservation(
             terminal_outcome,
-            completed_at=completed_at,
-            affected_rows=(
-                affected_rows
-                if terminal_outcome is DatabaseWriteOutcome.COMMITTED
-                else (
-                    0
-                    if terminal_outcome is DatabaseWriteOutcome.NOT_COMMITTED
-                    else None
-                )
-            ),
-            normalized_error_code=terminal_code,
-        )
-        try:
-            await self._receipt_store.finish_database_write_receipt(terminal)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            code = (
-                "write_outcome_unknown"
-                if terminal_outcome
-                in {
-                    DatabaseWriteOutcome.COMMITTED,
-                    DatabaseWriteOutcome.OUTCOME_UNKNOWN,
-                }
-                else "write_receipt_unavailable"
-            )
-            raise PostgreSQLUpdateExecutionError(
-                code,
-                "The terminal database write receipt could not be established.",
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+            FrozenJsonObject.from_mapping(
                 {
-                    "receipt_id": receipt.receipt_id,
-                    "outcome": (
-                        "outcome_unknown"
-                        if code == "write_outcome_unknown"
-                        else "not_committed"
+                    "source_id": validated.source_id,
+                    "resource_id": validated.resource_id,
+                    "intent_sha256": validated.intent_sha256,
+                    "preview_fingerprint": command.preview_fingerprint,
+                    "target_set_sha256": target_set_sha256,
+                    "expected_affected_rows": command.expected_affected_rows,
+                    "affected_rows": (
+                        affected_rows
+                        if terminal_outcome is EffectOutcome.SUCCEEDED
+                        else (
+                            0 if terminal_outcome is EffectOutcome.NOT_APPLIED else None
+                        )
                     ),
-                    "affected_rows": None if code == "write_outcome_unknown" else 0,
-                },
-            ) from None
+                    "normalized_error_code": terminal_code,
+                }
+            ),
+        )
         if cancelled is not None:
-            raise cancelled
-        if terminal_outcome is not DatabaseWriteOutcome.COMMITTED:
+            raise PostgreSQLUpdateExecutionCancelled(observation) from cancelled
+        if terminal_outcome is not EffectOutcome.SUCCEEDED:
             assert terminal_code is not None
             raise PostgreSQLUpdateExecutionError(
                 terminal_code,
                 (
                     "PostgreSQL commit certainty was lost; do not retry automatically."
-                    if terminal_outcome is DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                    if terminal_outcome is EffectOutcome.UNCERTAIN
                     else "PostgreSQL did not commit the approved update."
                 ),
                 {
-                    "receipt_id": receipt.receipt_id,
+                    "receipt_id": execution.effect_receipt_id,
                     "outcome": terminal_outcome.value,
                     "affected_rows": (
-                        0
-                        if terminal_outcome is DatabaseWriteOutcome.NOT_COMMITTED
-                        else None
+                        0 if terminal_outcome is EffectOutcome.NOT_APPLIED else None
                     ),
                 },
+                effect_observation=observation,
             )
         assert affected_rows is not None
         assert target_set_sha256 is not None
         return PostgreSQLUpdateResult(
-            receipt_id=receipt.receipt_id,
+            receipt_id=execution.effect_receipt_id,
             source_id=validated.source_id,
             resource_id=validated.resource_id,
             source_revision=validated.source_revision,
@@ -1017,6 +958,7 @@ class PostgreSQLUpdatePreviewBackend:
             target_set_sha256=target_set_sha256,
             affected_rows=affected_rows,
             committed_at=completed_at.isoformat(),
+            effect_observation=observation,
         )
 
 
@@ -1217,50 +1159,6 @@ def _affected_rows_from_status(value: object) -> int:
             "PostgreSQL returned an invalid update status.",
         )
     return int(count)
-
-
-def _raise_duplicate_receipt(
-    existing: DatabaseWriteReceipt,
-    proposed: DatabaseWriteReceipt,
-) -> None:
-    same_identity = (
-        existing.agent_id == proposed.agent_id
-        and existing.run_id == proposed.run_id
-        and existing.call_id == proposed.call_id
-        and existing.capability_id == proposed.capability_id
-        and existing.source_id == proposed.source_id
-        and existing.resource_id == proposed.resource_id
-        and existing.intent_sha256 == proposed.intent_sha256
-        and existing.preview_fingerprint == proposed.preview_fingerprint
-        and existing.expected_affected_rows == proposed.expected_affected_rows
-    )
-    if not same_identity:
-        raise PostgreSQLUpdateExecutionError(
-            "write_receipt_integrity_error",
-            "The run and call identity conflicts with a different database write intent.",
-        )
-    outcome = (
-        "outcome_unknown"
-        if existing.outcome is DatabaseWriteOutcome.STARTED
-        else existing.outcome.value
-    )
-    raise PostgreSQLUpdateExecutionError(
-        (
-            "write_outcome_unknown"
-            if outcome == "outcome_unknown"
-            else "write_execution_duplicate"
-        ),
-        "This exact run and call identity already has a durable write receipt; it was not executed again.",
-        {
-            "receipt_id": existing.receipt_id,
-            "outcome": outcome,
-            "affected_rows": (
-                existing.affected_rows
-                if outcome == "committed"
-                else 0 if outcome == "not_committed" else None
-            ),
-        },
-    )
 
 
 def _normalized_update_failure(error: BaseException) -> str:
@@ -1809,7 +1707,6 @@ def _normalized_failure(stage: str, error: BaseException) -> tuple[str, str]:
 
 
 __all__ = [
-    "DatabaseWriteReceiptStore",
     "PostgreSQLUpdateExecutionError",
     "PostgreSQLUpdatePreviewBackend",
     "PostgreSQLUpdatePreviewError",

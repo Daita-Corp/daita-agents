@@ -377,7 +377,7 @@ async def seed_completed_profile_agent(
     try:
         result = await agent.run(
             "Seed one deterministic completed profile job.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.COMPLETED
         jobs = await agent.list_jobs()
@@ -410,7 +410,7 @@ async def capture_run(
     start = len(fixture.provider.requests)
     result = await fixture.agent.run(
         message,
-        source_id=source_id,
+        source_scope_ids=(() if source_id is None else (source_id,)),
         conversation_id=conversation_id,
     )
     transcript = await fixture.agent.transcript(result.run_id)

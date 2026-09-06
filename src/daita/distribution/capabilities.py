@@ -10,6 +10,8 @@ from ..capabilities import (
     AccessMode,
     AutomationEligibility,
     Capability,
+    CapabilityInputError,
+    AutomationScopeProposal,
     CapabilityDeclarations,
     Executor,
     ToolboxId,
@@ -202,6 +204,18 @@ class DistributionCapabilityDomain:
             prepared["_request_sensitivity"] = request_sensitivity.value
             return FrozenJsonObject.from_mapping(prepared)
         return arguments
+
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
 
     async def side_effect_plan(
         self,

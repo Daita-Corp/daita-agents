@@ -970,7 +970,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         mismatch_block = _result_for_call(
             await agent.transcript(mismatch.run_id), "mismatch"
         )
-        assert _error_code(mismatch_block) == "source_scope_violation"
+        assert _error_code(mismatch_block) == "resource_read_not_allowed"
 
         provider.replace_script(
             (

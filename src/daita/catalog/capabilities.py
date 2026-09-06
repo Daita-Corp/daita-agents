@@ -62,19 +62,33 @@ class CatalogDeclarations:
 
 
 class CatalogProjection(Protocol):
-    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult: ...
+    async def search(
+        self,
+        request: CatalogSearchRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> CatalogSearchResult: ...
 
     async def inspect_resource(
         self,
         agent_id: str,
         resource_id: str,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject: ...
 
-    async def schema_slice(self, request: CatalogSchemaRequest) -> FrozenJsonObject: ...
+    async def schema_slice(
+        self,
+        request: CatalogSchemaRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> FrozenJsonObject: ...
 
     async def traverse(
         self,
         request: CatalogTraversalRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject: ...
 
 
@@ -90,6 +104,9 @@ class CatalogSearchExecutor:
         source_id = request.arguments.get("source_id")
         if source_id is not None and not isinstance(source_id, str):
             raise TypeError("source_id must be a string")
+        cursor = request.arguments.get("cursor")
+        if cursor is not None and not isinstance(cursor, str):
+            raise TypeError("cursor must be a string")
         resource_kinds = tuple(
             ResourceKind(value)
             for value in _string_tuple_argument(request, "resource_kinds", ())
@@ -102,7 +119,14 @@ class CatalogSearchExecutor:
                 source_ids=() if source_id is None else (source_id,),
                 resource_kinds=resource_kinds,
                 limit=limit,
-            )
+                cursor=cursor,
+                run_id=request.run_id,
+            ),
+            **(
+                {}
+                if request.source_scope is None
+                else {"readable_resource_ids": request.source_scope.resource_ids}
+            ),
         )
         return ToolOutput(
             kind=CATALOG_SEARCH_EVIDENCE_KIND,
@@ -117,11 +141,18 @@ class CatalogSearchExecutor:
                         "revision": hit.revision,
                         "sensitivity": hit.sensitivity.value,
                         "source_id": hit.source_id,
+                        "match_status": (
+                            "unmatched_fallback"
+                            if "unmatched_fallback" in hit.match_reasons
+                            else "matched"
+                        ),
                     }
                     for hit in result.hits
                 ],
                 "query": query,
                 "total_matches": result.total_matches,
+                "total_candidates": result.total_candidates,
+                "next_cursor": result.next_cursor,
                 "returned_count": result.returned_count,
                 "truncated": result.truncated,
                 "trust_classification": "untrusted_external_data",
@@ -141,6 +172,11 @@ class CatalogInspectExecutor:
         projection = await self._service.inspect_resource(
             self._agent_id,
             resource_id,
+            **(
+                {}
+                if request.source_scope is None
+                else {"readable_resource_ids": request.source_scope.resource_ids}
+            ),
         )
         return ToolOutput(
             kind=CATALOG_INSPECT_EVIDENCE_KIND,
@@ -185,7 +221,12 @@ class CatalogSchemaExecutor:
                     "max_join_depth",
                     CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
                 ),
-            )
+            ),
+            **(
+                {}
+                if request.source_scope is None
+                else {"readable_resource_ids": request.source_scope.resource_ids}
+            ),
         )
         return ToolOutput(
             kind=CATALOG_SCHEMA_EVIDENCE_KIND,
@@ -233,7 +274,14 @@ class CatalogTraverseExecutor:
                 CATALOG_TRAVERSAL_DEFAULT_EDGES,
             ),
         )
-        projection = await self._service.traverse(traversal_request)
+        projection = await self._service.traverse(
+            traversal_request,
+            **(
+                {}
+                if request.source_scope is None
+                else {"readable_resource_ids": request.source_scope.resource_ids}
+            ),
+        )
         return ToolOutput(
             kind=CATALOG_TRAVERSE_EVIDENCE_KIND,
             data=projection,
@@ -274,6 +322,7 @@ def catalog_declarations(
                     "uniqueItems": True,
                     "default": [],
                 },
+                "cursor": {"type": "string", "minLength": 1, "maxLength": 80},
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
@@ -288,7 +337,7 @@ def catalog_declarations(
         output_schema=_search_output_schema(),
         executor_id=search_executor.executor_id,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     schema = Capability(
         id=CATALOG_SCHEMA_CAPABILITY_ID,
@@ -343,7 +392,7 @@ def catalog_declarations(
         output_schema=_schema_output_schema(),
         executor_id=schema_executor.executor_id,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     inspect = Capability(
         id=CATALOG_INSPECT_CAPABILITY_ID,
@@ -385,7 +434,7 @@ def catalog_declarations(
         },
         executor_id=inspect_executor.executor_id,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     traverse = Capability(
         id=CATALOG_TRAVERSE_CAPABILITY_ID,
@@ -460,7 +509,7 @@ def catalog_declarations(
         output_schema=_traverse_output_schema(),
         executor_id=traverse_executor.executor_id,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     return CatalogDeclarations(
         capabilities=(search, schema, inspect, traverse),
@@ -534,6 +583,8 @@ def _search_output_schema() -> dict[str, object]:
             "hits": {"type": "array"},
             "query": {"type": "string"},
             "total_matches": {"type": "integer"},
+            "total_candidates": {"type": "integer"},
+            "next_cursor": {"type": ["string", "null"], "maxLength": 80},
             "returned_count": {"type": "integer"},
             "truncated": {"type": "boolean"},
             "trust_classification": {"type": "string"},
@@ -542,6 +593,8 @@ def _search_output_schema() -> dict[str, object]:
             "hits",
             "query",
             "total_matches",
+            "total_candidates",
+            "next_cursor",
             "returned_count",
             "truncated",
             "trust_classification",

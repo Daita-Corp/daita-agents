@@ -1454,7 +1454,7 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
     )
     high = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
-        maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
+        maximum_outbound_sensitivity=ModelSensitivity.CONFIDENTIAL,
         selections=(
             MCPToolSelection(
                 remote_name="lookup",
@@ -1517,12 +1517,14 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         )
         assert len(provider.requests) == 5
         assert tuple(request.sensitivity for request in provider.logical_requests) == (
-            ModelSensitivity.INTERNAL,
+            ModelSensitivity.CONFIDENTIAL,
             ModelSensitivity.CONFIDENTIAL,
             ModelSensitivity.CONFIDENTIAL,
         )
         assert blocks[0].sensitivity is ModelSensitivity.CONFIDENTIAL
-        assert blocks[0].sensitivity_provenance["run_sensitivity_floor"] == "internal"
+        assert (
+            blocks[0].sensitivity_provenance["run_sensitivity_floor"] == "confidential"
+        )
         assert _error_code(blocks[1]) == "mcp_outbound_sensitivity_exceeded"
         assert alpha.calls == [("lookup", {"query": "x"})]
     finally:

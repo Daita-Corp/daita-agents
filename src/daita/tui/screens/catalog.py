@@ -32,7 +32,6 @@ class CatalogScreen(ModalScreen[None]):
         summary: Any,
         sources: tuple[Any, ...],
         resources: tuple[Any, ...],
-        current_source_id: str | None,
         notice: str = "",
         notice_warning: bool = False,
     ) -> None:
@@ -40,7 +39,6 @@ class CatalogScreen(ModalScreen[None]):
         self._summary = summary
         self._sources = sources
         self._resources = resources
-        self._current_source_id = current_source_id
         self._notice = notice
         self._notice_warning = notice_warning
 
@@ -79,7 +77,6 @@ class CatalogScreen(ModalScreen[None]):
         ordered_sources = sorted(
             self._sources,
             key=lambda source: (
-                source.id != self._current_source_id,
                 source.display_name.casefold(),
                 source.id,
             ),
@@ -127,8 +124,6 @@ class CatalogScreen(ModalScreen[None]):
 
     def _source_label(self, source: Any, resource_count: int) -> Text:
         label = Text()
-        if source.id == self._current_source_id:
-            label.append("● ", style="#ACFD21")
         label.append(
             safe_display(source.display_name, fallback="source", maximum=512),
             style="bold",
@@ -136,8 +131,6 @@ class CatalogScreen(ModalScreen[None]):
         source_type = SOURCE_TYPE_LABELS.get(source.adapter_id, source.adapter_id)
         noun = "resource" if resource_count == 1 else "resources"
         label.append(f"  {source_type} · {resource_count} {noun}", style="dim")
-        if source.id == self._current_source_id:
-            label.append("  current", style="#ACFD21")
         return label
 
     @staticmethod

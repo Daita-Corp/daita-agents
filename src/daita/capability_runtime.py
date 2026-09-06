@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import re
-from collections.abc import Callable, Mapping
+import secrets
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import (
@@ -24,11 +26,17 @@ from .capabilities import (
     ApprovalHandler,
     ApprovalRequest,
     AutomationEligibility,
+    AutomationScopeProposal,
     Capability,
+    CapabilityGrant,
     CapabilityDeclarations,
     CapabilityInputError,
     CapabilityRegistry,
     Executor,
+    ExecutionContractReader,
+    EffectObservation,
+    EffectOutcome,
+    EffectEvidenceBasis,
     OperationalEffect,
     SideEffectExecutor,
     ToolboxId,
@@ -39,6 +47,7 @@ from .capabilities import (
     ToolView,
     validate_tool_schema_value,
 )
+from .scope import EffectiveSourceScope
 from .errors import DaitaError
 from .llm.errors import (
     ToolCatalogLimitExceeded,
@@ -63,6 +72,29 @@ from .loop.models import (
 )
 from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 
+if TYPE_CHECKING:
+    from .storage.sqlite_records import EffectReceipt
+
+
+class EffectReceiptStore(Protocol):
+    async def require_effects_unblocked(
+        self, agent_id: str, *, run_id: str | None = None, routine_id: str | None = None
+    ) -> None: ...
+    async def load_effect_receipt_for_call(
+        self, agent_id: str, run_id: str, call_id: str
+    ) -> EffectReceipt | None: ...
+    async def load_effect_receipt_for_operation(
+        self, agent_id: str, operation_key: str
+    ) -> EffectReceipt | None: ...
+    async def start_effect_receipt(
+        self,
+        receipt: EffectReceipt,
+        *,
+        grant: CapabilityGrant | None = None,
+        max_receipts_per_run: int = 64,
+    ) -> EffectReceipt: ...
+    async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt: ...
+
 
 @dataclass(frozen=True, slots=True)
 class CapabilityFailure:
@@ -71,12 +103,17 @@ class CapabilityFailure:
     code: str
     message: str
     details: Mapping[str, object] = field(default_factory=dict)
+    effect_observation: EffectObservation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.code, str) or not self.code:
             raise ValueError("capability failure code must be non-empty text")
         if not isinstance(self.message, str) or not self.message:
             raise ValueError("capability failure message must be non-empty text")
+        if self.effect_observation is not None and not isinstance(
+            self.effect_observation, EffectObservation
+        ):
+            raise TypeError("capability failure observation must be code-owned")
         object.__setattr__(
             self,
             "details",
@@ -92,6 +129,8 @@ class SideEffectPlan:
     approval_arguments: FrozenJsonObject | None = None
     approval_reason: str = "Allow this exact side-effecting tool invocation once?"
     recheck_after_approval: bool = True
+    capability_grant_digest: str | None = None
+    effect_intent: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.approval_required, bool):
@@ -104,6 +143,19 @@ class SideEffectPlan:
             raise ValueError("approval_reason must be non-empty text")
         if not isinstance(self.recheck_after_approval, bool):
             raise TypeError("recheck_after_approval must be a boolean")
+        if (
+            self.capability_grant_digest is not None
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", self.capability_grant_digest)
+            is None
+        ):
+            raise ValueError("side-effect grant digest is invalid")
+        if self.effect_intent is not None:
+            if not isinstance(self.effect_intent, FrozenJsonObject):
+                raise TypeError(
+                    "side-effect intent must be domain-normalized frozen JSON"
+                )
+            if len(canonical_json(self.effect_intent).encode("utf-8")) > 32 * 1024:
+                raise ValueError("side-effect intent exceeds its byte bound")
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +220,14 @@ class CapabilityDomain(Protocol):
     def declarations(self) -> CapabilityDeclarations: ...
 
     async def project(self, run: RunInput) -> tuple[str, ...]: ...
+
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject: ...
 
     def normalize_arguments(
         self,
@@ -254,6 +314,7 @@ class RunToolCatalog:
     aggregate_bytes: int
     manifest_bytes: int
     manifest_token_limit: int
+    source_scope: EffectiveSourceScope | None = None
 
     @property
     def capability_ids(self) -> frozenset[str]:
@@ -289,6 +350,7 @@ class StepToolProjection:
     callable_entries: tuple[RunToolCatalogEntry, ...]
     loaded_entries: tuple[RunToolCatalogEntry, ...]
     loaded_definition_bytes: int
+    source_scope: EffectiveSourceScope | None = None
 
     def require_current(
         self,
@@ -367,6 +429,7 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
                         "maximum": limits.max_toolbox_search_results,
                         "default": min(5, limits.max_toolbox_search_results),
                     },
+                    "cursor": {"type": "string", "minLength": 1, "maxLength": 80},
                 },
                 "required": ["query"],
                 "additionalProperties": False,
@@ -410,8 +473,13 @@ class CapabilityRuntime:
         observer: AgentObserver | None = None,
         clock: Callable[[], datetime] | None = None,
         artifacts: AgentHomeArtifactStore | None = None,
+        effect_receipts: EffectReceiptStore | None = None,
+        execution_contract_reader: ExecutionContractReader | None = None,
         limits: LoopLimits = LoopLimits(),
         side_effect_recovery_timeout_seconds: float | None = None,
+        source_scope_resolver: (
+            Callable[[RunInput], Awaitable[EffectiveSourceScope]] | None
+        ) = None,
     ) -> None:
         if not isinstance(registry, CapabilityRegistry):
             raise TypeError("registry must be CapabilityRegistry")
@@ -454,15 +522,153 @@ class CapabilityRuntime:
             raise ValueError(
                 "side_effect_recovery_timeout_seconds must be positive and at most 60"
             )
+        self._source_scope_resolver = source_scope_resolver
         self._registry = registry
+        self._search_cursor_key = secrets.token_bytes(32)
         self._domains = owners
         self._approval_handler = approval_handler
         self._mutation_lock = mutation_lock or asyncio.Lock()
         self._observer = observer
         self._clock = clock or (lambda: datetime.now(UTC))
         self._artifacts = artifacts
+        self._effect_receipts = effect_receipts
+        self._execution_contract_reader = execution_contract_reader
+        self._effect_receipts_unavailable = False
         self._limits = limits
         self._side_effect_recovery_timeout_seconds = float(recovery_timeout)
+
+    async def _validate_execution_contracts(self, run: RunInput) -> None:
+        scope = run.execution_scope
+        if scope is None:
+            return
+        if self._execution_contract_reader is None:
+            raise CapabilityInputError(
+                "execution_contract_unavailable",
+                "Machine execution requires its current contract reader.",
+            )
+        try:
+            current = await self._execution_contract_reader(
+                agent_id=run.agent_id,
+                source_ids=scope.allowed_source_ids,
+                resource_ids=scope.allowed_resource_ids,
+                capability_ids=scope.allowed_capability_ids,
+                connector_binding_ids=scope.allowed_connector_binding_ids,
+                model_route_ids=scope.eligible_model_routes,
+            )
+            origins = {
+                view.capability_id
+                for name in self._registry.tool_names
+                for view, _ in (self._registry.resolve_tool(name),)
+                if view.origin_revision_digest is not None
+                and view.capability_id in scope.allowed_capability_ids
+            }
+            current.validate_coverage(
+                capability_ids=scope.allowed_capability_ids,
+                resource_ids=scope.allowed_resource_ids,
+                route_ids=scope.eligible_model_routes,
+                mcp_capability_ids=origins,
+            )
+            if any(
+                current.capability_contracts[capability_id]
+                != self._registry.contract_digest(capability_id)
+                for capability_id in scope.allowed_capability_ids
+            ):
+                raise ValueError(
+                    "current capability contract differs from the registry"
+                )
+        except (KeyError, ValueError) as error:
+            raise CapabilityInputError(
+                "execution_contract_unavailable",
+                "An exact machine execution contract is unavailable.",
+            ) from error
+        if current != scope.contract_bindings:
+            raise CapabilityInputError(
+                "execution_contract_changed",
+                "An approved execution contract changed; foreground approval is required for a revision.",
+            )
+
+    async def prepare_automation_grant(
+        self,
+        capability_id: str,
+        requested_constraints: Mapping[str, object],
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> CapabilityGrant:
+        """Normalize one proposed grant through its current owner; never execute it."""
+
+        if not isinstance(proposal, AutomationScopeProposal):
+            raise TypeError("grant preparation requires an immutable scope proposal")
+        if (
+            type(max_calls_per_occurrence) is not int
+            or not 1 <= max_calls_per_occurrence <= 256
+        ):
+            raise CapabilityInputError(
+                "automation_grant_invalid",
+                "The requested call ceiling is outside its bound.",
+            )
+        try:
+            capability, _ = self._registry.resolve_execution(capability_id)
+            owner_id = self._registry.resolve_domain_owner(capability_id)
+        except KeyError:
+            raise CapabilityInputError(
+                "automation_grant_unsupported", "The exact capability is unavailable."
+            ) from None
+        policy = capability.automation_grant_policy
+        if (
+            capability.automation_eligibility
+            is not AutomationEligibility.AUTOMATION_DIRECT
+            or policy is None
+            or capability.effect_receipt_policy is None
+        ):
+            raise CapabilityInputError(
+                "automation_grant_unsupported",
+                "This capability does not support unattended effects.",
+            )
+        if (
+            capability_id not in proposal.allowed_capability_ids
+            or capability.access_mode not in proposal.allowed_access_modes
+            or capability.operational_effect not in proposal.allowed_operational_effects
+            or proposal.expires_at <= self._clock()
+        ):
+            raise CapabilityInputError(
+                "automation_grant_outside_scope",
+                "The proposed ceilings do not admit this effect.",
+            )
+        requested = self._registry.validate_grant_constraints(
+            capability_id, requested_constraints
+        )
+        normalized = await self._domains[owner_id].prepare_automation_grant(
+            capability, requested, max_calls_per_occurrence, proposal
+        )
+        if not isinstance(normalized, FrozenJsonObject):
+            raise TypeError("domain grant preparation must return frozen constraints")
+        normalized = self._registry.validate_grant_constraints(
+            capability_id, normalized
+        )
+        return CapabilityGrant(
+            # Identical preparation must survive the normal approval recheck.
+            # This value confers authority only inside its exact enclosing routine scope.
+            grant_id="capability-grant:"
+            + _sha256_digest(
+                {
+                    "agent_id": proposal.agent_id,
+                    "principal_id": proposal.principal_id,
+                    "capability_contract": self._registry.contract_digest(
+                        capability_id
+                    ),
+                    "domain_owner_id": owner_id,
+                    "constraints_kind": policy.constraints_kind,
+                    "constraints": normalized,
+                    "max_calls_per_occurrence": max_calls_per_occurrence,
+                }
+            ).removeprefix("sha256:"),
+            domain_owner_id=owner_id,
+            capability_id=capability_id,
+            capability_contract_digest=self._registry.contract_digest(capability_id),
+            constraints_kind=policy.constraints_kind,
+            constraints=normalized,
+            max_calls_per_occurrence=max_calls_per_occurrence,
+        )
 
     async def execute_internal(
         self,
@@ -472,6 +678,16 @@ class CapabilityRuntime:
 
         if not isinstance(request, InternalCapabilityRequest):
             raise TypeError("request must be InternalCapabilityRequest")
+        if self._source_scope_resolver is not None:
+            request = replace(
+                request,
+                run=replace(
+                    request.run,
+                    resolved_source_scope=await self._source_scope_resolver(
+                        request.run
+                    ),
+                ),
+            )
         capability, executor, owner_id = self._registry.resolve_internal_execution(
             request.capability_id,
             request.contract_digest,
@@ -496,6 +712,7 @@ class CapabilityRuntime:
             catalog_entry=None,
         )
         try:
+            await self._validate_execution_contracts(request.run)
             normalized = domain.normalize_arguments(capability, request.arguments)
             arguments = self._registry.validate_arguments(capability.id, normalized)
             arguments = await domain.prepare_call(
@@ -568,6 +785,11 @@ class CapabilityRuntime:
 
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
+        await self._validate_execution_contracts(run)
+        if self._source_scope_resolver is not None:
+            run = replace(
+                run, resolved_source_scope=await self._source_scope_resolver(run)
+            )
         projected: dict[str, RunToolCatalogEntry] = {}
         for owner_id in sorted(self._domains):
             domain = self._domains[owner_id]
@@ -586,7 +808,7 @@ class CapabilityRuntime:
                 if (
                     run.origin is RunOrigin.SCHEDULED_ROUTINE
                     and capability.automation_eligibility
-                    is not AutomationEligibility.SCHEDULED_DIRECT
+                    is not AutomationEligibility.AUTOMATION_DIRECT
                 ):
                     continue
                 schema_digest = _sha256_digest(capability.input_schema)
@@ -624,8 +846,12 @@ class CapabilityRuntime:
                 {
                     "run_id": run.id,
                     "agent_id": run.agent_id,
-                    "source_id": run.source_id,
-                    "conversation_source_id": run.conversation_source_id,
+                    "source_scope_ids": run.source_scope_ids,
+                    "source_scope": (
+                        None
+                        if run.resolved_source_scope is None
+                        else run.resolved_source_scope.to_mapping()
+                    ),
                 }
             )
         )
@@ -684,6 +910,7 @@ class CapabilityRuntime:
             aggregate_bytes=aggregate_bytes,
             manifest_bytes=manifest_bytes,
             manifest_token_limit=self._limits.max_toolbox_manifest_tokens,
+            source_scope=run.resolved_source_scope,
         )
 
     def project(
@@ -741,6 +968,7 @@ class CapabilityRuntime:
                 callable_entries=callable_entries,
                 loaded_entries=loaded,
                 activation_digest=activation_digest,
+                source_scope=catalog.source_scope,
             ),
             activation_digest=activation_digest,
             provider_definitions=provider_definitions,
@@ -748,6 +976,7 @@ class CapabilityRuntime:
             callable_entries=callable_entries,
             loaded_entries=loaded,
             loaded_definition_bytes=loaded_definition_bytes,
+            source_scope=catalog.source_scope,
         )
 
     async def execute_all(
@@ -788,6 +1017,7 @@ class CapabilityRuntime:
                 "step projection differs from the current toolbox transcript"
             )
         _validate_step_projection(projection, self._registry, self._limits)
+        run = replace(run, resolved_source_scope=projection.source_scope)
         calls = tuple(calls)
         if any(not isinstance(call, ToolCall) for call in calls):
             raise TypeError("calls must contain ToolCall records")
@@ -1158,11 +1388,29 @@ class CapabilityRuntime:
         scored: list[tuple[int, str, str, RunToolCatalogEntry]] = []
         for entry in projection.catalog_entries:
             score = _toolbox_search_score(query, entry)
-            if score > 0:
-                scored.append((score, entry.toolbox_id.value, entry.view.name, entry))
+            scored.append((score, entry.toolbox_id.value, entry.view.name, entry))
         scored.sort(key=lambda item: (-item[0], item[1], item[2]))
         total = len(scored)
-        selected = scored[:limit_value]
+        cursor = call.arguments.get("cursor")
+        position = 0
+        if cursor is not None:
+            try:
+                if (
+                    not isinstance(cursor, str)
+                    or re.fullmatch(r"[1-9][0-9]{0,5}\.[0-9a-f]{64}", cursor) is None
+                ):
+                    raise ValueError
+                position = int(cursor.partition(".")[0])
+                expected = self._toolbox_search_cursor(projection, query, position)
+                if not hmac.compare_digest(cursor, expected) or position >= total:
+                    raise ValueError
+            except ValueError:
+                return _error(
+                    call,
+                    "toolbox_search_cursor_invalid",
+                    "The search cursor is invalid or belongs to another prepared scope or query.",
+                )
+        selected = scored[position : position + limit_value]
         matches = [
             _toolbox_search_match(score, entry, loaded_names=loaded_names)
             for score, _, _, entry in selected
@@ -1171,14 +1419,22 @@ class CapabilityRuntime:
             data = {
                 "catalog_digest": projection.catalog_digest,
                 "matches": matches,
-                "total_matches": total,
+                "total_matches": sum(score > 0 for score, _, _, _ in scored),
+                "total_candidates": total,
                 "returned_count": len(matches),
-                "truncated": len(matches) < total,
+                "truncated": position + len(matches) < total,
+                "next_cursor": (
+                    self._toolbox_search_cursor(
+                        projection, query, position + len(matches)
+                    )
+                    if matches and position + len(matches) < total
+                    else None
+                ),
             }
             if (
                 len(canonical_json(data).encode("utf-8"))
                 <= self._limits.max_toolbox_search_result_bytes
-            ):
+            ) and (matches or total == 0):
                 return _control_success(
                     call,
                     "toolbox_search_result",
@@ -1194,6 +1450,22 @@ class CapabilityRuntime:
                     "The bounded toolbox search result cannot fit its byte limit.",
                 )
             matches.pop()
+
+    def _toolbox_search_cursor(
+        self, projection: StepToolProjection, query: str, position: int
+    ) -> str:
+        material = canonical_json(
+            {
+                "run_id": projection.run_id,
+                "catalog_digest": projection.catalog_digest,
+                "query": query,
+                "position": position,
+            }
+        ).encode("utf-8")
+        return (
+            f"{position}."
+            + hmac.new(self._search_cursor_key, material, "sha256").hexdigest()
+        )
 
     def _toolbox_load(
         self,
@@ -1352,6 +1624,7 @@ class CapabilityRuntime:
                 raise ValueError("tool catalog execution identity changed")
             capability = resolved
             _validate_run_execution_scope(run, capability, sensitivity)
+            await self._validate_execution_contracts(run)
             domain = self._domains[owner_id]
             if validated_arguments is None:
                 raw_arguments = domain.normalize_arguments(capability, call.arguments)
@@ -1383,6 +1656,8 @@ class CapabilityRuntime:
                 capability_id=capability.id,
                 arguments=arguments,
                 conversation_id=run.conversation_id or run.id,
+                source_scope=run.resolved_source_scope,
+                request_sensitivity=sensitivity,
             )
             if capability.operational_effect is not OperationalEffect.NONE:
                 (
@@ -1455,6 +1730,8 @@ class CapabilityRuntime:
             capability_id=capability.id,
             arguments=arguments,
             conversation_id=run.conversation_id or run.id,
+            source_scope=run.resolved_source_scope,
+            request_sensitivity=sensitivity,
         )
         candidate = await executor.execute(execution)
         if not isinstance(candidate, ToolOutput):
@@ -1497,6 +1774,27 @@ class CapabilityRuntime:
     ]:
         if capability.operational_effect is OperationalEffect.NONE:
             raise ValueError("effect execution requires an operational effect")
+        if capability.effect_receipt_policy is not None:
+            if self._effect_receipts is None or self._effect_receipts_unavailable:
+                raise CapabilityInputError(
+                    "effect_receipt_unavailable",
+                    "Durable external-effect evidence is unavailable; no action was dispatched.",
+                )
+            scope = run.start.execution_scope if run.start is not None else None
+            await self._effect_receipts.require_effects_unblocked(
+                run.agent_id,
+                run_id=run.id,
+                routine_id=None if scope is None else scope.routine_id,
+            )
+            existing = await self._effect_receipts.load_effect_receipt_for_call(
+                run.agent_id, run.id, call.id
+            )
+            if existing is not None:
+                return (
+                    _effect_duplicate_result(call, existing),
+                    None,
+                    ToolBatchCertainty.DEFINITE,
+                )
         preflight = getattr(executor, "preflight", None)
         if not callable(preflight):
             raise ValueError("side-effecting executor must provide preflight")
@@ -1511,6 +1809,8 @@ class CapabilityRuntime:
             execution,
             fingerprint,
         )
+        if capability.effect_receipt_policy is not None:
+            self._validate_effect_plan(run, capability, domain, plan)
         if plan.approval_required:
             if self._approval_handler is None:
                 return (
@@ -1634,6 +1934,16 @@ class CapabilityRuntime:
         ToolBatchCertainty,
     ]:
         async with self._mutation_lock:
+            await self._validate_execution_contracts(run)
+            if capability.effect_receipt_policy is not None:
+                current_arguments = await domain.prepare_call(
+                    run, call, capability, arguments, request_sensitivity=sensitivity
+                )
+                if current_arguments != arguments:
+                    raise CapabilityInputError(
+                        "state_changed",
+                        "Current effect binding changed after approval.",
+                    )
             if plan.recheck_after_approval:
                 try:
                     current = await side_effect.preflight(execution)
@@ -1641,13 +1951,21 @@ class CapabilityRuntime:
                         raise ValueError(
                             "side-effect preflight must return FrozenJsonObject"
                         )
-                    await domain.side_effect_plan(
+                    current_plan = await domain.side_effect_plan(
                         run,
                         call,
                         capability,
                         execution,
                         current,
                     )
+                    if (
+                        capability.effect_receipt_policy is not None
+                        and current_plan != plan
+                    ):
+                        raise CapabilityInputError(
+                            "state_changed",
+                            "Current effect authorization changed after approval.",
+                        )
                 except asyncio.CancelledError:
                     raise
                 except BaseException as error:
@@ -1676,6 +1994,18 @@ class CapabilityRuntime:
                         None,
                         ToolBatchCertainty.DEFINITE,
                     )
+            if capability.effect_receipt_policy is not None:
+                return await self._execute_reserved_effect(
+                    run,
+                    call,
+                    capability,
+                    side_effect,
+                    execution,
+                    arguments,
+                    plan,
+                    domain,
+                    sensitivity=sensitivity,
+                )
             candidate, execution_error, interruption_kind, outcome_certainty = (
                 await _execute_definitely(
                     side_effect,
@@ -1713,6 +2043,269 @@ class CapabilityRuntime:
                 interruption_kind,
                 outcome_certainty,
             )
+
+    def _validate_effect_plan(
+        self,
+        run: RunInput,
+        capability: Capability,
+        domain: CapabilityDomain,
+        plan: SideEffectPlan,
+    ) -> CapabilityGrant | None:
+        if plan.effect_intent is None:
+            raise ValueError(
+                "receipt-bearing effects require a canonical domain intent"
+            )
+        scope = run.start.execution_scope if run.start is not None else None
+        if scope is None:
+            if plan.capability_grant_digest is not None or not plan.approval_required:
+                raise ValueError(
+                    "foreground external effects require exact per-call approval"
+                )
+            return None
+        grants = tuple(
+            grant
+            for grant in scope.capability_grants
+            if grant.capability_id == capability.id
+        )
+        if (
+            len(grants) != 1
+            or plan.approval_required
+            or grants[0].grant_digest != plan.capability_grant_digest
+        ):
+            raise CapabilityInputError(
+                "effect_grant_required",
+                "The effect has no exact frozen standing grant.",
+            )
+        grant = grants[0]
+        if (
+            grant.domain_owner_id != domain.domain_owner_id
+            or grant.capability_contract_digest
+            != self._registry.contract_digest(capability.id)
+            or capability.automation_grant_policy is None
+            or grant.constraints_kind
+            != capability.automation_grant_policy.constraints_kind
+        ):
+            raise CapabilityInputError(
+                "effect_grant_changed",
+                "The retained effect grant contract is no longer current.",
+            )
+        self._registry.validate_grant_constraints(capability.id, grant.constraints)
+        return grant
+
+    async def _execute_reserved_effect(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        executor: SideEffectExecutor,
+        execution: ToolExecution,
+        arguments: FrozenJsonObject,
+        plan: SideEffectPlan,
+        domain: CapabilityDomain,
+        *,
+        sensitivity: ModelSensitivity,
+    ) -> tuple[ToolResultBlock, ToolBatchInterruption | None, ToolBatchCertainty]:
+        from .storage.sqlite_records import EffectReceipt, effect_receipt_id
+
+        store = self._effect_receipts
+        policy = capability.effect_receipt_policy
+        assert store is not None and policy is not None
+        grant = self._validate_effect_plan(run, capability, domain, plan)
+        scope = run.start.execution_scope if run.start is not None else None
+        routine_id = None if scope is None else scope.routine_id
+        await store.require_effects_unblocked(
+            run.agent_id, run_id=run.id, routine_id=routine_id
+        )
+        operation_key = _sha256_digest(
+            {
+                "agent_id": run.agent_id,
+                "run_id": run.id if routine_id is None else None,
+                "routine_id": routine_id,
+                "routine_revision": None if scope is None else scope.routine_revision,
+                "occurrence_id": None if scope is None else scope.occurrence_id,
+                "capability_contract_digest": self._registry.contract_digest(
+                    capability.id
+                ),
+                "effect_intent": plan.effect_intent,
+            }
+        )
+        existing = await store.load_effect_receipt_for_operation(
+            run.agent_id, operation_key
+        )
+        if existing is not None:
+            return (
+                _effect_duplicate_result(call, existing),
+                None,
+                ToolBatchCertainty.DEFINITE,
+            )
+        receipt = EffectReceipt(
+            receipt_id=effect_receipt_id(
+                agent_id=run.agent_id,
+                run_id=run.id,
+                call_id=call.id,
+                operation_key=operation_key,
+            ),
+            receipt_kind=policy.receipt_kind,
+            agent_id=run.agent_id,
+            run_id=run.id,
+            call_id=call.id,
+            capability_id=capability.id,
+            domain_owner_id=domain.domain_owner_id,
+            capability_contract_digest=self._registry.contract_digest(capability.id),
+            operation_key=operation_key,
+            argument_fingerprint=_sha256_digest(arguments),
+            sensitivity=sensitivity,
+            started_at=self._clock(),
+            routine_id=routine_id,
+            routine_revision=None if scope is None else scope.routine_revision,
+            occurrence_id=None if scope is None else scope.occurrence_id,
+            capability_grant_digest=None if grant is None else grant.grant_digest,
+        )
+        active_task = asyncio.current_task()
+        cancellations_before_reservation = (
+            0 if active_task is None else active_task.cancelling()
+        )
+        await store.start_effect_receipt(
+            receipt,
+            grant=grant,
+            max_receipts_per_run=min(self._limits.max_tool_calls_per_run, 256),
+        )
+        execution = replace(execution, effect_receipt_id=receipt.receipt_id)
+        observation: EffectObservation | None = None
+        interruption: ToolBatchInterruption | None = None
+        certainty = ToolBatchCertainty.DEFINITE
+        if (
+            active_task is not None
+            and active_task.cancelling() > cancellations_before_reservation
+        ):
+            interruption = ToolBatchInterruption.CANCELLED
+            observation = EffectObservation(
+                EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+            )
+            result = _error(
+                call,
+                "effect_not_dispatched",
+                "The effect was cancelled after reservation and before dispatch.",
+            )
+        else:
+            try:
+                candidate, execution_error, interruption, certainty = (
+                    await _execute_definitely(
+                        executor,
+                        execution,
+                        recovery_timeout_seconds=self._side_effect_recovery_timeout_seconds,
+                    )
+                )
+                if execution_error is not None:
+                    failure = domain.normalize_error(call, execution_error)
+                    observation = (
+                        None if failure is None else failure.effect_observation
+                    )
+                    result = self._exception_result(call, execution_error, domain)
+                else:
+                    if not isinstance(candidate, ToolOutput):
+                        raise ToolOutputValidationError(
+                            "executor did not return ToolOutput"
+                        )
+                    observation = candidate.effect_observation
+                    if observation is not None:
+                        observation = self._registry.validate_effect_observation(
+                            capability.id, observation
+                        )
+                    output = await domain.finalize_output(
+                        run,
+                        call,
+                        capability,
+                        arguments,
+                        candidate,
+                        request_sensitivity=sensitivity,
+                    )
+                    output = self._registry.validate_output(capability.id, output)
+                    _validate_output_execution_scope(run, capability, output)
+                    if (
+                        output.effect_observation != observation
+                        or output.artifact is not None
+                    ):
+                        raise ToolOutputValidationError(
+                            "effect finalization changed its observation or produced an artifact"
+                        )
+                    result = _classified_success(call, output)
+                    result = _bounded_tool_result(
+                        call, _with_execution_lineage(result, capability), self._limits
+                    )
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError):
+                    interruption = _cancel_interruption(error)
+                result = self._exception_result(call, error, domain)
+        try:
+            if observation is not None:
+                observation = self._registry.validate_effect_observation(
+                    capability.id, observation
+                )
+        except (ValueError, TypeError, ToolOutputValidationError):
+            observation = None
+        if observation is None or (
+            result.is_error
+            and observation.outcome is EffectOutcome.SUCCEEDED
+            and observation.evidence_basis is not EffectEvidenceBasis.ADAPTER_VERIFIED
+        ):
+            observation = EffectObservation(
+                EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN
+            )
+        if observation.outcome is EffectOutcome.UNCERTAIN:
+            certainty = ToolBatchCertainty.OUTCOME_UNKNOWN
+            result = _error(
+                call,
+                "effect_outcome_uncertain",
+                "The external operation may have acted. It will not be dispatched again; explicit foreground recovery is required.",
+            )
+        elif observation.outcome is not EffectOutcome.SUCCEEDED and not result.is_error:
+            result = _error(
+                call, "effect_not_applied", "The external operation was not applied."
+            )
+        terminal = receipt.finish(
+            observation, finished_at=max(self._clock(), receipt.started_at)
+        )
+        if (
+            _tool_result_bound_issue(
+                _with_effect_reference(result, terminal), self._limits
+            )
+            is not None
+        ):
+            result = _error(
+                call,
+                "tool_result_too_large",
+                "The effect result exceeded its fixed bound.",
+            )
+            if (
+                observation.outcome is EffectOutcome.SUCCEEDED
+                and observation.evidence_basis
+                is not EffectEvidenceBasis.ADAPTER_VERIFIED
+            ):
+                certainty = ToolBatchCertainty.OUTCOME_UNKNOWN
+                observation = EffectObservation(
+                    EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN
+                )
+                terminal = receipt.finish(
+                    observation, finished_at=terminal.finished_at or receipt.started_at
+                )
+        try:
+            terminal = await store.finish_effect_receipt(terminal)
+        except BaseException as error:
+            self._effect_receipts_unavailable = True
+            if isinstance(error, asyncio.CancelledError):
+                interruption = _cancel_interruption(error)
+            result = _error(
+                call,
+                "effect_receipt_unavailable",
+                "The terminal receipt could not be persisted. External effects are blocked; no automatic retry is allowed.",
+            )
+            return (
+                _with_effect_reference(result, receipt),
+                interruption,
+                ToolBatchCertainty.OUTCOME_UNKNOWN,
+            )
+        return _with_effect_reference(result, terminal), interruption, certainty
 
     async def _commit_artifact_output(
         self,
@@ -1788,6 +2381,23 @@ class CapabilityRuntime:
         error: BaseException,
         domain: CapabilityDomain | None,
     ) -> ToolResultBlock:
+        from .storage.sqlite_records import (
+            EffectReceiptConflictError,
+            EffectUnresolvedError,
+        )
+
+        if isinstance(error, EffectUnresolvedError):
+            return _error(
+                call,
+                "effect_unresolved",
+                str(error),
+                {
+                    "receipt_ids": error.receipt_ids,
+                    "omitted_count": error.omitted_count,
+                },
+            )
+        if isinstance(error, EffectReceiptConflictError):
+            return _error(call, "effect_reservation_conflict", str(error))
         if domain is not None:
             normalized = domain.normalize_error(call, error)
             if normalized is not None:
@@ -2028,6 +2638,8 @@ def _catalog_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
         "domain_owner_id": entry.domain_owner_id,
         "executor_id": entry.executor_id,
         "description": entry.view.description,
+        "presentation_sensitivity": entry.view.presentation_sensitivity.value,
+        "connector_presentation": entry.view.connector_presentation,
         "input_schema": entry.capability.input_schema,
         "input_schema_digest": entry.input_schema_digest,
         "output_kind": entry.capability.output_kind,
@@ -2308,6 +2920,14 @@ def _toolbox_search_score(query: str, entry: RunToolCatalogEntry) -> int:
         (entry.view.presentation.when_to_use, 10),
         (" ".join(entry.view.presentation.keywords), 30),
         (" ".join(entry.parameter_names), 15),
+        (
+            (
+                canonical_json(entry.view.connector_presentation)
+                if entry.view.connector_presentation is not None
+                else ""
+            ),
+            20,
+        ),
     )
     for text, weight in weighted_fields:
         tokens = set(_TOKEN.findall(text.lower()))
@@ -2341,6 +2961,7 @@ def _toolbox_search_match(
         "operational_effect": entry.capability.operational_effect.value,
         "parameter_names": entry.parameter_names,
         "score": score,
+        "match_status": "matched" if score > 0 else "unmatched_fallback",
     }
 
 
@@ -2354,6 +2975,7 @@ def _projection_digest(
     callable_entries: tuple[RunToolCatalogEntry, ...],
     loaded_entries: tuple[RunToolCatalogEntry, ...],
     activation_digest: str,
+    source_scope: EffectiveSourceScope | None = None,
 ) -> str:
     return _sha256_digest(
         {
@@ -2367,6 +2989,7 @@ def _projection_digest(
             "callable_tools": [entry.view.name for entry in callable_entries],
             "loaded_tools": [entry.view.name for entry in loaded_entries],
             "activation_digest": activation_digest,
+            "source_scope": None if source_scope is None else source_scope.to_mapping(),
         }
     )
 
@@ -2385,6 +3008,7 @@ def _step_projection_digest(projection: StepToolProjection) -> str:
         callable_entries=projection.callable_entries,
         loaded_entries=projection.loaded_entries,
         activation_digest=projection.activation_digest,
+        source_scope=projection.source_scope,
     )
 
 
@@ -2696,16 +3320,14 @@ def _validate_run_execution_scope(
     if (
         run.origin is RunOrigin.SCHEDULED_ROUTINE
         and capability.automation_eligibility
-        is not AutomationEligibility.SCHEDULED_DIRECT
+        is not AutomationEligibility.AUTOMATION_DIRECT
     ):
         raise CapabilityInputError(
             "scheduled_capability_ineligible",
             "The requested capability is not admitted for scheduled execution.",
             {"capability_id": capability.id},
         )
-    source_identity_allowed = run.source_id in scope.allowed_source_ids
-    if scope.routine_id is not None and run.source_id is None:
-        source_identity_allowed = True
+    source_identity_allowed = set(run.source_scope_ids) <= set(scope.allowed_source_ids)
     if (
         scope.agent_id != run.agent_id
         or not source_identity_allowed
@@ -2744,8 +3366,6 @@ def _source_pressure_key(run: RunInput, call: ToolCall) -> str:
     source_id = call.arguments.get("source_id")
     if isinstance(source_id, str):
         return source_id
-    if run.source_id is not None:
-        return run.source_id
     return "__agent_local__"
 
 
@@ -2774,6 +3394,34 @@ def _tool_result_bound_issue(
             },
         )
     return None
+
+
+def _with_effect_reference(
+    result: ToolResultBlock, receipt: EffectReceipt
+) -> ToolResultBlock:
+    return replace(
+        result,
+        output={
+            **result.output,
+            "effect_receipt": {
+                "receipt_id": receipt.receipt_id,
+                "receipt_digest": receipt.receipt_digest,
+                "outcome": receipt.outcome.value,
+                "evidence_basis": receipt.evidence_basis.value,
+            },
+        },
+    )
+
+
+def _effect_duplicate_result(call: ToolCall, receipt: EffectReceipt) -> ToolResultBlock:
+    return _with_effect_reference(
+        _error(
+            call,
+            "effect_already_reserved",
+            "This operation was already reserved and was not dispatched again.",
+        ),
+        receipt,
+    )
 
 
 def _bounded_tool_result(

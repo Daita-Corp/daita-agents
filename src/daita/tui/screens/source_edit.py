@@ -71,9 +71,9 @@ class SourceEditScreen(Screen[bool]):
 
     async def _load_initial_source(self) -> None:
         controller = self.app.controller  # type: ignore[attr-defined]
-        source = await controller.active_source()
-        if source is not None:
-            self._load_source(source)
+        sources = tuple(item for item in await controller.list_sources() if item.active)
+        if len(sources) == 1:
+            self._load_source(sources[0])
             return
         await self._choose_source()
 

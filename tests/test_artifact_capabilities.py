@@ -24,7 +24,7 @@ import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
 from daita._json import FrozenJsonObject
 from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
-from daita.domains.data.context import DataContextBuilder
+from daita.context import AgentContextBuilder
 from daita.domains.data.export_capabilities import (
     ARTIFACT_CONVERT_TOOL_NAME,
     ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
@@ -59,7 +59,7 @@ from daita.storage.sqlite_codecs import decode_message, encode_message
 
 
 async def _prepared_request(
-    builder: DataContextBuilder,
+    builder: AgentContextBuilder,
     run: RunInput,
     messages: tuple[CanonicalMessage, ...],
     tools: tuple[ToolDefinition, ...],
@@ -179,7 +179,7 @@ def test_d2_certifies_only_the_three_accepted_scheduled_artifact_capabilities() 
     scheduled = {
         capability.id
         for capability in capabilities
-        if capability.automation_eligibility is AutomationEligibility.SCHEDULED_DIRECT
+        if capability.automation_eligibility is AutomationEligibility.AUTOMATION_DIRECT
     }
 
     assert scheduled == {
@@ -1094,6 +1094,12 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
 
 
 class _Catalog:
+    async def source_routing_facts(self, agent_id, source_ids=()):
+        return ()
+
+    async def readable_resource_ids(self, agent_id, source_ids=()):
+        return frozenset(())
+
     async def admitted_model_sensitivity(
         self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> ModelSensitivity:
@@ -1123,7 +1129,7 @@ async def test_hosted_composition_does_not_project_local_delivery_tools_or_paths
         max_output_tokens=1_000,
         supports_tools=True,
     )
-    builder = DataContextBuilder(_Catalog(), profile=profile)
+    builder = AgentContextBuilder(_Catalog(), profile=profile)
     request = await _prepared_request(
         builder,
         RunInput(

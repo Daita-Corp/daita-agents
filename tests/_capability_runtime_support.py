@@ -9,7 +9,11 @@ from daita._json import FrozenJsonObject
 from daita.capabilities import (
     AccessMode,
     Capability,
+    CapabilityInputError,
+    AutomationScopeProposal,
     CapabilityDeclarations,
+    CapabilityRegistry,
+    ExecutionContractBindings,
     Executor,
     ToolboxId,
     ToolExecution,
@@ -80,6 +84,18 @@ class StaticTestDomain:
         del request_sensitivity
         return arguments
 
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
+
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -90,6 +106,11 @@ class StaticTestDomain:
     ) -> SideEffectPlan:
         return SideEffectPlan(
             recheck_after_approval=self._recheck_after_approval,
+            effect_intent=(
+                FrozenJsonObject.from_mapping(execution.arguments)
+                if capability.effect_receipt_policy is not None
+                else None
+            ),
         )
 
     async def finalize_output(
@@ -252,10 +273,21 @@ class ContextToolProjectionAdapter:
             _ContextExecutor(capability.executor_id) for capability in capabilities
         )
         domain = StaticTestDomain(capabilities, views)
+        registry = static_registry(domain, executors)
+
+        async def read_contracts(**kwargs):
+            return frozen_execution_bindings(
+                kwargs["capability_ids"],
+                kwargs["resource_ids"],
+                kwargs["model_route_ids"],
+                registry=registry,
+            )
+
         self._runtime = CapabilityRuntime(
-            static_registry(domain, executors),
+            registry,
             (domain,),
             limits=limits,
+            execution_contract_reader=read_contracts,
         )
 
     async def prepare_run(self, run: RunInput) -> RunToolCatalog:
@@ -267,6 +299,28 @@ class ContextToolProjectionAdapter:
         messages: tuple[CanonicalMessage, ...],
     ) -> StepToolProjection:
         return self._runtime.project(catalog, messages)
+
+
+def frozen_execution_bindings(
+    capability_ids: tuple[str, ...],
+    resource_ids: tuple[str, ...],
+    route_ids: tuple[str, ...],
+    *,
+    registry: CapabilityRegistry | None = None,
+) -> ExecutionContractBindings:
+    """Exact synthetic metadata for tests that have no source/model admission owner."""
+    return ExecutionContractBindings(
+        capability_contracts={
+            key: (
+                registry.contract_digest(key)
+                if registry is not None
+                else "sha256:" + "a" * 64
+            )
+            for key in capability_ids
+        },
+        resource_revisions={key: "sha256:" + "b" * 64 for key in resource_ids},
+        model_routes={key: "sha256:" + "c" * 64 for key in route_ids},
+    )
 
 
 __all__ = [

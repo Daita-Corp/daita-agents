@@ -7,7 +7,10 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
+
+if TYPE_CHECKING:
+    from .adapters.mcp import MCPServerBinding
 
 from ._json import FrozenJsonObject
 from .adapters.job_profiles import ConnectedJobProfile
@@ -55,7 +58,6 @@ from .hosting.embedded import (
     SourceEditConfirmationHandler,
     SourceEditPreview as SourceEditPreview,
     SourceEditResult,
-    SourceSelectionError,
 )
 from .jobs.models import (
     JobExecutionMode,
@@ -93,6 +95,8 @@ from .semantics import (
 )
 from .skills import Skill, SkillSummary
 from .storage.sqlite_records import (
+    EffectReceipt,
+    EffectResolutionDecision,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
     SourceReadMode,
@@ -321,14 +325,14 @@ class Agent:
         message: str,
         *,
         conversation_id: str | None = None,
-        source_id: str | None = None,
+        source_scope_ids: tuple[str, ...] = (),
         files_only: bool = False,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
             message,
             conversation_id=conversation_id,
-            source_id=source_id,
+            source_scope_ids=source_scope_ids,
             files_only=files_only,
             job_executor_profile_id=job_executor_profile_id,
         )
@@ -338,14 +342,14 @@ class Agent:
         message: str,
         *,
         conversation_id: str | None = None,
-        source_id: str | None = None,
+        source_scope_ids: tuple[str, ...] = (),
     ) -> LoopExit:
         """Run one explicit user-authorized foreground learning action."""
 
         return await self._embedded.learn(
             message,
             conversation_id=conversation_id,
-            source_id=source_id,
+            source_scope_ids=source_scope_ids,
         )
 
     async def transcript(self, run_id: str) -> Transcript:
@@ -410,6 +414,36 @@ class Agent:
         limit: int = 50,
     ) -> tuple[JobSummary, ...]:
         return await self._embedded.list_jobs(statuses=statuses, limit=limit)
+
+    async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
+        """Inspect one exact agent-owned external-effect receipt."""
+        return await self._embedded.inspect_effect(receipt_id)
+
+    async def list_effects(
+        self, *, unresolved_only: bool = False, limit: int = 20, offset: int = 0
+    ) -> tuple[EffectReceipt, ...]:
+        """Read one bounded page of external-effect evidence."""
+        return await self._embedded.list_effects(
+            unresolved_only=unresolved_only, limit=limit, offset=offset
+        )
+
+    async def resolve_effect(
+        self,
+        receipt_id: str,
+        *,
+        expected_digest: str,
+        decision: EffectResolutionDecision,
+        note: str,
+        evidence_references: tuple[str, ...] = (),
+    ) -> EffectReceipt:
+        """Request exact foreground recovery approval without retrying any action."""
+        return await self._embedded.resolve_effect(
+            receipt_id,
+            expected_digest=expected_digest,
+            decision=decision,
+            note=note,
+            evidence_references=evidence_references,
+        )
 
     async def inspect_job(self, job_id: str) -> JobInspection | None:
         return await self._embedded.inspect_job(job_id)
@@ -537,36 +571,26 @@ class Agent:
     async def reset_export_destination(self) -> ArtifactDestination:
         return await self._embedded.reset_export_destination()
 
-    async def active_source(
-        self,
-        *,
-        conversation_id: str | None = None,
-    ) -> SourceRegistration | None:
-        """Return the default or conversation-pinned active source."""
-
-        return await self._embedded.active_source(conversation_id=conversation_id)
-
     async def resolve_source(self, selector: str) -> SourceRegistration:
         """Resolve one active source ID, display name, or display-name alias."""
 
         return await self._embedded.resolve_source(selector)
 
-    async def select_source(self, selector: str) -> SourceRegistration:
-        """Persist one source as the default for subsequent conversations."""
-
-        return await self._embedded.select_source(selector)
-
     async def read_memory(self) -> str:
         return await self._embedded.read_memory()
 
-    async def set_memory(self, text: str) -> None:
-        await self._embedded.set_memory(text)
+    async def set_memory(
+        self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    ) -> None:
+        await self._embedded.set_memory(text, sensitivity=sensitivity)
 
     async def read_user_profile(self) -> str:
         return await self._embedded.read_user_profile()
 
-    async def set_user_profile(self, text: str) -> None:
-        await self._embedded.set_user_profile(text)
+    async def set_user_profile(
+        self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    ) -> None:
+        await self._embedded.set_user_profile(text, sensitivity=sensitivity)
 
     async def review_learning_candidates(
         self,
@@ -682,8 +706,12 @@ class Agent:
         name: str,
         description: str,
         instructions: str,
+        *,
+        sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED,
     ) -> bool:
-        return await self._embedded.save_skill(name, description, instructions)
+        return await self._embedded.save_skill(
+            name, description, instructions, sensitivity=sensitivity
+        )
 
     async def delete_skill(self, name: str) -> bool:
         return await self._embedded.delete_skill(name)
@@ -716,6 +744,31 @@ class Agent:
             maximum_outbound_sensitivity=maximum_outbound_sensitivity,
             local_label=local_label,
             binding_id=binding_id,
+        )
+
+    async def update_mcp_discovery(
+        self,
+        binding_id: str,
+        *,
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...] = (),
+    ) -> MCPServerBinding:
+        """Edit local hints; reopened MCP discovery uses them without a new admission revision."""
+        return await self._embedded.update_mcp_discovery(
+            binding_id, summary=summary, when_to_use=when_to_use, keywords=keywords
+        )
+
+    async def update_source_discovery(
+        self,
+        source_id: str,
+        *,
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...] = (),
+    ) -> SourceRegistration:
+        return await self._embedded.update_source_discovery(
+            source_id, summary=summary, when_to_use=when_to_use, keywords=keywords
         )
 
     async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
@@ -1032,6 +1085,5 @@ __all__ = [
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
     "SourceRefreshError",
-    "SourceSelectionError",
     "CatalogSummary",
 ]

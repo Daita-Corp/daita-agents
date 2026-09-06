@@ -1820,7 +1820,7 @@ async def test_catalog_schema_invalid_input_never_reaches_catalog_execution(
             message="inspect catalog",
             created_at=_OBSERVED_AT,
             conversation_id="catalog-invalid-input-conversation",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         results = await execute_projected(
             runtime,
@@ -2080,7 +2080,12 @@ async def test_structural_search_ranks_direct_matches_before_one_hop_neighbors(
                 limit=3,
             )
         )
-        assert no_synonym.hits == ()
+        assert no_synonym.total_matches == 0
+        assert no_synonym.total_candidates == 3
+        assert len(no_synonym.hits) == 3
+        assert all(
+            hit.match_reasons == ("unmatched_fallback",) for hit in no_synonym.hits
+        )
     finally:
         await agent.close()
 

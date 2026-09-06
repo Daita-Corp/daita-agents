@@ -25,7 +25,7 @@ from daita.domains.data.capabilities import (
     postgresql_update_capability_declarations,
     postgresql_update_preview_capability_declarations,
 )
-from daita.domains.data.context import _system_prompt
+from daita.context import _system_prompt
 from daita.hosting import embedded as embedded_module
 from daita.security import EmptySecretProvider, SecretReference
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope

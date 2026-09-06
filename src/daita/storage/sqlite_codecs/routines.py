@@ -49,7 +49,14 @@ from .distribution import (
     encode_distribution_plan,
     encode_outcome_contract,
 )
-from .execution_scope import decode_execution_scope, encode_execution_scope
+from .execution_scope import (
+    decode_execution_scope,
+    encode_execution_scope,
+    decode_execution_contract_bindings,
+    encode_execution_contract_bindings,
+    decode_capability_grant,
+    encode_capability_grant,
+)
 
 _ROUTINE_VERSION = 1
 _OCCURRENCE_VERSION = 1
@@ -66,6 +73,7 @@ def encode_scheduled_routine(value: ScheduledRoutine) -> str:
                 "conversation_id": value.conversation_id,
                 "owner_principal_id": value.owner_principal_id,
                 "title": value.title,
+                "run_immediately": value.run_immediately,
                 "authorized_instruction": value.authorized_instruction,
                 "instruction_digest": value.instruction_digest,
                 "schedule": _encode_schedule(value.schedule),
@@ -88,6 +96,12 @@ def encode_scheduled_routine(value: ScheduledRoutine) -> str:
                 ),
                 "allowed_resource_ids": list(value.allowed_resource_ids),
                 "allowed_capability_ids": list(value.allowed_capability_ids),
+                "contract_bindings": encode_execution_contract_bindings(
+                    value.contract_bindings
+                ),
+                "capability_grants": [
+                    encode_capability_grant(item) for item in value.capability_grants
+                ],
                 "allowed_access_modes": plain_encode(
                     tuple(sorted(item.value for item in value.allowed_access_modes))
                 ),
@@ -152,6 +166,7 @@ def decode_scheduled_routine(
             "conversation_id",
             "owner_principal_id",
             "title",
+            "run_immediately",
             "authorized_instruction",
             "instruction_digest",
             "schedule",
@@ -164,6 +179,8 @@ def decode_scheduled_routine(
             "allowed_connector_binding_ids",
             "allowed_resource_ids",
             "allowed_capability_ids",
+            "contract_bindings",
+            "capability_grants",
             "allowed_access_modes",
             "allowed_operational_effects",
             "sensitivity_ceiling",
@@ -222,7 +239,19 @@ def decode_scheduled_routine(
     precheck = fields["precheck"]
     observation = fields["last_acknowledged_precheck_observation"]
     promotion = fields["promotion_evidence"]
+    if type(fields["run_immediately"]) is not bool:
+        raise ValueError("stored routine run_immediately must be a boolean")
     return ScheduledRoutine(
+        run_immediately=fields["run_immediately"] is True,
+        contract_bindings=decode_execution_contract_bindings(
+            fields["contract_bindings"]
+        ),
+        capability_grants=tuple(
+            decode_capability_grant(item)
+            for item in sequence(
+                fields["capability_grants"], "routine capability grants"
+            )
+        ),
         routine_id=routine_id,
         agent_id=agent_id,
         conversation_id=text(fields["conversation_id"], "routine conversation"),
@@ -366,6 +395,7 @@ def encode_routine_occurrence(value: RoutineOccurrence) -> str:
                 "conclusion_digest": value.conclusion_digest,
                 "terminal_run_id": value.terminal_run_id,
                 "delivery_ids": list(value.delivery_ids),
+                "effect_receipt_ids": list(value.effect_receipt_ids),
                 "attempt_count": value.attempt_count,
                 "failure_code": value.failure_code,
                 "retry_at": optional_datetime_encode(value.retry_at),
@@ -409,6 +439,7 @@ def decode_routine_occurrence(
             "conclusion_digest",
             "terminal_run_id",
             "delivery_ids",
+            "effect_receipt_ids",
             "attempt_count",
             "failure_code",
             "retry_at",
@@ -429,6 +460,9 @@ def decode_routine_occurrence(
     observation = fields["precheck_observation"]
     scope = fields["execution_scope"]
     return RoutineOccurrence(
+        effect_receipt_ids=_text_sequence(
+            fields["effect_receipt_ids"], "occurrence effect receipt IDs"
+        ),
         occurrence_id=occurrence_id,
         agent_id=agent_id,
         routine_id=text(fields["routine_id"], "occurrence routine id"),

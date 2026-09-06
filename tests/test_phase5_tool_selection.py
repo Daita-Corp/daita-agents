@@ -396,7 +396,7 @@ async def test_connected_customer_schema_is_the_first_and_only_tool(
         source = await agent.attach(SQLiteSource(database, name="Customers"))
         result = await agent.run(
             PHASE5_ROUTES["customer_columns"][0],
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         transcript = await agent.transcript(result.run_id)
         _assert_route(transcript, "customer_columns")
@@ -510,7 +510,7 @@ async def test_postgresql_query_is_direct_and_structured_failure_has_no_fallback
             )
         )
         result = await agent.run(
-            PHASE5_ROUTES["postgres_query"][0], source_id=source.id
+            PHASE5_ROUTES["postgres_query"][0], source_scope_ids=(source.id,)
         )
         transcript = await agent.transcript(result.run_id)
         _assert_route(transcript, "postgres_query")
@@ -605,7 +605,9 @@ async def test_mixed_file_and_source_queries_remain_separate_and_grounded(
                 ),
             )
         )
-        result = await agent.run(PHASE5_ROUTES["mixed_compare"][0], source_id=source.id)
+        result = await agent.run(
+            PHASE5_ROUTES["mixed_compare"][0], source_scope_ids=(source.id,)
+        )
         transcript = await agent.transcript(result.run_id)
         _assert_route(transcript, "mixed_compare")
         calls = {call.id: call for call in _calls(transcript)}
@@ -1194,7 +1196,7 @@ async def test_generated_maximum_catalog_is_bounded_searchable_and_replacing(
         catalog = await runtime.prepare_run(run)
         initial = runtime.project(catalog, (start,))
 
-        builder = agent._embedded._data_context_builder
+        builder = agent._embedded._context_builder
         assert builder is not None
         snapshot = await builder.prepare(run, (start,), catalog)
         request = builder.project(

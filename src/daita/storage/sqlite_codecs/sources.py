@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ...adapters.models import SourceRegistration
+from ...llm.models import ModelSensitivity
 from .common import (
     JsonValue,
     datetime_decode,
@@ -16,6 +17,7 @@ from .common import (
     plain_encode,
     record,
     record_fields,
+    sequence,
     text,
 )
 
@@ -71,6 +73,10 @@ def _encode_source(value: SourceRegistration) -> dict[str, JsonValue]:
             "configuration": plain_encode(value.configuration),
             "attached_at": datetime_encode(value.attached_at),
             "detached_at": optional_datetime_encode(value.detached_at),
+            "summary": value.summary,
+            "when_to_use": value.when_to_use,
+            "keywords": list(value.keywords),
+            "presentation_sensitivity": value.presentation_sensitivity.value,
         },
     )
 
@@ -88,6 +94,10 @@ def _decode_source(value: JsonValue) -> SourceRegistration:
             "configuration",
             "attached_at",
             "detached_at",
+            "summary",
+            "when_to_use",
+            "keywords",
+            "presentation_sensitivity",
         ),
     )
     raw_configuration = mapping(fields["configuration"], "source configuration")
@@ -107,6 +117,15 @@ def _decode_source(value: JsonValue) -> SourceRegistration:
         configuration=configuration,
         attached_at=datetime_decode(fields["attached_at"]),
         detached_at=optional_datetime_decode(fields["detached_at"]),
+        summary=text(fields["summary"], "source summary"),
+        presentation_sensitivity=ModelSensitivity(
+            text(fields["presentation_sensitivity"], "source presentation sensitivity")
+        ),
+        when_to_use=text(fields["when_to_use"], "source when_to_use"),
+        keywords=tuple(
+            text(item, "source keyword")
+            for item in sequence(fields["keywords"], "source keywords")
+        ),
     )
 
 

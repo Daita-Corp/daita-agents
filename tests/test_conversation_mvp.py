@@ -12,10 +12,10 @@ from _workspace_support import workspace_for
 import daita
 from daita import Agent
 from daita._json import canonical_json
-from daita.domains.data.context import (
+from daita.context import (
     _HISTORY_OMISSION_MARKER,
     _MAXIMUM_PRIOR_UTF8_BYTES,
-    DataContextBuilder,
+    AgentContextBuilder,
     _neutral_message,
     _project_completed_history,
 )
@@ -51,7 +51,7 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 async def _prepared_request(
-    builder: DataContextBuilder,
+    builder: AgentContextBuilder,
     run: RunInput,
     messages: tuple[CanonicalMessage, ...],
     tools: tuple[ToolDefinition, ...],
@@ -81,7 +81,7 @@ async def _prepared_request(
 
 
 def test_context_builder_exposes_only_fixed_absolute_history_bounds():
-    assert "retain_messages" not in inspect.signature(DataContextBuilder).parameters
+    assert "retain_messages" not in inspect.signature(AgentContextBuilder).parameters
 
 
 class TranscriptContext:
@@ -223,6 +223,21 @@ class FreshQueryTools:
 
 
 class CatalogSpy:
+    async def source_routing_facts(self, agent_id, source_ids=()):
+        ids = {item.get("source_id", "source-history") for item in self.resources} or {
+            "source-history"
+        }
+        return tuple(
+            {"source_id": item, "adapter_id": "sqlite"}
+            for item in ids
+            if not source_ids or item in source_ids
+        )
+
+    async def readable_resource_ids(self, agent_id, source_ids=()):
+        return frozenset(item["resource_id"] for item in self.resources) or frozenset(
+            {"resource-unmatched"}
+        )
+
     def __init__(self, resources=(), sources=()):
         self.queries = []
         self.resources = resources
@@ -933,7 +948,7 @@ async def test_oversized_analytical_history_keeps_compact_contract_and_requeries
         max_output_tokens=2_000,
         supports_tools=True,
     )
-    builder = DataContextBuilder(catalog, profile=profile)
+    builder = AgentContextBuilder(catalog, profile=profile)
     request = await _prepared_request(
         builder,
         RunInput(
@@ -1217,7 +1232,7 @@ async def test_whole_request_budget_downgrades_full_turn_before_dropping_it():
     record, _ = _analytical_conversation_record(oversized=False)
     prior = _project_completed_history((record,))
     assert "'historical_projection', 'full'" in repr(prior)
-    builder = DataContextBuilder(
+    builder = AgentContextBuilder(
         CatalogSpy(),
         profile=ModelProfile(
             id="mock:full-downgrade",
@@ -1339,7 +1354,7 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
         max_output_tokens=1_000,
         supports_tools=True,
     )
-    builder = DataContextBuilder(catalog, profile=profile)
+    builder = AgentContextBuilder(catalog, profile=profile)
     prior = _project_completed_history(
         tuple(
             _simple_conversation_record(index, answer=f"answer-{index}-" + "x" * 1_500)
@@ -1383,7 +1398,7 @@ async def test_final_budget_omits_oldest_turns_and_preserves_current_exchange():
 
 async def test_catalog_queries_keep_current_and_most_recent_prior_user_separate():
     catalog = CatalogSpy()
-    builder = DataContextBuilder(
+    builder = AgentContextBuilder(
         catalog,
         profile=ModelProfile(
             id="mock:catalog-query",
@@ -1468,7 +1483,7 @@ async def test_context_fitting_retains_exact_current_anchor_and_updates_counts()
         },
     )
     catalog = CatalogSpy(resources, sources)
-    builder = DataContextBuilder(
+    builder = AgentContextBuilder(
         catalog,
         profile=ModelProfile(
             id="mock:catalog-fitting",
@@ -1504,6 +1519,72 @@ async def test_context_fitting_retains_exact_current_anchor_and_updates_counts()
     assert '"returned_count":1' in system.text
     assert '"total_matches":3' in system.text
     assert '"truncated":true' in system.text
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["Prior useful answer. " * 40, "前の回答。" * 50],
+    ids=["ascii", "multibyte"],
+)
+async def test_discovery_pressure_preserves_newest_continuity_and_tool_exchange(answer):
+    from daita.context import _estimate_input_tokens
+
+    source_id = "source:budget"
+    resources = tuple(
+        {
+            "kind": "table",
+            "name": f"candidate_{index:02d}_" + "r" * 200,
+            "resource_id": f"resource:{index}",
+            "source_id": source_id,
+            "revision": "sha256:" + "a" * 64,
+            "sensitivity": "public",
+            "match_reasons": ("unmatched_fallback",),
+        }
+        for index in range(24)
+    )
+    profile = ModelProfile(
+        id="mock:discovery-budget",
+        context_window_tokens=14000,
+        max_output_tokens=1000,
+        supports_tools=True,
+    )
+    builder = AgentContextBuilder(
+        CatalogSpy(resources), profile=profile, catalog_limit=24
+    )
+    prior = _project_completed_history((_simple_conversation_record(7, answer=answer),))
+    run = RunInput(
+        id="run-discovery-budget",
+        agent_id="agent-history",
+        message="Continue with those findings.",
+        created_at=NOW,
+    )
+    call = ToolCall(
+        "current-query", "data_query", {"source_id": source_id, "sql": "SELECT 1"}
+    )
+    current = (
+        run.start_message(),
+        CanonicalMessage(role=MessageRole.ASSISTANT, tool_calls=(call,)),
+        CanonicalMessage(
+            role=MessageRole.TOOL,
+            content=(
+                ToolResultBlock(
+                    call_id=call.id,
+                    output={"rows": [{"value": "result" * 80}]},
+                ),
+            ),
+        ),
+    )
+    tools = (
+        ToolDefinition(
+            name="data_query", description="Read data", input_schema={"type": "object"}
+        ),
+    )
+    request = await _prepared_request(builder, run, (*prior, *current), tools, step=2)
+    assert "history user 7" in repr(request.messages)
+    assert answer in repr(request.messages)
+    assert request.messages[-3:] == current
+    assert _estimate_input_tokens(request) <= profile.maximum_input_tokens
+    assert '"truncated":true' in repr(request.messages)
 
 
 async def test_context_overflow_fails_before_provider_and_is_not_replayed(tmp_path):
@@ -1770,7 +1851,7 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
     )
 
     unchanged = await _prepared_request(
-        DataContextBuilder(
+        AgentContextBuilder(
             CatalogSpy((current_resource,), (current_source,)),
             profile=profile,
         ),
@@ -1793,7 +1874,7 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
         "source_revision": "catalog:sha256:" + ("f" * 64),
     }
     changed = await _prepared_request(
-        DataContextBuilder(
+        AgentContextBuilder(
             CatalogSpy((changed_resource,), (changed_source,)),
             profile=profile,
         ),
@@ -1808,7 +1889,7 @@ async def test_historical_schema_slice_reuse_requires_current_matching_revisions
     assert _HISTORY_OMISSION_MARKER in changed_text
 
     missing_source = await _prepared_request(
-        DataContextBuilder(
+        AgentContextBuilder(
             CatalogSpy((current_resource,), ()),
             profile=profile,
         ),

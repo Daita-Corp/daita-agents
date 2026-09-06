@@ -11,8 +11,14 @@ from enum import Enum
 from hashlib import sha256
 from typing import TypeAlias
 
-from .._json import canonical_json
-from ..capabilities import AccessMode, ExecutionScope, OperationalEffect
+from .._json import FrozenJsonObject, canonical_json
+from ..capabilities import (
+    AccessMode,
+    CapabilityGrant,
+    ExecutionContractBindings,
+    ExecutionScope,
+    OperationalEffect,
+)
 from ..distribution.models import (
     MAX_DISTRIBUTION_TARGETS,
     DistributionPlan,
@@ -322,6 +328,8 @@ RoutineSchedule: TypeAlias = OnceSchedule | IntervalSchedule | CalendarSchedule
 
 @dataclass(frozen=True, slots=True)
 class ResourceRevisionPrecheck:
+    """Opt in to skipping solely on one structural catalog/resource revision."""
+
     capability_id: str
     contract_digest: str
     source_id: str
@@ -335,6 +343,27 @@ class ResourceRevisionPrecheck:
         ):
             _text(value, name)
         _digest(self.contract_digest, "precheck contract_digest")
+
+
+@dataclass(frozen=True, slots=True)
+class RequestedCapabilityGrant:
+    """Secret-free requested constraints; contains no standing authorization."""
+
+    capability_id: str
+    constraints: FrozenJsonObject
+    max_calls_per_occurrence: int
+
+    def __post_init__(self) -> None:
+        _text(self.capability_id, "requested grant capability_id")
+        if not isinstance(self.constraints, FrozenJsonObject):
+            raise TypeError("requested grant constraints must be frozen JSON")
+        if len(canonical_json(self.constraints).encode("utf-8")) > 32_768:
+            raise ValueError("requested grant constraints exceed their byte bound")
+        _bounded_count(
+            self.max_calls_per_occurrence, "requested grant call ceiling", maximum=256
+        )
+        if self.max_calls_per_occurrence == 0:
+            raise ValueError("requested grant call ceiling must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,6 +394,8 @@ class ScheduledRoutineDraft:
     maximum_consecutive_failures: int
     expires_at: datetime
     skill_names: tuple[str, ...] = ()
+    requested_capability_grants: tuple[RequestedCapabilityGrant, ...] = ()
+    run_immediately: bool = False
 
     def __post_init__(self) -> None:
         _text(self.origin_run_id, "routine draft origin_run_id")
@@ -410,13 +441,37 @@ class ScheduledRoutineDraft:
             "draft eligible_model_routes",
             allow_empty=False,
         )
+        requested = tuple(self.requested_capability_grants)
+        if len(requested) > MAX_ROUTINE_IDENTITY_ITEMS or any(
+            not isinstance(item, RequestedCapabilityGrant) for item in requested
+        ):
+            raise ValueError(
+                "requested routine grants are invalid or exceed their bound"
+            )
+        if len({item.capability_id for item in requested}) != len(requested) or any(
+            item.capability_id not in capabilities for item in requested
+        ):
+            raise ValueError(
+                "requested grants must uniquely narrow the capability ceiling"
+            )
+        object.__setattr__(
+            self,
+            "requested_capability_grants",
+            tuple(sorted(requested, key=lambda item: item.capability_id)),
+        )
+        if type(self.run_immediately) is not bool or (
+            self.run_immediately and isinstance(self.schedule, OnceSchedule)
+        ):
+            raise ValueError(
+                "run_immediately requires an interval or calendar schedule"
+            )
         skills = _identities(self.skill_names, "draft skill_names")
         if len(skills) > MAX_ROUTINE_SKILL_BINDINGS:
             raise ValueError("routine draft skill bindings exceed their bound")
-        if not sources and not bindings:
-            raise ValueError("routine draft requires a source or connector binding")
-        if sources and not resources:
-            raise ValueError("source-scoped draft requires exact resources")
+        if bool(sources) != bool(resources):
+            raise ValueError(
+                "routine draft source and resource ceilings must be present together"
+            )
         if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
             raise TypeError("routine draft sensitivity ceiling is invalid")
         if not isinstance(self.outcome_contract, OutcomeContract):
@@ -601,6 +656,9 @@ class ScheduledRoutine:
     revision: int
     created_at: datetime
     updated_at: datetime
+    contract_bindings: ExecutionContractBindings
+    capability_grants: tuple[CapabilityGrant, ...] = ()
+    run_immediately: bool = False
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -664,18 +722,98 @@ class ScheduledRoutine:
             "routine eligible_model_routes",
             allow_empty=False,
         )
-        if not sources and not bindings:
+        if not isinstance(self.contract_bindings, ExecutionContractBindings):
+            raise TypeError("routine requires frozen execution contract bindings")
+        self.contract_bindings.validate_coverage(
+            capability_ids=capabilities,
+            resource_ids=resources,
+            route_ids=routes,
+            mcp_capability_ids=self.contract_bindings.tool_origins,
+        )
+        grants = tuple(self.capability_grants)
+        if any(not isinstance(grant, CapabilityGrant) for grant in grants):
+            raise TypeError("routine capability grants are invalid")
+        if len({grant.capability_id for grant in grants}) != len(grants):
+            raise ValueError("routine permits only one grant per capability")
+        if any(
+            self.contract_bindings.capability_contracts.get(grant.capability_id)
+            != grant.capability_contract_digest
+            for grant in grants
+        ):
             raise ValueError(
-                "routine requires an exact source or connector binding ceiling"
+                "routine grants must match its frozen capability contracts"
             )
-        if sources and not resources:
-            raise ValueError("source-scoped routine requires exact resource identities")
+        object.__setattr__(
+            self,
+            "capability_grants",
+            tuple(sorted(grants, key=lambda grant: grant.capability_id)),
+        )
+        if bool(sources) != bool(resources):
+            raise ValueError(
+                "routine source and resource ceilings must be present together"
+            )
         access_modes = frozenset(self.allowed_access_modes)
-        if not access_modes or not access_modes <= {AccessMode.NONE, AccessMode.READ}:
-            raise ValueError("scheduled routines permit only none/read access modes")
+        if not access_modes or any(
+            not isinstance(item, AccessMode) for item in access_modes
+        ):
+            raise ValueError("routine access ceilings are invalid")
         effects = frozenset(self.allowed_operational_effects)
-        if effects != {OperationalEffect.NONE}:
-            raise ValueError("scheduled routines permit only no operational effect")
+        if not effects or not effects <= {
+            OperationalEffect.NONE,
+            OperationalEffect.MUTATE_DATA,
+            OperationalEffect.EXTERNAL_ACTION,
+        }:
+            raise ValueError("routine effect ceilings contain an unsupported operation")
+        if not isinstance(self.outcome_contract, OutcomeContract):
+            raise TypeError("routine outcome contract is invalid")
+        requirements = {
+            item.capability_id: item
+            for item in self.outcome_contract.effect_requirements
+        }
+        if (
+            set(requirements) != {grant.capability_id for grant in grants}
+            or bool(grants) != bool(effects - {OperationalEffect.NONE})
+            or any(
+                requirements[grant.capability_id].minimum_successful_calls
+                > grant.max_calls_per_occurrence
+                for grant in grants
+            )
+        ):
+            raise ValueError(
+                "routine effect grants and completion requirements must cover the same bounded actions"
+            )
+        if self.precheck is not None:
+            # This is the one concrete supported revision observer, not a
+            # generic freshness or data-value dependency expression.
+            revision_tools = {
+                "data.resource_revision_observation",
+                "catalog.schema",
+                "catalog.inspect",
+                "catalog.search",
+                "catalog.traverse",
+                "artifact.create_document",
+                "artifact.snapshot_result",
+                "skill.view",
+            }
+            if (
+                self.precheck.capability_id != "data.resource_revision_observation"
+                or self.precheck.capability_id not in capabilities
+                or sources != (self.precheck.source_id,)
+                or resources != (self.precheck.resource_id,)
+                or bindings
+                or effects != frozenset({OperationalEffect.NONE})
+                or not set(capabilities) <= revision_tools
+            ):
+                raise ValueError(
+                    "revision prechecks support only one exact structural catalog resource; "
+                    "data-value, effectful, MCP, and broader assignments require ordinary execution"
+                )
+        if type(self.run_immediately) is not bool or (
+            self.run_immediately and isinstance(self.schedule, OnceSchedule)
+        ):
+            raise ValueError(
+                "run_immediately requires an interval or calendar schedule"
+            )
         if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
             raise TypeError("routine sensitivity ceiling is invalid")
         skill_bindings = tuple(self.skill_bindings)
@@ -876,6 +1014,7 @@ class RoutineOccurrence:
     disposition: RoutineOccurrenceDisposition
     created_at: datetime
     updated_at: datetime
+    effect_receipt_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         for identity_value, identity_name in (
@@ -973,6 +1112,20 @@ class RoutineOccurrence:
         _utc(self.updated_at, "occurrence updated_at")
         if self.updated_at < self.created_at:
             raise ValueError("occurrence updated_at precedes created_at")
+        receipts = tuple(self.effect_receipt_ids)
+        if (
+            len(receipts) > 256
+            or len(set(receipts)) != len(receipts)
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"effect-receipt:sha256:[0-9a-f]{64}", item) is None
+                for item in receipts
+            )
+        ):
+            raise ValueError(
+                "occurrence effect receipt references are invalid or exceed their bound"
+            )
+        object.__setattr__(self, "effect_receipt_ids", receipts)
         object.__setattr__(self, "delivery_ids", delivery_ids)
 
 
@@ -986,8 +1139,11 @@ class ScheduledRoutineSummary:
     revision: int
     occurrence_count: int
     consecutive_failures: int
+    sensitivity_ceiling: ModelSensitivity
 
     def __post_init__(self) -> None:
+        if not isinstance(self.sensitivity_ceiling, ModelSensitivity):
+            raise TypeError("routine summary sensitivity is invalid")
         _text(self.routine_id, "routine summary routine_id")
         _text(self.title, "routine summary title", maximum=MAX_ROUTINE_TITLE_CHARACTERS)
         if not isinstance(self.state, RoutineState):

@@ -41,7 +41,14 @@ from daita.domains.data.sql import (
 from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
-from daita.storage.sqlite import DatabaseWriteOutcome, SQLiteStateStore
+from daita.storage.sqlite import SQLiteStateStore
+from daita.capabilities import (
+    EffectOutcome,
+    EffectObservation,
+    EffectEvidenceBasis,
+    EffectReceiptPolicy,
+)
+from daita.identity import AgentIdentity
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 SOURCE_ID = source_registration_id(
@@ -321,6 +328,7 @@ def _execution() -> ToolExecution:
         run_id="run-update",
         call_id="call-update",
         capability_id=POSTGRESQL_UPDATE_CAPABILITY_ID,
+        effect_receipt_id="effect-receipt:sha256:" + "e" * 64,
     )
 
 
@@ -344,7 +352,6 @@ def _backend(store: SQLiteStateStore):
         _SourceStore(_registration()),
         _Catalog(),
         EmptySecretProvider(),
-        receipt_store=store,
         clock=lambda: NOW,
     )
 
@@ -387,13 +394,12 @@ async def test_bulk_update_commits_once_with_exact_receipt(monkeypatch, tmp_path
         assert update_calls[0][2] == ("inactive", "active", 2)
         locked = next(item for item in write_connection.log if item[0] == "cursor")
         assert str(locked[1]).endswith(" FOR UPDATE")
-        receipt = await store.load_database_write_receipt(
-            "agent-update", result.receipt_id
-        )
-        assert receipt is not None
-        assert receipt.outcome is DatabaseWriteOutcome.COMMITTED
-        assert receipt.expected_affected_rows == 3
-        assert receipt.affected_rows == 3
+        observation = result.effect_observation
+        assert observation.outcome is EffectOutcome.SUCCEEDED
+        assert observation.evidence_basis is EffectEvidenceBasis.ADAPTER_VERIFIED
+        assert observation.payload is not None
+        assert observation.payload["expected_affected_rows"] == 3
+        assert observation.payload["affected_rows"] == 3
     finally:
         await store.close()
 
@@ -415,11 +421,14 @@ async def test_target_set_drift_rolls_back_without_update(monkeypatch, tmp_path)
             item[0] == "execute" and str(item[1]).startswith("UPDATE")
             for item in write_connection.log
         )
-        receipt = await store.load_database_write_receipt_for_call(
-            "agent-update", "run-update", "call-update"
+        observation = captured.value.effect_observation
+        assert (
+            observation is not None and observation.outcome is EffectOutcome.NOT_APPLIED
         )
-        assert receipt is not None
-        assert receipt.outcome is DatabaseWriteOutcome.NOT_COMMITTED
+        assert (
+            observation.payload is not None
+            and observation.payload["affected_rows"] == 0
+        )
     finally:
         await store.close()
 
@@ -475,10 +484,18 @@ class _AtomicUpdateExecutor:
     async def execute(self, request: ToolExecution) -> ToolOutput:
         del request
         self.execute_count += 1
-        return ToolOutput(kind="test.postgresql.update", data={"committed": True})
+        return ToolOutput(
+            kind="test.postgresql.update",
+            data={"committed": True},
+            effect_observation=EffectObservation(
+                EffectOutcome.SUCCEEDED,
+                EffectEvidenceBasis.ADAPTER_VERIFIED,
+                FrozenJsonObject.from_mapping({"committed": True}),
+            ),
+        )
 
 
-async def test_runtime_omits_only_redundant_post_approval_update_preflight():
+async def test_runtime_omits_only_redundant_post_approval_update_preflight(tmp_path):
     executor = _AtomicUpdateExecutor()
     capability = Capability(
         id=POSTGRESQL_UPDATE_CAPABILITY_ID,
@@ -498,6 +515,16 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         executor_id=executor.executor_id,
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
+        effect_receipt_policy=EffectReceiptPolicy(
+            "test.atomic",
+            {
+                "type": "object",
+                "properties": {"committed": {"type": "boolean"}},
+                "required": ["committed"],
+                "additionalProperties": False,
+            },
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+        ),
     )
     approvals: list[ApprovalRequest] = []
 
@@ -516,10 +543,14 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         (view,),
         recheck_after_approval=False,
     )
+    store = await SQLiteStateStore.open(tmp_path / "atomic.db", clock=lambda: NOW)
+    await store.initialize_identity(AgentIdentity("agent-update", "Update", NOW))
     runtime = CapabilityRuntime(
         static_registry(domain, (executor,)),
         (domain,),
         approval_handler=approve,
+        effect_receipts=store,
+        clock=lambda: NOW,
     )
     run = RunInput(
         id="run-runtime-update",
@@ -529,6 +560,7 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
         conversation_id="conversation-runtime-update",
     )
     call = ToolCall(id="call-runtime-update", name="test_update", arguments={})
+    await store.start(run)
     outcome = await execute_projected(
         runtime,
         run,
@@ -542,6 +574,8 @@ async def test_runtime_omits_only_redundant_post_approval_update_preflight():
     assert len(approvals) == 1
     assert executor.preflight_count == 1
     assert executor.execute_count == 1
+
+    await store.close()
 
 
 async def test_affected_row_mismatch_rolls_back(monkeypatch, tmp_path):
@@ -577,11 +611,14 @@ async def test_commit_uncertainty_is_recorded_and_never_retried(monkeypatch, tmp
                 agent_id="agent-update", execution=_execution(), command=command
             )
         assert captured.value.error_code == "write_outcome_unknown"
-        receipt = await store.load_database_write_receipt_for_call(
-            "agent-update", "run-update", "call-update"
+        observation = captured.value.effect_observation
+        assert (
+            observation is not None and observation.outcome is EffectOutcome.UNCERTAIN
         )
-        assert receipt is not None
-        assert receipt.outcome is DatabaseWriteOutcome.OUTCOME_UNKNOWN
+        assert (
+            observation.payload is not None
+            and observation.payload["affected_rows"] is None
+        )
         assert (
             len(
                 [
@@ -597,23 +634,90 @@ async def test_commit_uncertainty_is_recorded_and_never_retried(monkeypatch, tmp
 
 
 async def test_duplicate_execution_identity_never_reconnects(monkeypatch, tmp_path):
+    from daita.domains.data.capabilities import POSTGRESQL_UPDATE_RECEIPT_POLICY
+
     store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
+    await store.initialize_identity(AgentIdentity("agent-update", "Update", NOW))
     rows = tuple(_row(index) for index in (1, 2, 3))
-    preview_connection = _Connection(rows)
-    write_connection = _Connection(rows)
-    connections = [preview_connection, write_connection]
+    connections = [_Connection(rows), _Connection(rows)]
     _patch_io(monkeypatch, connections)
     backend = _backend(store)
-    try:
-        command = await _command(backend)
-        await backend.execute_update(
-            agent_id="agent-update", execution=_execution(), command=command
-        )
-        with pytest.raises(write_module.PostgreSQLUpdateExecutionError) as captured:
-            await backend.execute_update(
-                agent_id="agent-update", execution=_execution(), command=command
+    command = await _command(backend)
+
+    class NativeExecutor(_AtomicUpdateExecutor):
+        async def execute(self, request: ToolExecution) -> ToolOutput:
+            self.execute_count += 1
+            result = await backend.execute_update(
+                agent_id="agent-update", execution=request, command=command
             )
-        assert captured.value.error_code == "write_execution_duplicate"
-        assert connections == []
+            return ToolOutput(
+                kind="test.postgresql.update",
+                data={"committed": True},
+                effect_observation=result.effect_observation,
+            )
+
+    executor = NativeExecutor()
+    capability = Capability(
+        id=POSTGRESQL_UPDATE_CAPABILITY_ID,
+        description="Exact native update",
+        input_schema={
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+        output_kind="test.postgresql.update",
+        output_schema={
+            "type": "object",
+            "properties": {"committed": {"type": "boolean"}},
+            "required": ["committed"],
+            "additionalProperties": False,
+        },
+        executor_id=executor.executor_id,
+        access_mode=AccessMode.WRITE,
+        operational_effect=OperationalEffect.MUTATE_DATA,
+        effect_receipt_policy=POSTGRESQL_UPDATE_RECEIPT_POLICY,
+    )
+    view = ToolView(
+        name="test_update",
+        capability_id=capability.id,
+        description=capability.description,
+        presentation=presentation_metadata(load_mode=ToolLoadMode.ON_DEMAND),
+    )
+    domain = StaticTestDomain((capability,), (view,), recheck_after_approval=False)
+
+    async def approve(request):
+        return ApprovalDecision.APPROVE
+
+    runtime = CapabilityRuntime(
+        static_registry(domain, (executor,)),
+        (domain,),
+        effect_receipts=store,
+        approval_handler=approve,
+        clock=lambda: NOW,
+    )
+    run = RunInput(
+        id="run-update",
+        agent_id="agent-update",
+        message="Update",
+        created_at=NOW,
+        conversation_id="conversation-update",
+    )
+    await store.start(run)
+    call = ToolCall(id="call-update", name="test_update", arguments={})
+    try:
+        first = (await execute_projected(runtime, run, (call,))).ordered_results[0]
+        assert not first.is_error
+        second = (await execute_projected(runtime, run, (call,))).ordered_results[0]
+        assert (
+            second.is_error
+            and second.output["error"]["code"] == "effect_already_reserved"
+        )
+        assert second.output["effect_receipt"] == first.output["effect_receipt"]
+        assert executor.execute_count == 1 and connections == []
+        receipt = await store.load_effect_receipt_for_call(
+            run.agent_id, run.id, call.id
+        )
+        assert receipt is not None and receipt.outcome is EffectOutcome.SUCCEEDED
+        assert receipt.evidence_basis is EffectEvidenceBasis.ADAPTER_VERIFIED
     finally:
         await store.close()

@@ -125,7 +125,7 @@ def resource_revision_observation_declarations(
         },
         executor_id=RESOURCE_REVISION_OBSERVATION_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     return ResourceRevisionObservationDeclarations(
         capabilities=(capability,),

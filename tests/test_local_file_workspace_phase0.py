@@ -328,7 +328,7 @@ async def test_files_only_cannot_be_combined_with_a_selected_source(
     agent = await Agent.create("exclusive", workspace=workspace, root=tmp_path)
     try:
         with pytest.raises(ValueError, match="mutually exclusive"):
-            await agent.run("invalid", source_id="source-1", files_only=True)
+            await agent.run("invalid", source_scope_ids=("source-1",), files_only=True)
     finally:
         await agent.close()
 

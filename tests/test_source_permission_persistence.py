@@ -200,7 +200,9 @@ async def test_admitted_resource_scope_derives_sensitivity_and_fails_closed(
     tmp_path: Path,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "sensitivity.db")
-    registration = _registration()
+    registration = replace(
+        _registration(), presentation_sensitivity=ModelSensitivity.PUBLIC
+    )
     public_snapshot, resource, _ = _snapshot(
         registration,
         sync_id="sync-public",
@@ -399,7 +401,6 @@ async def test_source_edit_atomically_hands_off_catalog_and_scopes(
         edited_read_scope
     )
     assert await store.list_postgresql_update_scopes(edited.agent_id, edited.id) == ()
-    assert await store.load_active_source_id(edited.agent_id) == edited.id
     refs = await store.list_current_snapshot_refs(edited.agent_id, (edited.id,))
     assert len(refs) == 1 and refs[0].sync_id == "sync-edited"
     await store.close()
@@ -445,7 +446,6 @@ async def test_same_identity_source_edit_updates_connection_and_clears_updates(
     assert await store.list_sources(edited.agent_id) == (edited,)
     assert await store.load_source_read_scope(edited.agent_id, edited.id) == read_scope
     assert await store.list_postgresql_update_scopes(edited.agent_id, edited.id) == ()
-    assert await store.load_active_source_id(edited.agent_id) == edited.id
     await store.close()
 
 
@@ -689,7 +689,6 @@ async def test_cancel_before_source_edit_transaction_keeps_current_connection(
 
     assert await store.load_source(current.agent_id, current.id) == current
     assert await store.load_source(edited.agent_id, edited.id) is None
-    assert await store.load_active_source_id(current.agent_id) == current.id
     assert await store.load_source_read_scope(
         current.agent_id,
         current.id,

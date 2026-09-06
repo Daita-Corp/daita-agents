@@ -354,6 +354,7 @@ class AgentLoop:
         usage = ModelUsage(cost_estimate=CostEstimate.unavailable("no_model_attempts"))
         artifacts: list[ArtifactRef] = []
         artifact_deliveries: list[ArtifactDeliveryReceipt] = []
+        sensitivity = run.history_sensitivity
         previous_request_input_tokens: int | None = None
         tool_call_count = 0
         run_route: object | None = None if prepared is None else prepared.run_route
@@ -389,6 +390,7 @@ class AgentLoop:
                         run_started,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
                 step_messages = messages[current_start:]
                 step_tool_projection = self._tools.project(
@@ -401,6 +403,9 @@ class AgentLoop:
                     step=step,
                     tool_context=step_tool_projection,
                     previous_request_input_tokens=previous_request_input_tokens,
+                )
+                sensitivity = max(
+                    sensitivity, request.sensitivity, key=lambda item: item.routing_rank
                 )
                 if run_route is None:
                     try:
@@ -415,6 +420,7 @@ class AgentLoop:
                             run_started,
                             artifacts=tuple(artifacts),
                             artifact_deliveries=tuple(artifact_deliveries),
+                            sensitivity=sensitivity,
                         )
                 if not _provider_supports_run_request(
                     self._model,
@@ -430,6 +436,7 @@ class AgentLoop:
                         run_started,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
                 if not self._cost_limit_allows_request(request, run_route, limits):
                     return await self._finish(
@@ -441,6 +448,7 @@ class AgentLoop:
                         run_started,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
                 model_started = (
                     asyncio.get_running_loop().time()
@@ -482,6 +490,7 @@ class AgentLoop:
                         final_message=assistant,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
 
                 if response.finish_reason is not FinishReason.TOOL_CALLS:
@@ -496,6 +505,7 @@ class AgentLoop:
                         run_started,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
 
                 assert response.tool_calls
@@ -509,6 +519,7 @@ class AgentLoop:
                         run_started,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
                 if (
                     tool_call_count + len(response.tool_calls)
@@ -523,6 +534,7 @@ class AgentLoop:
                         run_started,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
                 tool_call_count += len(response.tool_calls)
                 await self._transcripts.append(run.id, assistant)
@@ -543,6 +555,13 @@ class AgentLoop:
                     ),
                 )
                 results = outcome.ordered_results
+                sensitivity = max(
+                    (
+                        sensitivity,
+                        *(item.sensitivity or sensitivity for item in results),
+                    ),
+                    key=lambda item: item.routing_rank,
+                )
                 if len(results) != len(response.tool_calls) or any(
                     result.call_id != call.id
                     for call, result in zip(response.tool_calls, results, strict=True)
@@ -582,6 +601,7 @@ class AgentLoop:
                             run_started,
                             artifacts=tuple(artifacts),
                             artifact_deliveries=tuple(artifact_deliveries),
+                            sensitivity=sensitivity,
                         )
                     return await self._finish(
                         run,
@@ -592,6 +612,7 @@ class AgentLoop:
                         run_started,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
 
                 budget_reason = self._usage_limit_reason(usage, limits)
@@ -606,6 +627,7 @@ class AgentLoop:
                             run_started,
                             artifacts=tuple(artifacts),
                             artifact_deliveries=tuple(artifact_deliveries),
+                            sensitivity=sensitivity,
                         )
                     return await self._wrap_up(
                         run,
@@ -622,6 +644,7 @@ class AgentLoop:
                         limits,
                         artifacts=tuple(artifacts),
                         artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
 
             return await self._wrap_up(
@@ -639,6 +662,7 @@ class AgentLoop:
                 limits,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
+                sensitivity=sensitivity,
             )
         except asyncio.CancelledError:
             await self._finish_best_effort(
@@ -650,6 +674,7 @@ class AgentLoop:
                 run_started,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
+                sensitivity=sensitivity,
             )
             raise
         except TimeoutError:
@@ -662,6 +687,7 @@ class AgentLoop:
                 run_started,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
+                sensitivity=sensitivity,
             )
         except (
             ContextWindowExceeded,
@@ -680,6 +706,7 @@ class AgentLoop:
                 run_started,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
+                sensitivity=sensitivity,
             )
         except ModelProviderError as error:
             usage = _add_usage(usage, error.usage)
@@ -694,6 +721,7 @@ class AgentLoop:
                 provider_failure=error.diagnostic,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
+                sensitivity=sensitivity,
             )
         except Exception:
             await self._finish_best_effort(
@@ -705,6 +733,7 @@ class AgentLoop:
                 run_started,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
+                sensitivity=sensitivity,
             )
             raise
 
@@ -723,6 +752,7 @@ class AgentLoop:
         run_route: object | None,
         limits: LoopLimits,
         *,
+        sensitivity: ModelSensitivity,
         artifacts: tuple[ArtifactRef, ...],
         artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
     ) -> LoopExit:
@@ -736,6 +766,7 @@ class AgentLoop:
                 run_started,
                 artifacts=artifacts,
                 artifact_deliveries=artifact_deliveries,
+                sensitivity=sensitivity,
             )
         tool_context = self._tools.project(tool_catalog, messages)
         request = self._context_builder.project(
@@ -745,6 +776,9 @@ class AgentLoop:
             tool_context=tool_context,
             final=True,
             previous_request_input_tokens=previous_request_input_tokens,
+        )
+        sensitivity = max(
+            sensitivity, request.sensitivity, key=lambda item: item.routing_rank
         )
         if not _provider_supports_run_request(self._model, run_route, request):
             return await self._finish(
@@ -756,6 +790,7 @@ class AgentLoop:
                 run_started,
                 artifacts=artifacts,
                 artifact_deliveries=artifact_deliveries,
+                sensitivity=sensitivity,
             )
         if not self._cost_limit_allows_request(request, run_route, limits):
             return await self._finish(
@@ -767,6 +802,7 @@ class AgentLoop:
                 run_started,
                 artifacts=artifacts,
                 artifact_deliveries=artifact_deliveries,
+                sensitivity=sensitivity,
             )
         try:
             model_started = (
@@ -792,6 +828,7 @@ class AgentLoop:
                 run_started,
                 artifacts=artifacts,
                 artifact_deliveries=artifact_deliveries,
+                sensitivity=sensitivity,
             )
         model_duration_ms = (
             _duration_ms(model_started) if model_started is not None else None
@@ -807,6 +844,7 @@ class AgentLoop:
                 run_started,
                 artifacts=artifacts,
                 artifact_deliveries=artifact_deliveries,
+                sensitivity=sensitivity,
             )
         assistant = _assistant_message(response)
         if self._observer is not None:
@@ -828,6 +866,7 @@ class AgentLoop:
                 run_started,
                 artifacts=artifacts,
                 artifact_deliveries=artifact_deliveries,
+                sensitivity=sensitivity,
             )
         assert response.text is not None and not response.tool_calls
         return await self._finish(
@@ -841,6 +880,7 @@ class AgentLoop:
             final_message=assistant,
             artifacts=artifacts,
             artifact_deliveries=artifact_deliveries,
+            sensitivity=sensitivity,
         )
 
     async def _finish(
@@ -852,6 +892,7 @@ class AgentLoop:
         usage: ModelUsage,
         run_started: float,
         *,
+        sensitivity: ModelSensitivity,
         final_text: str | None = None,
         final_message: CanonicalMessage | None = None,
         provider_id: str | None = None,
@@ -872,6 +913,7 @@ class AgentLoop:
             artifacts=artifacts,
             artifact_deliveries=artifact_deliveries,
             created_at=self._clock(),
+            sensitivity=sensitivity,
         )
         if kind is LoopExitKind.COMPLETED:
             if final_message is None:
@@ -925,6 +967,7 @@ class AgentLoop:
         usage: ModelUsage,
         run_started: float,
         *,
+        sensitivity: ModelSensitivity,
         artifacts: tuple[ArtifactRef, ...] = (),
         artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...] = (),
     ) -> None:
@@ -939,6 +982,7 @@ class AgentLoop:
                     run_started,
                     artifacts=artifacts,
                     artifact_deliveries=artifact_deliveries,
+                    sensitivity=sensitivity,
                 )
             )
         except BaseException:

@@ -148,7 +148,7 @@ def test_release_smoke_is_isolated_and_covers_the_complete_pipx_lifecycle():
     assert '"artifact_save_local"' in smoke
     assert "artifact_deliveries" in smoke
     assert '"artifact_delivery"' in smoke
-    assert "DatabaseWriteReceipt.start" in smoke
+    assert "start_effect_receipt" in smoke
     assert '"receipt_id"' in smoke
     assert '"delivery-config.json"' in smoke
     assert '"Append after upgrade."' in smoke

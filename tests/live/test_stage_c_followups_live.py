@@ -431,7 +431,8 @@ async def _seed_terminal_job(
     )
     try:
         started = await agent.run(
-            "Seed one deterministic profile.", source_id=source_id
+            "Seed one deterministic profile.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
         )
         transcript = await agent.transcript(started.run_id)
         job_id = _job_id_from_start(transcript)
@@ -501,7 +502,8 @@ async def _seed_failed_terminal_job(
     monkeypatch.setattr(executor, "execute", fail_execution)
     try:
         started = await agent.run(
-            "Seed one deterministically failing profile.", source_id=source_id
+            "Seed one deterministically failing profile.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
         )
         transcript = await agent.transcript(started.run_id)
         job_id = _job_id_from_start(transcript)
@@ -534,7 +536,7 @@ async def test_live_model_runs_stage_b_start_through_stage_c_inbox(
         started = await agent.run(
             f"Start exactly one durable background profile for {_TABLE} with a "
             f"sample bound of exactly {_PROFILE_ROWS} rows.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
         )
         started_transcript = await agent.transcript(started.run_id)
         assert started.kind is LoopExitKind.COMPLETED, started

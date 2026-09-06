@@ -19,10 +19,9 @@ SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
 SLASH_COMMAND_COMPLETIONS = (
     ("/model", "/model", "Choose or validate the active model"),
     ("/sources", "/sources", "List registered data sources"),
-    ("/source", "/source", "Choose the active query source"),
-    ("/source use ", "/source use <name>", "Use a source for new conversations"),
+    ("/source", "/source", "Browse admitted sources"),
     ("/source add", "/source add", "Add a data source"),
-    ("/source edit", "/source edit", "Edit the active source connection"),
+    ("/source edit", "/source edit", "Edit an admitted source connection"),
     ("/source refresh ", "/source refresh <id>", "Refresh a source catalog"),
     (
         "/source detach ",

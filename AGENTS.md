@@ -61,7 +61,9 @@ src/daita/
   capabilities.py             # declarations, registry, schema validation
   capability_runtime.py       # common model-to-execution boundary
   domains/                    # statically composed capability domains
-  domains/data/               # data context, validation, SQL, files, artifacts
+  context.py                  # bounded classified framework request construction
+  scope.py                    # effective source/resource scope intersection
+  domains/data/               # data validation, SQL, files, artifacts
   catalog/                    # normalized source and resource truth
   adapters/                   # source admission, discovery, and bounded I/O
   artifacts/                  # artifact records, renderers, storage, delivery
@@ -120,11 +122,29 @@ It depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
 validation, source I/O, policy, and feature lifecycle state stay outside the
 loop.
 
-`daita.domains.data.context.DataContextBuilder` creates each model request from
+`daita.context.AgentContextBuilder` creates each model request from
 the current transcript, current catalog, projected tool definitions, and model
 profile. It keeps complete tool exchanges together and labels catalog, tool,
 file, memory, skill, and data content as untrusted. Untrusted content cannot
 become an instruction or grant authority.
+
+Foreground `RunInput.source_scope_ids=()` admits all currently readable sources
+as candidates at preparation; a nonempty tuple narrows them to exact caller IDs.
+One explicit effective scope freezes source and resource candidates for that run.
+Revocation narrows it; later attachment or permission expansion cannot widen it.
+An empty machine ceiling or resolved scope means no sources. Files-only excludes
+both catalog and MCP tools. There is no active source, conversation source, or
+implicit source argument injection.
+
+Completed-run sensitivity is a conservative floor retained with conversation
+continuity, including compressed assistant answers after source detach. Requests
+also include the classifications of rendered connector metadata, memory, skills,
+semantics, and current results. Model-written advisory content inherits the full
+request classification. Local advisory imports default to restricted; explicit
+local classification uses typed owner APIs or the owned Markdown sensitivity
+label. These labels affect information handling, never execution authority.
+Scheduled reasoning starts from its approved self-contained instruction and
+exact retained skills, without unrelated conversation history or mutable memory.
 
 The catalog is authoritative for current source and resource identity,
 schemas, facets, relationships, and freshness. A current validated tool result
@@ -138,7 +158,13 @@ routine identity, allowed sources, resources, connector bindings,
 capabilities, access modes, operational effects, sensitivity ceiling, model
 routes, per-run budgets, and distribution-plan digest. Scheduled instructions
 are foreground-authorized content; job-event instructions are code-owned.
-Untrusted payloads and model text cannot enlarge the scope.
+Untrusted payloads and model text cannot enlarge the scope. `contract_bindings`
+retains exact capability, MCP-origin, resource-structure and model-configuration
+digests. The composition supplies one bound current-contract reader to routine
+admission, runtime checks and code-owned follow-up construction; it cannot execute
+work. Revalidation compares retained references, never accepts replacement current
+contracts implicitly. Local hints and refresh timestamps are presentation/freshness
+facts, not execution authority.
 
 ## Capabilities and execution
 
@@ -147,8 +173,14 @@ executor, and domain identities. It projects tool schemas and validates model
 arguments and executor output. A tool is a model-facing view of a capability,
 not another execution path.
 
-`toolbox_search` accepts only a natural-language `query` and optional bounded
-`limit` over the run's applicable catalog. Toolbox grouping, access modes, and
+`toolbox_search` accepts a natural-language `query`, optional bounded
+`limit`, and an opaque continuation `cursor` over the run's applicable catalog.
+Catalog and toolbox search rank lexical matches first and include labeled
+unmatched fallbacks; bounded pages retain access to every scoped candidate.
+The framework context includes an ephemeral bounded connector directory built
+from current catalog, MCP binding, toolbox, and skill metadata. Local discovery
+hints are untrusted presentation and never change execution authority.
+Toolbox grouping, access modes, and
 operational effects are metadata, not model-selected search filters. Improve
 discovery vocabulary in existing `ToolPresentation` records without changing
 capability execution contracts. `toolbox_load` accepts exact on-demand names
@@ -185,6 +217,28 @@ and applies the ordinary validation, execution, artifact, sensitivity,
 provenance, result-bound, and observation rules. It is not a recursive model
 call or a second runtime.
 
+External native data effects and admitted external actions declare an
+`EffectReceiptPolicy`. Automation proposals also require an
+`AutomationGrantPolicy`; the runtime validates both requested and domain-normalized
+constraints. Effect-free and local management capabilities cannot use these
+external-effect policies. Production unattended effects remain disabled until their
+concrete native/MCP adapter and product acceptance gates pass. Generic routine
+authority and outcome conformance alone does not enable them.
+
+The runtime reserves a unique operation and call identity in SQLite before
+external dispatch, validates the resulting observation and ordinary output, and
+persists terminal evidence before returning an authenticated receipt reference.
+Reservations are never automatically refunded or replayed. Native commit evidence
+is adapter-verified; server invocation evidence is server-reported. Unusable
+server output, missing evidence, and ambiguous failures become uncertain. Startup
+recovers leftover started receipts before effects are admitted.
+
+Unresolved receipts block new foreground external effects and their originating
+routine. `Agent.inspect_effect`, bounded `Agent.list_effects`, and the human-only
+`Agent.resolve_effect` expose evidence and exact foreground-approved recovery.
+One immutable resolution is retained separately from the original observation;
+resolution performs no retry and grants no connector permission.
+
 Do not call source clients or executors directly from `AgentLoop`, `Agent`, a
 tool view, or model-authored text. Do not infer access, effects, or automation
 eligibility from a tool name when capability metadata defines them.
@@ -211,7 +265,9 @@ Data capabilities are reads except for the explicitly enabled structured
 PostgreSQL update. The update uses one plan for single-row and bulk selections
 with resource-scoped readiness, current admission rechecks, an exact target-set
 preview and fingerprint, once-only approval, transactional drift detection,
-exact affected-count validation, and an immutable receipt. Arbitrary SQL,
+exact affected-count validation, and a runtime-owned effect receipt. The adapter
+returns a code-owned transaction observation and never reserves or finalizes
+SQLite receipt state. Arbitrary SQL,
 inserts, deletes, DDL, and every other external data write are unsupported.
 Adding another data mutation requires an explicit design for validation,
 authorization, transactionality, idempotency, uncertain outcomes, and
@@ -312,7 +368,7 @@ resource, MCP binding, capability, model-route, sensitivity, outcome,
 distribution, budget, expiry, and optional retained skill-content contracts.
 Raw prompt text never determines whether a time slot is due.
 
-Scheduled execution permits only statically declared `scheduled_direct`
+Scheduled execution permits only statically declared `automation_direct`
 capabilities with `OperationalEffect.NONE` and read/none data access. It can
 create only these artifacts:
 
@@ -560,7 +616,7 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | declarations and registry |
 | `src/daita/capability_runtime.py` | common execution mechanics |
-| `src/daita/domains/data/context.py` | model-request construction |
+| `src/daita/context.py` | model-request construction |
 | `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/domains/mcp.py` | MCP projection and call-time rechecks |
 | `src/daita/jobs/` | durable job records and supervision |

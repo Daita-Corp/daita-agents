@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ...llm.models import ModelSensitivity
+
 from ...semantics import (
     ResourceRevisionBinding,
     SemanticAnnotation,
@@ -158,6 +160,7 @@ def _encode_annotation(value: SemanticAnnotation) -> dict[str, JsonValue]:
             "confirmed_at": datetime_encode(value.confirmed_at),
             "confirmed_by": value.confirmed_by,
             "supersedes_id": value.supersedes_id,
+            "sensitivity": enum_encode(value.sensitivity, "ModelSensitivity"),
         },
     )
 
@@ -178,6 +181,7 @@ def _decode_annotation(value: JsonValue) -> SemanticAnnotation:
             "confirmed_at",
             "confirmed_by",
             "supersedes_id",
+            "sensitivity",
         ),
     )
     return SemanticAnnotation(
@@ -200,4 +204,7 @@ def _decode_annotation(value: JsonValue) -> SemanticAnnotation:
         confirmed_at=datetime_decode(fields["confirmed_at"]),
         confirmed_by=text(fields["confirmed_by"], "semantic confirmed_by"),
         supersedes_id=optional_text(fields["supersedes_id"], "semantic supersedes id"),
+        sensitivity=enum_decode(
+            fields["sensitivity"], ModelSensitivity, "ModelSensitivity"
+        ),
     )

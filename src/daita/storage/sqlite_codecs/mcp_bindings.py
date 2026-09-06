@@ -57,6 +57,9 @@ def encode_mcp_binding(value: MCPServerBinding) -> str:
                 "server_name": value.server_name,
                 "server_version": value.server_version,
                 "local_label": value.local_label,
+                "summary": value.summary,
+                "when_to_use": value.when_to_use,
+                "keywords": list(value.keywords),
                 "maximum_outbound_sensitivity": (
                     value.maximum_outbound_sensitivity.value
                 ),
@@ -90,6 +93,9 @@ def decode_mcp_binding(
             "server_name",
             "server_version",
             "local_label",
+            "summary",
+            "when_to_use",
+            "keywords",
             "maximum_outbound_sensitivity",
             "tools",
             "state",
@@ -132,6 +138,12 @@ def decode_mcp_binding(
         server_name=text(fields["server_name"], "MCP server name"),
         server_version=text(fields["server_version"], "MCP server version"),
         local_label=text(fields["local_label"], "MCP local server label"),
+        summary=text(fields["summary"], "MCP binding summary"),
+        when_to_use=text(fields["when_to_use"], "MCP binding when_to_use"),
+        keywords=tuple(
+            text(item, "MCP binding keyword")
+            for item in sequence(fields["keywords"], "MCP binding keywords")
+        ),
         maximum_outbound_sensitivity=maximum_outbound,
         tools=tools,
         state=state,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import datetime
 from decimal import Decimal
@@ -16,7 +16,10 @@ from ..capabilities import (
     RESERVED_TOOL_NAMES,
     AccessMode,
     AutomationEligibility,
+    AutomationScopeProposal,
+    CapabilityGrant,
     CapabilityRegistry,
+    ExecutionContractReader,
     OperationalEffect,
 )
 from ..catalog.models import CatalogResource, Sensitivity
@@ -39,6 +42,7 @@ from ..skills import Skill
 from ..skills.capabilities import SKILL_VIEW_CAPABILITY_ID
 from .models import (
     MAX_ROUTINE_HISTORY_PAGE_SIZE,
+    MAX_ROUTINE_IDENTITY_ITEMS,
     MAX_ROUTINE_LIST_PAGE_SIZE,
     SCHEDULE_INTERPRETER_REVISION,
     CalendarSchedule,
@@ -54,6 +58,7 @@ from .models import (
     RoutineSkillBinding,
     RoutineState,
     ScheduledRoutine,
+    RequestedCapabilityGrant,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
     text_digest,
@@ -72,6 +77,10 @@ class RoutineError(DaitaError):
 
 
 class RoutineStore(Protocol):
+    async def require_effects_unblocked(
+        self, agent_id: str, *, run_id: str | None = None, routine_id: str | None = None
+    ) -> None: ...
+
     async def admit_scheduled_routine(
         self, routine: ScheduledRoutine
     ) -> ScheduledRoutine: ...
@@ -174,6 +183,7 @@ class RoutineOwner:
         maximum_per_run_tokens: int,
         maximum_per_run_cost_usd: Decimal | None,
         clock: Callable[[], datetime],
+        execution_contract_reader: ExecutionContractReader,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("routine owner agent_id must be non-empty text")
@@ -198,7 +208,15 @@ class RoutineOwner:
         self._maximum_per_run_tokens = maximum_per_run_tokens
         self._maximum_per_run_cost_usd = maximum_per_run_cost_usd
         self._clock = clock
+        self._execution_contract_reader = execution_contract_reader
         self._wake: Callable[[], None] | None = None
+        self._grant_preparer: (
+            Callable[
+                [str, Mapping[str, object], int, AutomationScopeProposal],
+                Awaitable[CapabilityGrant],
+            ]
+            | None
+        ) = None
 
     def bind_capability_registry(self, capabilities: CapabilityRegistry) -> None:
         """Bind the one complete immutable registry during composition."""
@@ -208,6 +226,19 @@ class RoutineOwner:
         if not isinstance(capabilities, CapabilityRegistry):
             raise TypeError("routine owner requires CapabilityRegistry")
         self._capabilities = capabilities
+
+    def bind_grant_preparer(
+        self,
+        preparer: Callable[
+            [str, Mapping[str, object], int, AutomationScopeProposal],
+            Awaitable[CapabilityGrant],
+        ],
+    ) -> None:
+        if self._grant_preparer is not None:
+            raise RuntimeError("routine grant preparer is already bound")
+        if not callable(preparer):
+            raise TypeError("routine grant preparer must be callable")
+        self._grant_preparer = preparer
 
     def bind_wake(self, wake: Callable[[], None]) -> None:
         if self._wake is not None:
@@ -246,8 +277,10 @@ class RoutineOwner:
         expires_at: datetime,
         skill_names: tuple[str, ...],
         basis_run_id: str | None,
+        requested_capability_grants: tuple[RequestedCapabilityGrant, ...] = (),
+        run_immediately: bool = False,
     ) -> ScheduledRoutine:
-        origin = await self._owned_run(run_id, conversation_id)
+        origin = await self._owned_run(run_id, conversation_id, sensitivity_ceiling)
         promotion = (
             None
             if basis_run_id is None
@@ -277,7 +310,42 @@ class RoutineOwner:
                 "routine_distribution_destination_invalid",
                 "The exact distribution destination is not currently selectable.",
             ) from error
+        if requested_capability_grants:
+            await self._store.require_effects_unblocked(self.agent_id)
         record = ScheduledRoutine(
+            capability_grants=await self._prepare_requested_grants(
+                AutomationScopeProposal(
+                    agent_id=self.agent_id,
+                    principal_id=f"agent:{self.agent_id}",
+                    allowed_source_ids=allowed_source_ids,
+                    allowed_resource_ids=allowed_resource_ids,
+                    allowed_connector_binding_ids=allowed_connector_binding_ids,
+                    allowed_capability_ids=allowed_capability_ids,
+                    allowed_access_modes=self._access_modes(allowed_capability_ids),
+                    allowed_operational_effects=frozenset(
+                        self._require_capability_registry()
+                        .capability(item)
+                        .operational_effect
+                        for item in allowed_capability_ids
+                    ),
+                    sensitivity_ceiling=sensitivity_ceiling,
+                    eligible_model_routes=eligible_model_routes,
+                    per_run_max_cost_usd=per_run_max_cost_usd,
+                    per_run_max_tokens=per_run_max_tokens,
+                    expires_at=expires_at,
+                    distribution_plan_digest=distribution_plan.plan_digest,
+                ),
+                requested_capability_grants,
+            ),
+            run_immediately=run_immediately,
+            contract_bindings=await self._execution_contract_reader(
+                agent_id=self.agent_id,
+                source_ids=allowed_source_ids,
+                resource_ids=allowed_resource_ids,
+                capability_ids=allowed_capability_ids,
+                connector_binding_ids=allowed_connector_binding_ids,
+                model_route_ids=eligible_model_routes,
+            ),
             routine_id=f"routine-{routine_hash}",
             agent_id=self.agent_id,
             conversation_id=conversation_id,
@@ -296,7 +364,10 @@ class RoutineOwner:
             allowed_resource_ids=allowed_resource_ids,
             allowed_capability_ids=allowed_capability_ids,
             allowed_access_modes=access_modes,
-            allowed_operational_effects=frozenset({OperationalEffect.NONE}),
+            allowed_operational_effects=frozenset(
+                self._require_capability_registry().capability(item).operational_effect
+                for item in allowed_capability_ids
+            ),
             sensitivity_ceiling=sensitivity_ceiling,
             outcome_contract=outcome_contract,
             distribution_plan=distribution_plan,
@@ -370,8 +441,10 @@ class RoutineOwner:
         expires_at: datetime,
         skill_names: tuple[str, ...],
         basis_run_id: str | None,
+        requested_capability_grants: tuple[RequestedCapabilityGrant, ...] = (),
+        run_immediately: bool = False,
     ) -> ScheduledRoutine:
-        origin = await self._owned_run(run_id, conversation_id)
+        origin = await self._owned_run(run_id, conversation_id, sensitivity_ceiling)
         if current.conversation_id != conversation_id:
             raise RoutineError(
                 "routine_conversation_mismatch",
@@ -407,8 +480,46 @@ class RoutineOwner:
                 "routine_distribution_destination_invalid",
                 "The exact distribution destination is not currently selectable.",
             ) from error
+        if run_immediately:
+            raise RoutineError(
+                "routine_immediate_creation_only",
+                "Immediate-first execution belongs to creation; use run-now for an existing routine.",
+            )
         revised = replace(
             current,
+            run_immediately=False,
+            capability_grants=await self._prepare_requested_grants(
+                AutomationScopeProposal(
+                    agent_id=self.agent_id,
+                    principal_id=f"agent:{self.agent_id}",
+                    allowed_source_ids=allowed_source_ids,
+                    allowed_resource_ids=allowed_resource_ids,
+                    allowed_connector_binding_ids=allowed_connector_binding_ids,
+                    allowed_capability_ids=allowed_capability_ids,
+                    allowed_access_modes=self._access_modes(allowed_capability_ids),
+                    allowed_operational_effects=frozenset(
+                        self._require_capability_registry()
+                        .capability(item)
+                        .operational_effect
+                        for item in allowed_capability_ids
+                    ),
+                    sensitivity_ceiling=sensitivity_ceiling,
+                    eligible_model_routes=eligible_model_routes,
+                    per_run_max_cost_usd=per_run_max_cost_usd,
+                    per_run_max_tokens=per_run_max_tokens,
+                    expires_at=expires_at,
+                    distribution_plan_digest=distribution_plan.plan_digest,
+                ),
+                requested_capability_grants,
+            ),
+            contract_bindings=await self._execution_contract_reader(
+                agent_id=self.agent_id,
+                source_ids=allowed_source_ids,
+                resource_ids=allowed_resource_ids,
+                capability_ids=allowed_capability_ids,
+                connector_binding_ids=allowed_connector_binding_ids,
+                model_route_ids=eligible_model_routes,
+            ),
             title=title,
             authorized_instruction=authorized_instruction,
             instruction_digest=text_digest(authorized_instruction),
@@ -422,6 +533,10 @@ class RoutineOwner:
             allowed_resource_ids=allowed_resource_ids,
             allowed_capability_ids=allowed_capability_ids,
             allowed_access_modes=self._access_modes(allowed_capability_ids),
+            allowed_operational_effects=frozenset(
+                self._require_capability_registry().capability(item).operational_effect
+                for item in allowed_capability_ids
+            ),
             sensitivity_ceiling=sensitivity_ceiling,
             outcome_contract=outcome_contract,
             distribution_plan=distribution_plan,
@@ -504,6 +619,13 @@ class RoutineOwner:
                 "The routine changed or is no longer owned by this agent.",
             )
         now = self._clock()
+        if current.capability_grants and action in {
+            RoutineControlAction.RUN_NOW,
+            RoutineControlAction.RESUME,
+        }:
+            await self._store.require_effects_unblocked(
+                self.agent_id, routine_id=routine_id
+            )
         if action is RoutineControlAction.RUN_NOW:
             if current.state is not RoutineState.ACTIVE:
                 raise RoutineError(
@@ -656,22 +778,105 @@ class RoutineOwner:
             capability_ids = capabilities.validate_execution_scope_grant(
                 routine.allowed_capability_ids,
                 allowed_access_modes=routine.allowed_access_modes,
-                allowed_operational_effects=frozenset({OperationalEffect.NONE}),
+                allowed_operational_effects=routine.allowed_operational_effects,
             )
         except (KeyError, ValueError) as error:
             raise RoutineError(
                 "routine_capability_invalid",
                 "The exact capability ceiling is no longer admitted.",
             ) from error
+        try:
+            current_contracts = await self._execution_contract_reader(
+                agent_id=self.agent_id,
+                source_ids=routine.allowed_source_ids,
+                resource_ids=routine.allowed_resource_ids,
+                capability_ids=routine.allowed_capability_ids,
+                connector_binding_ids=routine.allowed_connector_binding_ids,
+                model_route_ids=routine.eligible_model_routes,
+            )
+        except (KeyError, ValueError) as error:
+            raise RoutineError(
+                "routine_execution_contract_unavailable",
+                "An exact approved execution contract is unavailable.",
+            ) from error
+        if routine.capability_grants:
+            await self._store.require_effects_unblocked(
+                self.agent_id, routine_id=routine.routine_id
+            )
+        if current_contracts != routine.contract_bindings:
+            raise RoutineError(
+                "routine_execution_contract_changed",
+                "An approved execution contract changed; a foreground-approved revision is required.",
+            )
+        declared = tuple(capabilities.capability(item) for item in capability_ids)
+        if routine.allowed_access_modes != frozenset(
+            item.access_mode for item in declared
+        ) or routine.allowed_operational_effects != frozenset(
+            item.operational_effect for item in declared
+        ):
+            raise RoutineError(
+                "routine_ceiling_invalid",
+                "Access and effect ceilings must exactly match the approved capabilities.",
+            )
+        effectful = {
+            item.id: item
+            for item in declared
+            if item.operational_effect is not OperationalEffect.NONE
+        }
+        grants = {item.capability_id: item for item in routine.capability_grants}
+        requirements = {
+            item.capability_id: item
+            for item in routine.outcome_contract.effect_requirements
+        }
+        if set(grants) != set(effectful) or set(requirements) != set(effectful):
+            raise RoutineError(
+                "routine_effect_contract_invalid",
+                "Each allowed effect requires one exact grant and an explicit mandatory or optional completion requirement.",
+            )
+        for capability_id, capability in effectful.items():
+            grant = grants[capability_id]
+            effect_requirement = requirements[capability_id]
+            if (
+                capability.automation_grant_policy is None
+                or capability.effect_receipt_policy is None
+            ):
+                raise RoutineError(
+                    "routine_effect_contract_invalid",
+                    "The effect does not support a standing grant and receipt.",
+                )
+            if (
+                grant.domain_owner_id
+                != capabilities.resolve_domain_owner(capability_id)
+                or grant.constraints_kind
+                != capability.automation_grant_policy.constraints_kind
+            ):
+                raise RoutineError(
+                    "routine_effect_contract_invalid",
+                    "The grant does not match its exact owning capability.",
+                )
+            capabilities.validate_grant_constraints(capability_id, grant.constraints)
+            if (
+                effect_requirement.minimum_successful_calls
+                > grant.max_calls_per_occurrence
+                or capability.effect_receipt_policy.success_evidence_basis
+                not in effect_requirement.accepted_evidence_bases
+            ):
+                raise RoutineError(
+                    "routine_effect_requirement_unsupported",
+                    "The requested completion evidence or call count cannot be established by this producer.",
+                )
+        if routine.precheck is not None and effectful:
+            raise RoutineError(
+                "routine_precheck_scope_invalid",
+                "An effectful assignment cannot skip work based on a resource revision.",
+            )
         capability_facts: list[dict[str, object]] = []
         mcp_capability_ids: set[str] = set()
         for capability_id in capability_ids:
             capability = capabilities.capability(capability_id)
             if (
                 capability.automation_eligibility
-                is not AutomationEligibility.SCHEDULED_DIRECT
-                or capability.operational_effect is not OperationalEffect.NONE
-                or capability.access_mode not in {AccessMode.NONE, AccessMode.READ}
+                is not AutomationEligibility.AUTOMATION_DIRECT
             ):
                 raise RoutineError(
                     "routine_capability_interactive_only",
@@ -725,8 +930,12 @@ class RoutineOwner:
                 "routine_skill_capability_invalid",
                 "Pinned skills and the exact skill-view capability must be present together.",
             )
-        readable = await self._catalog.readable_resource_ids(
-            self.agent_id, routine.allowed_source_ids
+        readable = (
+            await self._catalog.readable_resource_ids(
+                self.agent_id, routine.allowed_source_ids
+            )
+            if routine.allowed_source_ids
+            else frozenset()
         )
         if not set(routine.allowed_resource_ids) <= readable:
             raise RoutineError(
@@ -805,6 +1014,11 @@ class RoutineOwner:
                 "The exact MCP capability ceiling is not bound by the retained servers.",
             )
         if routine.precheck is not None:
+            if not routine.allowed_source_ids or routine.allowed_connector_binding_ids:
+                raise RoutineError(
+                    "routine_precheck_scope_invalid",
+                    "Unchanged prechecks require an exact source-only assignment about its structural catalog revision.",
+                )
             if (
                 routine.precheck.source_id not in routine.allowed_source_ids
                 or routine.precheck.resource_id not in routine.allowed_resource_ids
@@ -850,10 +1064,19 @@ class RoutineOwner:
                     "routine_skill_content_missing",
                     "Exact retained skill content is missing or changed.",
                 )
+            if (
+                retained.sensitivity.routing_rank
+                > routine.sensitivity_ceiling.routing_rank
+            ):
+                raise RoutineError(
+                    "routine_skill_sensitivity_exceeded",
+                    "The retained skill exceeds the routine sensitivity ceiling.",
+                )
             skill_facts.append(
                 {
                     "skill_name": skill_binding.skill_name,
                     "content_digest": skill_binding.content_digest,
+                    "sensitivity": retained.sensitivity.value,
                 }
             )
         return FrozenJsonObject.from_mapping(
@@ -871,7 +1094,9 @@ class RoutineOwner:
             }
         )
 
-    async def _owned_run(self, run_id: str, conversation_id: str) -> Transcript:
+    async def _owned_run(
+        self, run_id: str, conversation_id: str, sensitivity_ceiling: ModelSensitivity
+    ) -> Transcript:
         try:
             transcript = await self._store.load(run_id)
         except KeyError as error:
@@ -887,6 +1112,17 @@ class RoutineOwner:
             raise RoutineError(
                 "routine_origin_run_mismatch",
                 "Routine management requires this exact foreground conversation run.",
+            )
+        result = await self._store.result(run_id)
+        floor = max(
+            transcript.run.history_sensitivity,
+            result.sensitivity if result is not None else ModelSensitivity.PUBLIC,
+            key=lambda item: item.routing_rank,
+        )
+        if floor.routing_rank > sensitivity_ceiling.routing_rank:
+            raise RoutineError(
+                "routine_instruction_sensitivity_exceeded",
+                "The saved instruction must retain its originating request sensitivity.",
             )
         return transcript
 
@@ -1032,6 +1268,43 @@ class RoutineOwner:
                     "Exact skill content could not be retained.",
                 ) from error
 
+    async def _prepare_requested_grants(
+        self,
+        proposal: AutomationScopeProposal,
+        requested: tuple[RequestedCapabilityGrant, ...],
+    ) -> tuple[CapabilityGrant, ...]:
+        if not requested:
+            return ()
+        if (
+            len(requested) > MAX_ROUTINE_IDENTITY_ITEMS
+            or any(not isinstance(item, RequestedCapabilityGrant) for item in requested)
+            or len({item.capability_id for item in requested}) != len(requested)
+        ):
+            raise RoutineError(
+                "routine_grant_request_invalid",
+                "Requested grants must be bounded and unique by capability.",
+            )
+        if self._grant_preparer is None:
+            raise RoutineError(
+                "automation_grant_unsupported",
+                "The grant preparation boundary is unavailable.",
+            )
+        grants = []
+        for item in requested:
+            if not isinstance(item, RequestedCapabilityGrant):
+                raise RoutineError(
+                    "routine_grant_request_invalid", "A requested grant is invalid."
+                )
+            grants.append(
+                await self._grant_preparer(
+                    item.capability_id,
+                    item.constraints,
+                    item.max_calls_per_occurrence,
+                    proposal,
+                )
+            )
+        return tuple(grants)
+
     def _access_modes(self, capability_ids: tuple[str, ...]) -> frozenset[AccessMode]:
         capabilities = self._require_capability_registry()
         try:
@@ -1069,6 +1342,7 @@ class RoutineOwner:
 
 def _summary(routine: ScheduledRoutine) -> ScheduledRoutineSummary:
     return ScheduledRoutineSummary(
+        sensitivity_ceiling=routine.sensitivity_ceiling,
         routine_id=routine.routine_id,
         title=routine.title,
         state=routine.state,
@@ -1142,6 +1416,10 @@ def _routine_proposal_payload(routine: ScheduledRoutine) -> dict[str, object]:
         "authorized_instruction": routine.authorized_instruction,
         "instruction_digest": routine.instruction_digest,
         "schedule": _schedule_payload(routine.schedule),
+        "run_immediately": routine.run_immediately,
+        "allowed_operational_effects": sorted(
+            item.value for item in routine.allowed_operational_effects
+        ),
         "misfire_policy": routine.misfire_policy.value,
         "reporting_mode": routine.reporting_mode.value,
         "precheck": (
@@ -1158,6 +1436,10 @@ def _routine_proposal_payload(routine: ScheduledRoutine) -> dict[str, object]:
         "allowed_connector_binding_ids": routine.allowed_connector_binding_ids,
         "allowed_resource_ids": routine.allowed_resource_ids,
         "allowed_capability_ids": routine.allowed_capability_ids,
+        "contract_bindings": routine.contract_bindings.material(),
+        "capability_grants": tuple(
+            grant.material() for grant in routine.capability_grants
+        ),
         "allowed_access_modes": tuple(
             sorted(item.value for item in routine.allowed_access_modes)
         ),

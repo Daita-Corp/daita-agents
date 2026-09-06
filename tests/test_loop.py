@@ -5,7 +5,10 @@ from hashlib import sha256
 from typing import cast
 
 import pytest
-from _capability_runtime_support import ContextToolProjectionAdapter
+from _capability_runtime_support import (
+    ContextToolProjectionAdapter,
+    frozen_execution_bindings,
+)
 from _distribution_support import inbox_distribution_plan
 from _workspace_support import workspace_for
 
@@ -129,6 +132,44 @@ class StaticDefinitionTools:
         raise AssertionError("an over-limit tool surface must never execute")
 
 
+@pytest.mark.parametrize("maximum_steps", (1, 3))
+async def test_terminal_sensitivity_retains_tool_evidence_through_completion(
+    maximum_steps,
+):
+    from daita.storage.sqlite_codecs import decode_loop_exit, encode_loop_exit
+
+    run = RunInput("classified-run", "agent-1", "Read the result", NOW)
+    tool = ToolCall(id="private-read", name="lookup", arguments={})
+    provider = MockModelProvider(
+        (
+            ModelResponse(finish_reason=FinishReason.TOOL_CALLS, tool_calls=(tool,)),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Private conclusion"),
+        )
+    )
+    tools = ScriptedTools(
+        {
+            tool.id: ToolResultBlock(
+                call_id=tool.id,
+                output={"private_value": 42},
+                sensitivity=ModelSensitivity.CONFIDENTIAL,
+                sensitivity_provenance={"authority": "test_admission"},
+            )
+        }
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=tools,
+        limits=LoopLimits(max_steps=maximum_steps),
+    )
+
+    result = await loop.run(run)
+
+    assert result.kind is LoopExitKind.COMPLETED
+    assert result.sensitivity is ModelSensitivity.CONFIDENTIAL
+    assert decode_loop_exit(encode_loop_exit(result)).sensitivity is result.sensitivity
+
+
 async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
     events: list[AgentEvent] = []
     provider = MockModelProvider(
@@ -141,7 +182,14 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
     )
     instruction = "Inspect the bounded job result."
     payload_digest = "sha256:" + sha256(b"{}").hexdigest()
+    tools = ScriptedTools({})
     scope = ExecutionScope(
+        contract_bindings=frozen_execution_bindings(
+            ("test.lookup",),
+            ("resource-1",),
+            (provider.provider_id,),
+            registry=tools._projection._runtime._registry,
+        ),
         scope_id="scope-1",
         revision=1,
         agent_id="agent-1",
@@ -151,7 +199,7 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
         job_revision=3,
         allowed_source_ids=("source-1",),
         allowed_resource_ids=("resource-1",),
-        allowed_capability_ids=("catalog.inspect",),
+        allowed_capability_ids=("test.lookup",),
         allowed_access_modes=frozenset({AccessMode.NONE, AccessMode.READ}),
         allowed_operational_effects=frozenset({OperationalEffect.NONE}),
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
@@ -166,7 +214,7 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
         message=instruction,
         created_at=NOW,
         conversation_id="conversation-1",
-        source_id="source-1",
+        source_scope_ids=("source-1",),
         start=RunStartEnvelope(
             origin=RunOrigin.JOB_EVENT,
             instruction_authority=InstructionAuthority.CODE_OWNED,
@@ -183,7 +231,7 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
     loop = AgentLoop(
         model=provider,
         context_builder=TranscriptContext(),
-        tools=ScriptedTools({}),
+        tools=tools,
         limits=configured,
         clock=lambda: NOW,
         observer=events.append,

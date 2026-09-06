@@ -456,9 +456,12 @@ class LearningCandidate:
     updated_at: datetime
     rejection_reason: LearningCandidateRejectionReason | None = None
     candidate_identity_sha256: str = ""
+    sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
 
     def __post_init__(self) -> None:
         _identifier(self.id, "learning candidate id")
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("candidate sensitivity must be ModelSensitivity")
         _identifier(self.agent_id, "learning candidate agent_id")
         if not isinstance(self.target, LearningCandidateTarget):
             raise TypeError("learning candidate target must be LearningCandidateTarget")
@@ -758,6 +761,8 @@ class LearningMemoryReader(Protocol):
 
     async def read_user_profile(self) -> str: ...
 
+    async def read_context(self) -> tuple[str, str, ModelSensitivity]: ...
+
 
 class LearningCatalogReader(Protocol):
     async def semantic_resource_facts(
@@ -769,6 +774,7 @@ class LearningCatalogReader(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _ArtifactState:
+    sensitivity: ModelSensitivity
     memory: str
     user_profile: str
     semantic_summaries: tuple[FrozenJsonObject, ...]
@@ -1122,6 +1128,7 @@ class OneShotCandidateReviewer:
                     review_fingerprint=review_fingerprint,
                     by_run_id=by_run_id,
                     created_at=now,
+                    sensitivity=request.sensitivity,
                 )
             except (LearningCandidateError, TypeError, ValueError):
                 continue
@@ -1300,11 +1307,19 @@ class OneShotCandidateReviewer:
         return view
 
     async def _artifact_state(self) -> _ArtifactState:
-        memory, user_profile, skills, annotations = await asyncio.gather(
-            self._memory.read_memory(),
-            self._memory.read_user_profile(),
+        memory_context, skills, annotations = await asyncio.gather(
+            self._memory.read_context(),
             self._skills.list_skills(),
             self._store.list_semantic_annotations(self._agent_id),
+        )
+        memory, user_profile, memory_floor = memory_context
+        sensitivity = max(
+            (
+                memory_floor,
+                *(item.sensitivity for item in skills),
+                *(item.sensitivity for item in annotations),
+            ),
+            key=lambda item: item.routing_rank,
         )
         resource_ids = tuple(
             sorted(
@@ -1344,6 +1359,7 @@ class OneShotCandidateReviewer:
         skill_index = "\n".join(f"- {item.name}: {item.description}" for item in skills)
         digest = _fingerprint(
             {
+                "sensitivity": sensitivity.value,
                 "memory": memory,
                 "user_profile": user_profile,
                 "semantic_summaries": semantic_summaries,
@@ -1351,6 +1367,7 @@ class OneShotCandidateReviewer:
             }
         )
         return _ArtifactState(
+            sensitivity=sensitivity,
             memory=memory,
             user_profile=user_profile,
             semantic_summaries=semantic_summaries,
@@ -1428,6 +1445,7 @@ class OneShotCandidateReviewer:
                         "name": skill.name,
                         "description": skill.description,
                         "instructions": skill.instructions,
+                        "sensitivity": skill.sensitivity.value,
                     }
                 )
         while selected:
@@ -1510,6 +1528,7 @@ class OneShotCandidateReviewer:
         review_fingerprint: str,
         by_run_id: Mapping[str, _ProjectedRun],
         created_at: datetime,
+        sensitivity: ModelSensitivity,
     ) -> LearningCandidate:
         if not set(proposal.supporting_run_ids).issubset(by_run_id):
             raise LearningCandidateError("candidate references an unreviewed run")
@@ -1563,7 +1582,9 @@ class OneShotCandidateReviewer:
         if proposal.source_ids and (
             len(proposal.source_ids) != 1
             or any(
-                item.transcript.run.source_id != proposal.source_ids[0]
+                item.transcript.run.resolved_source_scope is None
+                or proposal.source_ids[0]
+                not in item.transcript.run.resolved_source_scope.source_ids
                 for item in support
             )
         ):
@@ -1612,6 +1633,7 @@ class OneShotCandidateReviewer:
             status=LearningCandidateStatus.AWAITING_REVIEW,
             created_at=created_at,
             updated_at=created_at,
+            sensitivity=sensitivity,
             candidate_identity_sha256=_candidate_identity_sha256(
                 target=proposal.target,
                 source_ids=proposal.source_ids,
@@ -2534,7 +2556,7 @@ def _eligible_completed_run(record: ConversationRun) -> bool:
 def _project_review_run(record: ConversationRun) -> tuple[CanonicalMessage, ...]:
     # Reuse the current bounded historical trust projection without giving the
     # reviewer an alternate transcript or tool execution path.
-    from .domains.data.context import _project_completed_history
+    from .context import _project_completed_history
 
     projected = _project_completed_history((record,))
     if len(projected) > LEARNING_REVIEW_MAX_MESSAGES:
@@ -2742,7 +2764,13 @@ def _review_request(
     transcript_payload = tuple(
         {
             "run_id": item.reference.run_id,
-            "source_id": item.record.transcript.run.source_id,
+            "source_scope_ids": (
+                tuple(
+                    sorted(item.record.transcript.run.resolved_source_scope.source_ids)
+                )
+                if item.record.transcript.run.resolved_source_scope is not None
+                else item.record.transcript.run.source_scope_ids
+            ),
             "messages": tuple(_message_mapping(message) for message in item.messages),
         }
         for item in projected
@@ -2803,7 +2831,21 @@ def _review_request(
         ),
         tools=(),
         response_schema=_review_response_schema() if structured else None,
-        sensitivity=ModelSensitivity.INTERNAL,
+        sensitivity=max(
+            (
+                artifacts.sensitivity,
+                *(
+                    ModelSensitivity(body["sensitivity"])
+                    for body in skill_bodies.values()
+                ),
+                *(
+                    item.record.result.sensitivity
+                    for item in projected
+                    if item.record.result is not None
+                ),
+            ),
+            key=lambda item: item.routing_rank,
+        ),
         allow_parallel_tool_calls=False,
     )
 
@@ -2884,6 +2926,8 @@ def _json_value(value: object) -> object:
         return value.isoformat()
     if isinstance(value, Decimal):
         return str(value)
+    if isinstance(value, frozenset):
+        return tuple(sorted((_json_value(item) for item in value), key=canonical_json))
     if isinstance(value, (tuple, list)):
         return tuple(_json_value(item) for item in value)
     return value

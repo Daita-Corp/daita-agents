@@ -109,6 +109,10 @@ Memory and skills are bounded advisory Markdown—not source truth, evidence, or
 authorization. Durable jobs and scheduled routines use the same catalog,
 capability runtime, and execution loop as foreground questions.
 
+Questions can span admitted sources without selecting one first. See
+[context and source scope](docs/CONTEXT_AND_SCOPE.md) for exact caller filters,
+retained sensitivity, and the self-contained context used by scheduled work.
+
 For the full implementation boundaries, see the
 [repository architecture guide](AGENTS.md).
 

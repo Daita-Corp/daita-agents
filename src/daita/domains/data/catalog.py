@@ -82,11 +82,32 @@ class CatalogDataView:
 
         selected_source_ids = frozenset(source_ids)
         registrations = await self._sources.list_sources(agent_id)
+        readable_sources: set[str] = set()
+        for registration in registrations:
+            if registration.agent_id != agent_id or not registration.active:
+                continue
+            if selected_source_ids and registration.id not in selected_source_ids:
+                continue
+            scope = await self._sources.load_source_read_scope(
+                agent_id, registration.id
+            )
+            if scope is None:
+                raise SourcePermissionStateError(
+                    "active source is missing its read scope"
+                )
+            self._require_owned_read_scope(registration.id, agent_id, scope)
+            if scope.mode is not SourceReadMode.NONE:
+                readable_sources.add(registration.id)
         return tuple(
             FrozenJsonObject.from_mapping(
                 {
                     "source_id": registration.id,
                     "adapter_id": registration.adapter_id,
+                    "display_name": registration.display_name,
+                    "summary": registration.summary,
+                    "when_to_use": registration.when_to_use,
+                    "keywords": registration.keywords,
+                    "presentation_sensitivity": registration.presentation_sensitivity.value,
                 }
             )
             for registration in sorted(
@@ -95,6 +116,7 @@ class CatalogDataView:
             )
             if registration.agent_id == agent_id
             and registration.active
+            and registration.id in readable_sources
             and (not selected_source_ids or registration.id in selected_source_ids)
         )
 
@@ -120,6 +142,13 @@ class CatalogDataView:
         except SourcePermissionStateError:
             return None
         sensitivities: list[ModelSensitivity] = []
+        sensitivities.extend(
+            registration.presentation_sensitivity
+            for registration in await self._sources.list_sources(agent_id)
+            if registration.agent_id == agent_id
+            and registration.active
+            and (not source_ids or registration.id in source_ids)
+        )
         for resource in resources:
             if resource.sensitivity is Sensitivity.UNKNOWN:
                 return None
@@ -199,21 +228,35 @@ class CatalogDataView:
                 "active source read scope ownership is invalid"
             )
 
-    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
+    async def search(
+        self,
+        request: CatalogSearchRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> CatalogSearchResult:
         readable = await self.readable_resource_ids(
             request.agent_id,
             request.source_ids,
         )
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         return await self._service.search(
             request,
             readable_resource_ids=readable,
         )
 
-    async def schema_slice(self, request: CatalogSchemaRequest) -> FrozenJsonObject:
+    async def schema_slice(
+        self,
+        request: CatalogSchemaRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> FrozenJsonObject:
         readable = await self.readable_resource_ids(
             request.agent_id,
             (() if request.source_id is None else (request.source_id,)),
         )
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         return await self._service.schema_slice(
             request,
             readable_resource_ids=readable,
@@ -223,8 +266,12 @@ class CatalogDataView:
         self,
         agent_id: str,
         resource_id: str,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
         readable = await self.readable_resource_ids(agent_id)
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         return await self._service.inspect_resource(
             agent_id,
             resource_id,
@@ -234,8 +281,12 @@ class CatalogDataView:
     async def traverse(
         self,
         request: CatalogTraversalRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
         readable = await self.readable_resource_ids(request.agent_id)
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         return await self._service.traverse(
             request,
             readable_resource_ids=readable,

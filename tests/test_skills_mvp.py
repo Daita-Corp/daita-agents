@@ -135,7 +135,7 @@ async def test_fresh_agent_empty_and_public_crud_survives_cold_reopen(tmp_path):
             "Use paid invoice date.\n## Other heading\nState the timezone. 日本語 🧭",
         )
         assert (home / "skills/monthly-revenue/SKILL.md").read_bytes() == (
-            "# monthly-revenue\n\n"
+            "<!-- daita-sensitivity: restricted -->\n# monthly-revenue\n\n"
             "Analyze monthly revenue consistently.\n\n"
             "## Instructions\n\n"
             "Use paid invoice date.\n## Other heading\n"
@@ -464,7 +464,7 @@ async def test_rendered_document_byte_limit_fails_before_partial_write(
         with pytest.raises(SkillValidationError, match="rendered SKILL.md"):
             await agent.save_skill("too-large", "Description", "Body")
         assert (agent.home / "skills/prior/SKILL.md").read_text(encoding="utf-8") == (
-            "# prior\n\nPrior\n\n## Instructions\n\nprior body\n"
+            "<!-- daita-sensitivity: restricted -->\n# prior\n\nPrior\n\n## Instructions\n\nprior body\n"
         )
         assert not (agent.home / "skills/too-large").exists()
     finally:
@@ -489,7 +489,7 @@ async def test_failed_atomic_replacement_preserves_prior_valid_skill(
             await agent.save_skill("safe-name", "New", "new body")
         assert (agent.home / "skills/safe-name/SKILL.md").read_text(
             encoding="utf-8"
-        ) == "# safe-name\n\nPrior\n\n## Instructions\n\nprior body\n"
+        ) == "<!-- daita-sensitivity: restricted -->\n# safe-name\n\nPrior\n\n## Instructions\n\nprior body\n"
         assert not tuple((agent.home / "skills/safe-name").glob(".SKILL.md.*.tmp"))
     finally:
         await agent.close()
@@ -874,12 +874,12 @@ async def test_parallel_skill_and_data_reads_start_together_and_keep_order(
             await release.wait()
             return await original_read(name)
 
-        async def slow_search(request):
+        async def slow_search(request, **kwargs):
             started.add("data")
             if len(started) == 2:
                 release.set()
             await release.wait()
-            return await original_search(request)
+            return await original_search(request, **kwargs)
 
         monkeypatch.setattr(skill_store, "read_skill_with_digest", slow_read)
         monkeypatch.setattr(data_view, "search", slow_search)
@@ -1044,7 +1044,7 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
         assert tables == {
             "autonomous_followups",
             "deliveries",
-            "database_write_receipts",
+            "effect_receipts",
             "learning_candidates",
             "job_runs",
             "mcp_server_bindings",
@@ -1076,10 +1076,12 @@ def test_records_limits_and_absent_lifecycle_state_are_exact():
         "name",
         "description",
         "instructions",
+        "sensitivity",
     )
     assert tuple(field.name for field in fields(SkillSummary)) == (
         "name",
         "description",
+        "sensitivity",
     )
     assert (
         SKILL_MAX_COUNT,
@@ -1089,7 +1091,12 @@ def test_records_limits_and_absent_lifecycle_state_are_exact():
         SKILL_RENDERED_MAX_UTF8_BYTES,
         SKILL_INDEX_MAX_UTF8_BYTES,
     ) == (32, 240, 12_000, 4_000, 50_000, 16_000)
-    assert set(Skill.__dataclass_fields__) == {"name", "description", "instructions"}
+    assert set(Skill.__dataclass_fields__) == {
+        "name",
+        "description",
+        "instructions",
+        "sensitivity",
+    }
     assert not any(
         term in Skill.__dataclass_fields__
         for term in (

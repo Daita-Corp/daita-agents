@@ -10,6 +10,7 @@ from ..capabilities import (
     AccessMode,
     AutomationEligibility,
     Capability,
+    AutomationScopeProposal,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
@@ -91,7 +92,12 @@ class SkillViewExecutor:
         }
         if content_digest is not None:
             data["content_digest"] = content_digest
-        return ToolOutput(kind=SKILL_VIEW_OUTPUT_KIND, data=data)
+        return ToolOutput(
+            kind=SKILL_VIEW_OUTPUT_KIND,
+            data=data,
+            sensitivity=skill.sensitivity,
+            sensitivity_provenance={"authority": "skill_owner", "name": skill.name},
+        )
 
 
 class SkillSaveExecutor:
@@ -106,7 +112,12 @@ class SkillSaveExecutor:
         name, description, instructions, expected_sha256 = _save_arguments(request)
         try:
             exists, document_digest, state_digest, index_digest = (
-                await self._store.preflight_save(name, description, instructions)
+                await self._store.preflight_save(
+                    name,
+                    description,
+                    instructions,
+                    sensitivity=request.request_sensitivity,
+                )
             )
         except SkillValidationError as error:
             raise CapabilityInputError(
@@ -140,6 +151,7 @@ class SkillSaveExecutor:
             name,
             description,
             instructions,
+            sensitivity=request.request_sensitivity,
         )
         return ToolOutput(
             kind=SKILL_SAVE_OUTPUT_KIND,
@@ -229,7 +241,7 @@ def skill_declarations(store: SkillStore) -> SkillDeclarations:
             },
             executor_id=view.executor_id,
             access_mode=AccessMode.NONE,
-            automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         ),
         Capability(
             id=SKILL_SAVE_CAPABILITY_ID,
@@ -392,6 +404,9 @@ class SkillCapabilityDomain:
     def clear_scheduled_bindings(self, run_id: str) -> None:
         self._scheduled_bindings.pop(run_id, None)
 
+    def scheduled_bindings(self, run_id: str) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted(self._scheduled_bindings.get(run_id, {}).items()))
+
     @property
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
@@ -459,6 +474,18 @@ class SkillCapabilityDomain:
                 )
         return arguments
 
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
+
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -479,14 +506,13 @@ class SkillCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
-        del request_sensitivity
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         return replace(
             output,
-            sensitivity=ModelSensitivity.INTERNAL,
+            sensitivity=request_sensitivity,
             sensitivity_provenance={
                 "authority": "skill_domain",
                 "capability_id": capability.id,

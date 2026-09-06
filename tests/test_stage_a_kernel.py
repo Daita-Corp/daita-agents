@@ -27,7 +27,7 @@ from daita.capabilities import (
 )
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
-from daita.domains.data.context import DataContextBuilder, _estimate_input_tokens
+from daita.context import AgentContextBuilder, _estimate_input_tokens
 from daita.domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
 from daita.llm.errors import ContextEvidencePressureExceeded
 from daita.llm.models import (
@@ -114,6 +114,12 @@ class _RuntimeCatalog:
 
 
 class _SnapshotCatalog:
+    async def source_routing_facts(self, agent_id, source_ids=()):
+        return ({"source_id": "source-snapshot", "adapter_id": "sqlite"},)
+
+    async def readable_resource_ids(self, agent_id, source_ids=()):
+        return frozenset(("resource-snapshot",))
+
     def __init__(self) -> None:
         self.context_reads = 0
         self.sensitivity_reads = 0
@@ -616,14 +622,14 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         max_output_tokens=2_000,
         supports_tools=True,
     )
-    builder = DataContextBuilder(catalog, profile=profile)
+    builder = AgentContextBuilder(catalog, profile=profile)
     run = RunInput(
         id="run-context-snapshot",
         agent_id="agent-stage-a",
         message="question",
         created_at=NOW,
         conversation_id="conversation-stage-a-context",
-        source_id="source-stage-a",
+        source_scope_ids=("source-snapshot",),
     )
     user = CanonicalMessage(role=MessageRole.USER, content=(TextBlock("question"),))
     tool = ToolDefinition(
@@ -687,7 +693,7 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         second.sensitivity_provenance["initial_sensitivity_provenance"],
     )
     assert initial_provenance["authority"] == "run_context_snapshot"
-    assert initial_provenance["source_ids"] == ("source-stage-a",)
+    assert initial_provenance["source_ids"] == ("source-snapshot",)
     assert initial_provenance["static_context_sha256"] == (
         snapshot.static_context_sha256
     )
@@ -710,7 +716,7 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
 
 
 async def test_context_owns_durable_job_handoff_guidance() -> None:
-    builder = DataContextBuilder(
+    builder = AgentContextBuilder(
         _SnapshotCatalog(),
         profile=ModelProfile(
             id="mock:durable-handoff-context",
@@ -725,7 +731,7 @@ async def test_context_owns_durable_job_handoff_guidance() -> None:
         message="Profile the current table in the background.",
         created_at=NOW,
         conversation_id="conversation-durable-handoff-context",
-        source_id="source-stage-a",
+        source_scope_ids=("source-snapshot",),
     )
     user = run.start_message()
     start_tool = ToolDefinition(
@@ -753,7 +759,7 @@ async def test_context_owns_durable_job_handoff_guidance() -> None:
 
 
 async def test_context_owner_rejects_cumulative_evidence_pressure_explicitly():
-    builder = DataContextBuilder(
+    builder = AgentContextBuilder(
         _SnapshotCatalog(),
         profile=ModelProfile(
             id="mock:stage-a-pressure",

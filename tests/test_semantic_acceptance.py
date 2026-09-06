@@ -491,7 +491,7 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
             message="inspect current semantics",
             created_at=NOW,
             conversation_id="semantic-read-conversation",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         semantic_domain.select_explicit_learning_run(read_run.id)
         listed = (

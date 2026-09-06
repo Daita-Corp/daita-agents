@@ -9,15 +9,12 @@ from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 
-from .._json import canonical_json
+from .._json import FrozenJsonObject, canonical_json
+from ..capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
+from ..llm.models import ModelSensitivity
 from ..adapters.models import SourceRegistration
 from ..catalog.models import CatalogFacet, CatalogResource, FacetKind, ResourceKind
 
-_DATABASE_WRITE_RECEIPT_ID = re.compile(r"database-write-receipt:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
 _SOURCE_PERMISSION_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
@@ -513,257 +510,293 @@ def postgresql_update_authorization_fingerprint(
     return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
-class DatabaseWriteOutcome(str, Enum):
-    STARTED = "started"
-    COMMITTED = "committed"
-    NOT_COMMITTED = "not_committed"
-    OUTCOME_UNKNOWN = "outcome_unknown"
+class EffectReceiptConflictError(RuntimeError):
+    """A reserved operation or immutable terminal observation conflicts."""
 
 
-class DatabaseWriteReceiptConflictError(RuntimeError):
-    """The durable receipt identity or immutable terminal state conflicts."""
+class EffectUnresolvedError(RuntimeError):
+    """External work is blocked by durable unresolved evidence."""
+
+    def __init__(self, receipt_ids: tuple[str, ...], omitted_count: int) -> None:
+        self.receipt_ids = receipt_ids
+        self.omitted_count = omitted_count
+        super().__init__(
+            "Unresolved external effects require explicit foreground recovery."
+        )
 
 
-def database_write_text(value: str, name: str, *, maximum: int = 512) -> str:
+def effect_receipt_text(value: str, name: str, *, maximum: int = 512) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"{name} must be non-empty text without surrounding space")
-    if len(value) > maximum:
-        raise ValueError(f"{name} exceeds {maximum} characters")
+    if len(value) > maximum or any(character in "\r\n\x00" for character in value):
+        raise ValueError(f"{name} must be bounded single-line text")
     return value
 
 
-def database_write_aware(value: datetime, name: str) -> datetime:
-    if (
-        not isinstance(value, datetime)
-        or value.tzinfo is None
-        or value.utcoffset() is None
-    ):
+def effect_receipt_aware(value: datetime, name: str) -> datetime:
+    if not isinstance(value, datetime) or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
     return value
 
 
-def database_write_receipt_id(
-    *,
-    agent_id: str,
-    run_id: str,
-    call_id: str,
-    capability_id: str,
-    intent_sha256: str,
+def effect_receipt_id(
+    *, agent_id: str, run_id: str, call_id: str, operation_key: str
 ) -> str:
-    identity = {
-        "agent_id": database_write_text(agent_id, "receipt agent_id"),
-        "call_id": database_write_text(call_id, "receipt call_id"),
-        "capability_id": database_write_text(
-            capability_id, "receipt capability_id", maximum=128
-        ),
-        "intent_sha256": intent_sha256,
-        "run_id": database_write_text(run_id, "receipt run_id"),
+    material = {
+        "agent_id": effect_receipt_text(agent_id, "receipt agent_id"),
+        "run_id": effect_receipt_text(run_id, "receipt run_id"),
+        "call_id": effect_receipt_text(call_id, "receipt call_id"),
+        "operation_key": operation_key,
     }
     if (
-        not isinstance(intent_sha256, str)
-        or _DATABASE_WRITE_HASH.fullmatch(intent_sha256) is None
+        not isinstance(operation_key, str)
+        or _SOURCE_PERMISSION_HASH.fullmatch(operation_key) is None
     ):
-        raise ValueError("receipt intent_sha256 must be a sha256 hash")
-    digest = sha256(canonical_json(identity).encode("utf-8")).hexdigest()
-    return f"database-write-receipt:sha256:{digest}"
+        raise ValueError("receipt operation key must be a sha256 digest")
+    return (
+        "effect-receipt:sha256:"
+        + sha256(canonical_json(material).encode("utf-8")).hexdigest()
+    )
 
 
-def validate_database_write_receipt_id(value: str) -> str:
+def validate_effect_receipt_id(value: str) -> str:
     if (
         not isinstance(value, str)
-        or _DATABASE_WRITE_RECEIPT_ID.fullmatch(value) is None
+        or re.fullmatch(r"effect-receipt:sha256:[0-9a-f]{64}", value) is None
     ):
-        raise ValueError("receipt_id must be a canonical database-write receipt id")
+        raise ValueError("receipt_id must be a canonical effect receipt id")
     return value
 
 
+class EffectResolutionDecision(str, Enum):
+    CLOSE_WITHOUT_RETRY = "close_without_retry"
+    ALLOW_FUTURE_WORK = "allow_future_work"
+
+
 @dataclass(frozen=True, slots=True)
-class DatabaseWriteReceipt:
-    """Bounded durable metadata for one exact external database-write attempt."""
+class EffectResolution:
+    """One human decision retained separately from the original observation."""
 
     receipt_id: str
+    receipt_digest: str
+    decision: EffectResolutionDecision
+    approving_principal_id: str
+    control_id: str
+    resolved_at: datetime
+    note: str
+    evidence_references: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        validate_effect_receipt_id(self.receipt_id)
+        if (
+            not isinstance(self.receipt_digest, str)
+            or _SOURCE_PERMISSION_HASH.fullmatch(self.receipt_digest) is None
+        ):
+            raise ValueError("resolution receipt digest is invalid")
+        if not isinstance(self.decision, EffectResolutionDecision):
+            raise TypeError("resolution decision is invalid")
+        effect_receipt_text(self.approving_principal_id, "resolution principal")
+        effect_receipt_text(self.control_id, "resolution control identity")
+        effect_receipt_aware(self.resolved_at, "resolution time")
+        if (
+            not isinstance(self.note, str)
+            or not self.note.strip()
+            or "\x00" in self.note
+            or len(self.note.encode("utf-8")) > 4096
+        ):
+            raise ValueError("resolution requires a bounded non-empty user note")
+        references = _canonical_permission_texts(
+            self.evidence_references,
+            "resolution evidence references",
+            maximum_items=16,
+            maximum_characters=512,
+        )
+        object.__setattr__(self, "evidence_references", references)
+
+
+@dataclass(frozen=True, slots=True)
+class EffectReceipt:
+    """One runtime-reserved external operation and its immutable observation."""
+
+    receipt_id: str
+    receipt_kind: str
     agent_id: str
     run_id: str
     call_id: str
     capability_id: str
-    source_id: str
-    resource_id: str
-    intent_sha256: str
-    preview_fingerprint: str
-    expected_affected_rows: int
-    outcome: DatabaseWriteOutcome
-    affected_rows: int | None
-    normalized_error_code: str | None
+    domain_owner_id: str
+    capability_contract_digest: str
+    operation_key: str
+    argument_fingerprint: str
+    sensitivity: ModelSensitivity
     started_at: datetime
-    completed_at: datetime | None
+    routine_id: str | None = None
+    routine_revision: int | None = None
+    occurrence_id: str | None = None
+    capability_grant_digest: str | None = None
+    outcome: EffectOutcome = EffectOutcome.STARTED
+    evidence_basis: EffectEvidenceBasis = EffectEvidenceBasis.UNKNOWN
+    payload: FrozenJsonObject | None = None
+    finished_at: datetime | None = None
+    resolution: EffectResolution | None = None
 
     def __post_init__(self) -> None:
-        validate_database_write_receipt_id(self.receipt_id)
-        database_write_text(self.agent_id, "receipt agent_id")
-        database_write_text(self.run_id, "receipt run_id")
-        database_write_text(self.call_id, "receipt call_id")
-        database_write_text(self.capability_id, "receipt capability_id", maximum=128)
-        if (
-            not isinstance(self.source_id, str)
-            or _DATABASE_WRITE_SOURCE_ID.fullmatch(self.source_id) is None
+        validate_effect_receipt_id(self.receipt_id)
+        for name in (
+            "receipt_kind",
+            "agent_id",
+            "run_id",
+            "call_id",
+            "capability_id",
+            "domain_owner_id",
         ):
-            raise ValueError("receipt source_id must be a canonical source id")
-        if (
-            not isinstance(self.resource_id, str)
-            or _DATABASE_WRITE_RESOURCE_ID.fullmatch(self.resource_id) is None
+            effect_receipt_text(getattr(self, name), f"receipt {name}")
+        for name in (
+            "capability_contract_digest",
+            "operation_key",
+            "argument_fingerprint",
         ):
-            raise ValueError("receipt resource_id must be a canonical resource id")
-        for value, name in (
-            (self.intent_sha256, "intent_sha256"),
-            (self.preview_fingerprint, "preview_fingerprint"),
-        ):
+            value = getattr(self, name)
             if (
                 not isinstance(value, str)
-                or _DATABASE_WRITE_HASH.fullmatch(value) is None
+                or _SOURCE_PERMISSION_HASH.fullmatch(value) is None
             ):
-                raise ValueError(f"receipt {name} must be a sha256 hash")
-        if not isinstance(self.outcome, DatabaseWriteOutcome):
-            raise TypeError("receipt outcome must be a DatabaseWriteOutcome")
-        if (
-            not isinstance(self.expected_affected_rows, int)
-            or isinstance(self.expected_affected_rows, bool)
-            or self.expected_affected_rows < 1
+                raise ValueError(f"receipt {name} must be a sha256 digest")
+        routine_fields = (
+            self.routine_id,
+            self.routine_revision,
+            self.occurrence_id,
+            self.capability_grant_digest,
+        )
+        if any(item is not None for item in routine_fields):
+            if any(item is None for item in routine_fields):
+                raise ValueError("receipt routine fields must be present together")
+            effect_receipt_text(self.routine_id or "", "receipt routine_id")
+            effect_receipt_text(self.occurrence_id or "", "receipt occurrence_id")
+            if type(self.routine_revision) is not int or self.routine_revision < 1:
+                raise ValueError("receipt routine revision must be positive")
+            if (
+                not isinstance(self.capability_grant_digest, str)
+                or _SOURCE_PERMISSION_HASH.fullmatch(self.capability_grant_digest)
+                is None
+            ):
+                raise ValueError("receipt grant digest is invalid")
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("receipt sensitivity must be classified")
+        effect_receipt_aware(self.started_at, "receipt start time")
+        if not isinstance(self.outcome, EffectOutcome) or not isinstance(
+            self.evidence_basis, EffectEvidenceBasis
         ):
-            raise ValueError("receipt expected_affected_rows must be positive")
-        database_write_aware(self.started_at, "receipt started_at")
-        if self.completed_at is not None:
-            database_write_aware(self.completed_at, "receipt completed_at")
-            if self.completed_at < self.started_at:
-                raise ValueError("receipt cannot complete before it starts")
-        expected_id = database_write_receipt_id(
+            raise TypeError("receipt observation classification is invalid")
+        if self.receipt_id != effect_receipt_id(
             agent_id=self.agent_id,
             run_id=self.run_id,
             call_id=self.call_id,
-            capability_id=self.capability_id,
-            intent_sha256=self.intent_sha256,
-        )
-        if self.receipt_id != expected_id:
-            raise ValueError("receipt_id does not match its execution identity")
-        if self.normalized_error_code is not None and (
-            not isinstance(self.normalized_error_code, str)
-            or _DATABASE_WRITE_ERROR_CODE.fullmatch(self.normalized_error_code) is None
+            operation_key=self.operation_key,
         ):
-            raise ValueError("receipt normalized_error_code is invalid")
-        if self.affected_rows is not None and (
-            not isinstance(self.affected_rows, int)
-            or isinstance(self.affected_rows, bool)
-        ):
-            raise TypeError("receipt affected_rows must be an integer or None")
-        if self.outcome is DatabaseWriteOutcome.STARTED:
-            if any(
-                value is not None
-                for value in (
-                    self.affected_rows,
-                    self.normalized_error_code,
-                    self.completed_at,
-                )
-            ):
-                raise ValueError("started receipt cannot contain terminal fields")
-        elif self.outcome is DatabaseWriteOutcome.COMMITTED:
+            raise ValueError("receipt ID does not match its execution identity")
+        if self.outcome is EffectOutcome.STARTED:
             if (
-                self.affected_rows != self.expected_affected_rows
-                or self.normalized_error_code is not None
-                or self.completed_at is None
+                self.finished_at is not None
+                or self.payload is not None
+                or self.evidence_basis is not EffectEvidenceBasis.UNKNOWN
             ):
-                raise ValueError(
-                    "committed receipt must record the expected affected rows"
-                )
-        elif self.outcome is DatabaseWriteOutcome.NOT_COMMITTED:
-            if (
-                self.affected_rows != 0
-                or self.normalized_error_code is None
-                or self.completed_at is None
-            ):
-                raise ValueError(
-                    "not_committed receipt must record zero rows and an error code"
-                )
-        elif (
-            self.affected_rows is not None
-            or self.normalized_error_code != "write_outcome_unknown"
-            or self.completed_at is None
-        ):
-            raise ValueError(
-                "outcome_unknown receipt must omit affected rows and use its stable code"
+                raise ValueError("started receipt cannot contain terminal evidence")
+        else:
+            if self.finished_at is None:
+                raise ValueError("terminal receipt requires a finish time")
+            effect_receipt_aware(self.finished_at, "receipt finish time")
+            if self.finished_at < self.started_at:
+                raise ValueError("receipt cannot finish before it starts")
+            observation = EffectObservation(
+                self.outcome, self.evidence_basis, self.payload
             )
+            object.__setattr__(self, "payload", observation.payload)
+        if self.resolution is not None:
+            if (
+                not isinstance(self.resolution, EffectResolution)
+                or self.outcome is not EffectOutcome.UNCERTAIN
+            ):
+                raise ValueError("only uncertain receipts can carry a human resolution")
+            if (
+                self.resolution.receipt_id != self.receipt_id
+                or self.resolution.receipt_digest != self.receipt_digest
+            ):
+                raise ValueError("resolution does not bind this exact observation")
+            if (
+                self.finished_at is None
+                or self.resolution.resolved_at < self.finished_at
+            ):
+                raise ValueError("resolution cannot precede its terminal observation")
 
-    @classmethod
-    def start(
-        cls,
-        *,
-        agent_id: str,
-        run_id: str,
-        call_id: str,
-        capability_id: str,
-        source_id: str,
-        resource_id: str,
-        intent_sha256: str,
-        preview_fingerprint: str,
-        expected_affected_rows: int,
-        started_at: datetime,
-    ) -> DatabaseWriteReceipt:
-        return cls(
-            receipt_id=database_write_receipt_id(
-                agent_id=agent_id,
-                run_id=run_id,
-                call_id=call_id,
-                capability_id=capability_id,
-                intent_sha256=intent_sha256,
+    def material(self) -> dict[str, object]:
+        return {
+            "receipt_id": self.receipt_id,
+            "receipt_kind": self.receipt_kind,
+            "agent_id": self.agent_id,
+            "run_id": self.run_id,
+            "call_id": self.call_id,
+            "capability_id": self.capability_id,
+            "domain_owner_id": self.domain_owner_id,
+            "capability_contract_digest": self.capability_contract_digest,
+            "routine_id": self.routine_id,
+            "routine_revision": self.routine_revision,
+            "occurrence_id": self.occurrence_id,
+            "capability_grant_digest": self.capability_grant_digest,
+            "operation_key": self.operation_key,
+            "argument_fingerprint": self.argument_fingerprint,
+            "outcome": self.outcome.value,
+            "evidence_basis": self.evidence_basis.value,
+            "sensitivity": self.sensitivity.value,
+            "payload": self.payload,
+            "started_at": self.started_at.isoformat(),
+            "finished_at": (
+                None if self.finished_at is None else self.finished_at.isoformat()
             ),
-            agent_id=agent_id,
-            run_id=run_id,
-            call_id=call_id,
-            capability_id=capability_id,
-            source_id=source_id,
-            resource_id=resource_id,
-            intent_sha256=intent_sha256,
-            preview_fingerprint=preview_fingerprint,
-            expected_affected_rows=expected_affected_rows,
-            outcome=DatabaseWriteOutcome.STARTED,
-            affected_rows=None,
-            normalized_error_code=None,
-            started_at=started_at,
-            completed_at=None,
+        }
+
+    @property
+    def receipt_digest(self) -> str:
+        return (
+            "sha256:"
+            + sha256(canonical_json(self.material()).encode("utf-8")).hexdigest()
         )
+
+    @property
+    def unresolved(self) -> bool:
+        return self.resolution is None and self.outcome in {
+            EffectOutcome.STARTED,
+            EffectOutcome.UNCERTAIN,
+        }
 
     def finish(
-        self,
-        outcome: DatabaseWriteOutcome,
-        *,
-        completed_at: datetime,
-        affected_rows: int | None,
-        normalized_error_code: str | None,
-    ) -> DatabaseWriteReceipt:
-        if self.outcome is not DatabaseWriteOutcome.STARTED:
-            raise ValueError("only a started receipt can reach a terminal outcome")
-        if outcome is DatabaseWriteOutcome.STARTED:
-            raise ValueError("receipt terminal outcome cannot be started")
+        self, observation: EffectObservation, *, finished_at: datetime
+    ) -> EffectReceipt:
+        if self.outcome is not EffectOutcome.STARTED:
+            raise ValueError("only a started receipt can reach a terminal observation")
         return replace(
             self,
-            outcome=outcome,
-            affected_rows=affected_rows,
-            normalized_error_code=normalized_error_code,
-            completed_at=completed_at,
+            outcome=observation.outcome,
+            evidence_basis=observation.evidence_basis,
+            payload=observation.payload,
+            finished_at=finished_at,
         )
 
-    def as_started(self) -> DatabaseWriteReceipt:
+    def as_started(self) -> EffectReceipt:
         return replace(
             self,
-            outcome=DatabaseWriteOutcome.STARTED,
-            affected_rows=None,
-            normalized_error_code=None,
-            completed_at=None,
+            outcome=EffectOutcome.STARTED,
+            evidence_basis=EffectEvidenceBasis.UNKNOWN,
+            payload=None,
+            finished_at=None,
+            resolution=None,
         )
 
 
 __all__ = [
-    "DatabaseWriteOutcome",
-    "DatabaseWriteReceipt",
-    "DatabaseWriteReceiptConflictError",
+    "EffectOutcome",
+    "EffectReceipt",
+    "EffectReceiptConflictError",
     "PostgreSQLUpdateScope",
     "SourcePermissionResource",
     "SourcePermissionState",
@@ -773,9 +806,9 @@ __all__ = [
     "SourcePermissionsPreview",
     "SourceReadMode",
     "SourceReadScope",
-    "database_write_aware",
-    "database_write_receipt_id",
-    "database_write_text",
+    "effect_receipt_aware",
+    "effect_receipt_id",
+    "effect_receipt_text",
     "postgresql_update_authorization_fingerprint",
-    "validate_database_write_receipt_id",
+    "validate_effect_receipt_id",
 ]

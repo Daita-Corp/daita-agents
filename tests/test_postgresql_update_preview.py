@@ -384,3 +384,43 @@ async def test_scope_is_checked_before_source_connection(monkeypatch):
             scope_issue=("update_column_not_allowed", "not allowed")
         ).preview_update(agent_id="agent-preview", intent=_intent())
     assert captured.value.error_code == "update_column_not_allowed"
+
+
+def test_native_operation_identity_ignores_equivalent_predicate_and_assignment_order():
+    from daita.domains.data.sql.postgresql_update import (
+        validate_postgresql_update_intent,
+    )
+
+    arguments = {
+        "source_id": SOURCE_ID,
+        "resource_id": RESOURCE_ID,
+        "where": [
+            {"column": "status", "operator": "eq", "value": "active"},
+            {"column": "priority", "operator": "in", "value": [1, 2]},
+        ],
+        "assignments": [
+            {"column": "status", "value": "inactive"},
+            {"column": "priority", "value": 3},
+        ],
+    }
+    original = validate_postgresql_update_intent(
+        PostgreSQLUpdateIntent.from_mapping(arguments), resources=(_resource(),)
+    )
+    reordered = validate_postgresql_update_intent(
+        PostgreSQLUpdateIntent.from_mapping(
+            {
+                **arguments,
+                "where": [
+                    {"column": "priority", "operator": "in", "value": [2, 1]},
+                    {"column": "status", "operator": "eq", "value": "active"},
+                ],
+                "assignments": [
+                    {"column": "priority", "value": 3},
+                    {"column": "status", "value": "inactive"},
+                ],
+            }
+        ),
+        resources=(_resource(),),
+    )
+    assert original.validated is not None and reordered.validated is not None
+    assert original.validated.intent_sha256 == reordered.validated.intent_sha256

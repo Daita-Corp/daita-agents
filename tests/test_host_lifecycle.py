@@ -166,7 +166,9 @@ async def test_foreground_run_serializes_owned_host_mutations_but_not_inspection
             postgresql_update_scopes={},
         )
 
-    run = asyncio.create_task(agent.run("answer without tools", source_id=source.id))
+    run = asyncio.create_task(
+        agent.run("answer without tools", source_scope_ids=(source.id,))
+    )
     await asyncio.sleep(0)
     assert not run.done(), repr(run.exception()) if run.done() else ""
     await asyncio.wait_for(provider.started.wait(), timeout=1)

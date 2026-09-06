@@ -298,14 +298,14 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
             "a query tool, merely show SQL, or claim success without a committed "
             "update result. If the database role cannot pass the write guardrails, "
             "explain that the change was not committed.",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         transcript = await agent.transcript(exit.run_id)
         update_receipts = []
         for call in _tool_calls(transcript):
             if call.name == POSTGRESQL_UPDATE_TOOL_NAME:
                 update_receipts.append(
-                    await agent._embedded._store.load_database_write_receipt_for_call(
+                    await agent._embedded._store.load_effect_receipt_for_call(
                         agent.id,
                         exit.run_id,
                         call.id,

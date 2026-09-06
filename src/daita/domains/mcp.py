@@ -20,11 +20,13 @@ from ..adapters.mcp import (
     MCPServerBinding,
     MCPToolBinding,
     mcp_binding_drift_reason,
+    mcp_execution_origin_digest,
 )
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
     Capability,
+    AutomationScopeProposal,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
@@ -346,6 +348,18 @@ class MCPCapabilityDomain:
             )
         return arguments
 
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
+
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -457,7 +471,7 @@ async def activate_mcp_domain(
             output_schema=_MCP_OUTPUT_SCHEMA,
             executor_id=tool.executor_id,
             access_mode=AccessMode.READ,
-            automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         )
         for item in activated
         for tool in item.binding.tools
@@ -474,27 +488,22 @@ async def activate_mcp_domain(
                 capability_id=tool.capability_id,
                 description=tool.description,
                 presentation=tool.presentation,
-                origin_revision_digest="sha256:"
-                + sha256(
-                    canonical_json(
-                        {
-                            "binding_id": item.binding.binding_id,
-                            "binding_revision": item.binding.revision,
-                            "capability_id": tool.capability_id,
-                            "executor_id": tool.executor_id,
-                            "input_schema_digest": tool.input_schema_digest,
-                            "output_schema_digest": tool.output_schema_digest,
-                            "presentation": {
-                                "toolbox_id": tool.presentation.toolbox_id.value,
-                                "load_mode": tool.presentation.load_mode.value,
-                                "text_trust": tool.presentation.text_trust.value,
-                                "summary": tool.presentation.summary,
-                                "when_to_use": tool.presentation.when_to_use,
-                                "keywords": tool.presentation.keywords,
-                            },
-                        }
-                    ).encode("utf-8")
-                ).hexdigest(),
+                presentation_sensitivity=max(
+                    (candidate.result_sensitivity for candidate in item.binding.tools),
+                    key=lambda sensitivity: sensitivity.routing_rank,
+                ),
+                connector_presentation=FrozenJsonObject.from_mapping(
+                    {
+                        "kind": "mcp_binding",
+                        "id": item.binding.binding_id,
+                        "label": item.binding.local_label,
+                        "summary": item.binding.summary,
+                        "when_to_use": item.binding.when_to_use,
+                        "keywords": item.binding.keywords,
+                        "tool_count": len(item.binding.tools),
+                    }
+                ),
+                origin_revision_digest=mcp_execution_origin_digest(item.binding, tool),
             )
             for item in activated
             for tool in item.binding.tools
@@ -523,7 +532,10 @@ def _require_current_binding(
         )
     assert current is not None
     current_tools = {item.capability_id: item for item in current.tools}
-    if current_tools.get(tool.capability_id) != tool:
+    current_tool = current_tools.get(tool.capability_id)
+    if current_tool is None or mcp_execution_origin_digest(
+        current, current_tool
+    ) != mcp_execution_origin_digest(accepted, tool):
         raise MCPProtocolError(
             "mcp_binding_stale",
             "The admitted MCP capability mapping changed.",

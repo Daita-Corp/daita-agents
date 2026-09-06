@@ -480,7 +480,7 @@ async def test_catalog_derived_skill_keeps_binding_for_read_time_obsolescence(
         )
         await agent.run(
             "Run and retain a reusable monthly invoice procedure.",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         candidate = (await agent.review_learning_candidates()).candidates[0]
         assert candidate.candidate.catalog_revisions
@@ -534,7 +534,7 @@ async def test_reviewer_discards_cross_source_semantic_delete_candidate(tmp_path
         )
         evidence_run = await agent.run(
             "Booked revenue uses the invoices table.",
-            source_id=second_source.id,
+            source_scope_ids=(second_source.id,),
         )
         evidence_transcript = await agent.transcript(evidence_run.run_id)
         second_resource = (
@@ -569,7 +569,7 @@ async def test_reviewer_discards_cross_source_semantic_delete_candidate(tmp_path
         support = await agent.run(
             "Remember to delete semantic annotations first-source-definition "
             "and cross-source-definition.",
-            source_id=first_source.id,
+            source_scope_ids=(first_source.id,),
         )
         assert support.run_id == "run-2"
         support_transcript = await agent.transcript(support.run_id)
@@ -686,11 +686,11 @@ async def test_scoped_candidate_cannot_pool_grounding_from_another_source(tmp_pa
         second_source = await agent.attach_sqlite(second_database, name="second")
         first_run = await agent.run(
             "Remember that first-source reporting uses monthly invoices.",
-            source_id=first_source.id,
+            source_scope_ids=(first_source.id,),
         )
         second_run = await agent.run(
             "Remember to delete semantic annotation source-a-definition.",
-            source_id=second_source.id,
+            source_scope_ids=(second_source.id,),
         )
         first_transcript = await agent.transcript(first_run.run_id)
         first_resource = (

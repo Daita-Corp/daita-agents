@@ -54,7 +54,9 @@ from daita.semantics import (
     SemanticKind,
     SemanticSubject,
 )
-from daita.storage.sqlite import DatabaseWriteOutcome, DatabaseWriteReceipt
+from daita.capabilities import EffectOutcome, EffectObservation, EffectEvidenceBasis
+from daita._json import FrozenJsonObject
+from daita.storage.sqlite_records import EffectReceipt, effect_receipt_id
 from daita.storage.sqlite_codecs import (
     decode_catalog_snapshot,
     decode_catalog_sync,
@@ -153,23 +155,33 @@ def test_source_codec_rejects_adapters_outside_the_current_state_shape(
         encode_source(unsupported)
 
 
-def _receipt() -> DatabaseWriteReceipt:
-    return DatabaseWriteReceipt.start(
+def _receipt() -> EffectReceipt:
+    key = "sha256:" + "3" * 64
+    return EffectReceipt(
+        receipt_id=effect_receipt_id(
+            agent_id="agent-codec",
+            run_id="run-codec",
+            call_id="call-codec",
+            operation_key=key,
+        ),
+        receipt_kind="data.update_rows",
         agent_id="agent-codec",
         run_id="run-codec",
         call_id="call-codec",
         capability_id="data.postgresql.update",
-        source_id="source:sha256:" + "1" * 64,
-        resource_id="catalog-resource:sha256:" + "2" * 64,
-        intent_sha256="sha256:" + "3" * 64,
-        preview_fingerprint="sha256:" + "4" * 64,
-        expected_affected_rows=3,
+        domain_owner_id="data",
+        capability_contract_digest=key,
+        operation_key=key,
+        argument_fingerprint=key,
+        sensitivity=ModelSensitivity.INTERNAL,
         started_at=NOW,
     ).finish(
-        DatabaseWriteOutcome.COMMITTED,
-        completed_at=NOW + timedelta(seconds=1),
-        affected_rows=3,
-        normalized_error_code=None,
+        EffectObservation(
+            EffectOutcome.SUCCEEDED,
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+            FrozenJsonObject.from_mapping({"affected_rows": 3}),
+        ),
+        finished_at=NOW + timedelta(seconds=1),
     )
 
 
@@ -306,8 +318,7 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         "Question?",
         NOW,
         conversation_id="conversation-codec",
-        source_id="source-codec",
-        conversation_source_id="source-codec",
+        source_scope_ids=("source-codec",),
     )
     message = CanonicalMessage(MessageRole.USER, content=(TextBlock("Question?"),))
     result = _loop_exit()
@@ -528,7 +539,7 @@ def test_source_permission_codecs_reject_unknown_versions_and_noncanonical_sets(
 def test_current_record_shape_rejects_missing_fields() -> None:
     run = RunInput("run-codec", "agent-codec", "Question?", NOW)
     payload = json.loads(encode_run_input(run))
-    del payload["fields"]["conversation_source_id"]
+    del payload["fields"]["source_scope_ids"]
     with pytest.raises(ValueError, match="missing fields"):
         decode_run_input(json.dumps(payload))
 

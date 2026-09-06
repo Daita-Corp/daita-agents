@@ -19,6 +19,7 @@ from .models import (
     RoutineState,
     ScheduledRoutine,
     ScheduledRoutineDraft,
+    RequestedCapabilityGrant,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "RoutineSlotKind",
     "RoutineState",
     "ScheduledRoutineDraft",
+    "RequestedCapabilityGrant",
     "ScheduledRoutineInspection",
     "ScheduledRoutineSummary",
     "ScheduledRoutine",

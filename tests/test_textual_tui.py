@@ -182,6 +182,7 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     observed = datetime(2026, 8, 28, 12, tzinfo=UTC)
     summary = ScheduledRoutineSummary(
+        sensitivity_ceiling=ModelSensitivity.INTERNAL,
         routine_id="routine-ui",
         title="Invoice count",
         state=RoutineState.ACTIVE,
@@ -495,7 +496,7 @@ async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path:
             notice = str(app.screen.query_one("#notice-bar", Static).content)
             assert "no model · use /model" in notice
             assert "Files:" in notice
-            assert "Run source: none connected (a source is optional)" in notice
+            assert "Sources: none connected (sources are optional)" in notice
             assert "no source · use /source add" not in notice
             assert app.screen.query_one(Composer).disabled is False
             app.exit(0)
@@ -2320,8 +2321,9 @@ async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
             await command_task
-            active = await opened.active_source()
-            assert active is not None
+            (active,) = tuple(
+                item for item in await opened.list_sources() if item.active
+            )
             assert active.configuration["path"] == str(edited_path)
             app.exit(0)
     finally:
@@ -2332,6 +2334,7 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     source = SimpleNamespace(
         id="source-postgresql",
+        active=True,
         adapter_id="postgresql",
         display_name="Warehouse",
         configuration={
@@ -2346,8 +2349,8 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
     )
     edited: dict[str, object] = {}
 
-    async def active_source() -> object:
-        return source
+    async def list_sources() -> tuple[object, ...]:
+        return (source,)
 
     async def probe_postgresql_source(*_args: object, **_kwargs: object) -> object:
         return SimpleNamespace(
@@ -2363,7 +2366,7 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
         edited.update(kwargs)
         return SimpleNamespace(source=source)
 
-    monkeypatch.setattr(app.controller, "active_source", active_source)
+    monkeypatch.setattr(app.controller, "list_sources", list_sources)
     monkeypatch.setattr(
         app.controller, "probe_postgresql_source", probe_postgresql_source
     )
@@ -2403,13 +2406,9 @@ async def test_source_edit_rejects_a_zero_resource_preview_without_confirmation(
 ):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
-    async def active_source() -> None:
-        return None
-
     async def list_sources() -> tuple[object, ...]:
         return ()
 
-    monkeypatch.setattr(app.controller, "active_source", active_source)
     monkeypatch.setattr(app.controller, "list_sources", list_sources)
 
     async with app.run_test(size=(100, 34)) as pilot:
@@ -2436,7 +2435,6 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
     )
     first = await opened.attach(SQLiteSource(first_path, name="Sales"))
     await opened.attach(SQLiteSource(second_path, name="Support"))
-    await opened.select_source(first.id)
     app = DaitaApp(
         root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
     )
@@ -2467,7 +2465,7 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
             assert tree.has_focus is True
             assert tree.cursor_line == 0
             source_labels = tuple(str(node.label) for node in tree.root.children)
-            assert source_labels[0] == "● Sales  SQLite · 1 resource  current"
+            assert source_labels[0] == "Sales  SQLite · 1 resource"
             assert source_labels[1] == "Support  SQLite · 1 resource"
             resource_labels = tuple(
                 str(node.label)

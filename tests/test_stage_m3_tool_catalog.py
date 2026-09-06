@@ -574,7 +574,7 @@ async def test_search_is_intent_only_deterministic_bounded_and_does_not_load() -
     )
     properties = definition.input_schema["properties"]
     assert isinstance(properties, Mapping)
-    assert set(properties) == {"query", "limit"}
+    assert set(properties) == {"query", "limit", "cursor"}
     assert definition.input_schema["required"] == ("query",)
     assert definition.input_schema["additionalProperties"] is False
     call = ToolCall(
@@ -804,7 +804,8 @@ async def test_production_intent_search_distinguishes_current_competing_tools(tm
     try:
         source = await agent.attach_sqlite(database)
         result = await agent.learn(
-            "Remember the current sales metric definition.", source_id=source.id
+            "Remember the current sales metric definition.",
+            source_scope_ids=(source.id,),
         )
         assert result.kind is LoopExitKind.COMPLETED
         transcript = await agent.transcript(result.run_id)
@@ -1181,7 +1182,7 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
     )
     try:
         runtime = agent._embedded._capability_runtime
-        builder = agent._embedded._data_context_builder
+        builder = agent._embedded._context_builder
         assert builder is not None
         run = RunInput(
             id="run-context-projection",

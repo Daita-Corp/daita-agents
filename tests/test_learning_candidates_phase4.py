@@ -784,7 +784,7 @@ async def test_source_scoped_candidate_cannot_be_accepted_through_another_source
         source_b = await agent.attach_sqlite(second_path, name="second")
         await agent.run(
             "Run and retain a reusable monthly invoice procedure.",
-            source_id=source_a.id,
+            source_scope_ids=(source_a.id,),
         )
         reviewer.replace_script(
             (
@@ -1247,7 +1247,7 @@ async def test_reviewer_redacts_secret_values_inside_bounded_tool_results(tmp_pa
         )
         run = await agent.run(
             "Inspect the credential record without retaining its value.",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         transcript = await agent.transcript(run.run_id)
         tool_result = transcript.messages[2].content[0]

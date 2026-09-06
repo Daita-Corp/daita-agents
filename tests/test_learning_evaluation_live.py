@@ -328,7 +328,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
                 "Using analytics.orders, analytics.order_items, analytics.products, "
                 "analytics.customers, and analytics.regions, calculate paid contribution "
                 "margin by region and currency. Keep currencies separate.",
-                source_id=source.id,
+                source_scope_ids=(source.id,),
             )
             baseline_events = tuple(events[baseline_start:])
             baseline_transcript = await agent.transcript(baseline_exit.run_id)
@@ -342,7 +342,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
                 "analytics.orders.status = paid. The 3% term is our risk reserve. Report "
                 "results by region and currency, and never compare currencies without an "
                 "explicit conversion.",
-                source_id=source.id,
+                source_scope_ids=(source.id,),
             )
             teaching_views = await agent.list_semantic_annotations()
             active = tuple(
@@ -368,7 +368,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
                 "Using analytics.orders, analytics.order_items, analytics.products, "
                 "analytics.customers, and analytics.regions, calculate paid contribution "
                 "margin by region and currency. Keep currencies separate.",
-                source_id=source.id,
+                source_scope_ids=(source.id,),
             )
             learned_transcript = await reopened.transcript(learned_exit.run_id)
             learned_events = tuple(events[teaching_start:])

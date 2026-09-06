@@ -31,7 +31,6 @@ from .capabilities import (
     postgresql_update_preview_declarations,
 )
 from .catalog import CatalogDataView
-from .context import CatalogContextReader, DataContextBuilder
 from .controller import (
     DATA_DOMAIN_OWNER_ID,
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
@@ -155,10 +154,8 @@ __all__ = [
     "LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS",
     "LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS",
     "TABULAR_EXPORT_OUTPUT_KIND",
-    "CatalogContextReader",
     "CatalogDataView",
     "CatalogSchemaReader",
-    "DataContextBuilder",
     "DATA_DOMAIN_OWNER_ID",
     "DATA_EXPORT_TABULAR_CAPABILITY_ID",
     "DATA_EXPORT_TABULAR_EXECUTOR_ID",

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from _capability_runtime_support import frozen_execution_bindings
+
 import asyncio
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
@@ -67,6 +70,9 @@ def routine_record(
 ) -> ScheduledRoutine:
     instruction = "Read the exact admitted resource and report its current value."
     return ScheduledRoutine(
+        contract_bindings=frozen_execution_bindings(
+            ("catalog.inspect", "data.query"), ("resource-1",), ("mock:routine",)
+        ),
         routine_id=routine_id,
         agent_id=agent_id,
         conversation_id=conversation_id,
@@ -188,11 +194,14 @@ def test_occurrence_codec_v1_round_trip_is_exact() -> None:
 
 def execution_scope(occurrence: RoutineOccurrence) -> ExecutionScope:
     return ExecutionScope(
+        contract_bindings=frozen_execution_bindings(
+            ("catalog.inspect", "data.query"), ("resource-1",), ("mock:routine",)
+        ),
         scope_id=f"scope:{occurrence.occurrence_id}",
         revision=1,
         agent_id=occurrence.agent_id,
         principal_id="principal-1",
-        grant_id=f"routine:{occurrence.routine_id}",
+        grant_id=f"routine:{occurrence.routine_id}:revision:{occurrence.routine_revision}",
         job_id=None,
         job_revision=None,
         allowed_source_ids=("source-1",),
@@ -210,6 +219,52 @@ def execution_scope(occurrence: RoutineOccurrence) -> ExecutionScope:
         occurrence_id=occurrence.occurrence_id,
         allowed_connector_binding_ids=(),
     )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        {"principal_id": "different-principal"},
+        {"grant_id": "unapproved-grant"},
+        {"sensitivity_ceiling": ModelSensitivity.RESTRICTED},
+        {"per_run_max_tokens": 6000},
+        {"per_run_max_cost_usd": Decimal("0.10")},
+        {"allowed_access_modes": frozenset({AccessMode.READ, AccessMode.WRITE})},
+        {"distribution_plan_digest": "sha256:" + "e" * 64},
+        {"allowed_connector_binding_ids": ("unapproved-binding",)},
+    ],
+)
+async def test_run_binding_rejects_every_changed_authority_field(tmp_path, changed):
+    from daita.routines.supervisor import _execution_scope
+
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    try:
+        routine = await store.admit_scheduled_routine(routine_record())
+        claimed = await store.claim_due_routine_occurrence(
+            routine.agent_id,
+            routine.routine_id,
+            expected_revision=routine.revision,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="claim-exact",
+        )
+        assert claimed is not None
+        scope = _execution_scope(routine, claimed)
+        bound = await store.bind_routine_occurrence_run(
+            routine.agent_id,
+            claimed.occurrence_id,
+            claim_token="claim-exact",
+            run_id="run-exact",
+            execution_scope=replace(scope, **changed),
+            bound_at=NOW,
+        )
+        assert bound is None
+        current = await store.load_routine_occurrence(
+            routine.agent_id, claimed.occurrence_id
+        )
+        assert current == claimed
+    finally:
+        await store.close()
 
 
 async def test_store_admits_lists_reopens_and_hides_cross_agent_routines(
@@ -842,7 +897,7 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
             message=instruction,
             created_at=NOW + timedelta(seconds=1),
             conversation_id=routine.conversation_id,
-            source_id="source-1",
+            source_scope_ids=("source-1",),
             start=RunStartEnvelope(
                 origin=RunOrigin.SCHEDULED_ROUTINE,
                 instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
@@ -951,7 +1006,7 @@ async def test_terminal_result_sensitivity_escalation_fails_and_blocks_delivery(
             message=routine.authorized_instruction,
             created_at=NOW + timedelta(seconds=1),
             conversation_id=routine.conversation_id,
-            source_id="source-1",
+            source_scope_ids=("source-1",),
             start=RunStartEnvelope(
                 origin=RunOrigin.SCHEDULED_ROUTINE,
                 instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
@@ -1064,7 +1119,7 @@ async def test_terminal_failure_at_threshold_uses_its_one_conclusion_as_escalati
             message=routine.authorized_instruction,
             created_at=NOW + timedelta(seconds=1),
             conversation_id=routine.conversation_id,
-            source_id="source-1",
+            source_scope_ids=("source-1",),
             start=RunStartEnvelope(
                 origin=RunOrigin.SCHEDULED_ROUTINE,
                 instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
@@ -1159,7 +1214,7 @@ async def test_reopen_converges_completed_reserved_run_without_reexecution(
         message=routine.authorized_instruction,
         created_at=NOW + timedelta(seconds=1),
         conversation_id=routine.conversation_id,
-        source_id="source-1",
+        source_scope_ids=("source-1",),
         start=RunStartEnvelope(
             origin=RunOrigin.SCHEDULED_ROUTINE,
             instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,
@@ -1214,3 +1269,96 @@ async def test_reopen_converges_completed_reserved_run_without_reexecution(
         assert len(await reopened.list_deliveries(routine.agent_id)) == 1
     finally:
         await reopened.close()
+
+
+async def test_immediate_first_creation_claims_once_with_normal_budget_and_next_anchor(
+    tmp_path,
+):
+    store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
+    proposal = replace(routine_record(), run_immediately=True)
+    created = await store.admit_scheduled_routine(proposal)
+    assert created.active_occurrence_id is not None
+    assert created.occurrence_count == created.attempt_count == 1
+    assert created.reserved_tokens == created.per_run_max_tokens
+    assert created.reserved_cost_usd == created.per_run_max_cost_usd
+    assert created.next_due_at == NOW + timedelta(hours=1)
+    occurrences = await store.list_routine_occurrences(
+        created.agent_id, created.routine_id
+    )
+    assert len(occurrences) == 1
+    assert occurrences[0].slot_kind is RoutineSlotKind.MANUAL
+    assert occurrences[0].scheduled_for == NOW
+    with pytest.raises(ValueError, match="routine_identity_already_exists"):
+        await store.admit_scheduled_routine(proposal)
+    assert (
+        await store.list_routine_occurrences(created.agent_id, created.routine_id)
+        == occurrences
+    )
+    await store.close()
+
+
+async def test_immediate_first_claim_failure_rolls_back_the_whole_creation(
+    tmp_path, monkeypatch
+):
+    import daita.storage.sqlite as sqlite_module
+
+    store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
+    proposal = replace(routine_record(), run_immediately=True)
+
+    def fail_claim(*_args):
+        raise OSError("cannot persist immediate occurrence")
+
+    monkeypatch.setattr(sqlite_module, "_insert_routine_occurrence", fail_claim)
+    with pytest.raises(OSError, match="immediate occurrence"):
+        await store.admit_scheduled_routine(proposal)
+    assert (
+        await store.load_scheduled_routine(proposal.agent_id, proposal.routine_id)
+        is None
+    )
+    assert (
+        await store.list_routine_occurrences(proposal.agent_id, proposal.routine_id)
+        == ()
+    )
+    await store.close()
+
+
+async def test_cancelled_immediate_admission_settles_one_atomic_assignment(
+    tmp_path, monkeypatch
+):
+    store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
+    proposal = replace(routine_record(), run_immediately=True)
+    entered, release = threading.Event(), threading.Event()
+    original = sqlite_module._insert_routine_occurrence
+
+    def hold_claim(*args):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test did not release the atomic admission")
+        return original(*args)
+
+    monkeypatch.setattr(sqlite_module, "_insert_routine_occurrence", hold_claim)
+    admission = asyncio.create_task(store.admit_scheduled_routine(proposal))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        admission.cancel()
+        release.set()
+        try:
+            await admission
+        except asyncio.CancelledError:
+            pass
+        stored = await store.load_scheduled_routine(
+            proposal.agent_id, proposal.routine_id
+        )
+        assert stored is not None and stored.active_occurrence_id is not None
+        occurrences = await store.list_routine_occurrences(
+            proposal.agent_id, proposal.routine_id
+        )
+        assert len(occurrences) == 1 and stored.occurrence_count == 1
+        assert stored.reserved_tokens == occurrences[0].reserved_tokens
+        assert stored.reserved_cost_usd == occurrences[0].reserved_cost_usd
+        with pytest.raises(ValueError, match="routine_identity_already_exists"):
+            await store.admit_scheduled_routine(proposal)
+        assert await store.list_effect_receipts(proposal.agent_id) == ()
+    finally:
+        release.set()
+        await store.close()

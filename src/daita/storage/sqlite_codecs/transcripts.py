@@ -28,6 +28,7 @@ from ...loop.models import (
     RunOrigin,
     RunStartEnvelope,
 )
+from ...scope import EffectiveSourceScope
 from .artifacts import (
     decode_artifact_ref,
     decode_delivery_receipt,
@@ -100,8 +101,13 @@ def _encode_run_input(value: RunInput) -> dict[str, JsonValue]:
             "message": value.message,
             "created_at": datetime_encode(value.created_at),
             "conversation_id": value.conversation_id,
-            "source_id": value.source_id,
-            "conversation_source_id": value.conversation_source_id,
+            "source_scope_ids": list(value.source_scope_ids),
+            "resolved_source_scope": (
+                None
+                if value.resolved_source_scope is None
+                else plain_encode(value.resolved_source_scope.to_mapping())
+            ),
+            "history_sensitivity": value.history_sensitivity.value,
             "start": _encode_run_start(value.start),
         },
     )
@@ -117,8 +123,9 @@ def _decode_run_input(value: JsonValue) -> RunInput:
             "message",
             "created_at",
             "conversation_id",
-            "source_id",
-            "conversation_source_id",
+            "source_scope_ids",
+            "resolved_source_scope",
+            "history_sensitivity",
             "start",
         ),
     )
@@ -128,11 +135,35 @@ def _decode_run_input(value: JsonValue) -> RunInput:
         message=text(fields["message"], "run message"),
         created_at=datetime_decode(fields["created_at"]),
         conversation_id=optional_text(fields["conversation_id"], "conversation id"),
-        source_id=optional_text(fields["source_id"], "run source_id"),
-        conversation_source_id=optional_text(
-            fields["conversation_source_id"], "conversation source_id"
+        source_scope_ids=tuple(
+            text(item, "run source scope ID")
+            for item in sequence(fields["source_scope_ids"], "run source scope")
+        ),
+        resolved_source_scope=_decode_resolved_source_scope(
+            fields["resolved_source_scope"]
         ),
         start=_decode_run_start(fields["start"]),
+        history_sensitivity=ModelSensitivity(
+            text(fields["history_sensitivity"], "run history sensitivity")
+        ),
+    )
+
+
+def _decode_resolved_source_scope(value: JsonValue) -> EffectiveSourceScope | None:
+    if value is None:
+        return None
+    fields = mapping(value, "resolved source scope")
+    if set(fields) != {"source_ids", "resource_ids"}:
+        raise ValueError("resolved source scope fields are invalid")
+    return EffectiveSourceScope(
+        source_ids=frozenset(
+            text(item, "scope source ID")
+            for item in sequence(fields["source_ids"], "scope source IDs")
+        ),
+        resource_ids=frozenset(
+            text(item, "scope resource ID")
+            for item in sequence(fields["resource_ids"], "scope resource IDs")
+        ),
     )
 
 
@@ -600,6 +631,7 @@ def _encode_loop_exit(value: LoopExit) -> dict[str, JsonValue]:
             "artifact_deliveries": [
                 encode_delivery_receipt(item) for item in value.artifact_deliveries
             ],
+            "sensitivity": value.sensitivity.value,
         },
     )
 
@@ -621,6 +653,7 @@ def _decode_loop_exit(value: JsonValue) -> LoopExit:
             "provider_failure",
             "artifacts",
             "artifact_deliveries",
+            "sensitivity",
         ),
     )
     return LoopExit(
@@ -632,6 +665,9 @@ def _decode_loop_exit(value: JsonValue) -> LoopExit:
         final_text=optional_text(fields["final_text"], "loop-exit final text"),
         steps=integer(fields["steps"], "loop-exit steps"),
         usage=_decode_model_usage(fields["usage"]),
+        sensitivity=ModelSensitivity(
+            text(fields["sensitivity"], "loop-exit sensitivity")
+        ),
         provider_id=optional_text(fields["provider_id"], "loop-exit provider id"),
         provider_failure=(
             None

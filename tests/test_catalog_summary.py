@@ -260,7 +260,7 @@ async def test_catalog_search_compiles_one_generation_once_for_concurrent_cold_q
         await agent.close()
 
 
-async def test_non_empty_catalog_search_ranks_only_posting_candidates(
+async def test_catalog_search_ranks_posting_candidates_before_unmatched_fallbacks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -298,7 +298,14 @@ async def test_non_empty_catalog_search_ranks_only_posting_candidates(
             )
         )
 
-        assert tuple(hit.name for hit in result.hits) == ("resource_073",)
+        assert result.hits[0].name == "resource_073"
+        assert result.total_matches == 1
+        assert result.total_candidates == 128
+        assert len(result.hits) == 10
+        assert all(
+            hit.match_reasons == ("unmatched_fallback",) for hit in result.hits[1:]
+        )
+        assert result.next_cursor is not None
         assert rank_count == 1
     finally:
         await agent.close()
@@ -357,7 +364,9 @@ async def test_catalog_index_refresh_evicts_stale_postings_and_inactive_sources(
                 limit=10,
             )
         )
-        assert stale.hits == ()
+        assert stale.total_matches == 0
+        assert tuple(hit.name for hit in stale.hits) == ("new_table",)
+        assert stale.hits[0].match_reasons == ("unmatched_fallback",)
         assert tuple(hit.name for hit in current.hits) == ("new_table",)
         assert len(compiled_sync_ids) == 2
         assert set(agent._embedded._catalog_service._source_indexes) == {

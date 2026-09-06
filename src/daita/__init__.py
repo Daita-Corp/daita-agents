@@ -29,6 +29,8 @@ from .capabilities import (
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
+    EffectOutcome,
+    EffectEvidenceBasis,
     ToolboxDefinition,
     ToolboxId,
     ToolLoadMode,
@@ -51,6 +53,7 @@ from .distribution import (
     OutcomeArtifactReference,
     OutcomeConclusionKind,
     OutcomeContract,
+    EffectRequirement,
     OutcomeReference,
     OutcomeState,
 )
@@ -103,6 +106,7 @@ from .routines import (
     RoutineState,
     ScheduledRoutine,
     ScheduledRoutineDraft,
+    RequestedCapabilityGrant,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
@@ -124,7 +128,18 @@ from .workspace import LocalWorkspace
 
 __version__ = "1.0.1"
 
+from .storage.sqlite_records import (
+    EffectReceipt,
+    EffectResolution,
+    EffectResolutionDecision,
+)
+
 __all__ = [
+    "EffectReceipt",
+    "EffectResolution",
+    "EffectResolutionDecision",
+    "EffectOutcome",
+    "EffectEvidenceBasis",
     "Agent",
     "AgentConfig",
     "AgentEvent",
@@ -198,6 +213,7 @@ __all__ = [
     "OutcomeConclusionKind",
     "OutcomeArtifactReference",
     "OutcomeContract",
+    "EffectRequirement",
     "OutcomeReference",
     "OutcomeState",
     "PostgreSQLSource",
@@ -224,6 +240,7 @@ __all__ = [
     "SkillCandidateContent",
     "SkillSummary",
     "ScheduledRoutineDraft",
+    "RequestedCapabilityGrant",
     "ScheduledRoutineInspection",
     "ScheduledRoutineSummary",
     "ScheduledRoutine",

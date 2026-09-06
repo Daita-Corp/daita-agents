@@ -325,32 +325,13 @@ class DaitaApp(App[int]):
             f"Files: {workspace.root.name} ({workspace.sensitivity.value})"
         )
         if not sources:
-            source_status = "Run source: none connected (a source is optional)"
+            source_status = "Sources: none connected (sources are optional)"
         else:
-            active_source = await self.controller.active_source()
-            if len(sources) > 1 and active_source is None:
-                source_status = "Run source: Files only or choose with @"
-            else:
-                selected = active_source or next(iter(sources))
-                source_status = f"Run source: {selected.display_name}"
+            source_status = f"Sources: {len(sources)} admitted"
             if (await self.controller.catalog_summary()).is_empty:
                 setup_guidance.append("catalog has 0 resources · use /source edit")
         status = "  ·  ".join((workspace_status, source_status, *setup_guidance))
         chat.show_notice(status)
-
-    async def _pick_source(self) -> None:
-        sources = await self.controller.list_sources()
-        options = tuple(
-            PickerOption(source.id, source.display_name, source.adapter_id)
-            for source in sources
-            if source.active
-        )
-        selected = await self._await_modal(
-            SelectionScreen(title="Choose the active source", options=options)
-        )
-        if selected is None:
-            return
-        await self.controller.select_source(selected[0])
 
     async def _show_chat(self) -> None:
         self.invalidate_completion_cache()
@@ -650,11 +631,6 @@ class DaitaApp(App[int]):
         payload: dict[str, Any],
         message: str = "",
     ) -> None:
-        if screen_name == "source_picker":
-            await self._pick_source()
-            await self._refresh_status()
-            await self._show_home_guidance()
-            return
         if screen_name == "source_setup":
             await self._await_modal(SourceSetupScreen())
             await self._refresh_status()
@@ -736,13 +712,11 @@ class DaitaApp(App[int]):
                 for source_resources in resource_groups
                 for resource in source_resources
             )
-            current = await self.controller.active_source()
             await self._await_modal(
                 CatalogScreen(
                     summary=await self.controller.catalog_summary(),
                     sources=sources,
                     resources=resources,
-                    current_source_id=None if current is None else current.id,
                     notice=message,
                     notice_warning=bool(payload.get("catalog_notice_warning", False)),
                 )
@@ -1064,7 +1038,7 @@ class DaitaApp(App[int]):
             result = await agent.run(
                 message,
                 conversation_id=self.controller.conversation_id,
-                source_id=source_id,
+                source_scope_ids=(() if source_id is None else (source_id,)),
                 files_only=files_only,
             )
             await self._settle_result(result)

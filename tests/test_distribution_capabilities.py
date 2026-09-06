@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _capability_runtime_support import frozen_execution_bindings
+
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
@@ -187,6 +189,9 @@ async def test_scheduled_scope_cannot_discover_or_inspect_distribution() -> None
     instruction = "Read within the frozen scope."
     plan = inbox_distribution_plan("conversation-1")
     scope = ExecutionScope(
+        contract_bindings=frozen_execution_bindings(
+            ("data.query",), ("resource-1",), ("mock",)
+        ),
         scope_id="scope-routine",
         revision=1,
         agent_id="agent-1",

@@ -14,6 +14,8 @@ from ..capabilities import (
     AccessMode,
     AutomationEligibility,
     Capability,
+    AutomationScopeProposal,
+    EffectEvidenceBasis,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
@@ -33,6 +35,7 @@ from ..distribution.models import (
     MAX_OUTCOME_ARTIFACT_REQUIREMENTS,
     MAX_OUTCOME_TOTAL_ARTIFACT_BYTES,
     ArtifactRequirement,
+    EffectRequirement,
     OutcomeContract,
 )
 from ..llm.models import ModelSensitivity, ToolCall
@@ -63,6 +66,7 @@ from .models import (
     RoutineSchedule,
     RoutineState,
     ScheduledRoutine,
+    RequestedCapabilityGrant,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
@@ -110,6 +114,14 @@ class RoutineListExecutor(_RoutineExecutor):
         )
         return ToolOutput(
             kind="routine.list",
+            sensitivity=max(
+                (
+                    request.request_sensitivity,
+                    *(item.sensitivity_ceiling for item in summaries),
+                ),
+                key=lambda item: item.routing_rank,
+            ),
+            sensitivity_provenance={"authority": "agent_owned_routine_summaries"},
             data={
                 "routines": tuple(_summary_payload(item) for item in summaries),
                 "count": len(summaries),
@@ -130,6 +142,15 @@ class RoutineInspectExecutor(_RoutineExecutor):
             )
         return ToolOutput(
             kind="routine.inspection",
+            sensitivity=max(
+                request.request_sensitivity,
+                inspection.routine.sensitivity_ceiling,
+                key=lambda item: item.routing_rank,
+            ),
+            sensitivity_provenance={
+                "authority": "agent_owned_routine",
+                "routine_id": routine_id,
+            },
             data=_inspection_payload(inspection),
         )
 
@@ -146,6 +167,15 @@ class RoutineCreateExecutor(_RoutineExecutor):
         stored = await self._owner.admit(proposal)
         return ToolOutput(
             kind="routine.receipt",
+            sensitivity=max(
+                request.request_sensitivity,
+                stored.sensitivity_ceiling,
+                key=lambda item: item.routing_rank,
+            ),
+            sensitivity_provenance={
+                "authority": "agent_owned_routine",
+                "routine_id": stored.routine_id,
+            },
             data={"action": "create", "routine": _routine_payload(stored)},
         )
 
@@ -162,6 +192,15 @@ class RoutineUpdateExecutor(_RoutineExecutor):
         stored = await self._owner.revise(proposal, expected_revision=expected)
         return ToolOutput(
             kind="routine.receipt",
+            sensitivity=max(
+                request.request_sensitivity,
+                stored.sensitivity_ceiling,
+                key=lambda item: item.routing_rank,
+            ),
+            sensitivity_provenance={
+                "authority": "agent_owned_routine",
+                "routine_id": stored.routine_id,
+            },
             data={"action": "update", "routine": _routine_payload(stored)},
         )
 
@@ -205,6 +244,15 @@ class RoutineControlExecutor(_RoutineExecutor):
         )
         return ToolOutput(
             kind="routine.receipt",
+            sensitivity=max(
+                request.request_sensitivity,
+                routine.sensitivity_ceiling,
+                key=lambda item: item.routing_rank,
+            ),
+            sensitivity_provenance={
+                "authority": "agent_owned_routine",
+                "routine_id": routine.routine_id,
+            },
             data={
                 "action": _string(request.arguments, "action"),
                 "routine": _routine_payload(routine),
@@ -261,7 +309,7 @@ class RoutineCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
-        del call, capability, request_sensitivity
+        del call
         if (
             run.agent_id != self._owner.agent_id
             or run.origin is not RunOrigin.USER
@@ -271,7 +319,29 @@ class RoutineCapabilityDomain:
                 "routine_foreground_required",
                 "Routine management requires an exact foreground conversation.",
             )
+        if capability.id in {
+            ROUTINE_CREATE_CAPABILITY_ID,
+            ROUTINE_UPDATE_CAPABILITY_ID,
+        }:
+            ceiling = ModelSensitivity(_string(arguments, "sensitivity_ceiling"))
+            if request_sensitivity.routing_rank > ceiling.routing_rank:
+                raise CapabilityInputError(
+                    "routine_instruction_sensitivity_exceeded",
+                    "The saved instruction must retain the full request sensitivity.",
+                )
         return arguments
+
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
 
     async def side_effect_plan(
         self,
@@ -288,7 +358,9 @@ class RoutineCapabilityDomain:
         ):
             raise ValueError("routine domain received an unsupported effect")
         if capability.id == ROUTINE_CREATE_CAPABILITY_ID:
-            reason = "Create this exact scheduled read routine once?"
+            reason = (
+                "Approve this exact assignment, its standing actions, and its schedule?"
+            )
         elif capability.id == ROUTINE_UPDATE_CAPABILITY_ID:
             reason = "Replace this routine with the exact proposed revision once?"
         else:
@@ -367,7 +439,7 @@ def routine_capability_declarations(
     create_capability = Capability(
         id=ROUTINE_CREATE_CAPABILITY_ID,
         description=(
-            "Create one exact, finite, read-only routine from a self-contained instruction "
+            "Create one exact, finite routine with frozen action grants from a self-contained instruction "
             "and typed schedule."
         ),
         input_schema=_spec_schema(update=False),
@@ -445,7 +517,7 @@ def routine_capability_declarations(
             ("routine", "inspect", "history"),
         ),
         ROUTINE_CREATE_CAPABILITY_ID: (
-            "Create one scheduled read routine.",
+            "Create one scheduled assignment with exact action limits.",
             "Use only after expressing a self-contained instruction and exact typed schedule.",
             ("routine", "schedule", "create"),
         ),
@@ -550,12 +622,22 @@ class _ParsedSpec(TypedDict):
     maximum_consecutive_failures: int
     expires_at: datetime
     skill_names: tuple[str, ...]
+    requested_capability_grants: tuple[RequestedCapabilityGrant, ...]
+    run_immediately: bool
     basis_run_id: str | None
 
 
 def _parsed_spec(arguments: Mapping[str, object]) -> _ParsedSpec:
     return {
         "title": _string(arguments, "title"),
+        "requested_capability_grants": _parse_requested_grants(
+            arguments.get("requested_capability_grants", ())
+        ),
+        "run_immediately": (
+            _boolean(arguments, "run_immediately")
+            if "run_immediately" in arguments
+            else False
+        ),
         "authorized_instruction": _string(arguments, "authorized_instruction"),
         "schedule": _parse_schedule(_mapping(arguments, "schedule")),
         "misfire_policy": MisfirePolicy(_string(arguments, "misfire_policy")),
@@ -641,6 +723,30 @@ def _parse_precheck(value: object) -> ResourceRevisionPrecheck | None:
     )
 
 
+def _parse_requested_grants(value: object) -> tuple[RequestedCapabilityGrant, ...]:
+    if not isinstance(value, tuple):
+        raise CapabilityInputError(
+            "routine_grant_request_invalid", "Requested grants must be an array."
+        )
+    requested = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise CapabilityInputError(
+                "routine_grant_request_invalid",
+                "Requested grants must contain exact objects.",
+            )
+        requested.append(
+            RequestedCapabilityGrant(
+                capability_id=_string(item, "capability_id"),
+                constraints=FrozenJsonObject.from_mapping(
+                    _mapping(item, "constraints")
+                ),
+                max_calls_per_occurrence=_integer(item, "max_calls_per_occurrence"),
+            )
+        )
+    return tuple(requested)
+
+
 def _parse_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
     requirements_value = value.get("artifact_requirements")
     if not isinstance(requirements_value, tuple):
@@ -682,7 +788,23 @@ def _parse_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
                 "An artifact requirement is invalid.",
             ) from error
     try:
+        effects_value = value.get("effect_requirements", ())
+        if not isinstance(effects_value, tuple) or any(
+            not isinstance(item, Mapping) for item in effects_value
+        ):
+            raise ValueError("effect requirements must be exact objects")
         return OutcomeContract(
+            effect_requirements=tuple(
+                EffectRequirement(
+                    capability_id=_string(item, "capability_id"),
+                    minimum_successful_calls=_integer(item, "minimum_successful_calls"),
+                    accepted_evidence_bases=frozenset(
+                        EffectEvidenceBasis(basis)
+                        for basis in _strings(item, "accepted_evidence_bases")
+                    ),
+                )
+                for item in effects_value
+            ),
             require_terminal_conclusion=_boolean(value, "require_terminal_conclusion"),
             artifact_requirements=tuple(requirements),
             maximum_total_artifact_bytes=_integer(
@@ -718,6 +840,33 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "maxLength": MAX_ROUTINE_INSTRUCTION_BYTES,
         },
         "schedule": {"type": "object"},
+        "run_immediately": {"type": "boolean"},
+        "requested_capability_grants": {
+            "type": "array",
+            "maxItems": MAX_ROUTINE_IDENTITY_ITEMS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "capability_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 1024,
+                    },
+                    "constraints": {"type": "object"},
+                    "max_calls_per_occurrence": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 256,
+                    },
+                },
+                "required": [
+                    "capability_id",
+                    "constraints",
+                    "max_calls_per_occurrence",
+                ],
+                "additionalProperties": False,
+            },
+        },
         "misfire_policy": {
             "type": "string",
             "enum": [item.value for item in MisfirePolicy],
@@ -908,6 +1057,41 @@ def _outcome_contract_schema() -> dict[str, object]:
         "type": "object",
         "properties": {
             "require_terminal_conclusion": {"type": "boolean"},
+            "effect_requirements": {
+                "type": "array",
+                "maxItems": MAX_ROUTINE_IDENTITY_ITEMS,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "capability_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 1024,
+                        },
+                        "minimum_successful_calls": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 256,
+                        },
+                        "accepted_evidence_bases": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": ["adapter_verified", "server_reported"],
+                            },
+                            "minItems": 1,
+                            "maxItems": 2,
+                            "uniqueItems": True,
+                        },
+                    },
+                    "required": [
+                        "capability_id",
+                        "minimum_successful_calls",
+                        "accepted_evidence_bases",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
             "artifact_requirements": {
                 "type": "array",
                 "items": requirement,
@@ -999,6 +1183,7 @@ def _occurrence_payload(item: RoutineOccurrence) -> dict[str, object]:
         "reserved_run_id": item.reserved_run_id,
         "terminal_run_id": item.terminal_run_id,
         "delivery_ids": item.delivery_ids,
+        "effect_receipt_ids": item.effect_receipt_ids,
         "failure_code": item.failure_code,
         "attempt_count": item.attempt_count,
         "updated_at": item.updated_at.isoformat(),

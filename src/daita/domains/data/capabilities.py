@@ -13,6 +13,9 @@ from ...capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
+    EffectReceiptPolicy,
+    EffectObservation,
+    EffectEvidenceBasis,
     OperationalEffect,
     ToolboxId,
     ToolExecution,
@@ -47,6 +50,38 @@ POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME = "data_preview_postgresql_update"
 POSTGRESQL_UPDATE_EXECUTOR_ID = "data.postgresql.update.executor"
 POSTGRESQL_UPDATE_TOOL_NAME = "data_update_postgresql"
 _MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
+
+POSTGRESQL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
+    receipt_kind="data.update_rows",
+    success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
+    payload_schema={
+        "type": "object",
+        "properties": {
+            "source_id": {"type": "string", "maxLength": 256},
+            "resource_id": {"type": "string", "maxLength": 256},
+            "intent_sha256": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
+            "preview_fingerprint": {
+                "type": "string",
+                "pattern": r"^sha256:[0-9a-f]{64}$",
+            },
+            "target_set_sha256": {"type": ["string", "null"], "maxLength": 71},
+            "expected_affected_rows": {"type": "integer", "minimum": 1},
+            "affected_rows": {"type": ["integer", "null"], "minimum": 0},
+            "normalized_error_code": {"type": ["string", "null"], "maxLength": 128},
+        },
+        "required": [
+            "source_id",
+            "resource_id",
+            "intent_sha256",
+            "preview_fingerprint",
+            "target_set_sha256",
+            "expected_affected_rows",
+            "affected_rows",
+            "normalized_error_code",
+        ],
+        "additionalProperties": False,
+    },
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +349,7 @@ class PostgreSQLUpdateResult:
     target_set_sha256: str
     affected_rows: int
     committed_at: str
+    effect_observation: EffectObservation
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -575,7 +611,11 @@ class PostgreSQLUpdateExecutor:
             or result.preview_fingerprint != command.preview_fingerprint
         ):
             raise ValueError("update backend returned a different update identity")
-        return ToolOutput(kind=POSTGRESQL_UPDATE_EVIDENCE_KIND, data=result.tool_data())
+        return ToolOutput(
+            kind=POSTGRESQL_UPDATE_EVIDENCE_KIND,
+            data=result.tool_data(),
+            effect_observation=result.effect_observation,
+        )
 
 
 def data_query_declarations(
@@ -813,6 +853,7 @@ def postgresql_update_capability_declarations() -> CapabilityDeclarations:
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        effect_receipt_policy=POSTGRESQL_UPDATE_RECEIPT_POLICY,
     )
     view = ToolView(
         name=POSTGRESQL_UPDATE_TOOL_NAME,
@@ -872,7 +913,7 @@ def _query_declarations(
         output_schema=_query_output_schema(),
         executor_id=DATA_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     view = ToolView(
         name=DATA_QUERY_TOOL_NAME,
@@ -1025,7 +1066,7 @@ def _postgresql_update_output_schema() -> dict[str, object]:
         "properties": {
             "receipt_id": {
                 "type": "string",
-                "pattern": r"^database-write-receipt:sha256:[0-9a-f]{64}$",
+                "pattern": r"^effect-receipt:sha256:[0-9a-f]{64}$",
             },
             "outcome": {"type": "string", "enum": ["committed"]},
             "source_id": {"type": "string"},

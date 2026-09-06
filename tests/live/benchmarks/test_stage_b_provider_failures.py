@@ -125,7 +125,7 @@ async def test_transient_retry_after_start_receipt_does_not_reexecute_job_start(
     try:
         result = await agent.run(
             "Start one profile and survive a later provider retry.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.COMPLETED
         assert len(scripted.requests) == 4
@@ -156,7 +156,7 @@ async def test_permanent_provider_failure_after_receipt_leaves_one_durable_job(
     try:
         result = await agent.run(
             "Start one profile before the provider becomes permanently invalid.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.FAILED
         assert result.reason == ProviderErrorCode.INVALID_REQUEST.value
@@ -192,7 +192,7 @@ async def test_visible_stream_failure_after_receipt_never_persists_partial_text(
     try:
         result = await agent.run(
             "Start one profile before a visible stream interruption.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.FAILED
         assert result.reason == ProviderErrorCode.PROVIDER_UNAVAILABLE.value
@@ -225,7 +225,7 @@ async def test_malformed_terminal_stream_after_receipt_preserves_job_truth(
     try:
         result = await agent.run(
             "Start one profile before a malformed terminal model stream.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.FAILED
         assert result.reason == ProviderErrorCode.MALFORMED_RESPONSE.value

@@ -164,7 +164,7 @@ def test_phase1_has_one_toolbox_catalog_and_no_legacy_discovery_path():
 def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
-    assert _class_owners("DataContextBuilder") == {"domains/data/context.py"}
+    assert _class_owners("AgentContextBuilder") == {"context.py"}
     assert _class_owners("ToolRuntime") == {"loop/driver.py"}
     assert "tools: ToolRuntime" in loop
     assert "_capability_runtime" in embedded
@@ -447,6 +447,11 @@ def test_model_suggestions_remain_terminal_only_presentation_metadata():
 
 def test_public_surface_is_focused():
     assert set(daita.__all__) == {
+        "EffectReceipt",
+        "EffectResolution",
+        "EffectResolutionDecision",
+        "EffectOutcome",
+        "EffectEvidenceBasis",
         "Agent",
         "AgentConfig",
         "AgentEvent",
@@ -520,6 +525,7 @@ def test_public_surface_is_focused():
         "OutcomeConclusionKind",
         "OutcomeArtifactReference",
         "OutcomeContract",
+        "EffectRequirement",
         "OutcomeReference",
         "OutcomeState",
         "PostgreSQLSource",
@@ -546,6 +552,7 @@ def test_public_surface_is_focused():
         "SkillCandidateContent",
         "SkillSummary",
         "ScheduledRoutineDraft",
+        "RequestedCapabilityGrant",
         "ScheduledRoutineInspection",
         "ScheduledRoutineSummary",
         "ScheduledRoutine",
@@ -929,7 +936,7 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
     skill_capabilities = (PACKAGE / "skills" / "capabilities.py").read_text(
         encoding="utf-8"
     )
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     assert "class SkillCapabilityDomain" in skill_capabilities
     assert "SKILL_VIEW_CAPABILITY_ID" in skill_capabilities
     assert "SKILL_SAVE_CAPABILITY_ID" in skill_capabilities
@@ -941,7 +948,7 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
 def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
 
@@ -985,7 +992,7 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
 
 def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
@@ -1128,9 +1135,11 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
             encoding="utf-8"
         )
-        assert "start_database_write_receipt" in write_backend
-        assert "finish_database_write_receipt" in write_backend
-        assert "database_write_receipts" not in write_backend
+        assert "start_effect_receipt" in runtime
+        assert "start_effect_receipt" not in write_backend
+        assert "finish_effect_receipt" in runtime
+        assert "finish_effect_receipt" not in write_backend
+        assert "effect_receipts" not in write_backend
         assert "SideEffectExecutor" not in write_backend
         assert "approval_handler" not in write_backend
         assert "_execute_side_effect" in runtime
@@ -1159,9 +1168,7 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
                 PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
             )
             assert method not in controller
-            assert method not in (
-                PACKAGE / "domains" / "data" / "context.py"
-            ).read_text(encoding="utf-8")
+            assert method not in (PACKAGE / "context.py").read_text(encoding="utf-8")
     finally:
         await agent.close()
 
@@ -1179,7 +1186,7 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
     )
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
     terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
     tui_commands = (PACKAGE / "tui" / "commands.py").read_text(encoding="utf-8")
@@ -1257,7 +1264,7 @@ def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
     )
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
         encoding="utf-8"
     )
@@ -2002,7 +2009,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
         }
 
         assert tables == {
-            "database_write_receipts",
+            "effect_receipts",
             "learning_candidates",
             "job_runs",
             "autonomous_followups",
@@ -2022,11 +2029,16 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "syncs",
         }
         assert columns == {
-            "database_write_receipts": (
+            "effect_receipts": (
                 "agent_id",
                 "id",
                 "run_id",
                 "call_id",
+                "operation_key",
+                "routine_id",
+                "occurrence_id",
+                "grant_digest",
+                "unresolved",
                 "data",
             ),
             "learning_candidates": ("agent_id", "id", "data"),
@@ -2096,6 +2108,8 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "syncs": ("agent_id", "id", "source_id", "data"),
         }
         assert named_indexes == {
+            "effect_receipts_unresolved": "effect_receipts",
+            "effect_receipts_grant_reservations": "effect_receipts",
             "deliveries_conversation_history": "deliveries",
             "routine_occurrences_stale": "routine_occurrences",
             "runs_conversation_turn": "runs",
@@ -2285,9 +2299,7 @@ def test_artifact_delivery_uses_no_bash_shell_subprocess_or_unrestricted_file_to
 
 def test_artifact_payloads_and_destination_grants_never_enter_sqlite_messages_or_model_requests():
     sqlite_text = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
-    context_text = (PACKAGE / "domains" / "data" / "context.py").read_text(
-        encoding="utf-8"
-    )
+    context_text = (PACKAGE / "context.py").read_text(encoding="utf-8")
     assert "ArtifactPayload" not in sqlite_text
     assert "ArtifactDraft" not in sqlite_text
     assert "_DestinationGrant" not in sqlite_text

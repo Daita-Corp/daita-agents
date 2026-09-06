@@ -356,7 +356,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     baseline_exit = await baseline_agent.run(
         "Using orders, order_items, products, customers, and regions, calculate "
         "paid contribution margin by region and currency.",
-        source_id=source.id,
+        source_scope_ids=(source.id,),
     )
     baseline_events = tuple(events[baseline_start:])
     baseline_transcript = await baseline_agent.transcript(baseline_exit.run_id)
@@ -416,7 +416,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         "When we say paid contribution margin, use line total minus quantity times "
         "unit cost for paid orders, report by region and currency, and never compare "
         "currencies without conversion.",
-        source_id=source.id,
+        source_scope_ids=(source.id,),
     )
     assert teaching_exit.final_text == (
         "The paid contribution margin definition is saved."
@@ -501,7 +501,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     learned_exit = await learned_agent.run(
         "Using orders, order_items, products, customers, and regions, calculate "
         "paid contribution margin by region and currency.",
-        source_id=source.id,
+        source_scope_ids=(source.id,),
     )
     learned_events = tuple(events[learned_lifecycle_start:])
     learned_transcript = await learned_agent.transcript(learned_exit.run_id)
@@ -578,13 +578,13 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     denied_baseline_start = len(events)
     denied_baseline = await denied_agent.run(
         "Calculate paid contribution margin.",
-        source_id=denied_source.id,
+        source_scope_ids=(denied_source.id,),
     )
     denied_baseline_events = tuple(events[denied_baseline_start:])
     denied_learned_start = len(events)
     denied_teaching = await denied_agent.learn(
         "When we say paid contribution margin, use the durable paid-order formula.",
-        source_id=denied_source.id,
+        source_scope_ids=(denied_source.id,),
     )
     assert denied_teaching.final_text == "The proposed definition was not saved."
     assert await denied_agent.list_semantic_annotations() == ()
@@ -612,7 +612,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     )
     denied_follow_up = await denied_reopened.run(
         "Calculate paid contribution margin.",
-        source_id=denied_source.id,
+        source_scope_ids=(denied_source.id,),
     )
     denied_lifecycle_events = tuple(events[denied_learned_start:])
     assert denied_follow_up.final_text == denied_baseline.final_text

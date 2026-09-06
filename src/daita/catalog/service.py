@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import re
+import secrets
 import unicodedata
 from bisect import bisect_left
 from collections import deque
@@ -13,7 +15,7 @@ from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
-from .._json import FrozenJsonObject
+from .._json import FrozenJsonObject, canonical_json
 from .models import (
     CATALOG_MAX_LIMIT,
     CATALOG_TRAVERSAL_MAX_EDGES,
@@ -257,6 +259,7 @@ class CatalogService:
         self._sources = sources
         self._source_indexes: dict[tuple[str, str, str], _SourceCatalogIndex] = {}
         self._source_index_lock = asyncio.Lock()
+        self._search_cursor_key = secrets.token_bytes(32)
 
     async def summary(self, agent_id: str) -> CatalogSummary:
         """Project active source counts from their current committed snapshots."""
@@ -461,6 +464,19 @@ class CatalogService:
                 request,
                 tuple(indexes),
                 readable_resource_ids=readable_resource_ids,
+                source_hints=tuple(
+                    {
+                        "source_id": source.id,
+                        "label": source.display_name,
+                        "summary": source.summary,
+                        "when_to_use": source.when_to_use,
+                        "keywords": source.keywords,
+                    }
+                    for source in await self._sources.list_sources(request.agent_id)
+                    if source.agent_id == request.agent_id
+                    and source.active
+                    and source.id in scoped_source_ids
+                ),
             )
             current_active_source_ids = await self._active_source_ids(request.agent_id)
             current_refs = (
@@ -550,20 +566,146 @@ class CatalogService:
         indexes: tuple[_SourceCatalogIndex, ...],
         *,
         readable_resource_ids: frozenset[str] | None = None,
+        include_fallback: bool = True,
+        source_hints: tuple[Mapping[str, object], ...] = (),
     ) -> CatalogSearchResult:
         selection = self._select_index_hits(
             request,
             indexes,
             readable_resource_ids=readable_resource_ids,
         )
-        all_hits = selection.ordered_hits
-        hits = tuple(all_hits[: request.limit])
+        matched_hits = selection.ordered_hits
+        matched_ids = {hit.resource_id for hit in matched_hits}
+        query_terms = (
+            set(_normalize_search_text(request.query).tokens) - _SEARCH_STOP_WORDS
+        )
+        hinted_sources = {
+            hint["source_id"]
+            for hint in source_hints
+            if query_terms
+            & set(
+                _normalize_search_text(
+                    canonical_json(
+                        {
+                            key: value
+                            for key, value in hint.items()
+                            if key != "source_id"
+                        }
+                    )
+                ).tokens
+            )
+        }
+        hinted_hits = tuple(
+            CatalogSearchHit(
+                resource_id=resource.id,
+                source_id=resource.source_id,
+                kind=resource.kind,
+                name=resource.name,
+                revision=resource.current_revision,
+                sensitivity=resource.sensitivity,
+                score=1,
+                match_reasons=("source_hint",),
+            )
+            for resource in sorted(
+                (
+                    resource
+                    for index in indexes
+                    for resource in index.resources_by_id.values()
+                    if resource.source_id in hinted_sources
+                    and resource.id not in matched_ids
+                    and (
+                        readable_resource_ids is None
+                        or resource.id in readable_resource_ids
+                    )
+                    and (
+                        not request.resource_kinds
+                        or resource.kind in request.resource_kinds
+                    )
+                ),
+                key=_resource_search_tie_key,
+            )
+        )
+        matched_hits = (*matched_hits, *hinted_hits)
+        matched_ids.update(hit.resource_id for hit in hinted_hits)
+        fallback = (
+            tuple(
+                CatalogSearchHit(
+                    resource_id=resource.id,
+                    source_id=resource.source_id,
+                    kind=resource.kind,
+                    name=resource.name,
+                    revision=resource.current_revision,
+                    sensitivity=resource.sensitivity,
+                    score=0,
+                    match_reasons=("unmatched_fallback",),
+                )
+                for resource in sorted(
+                    (
+                        resource
+                        for index in indexes
+                        for resource in index.resources_by_id.values()
+                        if resource.id not in matched_ids
+                        and (
+                            readable_resource_ids is None
+                            or resource.id in readable_resource_ids
+                        )
+                        and (
+                            not request.resource_kinds
+                            or resource.kind in request.resource_kinds
+                        )
+                    ),
+                    key=_resource_search_tie_key,
+                )
+            )
+            if include_fallback
+            else ()
+        )
+        all_hits = (*matched_hits, *fallback)
+        context = canonical_json(
+            {
+                "agent_id": request.agent_id,
+                "run_id": request.run_id,
+                "query": request.query,
+                "source_ids": request.source_ids,
+                "resource_kinds": tuple(kind.value for kind in request.resource_kinds),
+                "source_hints": tuple(
+                    sorted(source_hints, key=lambda hint: str(hint["source_id"]))
+                ),
+                "candidate_revisions": tuple(
+                    (hit.resource_id, hit.revision, hit.score, hit.match_reasons)
+                    for hit in all_hits
+                ),
+            }
+        ).encode("utf-8")
+
+        def cursor_for(position: int) -> str:
+            return (
+                f"{position}."
+                + hmac.new(
+                    self._search_cursor_key, context + f":{position}".encode(), "sha256"
+                ).hexdigest()
+            )
+
+        position = 0
+        if request.cursor is not None:
+            if re.fullmatch(r"[1-9][0-9]{0,5}\.[0-9a-f]{64}", request.cursor) is None:
+                raise CatalogStoreError("catalog search cursor is invalid or stale")
+            position = int(request.cursor.partition(".")[0])
+            if position >= len(all_hits) or not hmac.compare_digest(
+                request.cursor, cursor_for(position)
+            ):
+                raise CatalogStoreError("catalog search cursor is invalid or stale")
+        hits = tuple(all_hits[position : position + request.limit])
+        truncated = position + len(hits) < len(all_hits)
         return CatalogSearchResult(
             request=request,
             hits=hits,
-            total_matches=len(all_hits),
+            total_matches=len(matched_hits),
             returned_count=len(hits),
-            truncated=len(all_hits) > len(hits),
+            truncated=truncated,
+            total_candidates=len(all_hits),
+            position=position,
+            next_cursor=cursor_for(position + len(hits)) if truncated else None,
         )
 
     def _select_index_hits(
@@ -925,6 +1067,7 @@ class CatalogService:
                     if request.source_id is None or index.source_id == request.source_id
                 ),
                 readable_resource_ids=readable_resource_ids,
+                include_fallback=False,
             )
             match_by_resource_id = {hit.resource_id: hit for hit in search.hits}
         else:

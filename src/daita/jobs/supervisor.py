@@ -378,7 +378,7 @@ class JobSupervisor:
             message="Execute the exact frozen durable data job.",
             created_at=attempt.claimed_at,
             conversation_id=job.conversation_id,
-            source_id=source_ids[0] if len(source_ids) == 1 else None,
+            source_scope_ids=source_ids,
         )
         outcome = await self._runtime.execute_internal(
             InternalCapabilityRequest(

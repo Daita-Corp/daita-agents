@@ -1,6 +1,6 @@
-# Scheduled read routines and outcomes
+# Scheduled assignments and outcomes
 
-Daita scheduled routines repeat bounded read-only agent work. A routine freezes
+Daita scheduled routines perform bounded assignments once or on a recurring schedule. A routine freezes
 one exact self-contained instruction and executes each admitted occurrence
 through the ordinary `AgentLoop` and `CapabilityRuntime`. Each terminal
 occurrence converges atomically with one immutable logical `Delivery` in the
@@ -28,8 +28,13 @@ Admission validates and retains the exact agent, conversation, source,
 resource, MCP binding, capability contract, model route, sensitivity, budget,
 expiration, typed outcome contract, and immutable inbox distribution plan. Only
 capabilities statically declared
-`scheduled_direct`, with `OperationalEffect.NONE` and read/none data access,
-can enter the ceiling. Routine-management capabilities remain interactive-only.
+`automation_direct` can enter the ceiling. Effectful capabilities additionally
+require a domain-normalized `CapabilityGrant`, an exact call ceiling, a receipt
+policy and an `EffectRequirement`. Routine-management capabilities remain
+interactive-only. Source-free assignments use empty source/resource/binding
+ceilings; those empty machine ceilings never mean all currently admitted sources.
+Native and MCP unattended actions are enabled only after their concrete adapter
+conformance gates; the common routine contract does not confer connector authority.
 If an artifact is required, admission also proves that at least one allowed
 producer can satisfy its media type, authorship, exact-source, sensitivity, and
 byte bounds. Impossible contracts fail before the routine is created.
@@ -45,7 +50,9 @@ Artifact inventory, reading, conversion, editing, local publication, and
 export-location capabilities remain interactive-only.
 
 An optional `changes_only` resource-revision precheck runs through the ordinary
-trusted runtime request. When its canonical observation is unchanged, the
+trusted runtime request. It is restricted to one exact structural catalog/resource
+revision and the supported catalog/report tools. It cannot skip row-value research,
+effects, MCP calls, source-free work or broader resource assignments. When its canonical observation is unchanged, the
 occurrence advances with zero model calls and one no-change Delivery. `always`
 routines do not use that precheck.
 
@@ -64,10 +71,41 @@ routine; missing or digest-mismatched retained bytes fail closed. Skill text,
 source values, MCP metadata and output, precheck observations, and prior
 transcript content remain untrusted data and cannot expand authority.
 
-Scheduled execution cannot write data, start or cancel a durable job, manage
-another routine, call a remote write tool, deliver externally, run shell
-commands, or submit a graph. Email/external delivery, recurring ingestion, and
-graphs are not implemented.
+Scheduled execution cannot start or cancel a durable job, manage another routine,
+publish local files, deliver through an external Distribution destination, run
+shell commands, or submit a graph. An admitted effect capability uses its existing
+domain and the common runtime, within an exact standing grant.
+
+## Immediate execution and effect outcomes
+
+For an interval or calendar schedule, `run_immediately=true` creates one immediate
+occurrence in the same SQLite transaction as the assignment. That occurrence uses
+the ordinary supervisor, run budget and action limits. The original calendar or
+interval anchor retains its next future slot. Approval covers this one assignment;
+there is no separate foreground write and no second immediate occurrence on a
+retry with the same creation identity. Revisions use explicit run-now instead.
+
+Every permitted effect has one completion requirement. A positive minimum requires
+that many unique successful, validated invocations; zero explicitly permits no
+action. Approval retains the accepted evidence bases and rejects stronger evidence
+than the capability can produce. Server-reported invocation evidence does not
+establish a downstream business result. A persuasive answer or artifact cannot
+substitute for a required action.
+
+The finalizer loads authoritative receipts for the exact run, occurrence, grant
+and capability contract and authenticates their successful tool results. It keeps
+valid partial artifacts if another action or artifact minimum fails. An uncertain
+or started effect forces failure even on an optional path. The inbox then shows a
+code-authored failure notice with receipt and artifact references, rather than
+presenting the model's completion claim as success.
+
+Uncertainty immediately pauses the originating routine. Resume, run-now, changed
+arguments, revised grants and new effectful clones cannot bypass its durable block.
+Previously approved unrelated routines and read-only work can continue. Exact
+foreground recovery records a separate immutable resolution and never dispatches
+an action: close-without-retry disables the routine; allow-future-work leaves it
+paused until explicitly resumed. A delayed finalizer preserves that stop decision.
+See [Effect receipts and recovery](EFFECT_RECEIPTS.md).
 
 ## Terminal use
 
@@ -137,7 +175,8 @@ definition. For example:
     "maximum_total_artifact_bytes": 0,
     "maximum_effective_sensitivity": "internal",
     "require_current_run_provenance": true,
-    "require_exact_source_bindings": false
+    "require_exact_source_bindings": false,
+    "effect_requirements": []
   },
   "distribution_destination_id": "conversation_inbox:conversation-...",
   "eligible_model_routes": ["openai"],
@@ -206,3 +245,10 @@ If a host stops, persisted routines and occurrences remain inspectable but no
 new due work runs. On reopen, Daita fences stale claims, finalizes a run that
 was already durably terminal without rerunning it, and preserves exactly one
 logical inbox delivery.
+
+Each approved revision retains `contract_bindings`: exact capability contracts,
+MCP execution origins, structural resource revisions and non-secret model route
+configuration digests. The occurrence copies those references into its immutable
+scope. Claim and call checks compare current facts with those retained references.
+A structural or execution contract change requires a new approved revision; row
+values, catalog refresh time and editable discovery hints do not change authority.

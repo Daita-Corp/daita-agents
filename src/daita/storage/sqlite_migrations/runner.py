@@ -11,10 +11,18 @@ from .models import SQLiteMigration
 DEVELOPMENT_BASELINE_ID = "development_baseline"
 DEVELOPMENT_BASELINE_DEFINITION = """development_baseline
 current pre-production SQLite state shape;
+effect_receipts replace adapter-owned database receipts with runtime reservations and separate human resolutions;
+ExecutionScope and ScheduledRoutine codec-v1 embed normalized capability grants and exact ExecutionContractBindings;
+RunInput codec-v1 uses explicit prepared source scope and history sensitivity;
+LoopExit, SemanticAnnotation and LearningCandidate codec-v1 retain sensitivity;
+active-source metadata is absent;
 MCPToolBinding codec-v1 uses exact toolbox presentation fields;
+SourceRegistration and MCPServerBinding codec-v1 retain local discovery hints;
 ArtifactProvenance codec-v1 includes exact local-file edit binding facts;
 ArtifactDeliveryReceipt codec-v1 includes exact create/replace outcome facts;
-ScheduledRoutine and RoutineOccurrence codec-v1 use the accepted D1 shape;
+ScheduledRoutine and RoutineOccurrence codec-v1 use exact routine authority;
+OutcomeContract codec-v1 includes explicit effect invocation requirements;
+RoutineOccurrence and OutcomeReference codec-v1 retain authenticated effect receipt IDs;
 Delivery codec-v1 replaces the pre-production conversation inbox aggregate;
 mutable until the first production state baseline is explicitly frozen
 """

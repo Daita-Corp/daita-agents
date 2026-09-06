@@ -275,7 +275,6 @@ assert len(content) > 0
 import asyncio
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
-import inspect
 import json
 from pathlib import Path
 import sqlite3
@@ -309,7 +308,11 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.providers.mock import MockModelProvider
-from daita.storage.sqlite import DatabaseWriteOutcome, DatabaseWriteReceipt
+from daita._json import FrozenJsonObject
+from daita.capabilities import EffectOutcome, EffectObservation, EffectEvidenceBasis
+from daita.llm.models import ModelSensitivity
+from daita.loop.models import RunInput
+from daita.storage.sqlite_records import EffectReceipt, effect_receipt_id
 
 
 def ids():
@@ -440,29 +443,25 @@ async def main():
     )
     resource = (await agent.list_catalog_resources())[0]
     transcript = await agent.transcript(run.run_id)
-    receipt_arguments = dict(
-        agent_id=agent.id,
-        run_id=run.run_id,
-        call_id="upgrade-receipt-call",
-        capability_id="data.postgresql.update",
-        source_id=postgresql_registration.id,
-        resource_id=resource.id,
-        intent_sha256="sha256:" + "6" * 64,
-        preview_fingerprint="sha256:" + "7" * 64,
-        started_at=transcript.run.created_at,
+    receipt_run = RunInput(
+        id="upgrade-receipt-run", agent_id=agent.id, message="Synthetic deterministic receipt preservation fixture.",
+        created_at=transcript.run.created_at, conversation_id="upgrade-receipt-conversation",
     )
-    if "expected_affected_rows" in inspect.signature(
-        DatabaseWriteReceipt.start
-    ).parameters:
-        receipt_arguments["expected_affected_rows"] = 1
-    receipt = DatabaseWriteReceipt.start(**receipt_arguments).finish(
-        DatabaseWriteOutcome.COMMITTED,
-        completed_at=transcript.run.created_at + timedelta(seconds=1),
-        affected_rows=1,
-        normalized_error_code=None,
+    await agent._embedded._store.start(receipt_run)
+    operation_key = "sha256:" + "6" * 64
+    receipt = EffectReceipt(
+        receipt_id=effect_receipt_id(agent_id=agent.id, run_id=receipt_run.id, call_id="upgrade-receipt-call", operation_key=operation_key),
+        receipt_kind="test.preservation", agent_id=agent.id, run_id=receipt_run.id,
+        call_id="upgrade-receipt-call", capability_id="test.preservation", domain_owner_id="test",
+        capability_contract_digest=operation_key, operation_key=operation_key, argument_fingerprint=operation_key,
+        sensitivity=ModelSensitivity.INTERNAL, started_at=transcript.run.created_at,
+    ).finish(
+        EffectObservation(EffectOutcome.SUCCEEDED, EffectEvidenceBasis.ADAPTER_VERIFIED,
+            FrozenJsonObject.from_mapping({"affected_rows": 1, "source_id": postgresql_registration.id, "resource_id": resource.id})),
+        finished_at=transcript.run.created_at + timedelta(seconds=1),
     )
-    await agent._embedded._store.start_database_write_receipt(receipt.as_started())
-    await agent._embedded._store.finish_database_write_receipt(receipt)
+    await agent._embedded._store.start_effect_receipt(receipt.as_started())
+    await agent._embedded._store.finish_effect_receipt(receipt)
     annotation = SemanticAnnotation(
         id="upgrade-booked-at",
         agent_id=agent.id,
@@ -620,10 +619,9 @@ async def main():
     skill = await agent.read_skill("upgrade-check")
     semantics = await agent.list_semantic_annotations()
     candidates = await agent.list_learning_candidates()
-    active = await agent.active_source()
     artifact = await agent.read_artifact(expected["artifact_id"])
     export_destination = await agent.export_destination()
-    receipt = await agent._embedded._store.load_database_write_receipt(
+    receipt = await agent._embedded._store.load_effect_receipt(
         agent.id,
         expected["receipt_id"],
     )
@@ -632,7 +630,7 @@ async def main():
     assert len(runs[0].result.artifact_deliveries) == 1
     delivery = runs[0].result.artifact_deliveries[0]
     projection = {
-        "active_source_id": None if active is None else active.id,
+        "admitted_source_ids": sorted(source.id for source in sources if source.active),
         "agent_id": agent.id,
         "artifact_content": artifact.content.decode("utf-8"),
         "artifact_id": artifact.ref.artifact_id,
@@ -655,15 +653,15 @@ async def main():
         "memory": await agent.read_memory(),
         "model_provider_id": agent.model_route.candidates[0].provider_id,
         "receipt": {
-            "affected_rows": receipt.affected_rows,
+            "affected_rows": receipt.payload["affected_rows"],
             "call_id": receipt.call_id,
             "capability_id": receipt.capability_id,
-            "completed_at": receipt.completed_at.isoformat(),
+            "finished_at": receipt.finished_at.isoformat(),
             "id": receipt.receipt_id,
             "outcome": receipt.outcome.value,
-            "resource_id": receipt.resource_id,
+            "resource_id": receipt.payload["resource_id"],
             "run_id": receipt.run_id,
-            "source_id": receipt.source_id,
+            "source_id": receipt.payload["source_id"],
             "started_at": receipt.started_at.isoformat(),
         },
         "run_answer": transcript.run.message,
@@ -856,7 +854,7 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
         if any(
             migrated_database_rows.get(table) != rows
             for table, rows in preserved_database_rows.items()
-            if table not in {"database_write_receipts", "sources", "state_migrations"}
+            if table not in {"effect_receipts", "sources", "state_migrations"}
         ):
             raise AssertionError(
                 "candidate migration changed rows owned by the baseline format"

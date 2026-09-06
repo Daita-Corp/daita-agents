@@ -2,41 +2,44 @@
 
 from __future__ import annotations
 
+import re
+
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import Protocol, cast
 
-from ..._json import FrozenJsonObject, canonical_json
-from ...artifacts.models import ArtifactDestination, artifact_destination_to_mapping
-from ...capabilities import ToolLoadMode
-from ...capability_runtime import (
+from ._json import FrozenJsonObject, canonical_json
+from .artifacts.models import ArtifactDestination, artifact_destination_to_mapping
+from .capabilities import ToolLoadMode
+from .scope import SourceScopeCatalog, resolve_effective_source_scope
+from .capability_runtime import (
     RunToolCatalog,
     StepToolProjection,
 )
-from ...catalog.capabilities import (
+from .catalog.capabilities import (
     CATALOG_INSPECT_EVIDENCE_KIND,
     CATALOG_SCHEMA_EVIDENCE_KIND,
     CATALOG_SEARCH_EVIDENCE_KIND,
     CATALOG_TRAVERSE_EVIDENCE_KIND,
 )
-from ...catalog.models import (
+from .catalog.models import (
     CATALOG_CONTEXT_DEFAULT_LIMIT,
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
 )
-from ...jobs.capabilities import (
+from .jobs.capabilities import (
     JOB_CANCEL_CAPABILITY_ID,
     JOB_INSPECT_CAPABILITY_ID,
     JOB_LIST_CAPABILITY_ID,
     JOB_READ_RESULTS_CAPABILITY_ID,
 )
-from ...llm.errors import (
+from .llm.errors import (
     ContextEvidencePressureExceeded,
     ContextWindowExceeded,
     RequestSensitivityUnavailable,
     ToolManifestLimitExceeded,
 )
-from ...llm.models import (
+from .llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelProfile,
@@ -47,9 +50,9 @@ from ...llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from ...loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
-from ...memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
-from ...semantics import (
+from .loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
+from .memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
+from .semantics import (
     SEMANTIC_DELETE_OUTPUT_KIND,
     SEMANTIC_DELETE_TOOL_NAME,
     SEMANTIC_SAVE_CAPABILITY_ID,
@@ -61,19 +64,19 @@ from ...semantics import (
     inspect_semantic_annotations,
     render_semantic_recall,
 )
-from ...skills.capabilities import (
+from .skills.capabilities import (
     SKILL_DELETE_OUTPUT_KIND,
     SKILL_DELETE_TOOL_NAME,
     SKILL_SAVE_OUTPUT_KIND,
     SKILL_SAVE_TOOL_NAME,
     SKILL_VIEW_OUTPUT_KIND,
 )
-from .capabilities import (
+from .domains.data.capabilities import (
     DATA_QUERY_TOOL_NAME,
     POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
     POSTGRESQL_UPDATE_TOOL_NAME,
 )
-from .controller import (
+from .domains.data.controller import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
     POSTGRESQL_UPDATE_CAPABILITY_ID,
@@ -81,7 +84,7 @@ from .controller import (
     POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
     POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
 )
-from .export_capabilities import (
+from .domains.data.export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
     ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
     ARTIFACT_CREATE_TABULAR_TOOL_NAME,
@@ -95,13 +98,14 @@ from .export_capabilities import (
     DATA_EXPORT_TABULAR_TOOL_NAME,
     DOCUMENT_CREATE_CAPABILITY_ID,
 )
-from .file_capabilities import (
+from .domains.data.file_capabilities import (
     LOCAL_FILE_READ_CAPABILITY_ID,
     LOCAL_FILE_READ_OUTPUT_KIND as LOCAL_FILE_READ_EVIDENCE_KIND,
     LOCAL_FILE_READ_TOOL_NAME,
     LOCAL_FILE_SEARCH_CAPABILITY_ID,
 )
-from .profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
+from .domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
+from .skills.store import Skill, SkillSummary, render_skill_index
 
 _MAXIMUM_PRIOR_COMPLETED_RUNS = 8
 _MAXIMUM_PRIOR_MESSAGES = 40
@@ -159,7 +163,7 @@ _SIDE_EFFECT_TOOL_NAMES = frozenset(
 )
 
 
-class CatalogContextReader(Protocol):
+class CatalogContextReader(SourceScopeCatalog, Protocol):
     async def admitted_model_sensitivity(
         self,
         agent_id: str,
@@ -187,13 +191,15 @@ class SemanticCatalogContextReader(Protocol):
 
 
 class MemoryContextReader(Protocol):
-    async def read_memory(self) -> str: ...
-
-    async def read_user_profile(self) -> str: ...
+    async def read_context(self) -> tuple[str, str, ModelSensitivity]: ...
 
 
 class SkillContextReader(Protocol):
-    async def skill_index(self) -> str: ...
+    async def list_skills(self) -> tuple[SkillSummary, ...]: ...
+
+    async def read_retained_skill(
+        self, name: str, content_digest: str
+    ) -> Skill | None: ...
 
 
 class SemanticContextReader(Protocol):
@@ -296,7 +302,7 @@ class RunContextSnapshot:
         )
 
 
-class DataContextBuilder:
+class AgentContextBuilder:
     """Prepare immutable run context and project bounded model requests."""
 
     def __init__(
@@ -306,6 +312,9 @@ class DataContextBuilder:
         profile: ModelProfile,
         memory: MemoryContextReader | None = None,
         skills: SkillContextReader | None = None,
+        scheduled_skill_bindings: (
+            Callable[[str], tuple[tuple[str, str], ...]] | None
+        ) = None,
         semantics: SemanticContextReader | None = None,
         explicit_learning_requested: Callable[[str], bool] | None = None,
         artifact_destinations: ArtifactDestinationContextReader | None = None,
@@ -321,12 +330,9 @@ class DataContextBuilder:
             raise TypeError("catalog must provide catalog_context")
         if not callable(getattr(catalog, "admitted_model_sensitivity", None)):
             raise TypeError("catalog must provide admitted_model_sensitivity")
-        if memory is not None and (
-            not callable(getattr(memory, "read_memory", None))
-            or not callable(getattr(memory, "read_user_profile", None))
-        ):
-            raise TypeError("memory must provide both bounded document reads")
-        if skills is not None and not callable(getattr(skills, "skill_index", None)):
+        if memory is not None and not callable(getattr(memory, "read_context", None)):
+            raise TypeError("memory must provide a classified bounded context read")
+        if skills is not None and not callable(getattr(skills, "list_skills", None)):
             raise TypeError("skills must provide the bounded skill index")
         if semantics is not None and not callable(
             getattr(semantics, "list_semantic_annotations", None)
@@ -372,6 +378,7 @@ class DataContextBuilder:
         self._catalog = catalog
         self._memory = memory
         self._skills = skills
+        self._scheduled_skill_bindings = scheduled_skill_bindings
         self._semantics = semantics
         if explicit_learning_requested is not None and not callable(
             explicit_learning_requested
@@ -392,13 +399,16 @@ class DataContextBuilder:
         self._profile = profile
         self._catalog_limit = catalog_limit
         self._max_context_evidence_bytes = max_context_evidence_bytes
-        self._selected_learning_candidates: dict[str, tuple[str, str]] = {}
+        self._selected_learning_candidates: dict[
+            str, tuple[str, str, ModelSensitivity]
+        ] = {}
 
     def select_learning_candidate(
         self,
         run_id: str,
         candidate_id: str,
         rendered_candidate: str,
+        sensitivity: ModelSensitivity,
     ) -> None:
         """Bind one candidate to one fresh run before context preparation."""
 
@@ -413,6 +423,8 @@ class DataContextBuilder:
             raise ValueError("candidate context values must be non-empty text")
         if run_id in self._selected_learning_candidates:
             raise ValueError("candidate context is already selected for this run")
+        if not isinstance(sensitivity, ModelSensitivity):
+            raise TypeError("candidate sensitivity must be ModelSensitivity")
         # EmbeddedAgent serializes foreground runs, so more than one live
         # selection indicates a host lifecycle bug.
         if self._selected_learning_candidates:
@@ -420,6 +432,7 @@ class DataContextBuilder:
         self._selected_learning_candidates[run_id] = (
             candidate_id,
             rendered_candidate,
+            sensitivity,
         )
 
     def clear_learning_candidate(self, run_id: str) -> None:
@@ -472,12 +485,32 @@ class DataContextBuilder:
             if run.origin is RunOrigin.USER and self._workspace_sensitivity is not None
             else ModelSensitivity.PUBLIC
         )
-        execution_scope = run.execution_scope
-        sensitivity_source_ids = (
-            execution_scope.allowed_source_ids
-            if execution_scope is not None
-            else (() if run.source_id is None else (run.source_id,))
+        sensitivity = max(
+            (
+                sensitivity,
+                run.history_sensitivity,
+                *(
+                    entry.view.presentation_sensitivity
+                    for entry in tool_context.entries
+                ),
+            ),
+            key=lambda item: item.routing_rank,
         )
+        execution_scope = run.execution_scope
+        if execution_scope is not None:
+            # Retained machine instructions/payloads have no independent public
+            # classification. Their approved ceiling is the conservative floor.
+            sensitivity = max(
+                sensitivity,
+                execution_scope.sensitivity_ceiling,
+                key=lambda item: item.routing_rank,
+            )
+        source_scope = tool_context.source_scope
+        if source_scope is None:
+            source_scope = await resolve_effective_source_scope(
+                run, self._catalog, files_only=files_only
+            )
+        sensitivity_source_ids = tuple(sorted(source_scope.source_ids))
         if sensitivity_source_ids:
             classified = await self._catalog.admitted_model_sensitivity(
                 run.agent_id,
@@ -494,14 +527,40 @@ class DataContextBuilder:
 
         memory_text = ""
         user_profile = ""
-        if self._memory is not None:
-            memory_text = await self._memory.read_memory()
-            user_profile = await self._memory.read_user_profile()
+        if self._memory is not None and run.origin is RunOrigin.USER:
+            memory_text, user_profile, memory_floor = await self._memory.read_context()
+            if not isinstance(memory_floor, ModelSensitivity):
+                raise RequestSensitivityUnavailable()
+            sensitivity = max(
+                sensitivity, memory_floor, key=lambda item: item.routing_rank
+            )
         skill_index: str | None = None
+        skill_summaries: tuple[SkillSummary, ...] = ()
         if self._skills is not None:
-            skill_index = await self._skills.skill_index()
+            if run.origin is RunOrigin.USER:
+                skill_summaries = await self._skills.list_skills()
+            elif (
+                run.origin is RunOrigin.SCHEDULED_ROUTINE
+                and self._scheduled_skill_bindings is not None
+            ):
+                retained = []
+                for name, digest in self._scheduled_skill_bindings(run.id):
+                    skill = await self._skills.read_retained_skill(name, digest)
+                    if skill is None:
+                        raise RequestSensitivityUnavailable()
+                    retained.append(skill.summary)
+                skill_summaries = tuple(retained)
+            skill_index = render_skill_index(skill_summaries)
+            sensitivity = max(
+                (sensitivity, *(item.sensitivity for item in skill_summaries)),
+                key=lambda item: item.routing_rank,
+            )
         semantic_views: tuple[SemanticAnnotationView, ...] = ()
-        if self._semantics is not None and not files_only:
+        if (
+            self._semantics is not None
+            and not files_only
+            and run.origin is not RunOrigin.SCHEDULED_ROUTINE
+        ):
             annotations = await self._semantics.list_semantic_annotations(run.agent_id)
             resource_ids = tuple(
                 sorted(
@@ -521,7 +580,9 @@ class DataContextBuilder:
             readable_annotations = tuple(
                 annotation
                 for annotation in annotations
-                if set(annotation.subject.resource_ids) <= readable_fact_ids
+                if set(annotation.subject.resource_ids)
+                <= (readable_fact_ids & source_scope.resource_ids)
+                and set(annotation.subject.source_ids) <= source_scope.source_ids
                 and (
                     execution_scope is None
                     or (
@@ -536,6 +597,16 @@ class DataContextBuilder:
                 readable_annotations,
                 facts,
             )
+            sensitivity = max(
+                (sensitivity, *(item.sensitivity for item in readable_annotations)),
+                key=lambda item: item.routing_rank,
+            )
+        if (
+            execution_scope is not None
+            and sensitivity.routing_rank
+            > execution_scope.sensitivity_ceiling.routing_rank
+        ):
+            raise RequestSensitivityUnavailable()
         candidate_text = ""
         explicit_learning = (
             self._explicit_learning_requested is not None
@@ -543,7 +614,10 @@ class DataContextBuilder:
         )
         selected_candidate = self._selected_learning_candidates.get(run.id)
         if selected_candidate is not None:
-            _selected_candidate_id, candidate_text = selected_candidate
+            _selected_candidate_id, candidate_text, candidate_floor = selected_candidate
+            sensitivity = max(
+                sensitivity, candidate_floor, key=lambda item: item.routing_rank
+            )
         artifact_tools_projected = bool(
             capability_ids
             & {
@@ -562,7 +636,7 @@ class DataContextBuilder:
             else await self._artifact_destinations.model_destinations(run.id)
         )
         catalog_query = run.message[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS]
-        if files_only:
+        if not source_scope.resource_ids:
             catalog = FrozenJsonObject.from_mapping(
                 {
                     "resources": (),
@@ -580,19 +654,56 @@ class DataContextBuilder:
                 catalog_query,
                 prior_query=prior_catalog_query,
                 limit=self._catalog_limit,
-                source_ids=(
-                    execution_scope.allowed_source_ids
-                    if execution_scope is not None
-                    else (() if run.source_id is None else (run.source_id,))
-                ),
-                resource_ids=(
-                    ()
-                    if execution_scope is None
-                    else execution_scope.allowed_resource_ids
-                ),
+                source_ids=tuple(sorted(source_scope.source_ids)),
+                resource_ids=tuple(sorted(source_scope.resource_ids)),
             )
         catalog_payload = catalog.to_dict()
-        catalog_payload, semantic_text = self._fit_mandatory_request(
+        source_presentations = (
+            await self._catalog.source_routing_facts(
+                run.agent_id, tuple(sorted(source_scope.source_ids))
+            )
+            if source_scope.source_ids
+            else ()
+        )
+        catalog_payload["connector_directory"] = _connector_directory(
+            run.message,
+            source_presentations,
+            tool_context,
+            skill_summaries,
+            maximum_bytes=min(
+                # A first-glance directory duplicates searchable metadata. Cap
+                # it at 5% of input capacity (using our conservative byte/token
+                # accounting), and 8 KB even for large models. The fitter below
+                # may shrink it further; continuation retains full reachability.
+                8_000,
+                max(512, self._profile.maximum_input_tokens // 20),
+            ),
+        )
+        # Hash values have fixed length; price the real projection metadata
+        # before the final static-context digest is known.
+        provenance = FrozenJsonObject.from_mapping(
+            {
+                "authority": "run_context_snapshot",
+                "run_id": run.id,
+                "source_ids": tuple(sorted(source_scope.source_ids)),
+                "resource_ids": tuple(sorted(source_scope.resource_ids)),
+                "workspace_id": (
+                    self._workspace_id if run.origin is RunOrigin.USER else None
+                ),
+                "workspace_sensitivity": (
+                    self._workspace_sensitivity.value
+                    if run.origin is RunOrigin.USER
+                    and self._workspace_sensitivity is not None
+                    else None
+                ),
+                "files_only": files_only,
+                "execution_scope_digest": (
+                    None if execution_scope is None else execution_scope.digest
+                ),
+                "static_context_sha256": "0" * 64,
+            }
+        )
+        catalog_payload, semantic_text, growth_reserve = self._fit_mandatory_request(
             catalog_payload,
             current_messages,
             tools,
@@ -608,6 +719,10 @@ class DataContextBuilder:
             explicit_learning=explicit_learning,
             artifact_destinations=artifact_destinations,
             sensitivity=sensitivity,
+            initial_provenance=provenance,
+            newest_continuity=(
+                _continuity_from_projected_turn(prior_turns[-1]) if prior_turns else ()
+            ),
         )
         validated_prior_turns: list[tuple[CanonicalMessage, ...]] = []
         schema_history_omitted = False
@@ -650,12 +765,13 @@ class DataContextBuilder:
                 explicit_learning=explicit_learning,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
+                initial_provenance=provenance,
                 final=False,
                 history_omitted=omitted,
                 profile=self._profile,
             )
             if (
-                _estimate_input_tokens(candidate) + _CURRENT_RUN_GROWTH_RESERVE
+                _estimate_input_tokens(candidate) + growth_reserve
                 <= self._profile.maximum_input_tokens
             ):
                 selected = proposed
@@ -689,12 +805,13 @@ class DataContextBuilder:
                 explicit_learning=explicit_learning,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
+                initial_provenance=provenance,
                 final=False,
                 history_omitted=omitted,
                 profile=self._profile,
             )
             if (
-                _estimate_input_tokens(candidate) + _CURRENT_RUN_GROWTH_RESERVE
+                _estimate_input_tokens(candidate) + growth_reserve
                 <= self._profile.maximum_input_tokens
             ):
                 selected = proposed
@@ -723,6 +840,7 @@ class DataContextBuilder:
             explicit_learning=explicit_learning,
             artifact_destinations=artifact_destinations,
             sensitivity=sensitivity,
+            initial_provenance=provenance,
             final=False,
             history_omitted=history_omitted,
             profile=self._profile,
@@ -742,6 +860,7 @@ class DataContextBuilder:
             explicit_learning=explicit_learning,
             artifact_destinations=(),
             sensitivity=sensitivity,
+            initial_provenance=provenance,
             final=True,
             history_omitted=history_omitted,
             profile=self._profile,
@@ -775,29 +894,7 @@ class DataContextBuilder:
         }
         digest = sha256(canonical_json(static_material).encode("utf-8")).hexdigest()
         provenance = FrozenJsonObject.from_mapping(
-            {
-                "authority": "run_context_snapshot",
-                "run_id": run.id,
-                "source_ids": (
-                    execution_scope.allowed_source_ids
-                    if execution_scope is not None
-                    else (() if run.source_id is None else (run.source_id,))
-                ),
-                "workspace_id": (
-                    self._workspace_id if run.origin is RunOrigin.USER else None
-                ),
-                "workspace_sensitivity": (
-                    self._workspace_sensitivity.value
-                    if run.origin is RunOrigin.USER
-                    and self._workspace_sensitivity is not None
-                    else None
-                ),
-                "files_only": files_only,
-                "execution_scope_digest": (
-                    None if execution_scope is None else execution_scope.digest
-                ),
-                "static_context_sha256": digest,
-            }
+            {**provenance, "static_context_sha256": digest}
         )
         return RunContextSnapshot(
             run_id=run.id,
@@ -924,7 +1021,9 @@ class DataContextBuilder:
         explicit_learning: bool,
         artifact_destinations: tuple[ArtifactDestination, ...],
         sensitivity: ModelSensitivity,
-    ) -> tuple[dict[str, object], str]:
+        initial_provenance: FrozenJsonObject,
+        newest_continuity: tuple[CanonicalMessage, ...],
+    ) -> tuple[dict[str, object], str, int]:
         resources = catalog.get("resources")
         sources = catalog.get("sources")
         if not isinstance(resources, list):
@@ -970,7 +1069,14 @@ class DataContextBuilder:
                 "returned_count": len(retained),
                 "truncated": service_truncated or len(retained) < len(resources),
                 "trust_classification": trust,
+                "connector_directory": catalog.get("connector_directory"),
             }
+            directory = payload.get("connector_directory")
+            if (
+                isinstance(directory, Mapping)
+                and directory.get("total_candidates") == 0
+            ):
+                payload.pop("connector_directory")
             semantic_text = render_semantic_recall(
                 semantic_views,
                 selected_resource_ids=_catalog_resource_ids(retained),
@@ -991,15 +1097,153 @@ class DataContextBuilder:
                 explicit_learning=explicit_learning,
                 artifact_destinations=artifact_destinations,
                 sensitivity=sensitivity,
+                initial_provenance=initial_provenance,
                 final=False,
                 history_omitted=False,
                 profile=self._profile,
             )
-            if _estimate_input_tokens(candidate) <= self._profile.maximum_input_tokens:
-                return payload, semantic_text
-            if not retained:
-                raise ContextWindowExceeded()
-            retained.pop()
+            # Price the whole preferred request, including record framing and
+            # the history marker. Optional discovery must leave the existing
+            # growth reserve even after the directory has become empty.
+            preferred = (
+                replace(
+                    candidate,
+                    messages=(
+                        candidate.messages[0],
+                        _history_omission_message(),
+                        *newest_continuity,
+                        *current_messages,
+                    ),
+                )
+                if newest_continuity
+                else candidate
+            )
+            estimate = _estimate_input_tokens(preferred)
+            directory = payload.get("connector_directory")
+            if (
+                estimate + _CURRENT_RUN_GROWTH_RESERVE
+                <= self._profile.maximum_input_tokens
+            ):
+                return payload, semantic_text, _CURRENT_RUN_GROWTH_RESERVE
+            if (
+                isinstance(directory, dict)
+                and isinstance(directory.get("entries"), list)
+                and directory["entries"]
+            ):
+                directory["entries"].pop()
+                directory["omitted_count"] = int(directory["total_candidates"]) - len(
+                    directory["entries"]
+                )
+                continue
+            if retained:
+                retained.pop()
+                continue
+            if newest_continuity and estimate <= self._profile.maximum_input_tokens:
+                # Once optional discovery is exhausted, retain useful newest
+                # continuity with the headroom actually available. The growth
+                # reserve is advisory; every later complete request is checked.
+                return (
+                    payload,
+                    semantic_text,
+                    self._profile.maximum_input_tokens - estimate,
+                )
+            if newest_continuity:
+                newest_continuity = ()
+                continue
+            # Mandatory instructions/current input may themselves leave less
+            # growth room. They are never truncated or rejected solely to keep
+            # an advisory reserve; actual projection still enforces the window.
+            if estimate <= self._profile.maximum_input_tokens:
+                return (
+                    payload,
+                    semantic_text,
+                    self._profile.maximum_input_tokens - estimate,
+                )
+            raise ContextWindowExceeded()
+
+
+def _connector_directory(
+    prompt: str,
+    sources: tuple[Mapping[str, object], ...],
+    tools: RunToolCatalog,
+    skills: tuple[SkillSummary, ...],
+    *,
+    maximum_bytes: int,
+) -> dict[str, object]:
+    """Bound discovery presentation from the current owners without adding authority."""
+
+    entries: list[dict[str, object]] = []
+    for source in sources:
+        entries.append(
+            {
+                "kind": "catalog_source",
+                "id": source["source_id"],
+                "label": source.get("display_name", source["source_id"]),
+                "summary": source.get("summary", ""),
+                "when_to_use": source.get("when_to_use", ""),
+                "keywords": source.get("keywords", ()),
+            }
+        )
+    bindings: dict[str, FrozenJsonObject] = {}
+    binding_counts: dict[str, int] = {}
+    for entry in tools.entries:
+        presentation = entry.view.connector_presentation
+        if presentation is not None:
+            identity = str(presentation["id"])
+            bindings[identity] = presentation
+            binding_counts[identity] = binding_counts.get(identity, 0) + 1
+    for identity, presentation in bindings.items():
+        entries.append(
+            {**presentation.to_dict(), "tool_count": binding_counts[identity]}
+        )
+    entries.extend(
+        {
+            "kind": "toolbox",
+            "id": entry.toolbox_id.value,
+            "label": entry.label,
+            "summary": entry.summary,
+            "tool_count": entry.pinned_count + entry.on_demand_count,
+        }
+        for entry in tools.toolbox_manifest
+    )
+    entries.extend(
+        {
+            "kind": "skill",
+            "id": skill.name,
+            "label": skill.name,
+            "summary": skill.description,
+        }
+        for skill in skills
+    )
+    for directory_entry in entries:
+        directory_entry["discovery_digest"] = (
+            "sha256:"
+            + sha256(canonical_json(directory_entry).encode("utf-8")).hexdigest()
+        )
+    terms = set(re.findall(r"[a-z0-9]+", prompt.lower()))
+    entries.sort(
+        key=lambda entry: (
+            -len(terms & set(re.findall(r"[a-z0-9]+", canonical_json(entry).lower()))),
+            str(entry["kind"]),
+            str(entry["id"]),
+        )
+    )
+    digest = "sha256:" + sha256(canonical_json(entries).encode("utf-8")).hexdigest()
+    retained_entries = entries.copy()
+    payload: dict[str, object] = {
+        "entries": retained_entries,
+        "total_candidates": len(entries),
+        "omitted_count": 0,
+        "discovery_digest": digest,
+        "trust_classification": "untrusted_discovery_hints",
+    }
+    while (
+        len(canonical_json(payload).encode("utf-8")) > maximum_bytes
+        and retained_entries
+    ):
+        retained_entries.pop()
+        payload["omitted_count"] = len(entries) - len(retained_entries)
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -1815,6 +2059,7 @@ def _request(
     explicit_learning: bool,
     artifact_destinations: tuple[ArtifactDestination, ...],
     sensitivity: ModelSensitivity,
+    initial_provenance: FrozenJsonObject,
     final: bool,
     history_omitted: bool,
     profile: ModelProfile,
@@ -1854,6 +2099,14 @@ def _request(
         messages=(system, *omission, *messages),
         tools=tools,
         sensitivity=sensitivity,
+        sensitivity_provenance={
+            "authority": "run_context_snapshot",
+            "static_context_sha256": initial_provenance["static_context_sha256"],
+            "initial_sensitivity": sensitivity.value,
+            "initial_sensitivity_provenance": initial_provenance,
+            "effective_sensitivity": sensitivity.value,
+            "classified_results": (),
+        },
         allow_parallel_tool_calls=(
             True if tools and profile.supports_parallel_tools else None
         ),
@@ -2306,7 +2559,7 @@ def _flatten(
 
 __all__ = [
     "CatalogContextReader",
-    "DataContextBuilder",
+    "AgentContextBuilder",
     "MemoryContextReader",
     "RunContextSnapshot",
     "SkillContextReader",

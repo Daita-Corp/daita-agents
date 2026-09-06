@@ -19,6 +19,7 @@ from ...artifacts.models import (
 from ...capabilities import (
     AccessMode,
     Capability,
+    AutomationScopeProposal,
     CapabilityDeclarations,
     CapabilityInputError,
     OperationalEffect,
@@ -35,6 +36,7 @@ from ...catalog.capabilities import (
 )
 from ...catalog.models import Sensitivity
 from ...llm.models import ModelSensitivity, ToolCall
+from ...scope import resolve_effective_source_scope
 from ...loop.models import RunInput, RunOrigin
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
@@ -240,20 +242,24 @@ class DataCapabilityDomain:
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
         files_only = run.id in self._files_only_run_ids
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=files_only
+        )
+        run = replace(run, resolved_source_scope=scope)
         facts: tuple[Mapping[str, object], ...]
         update_source_ids: frozenset[str]
-        if files_only:
+        if not scope.source_ids:
             facts = ()
             update_source_ids = frozenset()
         else:
             facts = await self._catalog.source_routing_facts(
                 run.agent_id,
-                (() if run.source_id is None else (run.source_id,)),
+                tuple(sorted(scope.source_ids)),
             )
             update_source_ids = (
                 await self._catalog.postgresql_update_applicable_source_ids(
                     run.agent_id,
-                    (() if run.source_id is None else (run.source_id,)),
+                    tuple(sorted(scope.source_ids)),
                 )
             )
         active_adapter_ids: set[str] = set()
@@ -315,6 +321,10 @@ class DataCapabilityDomain:
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
         del request_sensitivity
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        run = replace(run, resolved_source_scope=scope)
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
             if (
                 self._workspace_id is None
@@ -360,7 +370,6 @@ class DataCapabilityDomain:
             return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
-        arguments = self._apply_source_scope(run, capability, arguments)
         await self._validate_source_scope(run, capability, arguments)
         self._validate_execution_resource_scope(run, capability, arguments)
         await self._validate_resource_read_scope(run, capability, arguments)
@@ -412,6 +421,18 @@ class DataCapabilityDomain:
             )
         return arguments
 
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
+
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -425,7 +446,16 @@ class DataCapabilityDomain:
             or capability.operational_effect is not OperationalEffect.MUTATE_DATA
         ):
             raise ValueError("data domain received an unsupported side effect")
-        return SideEffectPlan(recheck_after_approval=False)
+        return SideEffectPlan(
+            recheck_after_approval=False,
+            effect_intent=FrozenJsonObject.from_mapping(
+                {
+                    "source_id": execution.arguments["source_id"],
+                    "resource_id": execution.arguments["resource_id"],
+                    "intent_sha256": fingerprint["intent_sha256"],
+                }
+            ),
+        )
 
     async def finalize_output(
         self,
@@ -511,6 +541,8 @@ class DataCapabilityDomain:
             )
         except SourcePermissionStateError as error:
             raise _incomplete_export(draft, "permission_state_invalid") from error
+        if run.resolved_source_scope is not None:
+            readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
@@ -580,28 +612,29 @@ class DataCapabilityDomain:
         error: BaseException,
     ) -> CapabilityFailure | None:
         del call
+        from ...adapters.postgresql_write import (
+            PostgreSQLUpdateExecutionError,
+            PostgreSQLUpdateExecutionCancelled,
+        )
+
+        if isinstance(error, PostgreSQLUpdateExecutionError):
+            return CapabilityFailure(
+                error.error_code,
+                str(error),
+                error.details,
+                effect_observation=error.effect_observation,
+            )
+        if isinstance(error, PostgreSQLUpdateExecutionCancelled):
+            return CapabilityFailure(
+                "write_interrupted",
+                "The native update was interrupted; see its transaction evidence.",
+                effect_observation=error.effect_observation,
+            )
         if isinstance(error, LocalWorkspaceError):
             return CapabilityFailure(error.code, error.message, error.details)
         if isinstance(error, LocalFileQueryError):
             return CapabilityFailure(error.code, error.message, error.details)
         return None
-
-    def _apply_source_scope(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: FrozenJsonObject,
-    ) -> FrozenJsonObject:
-        if (
-            run.source_id is None
-            or capability.id
-            not in {CATALOG_SEARCH_CAPABILITY_ID, CATALOG_SCHEMA_CAPABILITY_ID}
-            or arguments.get("source_id") is not None
-        ):
-            return arguments
-        scoped = arguments.to_dict()
-        scoped["source_id"] = run.source_id
-        return FrozenJsonObject.from_mapping(scoped)
 
     async def _validate_source_scope(
         self,
@@ -609,16 +642,20 @@ class DataCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> None:
-        selected_source_id = run.source_id
-        if selected_source_id is None:
-            return
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        selected_source_ids = scope.source_ids
         supplied_source_id = arguments.get("source_id")
-        if supplied_source_id is not None and supplied_source_id != selected_source_id:
+        if (
+            supplied_source_id is not None
+            and supplied_source_id not in selected_source_ids
+        ):
             raise CapabilityInputError(
                 "source_scope_violation",
-                "This run can only access the source selected by the user.",
+                "The requested source is outside this run's effective scope.",
                 {
-                    "selected_source_id": selected_source_id,
+                    "allowed_source_ids": tuple(sorted(selected_source_ids)),
                     "requested_source_id": supplied_source_id,
                 },
             )
@@ -645,14 +682,10 @@ class DataCapabilityDomain:
                 run.agent_id,
                 resource_id,
             )
-            if identity is None or identity[0] != selected_source_id:
+            if identity is None or identity[0] not in selected_source_ids:
                 raise CapabilityInputError(
-                    "source_scope_violation",
-                    "This run can only access resources from the selected source.",
-                    {
-                        "resource_id": resource_id,
-                        "selected_source_id": selected_source_id,
-                    },
+                    "resource_read_not_allowed",
+                    "The requested resource is not available for reading.",
                 )
 
     async def _validate_resource_read_scope(
@@ -692,6 +725,8 @@ class DataCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
+        if run.resolved_source_scope is not None:
+            readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         if any(resource_id not in readable for resource_id in requested):
@@ -763,6 +798,8 @@ class DataCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
+        if run.resolved_source_scope is not None:
+            readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
@@ -961,11 +998,15 @@ class DataCapabilityDomain:
                     "physical_revisions": tuple(physical_revisions),
                 },
             )
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        run = replace(run, resolved_source_scope=scope)
         source_id = call.arguments.get("source_id")
         source_ids = (
             (source_id,)
             if isinstance(source_id, str)
-            else (() if run.source_id is None else (run.source_id,))
+            else tuple(sorted(scope.source_ids))
         )
         sensitivity = await self._catalog.admitted_model_sensitivity(
             run.agent_id,
@@ -981,6 +1022,8 @@ class DataCapabilityDomain:
             run.agent_id,
             source_ids,
         )
+        if run.resolved_source_scope is not None:
+            readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         return replace(
