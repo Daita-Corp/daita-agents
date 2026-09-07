@@ -129,7 +129,7 @@ async def test_source_edit_preserves_selected_reads_and_switches_atomically(
             source_id=current.id,
             read_mode="selected",
             read_resource_ids=(current_resources[0].id,),
-            postgresql_update_scopes={},
+            relational_write_scopes={},
         )
         await agent.apply_source_permissions(
             source_id=current.id,
@@ -161,7 +161,7 @@ async def test_source_edit_preserves_selected_reads_and_switches_atomically(
         inspection = await agent.inspect_source_permissions(result.source.id)
         assert inspection.state.read_scope.mode.value == "selected"
         assert len(inspection.state.read_scope.resource_ids) == 1
-        assert inspection.state.postgresql_update_scopes == ()
+        assert inspection.state.relational_write_scopes == ()
     finally:
         await agent.close()
 

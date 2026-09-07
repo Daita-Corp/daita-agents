@@ -124,6 +124,8 @@ SELECT
     c.ordinal_position AS ordinal,
     (c.is_nullable = 'YES') AS nullable,
     c.column_default AS default_expression,
+    CASE WHEN coll_ns.nspname = 'pg_catalog' AND coll.collisdeterministic
+         THEN coll.collname ELSE NULL END AS collation,
     (a.attidentity <> '') AS is_identity,
     (a.attgenerated <> '') AS is_generated,
     (c.is_updatable = 'YES') AS is_updatable,
@@ -138,6 +140,8 @@ JOIN pg_attribute AS a
  AND NOT a.attisdropped
 JOIN pg_type AS type_def ON type_def.oid = a.atttypid
 JOIN pg_namespace AS type_ns ON type_ns.oid = type_def.typnamespace
+LEFT JOIN pg_collation AS coll ON coll.oid = a.attcollation
+LEFT JOIN pg_namespace AS coll_ns ON coll_ns.oid = coll.collnamespace
 LEFT JOIN (
     SELECT
         con.conrelid,
@@ -162,6 +166,11 @@ SELECT
         FILTER (WHERE att.attname IS NOT NULL) AS columns,
     bool_and(att.attname IS NOT NULL) AS simple_columns,
     ind.indisunique AS is_unique,
+    (ind.indisunique AND ind.indisvalid AND ind.indisready AND ind.indimmediate
+     AND ind.indpred IS NULL AND ind.indexprs IS NULL AND am.amname = 'btree'
+     AND bool_and(opc.opcdefault AND opc_ns.nspname = 'pg_catalog'
+                  AND ind.indcollation[key.ordinality - 1] = att.attcollation))
+        AS write_conflict_supported,
     pg_get_expr(ind.indpred, ind.indrelid) AS predicate
 FROM pg_namespace AS n
 JOIN pg_class AS rel ON rel.relnamespace = n.oid
@@ -172,10 +181,13 @@ CROSS JOIN LATERAL unnest(ind.indkey)
     WITH ORDINALITY AS key(attnum, ordinality)
 LEFT JOIN pg_attribute AS att
   ON att.attrelid = rel.oid AND att.attnum = key.attnum
+JOIN pg_opclass AS opc ON opc.oid = ind.indclass[key.ordinality - 1]
+JOIN pg_namespace AS opc_ns ON opc_ns.oid = opc.opcnamespace
 WHERE n.nspname = $1
   AND rel.relname = $2
   AND key.ordinality <= ind.indnkeyatts
-GROUP BY idx.relname, am.amname, ind.indisunique, ind.indpred, ind.indrelid
+GROUP BY idx.relname, am.amname, ind.indisunique, ind.indpred, ind.indrelid,
+         ind.indisvalid, ind.indisready, ind.indimmediate, ind.indexprs
 ORDER BY idx.relname
 LIMIT $3
 """
@@ -939,6 +951,7 @@ def _column(row: Mapping[str, object]) -> TabularColumn:
             None if primary is None else _positive_int(primary, "primary_key_ordinal")
         ),
         default_expression=_optional_row_text(row, "default_expression"),
+        collation=_optional_row_text(row, "collation"),
         identity=_row_bool(row, "is_identity"),
         generated=_row_bool(row, "is_generated"),
         updatable=_row_bool(row, "is_updatable"),
@@ -968,6 +981,7 @@ def _index(
         kind=_row_text(row, "index_kind"),
         columns=columns,
         unique=_row_bool(row, "is_unique"),
+        write_conflict_supported=row.get("write_conflict_supported") is True,
         predicate=_optional_row_text(row, "predicate"),
     )
 

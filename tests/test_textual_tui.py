@@ -1595,18 +1595,19 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
         await opened.close()
 
 
-async def test_source_permissions_configures_exact_postgresql_update_scope():
+async def test_source_permissions_configures_exact_relational_write_scope():
     read_scope = SimpleNamespace(mode=SimpleNamespace(value="all"), resource_ids=())
     initial_state = SimpleNamespace(
         read_scope=read_scope,
-        postgresql_update_scopes=(),
+        relational_write_scopes=(),
     )
     tickets = SimpleNamespace(
         resource_id="resource-tickets",
+        key_columns=("ticket_id",),
         display_name="support.tickets",
         resource_kind="table",
         eligible_assignment_columns=("priority", "ticket_status"),
-        postgresql_update_eligible=True,
+        relational_update_eligible=True,
         requires_advanced_column_selection=False,
     )
     inspection = SimpleNamespace(
@@ -1626,12 +1627,13 @@ async def test_source_permissions_configures_exact_postgresql_update_scope():
 
     async def preview_source_permissions(**kwargs: object):
         preview_calls.append(kwargs)
-        updates = kwargs["postgresql_update_scopes"]
+        updates = kwargs["relational_write_scopes"]
         assert isinstance(updates, dict)
         scopes = tuple(
             SimpleNamespace(
                 resource_id=resource_id,
-                allowed_assignment_columns=tuple(columns),
+                **columns,
+                constraints=lambda columns=columns: dict(columns),
             )
             for resource_id, columns in updates.items()
         )
@@ -1640,7 +1642,7 @@ async def test_source_permissions_configures_exact_postgresql_update_scope():
                 mode=SimpleNamespace(value=kwargs["read_mode"]),
                 resource_ids=kwargs["read_resource_ids"],
             ),
-            postgresql_update_scopes=scopes,
+            relational_write_scopes=scopes,
         )
         return SimpleNamespace(
             source_id=inspection.source_id,
@@ -1703,14 +1705,21 @@ async def test_source_permissions_configures_exact_postgresql_update_scope():
                 "source_id": inspection.source_id,
                 "read_mode": "all",
                 "read_resource_ids": (),
-                "postgresql_update_scopes": {
-                    tickets.resource_id: ("priority",),
+                "relational_write_scopes": {
+                    tickets.resource_id: {
+                        "allowed_operations": ("update",),
+                        "allowed_insert_columns": (),
+                        "allowed_update_columns": ("priority",),
+                        "key_columns": ("ticket_id",),
+                        "generated_identity_columns": (),
+                        "max_rows": 10000,
+                    },
                 },
             }
         ]
         body = str(permissions.query_one("#perm-body", Static).content)
-        assert "PostgreSQL update tables: 0 → 1" in body
-        assert "support.tickets: priority" in body
+        assert "Relational write tables: 0 → 1" in body
+        assert "support.tickets: update; keys: ticket_id; update: priority" in body
 
         assert await pilot.click("#perm-apply") is True
         await pilot.pause()
@@ -1727,24 +1736,24 @@ async def test_approval_approve_deny_cancel_and_unreviewable():
     request = ApprovalRequest(
         run_id="run-1",
         call_id="call-1",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping({"name": "safe"}),
         reason="update one row",
     )
     secret = ApprovalRequest(
         run_id="run-2",
         call_id="call-2",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping({"password": "hidden-secret"}),
         reason="secret shaped",
     )
     oversized = ApprovalRequest(
         run_id="run-3",
         call_id="call-3",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping({"blob": "x" * (70 * 1024)}),
         reason="too big",
     )
@@ -2520,6 +2529,48 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
         await opened.close()
 
 
+async def test_catalog_notice_and_tree_are_ready_before_mount_completes():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class DelayedCatalog(CatalogScreen):
+        async def on_mount(self) -> None:  # type: ignore[override]
+            entered.set()
+            await release.wait()
+
+    screen = DelayedCatalog(
+        summary=SimpleNamespace(
+            active_source_count=1, resource_count=0, relationship_count=0
+        ),
+        sources=(
+            SimpleNamespace(
+                id="source-empty", display_name="Empty source", adapter_id="sqlite"
+            ),
+        ),
+        resources=(),
+        notice="No current resources",
+        notice_warning=True,
+    )
+    async with app.run_test(size=(100, 34)):
+        mounted = asyncio.ensure_future(app.push_screen(screen))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert (
+                str(screen.query_one("#catalog-notice", Static).content)
+                == "No current resources"
+            )
+            tree = screen.query_one("#catalog-tree", Tree)
+            assert len(tree.root.children) == 1
+            assert "0 resources" in str(tree.root.children[0].label)
+            assert (
+                str(tree.root.children[0].children[0].label) == "No current resources"
+            )
+        finally:
+            release.set()
+            await mounted
+            app.exit(0)
+
+
 async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
     tmp_path: Path,
 ):
@@ -2920,8 +2971,8 @@ async def test_approval_presentation_failure_is_not_converted_to_denial():
     request = ApprovalRequest(
         run_id="run-failure",
         call_id="call-failure",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping({"name": "safe"}),
         reason="review failure",
     )

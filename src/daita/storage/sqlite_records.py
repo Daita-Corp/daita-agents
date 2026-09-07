@@ -13,7 +13,13 @@ from .._json import FrozenJsonObject, canonical_json
 from ..capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
 from ..llm.models import ModelSensitivity
 from ..adapters.models import SourceRegistration
-from ..catalog.models import CatalogFacet, CatalogResource, FacetKind, ResourceKind
+from ..catalog.models import (
+    CatalogFacet,
+    CatalogResource,
+    FacetKind,
+    ResourceKind,
+    TabularFacet,
+)
 
 _SOURCE_PERMISSION_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
@@ -105,45 +111,94 @@ class SourceReadScope:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateScope:
-    """One exact table and assignment-column PostgreSQL authorization."""
+class RelationalWriteScope:
+    """Exact operation, structure, column and row authority for one resource."""
 
     agent_id: str
     source_id: str
     resource_id: str
-    allowed_assignment_columns: tuple[str, ...]
+    resource_revision: str
+    allowed_operations: tuple[str, ...]
+    allowed_insert_columns: tuple[str, ...]
+    allowed_update_columns: tuple[str, ...]
+    key_columns: tuple[str, ...]
+    generated_identity_columns: tuple[str, ...]
+    max_rows: int
     authorization_fingerprint: str
 
     def __post_init__(self) -> None:
-        _permission_text(self.agent_id, "update scope agent_id")
-        if (
-            not isinstance(self.source_id, str)
-            or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
+        _permission_text(self.agent_id, "write scope agent_id")
+        for value, pattern, name in (
+            (self.source_id, _SOURCE_PERMISSION_SOURCE_ID, "source_id"),
+            (self.resource_id, _SOURCE_PERMISSION_RESOURCE_ID, "resource_id"),
+            (self.resource_revision, _SOURCE_PERMISSION_HASH, "resource_revision"),
+            (
+                self.authorization_fingerprint,
+                _SOURCE_PERMISSION_HASH,
+                "authorization_fingerprint",
+            ),
         ):
-            raise ValueError("update scope source_id must be a canonical source id")
-        if (
-            not isinstance(self.resource_id, str)
-            or _SOURCE_PERMISSION_RESOURCE_ID.fullmatch(self.resource_id) is None
+            if not isinstance(value, str) or pattern.fullmatch(value) is None:
+                raise ValueError(f"write scope {name} must be canonical")
+        for name in (
+            "allowed_operations",
+            "allowed_insert_columns",
+            "allowed_update_columns",
+            "key_columns",
+            "generated_identity_columns",
+        ):
+            values = _canonical_permission_texts(
+                getattr(self, name),
+                name,
+                maximum_items=_SOURCE_PERMISSION_MAX_CATALOG_COLUMNS,
+                maximum_characters=256,
+            )
+            object.__setattr__(self, name, values)
+        operations = set(self.allowed_operations)
+        if not operations or not operations <= {"update", "upsert"}:
+            raise ValueError(
+                "write scope requires explicit update and/or upsert operations"
+            )
+        if not self.key_columns or not self.allowed_update_columns:
+            raise ValueError("write scope requires exact keys and update columns")
+        if set(self.key_columns) & set(self.allowed_update_columns):
+            raise ValueError("write scope cannot authorize changing conflict keys")
+        if "upsert" not in operations and (
+            self.allowed_insert_columns or self.generated_identity_columns
         ):
             raise ValueError(
-                "update scope resource_id must be a canonical catalog resource id"
+                "update permission cannot authorize insertion or identity generation"
             )
-        columns = _canonical_permission_texts(
-            self.allowed_assignment_columns,
-            "update scope allowed_assignment_columns",
-            maximum_items=_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS,
-            maximum_characters=256,
-        )
-        if not columns:
-            raise ValueError("update scope allowed_assignment_columns cannot be empty")
-        if (
-            not isinstance(self.authorization_fingerprint, str)
-            or _SOURCE_PERMISSION_HASH.fullmatch(self.authorization_fingerprint) is None
+        if "upsert" in operations and not set(self.key_columns) <= set(
+            self.allowed_insert_columns
+        ):
+            raise ValueError("upsert permission must admit every explicit conflict key")
+        if set(self.generated_identity_columns) & (
+            set(self.allowed_insert_columns)
+            | set(self.allowed_update_columns)
+            | set(self.key_columns)
         ):
             raise ValueError(
-                "update scope authorization_fingerprint must be a sha256 hash"
+                "generated identities must be omitted and outside conflict keys"
             )
-        object.__setattr__(self, "allowed_assignment_columns", columns)
+        if (
+            not isinstance(self.max_rows, int)
+            or isinstance(self.max_rows, bool)
+            or not 1 <= self.max_rows <= 10_000
+        ):
+            raise ValueError("write scope max_rows must be between 1 and 10000")
+
+    def constraints(self) -> dict[str, object]:
+        """Canonical authority shared by permission review, codecs and grants."""
+        return {
+            "resource_revision": self.resource_revision,
+            "allowed_operations": self.allowed_operations,
+            "allowed_insert_columns": self.allowed_insert_columns,
+            "allowed_update_columns": self.allowed_update_columns,
+            "key_columns": self.key_columns,
+            "generated_identity_columns": self.generated_identity_columns,
+            "max_rows": self.max_rows,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +209,7 @@ class SourcePermissionResource:
     display_name: str
     resource_kind: str
     eligible_assignment_columns: tuple[str, ...] = ()
+    key_columns: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -174,9 +230,19 @@ class SourcePermissionResource:
             maximum_characters=256,
         )
         object.__setattr__(self, "eligible_assignment_columns", columns)
+        object.__setattr__(
+            self,
+            "key_columns",
+            _canonical_permission_texts(
+                self.key_columns,
+                "key columns",
+                maximum_items=512,
+                maximum_characters=256,
+            ),
+        )
 
     @property
-    def postgresql_update_eligible(self) -> bool:
+    def relational_update_eligible(self) -> bool:
         return bool(self.eligible_assignment_columns)
 
     @property
@@ -191,15 +257,15 @@ class SourcePermissionState:
     """One exact read/update-scope state returned by the control plane."""
 
     read_scope: SourceReadScope
-    postgresql_update_scopes: tuple[PostgreSQLUpdateScope, ...]
+    relational_write_scopes: tuple[RelationalWriteScope, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.read_scope, SourceReadScope):
             raise TypeError("permission state read_scope must be SourceReadScope")
-        scopes = tuple(self.postgresql_update_scopes)
-        if any(not isinstance(scope, PostgreSQLUpdateScope) for scope in scopes):
+        scopes = tuple(self.relational_write_scopes)
+        if any(not isinstance(scope, RelationalWriteScope) for scope in scopes):
             raise TypeError(
-                "permission state update scopes must be PostgreSQLUpdateScope records"
+                "permission state update scopes must be RelationalWriteScope records"
             )
         if len({scope.resource_id for scope in scopes}) != len(scopes):
             raise ValueError("permission state update scopes cannot repeat resources")
@@ -211,7 +277,7 @@ class SourcePermissionState:
             raise ValueError("permission state scopes must share one owner")
         object.__setattr__(
             self,
-            "postgresql_update_scopes",
+            "relational_write_scopes",
             tuple(sorted(scopes, key=lambda scope: scope.resource_id)),
         )
 
@@ -223,8 +289,8 @@ class SourcePermissionSummary:
     source_display_name: str
     read_mode: SourceReadMode
     selected_read_resource_count: int
-    postgresql_update_table_count: int
-    postgresql_update_table_examples: tuple[str, ...]
+    relational_write_table_count: int
+    relational_write_table_examples: tuple[str, ...]
     automatic_read_addition_examples: tuple[str, ...]
     dependent_update_revocation_examples: tuple[str, ...]
     postgresql_privilege_status: str = "unknown"
@@ -236,12 +302,12 @@ class SourcePermissionSummary:
             raise TypeError("permission summary read_mode must be SourceReadMode")
         for value, name in (
             (self.selected_read_resource_count, "selected read resource count"),
-            (self.postgresql_update_table_count, "update table count"),
+            (self.relational_write_table_count, "update table count"),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"permission summary {name} must be non-negative")
         for values, name in (
-            (self.postgresql_update_table_examples, "update table examples"),
+            (self.relational_write_table_examples, "update table examples"),
             (self.automatic_read_addition_examples, "automatic read examples"),
             (
                 self.dependent_update_revocation_examples,
@@ -257,7 +323,7 @@ class SourcePermissionSummary:
             object.__setattr__(
                 self,
                 {
-                    "update table examples": "postgresql_update_table_examples",
+                    "update table examples": "relational_write_table_examples",
                     "automatic read examples": "automatic_read_addition_examples",
                     "dependent revocation examples": (
                         "dependent_update_revocation_examples"
@@ -343,7 +409,7 @@ class SourcePermissionsPreview:
     before: SourcePermissionState
     after: SourcePermissionState
     automatic_read_additions: tuple[str, ...]
-    dependent_update_revocations: tuple[str, ...]
+    dependent_write_revocations: tuple[str, ...]
     summary: SourcePermissionSummary
     confirmation_fingerprint: str
 
@@ -365,7 +431,7 @@ class SourcePermissionsPreview:
                 raise ValueError(f"permission preview {name} belongs elsewhere")
         for values, name in (
             (self.automatic_read_additions, "automatic read additions"),
-            (self.dependent_update_revocations, "dependent update revocations"),
+            (self.dependent_write_revocations, "dependent update revocations"),
         ):
             normalized = _canonical_permission_texts(
                 values,
@@ -383,7 +449,7 @@ class SourcePermissionsPreview:
                 (
                     "automatic_read_additions"
                     if name == "automatic read additions"
-                    else "dependent_update_revocations"
+                    else "dependent_write_revocations"
                 ),
                 normalized,
             )
@@ -400,21 +466,14 @@ class SourcePermissionsPreview:
             )
 
 
-def postgresql_update_authorization_fingerprint(
+def relational_write_authorization_fingerprint(
     *,
     source: SourceRegistration,
     resource: CatalogResource,
     facet: CatalogFacet,
-    allowed_assignment_columns: Iterable[str],
+    scope: RelationalWriteScope,
 ) -> str:
-    """Bind only durable facts that determine one update authorization's meaning."""
-
-    if not isinstance(source, SourceRegistration):
-        raise TypeError("authorization source must be a SourceRegistration")
-    if not isinstance(resource, CatalogResource):
-        raise TypeError("authorization resource must be a CatalogResource")
-    if not isinstance(facet, CatalogFacet):
-        raise TypeError("authorization facet must be a CatalogFacet")
+    """Bind exact current structural and permission facts, excluding freshness."""
     if (
         source.adapter_id != "postgresql"
         or not source.active
@@ -423,91 +482,68 @@ def postgresql_update_authorization_fingerprint(
         or resource.kind is not ResourceKind.TABLE
         or facet.resource_id != resource.id
         or facet.kind is not FacetKind.TABULAR
+        or scope.agent_id != source.agent_id
+        or scope.source_id != source.id
+        or scope.resource_id != resource.id
+        or scope.resource_revision != resource.current_revision
     ):
         raise ValueError(
-            "authorization requires one current table from an active PostgreSQL source"
+            "write authorization requires exact current owned table structure"
         )
-    allowed = _canonical_permission_texts(
-        allowed_assignment_columns,
-        "authorization allowed_assignment_columns",
-        maximum_items=_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS,
-        maximum_characters=256,
-    )
-    if not allowed:
-        raise ValueError("authorization allowed_assignment_columns cannot be empty")
-    raw_columns = facet.payload.get("columns")
-    if not isinstance(raw_columns, tuple):
-        raise ValueError("authorization requires exact tabular column facts")
-    columns: dict[str, Mapping[str, object]] = {}
-    for raw_column in raw_columns:
-        if not isinstance(raw_column, Mapping):
-            raise ValueError("authorization tabular column facts are invalid")
-        name = raw_column.get("name")
-        if not isinstance(name, str) or name in columns:
-            raise ValueError("authorization tabular column identity is invalid")
-        columns[name] = raw_column
-
-    primary_key_columns: list[tuple[int, str]] = []
-    for name, column in columns.items():
-        ordinal = column.get("primary_key_ordinal")
-        if ordinal is None:
-            continue
-        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 1:
-            raise ValueError("authorization primary-key structure is invalid")
-        primary_key_columns.append((ordinal, name))
-    primary_key_columns.sort()
-    if [ordinal for ordinal, _ in primary_key_columns] != list(
-        range(1, len(primary_key_columns) + 1)
-    ):
-        raise ValueError("authorization primary-key structure is invalid")
-
-    allowed_facts: list[dict[str, object]] = []
-    primary_names = {name for _, name in primary_key_columns}
-    for name in allowed:
-        selected_column = columns.get(name)
-        if selected_column is None:
-            raise ValueError("authorization references an unknown assignment column")
-        native_type = selected_column.get("native_type")
-        namespace = selected_column.get("native_type_namespace")
-        native_name = selected_column.get("native_type_name")
-        updatable = selected_column.get("updatable")
-        identity = selected_column.get("identity")
-        generated = selected_column.get("generated")
-        if (
-            not isinstance(native_type, str)
-            or not isinstance(updatable, bool)
-            or not isinstance(identity, bool)
-            or not isinstance(generated, bool)
-            or (namespace is None) is not (native_name is None)
-            or (namespace is not None and not isinstance(namespace, str))
-            or (native_name is not None and not isinstance(native_name, str))
-        ):
-            raise ValueError("authorization assignment-column facts are invalid")
-        if name in primary_names or not updatable or identity or generated:
-            raise ValueError("authorization assignment column is not eligible")
-        allowed_facts.append(
-            {
-                "generated": generated,
-                "identity": identity,
-                "name": name,
-                "native_type": native_type,
-                "native_type_name": native_name,
-                "native_type_namespace": namespace,
-                "updatable": updatable,
-            }
-        )
-
-    material = {
-        "adapter_id": source.adapter_id,
-        "allowed_assignment_columns": allowed_facts,
-        "primary_key": tuple(
-            {"name": name, "ordinal": ordinal} for ordinal, name in primary_key_columns
-        ),
-        "resource_id": resource.id,
-        "resource_kind": resource.kind.value,
-        "source_id": source.id,
+    tabular = TabularFacet.from_payload(facet.payload)
+    columns = {column.name: column for column in tabular.columns}
+    primary = {
+        column.name
+        for column in tabular.columns
+        if column.primary_key_ordinal is not None
     }
-    return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
+    for name in scope.allowed_update_columns:
+        column = columns.get(name)
+        if (
+            column is None
+            or not column.updatable
+            or column.identity
+            or column.generated
+            or name in primary
+        ):
+            raise ValueError("authorization update column is not eligible")
+    if not set(scope.allowed_insert_columns) <= set(columns) or not set(
+        scope.key_columns
+    ) <= set(columns):
+        raise ValueError("authorization column is not eligible")
+    if any(not columns[name].identity for name in scope.generated_identity_columns):
+        raise ValueError("authorization generated identity is not eligible")
+    if "update" in scope.allowed_operations and set(scope.key_columns) != primary:
+        raise ValueError("update authority requires the exact primary key")
+    if "upsert" in scope.allowed_operations:
+        if set(scope.key_columns) not in [
+            set(index.columns)
+            for index in tabular.indexes
+            if index.unique
+            and index.predicate is None
+            and index.write_conflict_supported
+        ]:
+            raise ValueError("upsert authority requires a supported conflict key")
+        if any(
+            columns[name].identity or columns[name].generated
+            for name in scope.allowed_insert_columns
+        ):
+            raise ValueError("explicit generated columns are not eligible")
+    return (
+        "sha256:"
+        + sha256(
+            canonical_json(
+                {
+                    "agent_id": source.agent_id,
+                    "adapter_id": source.adapter_id,
+                    "source_id": source.id,
+                    "resource_id": resource.id,
+                    "structure": tabular.structural_payload(),
+                    "authority": scope.constraints(),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
 class EffectReceiptConflictError(RuntimeError):
@@ -797,7 +833,7 @@ __all__ = [
     "EffectOutcome",
     "EffectReceipt",
     "EffectReceiptConflictError",
-    "PostgreSQLUpdateScope",
+    "RelationalWriteScope",
     "SourcePermissionResource",
     "SourcePermissionState",
     "SourcePermissionStateError",
@@ -809,6 +845,6 @@ __all__ = [
     "effect_receipt_aware",
     "effect_receipt_id",
     "effect_receipt_text",
-    "postgresql_update_authorization_fingerprint",
+    "relational_write_authorization_fingerprint",
     "validate_effect_receipt_id",
 ]

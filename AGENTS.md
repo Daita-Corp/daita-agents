@@ -23,7 +23,7 @@ explain intent, but they do not define current behavior.
 ## Product architecture
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
-explicitly enabled PostgreSQL update capability. It uses one direct loop:
+explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL. It uses one direct loop:
 
 ```text
 user message -> model -> zero or more tool calls -> ordered tool results
@@ -261,17 +261,30 @@ SQL validation belongs in `daita.domains.data.sql`; connector guardrails still
 apply during execution. Do not duplicate either mechanism in a generic policy
 layer.
 
-Data capabilities are reads except for the explicitly enabled structured
-PostgreSQL update. The update uses one plan for single-row and bulk selections
-with resource-scoped readiness, current admission rechecks, an exact target-set
-preview and fingerprint, once-only approval, transactional drift detection,
-exact affected-count validation, and a runtime-owned effect receipt. The adapter
-returns a code-owned transaction observation and never reserves or finalizes
-SQLite receipt state. Arbitrary SQL,
-inserts, deletes, DDL, and every other external data write are unsupported.
-Adding another data mutation requires an explicit design for validation,
-authorization, transactionality, idempotency, uncertain outcomes, and
-recovery; approval alone is insufficient.
+Data capabilities are reads except for explicitly admitted `data_update_rows` and
+`data_upsert_rows`, initially backed by PostgreSQL. Their read-only counterparts are
+`data_preview_update_rows` and `data_preview_upsert_rows`. Execution requires an
+authenticated current-run preview and matching intent. Update retains its exact
+selection, target-count, drift, rollback and receipt safeguards.
+
+`RelationalWriteScope` binds exact structural revision, explicit update/upsert
+operations, keys, insert/update columns, admitted identity generation and row limits.
+Update permission never implies insertion authority. Upsert uses one bounded uniform
+scalar batch, supported non-null unique-key equality, explicit omitted/null semantics,
+and narrowly admitted identity generation. Its transaction acquires EXCLUSIVE on the
+exact table before the authoritative scan, rebuilds the preview, rejects drift,
+inserts missing rows, updates changed rows, skips unchanged rows, and verifies exact
+counts summing to the input count. Mismatches roll back the entire batch. Sequence
+allocations may leave gaps after rollback; receipts describe table-row effects.
+
+The data domain normalizes native standing grants and permits at most one native
+write capability per routine, with one invocation per occurrence and exact ceilings.
+An unchanged batch consumes its reservation and produces verified zero-mutation
+evidence. Full request sensitivity must fit the current target classification.
+Research lineage remains model-derived claims, distinct from transaction facts.
+Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
+insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
+Native implementation acceptance is not production release approval.
 
 ## Workspace files and artifacts
 
@@ -368,8 +381,9 @@ resource, MCP binding, capability, model-route, sensitivity, outcome,
 distribution, budget, expiry, and optional retained skill-content contracts.
 Raw prompt text never determines whether a time slot is due.
 
-Scheduled execution permits only statically declared `automation_direct`
-capabilities with `OperationalEffect.NONE` and read/none data access. It can
+Scheduled execution permits statically declared `automation_direct` capabilities.
+Native effects additionally require exact data-owned grants and runtime receipts;
+effect-free operations retain read/none access. It can
 create only these artifacts:
 
 - `artifact.create_document`;
@@ -380,7 +394,8 @@ create only these artifacts:
 an exact earlier successful result in the same run. It performs no source I/O
 or format projection.
 
-Scheduled runs cannot update data, start or cancel jobs, manage routines, call
+Scheduled runs can perform the one explicitly granted native update/upsert. They
+cannot start or cancel jobs, manage routines, call
 remote write tools, publish local files, deliver externally, run shell
 commands, or submit workflows or execution graphs. An exact resource-revision
 precheck may complete an unchanged occurrence without a model call.
@@ -443,8 +458,8 @@ changes use immutable migration IDs/checksums and owner-local migration files.
 Migrations validate a verified copy under the agent-home writer boundary and
 replace the active database only after complete target validation.
 
-Source read authority exists only in `source_read_scopes`. PostgreSQL update
-authority exists only in `postgresql_update_scopes`. Connection JSON never
+Source read authority exists only in `source_read_scopes`. Native relational write
+authority exists only in `relational_write_scopes`. Connection JSON never
 owns either permission. Reconstruction fails closed, refresh preserves exact
 scopes, and detach revokes both scope families atomically.
 

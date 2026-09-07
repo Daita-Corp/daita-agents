@@ -163,7 +163,7 @@ async def test_foreground_run_serializes_owned_host_mutations_but_not_inspection
             source_id=source.id,
             read_mode=SourceReadMode.NONE,
             read_resource_ids=(),
-            postgresql_update_scopes={},
+            relational_write_scopes={},
         )
 
     run = asyncio.create_task(

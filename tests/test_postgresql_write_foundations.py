@@ -20,10 +20,10 @@ from daita.catalog.models import (
     TabularFacet,
 )
 from daita.domains.data.capabilities import (
-    POSTGRESQL_UPDATE_CAPABILITY_ID,
-    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-    postgresql_update_capability_declarations,
-    postgresql_update_preview_capability_declarations,
+    RELATIONAL_UPDATE_CAPABILITY_ID,
+    RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
+    relational_update_capability_declarations,
+    relational_update_preview_capability_declarations,
 )
 from daita.context import _system_prompt
 from daita.hosting import embedded as embedded_module
@@ -34,8 +34,8 @@ NOW = datetime(2026, 8, 9, 12, 0, tzinfo=UTC)
 
 
 def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> None:
-    preview = postgresql_update_preview_capability_declarations()
-    update = postgresql_update_capability_declarations()
+    preview = relational_update_preview_capability_declarations()
+    update = relational_update_capability_declarations()
 
     preview_description = preview.tool_views[0].description
     update_description = update.tool_views[0].description
@@ -48,8 +48,8 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
         {},
         capability_ids=frozenset(
             {
-                POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-                POSTGRESQL_UPDATE_CAPABILITY_ID,
+                RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
+                RELATIONAL_UPDATE_CAPABILITY_ID,
             }
         ),
         tool_manifest=(),
@@ -63,7 +63,7 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
         final=False,
     )
     assert "a successful preview is not a terminal answer" in prompt
-    assert "in the same run, call data_update_postgresql" in prompt
+    assert "in the same run, call data_update_rows" in prompt
     assert "is what requests runtime approval and opens the approval card" in prompt
     assert "preview alone does neither" in prompt
     assert "Never claim that an approval card is displayed" in prompt
@@ -146,7 +146,7 @@ async def test_default_read_scope_round_trips_through_agent_reopen(tmp_path):
                 "SELECT source_id FROM source_read_scopes"
             ).fetchone() == (registration.id,)
             assert connection.execute(
-                "SELECT COUNT(*) FROM postgresql_update_scopes"
+                "SELECT COUNT(*) FROM relational_write_scopes"
             ).fetchone() == (0,)
     finally:
         await reopened.close()
@@ -170,7 +170,7 @@ async def test_detach_revokes_scopes_and_storage_reattachment_starts_read_only(
             "SELECT COUNT(*) FROM source_read_scopes"
         ).fetchone() == (0,)
         assert connection.execute(
-            "SELECT COUNT(*) FROM postgresql_update_scopes"
+            "SELECT COUNT(*) FROM relational_write_scopes"
         ).fetchone() == (0,)
 
     sync = CatalogSync(
@@ -196,7 +196,7 @@ async def test_detach_revokes_scopes_and_storage_reattachment_starts_read_only(
                 "SELECT COUNT(*) FROM source_read_scopes"
             ).fetchone() == (1,)
             assert connection.execute(
-                "SELECT COUNT(*) FROM postgresql_update_scopes"
+                "SELECT COUNT(*) FROM relational_write_scopes"
             ).fetchone() == (0,)
     finally:
         await agent.close()
@@ -284,7 +284,7 @@ async def test_postgresql_refresh_preserves_read_scope_outside_connection_identi
         )
         with sqlite3.connect(agent.home / "state.db") as connection:
             assert connection.execute(
-                "SELECT COUNT(*) FROM postgresql_update_scopes"
+                "SELECT COUNT(*) FROM relational_write_scopes"
             ).fetchone() == (0,)
         assert (
             await agent._embedded._store.load_source_read_scope(

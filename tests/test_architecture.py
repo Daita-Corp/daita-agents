@@ -410,7 +410,7 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["file_search"] == "data"
         assert resolved["file_read"] == "data"
         assert resolved["file_query"] == "data"
-        assert resolved["data_update_postgresql"] == "data"
+        assert resolved["data_update_rows"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
         assert resolved["semantic_list"] == "semantics"
@@ -529,7 +529,8 @@ def test_public_surface_is_focused():
         "OutcomeReference",
         "OutcomeState",
         "PostgreSQLSource",
-        "PostgreSQLUpdateReadiness",
+        "RelationalUpdateReadiness",
+        "RelationalWriteScope",
         "RetryPolicy",
         "ReportingMode",
         "ResidentReady",
@@ -766,7 +767,7 @@ def test_survivor_docs_and_examples_describe_only_the_mvp():
     for required in (
         "bounded projection of completed runs",
         "Data capabilities are reads except",
-        "structured PostgreSQL update",
+        "native relational update/upsert",
         "foreground-authorized content",
         "Approval is once-only, in-process",
         "does not create durable events, telemetry",
@@ -1066,7 +1067,8 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
         assert effect_tools == {
             "artifact_save_local",
             "artifact_set_export_location",
-            "data_update_postgresql",
+            "data_update_rows",
+            "data_upsert_rows",
             "job_cancel",
             "memory_set",
             "routine_control",
@@ -1082,7 +1084,7 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
         await agent.close()
 
 
-async def test_database_write_phase_three_registers_only_the_postgresql_update_slice(
+async def test_database_write_phase_three_registers_only_the_relational_update_slice(
     tmp_path,
 ):
     agent = await daita.Agent.create(
@@ -1095,10 +1097,10 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         capability_ids = {
             registry.resolve_tool(name)[1].id for name in registry.tool_names
         }
-        preview_tool = "data_preview_postgresql_update"
-        preview_capability = "data.postgresql.update_impact"
-        update_tool = "data_update_postgresql"
-        update_capability = "data.postgresql.update"
+        preview_tool = "data_preview_update_rows"
+        preview_capability = "data.preview_update_rows"
+        update_tool = "data_update_rows"
+        update_capability = "data.update_rows"
         forbidden_tools = {
             "data_preview_sqlite_update",
             "data_update_sqlite",
@@ -1131,7 +1133,7 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         for dormant_name in forbidden_tools | forbidden_capabilities:
             assert f'"{dormant_name}"' not in package_text
             assert f"'{dormant_name}'" not in package_text
-        assert "class PostgreSQLUpdateExecutor" in package_text
+        assert "class RelationalUpdateExecutor" in package_text
         write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
             encoding="utf-8"
         )
@@ -1181,7 +1183,7 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
     )
     backend_methods = _class_methods(
         PACKAGE / "adapters" / "postgresql_write.py",
-        "PostgreSQLUpdatePreviewBackend",
+        "PostgreSQLWriteBackend",
     )
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
@@ -1192,16 +1194,16 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
     tui_commands = (PACKAGE / "tui" / "commands.py").read_text(encoding="utf-8")
     tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
 
-    assert "postgresql_update_readiness" in agent_methods
-    assert "postgresql_update_readiness" in embedded_methods
-    assert "postgresql_update_readiness" in backend_methods
-    assert _class_owners("PostgreSQLUpdateReadiness") == {
+    assert "relational_update_readiness" in agent_methods
+    assert "relational_update_readiness" in embedded_methods
+    assert "relational_update_readiness" in backend_methods
+    assert _class_owners("RelationalUpdateReadiness") == {
         "adapters/postgresql_write.py"
     }
-    assert "postgresql_update_readiness" not in controller
-    assert "postgresql_update_readiness" not in context
-    assert ".postgresql_update_readiness(" in cli
-    assert ".postgresql_update_readiness(" not in terminal
+    assert "relational_update_readiness" not in controller
+    assert "relational_update_readiness" not in context
+    assert ".relational_update_readiness(" in cli
+    assert ".relational_update_readiness(" not in terminal
     assert "inspect_source_permissions" in tui_controller
     assert "preview_source_permissions" in tui_controller
     assert "apply_source_permissions" in tui_controller
@@ -2017,7 +2019,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "mcp_server_bindings",
             "messages",
             "metadata",
-            "postgresql_update_scopes",
+            "relational_write_scopes",
             "runs",
             "routine_occurrences",
             "scheduled_routines",
@@ -2066,7 +2068,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
             "mcp_server_bindings": ("agent_id", "binding_id", "data"),
-            "postgresql_update_scopes": (
+            "relational_write_scopes": (
                 "agent_id",
                 "source_id",
                 "resource_id",
@@ -2339,3 +2341,58 @@ def test_phase_three_xlsx_dependencies_are_scoped_and_integrations_remain_lazy()
     assert "xlsxwriter" not in top_level_imports
     assert "ExactXlsxRenderer" not in _python_text(PACKAGE / "loop")
     assert "ArtifactRendererRegistry" not in artifact_text
+
+
+def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
+    from dataclasses import fields
+    from daita.capabilities import AutomationEligibility
+    from daita.domains.data.capabilities import (
+        relational_update_preview_capability_declarations,
+        relational_update_capability_declarations,
+        relational_upsert_capability_declarations,
+    )
+
+    declarations = (
+        relational_update_preview_capability_declarations(),
+        relational_update_capability_declarations(),
+        relational_upsert_capability_declarations(),
+    )
+    assert {view.name for bundle in declarations for view in bundle.tool_views} == {
+        "data_preview_update_rows",
+        "data_update_rows",
+        "data_preview_upsert_rows",
+        "data_upsert_rows",
+    }
+    for bundle in declarations:
+        assert bundle.domain_owner_id == "data"
+        for capability in bundle.capabilities:
+            assert "postgresql" not in capability.id
+            assert (
+                capability.automation_eligibility
+                is AutomationEligibility.AUTOMATION_DIRECT
+            )
+            if capability.access_mode is AccessMode.WRITE:
+                assert capability.operational_effect is OperationalEffect.MUTATE_DATA
+                assert capability.automation_grant_policy is not None
+                assert (
+                    capability.automation_grant_policy.constraints_kind
+                    == "data.relational_write"
+                )
+                assert capability.effect_receipt_policy is not None
+            else:
+                assert capability.operational_effect is OperationalEffect.NONE
+    assert {field.name for field in fields(daita.RelationalWriteScope)} == {
+        "agent_id",
+        "source_id",
+        "resource_id",
+        "resource_revision",
+        "allowed_operations",
+        "allowed_insert_columns",
+        "allowed_update_columns",
+        "key_columns",
+        "generated_identity_columns",
+        "max_rows",
+        "authorization_fingerprint",
+    }
+    assert not hasattr(daita, "PostgreSQLUpdateScope")
+    assert not (PACKAGE / "domains/data/sql/postgresql_update.py").exists()

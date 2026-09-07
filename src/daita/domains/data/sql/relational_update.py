@@ -13,8 +13,8 @@ from ...._json import FrozenJsonValue, canonical_json, freeze_json, thaw_json
 from ....capabilities import render_approval_arguments
 from .contracts import ResourceSchema, SqlValidationIssue
 
-POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES = 64 * 1_024
-_POSTGRESQL_UPDATE_CAPABILITY_ID = "data.postgresql.update_impact"
+RELATIONAL_UPDATE_MAX_CANONICAL_BYTES = 64 * 1_024
+_RELATIONAL_UPDATE_CAPABILITY_ID = "data.preview_update_rows"
 _CANONICAL_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
 _CANONICAL_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -35,7 +35,7 @@ _FILTER_OPERATORS = frozenset(
 _ORDERED_FILTER_OPERATORS = frozenset({"lt", "lte", "gt", "gte"})
 _SET_FILTER_OPERATORS = frozenset({"in", "not_in"})
 _NULL_FILTER_OPERATORS = frozenset({"is_null", "is_not_null"})
-_POSTGRESQL_UPDATE_TYPES = frozenset(
+_RELATIONAL_UPDATE_TYPES = frozenset(
     {
         "bool",
         "int2",
@@ -58,7 +58,7 @@ _POSTGRESQL_UPDATE_TYPES = frozenset(
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateCell:
+class RelationalUpdateCell:
     """One catalog column and literal assignment value."""
 
     column: str
@@ -69,7 +69,7 @@ class PostgreSQLUpdateCell:
         object.__setattr__(self, "value", freeze_json(self.value))
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> PostgreSQLUpdateCell:
+    def from_mapping(cls, value: Mapping[str, object]) -> RelationalUpdateCell:
         if not isinstance(value, Mapping) or set(value) != {"column", "value"}:
             raise ValueError("update cells require exactly column and value")
         column = value.get("column")
@@ -82,7 +82,7 @@ class PostgreSQLUpdateCell:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateFilter:
+class RelationalUpdateFilter:
     """One typed predicate in an AND-combined structured target selection."""
 
     column: str
@@ -96,7 +96,7 @@ class PostgreSQLUpdateFilter:
         object.__setattr__(self, "value", freeze_json(self.value))
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> PostgreSQLUpdateFilter:
+    def from_mapping(cls, value: Mapping[str, object]) -> RelationalUpdateFilter:
         if not isinstance(value, Mapping) or set(value) != {
             "column",
             "operator",
@@ -120,13 +120,13 @@ class PostgreSQLUpdateFilter:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateIntent:
+class RelationalUpdateIntent:
     """A cardinality-independent, structured PostgreSQL update proposal."""
 
     source_id: str
     resource_id: str
-    where: tuple[PostgreSQLUpdateFilter, ...]
-    assignments: tuple[PostgreSQLUpdateCell, ...]
+    where: tuple[RelationalUpdateFilter, ...]
+    assignments: tuple[RelationalUpdateCell, ...]
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -138,18 +138,18 @@ class PostgreSQLUpdateIntent:
         where = tuple(self.where)
         assignments = tuple(self.assignments)
         if not where or any(
-            not isinstance(item, PostgreSQLUpdateFilter) for item in where
+            not isinstance(item, RelationalUpdateFilter) for item in where
         ):
             raise TypeError("update where must contain at least one update filter")
         if not assignments or any(
-            not isinstance(item, PostgreSQLUpdateCell) for item in assignments
+            not isinstance(item, RelationalUpdateCell) for item in assignments
         ):
             raise TypeError("update assignments must contain update cells")
         object.__setattr__(self, "where", where)
         object.__setattr__(self, "assignments", assignments)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> PostgreSQLUpdateIntent:
+    def from_mapping(cls, value: Mapping[str, object]) -> RelationalUpdateIntent:
         if not isinstance(value, Mapping):
             raise TypeError("PostgreSQL update intent must be an object")
         if set(value) != {"source_id", "resource_id", "where", "assignments"}:
@@ -170,9 +170,9 @@ class PostgreSQLUpdateIntent:
         return cls(
             source_id=source_id,
             resource_id=resource_id,
-            where=tuple(PostgreSQLUpdateFilter.from_mapping(item) for item in where),
+            where=tuple(RelationalUpdateFilter.from_mapping(item) for item in where),
             assignments=tuple(
-                PostgreSQLUpdateCell.from_mapping(item) for item in assignments
+                RelationalUpdateCell.from_mapping(item) for item in assignments
             ),
         )
 
@@ -186,16 +186,16 @@ class PostgreSQLUpdateIntent:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateCommand:
+class RelationalUpdateCommand:
     """The exact approved plan and its previewed target cardinality."""
 
-    intent: PostgreSQLUpdateIntent
+    intent: RelationalUpdateIntent
     preview_fingerprint: str
     expected_affected_rows: int
 
     def __post_init__(self) -> None:
-        if not isinstance(self.intent, PostgreSQLUpdateIntent):
-            raise TypeError("update command intent must be PostgreSQLUpdateIntent")
+        if not isinstance(self.intent, RelationalUpdateIntent):
+            raise TypeError("update command intent must be RelationalUpdateIntent")
         _require_sha256(self.preview_fingerprint, "preview_fingerprint")
         if (
             not isinstance(self.expected_affected_rows, int)
@@ -205,7 +205,7 @@ class PostgreSQLUpdateCommand:
             raise ValueError("expected_affected_rows must be a positive integer")
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> PostgreSQLUpdateCommand:
+    def from_mapping(cls, value: Mapping[str, object]) -> RelationalUpdateCommand:
         if not isinstance(value, Mapping):
             raise TypeError("PostgreSQL update command must be an object")
         expected = {
@@ -226,7 +226,7 @@ class PostgreSQLUpdateCommand:
         if not isinstance(preview_fingerprint, str):
             raise TypeError("preview_fingerprint must be text")
         return cls(
-            intent=PostgreSQLUpdateIntent.from_mapping(
+            intent=RelationalUpdateIntent.from_mapping(
                 {
                     "source_id": value.get("source_id"),
                     "resource_id": value.get("resource_id"),
@@ -247,7 +247,7 @@ class PostgreSQLUpdateCommand:
 
 
 @dataclass(frozen=True, slots=True)
-class ValidatedPostgreSQLUpdate:
+class ValidatedRelationalUpdate:
     """A catalog-bound update plan with a structured target selection."""
 
     source_id: str
@@ -258,8 +258,8 @@ class ValidatedPostgreSQLUpdate:
     source_revision: str
     resource_revision: str
     primary_key_columns: tuple[str, ...]
-    where: tuple[PostgreSQLUpdateFilter, ...]
-    assignments: tuple[PostgreSQLUpdateCell, ...]
+    where: tuple[RelationalUpdateFilter, ...]
+    assignments: tuple[RelationalUpdateCell, ...]
     column_types: tuple[tuple[str, str, str], ...]
     intent_sha256: str
 
@@ -311,7 +311,7 @@ class ValidatedPostgreSQLUpdate:
 
     def intent_payload(self) -> dict[str, object]:
         return {
-            "capability_id": _POSTGRESQL_UPDATE_CAPABILITY_ID,
+            "capability_id": _RELATIONAL_UPDATE_CAPABILITY_ID,
             "source_id": self.source_id,
             "resource_id": self.resource_id,
             "where": tuple(item.to_payload() for item in self.where),
@@ -320,9 +320,9 @@ class ValidatedPostgreSQLUpdate:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateValidationResult:
+class RelationalUpdateValidationResult:
     valid: bool
-    validated: ValidatedPostgreSQLUpdate | None
+    validated: ValidatedRelationalUpdate | None
     issues: tuple[SqlValidationIssue, ...]
 
     def __post_init__(self) -> None:
@@ -337,7 +337,7 @@ class PostgreSQLUpdateValidationResult:
 
 
 @dataclass(frozen=True, slots=True)
-class ValidatedPostgreSQLUpdateScope:
+class ValidatedRelationalWriteScope:
     """A value-free table and assignment-column readiness scope."""
 
     source_id: str
@@ -373,9 +373,9 @@ class ValidatedPostgreSQLUpdateScope:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateScopeValidationResult:
+class RelationalWriteScopeValidationResult:
     valid: bool
-    validated: ValidatedPostgreSQLUpdateScope | None
+    validated: ValidatedRelationalWriteScope | None
     issues: tuple[SqlValidationIssue, ...]
 
     def __post_init__(self) -> None:
@@ -390,7 +390,7 @@ class PostgreSQLUpdateScopeValidationResult:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateStatement:
+class RelationalUpdateStatement:
     sql: str
     parameters: tuple[object, ...]
     where_sql: str
@@ -406,13 +406,13 @@ class PostgreSQLUpdateStatement:
         object.__setattr__(self, "where_parameters", tuple(self.where_parameters))
 
 
-def validate_postgresql_update_scope(
+def validate_relational_write_scope(
     source_id: str,
     resource_id: str,
     assignment_columns: tuple[str, ...],
     *,
     resources: Iterable[ResourceSchema],
-) -> PostgreSQLUpdateScopeValidationResult:
+) -> RelationalWriteScopeValidationResult:
     """Resolve one resource/column update-readiness scope from catalog truth."""
 
     if not isinstance(source_id, str) or not isinstance(resource_id, str):
@@ -439,9 +439,9 @@ def validate_postgresql_update_scope(
         return _invalid_scope(*validation_issue)
     schema_name, relation_name = _qualified_identity(resource)
     order = {column: index for index, column in enumerate(resource.columns)}
-    return PostgreSQLUpdateScopeValidationResult(
+    return RelationalWriteScopeValidationResult(
         True,
-        ValidatedPostgreSQLUpdateScope(
+        ValidatedRelationalWriteScope(
             source_id=source_id,
             resource_id=resource_id,
             resource_name=f"{schema_name}.{relation_name}",
@@ -456,15 +456,15 @@ def validate_postgresql_update_scope(
     )
 
 
-def validate_postgresql_update_intent(
-    intent: PostgreSQLUpdateIntent,
+def validate_relational_update_intent(
+    intent: RelationalUpdateIntent,
     *,
     resources: Iterable[ResourceSchema],
-) -> PostgreSQLUpdateValidationResult:
+) -> RelationalUpdateValidationResult:
     """Resolve a structured single-row or bulk update against catalog truth."""
 
-    if not isinstance(intent, PostgreSQLUpdateIntent):
-        raise TypeError("intent must be PostgreSQLUpdateIntent")
+    if not isinstance(intent, RelationalUpdateIntent):
+        raise TypeError("intent must be RelationalUpdateIntent")
     resource, issue = _resolve_resource(intent.source_id, intent.resource_id, resources)
     if issue is not None or resource is None:
         return _invalid_update(*(issue or ("write_resource_not_writable", "")))
@@ -509,7 +509,7 @@ def validate_postgresql_update_intent(
             return _invalid_update(*issue)
     if (
         len(canonical_json(intent.to_payload()).encode("utf-8"))
-        > POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES
+        > RELATIONAL_UPDATE_MAX_CANONICAL_BYTES
     ):
         return _invalid_update(
             "write_plan_too_large",
@@ -529,7 +529,7 @@ def validate_postgresql_update_intent(
     order = {column: index for index, column in enumerate(resource.columns)}
     assignments = tuple(sorted(intent.assignments, key=lambda item: order[item.column]))
     payload = {
-        "capability_id": _POSTGRESQL_UPDATE_CAPABILITY_ID,
+        "capability_id": _RELATIONAL_UPDATE_CAPABILITY_ID,
         "source_id": intent.source_id,
         "resource_id": intent.resource_id,
         "where": tuple(
@@ -565,7 +565,7 @@ def validate_postgresql_update_intent(
             )
         )
     )
-    validated = ValidatedPostgreSQLUpdate(
+    validated = ValidatedRelationalUpdate(
         source_id=intent.source_id,
         resource_id=intent.resource_id,
         resource_name=f"{schema_name}.{relation_name}",
@@ -581,16 +581,16 @@ def validate_postgresql_update_intent(
         ),
         intent_sha256=_sha256_json(payload),
     )
-    return PostgreSQLUpdateValidationResult(True, validated, ())
+    return RelationalUpdateValidationResult(True, validated, ())
 
 
-def render_postgresql_update_statement(
-    validated: ValidatedPostgreSQLUpdate,
-) -> PostgreSQLUpdateStatement:
+def render_relational_update_statement(
+    validated: ValidatedRelationalUpdate,
+) -> RelationalUpdateStatement:
     """Render a parameterized UPDATE from catalog identifiers and typed predicates."""
 
-    if not isinstance(validated, ValidatedPostgreSQLUpdate):
-        raise TypeError("validated must be ValidatedPostgreSQLUpdate")
+    if not isinstance(validated, ValidatedRelationalUpdate):
+        raise TypeError("validated must be ValidatedRelationalUpdate")
     assignments = ", ".join(
         f"{_identifier(cell.column)} = ${index}"
         for index, cell in enumerate(validated.assignments, start=1)
@@ -611,7 +611,7 @@ def render_postgresql_update_statement(
         f"SET {assignments} WHERE {where_sql}"
     )
     shape = {
-        "operation": "postgresql_update",
+        "operation": "relational_update",
         "schema": validated.schema_name,
         "relation": validated.relation_name,
         "primary_key": validated.primary_key_columns,
@@ -624,7 +624,7 @@ def render_postgresql_update_statement(
     assignment_parameters = tuple(
         thaw_json(cell.value) for cell in validated.assignments
     )
-    return PostgreSQLUpdateStatement(
+    return RelationalUpdateStatement(
         sql=sql,
         parameters=(*assignment_parameters, *where_parameters),
         where_sql=where_sql,
@@ -689,7 +689,7 @@ def _resolve_resource(
     if any(
         nullable_by_column.get(column) is not False
         or type_by_column.get(column, (None, None))[0] != "pg_catalog"
-        or type_by_column.get(column, (None, None))[1] not in _POSTGRESQL_UPDATE_TYPES
+        or type_by_column.get(column, (None, None))[1] not in _RELATIONAL_UPDATE_TYPES
         for column in resource.primary_key_columns
     ):
         return None, (
@@ -733,7 +733,7 @@ def _assignment_scope_issue(
     if any(
         nullable_by_column.get(column) is None
         or type_by_column.get(column, (None, None))[0] != "pg_catalog"
-        or type_by_column.get(column, (None, None))[1] not in _POSTGRESQL_UPDATE_TYPES
+        or type_by_column.get(column, (None, None))[1] not in _RELATIONAL_UPDATE_TYPES
         for column in assignment_columns
     ):
         return (
@@ -744,12 +744,12 @@ def _assignment_scope_issue(
 
 
 def _filter_issue(
-    predicate: PostgreSQLUpdateFilter,
+    predicate: RelationalUpdateFilter,
     provenance: tuple[str, str],
     nullable_by_column: Mapping[str, bool],
 ) -> tuple[str, str] | None:
     namespace, type_name = provenance
-    if namespace != "pg_catalog" or type_name not in _POSTGRESQL_UPDATE_TYPES:
+    if namespace != "pg_catalog" or type_name not in _RELATIONAL_UPDATE_TYPES:
         return (
             "write_filter_invalid",
             "The target selection uses an unsupported PostgreSQL type.",
@@ -830,7 +830,7 @@ def _literal_issue(
         if allow_null and nullable_by_column[column] is True:
             return None
         return code, "The proposed null value is not valid for this operation."
-    if not _valid_postgresql_update_value(value, *provenance):
+    if not _valid_relational_update_value(value, *provenance):
         return (
             code,
             "The proposed literal is incompatible with the cataloged PostgreSQL type.",
@@ -839,7 +839,7 @@ def _literal_issue(
 
 
 def _render_where(
-    predicates: tuple[PostgreSQLUpdateFilter, ...],
+    predicates: tuple[RelationalUpdateFilter, ...],
     *,
     start_index: int,
 ) -> tuple[str, tuple[object, ...]]:
@@ -874,12 +874,12 @@ def _render_where(
     return " AND ".join(f"({clause})" for clause in clauses), tuple(parameters)
 
 
-def _valid_postgresql_update_value(
+def _valid_relational_update_value(
     value: FrozenJsonValue,
     namespace: str,
     type_name: str,
 ) -> bool:
-    if namespace != "pg_catalog" or type_name not in _POSTGRESQL_UPDATE_TYPES:
+    if namespace != "pg_catalog" or type_name not in _RELATIONAL_UPDATE_TYPES:
         return False
     if type_name == "bool":
         return isinstance(value, bool)
@@ -972,14 +972,14 @@ def _qualified_identity(resource: ResourceSchema) -> tuple[str, str]:
     return qualified[0], qualified[2]
 
 
-def _invalid_update(code: str, message: str) -> PostgreSQLUpdateValidationResult:
-    return PostgreSQLUpdateValidationResult(
+def _invalid_update(code: str, message: str) -> RelationalUpdateValidationResult:
+    return RelationalUpdateValidationResult(
         False, None, (SqlValidationIssue(code, message),)
     )
 
 
-def _invalid_scope(code: str, message: str) -> PostgreSQLUpdateScopeValidationResult:
-    return PostgreSQLUpdateScopeValidationResult(
+def _invalid_scope(code: str, message: str) -> RelationalWriteScopeValidationResult:
+    return RelationalWriteScopeValidationResult(
         False, None, (SqlValidationIssue(code, message),)
     )
 
@@ -1012,17 +1012,17 @@ def _require_sha256(value: str, name: str) -> None:
 
 
 __all__ = [
-    "POSTGRESQL_UPDATE_MAX_CANONICAL_BYTES",
-    "PostgreSQLUpdateCell",
-    "PostgreSQLUpdateCommand",
-    "PostgreSQLUpdateFilter",
-    "PostgreSQLUpdateIntent",
-    "PostgreSQLUpdateScopeValidationResult",
-    "PostgreSQLUpdateStatement",
-    "PostgreSQLUpdateValidationResult",
-    "ValidatedPostgreSQLUpdate",
-    "ValidatedPostgreSQLUpdateScope",
-    "render_postgresql_update_statement",
-    "validate_postgresql_update_intent",
-    "validate_postgresql_update_scope",
+    "RELATIONAL_UPDATE_MAX_CANONICAL_BYTES",
+    "RelationalUpdateCell",
+    "RelationalUpdateCommand",
+    "RelationalUpdateFilter",
+    "RelationalUpdateIntent",
+    "RelationalWriteScopeValidationResult",
+    "RelationalUpdateStatement",
+    "RelationalUpdateValidationResult",
+    "ValidatedRelationalUpdate",
+    "ValidatedRelationalWriteScope",
+    "render_relational_update_statement",
+    "validate_relational_update_intent",
+    "validate_relational_write_scope",
 ]

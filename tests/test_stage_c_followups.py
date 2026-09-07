@@ -347,7 +347,7 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
                 "job_cancel",
                 "memory_set",
                 "skill_create",
-                "postgresql_update",
+                "relational_update",
             }
             for tool in provider.logical_requests[2].tools
         )

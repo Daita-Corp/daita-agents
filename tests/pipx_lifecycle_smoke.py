@@ -695,7 +695,7 @@ async def main():
                 "update_scope_count": len(
                     (
                         await agent.inspect_source_permissions(item.id)
-                    ).state.postgresql_update_scopes
+                    ).state.relational_write_scopes
                 ),
             }
             for item in sources

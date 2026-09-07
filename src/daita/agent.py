@@ -26,7 +26,7 @@ from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
 )
-from .adapters.postgresql_write import PostgreSQLUpdateReadiness
+from .adapters.postgresql_write import RelationalUpdateReadiness
 from .adapters.protocols import (
     ResourceAdapterError as SourceRefreshError,
     ResourceSource,
@@ -925,7 +925,7 @@ class Agent:
         source_id: str,
         read_mode: SourceReadMode | str,
         read_resource_ids: tuple[str, ...],
-        postgresql_update_scopes: Mapping[str, Sequence[str]],
+        relational_write_scopes: Mapping[str, Mapping[str, object]],
     ) -> SourcePermissionsPreview:
         """Preview one exact final scope state without changing durable state."""
 
@@ -943,26 +943,20 @@ class Agent:
             for resource_id in read_resource_ids
         ):
             raise TypeError("read_resource_ids must be a tuple of non-empty strings")
-        if not isinstance(postgresql_update_scopes, Mapping):
-            raise TypeError("postgresql_update_scopes must be a mapping")
-        normalized_updates: dict[str, tuple[str, ...]] = {}
-        for resource_id, columns in postgresql_update_scopes.items():
-            if not isinstance(resource_id, str) or not resource_id:
-                raise ValueError("update scope resource ids must be non-empty strings")
-            if isinstance(columns, (str, bytes)) or not isinstance(
-                columns,
-                (list, tuple),
-            ):
-                raise TypeError("update scope columns must be lists or tuples")
-            normalized = tuple(columns)
-            if any(not isinstance(column, str) or not column for column in normalized):
-                raise TypeError("update scope columns must be non-empty strings")
-            normalized_updates[resource_id] = normalized
+        if not isinstance(relational_write_scopes, Mapping):
+            raise TypeError("relational_write_scopes must be a mapping")
+        if any(
+            not isinstance(resource_id, str) or not isinstance(value, Mapping)
+            for resource_id, value in relational_write_scopes.items()
+        ):
+            raise TypeError(
+                "relational_write_scopes must map exact resource IDs to explicit write constraints"
+            )
         return await self._embedded.preview_source_permissions(
             source_id=source_id,
             read_mode=read_mode,
             read_resource_ids=read_resource_ids,
-            postgresql_update_scopes=normalized_updates,
+            relational_write_scopes=relational_write_scopes,
         )
 
     async def apply_source_permissions(
@@ -985,12 +979,25 @@ class Agent:
             confirmation_fingerprint=confirmation_fingerprint,
         )
 
-    async def postgresql_update_readiness(
+    async def relational_upsert_readiness(
+        self, source_id: str, resource_id: str
+    ) -> Mapping[str, object]:
+        """Inspect exact admitted upsert structure and privileges without writing."""
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or not isinstance(resource_id, str)
+            or not resource_id
+        ):
+            raise ValueError("upsert readiness requires exact source and resource IDs")
+        return await self._embedded.relational_upsert_readiness(source_id, resource_id)
+
+    async def relational_update_readiness(
         self,
         source_id: str,
         resource_id: str,
         assignment_columns: tuple[str, ...],
-    ) -> PostgreSQLUpdateReadiness:
+    ) -> RelationalUpdateReadiness:
         """Return bounded non-mutating readiness for one exact update scope."""
 
         if not isinstance(source_id, str) or not source_id:
@@ -999,7 +1006,7 @@ class Agent:
             raise ValueError("resource_id must be a non-empty string")
         if not isinstance(assignment_columns, tuple):
             raise TypeError("assignment_columns must be a tuple")
-        return await self._embedded.postgresql_update_readiness(
+        return await self._embedded.relational_update_readiness(
             source_id,
             resource_id,
             assignment_columns,

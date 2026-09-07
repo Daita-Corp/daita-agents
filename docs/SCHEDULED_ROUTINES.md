@@ -252,3 +252,23 @@ configuration digests. The occurrence copies those references into its immutable
 scope. Claim and call checks compare current facts with those retained references.
 A structural or execution contract change requires a new approved revision; row
 values, catalog refresh time and editable discovery hints do not change authority.
+
+
+## Native update and upsert assignments
+
+The data domain supports exact native update/upsert grants, initially backed by
+PostgreSQL. One routine may contain one native write capability, with exactly one
+invocation per occurrence and explicit resource, structural revision, key, column,
+identity and row ceilings. Update authority never grants insertion. Read the
+[relational write contract](RELATIONAL_WRITES.md) before configuring an assignment.
+
+Immediate-first creation produces one immediate occurrence while retaining the
+approved interval/calendar schedule. Required effects are checked against current-run
+validated results and authenticated receipts. An unchanged upsert consumes the call
+and reports zero row changes. Missing effects, transaction failures and uncertainty
+cannot become a successful outcome through model text. Unknown commits block further
+potentially duplicating work, including future slots and run-now, pending explicit
+foreground recovery. No automatic replay or chunking is supported.
+
+This native path is a development implementation with deterministic acceptance;
+production release gates and the separate shared MCP external-action work remain.

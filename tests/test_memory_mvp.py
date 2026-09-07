@@ -408,7 +408,7 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
             "mcp_server_bindings",
             "messages",
             "metadata",
-            "postgresql_update_scopes",
+            "relational_write_scopes",
             "routine_occurrences",
             "runs",
             "semantic_annotations",

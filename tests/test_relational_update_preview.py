@@ -11,8 +11,9 @@ from daita.adapters import (
 )
 from daita.adapters.models import SourceRegistration, source_registration_id
 from daita.catalog.models import ResourceKind, TabularColumn
-from daita.domains.data.sql import PostgreSQLUpdateIntent, ResourceSchema
+from daita.domains.data.sql import RelationalUpdateIntent, ResourceSchema
 from daita.security import EmptySecretProvider
+from daita.storage.sqlite_records import RelationalWriteScope
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 SOURCE_ID = source_registration_id(
@@ -55,8 +56,23 @@ class _Catalog:
         del agent_id
         return (_resource(),) if source_id == SOURCE_ID else ()
 
-    async def postgresql_update_scope_issue(
-        self, agent_id, source_id, resource_id, assignment_columns
+    async def load_relational_write_scope(self, agent_id, source_id, resource_id):
+        return RelationalWriteScope(
+            agent_id=agent_id,
+            source_id=source_id,
+            resource_id=resource_id,
+            resource_revision=RESOURCE_REVISION,
+            allowed_operations=("update",),
+            allowed_insert_columns=(),
+            allowed_update_columns=("status", "priority"),
+            key_columns=("account_id",),
+            generated_identity_columns=(),
+            max_rows=10000,
+            authorization_fingerprint="sha256:" + "9" * 64,
+        )
+
+    async def relational_write_scope_issue(
+        self, agent_id, source_id, resource_id, assignment_columns, **kwargs
     ):
         del agent_id, source_id, resource_id, assignment_columns
         return self.scope_issue
@@ -176,8 +192,8 @@ def _resource() -> ResourceSchema:
     )
 
 
-def _intent() -> PostgreSQLUpdateIntent:
-    return PostgreSQLUpdateIntent.from_mapping(
+def _intent() -> RelationalUpdateIntent:
+    return RelationalUpdateIntent.from_mapping(
         {
             "source_id": SOURCE_ID,
             "resource_id": RESOURCE_ID,
@@ -275,7 +291,7 @@ def _structure():
 
 
 def _backend(*, scope_issue: tuple[str, str] | None = None):
-    return write_module.PostgreSQLUpdatePreviewBackend(
+    return write_module.PostgreSQLWriteBackend(
         _SourceStore(_registration()),
         _Catalog(scope_issue=scope_issue),
         EmptySecretProvider(),
@@ -369,7 +385,7 @@ async def test_oversized_values_use_row_version_for_drift_fingerprinting(monkeyp
 async def test_guardrails_fail_closed(monkeypatch):
     connection = _Connection((_row(1),), guardrails=_guardrails(role_superuser=True))
     _patch_io(monkeypatch, connection)
-    with pytest.raises(write_module.PostgreSQLUpdatePreviewError) as captured:
+    with pytest.raises(write_module.RelationalUpdatePreviewError) as captured:
         await _backend().preview_update(agent_id="agent-preview", intent=_intent())
     assert captured.value.error_code == "write_guardrail_rejected"
 
@@ -379,7 +395,7 @@ async def test_scope_is_checked_before_source_connection(monkeypatch):
         raise AssertionError("scope rejection must happen before source I/O")
 
     monkeypatch.setattr(write_module, "_connect", forbidden_connect)
-    with pytest.raises(write_module.PostgreSQLUpdatePreviewError) as captured:
+    with pytest.raises(write_module.RelationalUpdatePreviewError) as captured:
         await _backend(
             scope_issue=("update_column_not_allowed", "not allowed")
         ).preview_update(agent_id="agent-preview", intent=_intent())
@@ -387,8 +403,8 @@ async def test_scope_is_checked_before_source_connection(monkeypatch):
 
 
 def test_native_operation_identity_ignores_equivalent_predicate_and_assignment_order():
-    from daita.domains.data.sql.postgresql_update import (
-        validate_postgresql_update_intent,
+    from daita.domains.data.sql.relational_update import (
+        validate_relational_update_intent,
     )
 
     arguments = {
@@ -403,11 +419,11 @@ def test_native_operation_identity_ignores_equivalent_predicate_and_assignment_o
             {"column": "priority", "value": 3},
         ],
     }
-    original = validate_postgresql_update_intent(
-        PostgreSQLUpdateIntent.from_mapping(arguments), resources=(_resource(),)
+    original = validate_relational_update_intent(
+        RelationalUpdateIntent.from_mapping(arguments), resources=(_resource(),)
     )
-    reordered = validate_postgresql_update_intent(
-        PostgreSQLUpdateIntent.from_mapping(
+    reordered = validate_relational_update_intent(
+        RelationalUpdateIntent.from_mapping(
             {
                 **arguments,
                 "where": [

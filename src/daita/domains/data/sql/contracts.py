@@ -118,6 +118,13 @@ class ResourceSchema:
         default=(),
         compare=False,
     )
+    conflict_keys: tuple[tuple[str, ...], ...] = field(default=(), compare=False)
+    column_defaults: tuple[tuple[str, str | None], ...] = field(
+        default=(), compare=False
+    )
+    column_collations: tuple[tuple[str, str | None], ...] = field(
+        default=(), compare=False
+    )
     identity_columns: tuple[str, ...] = field(default=(), compare=False)
     generated_columns: tuple[str, ...] = field(default=(), compare=False)
     updatable_columns: tuple[str, ...] = field(default=(), compare=False)

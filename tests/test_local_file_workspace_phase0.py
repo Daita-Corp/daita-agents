@@ -148,7 +148,7 @@ async def test_files_only_omits_all_source_tools_with_multiple_sources(
 
         for method_name in (
             "source_routing_facts",
-            "postgresql_update_applicable_source_ids",
+            "relational_write_applicable_source_ids",
             "admitted_model_sensitivity",
             "catalog_context",
             "semantic_resource_facts",

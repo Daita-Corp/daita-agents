@@ -133,7 +133,7 @@ _FORBIDDEN_TOOL_NAMES = frozenset(
         "routine_inspect",
         "routine_list",
         "routine_update",
-        "data_update_postgresql",
+        "data_update_rows",
     }
 )
 

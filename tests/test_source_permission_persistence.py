@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _relational_write_support import update_scope
+
 import asyncio
 import json
 import sqlite3
@@ -31,11 +33,11 @@ from daita.storage import sqlite as sqlite_module
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_migrations import migration_rows
 from daita.storage.sqlite_records import (
-    PostgreSQLUpdateScope,
+    RelationalWriteScope,
     SourcePermissionStateError,
     SourceReadMode,
     SourceReadScope,
-    postgresql_update_authorization_fingerprint,
+    relational_write_authorization_fingerprint,
 )
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
@@ -155,19 +157,8 @@ def _scope(
     registration: SourceRegistration,
     resource: CatalogResource,
     facet: CatalogFacet,
-) -> PostgreSQLUpdateScope:
-    return PostgreSQLUpdateScope(
-        agent_id=registration.agent_id,
-        source_id=registration.id,
-        resource_id=resource.id,
-        allowed_assignment_columns=("amount",),
-        authorization_fingerprint=postgresql_update_authorization_fingerprint(
-            source=registration,
-            resource=resource,
-            facet=facet,
-            allowed_assignment_columns=("amount",),
-        ),
-    )
+) -> RelationalWriteScope:
+    return update_scope(registration, resource, facet, ("amount",))
 
 
 async def test_fresh_schema_has_only_scoped_permission_tables(tmp_path: Path) -> None:
@@ -184,7 +175,7 @@ async def test_fresh_schema_has_only_scoped_permission_tables(tmp_path: Path) ->
             )
         }
         assert "source_read_scopes" in tables
-        assert "postgresql_update_scopes" in tables
+        assert "relational_write_scopes" in tables
         assert (
             tuple(
                 connection.execute(
@@ -313,7 +304,7 @@ async def test_attach_refresh_detach_and_reopen_preserve_narrow_scopes(
         await store.load_source_read_scope(registration.agent_id, registration.id)
         == selected
     )
-    assert await store.list_postgresql_update_scopes(
+    assert await store.list_relational_write_scopes(
         registration.agent_id, registration.id
     ) == (update_scope,)
     await store.close()
@@ -323,7 +314,7 @@ async def test_attach_refresh_detach_and_reopen_preserve_narrow_scopes(
         await reopened.load_source_read_scope(registration.agent_id, registration.id)
         == selected
     )
-    assert await reopened.list_postgresql_update_scopes(
+    assert await reopened.list_relational_write_scopes(
         registration.agent_id, registration.id
     ) == (update_scope,)
     detached = await reopened.detach_source(
@@ -337,7 +328,7 @@ async def test_attach_refresh_detach_and_reopen_preserve_narrow_scopes(
         is None
     )
     assert (
-        await reopened.list_postgresql_update_scopes(
+        await reopened.list_relational_write_scopes(
             registration.agent_id, registration.id
         )
         == ()
@@ -349,7 +340,7 @@ async def test_attach_refresh_detach_and_reopen_preserve_narrow_scopes(
             "SELECT COUNT(*) FROM source_read_scopes"
         ).fetchone() == (0,)
         assert connection.execute(
-            "SELECT COUNT(*) FROM postgresql_update_scopes"
+            "SELECT COUNT(*) FROM relational_write_scopes"
         ).fetchone() == (0,)
 
 
@@ -395,12 +386,12 @@ async def test_source_edit_atomically_hands_off_catalog_and_scopes(
     detached = await store.load_source(current.agent_id, current.id)
     assert detached is not None and not detached.active
     assert await store.load_source_read_scope(current.agent_id, current.id) is None
-    assert await store.list_postgresql_update_scopes(current.agent_id, current.id) == ()
+    assert await store.list_relational_write_scopes(current.agent_id, current.id) == ()
     assert await store.load_source(edited.agent_id, edited.id) == edited
     assert await store.load_source_read_scope(edited.agent_id, edited.id) == (
         edited_read_scope
     )
-    assert await store.list_postgresql_update_scopes(edited.agent_id, edited.id) == ()
+    assert await store.list_relational_write_scopes(edited.agent_id, edited.id) == ()
     refs = await store.list_current_snapshot_refs(edited.agent_id, (edited.id,))
     assert len(refs) == 1 and refs[0].sync_id == "sync-edited"
     await store.close()
@@ -445,7 +436,7 @@ async def test_same_identity_source_edit_updates_connection_and_clears_updates(
 
     assert await store.list_sources(edited.agent_id) == (edited,)
     assert await store.load_source_read_scope(edited.agent_id, edited.id) == read_scope
-    assert await store.list_postgresql_update_scopes(edited.agent_id, edited.id) == ()
+    assert await store.list_relational_write_scopes(edited.agent_id, edited.id) == ()
     await store.close()
 
 
@@ -511,11 +502,11 @@ async def test_missing_corrupt_or_foreign_read_scope_fails_closed(
 def test_authorization_fingerprint_stales_only_on_relevant_facts() -> None:
     registration = _registration()
     _, resource, facet = _snapshot(registration, sync_id="sync-original")
-    original = postgresql_update_authorization_fingerprint(
+    original = relational_write_authorization_fingerprint(
         source=registration,
         resource=resource,
         facet=facet,
-        allowed_assignment_columns=("amount",),
+        scope=_scope(registration, resource, facet),
     )
     _, metadata_resource, metadata_facet = _snapshot(
         registration,
@@ -524,11 +515,11 @@ def test_authorization_fingerprint_stales_only_on_relevant_facts() -> None:
         sensitivity=Sensitivity.RESTRICTED,
     )
     assert (
-        postgresql_update_authorization_fingerprint(
+        relational_write_authorization_fingerprint(
             source=registration,
             resource=metadata_resource,
             facet=metadata_facet,
-            allowed_assignment_columns=("amount",),
+            scope=_scope(registration, metadata_resource, metadata_facet),
         )
         == original
     )
@@ -538,11 +529,11 @@ def test_authorization_fingerprint_stales_only_on_relevant_facts() -> None:
         amount_type="text",
     )
     assert (
-        postgresql_update_authorization_fingerprint(
+        relational_write_authorization_fingerprint(
             source=registration,
             resource=type_resource,
             facet=type_facet,
-            allowed_assignment_columns=("amount",),
+            scope=_scope(registration, type_resource, type_facet),
         )
         != original
     )
@@ -552,11 +543,11 @@ def test_authorization_fingerprint_stales_only_on_relevant_facts() -> None:
         amount_updatable=False,
     )
     with pytest.raises(ValueError, match="not eligible"):
-        postgresql_update_authorization_fingerprint(
+        relational_write_authorization_fingerprint(
             source=registration,
             resource=blocked_resource,
             facet=blocked_facet,
-            allowed_assignment_columns=("amount",),
+            scope=_scope(registration, blocked_resource, blocked_facet),
         )
 
 
@@ -590,7 +581,7 @@ async def test_invalid_scope_replacement_rolls_back_both_families(
         await store.load_source_read_scope(registration.agent_id, registration.id)
         == selected
     )
-    assert await store.list_postgresql_update_scopes(
+    assert await store.list_relational_write_scopes(
         registration.agent_id, registration.id
     ) == (update_scope,)
     await store.close()
@@ -641,9 +632,7 @@ async def test_cancel_before_scope_transaction_start_changes_nothing(
         == original
     )
     assert (
-        await store.list_postgresql_update_scopes(
-            registration.agent_id, registration.id
-        )
+        await store.list_relational_write_scopes(registration.agent_id, registration.id)
         == ()
     )
 

@@ -43,8 +43,8 @@ from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
 from ..adapters.postgresql_query import PostgreSQLQueryBackend
 from ..adapters.postgresql_write import (
-    PostgreSQLUpdatePreviewBackend,
-    PostgreSQLUpdateReadiness,
+    PostgreSQLWriteBackend,
+    RelationalUpdateReadiness,
 )
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
@@ -119,8 +119,9 @@ from ..domains.data import (
     data_export_tabular_declarations,
     data_query_declarations,
     local_file_declarations,
-    postgresql_update_declarations,
-    postgresql_update_preview_declarations,
+    relational_update_declarations,
+    relational_upsert_declarations,
+    relational_update_preview_declarations,
     resource_revision_observation_declarations,
 )
 from ..scope import resolve_effective_source_scope
@@ -133,7 +134,7 @@ from ..domains.data.profile_jobs import (
     data_profile_declarations,
 )
 from ..domains.data.sql import (
-    validate_postgresql_update_scope,
+    validate_relational_write_scope,
 )
 from ..domains.learning import LearningCandidateGuard
 from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
@@ -263,7 +264,7 @@ from ..storage.sqlite_records import (
     EffectResolution,
     EffectResolutionDecision,
     validate_effect_receipt_id,
-    PostgreSQLUpdateScope,
+    RelationalWriteScope,
     SourcePermissionResource,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
@@ -271,7 +272,7 @@ from ..storage.sqlite_records import (
     SourcePermissionSummary,
     SourceReadMode,
     SourceReadScope,
-    postgresql_update_authorization_fingerprint,
+    relational_write_authorization_fingerprint,
 )
 from ..workspace import LocalWorkspace
 
@@ -716,7 +717,7 @@ class EmbeddedAgent:
         data_profile_job_domain: DataProfileCapabilityDomain,
         learning_candidate_guard: LearningCandidateGuard,
         semantic_domain: SemanticCapabilityDomain,
-        postgresql_update_backend: PostgreSQLUpdatePreviewBackend,
+        relational_update_backend: PostgreSQLWriteBackend,
         memory_store: MemoryStore,
         skill_store: SkillStore,
         candidate_reviewer: OneShotCandidateReviewer,
@@ -778,7 +779,7 @@ class EmbeddedAgent:
         self._data_profile_job_domain = data_profile_job_domain
         self._learning_candidate_guard = learning_candidate_guard
         self._semantic_domain = semantic_domain
-        self._postgresql_update_backend = postgresql_update_backend
+        self._relational_update_backend = relational_update_backend
         self._memory_store = memory_store
         self._skill_store = skill_store
         self._candidate_reviewer = candidate_reviewer
@@ -1274,19 +1275,22 @@ class EmbeddedAgent:
             if artifact_store.available
             else None
         )
-        postgresql_preview_backend = PostgreSQLUpdatePreviewBackend(
+        postgresql_preview_backend = PostgreSQLWriteBackend(
             store,
             data_view,
             secret_provider or keychain,
             clock=clock,
         )
-        postgresql_preview = postgresql_update_preview_declarations(
+        postgresql_preview = relational_update_preview_declarations(
             identity.id,
             postgresql_preview_backend,
         )
-        postgresql_update = postgresql_update_declarations(
+        relational_update = relational_update_declarations(
             identity.id,
             postgresql_preview_backend,
+        )
+        relational_upsert = relational_upsert_declarations(
+            identity.id, postgresql_preview_backend
         )
         routine_precheck = resource_revision_observation_declarations(
             agent_id=identity.id,
@@ -1381,7 +1385,8 @@ class EmbeddedAgent:
                     else ()
                 ),
                 *postgresql_preview.capabilities,
-                *postgresql_update.capabilities,
+                *relational_update.capabilities,
+                *relational_upsert.capabilities,
                 *routine_precheck.capabilities,
                 *(local_files.capabilities if local_files is not None else ()),
             ),
@@ -1396,7 +1401,8 @@ class EmbeddedAgent:
                         else ()
                     ),
                     *postgresql_preview.capabilities,
-                    *postgresql_update.capabilities,
+                    *relational_update.capabilities,
+                    *relational_upsert.capabilities,
                     *routine_precheck.capabilities,
                     *(local_files.capabilities if local_files is not None else ()),
                 )
@@ -1410,7 +1416,8 @@ class EmbeddedAgent:
                     else ()
                 ),
                 *postgresql_preview.tool_views,
-                *postgresql_update.tool_views,
+                *relational_update.tool_views,
+                *relational_upsert.tool_views,
                 *(local_files.tool_views if local_files is not None else ()),
             ),
         )
@@ -1461,6 +1468,8 @@ class EmbeddedAgent:
             data_view,
             learning_candidate_guard,
             relational_export_available=relational_export is not None,
+            transcript_loader=store.load,
+            upsert_readiness=postgresql_preview_backend.upsert_readiness,
             workspace_id=(
                 None if workspace_backend is None else workspace_backend.workspace_id
             ),
@@ -1538,7 +1547,8 @@ class EmbeddedAgent:
             *relational_query.executors,
             *(relational_export.executors if relational_export is not None else ()),
             *postgresql_preview.executors,
-            *postgresql_update.executors,
+            *relational_update.executors,
+            *relational_upsert.executors,
             *routine_precheck.executors,
             *(local_files.executors if local_files is not None else ()),
             *memory.executors,
@@ -1652,6 +1662,7 @@ class EmbeddedAgent:
         )
         if artifact_domain is not None:
             artifact_domain.bind_capability_registry(capabilities)
+        data_domain.bind_capability_registry(capabilities)
         routine_owner.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
@@ -1835,7 +1846,7 @@ class EmbeddedAgent:
             data_profile_job_domain=data_profile_job_domain,
             learning_candidate_guard=learning_candidate_guard,
             semantic_domain=semantic_domain,
-            postgresql_update_backend=postgresql_preview_backend,
+            relational_update_backend=postgresql_preview_backend,
             memory_store=memory_store,
             skill_store=skill_store,
             candidate_reviewer=candidate_reviewer,
@@ -4008,7 +4019,7 @@ class EmbeddedAgent:
         source_id: str,
         read_mode: SourceReadMode,
         read_resource_ids: tuple[str, ...],
-        postgresql_update_scopes: Mapping[str, tuple[str, ...]],
+        relational_write_scopes: Mapping[str, Mapping[str, object]],
     ) -> SourcePermissionsPreview:
         """Build and retain one bounded in-process exact confirmation preview."""
 
@@ -4020,7 +4031,7 @@ class EmbeddedAgent:
                     inspection,
                     read_mode=read_mode,
                     read_resource_ids=read_resource_ids,
-                    postgresql_update_scopes=postgresql_update_scopes,
+                    relational_write_scopes=relational_write_scopes,
                 )
                 self._source_permission_previews[source_id] = preview
                 return preview
@@ -4057,14 +4068,18 @@ class EmbeddedAgent:
                     )
 
                 update_mapping = {
-                    scope.resource_id: scope.allowed_assignment_columns
-                    for scope in preview.after.postgresql_update_scopes
+                    scope.resource_id: {
+                        key: value
+                        for key, value in scope.constraints().items()
+                        if key != "resource_revision"
+                    }
+                    for scope in preview.after.relational_write_scopes
                 }
                 revalidated = await self._build_source_permissions_preview(
                     current,
                     read_mode=preview.after.read_scope.mode,
                     read_resource_ids=preview.after.read_scope.resource_ids,
-                    postgresql_update_scopes=update_mapping,
+                    relational_write_scopes=update_mapping,
                 )
                 if revalidated.after != preview.after:
                     raise ValueError(
@@ -4072,7 +4087,7 @@ class EmbeddedAgent:
                     )
                 await self._store.replace_source_permission_scopes(
                     preview.after.read_scope,
-                    preview.after.postgresql_update_scopes,
+                    preview.after.relational_write_scopes,
                 )
                 return await self._inspect_source_permissions_locked(source_id)
 
@@ -4094,7 +4109,7 @@ class EmbeddedAgent:
         )
         if read_scope is None:
             raise ValueError("active source is missing its read scope")
-        update_scopes = await self._store.list_postgresql_update_scopes(
+        update_scopes = await self._store.list_relational_write_scopes(
             self.identity.id,
             source_id,
         )
@@ -4127,7 +4142,7 @@ class EmbeddedAgent:
                 eligible_columns = tuple(
                     column
                     for column in schema.columns
-                    if validate_postgresql_update_scope(
+                    if validate_relational_write_scope(
                         source_id,
                         resource.id,
                         (column,),
@@ -4140,6 +4155,7 @@ class EmbeddedAgent:
                     display_name=resource.native_identity,
                     resource_kind=resource.kind.value,
                     eligible_assignment_columns=eligible_columns,
+                    key_columns=() if schema is None else schema.primary_key_columns,
                 )
             )
         return SourcePermissionsInspection(
@@ -4157,14 +4173,14 @@ class EmbeddedAgent:
         *,
         read_mode: SourceReadMode,
         read_resource_ids: tuple[str, ...],
-        postgresql_update_scopes: Mapping[str, tuple[str, ...]],
+        relational_write_scopes: Mapping[str, Mapping[str, object]],
     ) -> SourcePermissionsPreview:
         if not isinstance(read_mode, SourceReadMode):
             raise TypeError("read_mode must be SourceReadMode")
         if not isinstance(read_resource_ids, tuple):
             raise TypeError("read_resource_ids must be a tuple")
-        if not isinstance(postgresql_update_scopes, Mapping):
-            raise TypeError("postgresql_update_scopes must be a mapping")
+        if not isinstance(relational_write_scopes, Mapping):
+            raise TypeError("relational_write_scopes must be a mapping")
         current_resources = {
             resource.resource_id: resource for resource in inspection.resources
         }
@@ -4180,7 +4196,7 @@ class EmbeddedAgent:
                 raise ValueError(
                     "selected read resources are not current resources of this source"
                 )
-        if postgresql_update_scopes and inspection.adapter_id != "postgresql":
+        if relational_write_scopes and inspection.adapter_id != "postgresql":
             raise ValueError(
                 "PostgreSQL update scopes require an active PostgreSQL source"
             )
@@ -4202,50 +4218,93 @@ class EmbeddedAgent:
                 inspection.source_id,
             )
         }
-        update_scopes: list[PostgreSQLUpdateScope] = []
+        update_scopes: list[RelationalWriteScope] = []
         requested_update_ids: set[str] = set()
-        for resource_id, raw_columns in postgresql_update_scopes.items():
-            if not isinstance(resource_id, str) or not resource_id:
-                raise ValueError("update scope resource ids must be non-empty text")
-            if not isinstance(raw_columns, tuple):
-                raise TypeError("update scope columns must be tuples")
-            resource = current_resources.get(resource_id)
-            if resource is None or not resource.postgresql_update_eligible:
-                raise ValueError(
-                    "PostgreSQL update scope requires a current eligible table"
-                )
-            selected_columns = tuple(sorted(raw_columns))
-            if (
-                not selected_columns
-                or len(selected_columns) != len(set(selected_columns))
-                or not set(selected_columns)
-                <= set(resource.eligible_assignment_columns)
-            ):
-                raise ValueError(
-                    "update scope columns must be a non-empty eligible subset"
-                )
-            requested_update_ids.add(resource_id)
-            tabular = tabular_by_resource_id.get(resource_id)
-            if tabular is None or tabular.resource.kind is not ResourceKind.TABLE:
-                raise ValueError(
-                    "PostgreSQL update scope requires exact current table facts"
-                )
-            update_scopes.append(
-                PostgreSQLUpdateScope(
-                    agent_id=self.identity.id,
-                    source_id=inspection.source_id,
-                    resource_id=resource_id,
-                    allowed_assignment_columns=selected_columns,
-                    authorization_fingerprint=(
-                        postgresql_update_authorization_fingerprint(
-                            source=registration,
-                            resource=tabular.resource,
-                            facet=tabular.facet,
-                            allowed_assignment_columns=selected_columns,
-                        )
-                    ),
-                )
+        schemas = {
+            item.resource_id: item
+            for item in await self._data_view.resource_schemas(
+                self.identity.id, inspection.source_id
             )
+        }
+        from ..domains.data.sql.relational_upsert import (
+            validate_relational_upsert_scope,
+        )
+
+        for resource_id, constraints in relational_write_scopes.items():
+            if not isinstance(constraints, Mapping) or set(constraints) != {
+                "allowed_operations",
+                "allowed_insert_columns",
+                "allowed_update_columns",
+                "key_columns",
+                "generated_identity_columns",
+                "max_rows",
+            }:
+                raise ValueError(
+                    "write scopes require explicit operations, keys, insert/update columns, identities and row limit"
+                )
+            tabular = tabular_by_resource_id.get(resource_id)
+            schema = schemas.get(resource_id)
+            if (
+                tabular is None
+                or schema is None
+                or tabular.resource.kind is not ResourceKind.TABLE
+            ):
+                raise ValueError("write scope requires an exact current table")
+            scope = RelationalWriteScope(
+                agent_id=self.identity.id,
+                source_id=inspection.source_id,
+                resource_id=resource_id,
+                resource_revision=tabular.resource.current_revision,
+                allowed_operations=cast(
+                    tuple[str, ...], constraints["allowed_operations"]
+                ),
+                allowed_insert_columns=cast(
+                    tuple[str, ...], constraints["allowed_insert_columns"]
+                ),
+                allowed_update_columns=cast(
+                    tuple[str, ...], constraints["allowed_update_columns"]
+                ),
+                key_columns=cast(tuple[str, ...], constraints["key_columns"]),
+                generated_identity_columns=cast(
+                    tuple[str, ...], constraints["generated_identity_columns"]
+                ),
+                max_rows=cast(int, constraints["max_rows"]),
+                authorization_fingerprint="sha256:" + "0" * 64,
+            )
+            if "update" in scope.allowed_operations:
+                if (
+                    set(scope.key_columns) != set(schema.primary_key_columns)
+                    or not validate_relational_write_scope(
+                        inspection.source_id,
+                        resource_id,
+                        scope.allowed_update_columns,
+                        resources=(schema,),
+                    ).valid
+                ):
+                    raise ValueError(
+                        "update scope requires eligible columns and the exact primary key"
+                    )
+            if "upsert" in scope.allowed_operations:
+                validate_relational_upsert_scope(
+                    schema,
+                    key_columns=scope.key_columns,
+                    insert_columns=scope.allowed_insert_columns,
+                    update_columns=scope.allowed_update_columns,
+                    generated_identity_columns=scope.generated_identity_columns,
+                )
+                if scope.max_rows > 1000:
+                    raise ValueError("upsert scope cannot exceed 1000 rows")
+            scope = replace(
+                scope,
+                authorization_fingerprint=relational_write_authorization_fingerprint(
+                    source=registration,
+                    resource=tabular.resource,
+                    facet=tabular.facet,
+                    scope=scope,
+                ),
+            )
+            update_scopes.append(scope)
+            requested_update_ids.add(resource_id)
 
         automatic_read_additions: set[str] = set()
         if requested_read.mode is SourceReadMode.ALL:
@@ -4275,7 +4334,7 @@ class EmbeddedAgent:
         )
         dependent_revocations = tuple(
             scope.resource_id
-            for scope in inspection.state.postgresql_update_scopes
+            for scope in inspection.state.relational_write_scopes
             if scope.resource_id not in effective_read_ids
         )
 
@@ -4295,8 +4354,8 @@ class EmbeddedAgent:
                 if final_read_scope.mode is SourceReadMode.ALL
                 else len(final_read_scope.resource_ids)
             ),
-            postgresql_update_table_count=len(update_scopes),
-            postgresql_update_table_examples=tuple(
+            relational_write_table_count=len(update_scopes),
+            relational_write_table_examples=tuple(
                 names.get(scope.resource_id, scope.resource_id)
                 for scope in sorted(
                     update_scopes,
@@ -4325,7 +4384,7 @@ class EmbeddedAgent:
             "before": _source_permission_state_payload(inspection.state),
             "after": _source_permission_state_payload(after),
             "automatic_read_additions": tuple(sorted(automatic_read_additions)),
-            "dependent_update_revocations": tuple(sorted(dependent_revocations)),
+            "dependent_write_revocations": tuple(sorted(dependent_revocations)),
         }
         confirmation_fingerprint = (
             "sha256:"
@@ -4341,21 +4400,42 @@ class EmbeddedAgent:
             before=inspection.state,
             after=after,
             automatic_read_additions=tuple(automatic_read_additions),
-            dependent_update_revocations=dependent_revocations,
+            dependent_write_revocations=dependent_revocations,
             summary=summary,
             confirmation_fingerprint=confirmation_fingerprint,
         )
 
-    async def postgresql_update_readiness(
+    async def relational_upsert_readiness(
+        self, source_id: str, resource_id: str
+    ) -> FrozenJsonObject:
+        async with self._mutation_lock:
+            self._require_open()
+            permission = await self._data_view.load_relational_write_scope(
+                self.identity.id, source_id, resource_id
+            )
+            if permission is None:
+                raise ValueError("exact current upsert permission is required")
+            constraints = FrozenJsonObject.from_mapping(
+                {
+                    "source_id": source_id,
+                    "resource_id": resource_id,
+                    **permission.constraints(),
+                }
+            )
+            return await self._relational_update_backend.upsert_readiness(
+                self.identity.id, constraints
+            )
+
+    async def relational_update_readiness(
         self,
         source_id: str,
         resource_id: str,
         assignment_columns: tuple[str, ...],
-    ) -> PostgreSQLUpdateReadiness:
+    ) -> RelationalUpdateReadiness:
         """Inspect one exact PostgreSQL update scope without mutating state."""
 
         self._require_open()
-        return await self._postgresql_update_backend.postgresql_update_readiness(
+        return await self._relational_update_backend.relational_update_readiness(
             agent_id=self.identity.id,
             source_id=source_id,
             resource_id=resource_id,
@@ -4565,13 +4645,13 @@ def _source_permission_state_payload(
             "mode": state.read_scope.mode.value,
             "resource_ids": state.read_scope.resource_ids,
         },
-        "postgresql_updates": tuple(
+        "relational_writes": tuple(
             {
                 "resource_id": scope.resource_id,
-                "allowed_assignment_columns": scope.allowed_assignment_columns,
+                **scope.constraints(),
                 "authorization_fingerprint": scope.authorization_fingerprint,
             }
-            for scope in state.postgresql_update_scopes
+            for scope in state.relational_write_scopes
         ),
     }
 

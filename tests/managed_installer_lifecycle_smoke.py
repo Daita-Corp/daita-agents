@@ -341,7 +341,7 @@ async def main():
     }
     permissions = await agent.inspect_source_permissions(admitted[0].id)
     assert permissions.state.read_scope.mode.value == "all"
-    assert permissions.state.postgresql_update_scopes == ()
+    assert permissions.state.relational_write_scopes == ()
     await agent.close()
 
 

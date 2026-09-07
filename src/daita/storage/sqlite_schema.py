@@ -77,7 +77,7 @@ READ_SCOPE_TABLE = (
     ("source_id", "TEXT", 1, None, 2),
     ("data", "TEXT", 1, None, 0),
 )
-UPDATE_SCOPE_TABLE = (
+RELATIONAL_WRITE_SCOPE_TABLE = (
     ("agent_id", "TEXT", 1, None, 1),
     ("source_id", "TEXT", 1, None, 2),
     ("resource_id", "TEXT", 1, None, 3),
@@ -139,7 +139,7 @@ CURRENT_TABLES = {
     "effect_receipts": RECEIPT_TABLE,
     "state_migrations": JOURNAL_TABLE,
     "source_read_scopes": READ_SCOPE_TABLE,
-    "postgresql_update_scopes": UPDATE_SCOPE_TABLE,
+    "relational_write_scopes": RELATIONAL_WRITE_SCOPE_TABLE,
     "mcp_server_bindings": MCP_BINDING_TABLE,
     "job_runs": JOB_RUN_TABLE,
     "autonomous_followups": AUTONOMOUS_FOLLOWUP_TABLE,
@@ -325,8 +325,8 @@ CREATE TABLE source_read_scopes (
 )
 """
 
-POSTGRESQL_UPDATE_SCOPE_TABLE_SQL = """
-CREATE TABLE postgresql_update_scopes (
+RELATIONAL_WRITE_SCOPE_TABLE_SQL = """
+CREATE TABLE relational_write_scopes (
     agent_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     resource_id TEXT NOT NULL,
@@ -472,8 +472,8 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
             else {}
         ),
         **(
-            {"postgresql_update_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
-            if "postgresql_update_scopes" in definitions
+            {"relational_write_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
+            if "relational_write_scopes" in definitions
             else {}
         ),
         **(

@@ -65,7 +65,7 @@ from daita.storage.sqlite_codecs import (
     decode_learning_candidate,
     decode_loop_exit,
     decode_message,
-    decode_postgresql_update_scope,
+    decode_relational_write_scope,
     decode_receipt,
     decode_review_stamps,
     decode_run_input,
@@ -79,7 +79,7 @@ from daita.storage.sqlite_codecs import (
     encode_learning_candidate,
     encode_loop_exit,
     encode_message,
-    encode_postgresql_update_scope,
+    encode_relational_write_scope,
     encode_receipt,
     encode_review_stamps,
     encode_run_input,
@@ -88,7 +88,7 @@ from daita.storage.sqlite_codecs import (
     encode_source_read_scope,
 )
 from daita.storage.sqlite_records import (
-    PostgreSQLUpdateScope,
+    RelationalWriteScope,
     SourceReadMode,
     SourceReadScope,
 )
@@ -168,7 +168,7 @@ def _receipt() -> EffectReceipt:
         agent_id="agent-codec",
         run_id="run-codec",
         call_id="call-codec",
-        capability_id="data.postgresql.update",
+        capability_id="data.update_rows",
         domain_owner_id="data",
         capability_contract_digest=key,
         operation_key=key,
@@ -370,16 +370,22 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
     )
     assert encode_source_read_scope(read_scope) == encoded_read_scope
 
-    update_scope = PostgreSQLUpdateScope(
+    update_scope = RelationalWriteScope(
         agent_id=read_scope.agent_id,
         source_id=read_scope.source_id,
         resource_id="catalog-resource:sha256:" + "2" * 64,
-        allowed_assignment_columns=("status", "amount"),
+        allowed_update_columns=("status", "amount"),
+        resource_revision="sha256:" + "5" * 64,
+        allowed_operations=("update",),
+        allowed_insert_columns=(),
+        key_columns=("id",),
+        generated_identity_columns=(),
+        max_rows=10000,
         authorization_fingerprint="sha256:" + "4" * 64,
     )
-    encoded_update_scope = encode_postgresql_update_scope(update_scope)
+    encoded_update_scope = encode_relational_write_scope(update_scope)
     assert (
-        decode_postgresql_update_scope(
+        decode_relational_write_scope(
             encoded_update_scope,
             agent_id=update_scope.agent_id,
             source_id=update_scope.source_id,
@@ -388,7 +394,7 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         )
         == update_scope
     )
-    assert encode_postgresql_update_scope(update_scope) == encoded_update_scope
+    assert encode_relational_write_scope(update_scope) == encoded_update_scope
 
 
 def test_bound_edit_provenance_and_exact_outcome_receipt_round_trip_in_codec_v1() -> (

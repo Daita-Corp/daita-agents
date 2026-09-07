@@ -45,9 +45,9 @@ from .routines import (
 )
 from .semantics import decode_semantic_annotation, encode_semantic_annotation
 from .source_permissions import (
-    decode_postgresql_update_scope,
+    decode_relational_write_scope,
     decode_source_read_scope,
-    encode_postgresql_update_scope,
+    encode_relational_write_scope,
     encode_source_read_scope,
 )
 from .sources import CurrentSourceAdapterError, decode_source, encode_source
@@ -75,7 +75,7 @@ __all__ = [
     "decode_loop_exit",
     "decode_mcp_binding",
     "decode_message",
-    "decode_postgresql_update_scope",
+    "decode_relational_write_scope",
     "decode_outcome_contract",
     "decode_outcome_reference",
     "decode_receipt",
@@ -99,7 +99,7 @@ __all__ = [
     "encode_loop_exit",
     "encode_mcp_binding",
     "encode_message",
-    "encode_postgresql_update_scope",
+    "encode_relational_write_scope",
     "encode_outcome_contract",
     "encode_outcome_reference",
     "encode_receipt",

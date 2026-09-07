@@ -170,7 +170,7 @@ from .sqlite_codecs import (
     decode_loop_exit,
     decode_mcp_binding,
     decode_message,
-    decode_postgresql_update_scope,
+    decode_relational_write_scope,
     decode_receipt,
     decode_review_stamps,
     decode_routine_occurrence,
@@ -190,7 +190,7 @@ from .sqlite_codecs import (
     encode_loop_exit,
     encode_mcp_binding,
     encode_message,
-    encode_postgresql_update_scope,
+    encode_relational_write_scope,
     encode_receipt,
     encode_review_stamps,
     encode_routine_occurrence,
@@ -216,14 +216,14 @@ from .sqlite_records import (
     EffectUnresolvedError,
     EffectResolution,
     EffectResolutionDecision,
-    PostgreSQLUpdateScope,
+    RelationalWriteScope,
     SourcePermissionStateError,
     SourceReadMode,
     SourceReadScope,
     effect_receipt_aware as _effect_receipt_aware,
     effect_receipt_id,
     effect_receipt_text as _effect_receipt_text,
-    postgresql_update_authorization_fingerprint,
+    relational_write_authorization_fingerprint,
     validate_effect_receipt_id,
 )
 from .sqlite_schema import (
@@ -632,7 +632,7 @@ def _source_state_row(
 ) -> tuple[object, ...] | None:
     return connection.execute(
         """SELECT s.agent_id, s.id, s.data, r.data,
-                  (SELECT COUNT(*) FROM postgresql_update_scopes AS u
+                  (SELECT COUNT(*) FROM relational_write_scopes AS u
                    WHERE u.agent_id = s.agent_id AND u.source_id = s.id)
            FROM sources AS s
            LEFT JOIN source_read_scopes AS r
@@ -3915,7 +3915,7 @@ class SQLiteStateStore:
                 rows = connection.execute(
                     """SELECT s.agent_id, s.id, s.data, r.data,
                               (SELECT COUNT(*)
-                               FROM postgresql_update_scopes AS u
+                               FROM relational_write_scopes AS u
                                WHERE u.agent_id = s.agent_id
                                  AND u.source_id = s.id)
                        FROM sources AS s
@@ -3968,12 +3968,12 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
-    async def list_postgresql_update_scopes(
+    async def list_relational_write_scopes(
         self,
         agent_id: str,
         source_id: str,
-    ) -> tuple[PostgreSQLUpdateScope, ...]:
-        def read() -> tuple[PostgreSQLUpdateScope, ...]:
+    ) -> tuple[RelationalWriteScope, ...]:
+        def read() -> tuple[RelationalWriteScope, ...]:
             with _connect(self.path) as connection:
                 source_row = _source_state_row(connection, agent_id, source_id)
                 if source_row is None:
@@ -3996,14 +3996,14 @@ class SQLiteStateStore:
                     return ()
                 rows = connection.execute(
                     """SELECT resource_id, authorization_fingerprint, data
-                       FROM postgresql_update_scopes
+                       FROM relational_write_scopes
                        WHERE agent_id = ? AND source_id = ?
                        ORDER BY resource_id""",
                     (agent_id, source_id),
                 ).fetchall()
                 try:
                     return tuple(
-                        decode_postgresql_update_scope(
+                        decode_relational_write_scope(
                             data,
                             agent_id=agent_id,
                             source_id=source_id,
@@ -4022,16 +4022,16 @@ class SQLiteStateStore:
     async def replace_source_permission_scopes(
         self,
         read_scope: SourceReadScope,
-        update_scopes: tuple[PostgreSQLUpdateScope, ...],
+        update_scopes: tuple[RelationalWriteScope, ...],
     ) -> SourceRegistration:
         """Atomically replace only the two narrow scope families for one source."""
 
         if not isinstance(read_scope, SourceReadScope):
             raise TypeError("read_scope must be a SourceReadScope")
         if not isinstance(update_scopes, tuple) or any(
-            not isinstance(scope, PostgreSQLUpdateScope) for scope in update_scopes
+            not isinstance(scope, RelationalWriteScope) for scope in update_scopes
         ):
-            raise TypeError("update_scopes must be a tuple of PostgreSQLUpdateScope")
+            raise TypeError("update_scopes must be a tuple of RelationalWriteScope")
         if len({scope.resource_id for scope in update_scopes}) != len(update_scopes):
             raise ValueError("update_scopes cannot contain duplicate resources")
         gate = _CatalogCommitGate()
@@ -4104,11 +4104,11 @@ class SQLiteStateStore:
                         raise ValueError(
                             "PostgreSQL update scope requires a current table resource"
                         )
-                    expected = postgresql_update_authorization_fingerprint(
+                    expected = relational_write_authorization_fingerprint(
                         source=registration,
                         resource=resource,
                         facet=facet,
-                        allowed_assignment_columns=scope.allowed_assignment_columns,
+                        scope=scope,
                     )
                     if scope.authorization_fingerprint != expected:
                         raise ValueError(
@@ -4127,13 +4127,13 @@ class SQLiteStateStore:
                     ),
                 )
                 connection.execute(
-                    """DELETE FROM postgresql_update_scopes
+                    """DELETE FROM relational_write_scopes
                        WHERE agent_id = ? AND source_id = ?""",
                     (read_scope.agent_id, read_scope.source_id),
                 )
                 for scope in sorted(update_scopes, key=lambda item: item.resource_id):
                     connection.execute(
-                        """INSERT INTO postgresql_update_scopes(
+                        """INSERT INTO relational_write_scopes(
                                agent_id, source_id, resource_id,
                                authorization_fingerprint, data
                            ) VALUES (?, ?, ?, ?, ?)""",
@@ -4142,7 +4142,7 @@ class SQLiteStateStore:
                             scope.source_id,
                             scope.resource_id,
                             scope.authorization_fingerprint,
-                            encode_postgresql_update_scope(scope),
+                            encode_relational_write_scope(scope),
                         ),
                     )
                 connection.commit()
@@ -4567,7 +4567,7 @@ class SQLiteStateStore:
                     (agent_id, source_id),
                 )
                 connection.execute(
-                    """DELETE FROM postgresql_update_scopes
+                    """DELETE FROM relational_write_scopes
                        WHERE agent_id = ? AND source_id = ?""",
                     (agent_id, source_id),
                 )
@@ -4892,7 +4892,7 @@ class SQLiteStateStore:
                         (registration.agent_id, source_id),
                     )
                     connection.execute(
-                        """DELETE FROM postgresql_update_scopes
+                        """DELETE FROM relational_write_scopes
                            WHERE agent_id = ? AND source_id = ?""",
                         (registration.agent_id, source_id),
                     )
@@ -6964,7 +6964,7 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
     for agent_id, source_id, resource_id, fingerprint, data in connection.execute(
         """SELECT agent_id, source_id, resource_id,
                   authorization_fingerprint, data
-           FROM postgresql_update_scopes"""
+           FROM relational_write_scopes"""
     ):
         scope_registration = sources.get((agent_id, source_id))
         if (
@@ -6973,7 +6973,7 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
             or not scope_registration.active
         ):
             raise ValueError("stored PostgreSQL update scope is foreign")
-        decode_postgresql_update_scope(
+        decode_relational_write_scope(
             data,
             agent_id=agent_id,
             source_id=source_id,
@@ -7650,7 +7650,7 @@ __all__ = [
     "EffectOutcome",
     "EffectReceipt",
     "EffectReceiptConflictError",
-    "PostgreSQLUpdateScope",
+    "RelationalWriteScope",
     "SQLiteStateStore",
     "SourcePermissionStateError",
     "SourceReadMode",
@@ -7658,5 +7658,5 @@ __all__ = [
     "StateCompatibilityCode",
     "StateCompatibilityError",
     "effect_receipt_id",
-    "postgresql_update_authorization_fingerprint",
+    "relational_write_authorization_fingerprint",
 ]

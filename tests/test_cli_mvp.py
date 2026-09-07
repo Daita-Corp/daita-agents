@@ -847,8 +847,8 @@ def _approval_request(arguments: dict[str, object]) -> ApprovalRequest:
     return ApprovalRequest(
         run_id="run-1",
         call_id="call-1",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping(arguments),
         reason="update one row",
     )
@@ -869,8 +869,8 @@ def test_cli_approval_displays_the_exact_canonical_review_document():
     assert decision is ApprovalDecision.APPROVE
     assert stdout.getvalue() == (
         "Approval required\n\n"
-        "Tool:       data_update_postgresql\n"
-        "Capability: data.postgresql.update\n"
+        "Tool:       data_update_rows\n"
+        "Capability: data.update_rows\n"
         "Change:     update one row\n"
         "Arguments:\n"
         f"{rendered}\n"
@@ -964,7 +964,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "create",
         "attach",
         "sources",
-        "postgresql-update-readiness",
+        "relational-update-readiness",
         "detach",
         "conversations",
         "export-location",
@@ -986,7 +986,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name",),
         frozenset({"-h", "--help", "--yes"}),
     )
-    assert _surface(commands["postgresql-update-readiness"])[0] == (
+    assert _surface(commands["relational-update-readiness"])[0] == (
         "name",
         "source_id",
         "resource_id",

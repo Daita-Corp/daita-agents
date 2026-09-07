@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from _relational_write_support import update_constraints
+
 from dataclasses import asdict
 from datetime import UTC, datetime
 
@@ -161,7 +163,7 @@ async def test_inspect_is_exact_complete_catalog_and_secret_free(tmp_path):
     try:
         inspection = await agent.inspect_source_permissions(source.id)
         assert inspection.state.read_scope.mode is SourceReadMode.ALL
-        assert inspection.state.postgresql_update_scopes == ()
+        assert inspection.state.relational_write_scopes == ()
         assert {item.resource_id for item in inspection.resources} == {
             resource.id for resource in resources.values()
         }
@@ -194,7 +196,7 @@ async def test_preview_apply_read_modes(tmp_path, mode, selected_names):
             source_id=source.id,
             read_mode=mode,
             read_resource_ids=selected_ids,
-            postgresql_update_scopes={},
+            relational_write_scopes={},
         )
         assert preview.before.read_scope.mode is SourceReadMode.ALL
         assert preview.after.read_scope.mode is mode
@@ -222,14 +224,16 @@ async def test_write_adds_read_uses_exact_columns_and_read_narrowing_revokes(tmp
             source_id=source.id,
             read_mode="none",
             read_resource_ids=(),
-            postgresql_update_scopes={orders.id: ["value_01", "value_02"]},
+            relational_write_scopes={
+                orders.id: update_constraints(("value_01", "value_02"))
+            },
         )
         assert write_preview.after.read_scope.mode is SourceReadMode.SELECTED
         assert write_preview.after.read_scope.resource_ids == (orders.id,)
         assert write_preview.automatic_read_additions == (orders.id,)
-        assert write_preview.after.postgresql_update_scopes[
+        assert write_preview.after.relational_write_scopes[
             0
-        ].allowed_assignment_columns == ("value_01", "value_02")
+        ].allowed_update_columns == ("value_01", "value_02")
         await agent.apply_source_permissions(
             source_id=source.id,
             confirmation_fingerprint=write_preview.confirmation_fingerprint,
@@ -239,10 +243,10 @@ async def test_write_adds_read_uses_exact_columns_and_read_narrowing_revokes(tmp
             source_id=source.id,
             read_mode="none",
             read_resource_ids=(),
-            postgresql_update_scopes={},
+            relational_write_scopes={},
         )
-        assert revoke_preview.dependent_update_revocations == (orders.id,)
-        assert revoke_preview.after.postgresql_update_scopes == ()
+        assert revoke_preview.dependent_write_revocations == (orders.id,)
+        assert revoke_preview.after.relational_write_scopes == ()
         await agent.apply_source_permissions(
             source_id=source.id,
             confirmation_fingerprint=revoke_preview.confirmation_fingerprint,
@@ -255,15 +259,16 @@ async def test_write_selected_many_all_current_and_future_table_exclusion(tmp_pa
     agent, source, resources = await _agent_with_catalog(tmp_path)
     try:
         mapping = {
-            resource.id: ["value_01", "value_02"] for resource in resources.values()
+            resource.id: update_constraints(("value_01", "value_02"))
+            for resource in resources.values()
         }
         preview = await agent.preview_source_permissions(
             source_id=source.id,
             read_mode="all",
             read_resource_ids=(),
-            postgresql_update_scopes=mapping,
+            relational_write_scopes=mapping,
         )
-        assert len(preview.after.postgresql_update_scopes) == 2
+        assert len(preview.after.relational_write_scopes) == 2
         await agent.apply_source_permissions(
             source_id=source.id,
             confirmation_fingerprint=preview.confirmation_fingerprint,
@@ -280,7 +285,7 @@ async def test_write_selected_many_all_current_and_future_table_exclusion(tmp_pa
         )
         inspection = await agent.inspect_source_permissions(source.id)
         assert refreshed_resources["future"].id not in {
-            scope.resource_id for scope in inspection.state.postgresql_update_scopes
+            scope.resource_id for scope in inspection.state.relational_write_scopes
         }
     finally:
         await agent.close()
@@ -309,10 +314,10 @@ async def test_advanced_columns_support_wide_exact_binding_and_stale_preview(tmp
             source_id=source.id,
             read_mode="all",
             read_resource_ids=(),
-            postgresql_update_scopes={wide.id: list(all_columns)},
+            relational_write_scopes={wide.id: update_constraints(all_columns)},
         )
         assert (
-            preview.after.postgresql_update_scopes[0].allowed_assignment_columns
+            preview.after.relational_write_scopes[0].allowed_update_columns
             == all_columns
         )
 
@@ -329,7 +334,7 @@ async def test_advanced_columns_support_wide_exact_binding_and_stale_preview(tmp
             )
         assert (
             await agent.inspect_source_permissions(source.id)
-        ).state.postgresql_update_scopes == ()
+        ).state.relational_write_scopes == ()
     finally:
         await agent.close()
 
@@ -341,7 +346,7 @@ async def test_unknown_or_wrong_confirmation_never_changes_state(tmp_path):
             source_id=source.id,
             read_mode="selected",
             read_resource_ids=(resources["orders"].id,),
-            postgresql_update_scopes={},
+            relational_write_scopes={},
         )
         with pytest.raises(ValueError, match="unknown or expired"):
             await agent.apply_source_permissions(

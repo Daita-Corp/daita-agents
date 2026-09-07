@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-from ..sqlite_records import PostgreSQLUpdateScope, SourceReadMode, SourceReadScope
+from ..sqlite_records import RelationalWriteScope, SourceReadMode, SourceReadScope
 from .common import (
     dump_payload,
     integer,
     load_payload,
     record,
     record_fields,
+    plain_encode,
     sequence,
     text,
 )
 
 _SOURCE_READ_SCOPE_VERSION = 1
-_POSTGRESQL_UPDATE_SCOPE_VERSION = 1
+_RELATIONAL_WRITE_SCOPE_VERSION = 1
 
 
 def encode_source_read_scope(value: SourceReadScope) -> str:
@@ -61,57 +62,71 @@ def decode_source_read_scope(
     )
 
 
-def encode_postgresql_update_scope(value: PostgreSQLUpdateScope) -> str:
-    if not isinstance(value, PostgreSQLUpdateScope):
-        raise TypeError("update-scope codec requires PostgreSQLUpdateScope")
+def encode_relational_write_scope(value: RelationalWriteScope) -> str:
+    if not isinstance(value, RelationalWriteScope):
+        raise TypeError("write-scope codec requires RelationalWriteScope")
     return dump_payload(
         record(
-            "PostgreSQLUpdateScope",
+            "RelationalWriteScope",
             {
-                "version": _POSTGRESQL_UPDATE_SCOPE_VERSION,
-                "allowed_assignment_columns": list(value.allowed_assignment_columns),
+                "version": _RELATIONAL_WRITE_SCOPE_VERSION,
+                **{
+                    key: plain_encode(item) for key, item in value.constraints().items()
+                },
             },
         )
     )
 
 
-def decode_postgresql_update_scope(
+def decode_relational_write_scope(
     value: str,
     *,
     agent_id: str,
     source_id: str,
     resource_id: str,
     authorization_fingerprint: str,
-) -> PostgreSQLUpdateScope:
+) -> RelationalWriteScope:
     fields = record_fields(
         load_payload(value),
-        "PostgreSQLUpdateScope",
-        ("version", "allowed_assignment_columns"),
+        "RelationalWriteScope",
+        (
+            "version",
+            "resource_revision",
+            "allowed_operations",
+            "allowed_insert_columns",
+            "allowed_update_columns",
+            "key_columns",
+            "generated_identity_columns",
+            "max_rows",
+        ),
     )
     if (
-        integer(fields["version"], "update scope version")
-        != _POSTGRESQL_UPDATE_SCOPE_VERSION
+        integer(fields["version"], "write scope version")
+        != _RELATIONAL_WRITE_SCOPE_VERSION
     ):
-        raise ValueError("stored PostgreSQL update scope version is unsupported")
-    columns = tuple(
-        text(item, "update scope assignment column")
-        for item in sequence(
-            fields["allowed_assignment_columns"],
-            "update scope allowed_assignment_columns",
-        )
-    )
-    return PostgreSQLUpdateScope(
+        raise ValueError("stored relational write scope version is unsupported")
+
+    def names(name: str) -> tuple[str, ...]:
+        return tuple(text(item, name) for item in sequence(fields[name], name))
+
+    return RelationalWriteScope(
         agent_id=agent_id,
         source_id=source_id,
         resource_id=resource_id,
-        allowed_assignment_columns=columns,
         authorization_fingerprint=authorization_fingerprint,
+        resource_revision=text(fields["resource_revision"], "resource_revision"),
+        allowed_operations=names("allowed_operations"),
+        allowed_insert_columns=names("allowed_insert_columns"),
+        allowed_update_columns=names("allowed_update_columns"),
+        key_columns=names("key_columns"),
+        generated_identity_columns=names("generated_identity_columns"),
+        max_rows=integer(fields["max_rows"], "max_rows"),
     )
 
 
 __all__ = [
-    "decode_postgresql_update_scope",
+    "decode_relational_write_scope",
     "decode_source_read_scope",
-    "encode_postgresql_update_scope",
+    "encode_relational_write_scope",
     "encode_source_read_scope",
 ]

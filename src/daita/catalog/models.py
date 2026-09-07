@@ -294,6 +294,7 @@ class TabularColumn:
     default_expression: str | None = None
     native_type_namespace: str | None = None
     native_type_name: str | None = None
+    collation: str | None = None
     identity: bool = False
     generated: bool = False
     updatable: bool = False
@@ -325,6 +326,7 @@ class TabularColumn:
             raise ValueError(
                 "column native type namespace and name must be provided together"
             )
+        _optional_text(self.collation, "column collation", maximum=256)
         for value, name in (
             (self.identity, "column identity"),
             (self.generated, "column generated"),
@@ -335,6 +337,7 @@ class TabularColumn:
 
     def to_payload(self) -> dict[str, object]:
         return {
+            "collation": self.collation,
             "default_expression": self.default_expression,
             "name": self.name,
             "native_type": self.native_type,
@@ -356,6 +359,7 @@ class TabularColumn:
             payload,
             frozenset(
                 {
+                    "collation",
                     "default_expression",
                     "generated",
                     "identity",
@@ -377,6 +381,7 @@ class TabularColumn:
             ordinal=cast(int, value["ordinal"]),
             nullable=cast(bool, value["nullable"]),
             primary_key_ordinal=cast(int | None, value["primary_key_ordinal"]),
+            collation=cast(str | None, value["collation"]),
             default_expression=cast(str | None, value["default_expression"]),
             native_type_namespace=cast(
                 str | None,
@@ -396,6 +401,7 @@ class TabularIndex:
     columns: tuple[str, ...]
     unique: bool
     predicate: str | None = None
+    write_conflict_supported: bool = False
 
     def __post_init__(self) -> None:
         _required_text(self.name, "index name", maximum=256)
@@ -406,6 +412,8 @@ class TabularIndex:
             maximum_items=64,
             allow_empty=False,
         )
+        if not isinstance(self.write_conflict_supported, bool):
+            raise TypeError("index write_conflict_supported must be boolean")
         if not isinstance(self.unique, bool):
             raise TypeError("index unique must be a boolean")
         _optional_text(self.predicate, "index predicate", maximum=4_096)
@@ -418,6 +426,7 @@ class TabularIndex:
             "name": self.name,
             "predicate": self.predicate,
             "unique": self.unique,
+            "write_conflict_supported": self.write_conflict_supported,
         }
 
     @classmethod
@@ -426,7 +435,16 @@ class TabularIndex:
 
         value = _exact_payload_fields(
             payload,
-            frozenset({"columns", "kind", "name", "predicate", "unique"}),
+            frozenset(
+                {
+                    "columns",
+                    "kind",
+                    "name",
+                    "predicate",
+                    "unique",
+                    "write_conflict_supported",
+                }
+            ),
             "tabular index payload",
         )
         raw_columns = value["columns"]
@@ -437,6 +455,7 @@ class TabularIndex:
             kind=cast(str, value["kind"]),
             columns=cast(tuple[str, ...], raw_columns),
             unique=cast(bool, value["unique"]),
+            write_conflict_supported=cast(bool, value["write_conflict_supported"]),
             predicate=cast(str | None, value["predicate"]),
         )
 

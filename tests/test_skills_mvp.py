@@ -1050,7 +1050,7 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
             "mcp_server_bindings",
             "messages",
             "metadata",
-            "postgresql_update_scopes",
+            "relational_write_scopes",
             "runs",
             "routine_occurrences",
             "scheduled_routines",

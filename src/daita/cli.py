@@ -286,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_revoke.add_argument("--yes", action="store_true")
 
     readiness = commands.add_parser(
-        "postgresql-update-readiness",
+        "relational-update-readiness",
         help="inspect one resource and assignment-column update scope",
     )
     readiness.add_argument("name")
@@ -1436,8 +1436,8 @@ async def _execute(args: argparse.Namespace) -> object:
             if not args.yes:
                 raise ValueError("mcp revoke requires --yes")
             return _mcp_status_mapping(await agent.revoke_mcp_server(args.binding_id))
-        if args.command == "postgresql-update-readiness":
-            readiness_result = await agent.postgresql_update_readiness(
+        if args.command == "relational-update-readiness":
+            readiness_result = await agent.relational_update_readiness(
                 args.source_id,
                 args.resource_id,
                 tuple(args.assignment_columns),

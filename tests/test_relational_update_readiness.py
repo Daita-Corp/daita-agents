@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 from _workspace_support import workspace_for
 
-from daita import Agent, PostgreSQLSource, PostgreSQLUpdateReadiness
+from daita import Agent, PostgreSQLSource, RelationalUpdateReadiness
 from daita._json import canonical_json
 from daita.adapters import (
     postgresql as postgresql_module,
@@ -18,9 +18,10 @@ from daita.adapters.models import SourceRegistration
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.sql import (
     ResourceSchema,
-    validate_postgresql_update_scope,
+    validate_relational_write_scope,
 )
 from daita.security import SecretReference
+from daita.storage.sqlite_records import RelationalWriteScope
 
 NOW = datetime(2026, 8, 10, tzinfo=UTC)
 SOURCE_ID = "source:sha256:" + "a" * 64
@@ -160,12 +161,28 @@ class _Catalog:
         assert agent_id == "agent-readiness"
         return (self.resource,) if source_id == SOURCE_ID else ()
 
-    async def postgresql_update_scope_issue(
+    async def load_relational_write_scope(self, agent_id, source_id, resource_id):
+        return RelationalWriteScope(
+            agent_id=agent_id,
+            source_id=source_id,
+            resource_id=resource_id,
+            resource_revision=RESOURCE_REVISION,
+            allowed_operations=("update",),
+            allowed_insert_columns=(),
+            allowed_update_columns=("status",),
+            key_columns=("account_id",),
+            generated_identity_columns=(),
+            max_rows=10000,
+            authorization_fingerprint="sha256:" + "9" * 64,
+        )
+
+    async def relational_write_scope_issue(
         self,
         agent_id: str,
         source_id: str,
         resource_id: str,
         assignment_columns: tuple[str, ...],
+        **kwargs: object,
     ) -> tuple[str, str] | None:
         del agent_id, source_id, resource_id, assignment_columns
         return self.scope_issue
@@ -247,7 +264,7 @@ async def _readiness(
     facts: dict[str, object],
     resource: ResourceSchema | None = None,
     source_revision: str = SOURCE_REVISION,
-) -> tuple[PostgreSQLUpdateReadiness, _Connection]:
+) -> tuple[RelationalUpdateReadiness, _Connection]:
     connection = _Connection(facts)
 
     async def connect(*args: object, **kwargs: object):
@@ -264,7 +281,7 @@ async def _readiness(
 
     monkeypatch.setattr(write_module, "_connect", connect)
     monkeypatch.setattr(write_module, "_load_structure", load_structure)
-    backend = write_module.PostgreSQLUpdatePreviewBackend(
+    backend = write_module.PostgreSQLWriteBackend(
         _Sources(_registration()),
         _Catalog(
             resource,
@@ -278,7 +295,7 @@ async def _readiness(
             ),
         ),
     )
-    result = await backend.postgresql_update_readiness(
+    result = await backend.relational_update_readiness(
         agent_id="agent-readiness",
         source_id=SOURCE_ID,
         resource_id=RESOURCE_ID,
@@ -385,7 +402,7 @@ def test_readiness_scope_validation_fails_closed_on_catalog_shape(
     columns: tuple[str, ...],
     expected_code: str,
 ) -> None:
-    result = validate_postgresql_update_scope(
+    result = validate_relational_write_scope(
         SOURCE_ID,
         RESOURCE_ID,
         columns,
@@ -475,12 +492,12 @@ async def test_readiness_connection_failure_omits_raw_diagnostics(
         )
 
     monkeypatch.setattr(write_module, "_connect", failed_connect)
-    backend = write_module.PostgreSQLUpdatePreviewBackend(
+    backend = write_module.PostgreSQLWriteBackend(
         _Sources(_registration()),
         _Catalog(),
     )
 
-    result = await backend.postgresql_update_readiness(
+    result = await backend.relational_update_readiness(
         agent_id="agent-readiness",
         source_id=SOURCE_ID,
         resource_id=RESOURCE_ID,
@@ -507,12 +524,12 @@ async def test_readiness_rejects_unavailable_source_before_connection(
         raise AssertionError("unavailable source must be rejected before connection")
 
     monkeypatch.setattr(write_module, "_connect", forbidden_connect)
-    backend = write_module.PostgreSQLUpdatePreviewBackend(
+    backend = write_module.PostgreSQLWriteBackend(
         _Sources(_registration()),
         _Catalog(),
     )
 
-    result = await backend.postgresql_update_readiness(
+    result = await backend.relational_update_readiness(
         agent_id="wrong-agent",
         source_id=SOURCE_ID,
         resource_id=RESOURCE_ID,
@@ -546,12 +563,12 @@ async def test_readiness_rejects_wrong_adapter_or_inactive_source_before_connect
         raise AssertionError("ineligible source must be rejected before connection")
 
     monkeypatch.setattr(write_module, "_connect", forbidden_connect)
-    backend = write_module.PostgreSQLUpdatePreviewBackend(
+    backend = write_module.PostgreSQLWriteBackend(
         _Sources(registration),
         _Catalog(),
     )
 
-    result = await backend.postgresql_update_readiness(
+    result = await backend.relational_update_readiness(
         agent_id="agent-readiness",
         source_id=SOURCE_ID,
         resource_id=RESOURCE_ID,
@@ -573,13 +590,13 @@ async def test_readiness_rejects_wrong_adapter_or_inactive_source_before_connect
 async def test_readiness_rejects_malformed_assignment_scope_before_source_io(
     assignment_columns: tuple[str, ...],
 ) -> None:
-    backend = write_module.PostgreSQLUpdatePreviewBackend(
+    backend = write_module.PostgreSQLWriteBackend(
         _Sources(_registration()),
         _Catalog(),
     )
 
     with pytest.raises(ValueError, match="distinct bounded names"):
-        await backend.postgresql_update_readiness(
+        await backend.relational_update_readiness(
             agent_id="agent-readiness",
             source_id=SOURCE_ID,
             resource_id=RESOURCE_ID,
@@ -613,23 +630,23 @@ async def test_public_agent_readiness_delegates_exact_scope_without_mutation(
         "public-readiness", root=tmp_path, workspace=workspace_for(tmp_path)
     )
 
-    async def readiness(**kwargs: object) -> PostgreSQLUpdateReadiness:
+    async def readiness(**kwargs: object) -> RelationalUpdateReadiness:
         calls.append(kwargs)
         return expected
 
     monkeypatch.setattr(
-        agent._embedded._postgresql_update_backend,
-        "postgresql_update_readiness",
+        agent._embedded._relational_update_backend,
+        "relational_update_readiness",
         readiness,
     )
     try:
-        actual = await agent.postgresql_update_readiness(
+        actual = await agent.relational_update_readiness(
             SOURCE_ID,
             RESOURCE_ID,
             ("status",),
         )
         with pytest.raises(TypeError, match="must be a tuple"):
-            await agent.postgresql_update_readiness(
+            await agent.relational_update_readiness(
                 SOURCE_ID,
                 RESOURCE_ID,
                 ["status"],  # type: ignore[arg-type]

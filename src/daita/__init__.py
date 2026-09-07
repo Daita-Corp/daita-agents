@@ -15,7 +15,7 @@ from .adapters import (
     PostgreSQLSource,
     SQLiteSource,
 )
-from .adapters.postgresql_write import PostgreSQLUpdateReadiness
+from .adapters.postgresql_write import RelationalUpdateReadiness
 from .agent import Agent
 from .artifacts import (
     ArtifactDeliveryReceipt,
@@ -92,6 +92,7 @@ from .loop import (
     LoopLimits,
     Transcript,
 )
+from .storage.sqlite_records import RelationalWriteScope
 from .observation import AgentEvent, AgentEventKind, AgentObserver
 from .routines import (
     AmbiguousTimePolicy,
@@ -217,7 +218,7 @@ __all__ = [
     "OutcomeReference",
     "OutcomeState",
     "PostgreSQLSource",
-    "PostgreSQLUpdateReadiness",
+    "RelationalUpdateReadiness",
     "RetryPolicy",
     "ResidentReady",
     "ReportingMode",
@@ -241,6 +242,7 @@ __all__ = [
     "SkillSummary",
     "ScheduledRoutineDraft",
     "RequestedCapabilityGrant",
+    "RelationalWriteScope",
     "ScheduledRoutineInspection",
     "ScheduledRoutineSummary",
     "ScheduledRoutine",

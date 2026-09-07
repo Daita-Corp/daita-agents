@@ -31,16 +31,17 @@ from daita.capabilities import (
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.controller import (
-    POSTGRESQL_UPDATE_CAPABILITY_ID,
+    RELATIONAL_UPDATE_CAPABILITY_ID,
 )
 from daita.domains.data.sql import (
-    PostgreSQLUpdateCommand,
-    PostgreSQLUpdateIntent,
+    RelationalUpdateCommand,
+    RelationalUpdateIntent,
     ResourceSchema,
 )
 from daita.llm.models import ToolCall
 from daita.loop.models import RunInput
 from daita.security import EmptySecretProvider
+from daita.storage.sqlite_records import RelationalWriteScope
 from daita.storage.sqlite import SQLiteStateStore
 from daita.capabilities import (
     EffectOutcome,
@@ -88,8 +89,23 @@ class _Catalog:
         del agent_id
         return (_resource(),) if source_id == SOURCE_ID else ()
 
-    async def postgresql_update_scope_issue(
-        self, agent_id, source_id, resource_id, assignment_columns
+    async def load_relational_write_scope(self, agent_id, source_id, resource_id):
+        return RelationalWriteScope(
+            agent_id=agent_id,
+            source_id=source_id,
+            resource_id=resource_id,
+            resource_revision=RESOURCE_REVISION,
+            allowed_operations=("update",),
+            allowed_insert_columns=(),
+            allowed_update_columns=("status", "priority"),
+            key_columns=("account_id",),
+            generated_identity_columns=(),
+            max_rows=10000,
+            authorization_fingerprint="sha256:" + "9" * 64,
+        )
+
+    async def relational_write_scope_issue(
+        self, agent_id, source_id, resource_id, assignment_columns, **kwargs
     ):
         del agent_id, source_id, resource_id, assignment_columns
         return None
@@ -220,8 +236,8 @@ def _resource() -> ResourceSchema:
     )
 
 
-def _intent() -> PostgreSQLUpdateIntent:
-    return PostgreSQLUpdateIntent.from_mapping(
+def _intent() -> RelationalUpdateIntent:
+    return RelationalUpdateIntent.from_mapping(
         {
             "source_id": SOURCE_ID,
             "resource_id": RESOURCE_ID,
@@ -234,8 +250,8 @@ def _intent() -> PostgreSQLUpdateIntent:
     )
 
 
-def _priority_intent() -> PostgreSQLUpdateIntent:
-    return PostgreSQLUpdateIntent.from_mapping(
+def _priority_intent() -> RelationalUpdateIntent:
+    return RelationalUpdateIntent.from_mapping(
         {
             "source_id": SOURCE_ID,
             "resource_id": RESOURCE_ID,
@@ -327,7 +343,7 @@ def _execution() -> ToolExecution:
     return ToolExecution(
         run_id="run-update",
         call_id="call-update",
-        capability_id=POSTGRESQL_UPDATE_CAPABILITY_ID,
+        capability_id=RELATIONAL_UPDATE_CAPABILITY_ID,
         effect_receipt_id="effect-receipt:sha256:" + "e" * 64,
     )
 
@@ -348,7 +364,7 @@ def _patch_io(monkeypatch, connections: list[_Connection]) -> None:
 
 
 def _backend(store: SQLiteStateStore):
-    return write_module.PostgreSQLUpdatePreviewBackend(
+    return write_module.PostgreSQLWriteBackend(
         _SourceStore(_registration()),
         _Catalog(),
         EmptySecretProvider(),
@@ -360,12 +376,12 @@ async def _command(
     backend,
     *,
     expected_rows: int = 3,
-    intent: PostgreSQLUpdateIntent | None = None,
+    intent: RelationalUpdateIntent | None = None,
 ):
     selected = intent or _intent()
     preview = await backend.preview_update(agent_id="agent-update", intent=selected)
     assert preview.matched_rows == expected_rows
-    return PostgreSQLUpdateCommand(
+    return RelationalUpdateCommand(
         intent=selected,
         preview_fingerprint=preview.fingerprint.preview_fingerprint,
         expected_affected_rows=preview.matched_rows,
@@ -412,7 +428,7 @@ async def test_target_set_drift_rolls_back_without_update(monkeypatch, tmp_path)
     backend = _backend(store)
     try:
         command = await _command(backend)
-        with pytest.raises(write_module.PostgreSQLUpdateExecutionError) as captured:
+        with pytest.raises(write_module.RelationalUpdateExecutionError) as captured:
             await backend.execute_update(
                 agent_id="agent-update", execution=_execution(), command=command
             )
@@ -450,7 +466,7 @@ async def test_assigned_value_drift_rolls_back_without_update(monkeypatch, tmp_p
     backend = _backend(store)
     try:
         command = await _command(backend, intent=intent)
-        with pytest.raises(write_module.PostgreSQLUpdateExecutionError) as captured:
+        with pytest.raises(write_module.RelationalUpdateExecutionError) as captured:
             await backend.execute_update(
                 agent_id="agent-update", execution=_execution(), command=command
             )
@@ -498,7 +514,7 @@ class _AtomicUpdateExecutor:
 async def test_runtime_omits_only_redundant_post_approval_update_preflight(tmp_path):
     executor = _AtomicUpdateExecutor()
     capability = Capability(
-        id=POSTGRESQL_UPDATE_CAPABILITY_ID,
+        id=RELATIONAL_UPDATE_CAPABILITY_ID,
         description="test atomic PostgreSQL update",
         input_schema={
             "type": "object",
@@ -587,7 +603,7 @@ async def test_affected_row_mismatch_rolls_back(monkeypatch, tmp_path):
     backend = _backend(store)
     try:
         command = await _command(backend)
-        with pytest.raises(write_module.PostgreSQLUpdateExecutionError) as captured:
+        with pytest.raises(write_module.RelationalUpdateExecutionError) as captured:
             await backend.execute_update(
                 agent_id="agent-update", execution=_execution(), command=command
             )
@@ -606,7 +622,7 @@ async def test_commit_uncertainty_is_recorded_and_never_retried(monkeypatch, tmp
     backend = _backend(store)
     try:
         command = await _command(backend)
-        with pytest.raises(write_module.PostgreSQLUpdateExecutionError) as captured:
+        with pytest.raises(write_module.RelationalUpdateExecutionError) as captured:
             await backend.execute_update(
                 agent_id="agent-update", execution=_execution(), command=command
             )
@@ -634,7 +650,7 @@ async def test_commit_uncertainty_is_recorded_and_never_retried(monkeypatch, tmp
 
 
 async def test_duplicate_execution_identity_never_reconnects(monkeypatch, tmp_path):
-    from daita.domains.data.capabilities import POSTGRESQL_UPDATE_RECEIPT_POLICY
+    from daita.domains.data.capabilities import RELATIONAL_UPDATE_RECEIPT_POLICY
 
     store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
     await store.initialize_identity(AgentIdentity("agent-update", "Update", NOW))
@@ -658,7 +674,7 @@ async def test_duplicate_execution_identity_never_reconnects(monkeypatch, tmp_pa
 
     executor = NativeExecutor()
     capability = Capability(
-        id=POSTGRESQL_UPDATE_CAPABILITY_ID,
+        id=RELATIONAL_UPDATE_CAPABILITY_ID,
         description="Exact native update",
         input_schema={
             "type": "object",
@@ -675,7 +691,7 @@ async def test_duplicate_execution_identity_never_reconnects(monkeypatch, tmp_pa
         executor_id=executor.executor_id,
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
-        effect_receipt_policy=POSTGRESQL_UPDATE_RECEIPT_POLICY,
+        effect_receipt_policy=RELATIONAL_UPDATE_RECEIPT_POLICY,
     )
     view = ToolView(
         name="test_update",

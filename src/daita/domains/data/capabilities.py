@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...capabilities import (
     AccessMode,
     AutomationEligibility,
+    AutomationGrantPolicy,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -28,30 +29,31 @@ from ...capabilities import (
 from .controller import (
     DATA_QUERY_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
-    POSTGRESQL_UPDATE_CAPABILITY_ID,
-    POSTGRESQL_UPDATE_EVIDENCE_KIND,
-    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-    POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    RELATIONAL_UPDATE_CAPABILITY_ID,
+    RELATIONAL_UPDATE_EVIDENCE_KIND,
+    RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
+    RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
 )
 from .results import BoundedResultProjection
+from .sql.relational_upsert import RelationalUpsertIntent
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
-    PostgreSQLUpdateCell,
-    PostgreSQLUpdateCommand,
-    PostgreSQLUpdateFilter,
-    PostgreSQLUpdateIntent,
+    RelationalUpdateCell,
+    RelationalUpdateCommand,
+    RelationalUpdateFilter,
+    RelationalUpdateIntent,
 )
 
 DATA_QUERY_EXECUTOR_ID = "data.query.executor"
 DATA_QUERY_TOOL_NAME = "data_query"
-POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID = "data.postgresql.update_impact.executor"
-POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME = "data_preview_postgresql_update"
-POSTGRESQL_UPDATE_EXECUTOR_ID = "data.postgresql.update.executor"
-POSTGRESQL_UPDATE_TOOL_NAME = "data_update_postgresql"
+RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
+RELATIONAL_UPDATE_PREVIEW_TOOL_NAME = "data_preview_update_rows"
+RELATIONAL_UPDATE_EXECUTOR_ID = "data.update_rows.executor"
+RELATIONAL_UPDATE_TOOL_NAME = "data_update_rows"
 _MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
 
-POSTGRESQL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
+RELATIONAL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
     receipt_kind="data.update_rows",
     success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
     payload_schema={
@@ -151,7 +153,7 @@ class PostgreSQLReadResult(SqlReadResult):
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLPreviewFingerprint:
+class RelationalPreviewFingerprint:
     intent_sha256: str
     target_set_sha256: str
     statement_sha256: str
@@ -174,7 +176,7 @@ class PostgreSQLPreviewFingerprint:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdatePreviewChecks:
+class RelationalUpdatePreviewChecks:
     compile_only: str = "passed"
     target_set_fingerprinted: bool = True
     row_level_security: bool = False
@@ -211,23 +213,23 @@ class PostgreSQLUpdatePreviewChecks:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateSample:
-    primary_key: tuple[PostgreSQLUpdateCell, ...]
-    before: tuple[PostgreSQLUpdateCell, ...]
-    after: tuple[PostgreSQLUpdateCell, ...]
+class RelationalUpdateSample:
+    primary_key: tuple[RelationalUpdateCell, ...]
+    before: tuple[RelationalUpdateCell, ...]
+    after: tuple[RelationalUpdateCell, ...]
 
     def __post_init__(self) -> None:
         primary_key = tuple(self.primary_key)
         before = tuple(self.before)
         after = tuple(self.after)
         if not primary_key or any(
-            not isinstance(item, PostgreSQLUpdateCell) for item in primary_key
+            not isinstance(item, RelationalUpdateCell) for item in primary_key
         ):
             raise ValueError("update sample requires a primary key")
         if (
             not before
-            or any(not isinstance(item, PostgreSQLUpdateCell) for item in before)
-            or any(not isinstance(item, PostgreSQLUpdateCell) for item in after)
+            or any(not isinstance(item, RelationalUpdateCell) for item in before)
+            or any(not isinstance(item, RelationalUpdateCell) for item in after)
             or tuple(item.column for item in before)
             != tuple(item.column for item in after)
         ):
@@ -245,18 +247,18 @@ class PostgreSQLUpdateSample:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdatePreview:
+class RelationalUpdatePreview:
     source_id: str
     resource_id: str
     resource_name: str
     source_revision: str
     resource_revision: str
-    where: tuple[PostgreSQLUpdateFilter, ...]
-    assignments: tuple[PostgreSQLUpdateCell, ...]
+    where: tuple[RelationalUpdateFilter, ...]
+    assignments: tuple[RelationalUpdateCell, ...]
     matched_rows: int
-    samples: tuple[PostgreSQLUpdateSample, ...]
-    fingerprint: PostgreSQLPreviewFingerprint
-    checks: PostgreSQLUpdatePreviewChecks
+    samples: tuple[RelationalUpdateSample, ...]
+    fingerprint: RelationalPreviewFingerprint
+    checks: RelationalUpdatePreviewChecks
     warnings: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -273,11 +275,11 @@ class PostgreSQLUpdatePreview:
         assignments = tuple(self.assignments)
         samples = tuple(self.samples)
         if not where or any(
-            not isinstance(item, PostgreSQLUpdateFilter) for item in where
+            not isinstance(item, RelationalUpdateFilter) for item in where
         ):
             raise TypeError("preview where must contain update filters")
         if not assignments or any(
-            not isinstance(item, PostgreSQLUpdateCell) for item in assignments
+            not isinstance(item, RelationalUpdateCell) for item in assignments
         ):
             raise TypeError("preview assignments must contain update cells")
         if (
@@ -287,7 +289,7 @@ class PostgreSQLUpdatePreview:
         ):
             raise ValueError("preview matched_rows must be a non-negative integer")
         if len(samples) > 5 or any(
-            not isinstance(item, PostgreSQLUpdateSample) for item in samples
+            not isinstance(item, RelationalUpdateSample) for item in samples
         ):
             raise ValueError("preview samples must be bounded update samples")
         if len(samples) > self.matched_rows:
@@ -295,10 +297,10 @@ class PostgreSQLUpdatePreview:
         object.__setattr__(self, "where", where)
         object.__setattr__(self, "assignments", assignments)
         object.__setattr__(self, "samples", samples)
-        if not isinstance(self.fingerprint, PostgreSQLPreviewFingerprint):
-            raise TypeError("preview fingerprint must be PostgreSQLPreviewFingerprint")
-        if not isinstance(self.checks, PostgreSQLUpdatePreviewChecks):
-            raise TypeError("preview checks must be PostgreSQLUpdatePreviewChecks")
+        if not isinstance(self.fingerprint, RelationalPreviewFingerprint):
+            raise TypeError("preview fingerprint must be RelationalPreviewFingerprint")
+        if not isinstance(self.checks, RelationalUpdatePreviewChecks):
+            raise TypeError("preview checks must be RelationalUpdatePreviewChecks")
         warnings = tuple(self.warnings)
         if len(warnings) > 8 or any(
             not isinstance(item, str) or not item or len(item) > 160
@@ -336,7 +338,7 @@ class PostgreSQLUpdatePreview:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateResult:
+class RelationalUpdateResult:
     """One positively acknowledged committed PostgreSQL update plan."""
 
     receipt_id: str
@@ -420,23 +422,23 @@ class PostgreSQLReadBackend(SqlReadBackend, Protocol):
     pass
 
 
-class PostgreSQLUpdatePreviewBackend(Protocol):
+class RelationalUpdatePreviewBackend(Protocol):
     async def preview_update(
         self,
         *,
         agent_id: str,
-        intent: PostgreSQLUpdateIntent,
-    ) -> PostgreSQLUpdatePreview: ...
+        intent: RelationalUpdateIntent,
+    ) -> RelationalUpdatePreview: ...
 
 
-class PostgreSQLUpdateBackend(PostgreSQLUpdatePreviewBackend, Protocol):
+class RelationalUpdateBackend(RelationalUpdatePreviewBackend, Protocol):
     async def execute_update(
         self,
         *,
         agent_id: str,
         execution: ToolExecution,
-        command: PostgreSQLUpdateCommand,
-    ) -> PostgreSQLUpdateResult: ...
+        command: RelationalUpdateCommand,
+    ) -> RelationalUpdateResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,14 +449,14 @@ class DataQueryDeclarations:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdatePreviewDeclarations:
+class RelationalUpdatePreviewDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
     tool_views: tuple[ToolView, ...]
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateDeclarations:
+class RelationalUpdateDeclarations:
     capabilities: tuple[Capability, ...]
     executors: tuple[Executor, ...]
     tool_views: tuple[ToolView, ...]
@@ -518,13 +520,13 @@ class DataQueryExecutor:
         return ToolOutput(kind=DATA_QUERY_EVIDENCE_KIND, data=data)
 
 
-class PostgreSQLUpdatePreviewExecutor:
-    executor_id = POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID
+class RelationalUpdatePreviewExecutor:
+    executor_id = RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID
 
     def __init__(
         self,
         agent_id: str,
-        backend: PostgreSQLUpdatePreviewBackend,
+        backend: RelationalUpdatePreviewBackend,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("preview executor agent_id must be non-empty text")
@@ -534,7 +536,7 @@ class PostgreSQLUpdatePreviewExecutor:
         self._backend = backend
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        intent = PostgreSQLUpdateIntent.from_mapping(request.arguments)
+        intent = RelationalUpdateIntent.from_mapping(request.arguments)
         result = await self._backend.preview_update(
             agent_id=self._agent_id,
             intent=intent,
@@ -546,15 +548,15 @@ class PostgreSQLUpdatePreviewExecutor:
         ):
             raise ValueError("preview backend returned a different update identity")
         return ToolOutput(
-            kind=POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
+            kind=RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
             data=result.tool_data(),
         )
 
 
-class PostgreSQLUpdateExecutor:
-    executor_id = POSTGRESQL_UPDATE_EXECUTOR_ID
+class RelationalUpdateExecutor:
+    executor_id = RELATIONAL_UPDATE_EXECUTOR_ID
 
-    def __init__(self, agent_id: str, backend: PostgreSQLUpdateBackend) -> None:
+    def __init__(self, agent_id: str, backend: RelationalUpdateBackend) -> None:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("update executor agent_id must be non-empty text")
         if not callable(getattr(backend, "preview_update", None)) or not callable(
@@ -567,7 +569,7 @@ class PostgreSQLUpdateExecutor:
         self._backend = backend
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        command = PostgreSQLUpdateCommand.from_mapping(request.arguments)
+        command = RelationalUpdateCommand.from_mapping(request.arguments)
         preview = await self._backend.preview_update(
             agent_id=self._agent_id,
             intent=command.intent,
@@ -599,7 +601,7 @@ class PostgreSQLUpdateExecutor:
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        command = PostgreSQLUpdateCommand.from_mapping(request.arguments)
+        command = RelationalUpdateCommand.from_mapping(request.arguments)
         result = await self._backend.execute_update(
             agent_id=self._agent_id,
             execution=request,
@@ -612,7 +614,7 @@ class PostgreSQLUpdateExecutor:
         ):
             raise ValueError("update backend returned a different update identity")
         return ToolOutput(
-            kind=POSTGRESQL_UPDATE_EVIDENCE_KIND,
+            kind=RELATIONAL_UPDATE_EVIDENCE_KIND,
             data=result.tool_data(),
             effect_observation=result.effect_observation,
         )
@@ -630,26 +632,26 @@ def data_query_declarations(
     )
 
 
-def postgresql_update_preview_declarations(
+def relational_update_preview_declarations(
     agent_id: str,
-    backend: PostgreSQLUpdatePreviewBackend,
-) -> PostgreSQLUpdatePreviewDeclarations:
-    executor = PostgreSQLUpdatePreviewExecutor(agent_id, backend)
-    declarations = postgresql_update_preview_capability_declarations()
-    return PostgreSQLUpdatePreviewDeclarations(
+    backend: RelationalUpdatePreviewBackend,
+) -> RelationalUpdatePreviewDeclarations:
+    executor = RelationalUpdatePreviewExecutor(agent_id, backend)
+    declarations = relational_update_preview_capability_declarations()
+    return RelationalUpdatePreviewDeclarations(
         declarations.capabilities,
         (executor,),
         declarations.tool_views,
     )
 
 
-def postgresql_update_declarations(
+def relational_update_declarations(
     agent_id: str,
-    backend: PostgreSQLUpdateBackend,
-) -> PostgreSQLUpdateDeclarations:
-    executor = PostgreSQLUpdateExecutor(agent_id, backend)
-    declarations = postgresql_update_capability_declarations()
-    return PostgreSQLUpdateDeclarations(
+    backend: RelationalUpdateBackend,
+) -> RelationalUpdateDeclarations:
+    executor = RelationalUpdateExecutor(agent_id, backend)
+    declarations = relational_update_capability_declarations()
+    return RelationalUpdateDeclarations(
         declarations.capabilities,
         (executor,),
         declarations.tool_views,
@@ -671,7 +673,7 @@ def data_query_capability_declarations() -> CapabilityDeclarations:
     )
 
 
-def postgresql_update_preview_capability_declarations() -> CapabilityDeclarations:
+def relational_update_preview_capability_declarations() -> CapabilityDeclarations:
     cell_schema: dict[str, object] = {
         "type": "object",
         "properties": {
@@ -706,12 +708,12 @@ def postgresql_update_preview_capability_declarations() -> CapabilityDeclaration
         "additionalProperties": False,
     }
     capability = Capability(
-        id=POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+        id=RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
         description=(
             "Validate and preview one structured PostgreSQL update over an exact "
             "catalog-scoped target set without changing the database. When the "
             "user requested approval or execution, pass the exact successful "
-            "preview immediately to data_update_postgresql; preview alone does "
+            "preview immediately to data_update_rows; preview alone does "
             "not request approval."
         ),
         input_schema={
@@ -739,23 +741,23 @@ def postgresql_update_preview_capability_declarations() -> CapabilityDeclaration
             "required": ["source_id", "resource_id", "where", "assignments"],
             "additionalProperties": False,
         },
-        output_kind=POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND,
-        output_schema=_postgresql_update_preview_output_schema(),
-        executor_id=POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID,
+        output_kind=RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
+        output_schema=_relational_update_preview_output_schema(),
+        executor_id=RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
     view = ToolView(
-        name=POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME,
+        name=RELATIONAL_UPDATE_PREVIEW_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
         presentation=ToolPresentation(
             toolbox_id=ToolboxId.SOURCES,
             load_mode=ToolLoadMode.ON_DEMAND,
             text_trust=ToolTextTrust.CODE,
-            summary="Preview the exact target set for a structured PostgreSQL update.",
-            when_to_use="Use before requesting approval for any supported PostgreSQL update.",
-            keywords=("data", "postgresql", "update", "preview"),
+            summary="Preview matching rows and proposed changes for a relational update.",
+            when_to_use="Use before applying an admitted update to existing rows.",
+            keywords=("data", "relational", "postgresql", "rows", "update", "preview"),
         ),
     )
     return CapabilityDeclarations(
@@ -766,7 +768,7 @@ def postgresql_update_preview_capability_declarations() -> CapabilityDeclaration
     )
 
 
-def postgresql_update_capability_declarations() -> CapabilityDeclarations:
+def relational_update_capability_declarations() -> CapabilityDeclarations:
     cell_schema: dict[str, object] = {
         "type": "object",
         "properties": {
@@ -801,7 +803,7 @@ def postgresql_update_capability_declarations() -> CapabilityDeclarations:
         "additionalProperties": False,
     }
     capability = Capability(
-        id=POSTGRESQL_UPDATE_CAPABILITY_ID,
+        id=RELATIONAL_UPDATE_CAPABILITY_ID,
         description=(
             "Submit one exact previewed PostgreSQL update to runtime approval. "
             "Calling this tool opens the approval interaction and applies the "
@@ -847,25 +849,34 @@ def postgresql_update_capability_declarations() -> CapabilityDeclarations:
             ],
             "additionalProperties": False,
         },
-        output_kind=POSTGRESQL_UPDATE_EVIDENCE_KIND,
-        output_schema=_postgresql_update_output_schema(),
-        executor_id=POSTGRESQL_UPDATE_EXECUTOR_ID,
+        output_kind=RELATIONAL_UPDATE_EVIDENCE_KIND,
+        output_schema=_relational_update_output_schema(),
+        executor_id=RELATIONAL_UPDATE_EXECUTOR_ID,
         access_mode=AccessMode.WRITE,
         operational_effect=OperationalEffect.MUTATE_DATA,
-        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
-        effect_receipt_policy=POSTGRESQL_UPDATE_RECEIPT_POLICY,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        effect_receipt_policy=RELATIONAL_UPDATE_RECEIPT_POLICY,
+        automation_grant_policy=NATIVE_WRITE_GRANT_POLICY,
     )
     view = ToolView(
-        name=POSTGRESQL_UPDATE_TOOL_NAME,
+        name=RELATIONAL_UPDATE_TOOL_NAME,
         capability_id=capability.id,
         description=capability.description,
         presentation=ToolPresentation(
             toolbox_id=ToolboxId.SOURCES,
             load_mode=ToolLoadMode.ON_DEMAND,
             text_trust=ToolTextTrust.CODE,
-            summary="Request approval and execute one exact previewed PostgreSQL update.",
-            when_to_use="Use only after a successful exact update preview.",
-            keywords=("data", "postgresql", "update", "approval"),
+            summary="Apply an exact previewed update to existing relational rows.",
+            when_to_use="Use after a successful update preview, with approval or an exact standing grant.",
+            keywords=(
+                "data",
+                "relational",
+                "postgresql",
+                "rows",
+                "update",
+                "apply",
+                "approval",
+            ),
         ),
     )
     return CapabilityDeclarations(
@@ -976,7 +987,7 @@ def _query_output_schema() -> dict[str, object]:
     }
 
 
-def _postgresql_update_preview_output_schema() -> dict[str, object]:
+def _relational_update_preview_output_schema() -> dict[str, object]:
     cell_schema = {
         "type": "object",
         "properties": {"column": {"type": "string"}, "value": {}},
@@ -1045,7 +1056,7 @@ def _postgresql_update_preview_output_schema() -> dict[str, object]:
     }
 
 
-def _postgresql_update_output_schema() -> dict[str, object]:
+def _relational_update_output_schema() -> dict[str, object]:
     hash_rule = {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"}
     names = (
         "receipt_id",
@@ -1093,29 +1104,385 @@ __all__ = [
     "DATA_QUERY_TOOL_NAME",
     "DataQueryDeclarations",
     "DataQueryExecutor",
-    "POSTGRESQL_UPDATE_PREVIEW_EXECUTOR_ID",
-    "POSTGRESQL_UPDATE_PREVIEW_TOOL_NAME",
-    "POSTGRESQL_UPDATE_EXECUTOR_ID",
-    "POSTGRESQL_UPDATE_TOOL_NAME",
+    "RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID",
+    "RELATIONAL_UPDATE_PREVIEW_TOOL_NAME",
+    "RELATIONAL_UPDATE_EXECUTOR_ID",
+    "RELATIONAL_UPDATE_TOOL_NAME",
     "PostgreSQLReadBackend",
     "PostgreSQLReadResult",
-    "PostgreSQLPreviewFingerprint",
-    "PostgreSQLUpdatePreview",
-    "PostgreSQLUpdatePreviewBackend",
-    "PostgreSQLUpdatePreviewChecks",
-    "PostgreSQLUpdatePreviewDeclarations",
-    "PostgreSQLUpdatePreviewExecutor",
-    "PostgreSQLUpdateBackend",
-    "PostgreSQLUpdateDeclarations",
-    "PostgreSQLUpdateExecutor",
-    "PostgreSQLUpdateResult",
-    "PostgreSQLUpdateSample",
+    "RelationalPreviewFingerprint",
+    "RelationalUpdatePreview",
+    "RelationalUpdatePreviewBackend",
+    "RelationalUpdatePreviewChecks",
+    "RelationalUpdatePreviewDeclarations",
+    "RelationalUpdatePreviewExecutor",
+    "RelationalUpdateBackend",
+    "RelationalUpdateDeclarations",
+    "RelationalUpdateExecutor",
+    "RelationalUpdateResult",
+    "RelationalUpdateSample",
     "SQLiteReadBackend",
     "SQLiteReadResult",
     "data_query_declarations",
     "data_query_capability_declarations",
-    "postgresql_update_preview_declarations",
-    "postgresql_update_preview_capability_declarations",
-    "postgresql_update_declarations",
-    "postgresql_update_capability_declarations",
+    "relational_update_preview_declarations",
+    "relational_update_preview_capability_declarations",
+    "relational_upsert_declarations",
+    "relational_upsert_capability_declarations",
+    "RelationalUpsertResult",
+    "RelationalUpsertBackend",
+    "relational_update_declarations",
+    "relational_update_capability_declarations",
 ]
+
+# The native grant is one exact resource and one bounded invocation per occurrence.
+_NATIVE_COLUMNS_SCHEMA = {
+    "type": "array",
+    "items": {"type": "string", "minLength": 1, "maxLength": 256},
+    "maxItems": 512,
+    "uniqueItems": True,
+}
+NATIVE_WRITE_GRANT_POLICY = AutomationGrantPolicy(
+    constraints_kind="data.relational_write",
+    constraints_schema={
+        "type": "object",
+        "properties": {
+            "source_id": {"type": "string", "maxLength": 256},
+            "resource_id": {"type": "string", "maxLength": 256},
+            "resource_revision": {
+                "type": "string",
+                "pattern": r"^sha256:[0-9a-f]{64}$",
+            },
+            "key_columns": _NATIVE_COLUMNS_SCHEMA,
+            "allowed_insert_columns": _NATIVE_COLUMNS_SCHEMA,
+            "allowed_update_columns": _NATIVE_COLUMNS_SCHEMA,
+            "generated_identity_columns": _NATIVE_COLUMNS_SCHEMA,
+            "max_rows": {"type": "integer", "minimum": 1, "maximum": 10000},
+        },
+        "required": [
+            "source_id",
+            "resource_id",
+            "resource_revision",
+            "key_columns",
+            "allowed_insert_columns",
+            "allowed_update_columns",
+            "generated_identity_columns",
+            "max_rows",
+        ],
+        "additionalProperties": False,
+    },
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RelationalUpsertResult:
+    data: FrozenJsonObject
+    effect_observation: EffectObservation
+
+
+class RelationalUpsertBackend(Protocol):
+    async def preview_upsert(
+        self, *, agent_id: str, intent: RelationalUpsertIntent
+    ) -> FrozenJsonObject: ...
+    async def execute_upsert(
+        self,
+        *,
+        agent_id: str,
+        execution: ToolExecution,
+        intent: RelationalUpsertIntent,
+        preview_fingerprint: str,
+    ) -> RelationalUpsertResult: ...
+
+
+class RelationalUpsertPreviewExecutor:
+    executor_id = "data.preview_upsert_rows.executor"
+
+    def __init__(self, agent_id: str, backend: RelationalUpsertBackend) -> None:
+        self._agent_id, self._backend = agent_id, backend
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        intent = RelationalUpsertIntent.from_mapping(request.arguments)
+        return ToolOutput(
+            kind="data.preview_upsert_rows",
+            data=await self._backend.preview_upsert(
+                agent_id=self._agent_id, intent=intent
+            ),
+        )
+
+
+class RelationalUpsertExecutor:
+    executor_id = "data.upsert_rows.executor"
+
+    def __init__(self, agent_id: str, backend: RelationalUpsertBackend) -> None:
+        self._agent_id, self._backend = agent_id, backend
+
+    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
+        intent = RelationalUpsertIntent.from_mapping(request.arguments)
+        preview = await self._backend.preview_upsert(
+            agent_id=self._agent_id, intent=intent
+        )
+        if preview["preview_fingerprint"] != request.arguments["preview_fingerprint"]:
+            raise CapabilityInputError(
+                "write_preview_stale",
+                "The exact upsert preview changed before dispatch.",
+            )
+        return FrozenJsonObject.from_mapping(
+            {
+                key: preview[key]
+                for key in (
+                    "intent_sha256",
+                    "preview_fingerprint",
+                    "resource_revision",
+                    "target_set_sha256",
+                    "permission_fingerprint",
+                )
+            }
+        )
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        result = await self._backend.execute_upsert(
+            agent_id=self._agent_id,
+            execution=request,
+            intent=RelationalUpsertIntent.from_mapping(request.arguments),
+            preview_fingerprint=cast(str, request.arguments["preview_fingerprint"]),
+        )
+        return ToolOutput(
+            kind="data.upsert_rows_result",
+            data=result.data,
+            effect_observation=result.effect_observation,
+        )
+
+
+_UPSERT_RECEIPT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "source_id": {"type": "string", "maxLength": 256},
+        "resource_id": {"type": "string", "maxLength": 256},
+        "intent_sha256": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
+        "preview_fingerprint": {"type": "string", "pattern": r"^sha256:[0-9a-f]{64}$"},
+        "target_set_sha256": {"type": ["string", "null"], "maxLength": 71},
+        "input_count": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "inserted_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
+        "updated_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
+        "unchanged_count": {"type": ["integer", "null"], "minimum": 0, "maximum": 1000},
+        "normalized_error_code": {"type": ["string", "null"], "maxLength": 128},
+        "identity_sequence_gaps_possible": {"type": "boolean"},
+    },
+    "required": [
+        "source_id",
+        "resource_id",
+        "intent_sha256",
+        "preview_fingerprint",
+        "target_set_sha256",
+        "input_count",
+        "inserted_count",
+        "updated_count",
+        "unchanged_count",
+        "normalized_error_code",
+        "identity_sequence_gaps_possible",
+    ],
+    "additionalProperties": False,
+}
+
+
+def relational_upsert_capability_declarations() -> CapabilityDeclarations:
+    properties: dict[str, object] = {
+        "source_id": {"type": "string", "pattern": r"^source:sha256:[0-9a-f]{64}$"},
+        "resource_id": {
+            "type": "string",
+            "pattern": r"^catalog-resource:sha256:[0-9a-f]{64}$",
+        },
+        "key_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
+        "insert_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
+        "update_columns": {**_NATIVE_COLUMNS_SCHEMA, "minItems": 1},
+        "rows": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 1000,
+            "items": {
+                "type": "object",
+                "additionalProperties": {
+                    "type": ["string", "number", "boolean", "null"]
+                },
+            },
+        },
+        "evidence_call_ids": {
+            "type": "array",
+            "maxItems": 32,
+            "uniqueItems": True,
+            "items": {"type": "string", "maxLength": 256},
+        },
+    }
+    required = [
+        "source_id",
+        "resource_id",
+        "key_columns",
+        "insert_columns",
+        "update_columns",
+        "rows",
+    ]
+    preview = Capability(
+        id="data.preview_upsert_rows",
+        description=(
+            "Preview one exact uniform batch as inserts, updates or unchanged rows. Values are model-derived claims; "
+            "research call IDs retain current-run evidence, not proof of truth. Identity values are allocated only on insert. "
+            "Execution briefly takes a table-wide EXCLUSIVE lock permitting ordinary reads, with bounded timeouts."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        },
+        output_kind="data.preview_upsert_rows",
+        output_schema=_upsert_output_schema(preview=True),
+        executor_id=RelationalUpsertPreviewExecutor.executor_id,
+        access_mode=AccessMode.READ,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+    )
+    write = Capability(
+        id="data.upsert_rows",
+        description=(
+            "Apply one authenticated current-run upsert preview atomically under exact approval or a standing grant. "
+            "No chunking or replay. Unchanged rows consume the invocation and produce verified zero-change evidence. "
+            "Rollback does not restore identity sequence allocations."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                **properties,
+                "preview_fingerprint": {
+                    "type": "string",
+                    "pattern": r"^sha256:[0-9a-f]{64}$",
+                },
+            },
+            "required": [*required, "preview_fingerprint"],
+            "additionalProperties": False,
+        },
+        output_kind="data.upsert_rows_result",
+        output_schema=_upsert_output_schema(preview=False),
+        executor_id=RelationalUpsertExecutor.executor_id,
+        access_mode=AccessMode.WRITE,
+        operational_effect=OperationalEffect.MUTATE_DATA,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        automation_grant_policy=NATIVE_WRITE_GRANT_POLICY,
+        effect_receipt_policy=EffectReceiptPolicy(
+            receipt_kind="data.upsert_rows",
+            payload_schema=_UPSERT_RECEIPT_SCHEMA,
+            success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
+        ),
+    )
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(preview, write),
+        executor_ids=(preview.executor_id, write.executor_id),
+        tool_views=tuple(
+            ToolView(
+                name=cap.id.replace(".", "_"),
+                capability_id=cap.id,
+                description=cap.description,
+                presentation=ToolPresentation(
+                    toolbox_id=ToolboxId.SOURCES,
+                    load_mode=ToolLoadMode.ON_DEMAND,
+                    text_trust=ToolTextTrust.CODE,
+                    summary=summary,
+                    when_to_use=when_to_use,
+                    keywords=(
+                        "data",
+                        "relational",
+                        "upsert",
+                        "insert",
+                        "update",
+                        "rows",
+                        "research",
+                        *action_keywords,
+                    ),
+                ),
+            )
+            for cap, summary, when_to_use, action_keywords in (
+                (
+                    preview,
+                    "Preview which relational rows would be inserted, updated, or unchanged.",
+                    "Use before applying an admitted upsert batch identified by exact conflict keys.",
+                    ("preview",),
+                ),
+                (
+                    write,
+                    "Apply an exact previewed relational upsert, inserting or updating rows atomically.",
+                    "Use after a successful upsert preview, with approval or an exact standing grant.",
+                    ("apply", "save", "approval"),
+                ),
+            )
+        ),
+    )
+
+
+def _upsert_output_schema(*, preview: bool) -> dict[str, object]:
+    properties: dict[str, object] = {
+        "source_id": {"type": "string"},
+        "resource_id": {"type": "string"},
+        "resource_revision": {"type": "string"},
+        "intent_sha256": {"type": "string"},
+        "preview_fingerprint": {"type": "string"},
+        "target_set_sha256": {"type": "string"},
+        "permission_fingerprint": {"type": "string"},
+        "input_count": {"type": "integer", "minimum": 1, "maximum": 1000},
+        "inserted_count": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "updated_count": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "unchanged_count": {"type": "integer", "minimum": 0, "maximum": 1000},
+        "classifications": {
+            "type": "array",
+            "maxItems": 1000,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "object"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["insert", "update", "unchanged"],
+                    },
+                },
+                "required": ["key", "action"],
+                "additionalProperties": False,
+            },
+        },
+        "evidence_call_ids": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {"type": "string"},
+        },
+        "authorship": {"type": "string", "enum": ["model_derived"]},
+        "identity_sequence_gaps_possible": {"type": "boolean"},
+    }
+    if not preview:
+        properties.update(
+            {
+                "receipt_id": {"type": "string"},
+                "committed_at": {"type": "string"},
+                "generated_identities": {
+                    "type": "array",
+                    "maxItems": 1000,
+                    "items": {"type": "object"},
+                },
+            }
+        )
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
+def relational_upsert_declarations(
+    agent_id: str, backend: RelationalUpsertBackend
+) -> DataQueryDeclarations:
+    declarations = relational_upsert_capability_declarations()
+    return DataQueryDeclarations(
+        declarations.capabilities,
+        (
+            RelationalUpsertPreviewExecutor(agent_id, backend),
+            RelationalUpsertExecutor(agent_id, backend),
+        ),
+        declarations.tool_views,
+    )

@@ -10,6 +10,8 @@ from .models import SQLiteMigration
 
 DEVELOPMENT_BASELINE_ID = "development_baseline"
 DEVELOPMENT_BASELINE_DEFINITION = """development_baseline
+RelationalWriteScope codec-v1 binds explicit operations, resource revision, keys, insert/update columns, generated identities and row ceiling.
+CatalogSnapshot codec-v1 retains column collation and supported conflict-index facts.
 current pre-production SQLite state shape;
 effect_receipts replace adapter-owned database receipts with runtime reservations and separate human resolutions;
 ExecutionScope and ScheduledRoutine codec-v1 embed normalized capability grants and exact ExecutionContractBindings;

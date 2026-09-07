@@ -83,13 +83,14 @@ change the execution policy.
   files.
 - Remote MCP tools require an explicitly admitted read-only binding and are
   revalidated at call time.
-- The only supported source-data mutation is an explicitly enabled structured
-  PostgreSQL update with an exact target preview, once-only approval,
-  transactional drift detection, and an immutable receipt.
+- Native source-data mutations are explicitly enabled structured updates and
+  upserts, initially backed by PostgreSQL. Exact current-run previews, explicit
+  operation/column/row permissions, transactional drift checks, and runtime-owned
+  receipts govern each call. A routine permits one native write invocation per occurrence.
 
 Learn more in [Local workspaces](docs/LOCAL_WORKSPACES.md),
 [Remote MCP read connectivity](docs/MCP_CONNECTIVITY.md), and
-[PostgreSQL updates](docs/POSTGRESQL_UPDATES.md).
+[Relational writes](docs/RELATIONAL_WRITES.md).
 
 ## How it works
 
@@ -125,7 +126,7 @@ For the full implementation boundaries, see the
 | Codex, Claude Code, and Grok Build subscriptions | [Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
 | Read-only remote tools | [Remote MCP connectivity](docs/MCP_CONNECTIVITY.md) |
 | Schedules, outcomes, inboxes, and resident hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |
-| Scoped PostgreSQL updates and receipts | [PostgreSQL updates](docs/POSTGRESQL_UPDATES.md) |
+| Scoped relational writes and receipts | [Relational writes](docs/RELATIONAL_WRITES.md) |
 | State compatibility and automatic upgrades | [Local state compatibility](docs/LOCAL_STATE_UPGRADES.md) |
 | Managed installer release status | [Managed installer](docs/MANAGED_INSTALLER_RELEASE.md) |
 | Public Python API walkthroughs | [Offline examples](examples/README.md) |

@@ -58,9 +58,7 @@ class CatalogScreen(ModalScreen[None]):
                     classes="-warning" if self._notice_warning else "",
                     markup=False,
                 )
-            tree: Tree[str] = Tree("Sources", id="catalog-tree")
-            tree.show_root = False
-            yield tree
+            yield self._catalog_tree()
             yield Static(
                 "Click a source to expand/collapse  ·  ↑/↓ select  ·  Enter toggle",
                 id="catalog-help",
@@ -69,7 +67,13 @@ class CatalogScreen(ModalScreen[None]):
             yield Footer()
 
     def on_mount(self) -> None:
-        tree = self.query_one("#catalog-tree", Tree)
+        self.query_one("#catalog-tree", Tree).focus()
+
+    def _catalog_tree(self) -> Tree[str]:
+        # Publish the notice and its source/resource contents in one composition;
+        # another task can inspect the screen before its Mount message runs.
+        tree: Tree[str] = Tree("Sources", id="catalog-tree")
+        tree.show_root = False
         resources_by_source: dict[str, list[Any]] = defaultdict(list)
         for resource in self._resources:
             resources_by_source[resource.source_id].append(resource)
@@ -101,7 +105,7 @@ class CatalogScreen(ModalScreen[None]):
         tree.root.expand()
         if ordered_sources:
             tree.cursor_line = 0
-        tree.focus()
+        return tree
 
     def action_close(self) -> None:
         self.dismiss(None)

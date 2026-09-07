@@ -124,7 +124,7 @@ class PermissionsScreen(Screen[bool]):
         eligible = tuple(
             resource
             for resource in inspection.resources
-            if resource.postgresql_update_eligible
+            if resource.relational_update_eligible
         )
         access_options = [
             PickerOption("none", "No update access", "Remove all update scopes")
@@ -239,7 +239,21 @@ class PermissionsScreen(Screen[bool]):
             inspection,
             read_mode=proposal.read_scope.mode.value,
             read_resource_ids=proposal.read_scope.resource_ids,
-            updates=updates,
+            updates={
+                resource_id: {
+                    "allowed_operations": ("update",),
+                    "allowed_insert_columns": (),
+                    "allowed_update_columns": columns,
+                    "key_columns": next(
+                        resource.key_columns
+                        for resource in inspection.resources
+                        if resource.resource_id == resource_id
+                    ),
+                    "generated_identity_columns": (),
+                    "max_rows": 10000,
+                }
+                for resource_id, columns in updates.items()
+            },
         )
 
     async def _preview_mode(
@@ -251,8 +265,12 @@ class PermissionsScreen(Screen[bool]):
         inspection = await controller.inspect_source_permissions(self._source_id)
         proposal = self._proposal_state(inspection)
         updates = {
-            scope.resource_id: scope.allowed_assignment_columns
-            for scope in proposal.postgresql_update_scopes
+            scope.resource_id: {
+                key: value
+                for key, value in scope.constraints().items()
+                if key != "resource_revision"
+            }
+            for scope in proposal.relational_write_scopes
         }
         await self._preview_permissions(
             controller,
@@ -269,13 +287,13 @@ class PermissionsScreen(Screen[bool]):
         *,
         read_mode: str,
         read_resource_ids: tuple[str, ...],
-        updates: dict[str, tuple[str, ...]],
+        updates: dict[str, dict[str, object]],
     ) -> None:
         self._preview = await controller.preview_source_permissions(
             source_id=self._source_id,
             read_mode=read_mode,
             read_resource_ids=read_resource_ids,
-            postgresql_update_scopes=updates,
+            relational_write_scopes=updates,
         )
         self.query_one("#perm-body", Static).update(
             self._preview_text(self._preview, inspection)
@@ -292,15 +310,15 @@ class PermissionsScreen(Screen[bool]):
 
     def _inspection_text(self, inspection: Any) -> str:
         update_lines = self._update_scope_lines(
-            inspection.state.postgresql_update_scopes,
+            inspection.state.relational_write_scopes,
             inspection,
         )
         return sanitize_terminal_text(
             f"{inspection.source_display_name}\n"
             f"Read mode: {inspection.state.read_scope.mode.value}\n"
             f"Resources: {len(inspection.resources)}\n"
-            f"PostgreSQL update tables: "
-            f"{len(inspection.state.postgresql_update_scopes)}"
+            f"Relational write tables: "
+            f"{len(inspection.state.relational_write_scopes)}"
             f"{update_lines}",
             maximum=2_048,
             preserve_lines=True,
@@ -309,15 +327,15 @@ class PermissionsScreen(Screen[bool]):
 
     def _preview_text(self, preview: Any, inspection: Any) -> str:
         update_lines = self._update_scope_lines(
-            preview.after.postgresql_update_scopes,
+            preview.after.relational_write_scopes,
             inspection,
         )
         return sanitize_terminal_text(
             "Before → after\n"
             f"Read: {preview.before.read_scope.mode.value} → {preview.after.read_scope.mode.value}\n"
-            "PostgreSQL update tables: "
-            f"{len(preview.before.postgresql_update_scopes)} → "
-            f"{len(preview.after.postgresql_update_scopes)}"
+            "Relational write tables: "
+            f"{len(preview.before.relational_write_scopes)} → "
+            f"{len(preview.after.relational_write_scopes)}"
             f"{update_lines}\n"
             f"Fingerprint: {preview.confirmation_fingerprint}",
             maximum=2_048,
@@ -336,7 +354,16 @@ class PermissionsScreen(Screen[bool]):
             "\n  "
             + names.get(scope.resource_id, scope.resource_id)
             + ": "
-            + ", ".join(scope.allowed_assignment_columns)
+            + ", ".join(scope.allowed_operations)
+            + "; keys: "
+            + ", ".join(scope.key_columns)
+            + "; update: "
+            + ", ".join(scope.allowed_update_columns)
+            + "; insert: "
+            + ", ".join(scope.allowed_insert_columns)
+            + "; identities: "
+            + ", ".join(scope.generated_identity_columns)
+            + f"; max rows: {scope.max_rows}"
             for scope in scopes[:5]
         ]
         if len(scopes) > 5:
