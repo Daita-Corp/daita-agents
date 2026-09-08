@@ -52,6 +52,8 @@ from .models import (
     MAX_ROUTINE_PER_RUN_TOKENS,
     MAX_ROUTINE_SKILL_BINDINGS,
     MAX_ROUTINE_TITLE_CHARACTERS,
+    MIN_ROUTINE_INTERVAL_SECONDS,
+    MAX_ROUTINE_INTERVAL_SECONDS,
     AmbiguousTimePolicy,
     CalendarDaySelector,
     CalendarSchedule,
@@ -70,7 +72,12 @@ from .models import (
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
-from .owner import RoutineError, RoutineOwner, _routine_proposal_payload
+from .owner import (
+    RoutineError,
+    RoutineOwner,
+    _routine_proposal_payload,
+    _schedule_payload,
+)
 
 ROUTINE_DOMAIN_OWNER_ID = "routines"
 ROUTINE_LIST_CAPABILITY_ID = "routines.list"
@@ -176,7 +183,7 @@ class RoutineCreateExecutor(_RoutineExecutor):
                 "authority": "agent_owned_routine",
                 "routine_id": stored.routine_id,
             },
-            data={"action": "create", "routine": _routine_payload(stored)},
+            data=_mutation_receipt("create", stored),
         )
 
 
@@ -201,7 +208,7 @@ class RoutineUpdateExecutor(_RoutineExecutor):
                 "authority": "agent_owned_routine",
                 "routine_id": stored.routine_id,
             },
-            data={"action": "update", "routine": _routine_payload(stored)},
+            data=_mutation_receipt("update", stored),
         )
 
 
@@ -253,10 +260,7 @@ class RoutineControlExecutor(_RoutineExecutor):
                 "authority": "agent_owned_routine",
                 "routine_id": routine.routine_id,
             },
-            data={
-                "action": _string(request.arguments, "action"),
-                "routine": _routine_payload(routine),
-            },
+            data=_mutation_receipt(_string(request.arguments, "action"), routine),
         )
 
 
@@ -444,7 +448,7 @@ def routine_capability_declarations(
         ),
         input_schema=_spec_schema(update=False),
         output_kind="routine.receipt",
-        output_schema=_object_output_schema(("action", "routine")),
+        output_schema=_mutation_receipt_schema(),
         executor_id=ROUTINE_CREATE_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.MANAGE_SCHEDULED_ROUTINE,
@@ -455,7 +459,7 @@ def routine_capability_declarations(
         description="Replace one routine's material contract with an exact new revision.",
         input_schema=_spec_schema(update=True),
         output_kind="routine.receipt",
-        output_schema=_object_output_schema(("action", "routine")),
+        output_schema=_mutation_receipt_schema(),
         executor_id=ROUTINE_UPDATE_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.MANAGE_SCHEDULED_ROUTINE,
@@ -478,7 +482,7 @@ def routine_capability_declarations(
             "additionalProperties": False,
         },
         output_kind="routine.receipt",
-        output_schema=_object_output_schema(("action", "routine")),
+        output_schema=_mutation_receipt_schema(),
         executor_id=ROUTINE_CONTROL_EXECUTOR_ID,
         access_mode=AccessMode.NONE,
         operational_effect=OperationalEffect.MANAGE_SCHEDULED_ROUTINE,
@@ -518,7 +522,7 @@ def routine_capability_declarations(
         ),
         ROUTINE_CREATE_CAPABILITY_ID: (
             "Create one scheduled assignment with exact action limits.",
-            "Use only after expressing a self-contained instruction and exact typed schedule.",
+            "Discover assignment capabilities and their automation_contract in toolbox_search, and the Inbox destination. Load routine_create to author the schedule and exact grants; assignment execution tools need not be loaded.",
             ("routine", "schedule", "create"),
         ),
         ROUTINE_UPDATE_CAPABILITY_ID: (
@@ -827,6 +831,122 @@ def _parse_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
         ) from error
 
 
+def _schedule_schema() -> dict[str, object]:
+    """The model sees the same finite schedule family the owner accepts."""
+    calendar: dict[str, object] = {
+        "kind": {"type": "string", "enum": ["calendar"]},
+        "timezone": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256,
+            "description": "Exact IANA timezone, such as America/Chicago.",
+        },
+        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+        "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+        "months": {
+            "type": "array",
+            "uniqueItems": True,
+            "maxItems": 12,
+            "items": {"type": "integer", "minimum": 1, "maximum": 12},
+            "description": "Sorted month numbers; omit or use [] for every month.",
+        },
+        "nonexistent_time_policy": {
+            "type": "string",
+            "enum": [item.value for item in NonexistentTimePolicy],
+            "description": "Default: skip.",
+        },
+        "ambiguous_time_policy": {
+            "type": "string",
+            "enum": [item.value for item in AmbiguousTimePolicy],
+            "description": "Default: first.",
+        },
+    }
+    branches: list[dict[str, object]] = [
+        {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["once"]},
+                "exact_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Exact ISO 8601 timestamp with timezone.",
+                },
+            },
+            "required": ["kind", "exact_at"],
+            "additionalProperties": False,
+        },
+        {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["interval"]},
+                "interval_seconds": {
+                    "type": "integer",
+                    "minimum": MIN_ROUTINE_INTERVAL_SECONDS,
+                    "maximum": MAX_ROUTINE_INTERVAL_SECONDS,
+                },
+                "anchor_at": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64,
+                    "description": "Exact ISO 8601 anchor timestamp with timezone.",
+                },
+            },
+            "required": ["kind", "interval_seconds", "anchor_at"],
+            "additionalProperties": False,
+        },
+    ]
+    calendar["day_selector"] = {
+        "type": "string",
+        "enum": [item.value for item in CalendarDaySelector],
+    }
+    for name, maximum in (("weekdays", 7), ("month_days", 31)):
+        calendar[name] = {
+            "type": "array",
+            "uniqueItems": True,
+            "items": {"type": "integer", "minimum": 1, "maximum": maximum},
+            "description": (
+                "Sorted numbers. ISO weekdays: Monday=1, Sunday=7."
+                if name == "weekdays"
+                else "Sorted day-of-month numbers; nonexistent dates are skipped."
+            ),
+        }
+    selectors = []
+    for selector in CalendarDaySelector:
+        properties: dict[str, object] = {
+            "day_selector": {"enum": [selector.value]},
+        }
+        required = ["day_selector"]
+        for name, maximum, selected in (
+            ("weekdays", 7, selector is CalendarDaySelector.WEEKDAYS),
+            ("month_days", 31, selector is CalendarDaySelector.MONTH_DAYS),
+        ):
+            properties[name] = {
+                "minItems": 1 if selected else 0,
+                "maxItems": maximum if selected else 0,
+            }
+            if selected:
+                required.append(name)
+        selectors.append(
+            {"type": "object", "properties": properties, "required": required}
+        )
+    # Shared calendar constraints apply once; selectors only add their differences.
+    branches.append(
+        {
+            "type": "object",
+            "properties": calendar,
+            "required": ["kind", "timezone", "hour", "minute", "day_selector"],
+            "additionalProperties": False,
+            "oneOf": selectors,
+        }
+    )
+    return {
+        "type": "object",
+        "description": "Use exactly one typed schedule. Cron expressions and RRULE strings are unsupported.",
+        "oneOf": branches,
+    }
+
+
 def _spec_schema(*, update: bool) -> dict[str, object]:
     properties: dict[str, object] = {
         "title": {
@@ -839,7 +959,7 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "minLength": 1,
             "maxLength": MAX_ROUTINE_INSTRUCTION_BYTES,
         },
-        "schedule": {"type": "object"},
+        "schedule": _schedule_schema(),
         "run_immediately": {"type": "boolean"},
         "requested_capability_grants": {
             "type": "array",
@@ -852,7 +972,10 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
                         "minLength": 1,
                         "maxLength": 1024,
                     },
-                    "constraints": {"type": "object"},
+                    "constraints": {
+                        "type": "object",
+                        "description": "Exact domain-owned grant constraints from toolbox_load. Supply grants only for effects that require them; effect-free reads belong only in allowed_capability_ids.",
+                    },
                     "max_calls_per_occurrence": {
                         "type": "integer",
                         "minimum": 1,
@@ -875,7 +998,26 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "type": "string",
             "enum": [item.value for item in ReportingMode],
         },
-        "precheck": {"type": "object"},
+        "precheck": {
+            "type": "object",
+            "description": "Optional exact resource-revision precheck. Omit for MCP-only routines; connector revisions are not a resource precheck.",
+            "properties": {
+                "capability_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "contract_digest": {
+                    "type": "string",
+                    "pattern": "^sha256:[0-9a-f]{64}$",
+                },
+                "source_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+                "resource_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+            },
+            "required": [
+                "capability_id",
+                "contract_digest",
+                "source_id",
+                "resource_id",
+            ],
+            "additionalProperties": False,
+        },
         "allowed_source_ids": _identity_array_schema(),
         "allowed_connector_binding_ids": _identity_array_schema(),
         "allowed_resource_ids": _identity_array_schema(),
@@ -1152,6 +1294,64 @@ def _summary_payload(item: ScheduledRoutineSummary) -> dict[str, object]:
         "revision": item.revision,
         "occurrence_count": item.occurrence_count,
         "consecutive_failures": item.consecutive_failures,
+    }
+
+
+def _mutation_receipt(action: str, item: ScheduledRoutine) -> dict[str, object]:
+    """Confirm the committed mutation; execution evidence belongs to occurrences.
+
+    Approval and enforcement use the complete retained contract. Returning that
+    contract again after every mutation needlessly duplicates it in the exact
+    transcript. Inspection remains the explicit full-record read.
+    """
+    return {
+        "action": action,
+        "routine": {
+            "routine_id": item.routine_id,
+            "title": item.title,
+            "revision": item.revision,
+            "state": item.state.value,
+            "schedule": _schedule_payload(item.schedule),
+            "next_due_at": (
+                None if item.next_due_at is None else item.next_due_at.isoformat()
+            ),
+            "reserved_occurrences": item.occurrence_count,
+            "reserved_attempts": item.attempt_count,
+        },
+    }
+
+
+def _mutation_receipt_schema() -> dict[str, object]:
+    fields: dict[str, object] = {
+        "routine_id": {"type": "string", "minLength": 1, "maxLength": 1024},
+        "title": {"type": "string", "maxLength": MAX_ROUTINE_TITLE_CHARACTERS},
+        "revision": {"type": "integer", "minimum": 1},
+        "state": {"type": "string", "enum": [item.value for item in RoutineState]},
+        "schedule": _schedule_schema(),
+        "next_due_at": {"type": ["string", "null"], "maxLength": 64},
+        "reserved_occurrences": {"type": "integer", "minimum": 0},
+        "reserved_attempts": {"type": "integer", "minimum": 0},
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "create",
+                    "update",
+                    *(item.value for item in RoutineControlAction),
+                ],
+            },
+            "routine": {
+                "type": "object",
+                "properties": fields,
+                "required": list(fields),
+                "additionalProperties": False,
+            },
+        },
+        "required": ["action", "routine"],
+        "additionalProperties": False,
     }
 
 

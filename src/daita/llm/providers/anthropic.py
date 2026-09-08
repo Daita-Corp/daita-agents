@@ -14,13 +14,18 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
-from .._lifecycle import await_cleanup, closing_stream
+from .._lifecycle import await_cleanup, closing_stream, input_count_deadline
 from ..errors import (
     ModelProviderError,
+    interrupted_model_usage,
+    with_cancelled_model_usage,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
     detached_provider_error,
+    token_count_error,
+    before_generation,
+    retry_after_from_headers,
 )
 from ..models import (
     CanonicalMessage,
@@ -38,6 +43,8 @@ from ..models import (
     ToolResultBlock,
 )
 from ..pricing import (
+    bound_request_output,
+    with_request_admission,
     BillableQuantity,
     CostEstimate,
     PricingSchedule,
@@ -53,6 +60,8 @@ _STREAM_MISSING = object()
 
 
 class _MessagesResource(Protocol):
+    async def count_tokens(self, **kwargs: object) -> object: ...
+
     async def create(self, **kwargs: object) -> object: ...
 
     def stream(self, **kwargs: object) -> _MessageStreamManager: ...
@@ -159,8 +168,13 @@ class AnthropicMessagesProvider:
                 ) from error
             self._client = cast(
                 _AnthropicClient,
-                AsyncAnthropic(api_key=self._api_key),
+                AsyncAnthropic(api_key=self._api_key, max_retries=0),
             )
+        if not self._owns_client:
+            # Use a request view; do not change or close the caller's SDK client.
+            with_options = getattr(self._client, "with_options", None)
+            if callable(with_options):
+                return cast(_AnthropicClient, with_options(max_retries=0))
         return self._client
 
     async def close(self) -> None:
@@ -181,7 +195,17 @@ class AnthropicMessagesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            return await self._generate(request)
+            request.remaining_after(
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            )
+            async with asyncio.timeout_at(request.deadline):
+                return await self._generate(request)
+        except TimeoutError as error:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=interrupted_model_usage(error),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -207,6 +231,7 @@ class AnthropicMessagesProvider:
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         requested_at = self._clock()
+        counted_input_tokens = await self._admit_request(request, arguments)
         try:
             response = await self.client.messages.create(**arguments)
         except asyncio.CancelledError:
@@ -218,7 +243,12 @@ class AnthropicMessagesProvider:
         except Exception as error:
             raise _normalize_error(error) from error
         try:
-            return self._decode_response(response, requested_at=requested_at)
+            return with_request_admission(
+                self._decode_response(response, requested_at=requested_at),
+                request,
+                input_tokens=counted_input_tokens,
+                output_cap=cast(int | None, arguments.get("max_tokens")),
+            )
         except ModelProviderError:
             raise
         except (KeyError, TypeError, ValueError) as error:
@@ -240,10 +270,20 @@ class AnthropicMessagesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            async with closing_stream(self._stream(request)) as events:
-                async for event in events:
-                    yield event
+            request.remaining_after(
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            )
+            async with asyncio.timeout_at(request.deadline):
+                async with closing_stream(self._stream(request)) as events:
+                    async for event in events:
+                        yield event
             return
+        except TimeoutError as error:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=interrupted_model_usage(error),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -272,6 +312,7 @@ class AnthropicMessagesProvider:
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         requested_at = self._clock()
+        counted_input_tokens = await self._admit_request(request, arguments)
         decoder = _AnthropicStreamDecoder(
             provider_id=self.provider_id,
             id_factory=self._id_factory,
@@ -314,7 +355,14 @@ class AnthropicMessagesProvider:
                     code="terminal_completion_missing",
                     provider_id=self.provider_id,
                 ) from error
-            yield ModelStreamCompleted(response)
+            yield ModelStreamCompleted(
+                with_request_admission(
+                    response,
+                    request,
+                    input_tokens=counted_input_tokens,
+                    output_cap=cast(int | None, arguments.get("max_tokens")),
+                )
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -361,6 +409,49 @@ class AnthropicMessagesProvider:
                 }
             }
         return arguments
+
+    async def _admit_request(
+        self, request: ModelRequest, arguments: dict[str, object]
+    ) -> int | None:
+        request.remaining_after(
+            ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+        )
+        if request.max_total_tokens is None and request.max_estimated_cost_usd is None:
+            return None
+        # This adapter cannot pin advance billing dimensions. The common check
+        # rejects cost-limited requests before counting or generation.
+        bound_request_output(
+            request,
+            input_tokens=0,
+            input_tokens_counted=False,
+            maximum_output_tokens=self.max_tokens,
+        )
+        count_arguments = {
+            key: value for key, value in arguments.items() if key != "max_tokens"
+        }
+        try:
+            async with asyncio.timeout_at(input_count_deadline(request)):
+                counted = await self.client.messages.count_tokens(**count_arguments)
+        except asyncio.CancelledError as error:
+            raise with_cancelled_model_usage(
+                error, ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            ) from None
+        except ImportError:
+            raise
+        except (TypeError, ValueError):
+            raise token_count_error(invalid=True) from None
+        except Exception as error:
+            raise before_generation(
+                _normalize_error(error),
+                code="input_token_count_failed",
+            ) from None
+        tokens = _field(counted, "input_tokens", None)
+        if type(tokens) is not int or tokens < 0:
+            raise token_count_error(invalid=True)
+        arguments["max_tokens"] = bound_request_output(
+            request, input_tokens=tokens, maximum_output_tokens=self.max_tokens
+        )
+        return tokens
 
     def _decode_response(
         self,
@@ -1487,6 +1578,17 @@ def _normalize_error(error: Exception) -> ModelProviderError:
     return ModelProviderError(
         normalized,
         f"Anthropic request failed: {normalized.value}",
+        retry_after_seconds=(
+            retry_after_from_headers(
+                _field(_field(error, "response", None), "headers", None)
+            )
+            if normalized
+            in {
+                ProviderErrorCode.RATE_LIMIT_ERROR,
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+            }
+            else None
+        ),
     )
 
 

@@ -699,6 +699,9 @@ def _encode_provider_failure(
             "terminal_status": value.terminal_status,
             "output_item_types": list(value.output_item_types),
             "response_id_digest": value.response_id_digest,
+            "input_tokens": value.input_tokens,
+            "remaining_tokens": value.remaining_tokens,
+            "maximum_output_tokens": value.maximum_output_tokens,
         },
     )
 
@@ -714,6 +717,9 @@ def _decode_provider_failure(value: JsonValue) -> ProviderFailureDiagnostic:
             "terminal_status",
             "output_item_types",
             "response_id_digest",
+            "input_tokens",
+            "remaining_tokens",
+            "maximum_output_tokens",
         ),
     )
     return ProviderFailureDiagnostic(
@@ -737,5 +743,22 @@ def _decode_provider_failure(value: JsonValue) -> ProviderFailureDiagnostic:
         response_id_digest=optional_text(
             fields["response_id_digest"],
             "provider failure response ID digest",
+        ),
+        input_tokens=(
+            None
+            if fields["input_tokens"] is None
+            else integer(fields["input_tokens"], "admission input tokens")
+        ),
+        remaining_tokens=(
+            None
+            if fields["remaining_tokens"] is None
+            else integer(fields["remaining_tokens"], "admission remaining tokens")
+        ),
+        maximum_output_tokens=(
+            None
+            if fields["maximum_output_tokens"] is None
+            else integer(
+                fields["maximum_output_tokens"], "admission maximum output tokens"
+            )
         ),
     )

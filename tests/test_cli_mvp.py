@@ -1628,3 +1628,72 @@ def test_cli_4_shell_mutations_delegate_through_public_agent_methods_only():
         "Public instructions",
     )
     assert fake.close.await_count == 2
+
+
+def test_cli_stopped_run_retains_committed_routine_without_dumping_contract():
+    from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
+    from daita.llm.models import CanonicalMessage, ToolResultBlock
+
+    run = RunInput(
+        id="run-stopped",
+        agent_id="agent",
+        conversation_id="conversation",
+        message="create routine",
+        created_at=datetime.now(UTC),
+    )
+    result = LoopExit(
+        run_id=run.id,
+        conversation_id="conversation",
+        kind=LoopExitKind.FAILED,
+        reason="token_budget_insufficient",
+        created_at=run.created_at,
+    )
+    receipt = ToolResultBlock(
+        call_id="call-create",
+        capability_id="routines.create",
+        executor_id="routines.create.executor",
+        output_sha256="sha256:" + "a" * 64,
+        output={
+            "kind": "routine.receipt",
+            "data": {
+                "action": "create",
+                "routine": {
+                    "routine_id": "routine-committed",
+                    "revision": 1,
+                    "state": "active",
+                },
+            },
+        },
+    )
+    transcript = Transcript(
+        run,
+        (
+            run.start_message(),
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=(
+                    ToolCall(
+                        "call-create",
+                        "routine_create",
+                        {"authorized_instruction": "PRIVATE INSTRUCTION"},
+                    ),
+                ),
+            ),
+            CanonicalMessage(role=MessageRole.TOOL, content=(receipt,)),
+        ),
+    )
+    agent = AsyncMock()
+    agent.run.return_value = result
+    agent.transcript.return_value = transcript
+    args = cli.build_parser().parse_args(["run", "runner", "create routine"])
+    with patch.object(Agent, "open", new=AsyncMock(return_value=agent)):
+        record = asyncio.run(cli._execute(args))
+    assert isinstance(record, dict)
+    assert record["status"] == "failed" and record["text"] is None
+    assert (
+        "routine-committed" in record["notice"]
+        and "not rolled back" in record["notice"]
+    )
+    assert record["tool_results"][0]["is_error"] is False
+    assert "create committed" in record["tool_results"][0]["summary"]
+    assert "PRIVATE INSTRUCTION" not in json.dumps(record)

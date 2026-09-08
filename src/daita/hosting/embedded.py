@@ -3420,6 +3420,7 @@ class EmbeddedAgent:
         local_label: str | None = None,
         binding_id: str | None = None,
     ) -> MCPBindingStatus:
+        """Persist exact local MCP admission for the next immutable composition."""
         """Persist one exact binding; declarations activate only after reopen."""
 
         if not isinstance(maximum_outbound_sensitivity, ModelSensitivity):

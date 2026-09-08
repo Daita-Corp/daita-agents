@@ -13,13 +13,18 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
-from .._lifecycle import await_cleanup, closing_stream
+from .._lifecycle import await_cleanup, closing_stream, input_count_deadline
 from ..errors import (
     ModelProviderError,
+    interrupted_model_usage,
+    with_cancelled_model_usage,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
     detached_provider_error,
+    token_count_error,
+    before_generation,
+    retry_after_from_headers,
 )
 from ..models import (
     CanonicalMessage,
@@ -37,6 +42,8 @@ from ..models import (
     ToolResultBlock,
 )
 from ..pricing import (
+    bound_request_output,
+    with_request_admission,
     BillableQuantity,
     CostEstimate,
     PricingSchedule,
@@ -51,6 +58,8 @@ _PORTABLE_FUNCTION_CALL_SIGNATURE = b"skip_thought_signature_validator"
 
 
 class _GeminiModels(Protocol):
+    async def count_tokens(self, **kwargs: object) -> object: ...
+
     async def generate_content(self, **kwargs: object) -> object: ...
 
     async def generate_content_stream(self, **kwargs: object) -> object: ...
@@ -193,7 +202,17 @@ class GeminiProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            return await self._generate(request)
+            request.remaining_after(
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            )
+            async with asyncio.timeout_at(request.deadline):
+                return await self._generate(request)
+        except TimeoutError as error:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=interrupted_model_usage(error),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -219,6 +238,9 @@ class GeminiProvider:
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         requested_at = self._clock()
+        counted_input_tokens = await self._admit_request(
+            request, arguments, requested_at=requested_at
+        )
         try:
             response = await self.client.aio.models.generate_content(**arguments)
         except asyncio.CancelledError:
@@ -230,7 +252,17 @@ class GeminiProvider:
         except Exception as error:
             raise _normalize_error(error) from error
         try:
-            return self._decode_response(response, requested_at=requested_at)
+            return with_request_admission(
+                self._decode_response(response, requested_at=requested_at),
+                request,
+                input_tokens=counted_input_tokens,
+                output_cap=cast(
+                    int | None,
+                    cast(dict[str, object], arguments["config"]).get(
+                        "max_output_tokens"
+                    ),
+                ),
+            )
         except ModelProviderError:
             raise
         except (KeyError, TypeError, ValueError) as error:
@@ -252,10 +284,20 @@ class GeminiProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            async with closing_stream(self._stream(request)) as events:
-                async for event in events:
-                    yield event
+            request.remaining_after(
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            )
+            async with asyncio.timeout_at(request.deadline):
+                async with closing_stream(self._stream(request)) as events:
+                    async for event in events:
+                        yield event
             return
+        except TimeoutError as error:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=interrupted_model_usage(error),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -284,6 +326,9 @@ class GeminiProvider:
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         requested_at = self._clock()
+        counted_input_tokens = await self._admit_request(
+            request, arguments, requested_at=requested_at
+        )
         try:
             raw_stream = await self.client.aio.models.generate_content_stream(
                 **arguments
@@ -543,7 +588,19 @@ class GeminiProvider:
                     terminal_status=_safe_structural_token(finish_reason),
                 ),
             ) from error
-        yield ModelStreamCompleted(response)
+        yield ModelStreamCompleted(
+            with_request_admission(
+                response,
+                request,
+                input_tokens=counted_input_tokens,
+                output_cap=cast(
+                    int | None,
+                    cast(dict[str, object], arguments["config"]).get(
+                        "max_output_tokens"
+                    ),
+                ),
+            )
+        )
 
     def _require_supported_request_policy(self, request: ModelRequest) -> None:
         if not self.supports_request_policy(request):
@@ -560,6 +617,7 @@ class GeminiProvider:
             )
             config: dict[str, object] = {
                 "max_output_tokens": self._max_output_tokens,
+                "http_options": {"retry_options": {"attempts": 1}},
             }
             if system_instruction is not None:
                 config["system_instruction"] = system_instruction
@@ -570,7 +628,7 @@ class GeminiProvider:
                             {
                                 "name": tool.name,
                                 "description": tool.description,
-                                "parameters": FrozenJsonObject.from_mapping(
+                                "parameters_json_schema": FrozenJsonObject.from_mapping(
                                     tool.input_schema
                                 ).to_dict(),
                             }
@@ -583,11 +641,12 @@ class GeminiProvider:
                 config["response_json_schema"] = FrozenJsonObject.from_mapping(
                     request.response_schema
                 ).to_dict()
-            return {
+            arguments: dict[str, object] = {
                 "model": self.model,
                 "contents": contents,
                 "config": config,
             }
+            return arguments
         except ModelProviderError:
             raise
         except (KeyError, TypeError, ValueError) as error:
@@ -595,6 +654,72 @@ class GeminiProvider:
                 ProviderErrorCode.INVALID_REQUEST,
                 "canonical request cannot be translated for Gemini",
             ) from error
+
+    async def _admit_request(
+        self,
+        request: ModelRequest,
+        arguments: dict[str, object],
+        *,
+        requested_at: datetime,
+    ) -> int | None:
+        request.remaining_after(
+            ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+        )
+        if request.max_total_tokens is None and request.max_estimated_cost_usd is None:
+            return None
+
+        def output_limit(input_tokens: int, *, counted: bool = True) -> int:
+            return bound_request_output(
+                request,
+                input_tokens=input_tokens,
+                input_tokens_counted=counted,
+                maximum_output_tokens=self._max_output_tokens,
+                schedules=self._pricing_schedules,
+                provider="gemini",
+                model=self.model,
+                endpoint="generate_content",
+                requested_at=requested_at,
+                qualifiers={"service_tier": "standard"},
+            )
+
+        output_limit(0, counted=False)
+        try:
+            # google-genai's Developer API count config rejects tools/system
+            # fields. Its public extra_body option supports the documented full
+            # generateContentRequest instead. Use the already prepared content.
+            async with asyncio.timeout_at(input_count_deadline(request)):
+                counted = await self.client.aio.models.count_tokens(
+                    model=self.model,
+                    contents=None,
+                    config={
+                        "http_options": {
+                            "retry_options": {"attempts": 1},
+                            "extra_body": {
+                                "generateContentRequest": _count_request(arguments),
+                            },
+                        },
+                    },
+                )
+        except asyncio.CancelledError as error:
+            raise with_cancelled_model_usage(
+                error, ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            ) from None
+        except ImportError:
+            raise
+        except (TypeError, ValueError):
+            raise token_count_error(invalid=True) from None
+        except Exception as error:
+            raise before_generation(
+                _normalize_error(error),
+                code="input_token_count_failed",
+            ) from None
+        tokens = _field(counted, "total_tokens", None)
+        if type(tokens) is not int or tokens < 0:
+            raise token_count_error(invalid=True)
+        cast(dict[str, object], arguments["config"])["max_output_tokens"] = (
+            output_limit(tokens)
+        )
+        return tokens
 
     def _decode_response(
         self,
@@ -782,6 +907,71 @@ class GeminiProvider:
                 quantities=_gemini_billable_quantities(usage),
             ),
         )
+
+
+def _count_request(arguments: Mapping[str, object]) -> dict[str, object]:
+    """Project prepared SDK arguments into countTokens' full REST input shape.
+
+    Only the field names of the admitted SDK surface are translated; arbitrary
+    function arguments, results and JSON schemas remain untouched. Actual-SDK
+    tests compare this body with generation for every supported content shape.
+    """
+    contents = []
+    for content in cast(list[dict[str, object]], arguments["contents"]):
+        parts = []
+        for part in cast(list[dict[str, object]], content["parts"]):
+            native: dict[str, object] = {}
+            for key, value in part.items():
+                field = {
+                    "text": "text",
+                    "thought": "thought",
+                    "function_call": "functionCall",
+                    "function_response": "functionResponse",
+                    "thought_signature": "thoughtSignature",
+                }[key]
+                native[field] = (
+                    base64.b64encode(value).decode("ascii")
+                    if key == "thought_signature" and isinstance(value, bytes)
+                    else value
+                )
+            parts.append(native)
+        contents.append({"role": content["role"], "parts": parts})
+    model = cast(str, arguments["model"])
+    body: dict[str, object] = {
+        "model": model if model.startswith("models/") else f"models/{model}",
+        "contents": contents,
+    }
+    config = cast(dict[str, object], arguments["config"])
+    if set(config) - {
+        "http_options",
+        "max_output_tokens",
+        "system_instruction",
+        "tools",
+        "response_mime_type",
+        "response_json_schema",
+    }:
+        raise ValueError("uncounted Gemini configuration")
+    if "system_instruction" in config:
+        body["systemInstruction"] = {
+            "role": "user",
+            "parts": [{"text": config["system_instruction"]}],
+        }
+    if "tools" in config:
+        body["tools"] = [
+            {"functionDeclarations": tool["function_declarations"]}
+            for tool in cast(list[dict[str, object]], config["tools"])
+        ]
+    generation = {
+        native: config[key]
+        for key, native in (
+            ("response_mime_type", "responseMimeType"),
+            ("response_json_schema", "responseJsonSchema"),
+        )
+        if key in config
+    }
+    if generation:
+        body["generationConfig"] = generation
+    return body
 
 
 def _gemini_contents(
@@ -1141,6 +1331,17 @@ def _normalize_error(error: Exception) -> ModelProviderError:
     return ModelProviderError(
         normalized,
         f"Gemini request failed: {normalized.value}",
+        retry_after_seconds=(
+            retry_after_from_headers(
+                _lenient_field(_lenient_field(error, "response"), "headers")
+            )
+            if normalized
+            in {
+                ProviderErrorCode.RATE_LIMIT_ERROR,
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+            }
+            else None
+        ),
     )
 
 

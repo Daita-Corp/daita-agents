@@ -454,9 +454,11 @@ class AutonomousFollowup:
             ):
                 raise ValueError(f"{token_name} must be non-negative")
         if (
-            self.charged_cost_usd + self.reserved_cost_usd
+            self.reserved_cost_usd
+            and self.charged_cost_usd + self.reserved_cost_usd
             > self.grant.cumulative_max_cost_usd
-            or self.charged_tokens + self.reserved_tokens
+            or self.reserved_tokens
+            and self.charged_tokens + self.reserved_tokens
             > self.grant.cumulative_max_tokens
         ):
             raise ValueError("follow-up budget exceeds its cumulative ceiling")

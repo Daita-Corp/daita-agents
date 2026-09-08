@@ -19,6 +19,8 @@ from ..._json import FrozenJsonObject, canonical_json
 from .._lifecycle import await_cleanup, closing_stream
 from ..errors import (
     ModelProviderError,
+    interrupted_model_usage,
+    retry_after_from_headers,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
@@ -40,6 +42,8 @@ from ..models import (
     ToolResultBlock,
 )
 from ..pricing import (
+    CostEstimate,
+    bound_request_output,
     BillableQuantity,
     CostBasis,
     PricingQualifier,
@@ -197,8 +201,15 @@ class OpenAICompatibleProvider:
                 ) from error
             self._client = cast(
                 _OpenAICompatibleClient,
-                AsyncOpenAI(api_key=self._api_key, base_url=self.base_url),
+                AsyncOpenAI(
+                    api_key=self._api_key, base_url=self.base_url, max_retries=0
+                ),
             )
+        if not self._owns_client:
+            # Use a request view; do not change or close the caller's SDK client.
+            with_options = getattr(self._client, "with_options", None)
+            if callable(with_options):
+                return cast(_OpenAICompatibleClient, with_options(max_retries=0))
         return self._client
 
     async def close(self) -> None:
@@ -219,7 +230,17 @@ class OpenAICompatibleProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            return await self._generate(request)
+            request.remaining_after(
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            )
+            async with asyncio.timeout_at(request.deadline):
+                return await self._generate(request)
+        except TimeoutError as error:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=interrupted_model_usage(error),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -277,10 +298,20 @@ class OpenAICompatibleProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            async with closing_stream(self._stream(request)) as events:
-                async for event in events:
-                    yield event
+            request.remaining_after(
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            )
+            async with asyncio.timeout_at(request.deadline):
+                async with closing_stream(self._stream(request)) as events:
+                    async for event in events:
+                        yield event
             return
+        except TimeoutError as error:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=interrupted_model_usage(error),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -607,6 +638,19 @@ class OpenAICompatibleProvider:
                         ).to_dict(),
                     },
                 }
+            arguments["max_tokens"] = bound_request_output(
+                request,
+                # Chat compatibility defines no complete request-count API.
+                # Bound output here and reconcile input usage in the loop.
+                input_tokens=None,
+                maximum_output_tokens=self._max_tokens,
+                schedules=self._pricing_schedules,
+                provider=self.provider,
+                model=self.model,
+                endpoint="chat_completions",
+                requested_at=self._clock(),
+                qualifiers=self._pricing_qualifiers,
+            )
             return arguments
         except ModelProviderError:
             raise
@@ -939,6 +983,17 @@ def _normalize_error(error: Exception, provider: str) -> ModelProviderError:
     return ModelProviderError(
         normalized,
         f"{provider} request failed: {normalized.value}",
+        retry_after_seconds=(
+            retry_after_from_headers(
+                _lenient_field(_lenient_field(error, "response"), "headers")
+            )
+            if normalized
+            in {
+                ProviderErrorCode.RATE_LIMIT_ERROR,
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+            }
+            else None
+        ),
     )
 
 

@@ -843,7 +843,7 @@ async def test_sqlite_public_exact_csv_creation_delivery_restart_and_redelivery(
         assert secret_row not in caplog.text
         first_request_text = "\n".join(
             block.text
-            for message in provider.requests[0].messages
+            for message in provider.logical_requests[0].messages
             for block in message.content
             if isinstance(block, TextBlock)
         )

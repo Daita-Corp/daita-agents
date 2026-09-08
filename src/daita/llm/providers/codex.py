@@ -17,7 +17,7 @@ from ..errors import (
     ProviderFailurePhase,
 )
 from ..models import ModelRequest, ModelResponse, ModelStreamCompleted
-from ..pricing import CostEstimate
+from ..pricing import CostEstimate, bound_request_output
 from ..subscription_auth import (
     CodexOAuthCredential,
     refresh_codex_subscription,
@@ -105,7 +105,7 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
                     max_retries=0,
                 ),
             )
-        return self._client
+        return super().client
 
     async def _generate(self, request: ModelRequest) -> ModelResponse:
         try:
@@ -186,6 +186,23 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
         if request.tools:
             arguments["tool_choice"] = "auto"
         return arguments
+
+    async def _admit_request(
+        self,
+        request: ModelRequest,
+        arguments: dict[str, object],
+        *,
+        requested_at: datetime,
+    ) -> int | None:
+        # ChatGPT's subscription endpoint has neither the API token-count
+        # resource nor a wire output cap. Retain usage-based loop stopping;
+        # never send subscription credentials to the public counting endpoint.
+        bound_request_output(
+            request,
+            input_tokens=None,
+            maximum_output_tokens=self._max_output_tokens or 1024,
+        )
+        return None
 
     def _decode_response(
         self,

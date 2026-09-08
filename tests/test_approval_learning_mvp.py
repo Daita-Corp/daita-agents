@@ -941,10 +941,22 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         assert approvals[0].arguments["content"] == content
         assert len(provider.logical_requests) == 2
         assert content not in _system_text(provider.logical_requests[1])
+        first, second = provider.logical_requests
         assert (
-            provider.logical_requests[0].messages[0]
-            == provider.logical_requests[1].messages[0]
+            first.sensitivity_provenance["static_context_sha256"]
+            == second.sensitivity_provenance["static_context_sha256"]
         )
+        assert first.tools == second.tools
+        assert (
+            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(first)}."
+            in _system_text(first)
+        )
+        assert (
+            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(second)}."
+            in _system_text(second)
+        )
+        transcript = await agent.transcript(result.run_id)
+        assert second.messages[1:] == transcript.messages[:-1]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"target": "memory", "replaced": True}
@@ -992,10 +1004,22 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         assert "- monthly-revenue: Calculate monthly revenue consistently.\n" not in (
             _system_text(provider.logical_requests[1])
         )
+        first, second = provider.logical_requests
         assert (
-            provider.logical_requests[0].messages[0]
-            == provider.logical_requests[1].messages[0]
+            first.sensitivity_provenance["static_context_sha256"]
+            == second.sensitivity_provenance["static_context_sha256"]
         )
+        assert first.tools == second.tools
+        assert (
+            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(first)}."
+            in _system_text(first)
+        )
+        assert (
+            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(second)}."
+            in _system_text(second)
+        )
+        transcript = await agent.transcript(result.run_id)
+        assert second.messages[1:] == transcript.messages[:-1]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"name": "monthly-revenue", "changed": True}

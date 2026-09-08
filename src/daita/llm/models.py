@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import math
 import re
+import time
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from decimal import Decimal
 from enum import Enum
 
 from .._json import FrozenJsonObject, canonical_json
-from .pricing import CostEstimate
+from .pricing import CostEstimate, CostEstimateStatus
 
 
 def _required_text(value: str, field_name: str) -> None:
@@ -317,6 +320,12 @@ class ModelRequest:
     sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
     sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
     allow_parallel_tool_calls: bool | None = None
+    # Code-owned allowance for this logical request, including routed attempts.
+    max_total_tokens: int | None = None
+    max_estimated_cost_usd: Decimal | None = None
+    # Runtime-only absolute monotonic deadline; never sent to a provider API.
+    deadline: float | None = None
+    input_count_timeout_seconds: float = 15.0
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -354,6 +363,34 @@ class ModelRequest:
             raise TypeError(
                 "model-request allow_parallel_tool_calls must be bool or None"
             )
+        if self.max_total_tokens is not None and (
+            type(self.max_total_tokens) is not int or self.max_total_tokens < 0
+        ):
+            raise ValueError("model-request token allowance must be non-negative")
+        if self.max_estimated_cost_usd is not None and (
+            not isinstance(self.max_estimated_cost_usd, Decimal)
+            or not self.max_estimated_cost_usd.is_finite()
+            or self.max_estimated_cost_usd < 0
+        ):
+            raise ValueError(
+                "model-request cost allowance must be finite and non-negative"
+            )
+        if self.deadline is not None and (
+            isinstance(self.deadline, bool)
+            or not isinstance(self.deadline, (int, float))
+            or not math.isfinite(self.deadline)
+            or self.deadline < 0
+        ):
+            raise ValueError("model-request deadline must be finite and non-negative")
+        if (
+            isinstance(self.input_count_timeout_seconds, bool)
+            or not isinstance(self.input_count_timeout_seconds, (int, float))
+            or not math.isfinite(self.input_count_timeout_seconds)
+            or not 0 < self.input_count_timeout_seconds <= 60
+        ):
+            raise ValueError(
+                "input counting timeout must be positive and at most 60 seconds"
+            )
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "response_schema", response_schema)
@@ -362,6 +399,38 @@ class ModelRequest:
             "sensitivity_provenance",
             sensitivity_provenance,
         )
+
+    def remaining_after(self, usage: ModelUsage) -> ModelRequest:
+        """Narrow code-owned allowances by already incurred logical-call usage."""
+        from .errors import ModelProviderError, ProviderErrorCode
+
+        cost = self.max_estimated_cost_usd
+        tokens = self.max_total_tokens
+        reason = None
+        if cost is not None:
+            if (
+                usage.cost_estimate.status is not CostEstimateStatus.COMPLETE
+                and usage.cost_estimate.code != "no_model_attempts"
+            ):
+                reason = ProviderErrorCode.COST_LIMIT_UNPRICED_ROUTE
+            cost -= usage.cost_estimate.amount_usd or Decimal("0")
+            if cost <= 0:
+                reason = ProviderErrorCode.COST_LIMIT_REACHED
+        if tokens is not None:
+            tokens -= usage.total_tokens
+            if tokens <= 0 and reason is None:
+                reason = ProviderErrorCode.TOKEN_LIMIT_REACHED
+        if (
+            reason is None
+            and self.deadline is not None
+            and time.monotonic() >= self.deadline
+        ):
+            reason = ProviderErrorCode.TIMEOUT
+        if reason is not None:
+            raise ModelProviderError(
+                reason, "The model request allowance is exhausted.", usage=usage
+            )
+        return replace(self, max_total_tokens=tokens, max_estimated_cost_usd=cost)
 
 
 @dataclass(frozen=True, slots=True)

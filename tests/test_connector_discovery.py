@@ -344,9 +344,10 @@ async def test_mcp_hint_edits_preserve_execution_and_change_bounded_discovery(
         assert {entry["kind"] for entry in full_entries} == {
             "catalog_source",
             "mcp_binding",
-            "toolbox",
             "skill",
         }
+        # Toolbox summaries are retained once in the separate trusted manifest.
+        assert catalog_after.manifest_payload
         assert full["omitted_count"] == 0
         omitted_count = bounded["omitted_count"]
         assert isinstance(omitted_count, int) and omitted_count > 0

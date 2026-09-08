@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from decimal import Decimal
 
 import pytest
 from _workspace_support import workspace_for
 
 from daita import Agent, JobStatus
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
-from daita.llm.models import ModelStreamCompleted, ModelTextDelta
+from daita.llm.models import ModelStreamCompleted, ModelTextDelta, ModelUsage
+from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
 from daita.llm.routing import (
     ModelProviderRegistration,
@@ -104,15 +106,26 @@ async def _assert_one_independent_success(agent: Agent, run_id: str) -> str:
     return job_id
 
 
+@pytest.mark.parametrize("known_zero_usage", [False, True])
 async def test_transient_retry_after_start_receipt_does_not_reexecute_job_start(
     tmp_path: Path,
+    known_zero_usage: bool,
 ) -> None:
     home = await create_probe_home(tmp_path, "provider-transient-retry")
     scripted = MockModelProvider(
         (
             toolbox_load_response("start_data_profile"),
             start_profile_response(home.resource_ids[TARGET_PROFILE_TABLE]),
-            ModelProviderError(ProviderErrorCode.TIMEOUT),
+            ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                usage=ModelUsage(
+                    cost_estimate=(
+                        CostEstimate.complete(Decimal("0"))
+                        if known_zero_usage
+                        else CostEstimate.unavailable()
+                    ),
+                ),
+            ),
             stop_response("The independently admitted job is still running."),
         ),
         provider_id="mock:stage-b-transient",
@@ -127,8 +140,10 @@ async def test_transient_retry_after_start_receipt_does_not_reexecute_job_start(
             "Start one profile and survive a later provider retry.",
             source_scope_ids=(home.source_id,),
         )
-        assert result.kind is LoopExitKind.COMPLETED
-        assert len(scripted.requests) == 4
+        assert result.kind is (
+            LoopExitKind.COMPLETED if known_zero_usage else LoopExitKind.FAILED
+        )
+        assert len(scripted.requests) == (4 if known_zero_usage else 3)
         transcript = await agent.transcript(result.run_id)
         assert logical_names(transcript).count("start_data_profile") == 1
         await _assert_one_independent_success(agent, result.run_id)

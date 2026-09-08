@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from decimal import Decimal
 from typing import cast
 
 from ..security import (
@@ -14,8 +15,14 @@ from ..security import (
     default_secret_provider,
 )
 from ._lifecycle import await_cleanup, closing_stream
-from .errors import ModelProviderError, ProviderErrorCode
-from .models import ModelRequest, ModelResponse, ModelStreamEvent
+from .errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    before_generation,
+    with_cancelled_model_usage,
+)
+from .models import ModelRequest, ModelResponse, ModelStreamEvent, ModelUsage
+from .pricing import CostEstimate
 from .protocols import (
     ManagedModelProvider,
     ModelProvider,
@@ -200,6 +207,30 @@ class _LazyProvider:
                 yield event
 
     async def _resolve(self, request: ModelRequest) -> ModelProvider:
+        try:
+            async with asyncio.timeout_at(request.deadline):
+                return await self._resolve_before_generation(request)
+        except TimeoutError:
+            raise before_generation(
+                ModelProviderError(
+                    ProviderErrorCode.TIMEOUT,
+                    "The model request deadline expired during provider resolution.",
+                    provider_id=self.provider_id,
+                ),
+                code="provider_resolution_timeout",
+            ) from None
+        except asyncio.CancelledError as error:
+            raise with_cancelled_model_usage(
+                error,
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0))),
+            ) from None
+        except ModelProviderError as error:
+            raise before_generation(error, code="provider_resolution_failed") from None
+
+    async def _resolve_before_generation(self, request: ModelRequest) -> ModelProvider:
+        request.remaining_after(
+            ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+        )
         if self._close_task is not None:
             raise ModelProviderError(
                 ProviderErrorCode.PROVIDER_UNAVAILABLE,

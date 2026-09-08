@@ -21,6 +21,7 @@ from ..llm.models import (
     ModelSensitivity,
     ModelUsage,
     TextBlock,
+    ToolCall,
     ToolResultBlock,
 )
 
@@ -493,6 +494,31 @@ class Transcript:
         if any(not isinstance(message, CanonicalMessage) for message in messages):
             raise TypeError("transcript messages must be CanonicalMessage records")
         object.__setattr__(self, "messages", messages)
+
+    @property
+    def tool_pairs(self) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
+        """Ordered evidence, including unanswered calls in interrupted runs.
+
+        This is a projection of the exact transcript, not a second persisted
+        outcome. Tool success never implies that the enclosing run completed.
+        """
+        calls: list[ToolCall] = []
+        call_ids: set[str] = set()
+        results: dict[str, ToolResultBlock] = {}
+        for message in self.messages:
+            for call in message.tool_calls:
+                if call.id in call_ids:
+                    raise ValueError("transcript repeats a tool call ID")
+                call_ids.add(call.id)
+                calls.append(call)
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    if block.call_id not in call_ids:
+                        raise ValueError("transcript contains an unmatched tool result")
+                    if block.call_id in results:
+                        raise ValueError("transcript repeats a tool result ID")
+                    results[block.call_id] = block
+        return tuple((call, results.get(call.id)) for call in calls)
 
 
 def validate_completed_transcript(

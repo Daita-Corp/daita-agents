@@ -57,7 +57,6 @@ async def _prepared_request(
     tools: tuple[ToolDefinition, ...],
     *,
     step: int,
-    final: bool = False,
 ) -> ModelRequest:
     current_start = max(
         index
@@ -76,7 +75,6 @@ async def _prepared_request(
         messages[current_start:],
         step=step,
         tool_context=projection.project(catalog, messages[current_start:]),
-        final=final,
     )
 
 
@@ -85,7 +83,7 @@ def test_context_builder_exposes_only_fixed_absolute_history_bounds():
 
 
 class TranscriptContext:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         del run
         return messages[:-1], tool_context.initial_provider_definitions
 
@@ -96,14 +94,16 @@ class TranscriptContext:
         *,
         step,
         tool_context,
-        final=False,
         previous_request_input_tokens=None,
+        remaining_tokens=None,
+        request_input_growth_tokens=None,
+        remaining_steps=None,
     ):
         del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
-            tools=() if final else tools,
+            tools=tools,
         )
 
 

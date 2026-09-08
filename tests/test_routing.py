@@ -225,7 +225,7 @@ async def test_router_retries_transient_failure_then_returns():
 
     assert (await router.generate(request())).text == "ok"
     assert len(provider.requests) == 2
-    assert delays == [0.1]
+    assert len(delays) == 1 and 0.075 <= delays[0] <= 0.1
 
 
 async def test_router_does_not_retry_permanent_failure_and_uses_fallback():
@@ -399,7 +399,7 @@ async def test_router_retries_stream_before_progress_and_aggregates_completion()
 
     events = [event async for event in router.stream(request())]
 
-    assert delays == [0.1]
+    assert len(delays) == 1 and 0.075 <= delays[0] <= 0.1
     assert events[0] == ModelTextDelta("ok")
     assert isinstance(events[1], ModelStreamCompleted)
     assert events[1].response.text == "ok"

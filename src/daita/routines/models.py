@@ -95,20 +95,22 @@ def _positive_revision(value: int, name: str) -> None:
         raise ValueError(f"{name} must be a positive integer")
 
 
-def _bounded_count(value: int, name: str, *, maximum: int) -> None:
+def _bounded_count(value: int, name: str, *, maximum: int | None) -> None:
     if (
         not isinstance(value, int)
         or isinstance(value, bool)
-        or not 0 <= value <= maximum
+        or value < 0
+        or (maximum is not None and value > maximum)
     ):
         raise ValueError(f"{name} is outside its bound")
 
 
-def _money(value: Decimal, name: str, *, maximum: Decimal) -> None:
+def _money(value: Decimal, name: str, *, maximum: Decimal | None) -> None:
     if (
         not isinstance(value, Decimal)
         or not value.is_finite()
-        or not Decimal("0") <= value <= maximum
+        or value < 0
+        or (maximum is not None and value > maximum)
     ):
         raise ValueError(f"{name} must be a bounded non-negative Decimal")
 
@@ -866,7 +868,7 @@ class ScheduledRoutine:
             (
                 self.charged_tokens,
                 "charged token amount",
-                MAX_ROUTINE_CUMULATIVE_TOKENS,
+                None,
                 False,
             ),
             (
@@ -903,16 +905,20 @@ class ScheduledRoutine:
         _money(
             self.charged_cost_usd,
             "charged cost amount",
-            maximum=MAX_ROUTINE_CUMULATIVE_COST_USD,
+            maximum=None,
         )
         if self.per_run_max_tokens > self.cumulative_max_tokens:
             raise ValueError("per-run token ceiling exceeds cumulative ceiling")
         if self.per_run_max_cost_usd > self.cumulative_max_cost_usd:
             raise ValueError("per-run cost ceiling exceeds cumulative ceiling")
-        if self.reserved_tokens + self.charged_tokens > self.cumulative_max_tokens:
+        if (
+            self.reserved_tokens
+            and self.reserved_tokens + self.charged_tokens > self.cumulative_max_tokens
+        ):
             raise ValueError("routine token budget is oversubscribed")
         if (
-            self.reserved_cost_usd + self.charged_cost_usd
+            self.reserved_cost_usd
+            and self.reserved_cost_usd + self.charged_cost_usd
             > self.cumulative_max_cost_usd
         ):
             raise ValueError("routine cost budget is oversubscribed")
@@ -981,6 +987,18 @@ class ScheduledRoutine:
         object.__setattr__(self, "allowed_operational_effects", effects)
         object.__setattr__(self, "skill_bindings", skill_bindings)
         object.__setattr__(self, "last_delivery_ids", last_delivery_ids)
+
+    @property
+    def model_budget_exhausted(self) -> bool:
+        """Consumption is a fact; only a new reservation is capped by authority."""
+        return (
+            self.reserved_tokens + self.charged_tokens + self.per_run_max_tokens
+            > self.cumulative_max_tokens
+            or self.reserved_cost_usd
+            + self.charged_cost_usd
+            + self.per_run_max_cost_usd
+            > self.cumulative_max_cost_usd
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1086,7 +1104,7 @@ class RoutineOccurrence:
             (
                 self.charged_tokens,
                 "occurrence charged tokens",
-                MAX_ROUTINE_PER_RUN_TOKENS,
+                None,
             ),
             (self.attempt_count, "occurrence attempt count", MAX_ROUTINE_ATTEMPTS),
         ):
@@ -1099,7 +1117,7 @@ class RoutineOccurrence:
         _money(
             self.charged_cost_usd,
             "occurrence charged cost",
-            maximum=MAX_ROUTINE_PER_RUN_COST_USD,
+            maximum=None,
         )
         if (
             self.failure_code is not None

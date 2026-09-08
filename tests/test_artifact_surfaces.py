@@ -28,7 +28,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
-from daita.tui.projection import artifact_delivery_messages, completed_tool_pairs
+from daita.tui.projection import artifact_delivery_messages
 
 
 def _profile(provider: MockModelProvider) -> ModelProfile:
@@ -215,6 +215,17 @@ async def test_cli_run_json_contains_refs_and_receipts_but_no_payload_or_grant_m
             del message, conversation_id
             return result
 
+        async def transcript(self, run_id: str):
+            return Transcript(
+                RunInput(
+                    id=run_id,
+                    agent_id="agent",
+                    message="create file",
+                    conversation_id=result.conversation_id,
+                    created_at=result.created_at,
+                )
+            )
+
         async def close(self) -> None:
             return None
 
@@ -340,7 +351,7 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
             ),
         ),
     )
-    failed_messages = artifact_delivery_messages(completed_tool_pairs(failed))
+    failed_messages = artifact_delivery_messages(failed.tool_pairs)
     assert any(
         "remains available; local delivery failed" in text for text in failed_messages
     )
@@ -380,9 +391,7 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
             ),
         ),
     )
-    uncertain_messages = artifact_delivery_messages(
-        completed_tool_pairs(uncertain_edit)
-    )
+    uncertain_messages = artifact_delivery_messages(uncertain_edit.tool_pairs)
     assert any(
         "update outcome for workspace file config.yaml is uncertain" in text
         for text in uncertain_messages
@@ -417,9 +426,7 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
             ),
         ),
     )
-    not_delivered_messages = artifact_delivery_messages(
-        completed_tool_pairs(not_delivered)
-    )
+    not_delivered_messages = artifact_delivery_messages(not_delivered.tool_pairs)
     assert any(
         "was created internally but was not saved locally" in text
         for text in not_delivered_messages

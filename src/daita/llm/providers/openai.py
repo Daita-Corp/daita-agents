@@ -14,13 +14,18 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json, thaw_json
-from .._lifecycle import await_cleanup, closing_stream
+from .._lifecycle import await_cleanup, closing_stream, input_count_deadline
 from ..errors import (
     ModelProviderError,
+    interrupted_model_usage,
+    with_cancelled_model_usage,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
     detached_provider_error,
+    token_count_error,
+    before_generation,
+    retry_after_from_headers,
 )
 from ..models import (
     CanonicalMessage,
@@ -38,6 +43,8 @@ from ..models import (
     ToolResultBlock,
 )
 from ..pricing import (
+    bound_request_output,
+    with_request_admission,
     BillableQuantity,
     CostEstimate,
     PricingSchedule,
@@ -54,6 +61,10 @@ class _NativeStream(Protocol):
 
 class _ResponsesResource(Protocol):
     async def create(self, **kwargs: object) -> object: ...
+
+
+class _InputTokensResource(Protocol):
+    async def count(self, **kwargs: object) -> object: ...
 
 
 class _OpenAIClient(Protocol):
@@ -189,7 +200,14 @@ class OpenAIResponsesProvider:
                     "Daita's OpenAI runtime dependency is unavailable. "
                     f"{repair_guidance()}"
                 ) from error
-            self._client = cast(_OpenAIClient, AsyncOpenAI(api_key=self._api_key))
+            self._client = cast(
+                _OpenAIClient, AsyncOpenAI(api_key=self._api_key, max_retries=0)
+            )
+        if not self._owns_client:
+            # Use a request view; do not change or close the caller's SDK client.
+            with_options = getattr(self._client, "with_options", None)
+            if callable(with_options):
+                return cast(_OpenAIClient, with_options(max_retries=0))
         return self._client
 
     async def close(self) -> None:
@@ -210,7 +228,17 @@ class OpenAIResponsesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            return await self._generate(request)
+            request.remaining_after(
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            )
+            async with asyncio.timeout_at(request.deadline):
+                return await self._generate(request)
+        except TimeoutError as error:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=interrupted_model_usage(error),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -235,6 +263,9 @@ class OpenAIResponsesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         arguments = self._request_arguments(request)
         requested_at = self._clock()
+        counted_input_tokens = await self._admit_request(
+            request, arguments, requested_at=requested_at
+        )
         try:
             response = await self.client.responses.create(**arguments)
         except asyncio.CancelledError:
@@ -246,7 +277,12 @@ class OpenAIResponsesProvider:
         except Exception as error:
             raise _normalize_error(error) from error
         try:
-            return self._decode_response(response, requested_at=requested_at)
+            return with_request_admission(
+                self._decode_response(response, requested_at=requested_at),
+                request,
+                input_tokens=counted_input_tokens,
+                output_cap=cast(int | None, arguments.get("max_output_tokens")),
+            )
         except ModelProviderError:
             raise
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -272,10 +308,20 @@ class OpenAIResponsesProvider:
             raise TypeError("request must be a canonical ModelRequest")
         failure: ModelProviderError | None = None
         try:
-            async with closing_stream(self._stream(request)) as events:
-                async for event in events:
-                    yield event
+            request.remaining_after(
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            )
+            async with asyncio.timeout_at(request.deadline):
+                async with closing_stream(self._stream(request)) as events:
+                    async for event in events:
+                        yield event
             return
+        except TimeoutError as error:
+            failure = ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=interrupted_model_usage(error),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -302,8 +348,11 @@ class OpenAIResponsesProvider:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         arguments = self._request_arguments(request)
-        arguments["stream"] = True
         requested_at = self._clock()
+        counted_input_tokens = await self._admit_request(
+            request, arguments, requested_at=requested_at
+        )
+        arguments["stream"] = True
         try:
             stream = await self.client.responses.create(**arguments)
         except asyncio.CancelledError:
@@ -467,7 +516,16 @@ class OpenAIResponsesProvider:
                                 event_type=event_type,
                             )
                             raise
-                        yield ModelStreamCompleted(response)
+                        yield ModelStreamCompleted(
+                            with_request_admission(
+                                response,
+                                request,
+                                input_tokens=counted_input_tokens,
+                                output_cap=cast(
+                                    int | None, arguments.get("max_output_tokens")
+                                ),
+                            )
+                        )
                         completed = True
                         return
                     elif event_type == "error":
@@ -548,6 +606,69 @@ class OpenAIResponsesProvider:
                 }
             }
         return arguments
+
+    async def _admit_request(
+        self,
+        request: ModelRequest,
+        arguments: dict[str, object],
+        *,
+        requested_at: datetime,
+    ) -> int | None:
+        request.remaining_after(
+            ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+        )
+        if request.max_total_tokens is None and request.max_estimated_cost_usd is None:
+            return None
+
+        def output_limit(input_tokens: int, *, counted: bool = True) -> int:
+            return bound_request_output(
+                request,
+                input_tokens=input_tokens,
+                input_tokens_counted=counted,
+                maximum_output_tokens=self._max_output_tokens
+                or request.max_total_tokens
+                or 1_024,
+                schedules=self._pricing_schedules,
+                provider="openai",
+                model=self.model,
+                endpoint="responses",
+                requested_at=requested_at,
+                qualifiers={"service_tier": self._service_tier, "region": self._region},
+            )
+
+        # Reject exhausted/unpriced allowances before any counting I/O. Count
+        # the exact prepared input, omitting generation/transport-only controls.
+        output_limit(0, counted=False)
+        count_arguments = {
+            key: value
+            for key, value in arguments.items()
+            if key not in {"max_output_tokens", "service_tier", "store", "include"}
+        }
+        try:
+            counter = cast(
+                _InputTokensResource,
+                getattr(self.client.responses, "input_tokens", None),
+            )
+            async with asyncio.timeout_at(input_count_deadline(request)):
+                counted = await counter.count(**count_arguments)
+        except asyncio.CancelledError as error:
+            raise with_cancelled_model_usage(
+                error, ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            ) from None
+        except ImportError:
+            raise
+        except (TypeError, ValueError):
+            raise token_count_error(invalid=True) from None
+        except Exception as error:
+            raise before_generation(
+                _normalize_error(error),
+                code="input_token_count_failed",
+            ) from None
+        tokens = _field(counted, "input_tokens", None)
+        if type(tokens) is not int or tokens < 0:
+            raise token_count_error(invalid=True)
+        arguments["max_output_tokens"] = output_limit(tokens)
+        return tokens
 
     def _decode_response(
         self,
@@ -957,7 +1078,21 @@ def _normalize_error(error: Exception) -> ModelProviderError:
         normalized = ProviderErrorCode.INVALID_REQUEST
     else:
         normalized = ProviderErrorCode.PROVIDER_UNAVAILABLE
-    return ModelProviderError(normalized, f"OpenAI request failed: {normalized.value}")
+    return ModelProviderError(
+        normalized,
+        f"OpenAI request failed: {normalized.value}",
+        retry_after_seconds=(
+            retry_after_from_headers(
+                _field(_field(error, "response", None), "headers", None)
+            )
+            if normalized
+            in {
+                ProviderErrorCode.RATE_LIMIT_ERROR,
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+            }
+            else None
+        ),
+    )
 
 
 def _code_from_provider_value(value: str | None) -> ProviderErrorCode:

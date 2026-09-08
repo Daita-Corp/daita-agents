@@ -11,8 +11,11 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import lru_cache
 from importlib import resources
-from typing import TypeVar, cast
+from typing import TYPE_CHECKING, TypeVar, cast
 from urllib.parse import urlsplit
+
+if TYPE_CHECKING:
+    from .models import ModelRequest, ModelResponse
 
 _MAX_SCHEDULE_FILE_BYTES = 256 * 1_024
 _MAX_SCHEDULES = 128
@@ -690,6 +693,158 @@ def has_complete_pricing_coverage(
         return False
     except (TypeError, ValueError):
         return False
+
+
+def bound_request_output(
+    request: ModelRequest,
+    *,
+    input_tokens: int | None,
+    maximum_output_tokens: int,
+    input_tokens_counted: bool = True,
+    schedules: Iterable[PricingSchedule] = (),
+    provider: str = "",
+    model: str = "",
+    endpoint: str = "",
+    requested_at: datetime | None = None,
+    qualifiers: Mapping[str, str] | Iterable[PricingQualifier] = (),
+) -> int:
+    """Bound output using provider-counted input and reviewed token rates.
+
+    A provider count is an admission estimate, never incurred usage. None means
+    the endpoint has no complete request counter: only output and already
+    reported usage can be bounded, and a cost-limited dispatch is not admitted.
+    Returned usage remains the accounting truth for every route.
+    """
+    from .errors import (
+        ModelProviderError,
+        ProviderErrorCode,
+        ProviderFailureDiagnostic,
+        ProviderFailurePhase,
+        token_count_error,
+    )
+    from .models import ModelUsage
+
+    def deny(code: ProviderErrorCode) -> None:
+        raise ModelProviderError(
+            code,
+            "The remaining model budget cannot admit this request.",
+            usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
+            diagnostic=ProviderFailureDiagnostic(
+                phase=ProviderFailurePhase.REQUEST_ADMISSION,
+                code=code.value,
+                input_tokens=input_tokens if input_tokens_counted else None,
+                remaining_tokens=request.max_total_tokens,
+                maximum_output_tokens=maximum_output_tokens,
+            ),
+        )
+
+    if type(maximum_output_tokens) is not int or maximum_output_tokens < 1:
+        raise ValueError("maximum output tokens must be a positive integer")
+    if input_tokens is not None and (type(input_tokens) is not int or input_tokens < 0):
+        raise token_count_error(invalid=True)
+    output = maximum_output_tokens
+    if request.max_total_tokens is not None:
+        if request.max_total_tokens == 0:
+            deny(ProviderErrorCode.TOKEN_LIMIT_REACHED)
+        output = min(output, request.max_total_tokens - (input_tokens or 0))
+    if output <= 0:
+        deny(ProviderErrorCode.TOKEN_BUDGET_INSUFFICIENT)
+    cost = request.max_estimated_cost_usd
+    if cost is None:
+        return output
+    schedules = tuple(schedules)
+    if cost <= 0:
+        deny(ProviderErrorCode.COST_LIMIT_REACHED)
+    if input_tokens is None:
+        raise token_count_error()
+    if requested_at is None or not has_complete_pricing_coverage(
+        schedules,
+        provider=provider,
+        model=model,
+        endpoint=endpoint,
+        requested_at=requested_at,
+        qualifiers=qualifiers,
+        required_metrics=("input_uncached_tokens", "output_tokens"),
+        usage_range_metric="request_input_tokens",
+    ):
+        deny(ProviderErrorCode.COST_LIMIT_UNPRICED_ROUTE)
+    dimensions = _normalize_qualifiers(qualifiers)
+    candidates = tuple(
+        item
+        for item in schedules
+        if item.provider == provider
+        and item.model == model
+        and item.endpoint == endpoint
+        and item.qualifiers == dimensions
+        and requested_at is not None
+        and item.effective_from <= requested_at
+        and (item.effective_until is None or requested_at < item.effective_until)
+        and (
+            item.usage_range is None
+            or (
+                item.usage_range.metric == "request_input_tokens"
+                and (item.usage_range.minimum_inclusive or 0) <= input_tokens
+            )
+        )
+    )
+    if not candidates:
+        deny(ProviderErrorCode.COST_LIMIT_UNPRICED_ROUTE)
+    for schedule in candidates:
+        rates = {
+            rate.metric: rate.price_usd / rate.unit_size
+            for rate in schedule.rates
+            if rate.unit == "token"
+        }
+        if "input_uncached_tokens" not in rates or "output_tokens" not in rates:
+            deny(ProviderErrorCode.COST_LIMIT_UNPRICED_ROUTE)
+        multiplier = Decimal("1")
+        for modifier in schedule.modifiers:
+            multiplier *= modifier.multiplier
+        input_rate = (
+            max(value for metric, value in rates.items() if metric.startswith("input_"))
+            * multiplier
+        )
+        output_rate = rates["output_tokens"] * multiplier
+        remaining_cost = cost - input_rate * input_tokens
+        if remaining_cost <= 0:
+            deny(ProviderErrorCode.COST_BUDGET_INSUFFICIENT)
+        if output_rate:
+            output = min(output, int(remaining_cost / output_rate))
+    if output <= 0:
+        deny(ProviderErrorCode.COST_BUDGET_INSUFFICIENT)
+    return output
+
+
+def with_request_admission(
+    response: ModelResponse,
+    request: ModelRequest,
+    *,
+    input_tokens: int | None,
+    output_cap: int | None,
+) -> ModelResponse:
+    """Retain counted admission estimates separately from incurred response usage."""
+    if input_tokens is None:
+        return response
+    if (
+        type(input_tokens) is not int
+        or input_tokens < 0
+        or type(output_cap) is not int
+        or output_cap < 1
+    ):
+        raise ValueError(
+            "counted admission requires non-negative input and a positive output cap"
+        )
+    return replace(
+        response,
+        provider_metadata={
+            **response.provider_metadata,
+            "request_admission": {
+                "input_tokens": input_tokens,
+                "remaining_tokens": request.max_total_tokens,
+                "output_cap": output_cap,
+            },
+        },
+    )
 
 
 def calculate_cost_estimate(

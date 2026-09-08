@@ -1449,6 +1449,21 @@ class CapabilityRuntime:
                     "toolbox_search_limited",
                     "The bounded toolbox search result cannot fit its byte limit.",
                 )
+            # Authoring metadata is useful without activating execution schemas,
+            # but must not make a candidate unreachable on a bounded page. Omit
+            # whole contracts before removing candidates; exact load remains the
+            # full-contract inspection path for unusually large declarations.
+            expanded = [item for item in matches if "automation_contract" in item]
+            if expanded:
+                largest = max(
+                    expanded,
+                    key=lambda item: len(
+                        canonical_json(item["automation_contract"]).encode()
+                    ),
+                )
+                del largest["automation_contract"]
+                largest["automation_contract_omitted"] = True
+                continue
             matches.pop()
 
     def _toolbox_search_cursor(
@@ -1571,6 +1586,7 @@ class CapabilityRuntime:
             "loaded_names": [entry.view.name for entry in loaded],
             "definition_bytes": definition_bytes,
             "activation_digest": activation_digest,
+            "contracts": [_automation_contract(entry) for entry in loaded],
         }
         if (
             len(canonical_json(data).encode("utf-8"))
@@ -2654,6 +2670,31 @@ def _catalog_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
             "keywords": entry.view.presentation.keywords,
         },
         "origin_revision_digest": entry.origin_revision_digest,
+        "automation_contract": _automation_contract(entry),
+    }
+
+
+def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
+    """Bounded declaration data for authoring, never an execution grant."""
+    policy = entry.capability.automation_grant_policy
+    receipt = entry.capability.effect_receipt_policy
+    return {
+        "tool_name": entry.view.name,
+        "capability_id": entry.capability.id,
+        "automation_eligibility": entry.capability.automation_eligibility.value,
+        "requires_grant": policy is not None,
+        "grant_policy": (
+            None
+            if policy is None
+            else {
+                "constraints_kind": policy.constraints_kind,
+                "constraints_schema": policy.constraints_schema,
+            }
+        ),
+        "effect_evidence_basis": (
+            None if receipt is None else receipt.success_evidence_basis.value
+        ),
+        "connector": entry.view.connector_presentation,
     }
 
 
@@ -2857,6 +2898,7 @@ def _verified_loaded_entries(
         "loaded_names",
         "definition_bytes",
         "activation_digest",
+        "contracts",
     }:
         return None
     names_value = data.get("loaded_names")
@@ -2888,6 +2930,8 @@ def _verified_loaded_entries(
     expected_activation = _activation_digest(run_id, catalog_digest, entries)
     if (
         data.get("definition_bytes") != definition_bytes
+        or canonical_json(data.get("contracts"))
+        != canonical_json([_automation_contract(entry) for entry in entries])
         or definition_bytes > limits.max_loaded_tool_definition_bytes
         or data.get("activation_digest") != expected_activation
         or len(canonical_json(data).encode("utf-8"))
@@ -2941,28 +2985,29 @@ def _toolbox_search_match(
     *,
     loaded_names: set[str],
 ) -> dict[str, object]:
-    definition = next(
-        item for item in TOOLBOX_DEFINITIONS if item.id is entry.toolbox_id
-    )
     load_state = (
         ToolLoadMode.PINNED.value
         if entry.load_mode is ToolLoadMode.PINNED
         else ("loaded" if entry.view.name in loaded_names else "on_demand")
     )
-    return {
+    match: dict[str, object] = {
         "tool_name": entry.view.name,
         "toolbox_id": entry.toolbox_id.value,
-        "toolbox_label": definition.label,
+        "capability_id": entry.capability.id,
+        "automation_eligibility": entry.capability.automation_eligibility.value,
+        "requires_grant": entry.capability.automation_grant_policy is not None,
         "summary": entry.view.presentation.summary,
         "when_to_use": entry.view.presentation.when_to_use,
         "text_trust": entry.view.presentation.text_trust.value,
         "load_state": load_state,
         "data_access": entry.capability.access_mode.value,
         "operational_effect": entry.capability.operational_effect.value,
-        "parameter_names": entry.parameter_names,
         "score": score,
         "match_status": "matched" if score > 0 else "unmatched_fallback",
     }
+    if entry.capability.automation_grant_policy is not None:
+        match["automation_contract"] = _automation_contract(entry)
+    return match
 
 
 def _projection_digest(

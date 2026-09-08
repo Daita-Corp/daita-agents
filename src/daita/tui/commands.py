@@ -54,7 +54,7 @@ SLASH_COMMAND_COMPLETIONS = (
         "/routines update <routine-id> <instruction>",
         "Revise one scheduled routine through exact inspection and approval",
     ),
-    ("/mcp", "/mcp", "Manage remote MCP read tools"),
+    ("/mcp", "/mcp", "Manage admitted remote MCP tools and actions"),
     ("/mcp add", "/mcp add", "Guided MCP server setup"),
     ("/mcp inspect ", "/mcp inspect <endpoint>", "Inspect one no-auth endpoint"),
     (

@@ -1353,6 +1353,8 @@ class SQLiteStateStore:
             if current.active_occurrence_id is not None:
                 raise ValueError("routine_has_active_occurrence")
             if state is RoutineState.ACTIVE:
+                if current.model_budget_exhausted:
+                    raise ValueError("routine_model_budget_exhausted")
                 if current.capability_grants:
                     _require_effects_unblocked(
                         connection, agent_id, routine_id=routine_id
@@ -1575,16 +1577,7 @@ class SQLiteStateStore:
             or current.occurrence_count >= current.cumulative_max_occurrences
         ):
             raise ValueError("routine_occurrence_budget_exhausted")
-        if (
-            current.reserved_tokens
-            + current.charged_tokens
-            + current.per_run_max_tokens
-            > current.cumulative_max_tokens
-            or current.reserved_cost_usd
-            + current.charged_cost_usd
-            + current.per_run_max_cost_usd
-            > current.cumulative_max_cost_usd
-        ):
+        if current.model_budget_exhausted:
             raise ValueError("routine_model_budget_exhausted")
         identity = routine_occurrence_id(current.routine_id, slot_key)
         occurrence = RoutineOccurrence(
@@ -2080,14 +2073,29 @@ class SQLiteStateStore:
                     successful = False
                     contract_failure_code = "outcome_sensitivity_contract_failed"
                 estimate = result.usage.cost_estimate
-                charged_cost = (
-                    estimate.amount_usd
-                    if estimate.status is CostEstimateStatus.COMPLETE
-                    and estimate.amount_usd is not None
-                    and estimate.amount_usd <= current.reserved_cost_usd
-                    else current.reserved_cost_usd
-                )
-                charged_tokens = min(result.usage.total_tokens, current.reserved_tokens)
+                charged_tokens = result.usage.total_tokens
+                charged_cost = estimate.amount_usd or Decimal("0")
+                if (
+                    estimate.status is not CostEstimateStatus.COMPLETE
+                    and estimate.code != "no_model_attempts"
+                ):
+                    # Unknown consumption retains the reservation as a conservative
+                    # charge, without discarding a larger known partial amount.
+                    charged_cost = max(charged_cost, current.reserved_cost_usd)
+                    charged_tokens = max(charged_tokens, current.reserved_tokens)
+                    if successful:
+                        contract_failure_code = (
+                            contract_failure_code or "routine_run_usage_incomplete"
+                        )
+                    successful = False
+                if (
+                    result.usage.total_tokens > current.reserved_tokens
+                    or charged_cost > current.reserved_cost_usd
+                ):
+                    contract_failure_code = (
+                        contract_failure_code or "routine_run_budget_exceeded"
+                    )
+                    successful = False
                 # Authenticate committed partial artifacts even when a different
                 # required action failed. Minimum counts decide completion only.
                 try:
@@ -2158,6 +2166,13 @@ class SQLiteStateStore:
                 outcome = "completed" if successful else "failed"
                 reason = "completed" if successful else terminal_failure_code
 
+            accounted_routine = replace(
+                routine,
+                reserved_tokens=routine.reserved_tokens - current.reserved_tokens,
+                reserved_cost_usd=routine.reserved_cost_usd - current.reserved_cost_usd,
+                charged_tokens=routine.charged_tokens + charged_tokens,
+                charged_cost_usd=routine.charged_cost_usd + charged_cost,
+            )
             if current.slot_kind is RoutineSlotKind.MANUAL:
                 following = routine.next_due_at
             else:
@@ -2188,6 +2203,12 @@ class SQLiteStateStore:
                 following = None
             else:
                 next_state = RoutineState.ACTIVE
+            if (
+                next_state is RoutineState.ACTIVE
+                and accounted_routine.model_budget_exhausted
+            ):
+                next_state = RoutineState.NEEDS_ATTENTION
+                following = None
             if uncertain_effect:
                 next_state = RoutineState.PAUSED
                 following = None
@@ -2294,13 +2315,7 @@ class SQLiteStateStore:
             if successful and occurrence_observation is not None:
                 acknowledged_observation = occurrence_observation
             completed_routine = replace(
-                routine,
-                reserved_tokens=routine.reserved_tokens - current.reserved_tokens,
-                reserved_cost_usd=(
-                    routine.reserved_cost_usd - current.reserved_cost_usd
-                ),
-                charged_tokens=routine.charged_tokens + charged_tokens,
-                charged_cost_usd=routine.charged_cost_usd + charged_cost,
+                accounted_routine,
                 consecutive_failures=failures,
                 last_acknowledged_precheck_observation=acknowledged_observation,
                 active_occurrence_id=None,
@@ -3223,14 +3238,27 @@ class SQLiteStateStore:
                 successful = False
                 conclusion_failure_code = "outcome_sensitivity_contract_failed"
             estimate = result.usage.cost_estimate
-            charged_cost = (
-                estimate.amount_usd
-                if estimate.status is CostEstimateStatus.COMPLETE
-                and estimate.amount_usd is not None
-                and estimate.amount_usd <= current.reserved_cost_usd
-                else current.reserved_cost_usd
-            )
-            charged_tokens = min(result.usage.total_tokens, current.reserved_tokens)
+            charged_cost = estimate.amount_usd or Decimal("0")
+            charged_tokens = result.usage.total_tokens
+            if (
+                estimate.status is not CostEstimateStatus.COMPLETE
+                and estimate.code != "no_model_attempts"
+            ):
+                charged_cost = max(charged_cost, current.reserved_cost_usd)
+                charged_tokens = max(charged_tokens, current.reserved_tokens)
+                if successful:
+                    conclusion_failure_code = (
+                        conclusion_failure_code or "followup_run_usage_incomplete"
+                    )
+                successful = False
+            if (
+                result.usage.total_tokens > current.reserved_tokens
+                or charged_cost > current.reserved_cost_usd
+            ):
+                conclusion_failure_code = (
+                    conclusion_failure_code or "followup_run_budget_exceeded"
+                )
+                successful = False
             report_digest: str | None = None
             report_preview: str | None = None
             report_truncated = False

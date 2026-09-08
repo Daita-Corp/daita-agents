@@ -490,6 +490,31 @@ def test_failed_loop_exit_round_trips_bounded_provider_diagnostic() -> None:
     _assert_round_trip(value, encode_loop_exit, decode_loop_exit)
 
 
+def test_counted_admission_failure_preserves_native_count_and_allowance():
+    value = LoopExit(
+        run_id="run-counted-admission",
+        conversation_id="conversation-counted-admission",
+        provider_id="openai:fixture-model",
+        kind=LoopExitKind.FAILED,
+        reason="token_budget_insufficient",
+        created_at=NOW,
+        provider_failure=ProviderFailureDiagnostic(
+            phase=ProviderFailurePhase.REQUEST_ADMISSION,
+            code="token_budget_insufficient",
+            input_tokens=8100,
+            remaining_tokens=7583,
+            maximum_output_tokens=2048,
+        ),
+    )
+    _assert_round_trip(value, encode_loop_exit, decode_loop_exit)
+    with pytest.raises(ValueError, match="admission phase"):
+        ProviderFailureDiagnostic(
+            phase=ProviderFailurePhase.RESPONSE_DECODE,
+            code="invalid",
+            input_tokens=8100,
+        )
+
+
 def test_classified_tool_result_provenance_round_trips_without_entering_output() -> (
     None
 ):

@@ -25,7 +25,14 @@ from daita.capability_runtime import (
     InternalCapabilityRequest,
 )
 from daita.distribution import DistributionOwner, OutcomeState
-from daita.llm.models import CanonicalMessage, MessageRole, ModelSensitivity, TextBlock
+from daita.llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    ModelSensitivity,
+    TextBlock,
+    ModelUsage,
+)
+from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.routines.models import (
     IntervalSchedule,
@@ -262,6 +269,7 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
             created_at=NOW,
             final_text="The current value is 42.",
             steps=1,
+            usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
         )
         await store.complete(
             result,
@@ -367,6 +375,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
             created_at=NOW,
             final_text="Capacity retry completed.",
             steps=1,
+            usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
         )
         await store.complete(
             result,

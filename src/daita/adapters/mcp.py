@@ -16,6 +16,9 @@ from urllib.parse import urlsplit, urlunsplit
 from .._installation import repair_guidance
 from .._json import FrozenJsonObject, canonical_json
 from ..capabilities import (
+    AccessMode,
+    AutomationEligibility,
+    OperationalEffect,
     ToolboxId,
     ToolLoadMode,
     ToolPresentation,
@@ -95,6 +98,13 @@ class MCPBindingState(str, Enum):
     REVOKED = "revoked"
 
 
+class MCPCompletionSemantics(str, Enum):
+    """Locally attested completion contract; never inferred from result prose."""
+
+    DIRECT_RESULT = "direct_result"
+    ASYNCHRONOUS_ONLY = "asynchronous_only"
+
+
 class MCPError(DaitaError):
     """One safe protocol, transport, authentication, or admission failure."""
 
@@ -160,7 +170,7 @@ class MCPAuthentication:
 
 @dataclass(frozen=True, slots=True)
 class MCPToolSelection:
-    """Code-owned admission request for one explicitly selected read tool."""
+    """Local admission facts for one exact tool, independent of remote hints."""
 
     remote_name: str
     local_alias: str
@@ -169,7 +179,11 @@ class MCPToolSelection:
     when_to_use: str | None = None
     keywords: tuple[str, ...] = ()
     result_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL
-    read_only: bool = True
+    access_mode: AccessMode = AccessMode.READ
+    operational_effect: OperationalEffect = OperationalEffect.NONE
+    automation_eligibility: AutomationEligibility | None = None
+    maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    completion_semantics: MCPCompletionSemantics = MCPCompletionSemantics.DIRECT_RESULT
 
     def __post_init__(self) -> None:
         _remote_tool_name(self.remote_name)
@@ -196,10 +210,23 @@ class MCPToolSelection:
         object.__setattr__(self, "keywords", presentation.keywords)
         if not isinstance(self.result_sensitivity, ModelSensitivity):
             raise TypeError("MCP result_sensitivity is invalid")
-        if self.read_only is not True:
-            raise ValueError(
-                "MCP admission requires explicitly attested read-only tools"
+        if self.automation_eligibility is None:
+            object.__setattr__(
+                self,
+                "automation_eligibility",
+                (
+                    AutomationEligibility.AUTOMATION_DIRECT
+                    if self.operational_effect is OperationalEffect.NONE
+                    else AutomationEligibility.INTERACTIVE_ONLY
+                ),
             )
+        _validate_local_admission(
+            self.access_mode,
+            self.operational_effect,
+            self.automation_eligibility,
+            self.maximum_outbound_sensitivity,
+            self.completion_semantics,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,9 +239,12 @@ class MCPInspectedTool:
     output_schema_digest: str | None
     supported: bool
     unsupported_reason: str | None = None
+    task_support: str = "forbidden"
 
     def __post_init__(self) -> None:
         _remote_tool_name(self.remote_name)
+        if self.task_support not in {"forbidden", "optional", "required"}:
+            raise ValueError("MCP task support is invalid")
         if self.remote_description is not None:
             _bounded_text(
                 self.remote_description,
@@ -290,8 +320,28 @@ class MCPToolBinding:
     output_schema: FrozenJsonObject | None
     output_schema_digest: str | None
     result_sensitivity: ModelSensitivity
+    access_mode: AccessMode
+    operational_effect: OperationalEffect
+    automation_eligibility: AutomationEligibility
+    maximum_outbound_sensitivity: ModelSensitivity
+    completion_semantics: MCPCompletionSemantics
+    task_support: str
 
     def __post_init__(self) -> None:
+        _validate_local_admission(
+            self.access_mode,
+            self.operational_effect,
+            self.automation_eligibility,
+            self.maximum_outbound_sensitivity,
+            self.completion_semantics,
+        )
+        if self.task_support not in {"forbidden", "optional", "required"}:
+            raise ValueError("MCP task support is invalid")
+        if (
+            self.task_support == "required"
+            and self.automation_eligibility is AutomationEligibility.AUTOMATION_DIRECT
+        ):
+            raise ValueError("MCP unattended task completion is unsupported")
         for value, label, maximum in (
             (self.capability_id, "MCP capability id", 512),
             (self.executor_id, "MCP executor id", 512),
@@ -476,8 +526,12 @@ def mcp_execution_origin_digest(binding: MCPServerBinding, tool: MCPToolBinding)
         "output_schema": tool.output_schema,
         "output_schema_digest": tool.output_schema_digest,
         "result_sensitivity": tool.result_sensitivity.value,
-        "access_mode": "read",
-        "operational_effect": "none",
+        "access_mode": tool.access_mode.value,
+        "operational_effect": tool.operational_effect.value,
+        "automation_eligibility": tool.automation_eligibility.value,
+        "tool_maximum_outbound_sensitivity": tool.maximum_outbound_sensitivity.value,
+        "completion_semantics": tool.completion_semantics.value,
+        "task_support": tool.task_support,
     }
     return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
@@ -507,6 +561,8 @@ class MCPToolResult:
     text: tuple[str, ...] = ()
     structured: FrozenJsonObject | None = None
     is_error: bool = False
+    accepted_async: bool = False
+    operation_handle: str | None = None
 
     def __post_init__(self) -> None:
         text_items = tuple(self.text)
@@ -527,6 +583,12 @@ class MCPToolResult:
             )
         if not isinstance(self.is_error, bool):
             raise TypeError("MCP result is_error must be a boolean")
+        if not isinstance(self.accepted_async, bool):
+            raise TypeError("MCP acceptance must be a boolean")
+        if self.operation_handle is not None:
+            _bounded_text(self.operation_handle, "MCP operation handle", maximum=256)
+            if not self.accepted_async:
+                raise ValueError("MCP operation handle requires explicit acceptance")
         object.__setattr__(self, "text", text_items)
 
 
@@ -687,6 +749,21 @@ class StreamableHTTPMCPClient:
             "tools/call",
             {"name": remote_name, "arguments": frozen_arguments.to_dict()},
         )
+        # CreateTaskResult is protocol-level acceptance, not a CallToolResult.
+        # No task augmentation is sent and no task/result polling is supported.
+        if "task" in result:
+            task = result["task"]
+            handle = task.get("taskId") if isinstance(task, Mapping) else None
+            if (
+                not isinstance(handle, str)
+                or not handle
+                or len(handle) > 256
+                or "\x00" in handle
+            ):
+                raise MCPProtocolError(
+                    "mcp_result_malformed", "The MCP task acceptance handle is invalid."
+                )
+            return MCPToolResult(accepted_async=True, operation_handle=handle)
         content = result.get("content")
         if not isinstance(content, (tuple, list)):
             raise MCPProtocolError(
@@ -1128,7 +1205,7 @@ def mcp_binding_from_inspection(
     if not selections:
         raise MCPAdmissionError(
             "mcp_allowlist_empty",
-            "At least one exact MCP read tool must be selected.",
+            "At least one exact MCP tool must be selected.",
         )
     if len({item.remote_name for item in selections}) != len(selections):
         raise MCPAdmissionError(
@@ -1169,7 +1246,7 @@ def mcp_binding_from_inspection(
         ).hexdigest()
         tools.append(
             MCPToolBinding(
-                capability_id=f"mcp.read:sha256:{capability_hash}",
+                capability_id=f"mcp.tool:sha256:{capability_hash}",
                 executor_id=executor_id,
                 local_name=local_name,
                 remote_name=selection.remote_name,
@@ -1187,6 +1264,14 @@ def mcp_binding_from_inspection(
                 output_schema=inspected.output_schema,
                 output_schema_digest=inspected.output_schema_digest,
                 result_sensitivity=selection.result_sensitivity,
+                access_mode=selection.access_mode,
+                operational_effect=selection.operational_effect,
+                automation_eligibility=cast(
+                    AutomationEligibility, selection.automation_eligibility
+                ),
+                maximum_outbound_sensitivity=selection.maximum_outbound_sensitivity,
+                completion_semantics=selection.completion_semantics,
+                task_support=inspected.task_support,
             )
         )
     revision = 1 if prior is None else prior.revision + 1
@@ -1239,6 +1324,8 @@ def mcp_binding_drift_reason(
             return f"tool_missing:{accepted.remote_name}"
         if not current.supported:
             return f"tool_schema_unsupported:{accepted.remote_name}"
+        if current.task_support != accepted.task_support:
+            return f"tool_invocation_changed:{accepted.remote_name}"
         if (
             current.input_schema_digest != accepted.input_schema_digest
             or current.output_schema_digest != accepted.output_schema_digest
@@ -1283,7 +1370,15 @@ def _inspect_tool(value: object) -> MCPInspectedTool:
             description = description[:2_048]
     input_raw = value.get("inputSchema")
     output_raw = value.get("outputSchema")
+    execution = value.get("execution", {})
+    task_support = (
+        execution.get("taskSupport", "forbidden")
+        if isinstance(execution, Mapping)
+        else None
+    )
     try:
+        if task_support not in {"forbidden", "optional", "required"}:
+            raise ValueError("unsupported tool invocation semantics")
         if not isinstance(input_raw, Mapping):
             raise ValueError("input schema must be an object")
         input_schema, input_digest = canonical_mcp_schema(input_raw)
@@ -1313,7 +1408,44 @@ def _inspect_tool(value: object) -> MCPInspectedTool:
         output_schema=output_schema,
         output_schema_digest=output_digest,
         supported=True,
+        task_support=cast(str, task_support),
     )
+
+
+def _validate_local_admission(
+    access: AccessMode,
+    effect: OperationalEffect,
+    eligibility: AutomationEligibility | None,
+    outbound: ModelSensitivity,
+    completion: MCPCompletionSemantics,
+) -> None:
+    if not isinstance(access, AccessMode) or not isinstance(effect, OperationalEffect):
+        raise TypeError("MCP local access/effect admission is invalid")
+    if effect not in {
+        OperationalEffect.NONE,
+        OperationalEffect.MUTATE_DATA,
+        OperationalEffect.EXTERNAL_ACTION,
+    }:
+        raise ValueError(
+            "MCP operational effect is unsupported; shell, infrastructure and arbitrary execution are not admitted"
+        )
+    if (effect is OperationalEffect.NONE and access is AccessMode.WRITE) or (
+        effect is OperationalEffect.MUTATE_DATA and access is not AccessMode.WRITE
+    ):
+        raise ValueError("MCP data access must agree with its locally admitted effect")
+    if (
+        not isinstance(eligibility, AutomationEligibility)
+        or not isinstance(outbound, ModelSensitivity)
+        or not isinstance(completion, MCPCompletionSemantics)
+    ):
+        raise TypeError(
+            "MCP local eligibility, sensitivity or completion admission is invalid"
+        )
+    if (
+        completion is MCPCompletionSemantics.ASYNCHRONOUS_ONLY
+        and eligibility is AutomationEligibility.AUTOMATION_DIRECT
+    ):
+        raise ValueError("MCP unattended asynchronous completion is unsupported")
 
 
 def _validate_schema_node(value: Mapping[str, object], *, root: bool) -> None:
@@ -1493,6 +1625,7 @@ __all__ = [
     "MCPBindingStatus",
     "MCPClient",
     "MCPClientFactory",
+    "MCPCompletionSemantics",
     "MCPError",
     "MCPInspectedTool",
     "MCPProtocolError",

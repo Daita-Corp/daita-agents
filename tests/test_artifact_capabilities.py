@@ -961,7 +961,22 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
 ) -> None:
     downloads = tmp_path / "downloads"
     downloads.mkdir()
-    provider = MockModelProvider((_stop(),), provider_id="mock:artifact-context")
+    provider = MockModelProvider(
+        (
+            _call(
+                "load-artifact-procedures",
+                "toolbox_load",
+                {
+                    "tool_names": [
+                        DOCUMENT_CREATE_TOOL_NAME,
+                        ARTIFACT_SAVE_LOCAL_TOOL_NAME,
+                    ]
+                },
+            ),
+            _stop(),
+        ),
+        provider_id="mock:artifact-context",
+    )
     agent = await Agent.create(
         "artifact-context",
         root=tmp_path,
@@ -974,7 +989,7 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
         await agent.run("Create and download a Markdown file.")
         system = "\n".join(
             block.text
-            for message in provider.requests[0].messages
+            for message in provider.requests[1].messages
             if message.role is MessageRole.SYSTEM
             for block in message.content
             if isinstance(block, TextBlock)
@@ -1059,7 +1074,14 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
     downloads = tmp_path / "downloads"
     downloads.mkdir()
     provider = MockModelProvider(
-        (_stop(),),
+        (
+            _call(
+                "load-default-location",
+                "toolbox_load",
+                {"tool_names": [ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME]},
+            ),
+            _stop(),
+        ),
         provider_id="mock:default-location-intent",
     )
     agent = await Agent.create(
@@ -1082,7 +1104,7 @@ async def test_default_location_request_leaves_operation_choice_to_the_model(
         }.isdisjoint(projected)
         system = "\n".join(
             block.text
-            for message in request.messages
+            for message in provider.requests[1].messages
             if message.role is MessageRole.SYSTEM
             for block in message.content
             if isinstance(block, TextBlock)

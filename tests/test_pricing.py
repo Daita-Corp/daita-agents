@@ -186,7 +186,7 @@ def test_unknown_pricing_identities_fail_closed_while_xai_reports_exact_cost():
     assert all(
         provider.has_complete_pricing(request) is False for provider in providers
     )
-    assert GrokProvider("test-model").has_complete_pricing(request) is True
+    assert GrokProvider("test-model").has_complete_pricing(request) is False
 
     decoded = (
         decode_openai_usage({"input_tokens": 1, "output_tokens": 2}),

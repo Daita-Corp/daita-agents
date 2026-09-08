@@ -540,6 +540,8 @@ def _project_message(message: CanonicalMessage) -> dict[str, object]:
 
 
 def _request_document(request: ModelRequest, max_output_tokens: int) -> str:
+    from ..pricing import bound_request_output
+
     document = {
         "messages": [_project_message(message) for message in request.messages],
         "tools": [
@@ -553,6 +555,13 @@ def _request_document(request: ModelRequest, max_output_tokens: int) -> str:
         "allow_parallel_tool_calls": request.allow_parallel_tool_calls,
         "maximum_output_tokens": max_output_tokens,
     }
+    document["maximum_output_tokens"] = bound_request_output(
+        request,
+        # CLI subscriptions expose no request counter. This is an advisory
+        # output limit; the direct loop accounts for returned input usage.
+        input_tokens=None,
+        maximum_output_tokens=max_output_tokens,
+    )
     encoded = canonical_json(document)
     if len(encoded.encode("utf-8")) > _MAX_REQUEST_BYTES:
         raise ModelProviderError(

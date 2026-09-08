@@ -12,6 +12,7 @@ from .adapters import (
     MCPServerInspection,
     MCPToolBinding,
     MCPToolSelection,
+    MCPCompletionSemantics,
     PostgreSQLSource,
     SQLiteSource,
 )
@@ -206,6 +207,7 @@ __all__ = [
     "MCPServerInspection",
     "MCPToolBinding",
     "MCPToolSelection",
+    "MCPCompletionSemantics",
     "MisfirePolicy",
     "ModelRoute",
     "ModelRouteCandidate",

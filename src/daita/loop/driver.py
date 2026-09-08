@@ -26,6 +26,8 @@ from ..llm.errors import (
     ToolCatalogLimitExceeded,
     ToolManifestLimitExceeded,
     ToolSurfaceLimitExceeded,
+    interrupted_model_usage,
+    with_cancelled_model_usage,
 )
 from ..llm.models import (
     CanonicalMessage,
@@ -95,6 +97,8 @@ class ContextBuilder(Protocol):
         run: RunInput,
         messages: tuple[CanonicalMessage, ...],
         tool_context: object,
+        *,
+        max_total_tokens: int | None = None,
     ) -> object: ...
 
     def project(
@@ -104,8 +108,10 @@ class ContextBuilder(Protocol):
         *,
         step: int,
         tool_context: object,
-        final: bool = False,
         previous_request_input_tokens: int | None = None,
+        remaining_tokens: int | None = None,
+        request_input_growth_tokens: int | None = None,
+        remaining_steps: int | None = None,
     ) -> ModelRequest: ...
 
 
@@ -288,13 +294,17 @@ class AgentLoop:
         try:
             limits = _effective_run_limits(self._limits, run)
             tool_catalog = await self._tools.prepare_run(run)
-            snapshot = await self._context_builder.prepare(run, messages, tool_catalog)
+            snapshot = await self._context_builder.prepare(
+                run, messages, tool_catalog, max_total_tokens=limits.max_total_tokens
+            )
             projection = self._tools.project(tool_catalog, (start_message,))
             request = self._context_builder.project(
                 snapshot,
                 (start_message,),
                 step=1,
                 tool_context=projection,
+                remaining_tokens=limits.max_total_tokens,
+                remaining_steps=limits.max_steps,
             )
             run_route = _begin_run_route(self._model, request)
             if not _provider_supports_run_request(self._model, run_route, request):
@@ -356,6 +366,7 @@ class AgentLoop:
         artifact_deliveries: list[ArtifactDeliveryReceipt] = []
         sensitivity = run.history_sensitivity
         previous_request_input_tokens: int | None = None
+        request_input_growth_tokens: int | None = None
         tool_call_count = 0
         run_route: object | None = None if prepared is None else prepared.run_route
         limits = (
@@ -374,12 +385,29 @@ class AgentLoop:
                 tool_catalog = await _before(deadline, self._tools.prepare_run(run))
                 context_snapshot = await _before(
                     deadline,
-                    self._context_builder.prepare(run, messages, tool_catalog),
+                    self._context_builder.prepare(
+                        run,
+                        messages,
+                        tool_catalog,
+                        max_total_tokens=limits.max_total_tokens,
+                    ),
                 )
             else:
                 tool_catalog = prepared.tool_catalog
                 context_snapshot = prepared.context_snapshot
             for step in range(1, limits.max_steps + 1):
+                if limits.max_estimated_cost_usd == 0:
+                    return await self._finish(
+                        run,
+                        LoopExitKind.FAILED,
+                        "cost_limit_reached",
+                        step - 1,
+                        usage,
+                        run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
+                    )
                 if self._wall_time_exhausted(started, limits):
                     return await self._finish(
                         run,
@@ -403,10 +431,35 @@ class AgentLoop:
                     step=step,
                     tool_context=step_tool_projection,
                     previous_request_input_tokens=previous_request_input_tokens,
+                    remaining_tokens=max(
+                        0, limits.max_total_tokens - usage.total_tokens
+                    ),
+                    request_input_growth_tokens=request_input_growth_tokens,
+                    remaining_steps=limits.max_steps - step + 1,
                 )
                 sensitivity = max(
                     sensitivity, request.sensitivity, key=lambda item: item.routing_rank
                 )
+                try:
+                    request = replace(
+                        request,
+                        max_total_tokens=limits.max_total_tokens,
+                        max_estimated_cost_usd=limits.max_estimated_cost_usd,
+                        deadline=deadline,
+                    ).remaining_after(usage)
+                except ModelProviderError as error:
+                    # Admission consumed nothing; retained usage is already cumulative.
+                    return await self._finish(
+                        run,
+                        LoopExitKind.FAILED,
+                        error.code.value,
+                        step - 1,
+                        usage,
+                        run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
+                    )
                 if run_route is None:
                     try:
                         run_route = _begin_run_route(self._model, request)
@@ -455,17 +508,37 @@ class AgentLoop:
                     if self._observer is not None
                     else None
                 )
-                response = await self._model_response(
-                    request,
-                    run,
-                    model_call_index=step,
-                    deadline=deadline,
-                    run_route=run_route,
-                )
+                try:
+                    response = await self._model_response(
+                        request,
+                        run,
+                        model_call_index=step,
+                        deadline=deadline,
+                        run_route=run_route,
+                    )
+                except ModelProviderError:
+                    # Normalized failures carry their own attempt usage below.
+                    raise
+                except BaseException as error:
+                    # Cancellation and the outer deadline can interrupt a billed
+                    # request before the provider returns any terminal usage.
+                    usage = _add_usage(
+                        usage,
+                        interrupted_model_usage(error),
+                    )
+                    raise
                 model_duration_ms = (
                     _duration_ms(model_started) if model_started is not None else None
                 )
                 usage = _add_usage(usage, response.usage)
+                request_input_growth_tokens = (
+                    max(
+                        0, response.request_input_tokens - previous_request_input_tokens
+                    )
+                    if response.request_input_tokens is not None
+                    and previous_request_input_tokens is not None
+                    else None
+                )
                 previous_request_input_tokens = response.request_input_tokens
                 assistant = _assistant_message(response)
                 if self._observer is not None:
@@ -475,6 +548,52 @@ class AgentLoop:
                         response,
                         model_duration_ms,
                         model_call_index=step,
+                    )
+
+                budget_reason = self._usage_limit_reason(usage, limits)
+                if (
+                    budget_reason is None
+                    and len(response.tool_calls) > limits.max_tool_calls_per_response
+                ):
+                    budget_reason = "tool_calls_per_response_exceeded"
+                if (
+                    budget_reason is None
+                    and tool_call_count + len(response.tool_calls)
+                    > limits.max_tool_calls_per_run
+                ):
+                    budget_reason = "tool_calls_per_run_exceeded"
+                if budget_reason is not None:
+                    await self._transcripts.append(run.id, assistant)
+                    messages = (*messages, assistant)
+                    for call in response.tool_calls:
+                        result_message = CanonicalMessage(
+                            role=MessageRole.TOOL,
+                            content=(
+                                ToolResultBlock(
+                                    call_id=call.id,
+                                    is_error=True,
+                                    output={
+                                        "error": {
+                                            "code": budget_reason,
+                                            "message": "The run budget prevented execution; this tool was not called.",
+                                        }
+                                    },
+                                ),
+                            ),
+                        )
+                        await self._transcripts.append(run.id, result_message)
+                        messages = (*messages, result_message)
+                    return await self._finish(
+                        run,
+                        LoopExitKind.FAILED,
+                        budget_reason,
+                        step,
+                        usage,
+                        run_started,
+                        final_text=response.text,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
                     )
 
                 if response.finish_reason is FinishReason.STOP:
@@ -509,33 +628,6 @@ class AgentLoop:
                     )
 
                 assert response.tool_calls
-                if len(response.tool_calls) > limits.max_tool_calls_per_response:
-                    return await self._finish(
-                        run,
-                        LoopExitKind.FAILED,
-                        "tool_calls_per_response_exceeded",
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
-                if (
-                    tool_call_count + len(response.tool_calls)
-                    > limits.max_tool_calls_per_run
-                ):
-                    return await self._finish(
-                        run,
-                        LoopExitKind.FAILED,
-                        "tool_calls_per_run_exceeded",
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
                 tool_call_count += len(response.tool_calls)
                 await self._transcripts.append(run.id, assistant)
                 messages = (*messages, assistant)
@@ -615,51 +707,13 @@ class AgentLoop:
                         sensitivity=sensitivity,
                     )
 
-                budget_reason = self._usage_limit_reason(usage, limits)
-                if budget_reason is not None:
-                    if budget_reason.startswith("cost_limit_"):
-                        return await self._finish(
-                            run,
-                            LoopExitKind.FAILED,
-                            budget_reason,
-                            step,
-                            usage,
-                            run_started,
-                            artifacts=tuple(artifacts),
-                            artifact_deliveries=tuple(artifact_deliveries),
-                            sensitivity=sensitivity,
-                        )
-                    return await self._wrap_up(
-                        run,
-                        messages[current_start:],
-                        step,
-                        usage,
-                        budget_reason,
-                        deadline,
-                        run_started,
-                        context_snapshot,
-                        tool_catalog,
-                        previous_request_input_tokens,
-                        run_route,
-                        limits,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
-
-            return await self._wrap_up(
+            return await self._finish(
                 run,
-                messages[current_start:],
+                LoopExitKind.FAILED,
+                "step_limit_reached",
                 limits.max_steps,
                 usage,
-                "step_limit_reached",
-                deadline,
                 run_started,
-                context_snapshot,
-                tool_catalog,
-                previous_request_input_tokens,
-                run_route,
-                limits,
                 artifacts=tuple(artifacts),
                 artifact_deliveries=tuple(artifact_deliveries),
                 sensitivity=sensitivity,
@@ -736,152 +790,6 @@ class AgentLoop:
                 sensitivity=sensitivity,
             )
             raise
-
-    async def _wrap_up(
-        self,
-        run: RunInput,
-        messages: tuple[CanonicalMessage, ...],
-        steps: int,
-        usage: ModelUsage,
-        reason: str,
-        deadline: float,
-        run_started: float,
-        context_snapshot: object,
-        tool_catalog: object,
-        previous_request_input_tokens: int | None,
-        run_route: object | None,
-        limits: LoopLimits,
-        *,
-        sensitivity: ModelSensitivity,
-        artifacts: tuple[ArtifactRef, ...],
-        artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
-    ) -> LoopExit:
-        if asyncio.get_running_loop().time() >= deadline:
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                reason,
-                steps,
-                usage,
-                run_started,
-                artifacts=artifacts,
-                artifact_deliveries=artifact_deliveries,
-                sensitivity=sensitivity,
-            )
-        tool_context = self._tools.project(tool_catalog, messages)
-        request = self._context_builder.project(
-            context_snapshot,
-            messages,
-            step=steps + 1,
-            tool_context=tool_context,
-            final=True,
-            previous_request_input_tokens=previous_request_input_tokens,
-        )
-        sensitivity = max(
-            sensitivity, request.sensitivity, key=lambda item: item.routing_rank
-        )
-        if not _provider_supports_run_request(self._model, run_route, request):
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                "model_route_ineligible",
-                steps,
-                usage,
-                run_started,
-                artifacts=artifacts,
-                artifact_deliveries=artifact_deliveries,
-                sensitivity=sensitivity,
-            )
-        if not self._cost_limit_allows_request(request, run_route, limits):
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                "cost_limit_unpriced_route",
-                steps,
-                usage,
-                run_started,
-                artifacts=artifacts,
-                artifact_deliveries=artifact_deliveries,
-                sensitivity=sensitivity,
-            )
-        try:
-            model_started = (
-                asyncio.get_running_loop().time()
-                if self._observer is not None
-                else None
-            )
-            response = await self._model_response(
-                request,
-                run,
-                model_call_index=steps + 1,
-                deadline=deadline,
-                run_route=run_route,
-            )
-        except ModelProviderError as error:
-            usage = _add_usage(usage, error.usage)
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                reason,
-                steps,
-                usage,
-                run_started,
-                artifacts=artifacts,
-                artifact_deliveries=artifact_deliveries,
-                sensitivity=sensitivity,
-            )
-        model_duration_ms = (
-            _duration_ms(model_started) if model_started is not None else None
-        )
-        usage = _add_usage(usage, response.usage)
-        if response.finish_reason is FinishReason.TOOL_CALLS:
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                "tool_free_wrap_up_returned_tool_calls",
-                steps,
-                usage,
-                run_started,
-                artifacts=artifacts,
-                artifact_deliveries=artifact_deliveries,
-                sensitivity=sensitivity,
-            )
-        assistant = _assistant_message(response)
-        if self._observer is not None:
-            assert model_duration_ms is not None
-            self._emit_model_completed(
-                run,
-                response,
-                model_duration_ms,
-                model_call_index=steps + 1,
-            )
-        if response.finish_reason is not FinishReason.STOP:
-            await self._transcripts.append(run.id, assistant)
-            return await self._finish(
-                run,
-                LoopExitKind.FAILED,
-                _finish_reason_failure(response.finish_reason),
-                steps,
-                usage,
-                run_started,
-                artifacts=artifacts,
-                artifact_deliveries=artifact_deliveries,
-                sensitivity=sensitivity,
-            )
-        assert response.text is not None and not response.tool_calls
-        return await self._finish(
-            run,
-            LoopExitKind.COMPLETED,
-            reason,
-            steps,
-            usage,
-            run_started,
-            final_text=response.text,
-            final_message=assistant,
-            artifacts=artifacts,
-            artifact_deliveries=artifact_deliveries,
-            sensitivity=sensitivity,
-        )
 
     async def _finish(
         self,
@@ -1046,34 +954,45 @@ class AgentLoop:
                 events = routed_stream(run_route, request)
             else:
                 events = model.stream(request)
-            async with closing_stream(events):
-                async for event in events:
-                    if completed is not None:
-                        raise ModelProviderError(
-                            ProviderErrorCode.MALFORMED_RESPONSE,
-                            "model stream continued after its canonical completion",
-                            provider_id=self._model.provider_id,
-                        )
-                    if isinstance(event, ModelTextDelta):
-                        self._emit_model_text_delta(
-                            run,
-                            event.text,
-                            model_call_index=model_call_index,
-                        )
-                    elif isinstance(event, ModelToolCallDelta):
-                        pass
-                    elif isinstance(event, ModelStreamCompleted):
-                        completed = event.response
-                    else:
-                        raise ModelProviderError(
-                            ProviderErrorCode.MALFORMED_RESPONSE,
-                            "model stream returned an unsupported canonical event",
-                            provider_id=self._model.provider_id,
-                        )
-                    # A deterministic or local provider may have an immediately-ready
-                    # iterator. Yield so presentation, input, and cancellation remain
-                    # responsive even for a high-rate canonical stream.
-                    await asyncio.sleep(0)
+            try:
+                async with closing_stream(events):
+                    async for event in events:
+                        if completed is not None:
+                            raise ModelProviderError(
+                                ProviderErrorCode.MALFORMED_RESPONSE,
+                                "model stream continued after its canonical completion",
+                                provider_id=self._model.provider_id,
+                            )
+                        if isinstance(event, ModelTextDelta):
+                            self._emit_model_text_delta(
+                                run,
+                                event.text,
+                                model_call_index=model_call_index,
+                            )
+                        elif isinstance(event, ModelToolCallDelta):
+                            pass
+                        elif isinstance(event, ModelStreamCompleted):
+                            completed = event.response
+                        else:
+                            raise ModelProviderError(
+                                ProviderErrorCode.MALFORMED_RESPONSE,
+                                "model stream returned an unsupported canonical event",
+                                provider_id=self._model.provider_id,
+                            )
+                        # A deterministic or local provider may have an immediately-ready
+                        # iterator. Yield so presentation, input, and cancellation remain
+                        # responsive even for a high-rate canonical stream.
+                        await asyncio.sleep(0)
+            except asyncio.CancelledError as error:
+                if completed is not None:
+                    with_cancelled_model_usage(error, completed.usage)
+                raise
+            except ModelProviderError as error:
+                if completed is not None:
+                    # Completion carries the authoritative logical-request usage;
+                    # stream cleanup does not submit another model request.
+                    error.usage = completed.usage
+                raise
             if completed is None:
                 raise ModelProviderError(
                     ProviderErrorCode.MALFORMED_RESPONSE,
@@ -1149,8 +1068,6 @@ class AgentLoop:
         usage: ModelUsage,
         limits: LoopLimits,
     ) -> str | None:
-        if usage.total_tokens >= limits.max_total_tokens:
-            return "token_limit_reached"
         cost_limit = limits.max_estimated_cost_usd
         if cost_limit is not None:
             estimate = usage.cost_estimate
@@ -1159,6 +1076,8 @@ class AgentLoop:
             assert estimate.amount_usd is not None
             if estimate.amount_usd >= cost_limit:
                 return "cost_limit_reached"
+        if usage.total_tokens >= limits.max_total_tokens:
+            return "token_limit_reached"
         return None
 
 

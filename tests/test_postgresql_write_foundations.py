@@ -25,7 +25,7 @@ from daita.domains.data.capabilities import (
     relational_update_capability_declarations,
     relational_update_preview_capability_declarations,
 )
-from daita.context import _system_prompt
+from daita.context import _tool_guidance
 from daita.hosting import embedded as embedded_module
 from daita.security import EmptySecretProvider, SecretReference
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
@@ -44,23 +44,14 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
     assert "Calling this tool opens the approval interaction" in update_description
     assert "approved structured PostgreSQL update" not in update_description
 
-    prompt = _system_prompt(
-        {},
-        capability_ids=frozenset(
+    prompt = _tool_guidance(
+        frozenset(
             {
                 RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
                 RELATIONAL_UPDATE_CAPABILITY_ID,
             }
         ),
-        tool_manifest=(),
-        has_on_demand_tools=True,
-        memory_text="",
-        user_profile="",
-        skill_index=None,
-        semantic_text="",
-        candidate_text="",
-        artifact_destinations=(),
-        final=False,
+        (),
     )
     assert "a successful preview is not a terminal answer" in prompt
     assert "in the same run, call data_update_rows" in prompt

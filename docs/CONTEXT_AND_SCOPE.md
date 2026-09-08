@@ -5,7 +5,8 @@ There is no selected-source mode. Every data call still names its exact source
 and resource, and current permissions are checked before I/O.
 
 Initial context contains a bounded connector directory drawn from current source
-registrations, admitted MCP bindings, applicable toolboxes, and eligible skills.
+registrations, admitted MCP bindings, and eligible skills. A separate compact
+manifest lists applicable toolboxes; the directory does not repeat those entries.
 An omitted count makes truncation visible. `catalog_search` and `toolbox_search`
 return `next_cursor` when more candidates remain. Supply it with the same query
 to continue. Matching candidates come first; unmatched fallback candidates are
@@ -13,6 +14,20 @@ explicitly labeled. `total_matches` and `total_candidates` describe different
 counts. A cursor is valid only for its current prepared scope and discovery
 snapshot; a changed query, run, admission, or search snapshot requires a fresh
 search. Exact `toolbox_load` names still need no preceding search.
+For grant-requiring capabilities, discovery includes the exact automation contract
+used by scheduling. It does not activate execution tools. A contract too large for
+the bounded page is omitted in full with `automation_contract_omitted`; loading
+that exact tool returns the complete declaration.
+
+Core instructions and admitted context are frozen when a run starts. Each model
+step adds procedure guidance for its current callable tools and its remaining
+cumulative token allowance. Optional discovery and prior conversation continuity
+receive a conservative footprint allowance derived from that run limit, separate
+from mandatory instructions, current input, and pinned schemas. The complete
+projection still fits the model input window. This bounds optional context without
+changing the exact current-run
+transcript or its sensitivity floor. Provider-native counting remains the final
+request admission check on supported API routes.
 
 `update_source_discovery` and `update_mcp_discovery` edit bounded local `summary`,
 `when_to_use`, and normalized `keywords` hints. They preserve execution
@@ -78,3 +93,14 @@ sensitivity. A scheduled run does not import unrelated conversation history,
 mutable memory or semantic recall, or newly saved skills. Its inbox
 still belongs to the originating conversation, and only explicitly retained
 skill versions are included in its reasoning context.
+
+Budget guidance also reports the remaining model steps and an advisory two-request
+forecast from the latest measured input, its recent growth, and two configured
+output allowances. It explicitly accounts for needing another request to read tool
+results and finish the answer. Unknown input growth is labeled unknown; future
+schemas and results can exceed this forecast. The forecast is not a reservation,
+a native token count, or permission for extra work. Provider admission still checks
+the exact prepared request against the remaining hard allowance, and exhaustion is
+terminal. The framework never substitutes a smaller final context or a post-limit
+model request. Compact owner-defined results reduce growth without truncating the
+exact transcript or weakening the retained contracts.

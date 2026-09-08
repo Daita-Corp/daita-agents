@@ -82,6 +82,7 @@ from .llm.profiles import reviewed_model_profile
 from .llm.protocols import ManagedModelProvider
 from .security import SecretReference
 from .terminal import run_terminal_application
+from .tui.projection import run_failure_notice, tool_outcome_summary
 from .tui.models import (
     validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
 )
@@ -244,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     sources = commands.add_parser("sources", help="list attached sources")
     sources.add_argument("name")
 
-    mcp = commands.add_parser("mcp", help="manage admitted remote MCP read tools")
+    mcp = commands.add_parser("mcp", help="manage admitted remote MCP tools")
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
     mcp_inspect = mcp_commands.add_parser(
         "inspect",
@@ -1286,6 +1287,7 @@ async def _execute(args: argparse.Namespace) -> object:
                     conversation_id=args.conversation_id,
                 )
             )
+            transcript = await run_agent.transcript(result.run_id)
             return {
                 "run_id": result.run_id,
                 "conversation_id": result.conversation_id,
@@ -1293,6 +1295,22 @@ async def _execute(args: argparse.Namespace) -> object:
                 "reason": result.reason,
                 "text": result.final_text,
                 "steps": result.steps,
+                "notice": (
+                    None
+                    if result.kind.value == "completed"
+                    else run_failure_notice(result, transcript)
+                ),
+                "tool_results": tuple(
+                    {
+                        "call_id": call.id,
+                        "tool_name": call.name,
+                        "is_error": None if outcome is None else outcome.is_error,
+                        "summary": (
+                            None if outcome is None else tool_outcome_summary(outcome)
+                        ),
+                    }
+                    for call, outcome in transcript.tool_pairs
+                ),
                 "artifacts": tuple(
                     artifact_ref_to_mapping(item) for item in result.artifacts
                 ),

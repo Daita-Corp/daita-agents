@@ -3,20 +3,24 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import cast
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, Label, Static
+from textual.widgets import Button, Footer, Input, Label, Select, Static
 
 from daita import (
     MCPBindingState,
     MCPBindingStatus,
     MCPServerInspection,
     MCPToolSelection,
+    MCPCompletionSemantics,
 )
+from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
+from daita.llm.models import ModelSensitivity
 
 from ..models import PickerOption
 from ..sanitization import safe_display, sanitize_terminal_text
@@ -120,7 +124,7 @@ def render_mcp_servers(statuses: tuple[MCPBindingStatus, ...]) -> tuple[str, str
     if not groups:
         return (
             "No MCP servers",
-            "No remote MCP read tools are connected.\n\n"
+            "No remote MCP tools are connected.\n\n"
             "Choose Add server to inspect an endpoint and select tools.",
         )
     tool_count = sum(len(group.tool_names) for group in groups)
@@ -423,6 +427,131 @@ class MCPManagementScreen(ModalScreen[str | None]):
         )
 
 
+class MCPToolAdmissionScreen(ModalScreen[MCPToolSelection | None]):
+    """Explicit local authority and information-handling controls for one tool."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, selection: MCPToolSelection) -> None:
+        super().__init__()
+        self._selection = selection
+
+    def compose(self) -> ComposeResult:
+        selected = self._selection
+        with Vertical(id="mcp-tool-admission", classes="control-panel"):
+            yield Label(
+                safe_display(selected.remote_name, fallback="MCP tool"), markup=False
+            )
+            with VerticalScroll():
+                yield Label("Local alias")
+                yield Input(selected.local_alias, id="mcp-tool-alias")
+                yield Label("Local description")
+                yield Input(selected.description, id="mcp-tool-description")
+                yield Label("Data access")
+                yield Select(
+                    [(item.value, item.value) for item in AccessMode],
+                    value=selected.access_mode.value,
+                    allow_blank=False,
+                    id="mcp-tool-access",
+                )
+                yield Label("Operational effect (independently verify the tool)")
+                yield Select(
+                    [
+                        (item.value, item.value)
+                        for item in (
+                            OperationalEffect.NONE,
+                            OperationalEffect.EXTERNAL_ACTION,
+                            OperationalEffect.MUTATE_DATA,
+                        )
+                    ],
+                    value=selected.operational_effect.value,
+                    allow_blank=False,
+                    id="mcp-tool-effect",
+                )
+                yield Label("Unattended eligibility (still requires a standing grant)")
+                yield Select(
+                    [(item.value, item.value) for item in AutomationEligibility],
+                    value=cast(
+                        AutomationEligibility, selected.automation_eligibility
+                    ).value,
+                    allow_blank=False,
+                    id="mcp-tool-eligibility",
+                )
+                yield Label("Result sensitivity")
+                yield Select(
+                    [(item.value, item.value) for item in ModelSensitivity],
+                    value=selected.result_sensitivity.value,
+                    allow_blank=False,
+                    id="mcp-tool-result",
+                )
+                yield Label("Tool outbound ceiling (also bounded by server ceiling)")
+                yield Select(
+                    [(item.value, item.value) for item in ModelSensitivity],
+                    value=selected.maximum_outbound_sensitivity.value,
+                    allow_blank=False,
+                    id="mcp-tool-outbound",
+                )
+                yield Label("Known completion semantics")
+                yield Select(
+                    [(item.value, item.value) for item in MCPCompletionSemantics],
+                    value=selected.completion_semantics.value,
+                    allow_blank=False,
+                    id="mcp-tool-completion",
+                )
+                yield Static(
+                    "Direct results prove server-reported invocation only. Fix nested arguments in full in standing grants. Shell, infrastructure, arbitrary execution and asynchronous completion are unsupported.",
+                    markup=False,
+                )
+            yield Static("", id="mcp-admission-error", markup=False)
+            yield Button(
+                "Save local permissions", id="mcp-admission-save", variant="primary"
+            )
+            yield Button("Cancel", id="mcp-admission-cancel")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "mcp-admission-cancel":
+            self.dismiss(None)
+        elif event.button.id == "mcp-admission-save":
+            try:
+                values = {
+                    name: cast(str, self.query_one(f"#mcp-tool-{name}", Select).value)
+                    for name in (
+                        "access",
+                        "effect",
+                        "eligibility",
+                        "result",
+                        "outbound",
+                        "completion",
+                    )
+                }
+                self.dismiss(
+                    replace(
+                        self._selection,
+                        local_alias=self.query_one("#mcp-tool-alias", Input).value,
+                        description=self.query_one(
+                            "#mcp-tool-description", Input
+                        ).value,
+                        access_mode=AccessMode(values["access"]),
+                        operational_effect=OperationalEffect(values["effect"]),
+                        automation_eligibility=AutomationEligibility(
+                            values["eligibility"]
+                        ),
+                        result_sensitivity=ModelSensitivity(values["result"]),
+                        maximum_outbound_sensitivity=ModelSensitivity(
+                            values["outbound"]
+                        ),
+                        completion_semantics=MCPCompletionSemantics(
+                            values["completion"]
+                        ),
+                    )
+                )
+            except (TypeError, ValueError) as error:
+                self.query_one("#mcp-admission-error", Static).update(str(error))
+
+
 class MCPSetupScreen(ModalScreen[str | None]):
     """Inspect, select, review, and attach one no-auth MCP server."""
 
@@ -459,6 +588,16 @@ class MCPSetupScreen(ModalScreen[str | None]):
                 yield Button("Select tools", id="mcp-select", disabled=True)
                 yield Button("Attach tools", id="mcp-attach", disabled=True)
                 yield Button("Cancel", id="mcp-setup-cancel")
+            yield Button(
+                "Configure selected tool permissions", id="mcp-configure", disabled=True
+            )
+            yield Label("Server outbound sensitivity ceiling")
+            yield Select(
+                [(item.value, item.value) for item in ModelSensitivity],
+                value=ModelSensitivity.INTERNAL.value,
+                allow_blank=False,
+                id="mcp-outbound",
+            )
             yield Static("", id="mcp-error", markup=False)
             yield Footer()
 
@@ -510,6 +649,8 @@ class MCPSetupScreen(ModalScreen[str | None]):
                 await self._select_tools()
             elif button_id == "mcp-attach":
                 await self._attach_tools()
+            elif button_id == "mcp-configure":
+                await self._configure_tool()
         except (ValueError, RuntimeError, OSError) as error:
             self._show_error(error)
         finally:
@@ -531,7 +672,7 @@ class MCPSetupScreen(ModalScreen[str | None]):
             for index, tool in enumerate(supported)
         }
         self.query_one("#mcp-step", Static).update(
-            "Step 2 of 3  ·  Select supported read tools"
+            "Step 2 of 3  ·  Select supported tools, then configure local permissions"
         )
         lines = [
             safe_display(inspection.server_name, fallback="Unknown server", maximum=256)
@@ -582,7 +723,7 @@ class MCPSetupScreen(ModalScreen[str | None]):
         )
         selected = await self.app._await_modal(  # type: ignore[attr-defined]
             SelectionScreen(
-                title="Select independently verified read tools",
+                title="Select tools (read-only admission by default)",
                 options=options,
                 multi=True,
             )
@@ -595,6 +736,38 @@ class MCPSetupScreen(ModalScreen[str | None]):
             if self._tool_picker[picker_id] in supported_by_name
         )
         self._selections = mcp_tool_selections(remote_names)
+        self._render_selection()
+
+    async def _configure_tool(self) -> None:
+        selected = await self.app._await_modal(  # type: ignore[attr-defined]
+            SelectionScreen(
+                title="Configure exact tool permissions",
+                options=tuple(
+                    PickerOption(
+                        identity=item.remote_name,
+                        label=safe_display(item.remote_name, fallback="tool"),
+                        description=item.operational_effect.value,
+                    )
+                    for item in self._selections
+                ),
+            )
+        )
+        if not selected:
+            return
+        original = next(
+            item for item in self._selections if item.remote_name == selected[0]
+        )
+        configured = await self.app._await_modal(MCPToolAdmissionScreen(original))  # type: ignore[attr-defined]
+        if configured is not None:
+            self._selections = tuple(
+                configured if item.remote_name == original.remote_name else item
+                for item in self._selections
+            )
+            self._render_selection()
+
+    def _render_selection(self) -> None:
+        inspection = self._inspection
+        assert inspection is not None
         self.query_one("#mcp-step", Static).update(
             "Step 3 of 3  ·  Review aliases, descriptions, and sensitivity"
         )
@@ -619,6 +792,17 @@ class MCPSetupScreen(ModalScreen[str | None]):
                         selection.description, fallback="MCP read tool", maximum=512
                     ),
                     "  Result sensitivity: " + selection.result_sensitivity.value,
+                    "  Access / effect: "
+                    + selection.access_mode.value
+                    + " / "
+                    + selection.operational_effect.value,
+                    "  Unattended eligibility: "
+                    + cast(
+                        AutomationEligibility, selection.automation_eligibility
+                    ).value,
+                    "  Tool outbound ceiling: "
+                    + selection.maximum_outbound_sensitivity.value,
+                    "  Completion: " + selection.completion_semantics.value,
                 )
             )
         lines.extend(
@@ -639,9 +823,7 @@ class MCPSetupScreen(ModalScreen[str | None]):
             ConfirmScreen(
                 f"Attach {len(self._selections)} selected MCP "
                 + ("tool" if len(self._selections) == 1 else "tools")
-                + " as read-only?\n\nOnly continue if you have independently "
-                "verified every selected tool is read-only. Remote metadata does not "
-                "grant authority."
+                + " with the reviewed local permissions?\n\nIndependently verify each tool's access, effect and direct-result semantics. Shell, infrastructure and arbitrary execution are unsupported. Remote metadata grants no authority. Actions require exact per-call approval or a separately approved standing grant. Normal results establish only server-reported invocation, not verified business completion. No automatic replay."
             )
         )
         if not accepted:
@@ -649,6 +831,9 @@ class MCPSetupScreen(ModalScreen[str | None]):
         status = await self.app.controller.attach_mcp_tools(  # type: ignore[attr-defined]
             inspection.endpoint,
             self._selections,
+            maximum_outbound_sensitivity=ModelSensitivity(
+                cast(str, self.query_one("#mcp-outbound", Select).value)
+            ),
         )
         restart = False
         if status.reopen_required:
@@ -670,6 +855,7 @@ class MCPSetupScreen(ModalScreen[str | None]):
         self.query_one("#mcp-inspect", Button).disabled = self._busy
         self.query_one("#mcp-select", Button).disabled = self._busy or not supported
         self.query_one("#mcp-attach", Button).disabled = self._busy or not selected
+        self.query_one("#mcp-configure", Button).disabled = self._busy or not selected
         self.query_one("#mcp-setup-cancel", Button).disabled = self._busy
 
     def _show_error(self, error: Exception) -> None:

@@ -278,8 +278,10 @@ def _followup_contracts(
     )
 
 
+@pytest.mark.parametrize("accounting", ["complete", "overrun", "unknown"])
 async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
     tmp_path: Path,
+    accounting: str,
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
@@ -301,6 +303,25 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
         id_factory=ids,
         workspace=workspace_for(tmp_path),
     )
+    conclusion = _stop("The durable profile completed and its result is available.")
+    if accounting == "overrun":
+        conclusion = replace(
+            conclusion,
+            usage=ModelUsage(
+                input_tokens=20_000,
+                cost_estimate=CostEstimate.complete(Decimal("0.08")),
+            ),
+        )
+    elif accounting == "unknown":
+        conclusion = replace(
+            conclusion,
+            usage=ModelUsage(
+                input_tokens=100,
+                cost_estimate=CostEstimate.partial(
+                    Decimal("0.002"), code="unpriced_attempt"
+                ),
+            ),
+        )
     provider.replace_script(
         (
             _start_profile(resource.id),
@@ -309,7 +330,7 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
                 "job-stage-c-1",
                 resource_id_for_disallowed_calls=resource.id,
             ),
-            _stop("The durable profile completed and its result is available."),
+            conclusion,
         )
     )
     try:
@@ -322,9 +343,20 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
         delivery = items[0]
         assert delivery.state is DeliveryState.AVAILABLE
         assert await _delivery_job_id(agent, delivery) == job_id
-        assert delivery.conclusion_preview == (
-            "The durable profile completed and its result is available."
-        )
+        if accounting == "complete":
+            assert delivery.conclusion_preview == conclusion.text
+        else:
+            assert delivery.failure_code is not None
+            assert delivery.failure_code.startswith("followup_run_")
+        followup = (await agent._embedded._store.list_autonomous_followups(agent.id))[0]
+        if accounting == "overrun":
+            assert followup.charged_tokens == 20_000 + USAGE.total_tokens
+            assert followup.charged_cost_usd == Decimal("0.081")
+        elif accounting == "unknown":
+            assert followup.charged_tokens == followup.grant.per_run_max_tokens
+            assert followup.charged_cost_usd == followup.grant.per_run_max_cost_usd
+        assert followup.reserved_tokens == 0
+        assert followup.reserved_cost_usd == 0
         assert delivery.conclusion_preview_truncated is False
         followup_run_id = delivery.resulting_run_id
         assert followup_run_id is not None

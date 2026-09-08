@@ -98,20 +98,6 @@ DAITA_THEME = Theme(
 _CREATE_NEW_AGENT_SELECTION = "daita:create-new-agent"
 
 
-def _run_failure_notice(result: LoopExit) -> str:
-    if result.reason == "timeout":
-        return (
-            "The model provider timed out after bounded retries. Daita stopped "
-            "waiting; any completed tool results remain available above."
-        )
-    if result.reason == "wall_time_exhausted":
-        return (
-            "The run reached its overall time limit and was stopped. Any completed "
-            "tool results remain available above."
-        )
-    return f"{result.kind.value}: {result.reason}"
-
-
 class DaitaApp(App[int]):
     """One Textual app for onboarding, chat, commands, and approval."""
 
@@ -1047,6 +1033,7 @@ class DaitaApp(App[int]):
             if screen is not None:
                 screen.remove_block(self._partial_identity)
                 screen.clear_activity()
+                await self._replace_conversation_transcript()
                 screen.show_notice("Run cancelled.")
             raise
         except Exception as error:
@@ -1089,9 +1076,7 @@ class DaitaApp(App[int]):
             self._pending_user_identity = None
         self._partial_text = ""
         await self._replace_conversation_transcript()
-        if result.kind is not LoopExitKind.COMPLETED:
-            screen.show_notice(_run_failure_notice(result))
-        elif result.final_text:
+        if result.kind is LoopExitKind.COMPLETED and result.final_text:
             # Canonical assistant text is already in the transcript.
             pass
         for notice in await self.controller.artifact_notices(result):

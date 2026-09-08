@@ -724,7 +724,7 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
         )
         prompt = "\n".join(
             block.text
-            for message in provider.requests[0].messages
+            for message in provider.logical_requests[0].messages
             for block in message.content
             if isinstance(block, TextBlock)
         )

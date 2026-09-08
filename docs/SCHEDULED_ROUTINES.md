@@ -24,6 +24,20 @@ host restarts converge on the existing occurrence.
 
 ## Frozen authority
 
+`toolbox_search` exposes exact capability IDs, automation eligibility, and the
+domain-owned `automation_contract` for tools requiring grants: constraints schemas,
+connector references, and evidence bases. Scheduling does not require activating
+the assignment's execution tools. If a contract exceeds the bounded discovery
+page, `automation_contract_omitted` directs the model to `toolbox_load` for its
+complete declaration. Load also returns these contracts for selected tools.
+These declarations support proposal authoring; they do not grant execution
+authority. Reads need capability inclusion, without
+an effect grant. The routine tool declares the finite once, interval, and calendar
+schedule shapes, including calendar day selectors and daylight-saving policies.
+Cron and RRULE strings are not accepted schedule alternatives. Resource prechecks
+require exact capability, contract, source, and resource references; an MCP binding
+revision is not a resource precheck.
+
 Admission validates and retains the exact agent, conversation, source,
 resource, MCP binding, capability contract, model route, sensitivity, budget,
 expiration, typed outcome contract, and immutable inbox distribution plan. Only
@@ -33,8 +47,12 @@ require a domain-normalized `CapabilityGrant`, an exact call ceiling, a receipt
 policy and an `EffectRequirement`. Routine-management capabilities remain
 interactive-only. Source-free assignments use empty source/resource/binding
 ceilings; those empty machine ceilings never mean all currently admitted sources.
-Native and MCP unattended actions are enabled only after their concrete adapter
-conformance gates; the common routine contract does not confer connector authority.
+Native update/upsert and explicitly admitted direct-result MCP actions have concrete
+domain grant contracts; the common routine contract does not confer connector
+authority. MCP grants fix exact top-level arguments and allow only named scalar
+variables, with 1–256 reserved calls per occurrence further narrowed by run limits.
+MCP completion evidence is server-reported invocation only. See
+[MCP admission and actions](MCP_CONNECTIVITY.md) for the supported subset.
 If an artifact is required, admission also proves that at least one allowed
 producer can satisfy its media type, authorship, exact-source, sensitivity, and
 byte bounds. Impossible contracts fail before the routine is created.
@@ -63,6 +81,13 @@ same atomic finalization inserts one escalation in the conversation inbox. The
 item explicitly reports that no model run started. Terminal-run failures use
 their existing conclusion as the one escalation, so an occurrence never
 creates separate report and escalation deliveries.
+
+Finalization records all known consumption, even when it exceeds a reservation.
+Incomplete usage conservatively consumes at least the full reservation, while the
+run retains its partial or unavailable estimate. Such a run cannot produce a
+successful outcome. A routine without enough cumulative allowance for another run
+moves to `needs_attention`; resume and run-now cannot bypass that budget. There is
+no extra model call after the run reaches a step, token, or cost limit.
 
 Skills are optional and exact. Admission copies the current validated
 `SKILL.md` bytes into the existing SkillStore's bounded content-addressed
@@ -106,6 +131,24 @@ foreground recovery records a separate immutable resolution and never dispatches
 an action: close-without-retry disables the routine; allow-future-work leaves it
 paused until explicitly resumed. A delayed finalizer preserves that stop decision.
 See [Effect receipts and recovery](EFFECT_RECEIPTS.md).
+
+## Creation receipts and stopped model runs
+
+The model-facing create, update, and control tools return a compact, validated
+receipt for the committed mutation: action, routine ID/revision/state, typed
+schedule, next due time, and reservation counts. Reservation counts record admitted
+occurrences and attempts; they do not establish execution success. Full instructions,
+grants, contract bindings, budgets, and distribution remain available through
+`Agent.inspect_routine` and `routine_inspect` and remain the enforcement records.
+
+A foreground model run can stop after a routine was committed. Its failed or
+interrupted status does not roll back creation or disable the routine. The terminal
+retains this distinction, including after reopening the conversation, and displays
+recorded receipt facts alongside the stopped-run notice. Headless `daita run` output
+includes bounded tool-result summaries and call IDs without repeating tool arguments
+or full authorization records. The public `Transcript.tool_pairs` projection exposes
+the original ordered call/result evidence; a missing result remains unknown.
+Scheduled execution outcomes continue to appear separately in the Inbox.
 
 ## Terminal use
 

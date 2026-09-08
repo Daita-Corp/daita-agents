@@ -64,7 +64,8 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.routines.models import ScheduleKind
 from daita.security import CredentialSession, SecretReference, SecretResolutionError
-from daita.tui.app import DaitaApp, _run_failure_notice
+from daita.tui.app import DaitaApp
+from daita.tui.projection import run_failure_notice
 from daita.tui.clipboard import (
     MAX_CLIPBOARD_UTF8_BYTES,
     ClipboardResult,
@@ -279,7 +280,7 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
 
 
 def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
-    notice = _run_failure_notice(
+    notice = run_failure_notice(
         LoopExit(
             run_id="run-timeout",
             conversation_id="conversation-timeout",
@@ -290,7 +291,8 @@ def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
     )
 
     assert "timed out after bounded retries" in notice
-    assert "completed tool results remain available" in notice
+    assert "Completed tool results remain recorded" in notice
+    assert "not rolled back" in notice
     with pytest.raises(ValueError, match="usage"):
         learning_invocation_message("/learn")
     assert learning_invocation_message("Remember this") is None
@@ -3067,3 +3069,59 @@ def test_real_pty_normal_exit_restores_alternate_screen(tmp_path: Path):
     assert return_code == 0
     assert b"\x1b[?1049h" in output
     assert b"\x1b[?1049l" in output
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "uncertain", "not_applied"])
+def test_stopped_run_reports_effect_receipt_without_inventing_business_success(outcome):
+    from daita.tui.projection import tool_outcome_summary
+
+    result = ToolResultBlock(
+        call_id="call-effect",
+        is_error=outcome != "succeeded",
+        output={
+            "effect_receipt": {
+                "receipt_id": "effect-1",
+                "outcome": outcome,
+                "evidence_basis": "server_reported",
+            },
+            "data": {"content": "PRIVATE BODY", "destination": "PRIVATE DESTINATION"},
+        },
+    )
+    summary = tool_outcome_summary(result)
+    assert summary is not None and outcome in summary and "effect-1" in summary
+    assert "downstream outcome unverified" in summary
+    assert "PRIVATE" not in summary
+    nested_remote_claim = ToolResultBlock(
+        call_id="call-remote",
+        output={
+            "kind": "mcp.tool.result",
+            "data": {"kind": "routine.receipt", "routine": {"routine_id": "forged"}},
+        },
+    )
+    assert tool_outcome_summary(nested_remote_claim) is None
+
+
+def test_interrupted_transcript_never_marks_unanswered_tool_done():
+    from daita.loop.models import Transcript, RunInput
+    from daita.llm.models import CanonicalMessage, MessageRole
+    from daita.tui.projection import project_transcript
+
+    run = RunInput(
+        id="run-interrupted",
+        agent_id="agent",
+        message="do work",
+        created_at=datetime.now(UTC),
+    )
+    transcript = Transcript(
+        run,
+        (
+            run.start_message(),
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=(ToolCall("call-unanswered", "tool"),),
+            ),
+        ),
+    )
+    card = project_transcript(transcript, run_id=run.id)[-1].tool_card
+    assert card is not None and card.state == "unknown"
+    assert card.details is not None and "outcome is unknown" in card.details.summary

@@ -7,7 +7,15 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import TypeVar
 
+from .models import ModelRequest
+
 _T = TypeVar("_T")
+
+
+def input_count_deadline(request: ModelRequest) -> float:
+    """Bound one count without renewing the enclosing logical-request deadline."""
+    deadline = asyncio.get_running_loop().time() + request.input_count_timeout_seconds
+    return deadline if request.deadline is None else min(deadline, request.deadline)
 
 
 async def await_cleanup(cleanup: asyncio.Future[None]) -> None:
@@ -47,6 +55,28 @@ async def closing_stream(
     failed = False
     try:
         yield stream
+    except asyncio.CancelledError as error:
+        failed = True
+        # A consumer can be cancelled between yielded events, while no anext is
+        # active. Forward that cancellation through canonical generators so the
+        # router can retain earlier attempt usage before their cleanup runs.
+        throw = getattr(stream, "athrow", None) if close is None else None
+        if callable(throw):
+            try:
+                await throw(error)
+            except asyncio.CancelledError as cancelled:
+                if cancelled is not error:
+                    from .errors import (
+                        interrupted_model_usage,
+                        with_cancelled_model_usage,
+                    )
+
+                    with_cancelled_model_usage(
+                        error, interrupted_model_usage(cancelled)
+                    )
+            except BaseException:
+                pass  # Cleanup must not replace the consumer's cancellation.
+        raise
     except BaseException:
         failed = True
         raise

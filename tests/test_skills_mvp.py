@@ -754,7 +754,7 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
         "inert-skill",
         root=tmp_path,
         model=provider,
-        model_profile=_profile(provider),
+        model_profile=_profile(provider, context=32_000),
         limits=EAGER_LIMITS,
         workspace=workspace_for(tmp_path),
     )
@@ -943,7 +943,7 @@ async def test_direct_operations_emit_no_model_calls_or_observer_events(tmp_path
 
 async def test_custom_context_builder_remains_unwrapped(tmp_path):
     class CustomContext:
-        async def prepare(self, run, messages, tool_context):
+        async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
             del run
             return messages[:-1], tool_context
 
@@ -954,8 +954,10 @@ async def test_custom_context_builder_remains_unwrapped(tmp_path):
             *,
             tool_context,
             step,
-            final=False,
             previous_request_input_tokens=None,
+            remaining_tokens=None,
+            request_input_growth_tokens=None,
+            remaining_steps=None,
         ):
             del step, previous_request_input_tokens
             static, catalog = snapshot
@@ -1008,9 +1010,9 @@ async def test_skill_index_is_mandatory_for_default_request_budget(tmp_path):
     agent = await Agent.create(
         "skill-budget",
         root=tmp_path,
+        hosted=True,
         model=provider,
         model_profile=_profile(provider, context=5_000),
-        workspace=workspace_for(tmp_path),
     )
     try:
         for index in range(12):

@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
@@ -30,12 +31,14 @@ from daita.llm.models import (
     ModelSensitivity,
     ModelStreamCompleted,
     ModelTextDelta,
+    ModelUsage,
     TextBlock,
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
 )
 from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
+from daita.llm.pricing import CostEstimate
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop import (
     AgentLoop,
@@ -55,7 +58,7 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         del run
         return messages[:-1], tool_context.initial_provider_definitions
 
@@ -66,8 +69,10 @@ class TranscriptContext:
         *,
         step,
         tool_context,
-        final=False,
         previous_request_input_tokens=None,
+        remaining_tokens=None,
+        request_input_growth_tokens=None,
+        remaining_steps=None,
     ):
         del step, previous_request_input_tokens, tool_context
         sensitivity = ModelSensitivity.INTERNAL
@@ -82,7 +87,7 @@ class TranscriptContext:
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
-            tools=() if final else tools,
+            tools=tools,
             sensitivity=sensitivity,
         )
 
@@ -165,7 +170,9 @@ async def test_terminal_sensitivity_retains_tool_evidence_through_completion(
 
     result = await loop.run(run)
 
-    assert result.kind is LoopExitKind.COMPLETED
+    assert result.kind is (
+        LoopExitKind.FAILED if maximum_steps == 1 else LoopExitKind.COMPLETED
+    )
     assert result.sensitivity is ModelSensitivity.CONFIDENTIAL
     assert decode_loop_exit(encode_loop_exit(result)).sensitivity is result.sensitivity
 
@@ -173,7 +180,13 @@ async def test_terminal_sensitivity_retains_tool_evidence_through_completion(
 async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
     events: list[AgentEvent] = []
     provider = MockModelProvider(
-        (ModelResponse(finish_reason=FinishReason.STOP, text="done"),),
+        (
+            ModelResponse(
+                finish_reason=FinishReason.STOP,
+                text="done",
+                usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
+            ),
+        ),
         complete_pricing=True,
     )
     configured = LoopLimits(
@@ -272,7 +285,7 @@ async def test_projected_tool_surface_limits_fail_before_context_or_model(limit_
     )
 
     class ContextMustNotPrepare(TranscriptContext):
-        async def prepare(self, run, messages, tool_context):
+        async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
             del run, messages, tool_context
             raise AssertionError("tool bounds must precede context preparation")
 
@@ -435,7 +448,10 @@ async def test_post_tool_model_retry_reuses_result_without_reexecuting_tool():
     provider = MockModelProvider(
         (
             response_with_calls("one"),
-            ModelProviderError(ProviderErrorCode.TIMEOUT),
+            ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
+            ),
             ModelResponse(finish_reason=FinishReason.STOP, text="recovered answer"),
         ),
         provider_id="mock:subscription",
@@ -478,7 +494,7 @@ async def test_post_tool_model_retry_reuses_result_without_reexecuting_tool():
     assert provider.requests[1] == provider.requests[2]
 
 
-async def test_step_limit_gets_one_tool_free_wrap_up_call():
+async def test_step_limit_stops_without_an_additional_model_call():
     provider = MockModelProvider(
         (
             response_with_calls("one"),
@@ -498,37 +514,56 @@ async def test_step_limit_gets_one_tool_free_wrap_up_call():
         RunInput(id="run-2", agent_id="agent-1", message="question", created_at=NOW)
     )
 
-    assert result.kind is LoopExitKind.COMPLETED
+    assert result.kind is LoopExitKind.FAILED
     assert result.reason == "step_limit_reached"
-    assert result.final_text == "partial answer"
-    assert provider.requests[1].tools == ()
+    assert result.final_text is None
+    assert len(provider.requests) == 1
+    assert [call.id for call in tools.calls] == ["one"]
 
 
-async def test_tool_free_wrap_up_rejects_outstanding_calls_without_execution():
+@pytest.mark.parametrize("tool_response", (False, True))
+@pytest.mark.parametrize(
+    ("tokens", "cost", "reason"),
+    (
+        (150, "0.01", "token_limit_reached"),
+        (10, "0.20", "cost_limit_reached"),
+        (150, "0.20", "cost_limit_reached"),
+    ),
+)
+async def test_usage_exhaustion_precedes_tools_and_success(
+    tool_response, tokens, cost, reason
+):
+    calls = (ToolCall(id="one", name="lookup"), ToolCall(id="two", name="lookup"))
     provider = MockModelProvider(
         (
-            response_with_calls("one"),
             ModelResponse(
-                finish_reason=FinishReason.TOOL_CALLS,
-                text="invalid partial answer",
-                tool_calls=(ToolCall(id="unexecuted", name="lookup"),),
+                finish_reason=(
+                    FinishReason.TOOL_CALLS if tool_response else FinishReason.STOP
+                ),
+                text="Partial evidence",
+                tool_calls=calls if tool_response else (),
+                usage=ModelUsage(
+                    input_tokens=tokens,
+                    cost_estimate=CostEstimate.complete(Decimal(cost)),
+                ),
             ),
-        )
+        ),
+        complete_pricing=True,
     )
-    tools = ScriptedTools({"one": ToolResultBlock(call_id="one", output={"value": 1})})
+    tools = ScriptedTools({})
     transcripts = InMemoryTranscriptStore()
     loop = AgentLoop(
         model=provider,
         context_builder=TranscriptContext(),
         tools=tools,
         transcripts=transcripts,
-        limits=LoopLimits(max_steps=1),
+        limits=LoopLimits(max_total_tokens=100, max_estimated_cost_usd=Decimal("0.10")),
         clock=lambda: NOW,
     )
 
     result = await loop.run(
         RunInput(
-            id="run-wrap-up-calls",
+            id="run-budget",
             agent_id="agent-1",
             message="question",
             created_at=NOW,
@@ -536,14 +571,44 @@ async def test_tool_free_wrap_up_rejects_outstanding_calls_without_execution():
     )
 
     assert result.kind is LoopExitKind.FAILED
-    assert result.reason == "tool_free_wrap_up_returned_tool_calls"
-    assert [call.id for call in tools.calls] == ["one"]
-    transcript = await transcripts.load("run-wrap-up-calls")
-    assert all(
-        call.id != "unexecuted"
+    assert result.reason == reason
+    assert result.usage.total_tokens == tokens
+    assert result.usage.cost_estimate.amount_usd == Decimal(cost)
+    assert tools.calls == []
+    assert len(provider.requests) == 1
+    transcript = await transcripts.load("run-budget")
+    results = [
+        block
         for message in transcript.messages
-        for call in message.tool_calls
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+    ]
+    assert [block.call_id for block in results] == (
+        ["one", "two"] if tool_response else []
     )
+    assert all(
+        block.is_error
+        and cast(Mapping[str, object], block.output["error"])["code"] == reason
+        for block in results
+    )
+    assert any(
+        isinstance(block, TextBlock) and block.text == "Partial evidence"
+        for message in transcript.messages
+        for block in message.content
+    )
+
+
+async def test_zero_cost_budget_never_starts_a_model_request():
+    provider = MockModelProvider((), complete_pricing=True)
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools({}),
+        limits=LoopLimits(max_estimated_cost_usd=Decimal("0")),
+    )
+    result = await loop.run(RunInput("zero-budget", "agent-1", "question", NOW))
+    assert result.reason == "cost_limit_reached"
+    assert provider.requests == ()
 
 
 @pytest.mark.parametrize("failure_site", ("context", "tool_contract"))
@@ -551,7 +616,7 @@ async def test_unexpected_loop_failures_best_effort_terminalize_started_run(
     failure_site: str,
 ):
     class BrokenContext(TranscriptContext):
-        async def prepare(self, run, messages, tool_context):
+        async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
             if failure_site == "context":
                 raise RuntimeError("context exploded")
             return await super().prepare(run, messages, tool_context)
@@ -1020,6 +1085,44 @@ async def test_stream_failure_and_cancellation_never_persist_partial_text():
     cancelled_result = await cancelled_store.result("run-stream-cancelled")
     assert cancelled_result is not None
     assert cancelled_result.kind is LoopExitKind.INTERRUPTED
+    assert cancelled_result.usage.cost_estimate.code == "model_attempt_interrupted"
+
+
+async def test_outer_model_deadline_keeps_known_cost_and_marks_unfinished_attempt():
+    class HangingAfterResponse(MockModelProvider):
+        async def generate(self, request):
+            if self.requests:
+                await asyncio.Event().wait()
+            return await super().generate(request)
+
+    provider = HangingAfterResponse(
+        (
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(ToolCall(id="one", name="lookup", arguments={}),),
+                usage=ModelUsage(
+                    input_tokens=20,
+                    cost_estimate=CostEstimate.complete(Decimal("0.001")),
+                ),
+            ),
+        ),
+        complete_pricing=True,
+    )
+    store = InMemoryTranscriptStore()
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools({"one": ToolResultBlock(call_id="one", output={})}),
+        transcripts=store,
+        limits=LoopLimits(max_wall_time_seconds=0.05),
+        clock=lambda: NOW,
+    )
+    result = await loop.run(RunInput("deadline-accounting", "agent-1", "question", NOW))
+    assert result.reason == "wall_time_exhausted"
+    assert result.usage.total_tokens == 20
+    assert result.usage.cost_estimate.status.value == "partial"
+    assert result.usage.cost_estimate.amount_usd == Decimal("0.001")
+    assert await store.result(result.run_id) == result
 
 
 async def test_streaming_disabled_route_keeps_atomic_generate_fallback():

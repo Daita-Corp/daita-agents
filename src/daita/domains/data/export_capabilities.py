@@ -2190,7 +2190,7 @@ class ArtifactCapabilityDomain:
         result_data = evidence.data
         assert block.sensitivity is not None
         output_provenance = result_data.get("provenance")
-        if output_kind == "mcp.read.result" and (
+        if output_kind == "mcp.tool.result" and (
             not isinstance(output_provenance, Mapping)
             or output_provenance.get("output_schema_digest") == "none"
             or not isinstance(result_data.get("structured"), Mapping)

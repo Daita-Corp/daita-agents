@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
@@ -69,7 +70,7 @@ def _error(result: ToolResultBlock) -> Mapping[str, object]:
 
 
 class _Context:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         del run
         return messages[:-1], tool_context.initial_provider_definitions
 
@@ -80,14 +81,16 @@ class _Context:
         *,
         step,
         tool_context,
-        final=False,
         previous_request_input_tokens=None,
+        remaining_tokens=None,
+        request_input_growth_tokens=None,
+        remaining_steps=None,
     ):
         del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
-            tools=() if final else tools,
+            tools=tools,
         )
 
 
@@ -702,17 +705,49 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         second.sensitivity_provenance["classified_results"],
     )
     assert classified_results[0]["call_id"] == "classified"
-    final = builder.project(
-        snapshot,
-        current,
-        step=3,
-        tool_context=step_projection,
-        final=True,
-    )
-    assert final.tools == ()
-    assert final.messages[0] == snapshot.final_static_messages[0]
-    assert "execution step limit has been reached" in repr(final.messages[0])
     assert "execution step limit has been reached" not in repr(first.messages[0])
+    assert "execution step limit has been reached" not in repr(second.messages[0])
+    assert not hasattr(snapshot, "final_static_messages")
+
+
+async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_input():
+    catalog = _SnapshotCatalog()
+    profile = ModelProfile(
+        id="mock:large-window",
+        context_window_tokens=1_050_000,
+        max_output_tokens=128_000,
+        supports_tools=True,
+    )
+    builder = AgentContextBuilder(catalog, profile=profile)
+    run = replace(_run("run-context-budget"), source_scope_ids=("source-snapshot",))
+    user = run.start_message()
+    projection = ContextToolProjectionAdapter(())
+    tools = await projection.prepare_run(run)
+    wide = await builder.prepare(run, (user,), tools, max_total_tokens=100_000)
+    narrow = await builder.prepare(run, (user,), tools, max_total_tokens=1_000)
+    wide_request = builder.project(
+        wide, (user,), step=1, tool_context=projection.project(tools, (user,))
+    )
+    narrow_request = builder.project(
+        narrow,
+        (user,),
+        step=1,
+        tool_context=projection.project(tools, (user,)),
+        remaining_tokens=1,
+    )
+    assert '"returned_count":1' in repr(wide_request.messages[0])
+    assert '"returned_count":0' in repr(narrow_request.messages[0])
+    assert "Remaining cumulative run allowance: 1 tokens" in repr(
+        narrow_request.messages[0]
+    )
+    assert narrow_request.messages[-1] == user
+    assert wide.initial_sensitivity == narrow.initial_sensitivity
+    assert (
+        wide.initial_sensitivity_provenance["source_ids"]
+        == narrow.initial_sensitivity_provenance["source_ids"]
+    )
+    # Context shaping cannot replace provider counting with a byte-based refusal.
+    assert narrow_request.max_total_tokens is None
 
 
 async def test_context_owns_durable_job_handoff_guidance() -> None:
@@ -939,7 +974,7 @@ async def test_tool_call_response_bound_rejects_batch_before_execution():
     assert result.reason == "tool_calls_per_response_exceeded"
     assert tuple(
         message.role for message in (await store.load(result.run_id)).messages
-    ) == (MessageRole.USER,)
+    ) == (MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL, MessageRole.TOOL)
 
 
 async def test_tool_call_run_bound_counts_across_responses():

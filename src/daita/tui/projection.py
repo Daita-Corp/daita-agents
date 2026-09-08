@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 
-from daita import ConversationRun, Transcript
+from daita import ConversationRun, LoopExit, LoopExitKind, Transcript
 from daita.llm.models import MessageRole, ToolCall, ToolResultBlock
 
 from .models import ToolCardDetails, ToolCardState, ToolTablePreview, TranscriptBlock
@@ -50,6 +50,9 @@ CAPABILITY_LABELS = {
     "skill_view": "Read skill",
     "skill_save": "Save skill",
     "skill_delete": "Delete skill",
+    "routine_create": "Create routine",
+    "routine_update": "Update routine",
+    "routine_control": "Control routine",
 }
 _TOOL_ERROR_HEADINGS = {
     "postgresql_connect_failed": "Connection unavailable",
@@ -158,6 +161,9 @@ def project_tool_details(call: ToolCall, result: ToolResultBlock) -> ToolCardDet
         )
         error_heading = _TOOL_ERROR_HEADINGS.get(error_code, error_code)
         summary = one_logical_line(f"{error_heading} · {error_message}")
+        evidence = tool_outcome_summary(result)
+        if evidence is not None:
+            summary += " " + evidence
         return ToolCardDetails(
             summary=sanitize_terminal_text(
                 summary,
@@ -209,6 +215,7 @@ def project_tool_details(call: ToolCall, result: ToolResultBlock) -> ToolCardDet
             else None
         )
         summary = result_kind
+    summary = tool_outcome_summary(result) or summary
     if isinstance(code_value, str):
         summary = one_logical_line(code_value)
     elif result_text is not None and summary == "Tool result":
@@ -337,31 +344,6 @@ def tool_result_error_code(result: ToolResultBlock) -> str:
     return "tool_failed"
 
 
-def completed_tool_pairs(
-    transcript: Transcript,
-) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
-    calls: list[ToolCall] = []
-    call_ids: set[str] = set()
-    results: dict[str, ToolResultBlock] = {}
-    for message in transcript.messages:
-        if message.role is MessageRole.ASSISTANT:
-            for call in message.tool_calls:
-                if call.id in call_ids:
-                    raise ValueError("completed transcript repeats a tool call ID")
-                call_ids.add(call.id)
-                calls.append(call)
-        elif message.role is MessageRole.TOOL:
-            for block in message.content:
-                if not isinstance(block, ToolResultBlock):
-                    raise TypeError("tool transcript message contains non-tool content")
-                if block.call_id in results:
-                    raise ValueError("completed transcript repeats a tool result ID")
-                results[block.call_id] = block
-    if not set(results).issubset(call_ids):
-        raise ValueError("completed transcript contains an unmatched tool result")
-    return tuple((call, results.get(call.id)) for call in calls)
-
-
 def artifact_delivery_messages(
     pairs: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
 ) -> tuple[str, ...]:
@@ -453,7 +435,7 @@ def project_transcript(
     tools_expanded: bool = False,
 ) -> tuple[TranscriptBlock, ...]:
     blocks: list[TranscriptBlock] = []
-    pairs = completed_tool_pairs(transcript)
+    pairs = transcript.tool_pairs
     tool_index = 0
     for message in transcript.messages:
         if message.role is MessageRole.USER:
@@ -508,10 +490,16 @@ def project_transcript(
                     capability_id=getattr(call, "name", None),
                     label=label,
                     state=(
-                        "failed" if result is not None and result.is_error else "done"
+                        "unknown"
+                        if result is None
+                        else "failed" if result.is_error else "done"
                     ),
                     details=(
-                        None if result is None else project_tool_details(call, result)
+                        ToolCardDetails(
+                            summary="No terminal result recorded; execution outcome is unknown."
+                        )
+                        if result is None
+                        else project_tool_details(call, result)
                     ),
                     expanded=tools_expanded,
                 )
@@ -537,7 +525,88 @@ def project_conversation(
                 tools_expanded=tools_expanded,
             )
         )
+        if run.result is not None and run.result.kind is not LoopExitKind.COMPLETED:
+            blocks.append(
+                TranscriptBlock(
+                    "notice",
+                    f"{run.result.run_id}:terminal",
+                    run_failure_notice(run.result, run.transcript),
+                )
+            )
     return tuple(blocks)
+
+
+def tool_outcome_summary(result: ToolResultBlock) -> str | None:
+    """Present code-owned receipt facts without returning arguments or full records."""
+    reference = result.output.get("effect_receipt")
+    if isinstance(reference, Mapping):
+        basis = reference.get("evidence_basis")
+        meaning = (
+            "server-reported invocation; downstream outcome unverified"
+            if basis == "server_reported"
+            else str(basis)
+        )
+        return sanitize_terminal_text(
+            f"Effect receipt {reference.get('receipt_id')}: {reference.get('outcome')} ({meaning}).",
+            maximum=768,
+            preserve_lines=False,
+            fallback="Effect evidence retained.",
+        )
+    data = result.output.get("data")
+    if (
+        not result.is_error
+        and result.output.get("kind") == "routine.receipt"
+        and result.capability_id
+        in {"routines.create", "routines.update", "routines.control"}
+        and result.output_sha256 is not None
+        and isinstance(data, Mapping)
+        and isinstance(data.get("routine"), Mapping)
+    ):
+        routine = data["routine"]
+        assert isinstance(routine, Mapping)
+        return sanitize_terminal_text(
+            f"Routine {data.get('action')} committed: {routine.get('routine_id')} "
+            f"(revision {routine.get('revision')}, {routine.get('state')}). "
+            "Scheduled execution is reported separately in the Inbox.",
+            maximum=1600,
+            preserve_lines=False,
+            fallback="Routine mutation recorded.",
+        )
+    return None
+
+
+def run_failure_notice(result: LoopExit, transcript: Transcript | None = None) -> str:
+    """Describe a stopped run without treating completed tools as rolled back."""
+    if result.reason == "timeout":
+        reason = "The model provider timed out after bounded retries."
+    elif result.reason == "wall_time_exhausted":
+        reason = "The run reached its overall time limit."
+    elif result.reason in {
+        "token_budget_insufficient",
+        "token_limit_reached",
+        "cost_limit_reached",
+    }:
+        reason = (
+            "The run stopped at its model budget limit before completing its answer."
+        )
+    else:
+        reason = f"{result.kind.value}: {result.reason}."
+    notice = (
+        reason + " Completed tool results remain recorded; completed actions were not "
+        "rolled back. Check their receipts before repeating the request. "
+    )
+    if transcript is not None:
+        for _call, outcome in transcript.tool_pairs:
+            if outcome is not None:
+                summary = tool_outcome_summary(outcome)
+                if summary is not None:
+                    notice += "\n" + summary
+    return sanitize_terminal_text(
+        notice,
+        maximum=MAX_RENDER_CHARACTERS,
+        preserve_lines=True,
+        fallback="Run stopped.",
+    )
 
 
 def format_status_label(

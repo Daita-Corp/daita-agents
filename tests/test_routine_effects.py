@@ -70,7 +70,7 @@ class _NoCatalog:
 
 
 class _Context:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         return None
 
     def project(
@@ -80,12 +80,14 @@ class _Context:
         *,
         step,
         tool_context,
-        final=False,
         previous_request_input_tokens=None,
+        remaining_tokens=None,
+        request_input_growth_tokens=None,
+        remaining_steps=None,
     ):
         return ModelRequest(
             messages=messages,
-            tools=() if final else tool_context.provider_definitions,
+            tools=tool_context.provider_definitions,
             sensitivity=ModelSensitivity.INTERNAL,
         )
 

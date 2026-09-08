@@ -81,15 +81,16 @@ change the execution policy.
 - SQL is validated against the current catalog before source I/O.
 - Workspace reads reject traversal, symlinks, secret-like paths, and special
   files.
-- Remote MCP tools require an explicitly admitted read-only binding and are
-  revalidated at call time.
+- Remote MCP tools require explicit local access/effect admission and are
+  revalidated at call time. Admitted actions use exact per-call approval or a
+  frozen routine grant, one dispatch and durable invocation receipts.
 - Native source-data mutations are explicitly enabled structured updates and
   upserts, initially backed by PostgreSQL. Exact current-run previews, explicit
   operation/column/row permissions, transactional drift checks, and runtime-owned
   receipts govern each call. A routine permits one native write invocation per occurrence.
 
 Learn more in [Local workspaces](docs/LOCAL_WORKSPACES.md),
-[Remote MCP read connectivity](docs/MCP_CONNECTIVITY.md), and
+[Remote MCP tools and actions](docs/MCP_CONNECTIVITY.md), and
 [Relational writes](docs/RELATIONAL_WRITES.md).
 
 ## How it works
@@ -102,7 +103,29 @@ user message -> model -> tool calls -> ordered tool results -> model -> answer
 
 The current transcript is the loop state. Tool failures are returned to the
 model like ordinary results so it can correct a call on the next step. Steps,
-wall time, tokens, and estimated cost are bounded.
+wall time, tokens, and estimated cost bound progression. Exhaustion ends the run
+with retained evidence and an explicit failure; it never starts an extra model
+request to write a closing answer. Requests carry the remaining allowance, and
+OpenAI, Anthropic, and Gemini API adapters count the prepared input through their
+provider's counting endpoint before narrowing output limits. Counting shares the
+run deadline and does not generate a response. Routes without complete request
+counting retain usage-based stopping and supported output caps; they cannot admit
+an estimated-cost ceiling. Actual returned usage is retained even when it exceeds
+an allowance. An in-flight generation timeout can leave usage unknown; estimated
+ceilings are not a billing guarantee.
+
+Configured model routes own bounded retries, with SDK retries disabled. Credential
+resolution, counting, generation, and backoff share one run deadline; counting also
+has a 15-second phase cap. Temporary pre-generation failures can retry with known
+zero usage. Unknown generation consumption prevents budgeted retry or fallback.
+Stream progress and completion stop retry eligibility, and model retries never
+replay completed tool actions. Injecting a provider directly retains that provider's
+own behavior rather than implicitly adding a router.
+
+Each request includes procedure guidance for its currently loaded tools. Optional
+discovery and prior conversation context are fitted to the run allowance as well
+as the model window, while current-run messages remain exact. Admission diagnostics
+retain native input counts separately from actual returned usage.
 
 Agent identity, source registrations, catalog snapshots, transcripts, jobs,
 routines, and results are stored in one SQLite database inside the agent home.
@@ -124,7 +147,7 @@ For the full implementation boundaries, see the
 | Exact exports and evidence-bound derived files | [Artifacts](docs/ARTIFACTS.md) |
 | Workspace selection, file reads, queries, and edits | [Local workspaces](docs/LOCAL_WORKSPACES.md) |
 | Codex, Claude Code, and Grok Build subscriptions | [Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
-| Read-only remote tools | [Remote MCP connectivity](docs/MCP_CONNECTIVITY.md) |
+| Remote reads and admitted actions | [Remote MCP connectivity](docs/MCP_CONNECTIVITY.md) |
 | Schedules, outcomes, inboxes, and resident hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |
 | Scoped relational writes and receipts | [Relational writes](docs/RELATIONAL_WRITES.md) |
 | State compatibility and automatic upgrades | [Local state compatibility](docs/LOCAL_STATE_UPGRADES.md) |

@@ -782,7 +782,7 @@ def test_xai_provider_reported_ticks_take_precedence_over_token_rates():
     assert usage.cost_estimate.amount_usd == Decimal("0.00001585")
     assert usage.cost_estimate.basis is CostBasis.PROVIDER_REPORTED
     assert usage.cost_estimate.rate_schedule_id is None
-    assert provider.has_complete_pricing(_request()) is True
+    assert provider.has_complete_pricing(_request()) is False
     with pytest.raises(ValueError):
         provider._decode_usage(  # noqa: SLF001 - focused adapter contract
             {

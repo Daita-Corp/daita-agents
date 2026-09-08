@@ -23,6 +23,7 @@ from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelSensitivity,
+    ModelUsage,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -35,8 +36,10 @@ from daita.loop.models import (
     RunOrigin,
     RunStartEnvelope,
 )
+from daita.llm.pricing import CostEstimate
 from daita.routines.models import (
     IntervalSchedule,
+    OnceSchedule,
     MisfirePolicy,
     ReportingMode,
     RoutineOccurrence,
@@ -865,12 +868,23 @@ async def test_stale_claim_recovery_fences_the_old_token(tmp_path: Path) -> None
         await store.close()
 
 
+@pytest.mark.parametrize("usage_case", ("normal", "once", "overrun", "unknown"))
 async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
     tmp_path: Path,
+    usage_case: str,
 ) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     try:
-        routine = await store.admit_scheduled_routine(routine_record())
+        draft = routine_record()
+        if usage_case != "normal":
+            draft = replace(
+                draft,
+                cumulative_max_tokens=5_000,
+                cumulative_max_cost_usd=Decimal("0.05"),
+            )
+        if usage_case == "once":
+            draft = replace(draft, schedule=OnceSchedule(exact_at=NOW))
+        routine = await store.admit_scheduled_routine(draft)
         claimed = await store.claim_due_routine_occurrence(
             routine.agent_id,
             routine.routine_id,
@@ -920,6 +934,24 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
             created_at=NOW + timedelta(seconds=2),
             final_text=final_text,
             steps=1,
+            usage=ModelUsage(
+                input_tokens=(
+                    8_000
+                    if usage_case == "overrun"
+                    else (100 if usage_case in {"unknown", "once"} else 0)
+                ),
+                cost_estimate=(
+                    CostEstimate.partial(Decimal("0.01"), code="provider_usage_missing")
+                    if usage_case == "unknown"
+                    else CostEstimate.complete(
+                        Decimal(
+                            "0.08"
+                            if usage_case == "overrun"
+                            else ("0.01" if usage_case == "once" else "0")
+                        )
+                    )
+                ),
+            ),
         )
         await store.complete(
             result,
@@ -955,12 +987,19 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         assert first is not None and duplicate is not None
         duplicate_delivery = duplicate[1]
         assert duplicate_delivery is not None
-        assert first[0].disposition is RoutineOccurrenceDisposition.COMPLETED
+        assert first[0].disposition is (
+            RoutineOccurrenceDisposition.COMPLETED
+            if usage_case in {"normal", "once"}
+            else RoutineOccurrenceDisposition.TERMINAL_FAILED
+        )
         assert duplicate_delivery.delivery_id == "delivery-routine-1"
         assert duplicate_delivery.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
         inbox = await store.list_deliveries(routine.agent_id)
         assert len(inbox) == 1
-        assert inbox[0].outcome.conclusion_preview == final_text
+        if usage_case in {"normal", "once"}:
+            assert inbox[0].outcome.conclusion_preview == final_text
+        else:
+            assert "routine_run_" in inbox[0].outcome.conclusion_preview
         persisted = await store.load_scheduled_routine(
             routine.agent_id,
             routine.routine_id,
@@ -969,7 +1008,43 @@ async def test_terminal_run_finalization_is_idempotent_and_delivers_once(
         assert persisted.active_occurrence_id is None
         assert persisted.reserved_tokens == 0
         assert persisted.last_delivery_ids == ("delivery-routine-1",)
-        assert persisted.next_due_at == NOW + timedelta(hours=1)
+        if usage_case == "normal":
+            assert persisted.next_due_at == NOW + timedelta(hours=1)
+        elif usage_case == "once":
+            assert persisted.next_due_at is None
+            assert persisted.state is RoutineState.COMPLETED
+            assert persisted.charged_tokens == 100
+            assert persisted.charged_cost_usd == Decimal("0.01")
+            assert persisted.model_budget_exhausted
+        else:
+            expected_tokens, expected_cost = (
+                (8_000, Decimal("0.08"))
+                if usage_case == "overrun"
+                else (5_000, Decimal("0.05"))
+            )
+            assert (
+                persisted.charged_tokens == first[0].charged_tokens == expected_tokens
+            )
+            assert (
+                persisted.charged_cost_usd == first[0].charged_cost_usd == expected_cost
+            )
+            assert persisted.next_due_at is None
+            assert persisted.state is RoutineState.NEEDS_ATTENTION
+            assert duplicate_delivery.outcome.conclusion_state is OutcomeState.FAILED
+            await store.close()
+            store = await SQLiteStateStore.open(tmp_path / "state.db")
+            assert (
+                await store.load_scheduled_routine(routine.agent_id, routine.routine_id)
+                == persisted
+            )
+            with pytest.raises(ValueError, match="routine_model_budget_exhausted"):
+                await store.transition_scheduled_routine(
+                    routine.agent_id,
+                    routine.routine_id,
+                    expected_revision=persisted.revision,
+                    state=RoutineState.ACTIVE,
+                    transitioned_at=NOW + timedelta(seconds=5),
+                )
     finally:
         await store.close()
 
@@ -1236,6 +1311,7 @@ async def test_reopen_converges_completed_reserved_run_without_reexecution(
         created_at=NOW + timedelta(seconds=2),
         final_text="Recovered report.",
         steps=1,
+        usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
     )
     await store.complete(
         result,

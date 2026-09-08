@@ -5,6 +5,7 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from typing import cast
 
 import pytest
 from _capability_runtime_support import StaticTestDomain
@@ -13,10 +14,11 @@ from _workspace_support import workspace_for
 
 from daita import Agent
 from daita._json import FrozenJsonObject, canonical_json
-from daita.adapters.mcp import MCPToolBinding, MCPToolSelection
+from daita.adapters.mcp import MCPCompletionSemantics, MCPToolBinding, MCPToolSelection
 from daita.capabilities import (
     TOOLBOX_DEFINITIONS,
     AccessMode,
+    AutomationEligibility,
     ApprovalDecision,
     Capability,
     CapabilityDeclarations,
@@ -884,10 +886,15 @@ async def test_load_is_atomic_transcript_verified_and_replaces_the_working_set()
         "definition_bytes",
         "loaded_names",
         "run_id",
+        "contracts",
     }
     assert all(
         internal_name not in canonical_json(receipt)
-        for internal_name in ("capability_id", "domain_owner_id", "executor_id")
+        for internal_name in ("domain_owner_id", "executor_id")
+    )
+    assert (
+        cast(list[dict[str, object]], receipt["contracts"])[0]["capability_id"]
+        == "test.toolbox.toolbox_test.on_demand_a"
     )
 
     ordinary_a = ToolCall(
@@ -1029,6 +1036,26 @@ async def test_forged_stale_and_cross_run_load_receipts_fail_closed() -> None:
         (forged,),
     )
     assert runtime.project(catalog, forged_messages).loaded_entries == ()
+
+    tampered = dict(_data(result))
+    tampered["contracts"] = [
+        {"capability_id": "unadmitted.effect", "requires_grant": False}
+    ]
+    tampered_result = replace(
+        result, output={"kind": "toolbox_load_receipt", "data": tampered}
+    )
+    tampered_messages = _append_results(
+        (),
+        (
+            ToolCall(
+                id="load-forgery",
+                name="toolbox_load",
+                arguments={"tool_names": ["on_demand_a"]},
+            ),
+        ),
+        (tampered_result,),
+    )
+    assert runtime.project(catalog, tampered_messages).loaded_entries == ()
 
     stale_data = dict(_data(result))
     stale_data["definition_bytes"] = 0
@@ -1274,7 +1301,7 @@ async def test_static_context_stays_frozen_while_provider_definitions_change(
         await agent.close()
 
 
-async def test_tool_free_wrap_up_reprojects_after_a_terminal_step_load(
+async def test_terminal_step_load_does_not_create_an_extra_model_request(
     tmp_path,
 ) -> None:
     profile = ModelProfile(
@@ -1312,9 +1339,9 @@ async def test_tool_free_wrap_up_reprojects_after_a_terminal_step_load(
     )
     try:
         result = await agent.run("Prepare a document tool.")
-        assert result.kind is LoopExitKind.COMPLETED
+        assert result.kind is LoopExitKind.FAILED
         assert result.reason == "step_limit_reached"
-        assert provider.requests[1].tools == ()
+        assert len(provider.requests) == 1
     finally:
         await agent.close()
 
@@ -1470,7 +1497,7 @@ def test_remote_tool_text_is_forced_to_sources_on_demand_and_stays_untrusted() -
         ("remote", "mcp"),
     )
     binding = MCPToolBinding(
-        capability_id="mcp.read:sha256:" + "1" * 64,
+        capability_id="mcp.tool:sha256:" + "1" * 64,
         executor_id="mcp.executor:mcp-binding-" + "2" * 32,
         local_name="mcp_remote_lookup",
         remote_name="lookup",
@@ -1487,6 +1514,12 @@ def test_remote_tool_text_is_forced_to_sources_on_demand_and_stays_untrusted() -
         output_schema=None,
         output_schema_digest=None,
         result_sensitivity=ModelSensitivity.INTERNAL,
+        access_mode=AccessMode.READ,
+        operational_effect=OperationalEffect.NONE,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        maximum_outbound_sensitivity=ModelSensitivity.RESTRICTED,
+        completion_semantics=MCPCompletionSemantics.DIRECT_RESULT,
+        task_support="forbidden",
     )
     assert binding.presentation == presentation
     with pytest.raises(ValueError, match="Sources/on-demand"):

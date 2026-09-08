@@ -71,7 +71,7 @@ from .models import (
     UserInputError,
     parse_candidate_review_cost_limit,
 )
-from .projection import artifact_delivery_messages, completed_tool_pairs
+from .projection import artifact_delivery_messages
 from .sanitization import MAX_DISPLAY_CHARACTERS, render_model_answer, safe_display
 
 VALIDATION_ERRORS = {
@@ -1189,11 +1189,14 @@ class PresentationController:
         self,
         endpoint: str,
         selections: tuple[MCPToolSelection, ...],
+        *,
+        maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
     ) -> MCPBindingStatus:
         try:
             return await self.require_agent().attach_mcp_server(
                 endpoint=endpoint,
                 selections=selections,
+                maximum_outbound_sensitivity=maximum_outbound_sensitivity,
             )
         except MCPAdmissionError as error:
             reason = error.details.get("reason")
@@ -1551,7 +1554,7 @@ class PresentationController:
                 )
         try:
             transcript = await self.require_agent().transcript(result.run_id)
-            notices.extend(artifact_delivery_messages(completed_tool_pairs(transcript)))
+            notices.extend(artifact_delivery_messages(transcript.tool_pairs))
         except Exception:
             pass
         return tuple(notices)

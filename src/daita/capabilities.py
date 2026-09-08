@@ -686,7 +686,7 @@ TOOLBOX_DEFINITIONS = (
     ToolboxDefinition(
         ToolboxId.ROUTINES,
         "Routines",
-        "Create, inspect, update, and control bounded scheduled read routines.",
+        "Create, inspect, update, and control bounded scheduled assignments and their exact action grants.",
     ),
 )
 
@@ -1069,6 +1069,8 @@ class ToolView:
                 != {
                     "kind",
                     "id",
+                    "binding_revision",
+                    "remote_tool_name",
                     "label",
                     "summary",
                     "when_to_use",
@@ -1084,12 +1086,21 @@ class ToolView:
                 raise ValueError(
                     "tool connector presentation requires an admitted MCP binding"
                 )
-            for name in ("id", "label", "summary", "when_to_use"):
+            for name in ("id", "label", "summary", "when_to_use", "remote_tool_name"):
                 if not isinstance(presentation[name], str):
                     raise TypeError("connector presentation text is invalid")
             if not presentation["id"] or not presentation["label"]:
                 raise ValueError(
                     "connector presentation requires exact identity and label"
+                )
+            revision = presentation["binding_revision"]
+            if (
+                type(revision) is not int
+                or revision < 1
+                or not presentation["remote_tool_name"]
+            ):
+                raise ValueError(
+                    "connector presentation requires exact binding and tool references"
                 )
             count = presentation["tool_count"]
             if (
@@ -1441,7 +1452,9 @@ class CapabilityRegistry:
     ) -> FrozenJsonObject:
         capability = self._capabilities[capability_id]
         value = FrozenJsonObject.from_mapping(arguments)
-        _validate(capability.input_schema, value, CapabilityInputError)
+        _validate_rule(
+            "arguments", value, capability.input_schema, CapabilityInputError
+        )
         return value
 
     def validate_execution_scope_grant(
@@ -1511,7 +1524,9 @@ class CapabilityRegistry:
             raise ToolOutputValidationError(
                 f"output kind {output.kind} does not match {capability.output_kind}"
             )
-        _validate(capability.output_schema, output.data, ToolOutputValidationError)
+        _validate_rule(
+            "output", output.data, capability.output_schema, ToolOutputValidationError
+        )
         if (
             capability.effect_receipt_policy is None
             and output.effect_observation is not None
@@ -1535,7 +1550,9 @@ class CapabilityRegistry:
             raise CapabilityInputError(
                 "automation_grant_invalid", "Grant constraints exceed their byte bound."
             )
-        _validate(policy.constraints_schema, value, CapabilityInputError)
+        _validate_rule(
+            "constraints", value, policy.constraints_schema, CapabilityInputError
+        )
         return value
 
     def validate_effect_observation(
@@ -1547,8 +1564,11 @@ class CapabilityRegistry:
                 "effect observation has no matching receipt policy"
             )
         if observation.payload is not None:
-            _validate(
-                policy.payload_schema, observation.payload, ToolOutputValidationError
+            _validate_rule(
+                "receipt",
+                observation.payload,
+                policy.payload_schema,
+                ToolOutputValidationError,
             )
         if (
             observation.outcome is EffectOutcome.SUCCEEDED
@@ -1598,17 +1618,21 @@ def _provider_description(view: ToolView) -> str:
 def _check_schema(schema: Mapping[str, object]) -> None:
     if schema.get("type") != "object":
         raise ValueError("tool schemas must describe an object")
-    if not isinstance(schema.get("properties", {}), Mapping):
-        raise ValueError("tool schema properties must be an object")
-    properties = schema.get("properties", {})
-    assert isinstance(properties, Mapping)
-    for name, rule in properties.items():
-        if not isinstance(name, str) or not isinstance(rule, Mapping):
-            raise ValueError("tool schema properties must contain object rules")
-        _check_rule(rule)
+    _check_rule(schema)
 
 
 def _check_rule(rule: Mapping[str, object]) -> None:
+    alternatives = rule.get("oneOf")
+    if alternatives is not None:
+        if (
+            not isinstance(alternatives, (tuple, list))
+            or not 1 <= len(alternatives) <= 8
+        ):
+            raise ValueError("tool schema oneOf requires one to eight alternatives")
+        for alternative in alternatives:
+            if not isinstance(alternative, Mapping):
+                raise ValueError("tool schema alternatives must be object rules")
+            _check_rule(alternative)
     enum = rule.get("enum")
     if enum is not None and (not isinstance(enum, (tuple, list)) or not enum):
         raise ValueError("tool schema enum must be a non-empty array")
@@ -1676,7 +1700,7 @@ def _check_rule(rule: Mapping[str, object]) -> None:
             _check_rule(nested)
 
 
-def _validate(
+def _validate_object(
     schema: Mapping[str, object],
     value: Mapping[str, object],
     error_type: type[ValueError] | type[RuntimeError],
@@ -1725,7 +1749,7 @@ def validate_tool_schema_value(
     frozen_schema = FrozenJsonObject.from_mapping(schema)
     frozen_value = FrozenJsonObject.from_mapping(value)
     _check_schema(frozen_schema)
-    _validate(frozen_schema, frozen_value, ToolOutputValidationError)
+    _validate_rule("output", frozen_value, frozen_schema, ToolOutputValidationError)
     return frozen_value
 
 
@@ -1735,6 +1759,18 @@ def _validate_rule(
     rule: Mapping[str, object],
     error_type: type[ValueError] | type[RuntimeError],
 ) -> None:
+    alternatives = rule.get("oneOf")
+    if isinstance(alternatives, (tuple, list)):
+        matched = 0
+        for alternative in alternatives:
+            assert isinstance(alternative, Mapping)
+            try:
+                _validate_rule(name, item, alternative, error_type)
+            except error_type:
+                continue
+            matched += 1
+        if matched != 1:
+            _constraint_error(error_type, name, "exactly one declared shape", "oneOf")
     expected = rule.get("type")
     if expected is not None and not _matches_type(item, expected):
         if error_type is CapabilityInputError:
@@ -1799,7 +1835,7 @@ def _validate_rule(
                     error_type,
                 )
     if isinstance(item, Mapping) and expected == "object":
-        _validate(rule, item, error_type)
+        _validate_object(rule, item, error_type)
 
 
 def _constraint_error(

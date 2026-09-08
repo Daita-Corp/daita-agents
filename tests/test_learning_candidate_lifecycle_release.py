@@ -546,7 +546,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
 
 
 class _TranscriptContext:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         del run
         return messages[:-1], tool_context.initial_provider_definitions
 
@@ -557,14 +557,16 @@ class _TranscriptContext:
         *,
         step,
         tool_context,
-        final=False,
         previous_request_input_tokens=None,
+        remaining_tokens=None,
+        request_input_growth_tokens=None,
+        remaining_steps=None,
     ):
         del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
-            tools=() if final else tools,
+            tools=tools,
         )
 
 

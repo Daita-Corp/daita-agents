@@ -291,6 +291,19 @@ def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
     assert _class_owners("MCPCapabilityDomain") == {"domains/mcp.py"}
     assert "CapabilityRuntime(" not in adapter
     assert "CapabilityRuntime(" not in domain
+    assert _class_owners("MCPToolExecutor") == {"domains/mcp.py"}
+    for receipt_operation in ("start_effect_receipt", "finish_effect_receipt"):
+        assert receipt_operation not in domain
+        assert receipt_operation not in adapter
+    for action_extension in (
+        "tasks/get",
+        "tasks/result",
+        "idempotency_endpoint",
+        "preview_endpoint",
+    ):
+        assert action_extension not in adapter
+    assert "MCP_GRANT_POLICY" in domain
+    assert "MCP_RECEIPT_POLICY" in domain
     assert "activate_mcp_domain" in embedded
     assert "mcp_domain" in embedded
     assert "mcp_server_bindings" in (
@@ -511,6 +524,7 @@ def test_public_surface_is_focused():
         "MCPAuthenticationMode",
         "MCPBindingState",
         "MCPBindingStatus",
+        "MCPCompletionSemantics",
         "MCPError",
         "MCPInspectedTool",
         "MCPServerBinding",
@@ -1905,7 +1919,10 @@ def test_pricing_semantics_have_one_provider_neutral_owner():
     models = (PACKAGE / "llm" / "models.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop").lower()
     pricing = (PACKAGE / "llm" / "pricing.py").read_text(encoding="utf-8").lower()
-    assert "estimated_cost_usd" not in models
+    # Requests carry an allowance; returned usage still has one CostEstimate.
+    for node in ast.walk(ast.parse(models)):
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assert node.target.id != "estimated_cost_usd"
     assert "cost_per_million" not in models
     for provider in ("openai", "anthropic", "gemini", "grok", "ollama"):
         assert provider not in loop

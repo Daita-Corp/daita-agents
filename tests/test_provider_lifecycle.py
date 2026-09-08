@@ -517,6 +517,10 @@ async def test_configured_openai_route_closes_the_real_sdk_http_client(
     sdk_clients: list[openai.AsyncOpenAI] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/input_tokens"):
+            return httpx.Response(
+                200, json={"object": "response.input_tokens", "input_tokens": 10}
+            )
         return httpx.Response(
             200,
             request=request,
