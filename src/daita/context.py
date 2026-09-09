@@ -2463,6 +2463,19 @@ def _tool_guidance(
             "assignment's execution tools. Load them only to invoke them, or to inspect "
             "a contract marked automation_contract_omitted. Effect-free "
             "reads need no requested_capability_grants; include their IDs in allowed_capability_ids."
+            " Use one run_immediately recurring assignment for now-and-later work. "
+            "Routine approval cannot grant missing connector or native write permission. "
+            "Report the saved assignment and its host-dependent status, not completion. "
+            "Uncertain action receipts require human /effects recovery; never replay an action."
+        )
+    if "data.upsert_rows" in capability_ids:
+        instructions.append(
+            "Research/upsert: discover admitted research tools, cite evidence and coverage limits, "
+            "inspect the exact target and supported unique key, normalize one uniform scalar batch, "
+            "then preview and apply that exact batch with its current-run fingerprint. "
+            "Insert/update columns and identity generation require explicit permission. "
+            "No findings is no action, not a successful required write. Report verified inserted, "
+            "updated and unchanged counts separately from researched claims. Never chunk or replay."
         )
     if JOB_READ_RESULTS_CAPABILITY_ID in capability_ids:
         instructions.append(

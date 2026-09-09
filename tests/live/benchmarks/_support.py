@@ -153,7 +153,7 @@ class RecordingProvider:
         self.requests.append(request)
         started = perf_counter()
         response = None
-        failure = None
+        failure: BaseException | None = None
         first_event_seconds = None
         try:
             async with closing_stream(self._delegate.stream(request)) as events:
@@ -164,6 +164,12 @@ class RecordingProvider:
                         response = event.response
                         self.responses.append(response)
                     yield event
+        except GeneratorExit as error:
+            # Consumers close at the terminal event. That normal release is
+            # not a cancelled model attempt; early close still is.
+            if response is None:
+                failure = error
+            raise
         except BaseException as error:
             failure = error
             raise

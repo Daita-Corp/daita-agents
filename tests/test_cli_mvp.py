@@ -869,10 +869,10 @@ def test_cli_approval_displays_the_exact_canonical_review_document():
     assert decision is ApprovalDecision.APPROVE
     assert stdout.getvalue() == (
         "Approval required\n\n"
-        "Tool:       data_update_rows\n"
+        "Tool: data_update_rows\n"
         "Capability: data.update_rows\n"
-        "Change:     update one row\n"
-        "Arguments:\n"
+        "Change: update one row\n"
+        "Exact validated details:\n"
         f"{rendered}\n"
     )
     assert "Montr\\u00e9al" in stdout.getvalue()
@@ -892,7 +892,7 @@ def test_cli_approval_denies_unreviewable_arguments_without_prompting():
         decision = asyncio.run(cli._prompt_for_exact_approval(request))
 
     assert decision is ApprovalDecision.DENY
-    assert stdout.getvalue() == ""
+    assert "Approval unavailable" in stdout.getvalue()
     prompt.assert_not_called()
 
 
@@ -976,6 +976,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "mcp",
         "skills",
         "routines",
+        "effects",
         "inbox",
     }
     assert _surface(commands["detach"]) == (

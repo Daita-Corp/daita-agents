@@ -963,6 +963,7 @@ class RoutineOwner:
             resource_facts.append(
                 {
                     "resource_id": resource.id,
+                    "display_name": resource.native_identity,
                     "source_id": resource.source_id,
                     "revision": resource.current_revision,
                     "sensitivity": resource.sensitivity.value,
@@ -998,9 +999,16 @@ class RoutineOwner:
                 {
                     "binding_id": binding.binding_id,
                     "revision": binding.revision,
+                    "endpoint": binding.endpoint,
+                    "display_name": binding.local_label,
+                    "server_name": binding.server_name,
+                    "maximum_outbound_sensitivity": binding.maximum_outbound_sensitivity.value,
                     "tools": tuple(
                         {
                             "capability_id": tool.capability_id,
+                            "remote_tool_name": tool.remote_name,
+                            "maximum_outbound_sensitivity": tool.maximum_outbound_sensitivity.value,
+                            "result_sensitivity": tool.result_sensitivity.value,
                             "input_schema_digest": tool.input_schema_digest,
                             "output_schema_digest": tool.output_schema_digest,
                         }
@@ -1406,6 +1414,16 @@ def _schedule_payload(schedule: RoutineSchedule) -> dict[str, object]:
             }
         )
     return payload
+
+
+def routine_approval_arguments(authority: FrozenJsonObject) -> FrozenJsonObject:
+    """Keep one exact product review envelope over the validated snapshot."""
+    return FrozenJsonObject.from_mapping(
+        {
+            "proposal": authority["routine"],
+            "authority": authority["authority"],
+        }
+    )
 
 
 def _routine_proposal_payload(routine: ScheduledRoutine) -> dict[str, object]:

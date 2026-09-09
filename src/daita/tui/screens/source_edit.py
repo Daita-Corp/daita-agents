@@ -302,7 +302,7 @@ class SourceEditScreen(Screen[bool]):
             lines.append(f"Not carried forward: {shown}{suffix}")
         if preview.adapter_id == "postgresql":
             lines.append(
-                "PostgreSQL update access: none; exact scopes must be enabled again"
+                "PostgreSQL update/upsert access: none; exact scopes must be enabled again"
             )
         lines.append("A new conversation will start; existing history is retained.")
         accepted = await self.app._await_modal(  # type: ignore[attr-defined]

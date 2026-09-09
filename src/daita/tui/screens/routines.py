@@ -2,6 +2,15 @@
 
 from __future__ import annotations
 
+import json
+
+from daita._json import FrozenJsonObject
+from daita.routines.capabilities import (
+    routine_inspection_projection,
+    routine_projection,
+)
+from ..projection import approval_summary
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -11,9 +20,6 @@ from textual.widgets import Button, Footer, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 from daita import (
-    CalendarSchedule,
-    IntervalSchedule,
-    OnceSchedule,
     RoutineState,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
@@ -43,15 +49,15 @@ class RoutinesScreen(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="routines-manager"):
-            yield Label("Scheduled read routines", id="routines-title", markup=False)
+            yield Label("Saved assignments", id="routines-title", markup=False)
             yield Static("Loading…", id="routines-summary", markup=False)
             yield OptionList(id="routines-list")
             with VerticalScroll(id="routines-detail-scroll"):
                 yield Static("", id="routines-detail", markup=False)
             yield Static(
-                "Schedules progress only while this agent is held by the TUI, CLI, "
-                "or `daita host --agent <name>`. Stop a resident host before opening "
-                "the same agent here. Create and update routines conversationally.",
+                "Host open in this TUI. Queued assignments share the run lock with chat. "
+                "Exit this TUI before starting daita host --agent <name>; stop that host "
+                "before reopening here. No progress while every host is closed.",
                 id="routines-help",
                 markup=False,
             )
@@ -253,43 +259,30 @@ class RoutinesScreen(ModalScreen[None]):
 
 
 def render_routine_inspection(inspection: ScheduledRoutineInspection) -> Text:
-    routine = inspection.routine
-    if isinstance(routine.schedule, OnceSchedule):
-        schedule = f"once at {routine.schedule.exact_at.isoformat()}"
-    elif isinstance(routine.schedule, IntervalSchedule):
-        schedule = (
-            f"every {routine.schedule.interval_seconds}s from "
-            f"{routine.schedule.anchor_at.isoformat()}"
-        )
-    elif isinstance(routine.schedule, CalendarSchedule):
-        schedule = (
-            f"calendar {routine.schedule.hour:02d}:{routine.schedule.minute:02d} "
-            f"{routine.schedule.timezone} ({routine.schedule.day_selector.value}; "
-            f"gap={routine.schedule.nonexistent_time_policy.value}; "
-            f"overlap={routine.schedule.ambiguous_time_policy.value})"
-        )
-    else:  # pragma: no cover - the strict routine record makes this unreachable.
-        schedule = "invalid"
-    lines = (
-        f"ID: {safe_display(routine.routine_id, fallback='routine')}\n"
-        f"State: {routine.state.value} · revision {routine.revision}\n"
-        f"Schedule: {schedule}\n"
-        f"Next due: {routine.next_due_at.isoformat() if routine.next_due_at else '—'}\n"
-        f"Reporting: {routine.reporting_mode.value} · misfire {routine.misfire_policy.value}\n"
-        f"Instruction digest: {routine.instruction_digest}\n"
-        f"Instruction: {safe_display(routine.authorized_instruction, fallback='—', maximum=2048)}\n"
-        f"Sources: {', '.join(routine.allowed_source_ids) or '—'}\n"
-        f"Bindings: {', '.join(routine.allowed_connector_binding_ids) or '—'}\n"
-        f"Resources: {', '.join(routine.allowed_resource_ids) or '—'}\n"
-        f"Capabilities: {', '.join(routine.allowed_capability_ids)}\n"
-        f"Skills: {', '.join(item.skill_name for item in routine.skill_bindings) or '—'}\n"
-        f"Budget: {routine.charged_tokens}/{routine.cumulative_max_tokens} tokens; "
-        f"${routine.charged_cost_usd}/${routine.cumulative_max_cost_usd}\n"
-        f"Occurrences: {routine.occurrence_count} · failures {routine.consecutive_failures}\n"
-        f"Expires: {routine.expires_at.isoformat()}\n"
-        f"Recent occurrences: {len(inspection.recent_occurrences)}"
+    projection = routine_inspection_projection(inspection)
+    routine = routine_projection(inspection.routine)
+    exact = json.dumps(
+        FrozenJsonObject.from_mapping(projection).to_dict(),
+        ensure_ascii=True,
+        indent=2,
+        sort_keys=True,
     )
-    return Text(lines)
+    lines = [
+        approval_summary(
+            json.dumps({"proposal": FrozenJsonObject.from_mapping(routine).to_dict()})
+        )
+    ]
+    for item in inspection.recent_occurrences:
+        lines.append(
+            f"{item.scheduled_for.isoformat()} · {item.disposition.value} · "
+            f"{item.failure_code or 'no failure recorded'} · occurrence {item.occurrence_id} · "
+            f"run {item.terminal_run_id or item.reserved_run_id or 'not started'}"
+        )
+    lines.append(
+        "Receipt references and artifact/delivery evidence are in the exact details below. Use /effects to inspect or resolve uncertainty."
+    )
+    lines.append(exact)
+    return Text("\n".join(lines))
 
 
 __all__ = ["RoutinesScreen", "render_routine_inspection"]

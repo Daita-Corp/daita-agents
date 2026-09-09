@@ -291,7 +291,7 @@ async def test_write_selected_many_all_current_and_future_table_exclusion(tmp_pa
         await agent.close()
 
 
-async def test_advanced_columns_support_wide_exact_binding_and_stale_preview(tmp_path):
+async def test_wide_column_choices_support_exact_binding_and_stale_preview(tmp_path):
     agent = await Agent.create(
         "permission-bound",
         root=tmp_path,
@@ -309,7 +309,7 @@ async def test_advanced_columns_support_wide_exact_binding_and_stale_preview(tmp
     all_columns = tuple(f"value_{index:02d}" for index in range(1, 34))
     try:
         inspection = await agent.inspect_source_permissions(source.id)
-        assert inspection.resources[0].requires_advanced_column_selection
+        assert inspection.resources[0].eligible_assignment_columns == all_columns
         preview = await agent.preview_source_permissions(
             source_id=source.id,
             read_mode="all",

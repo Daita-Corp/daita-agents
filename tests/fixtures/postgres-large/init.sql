@@ -1240,6 +1240,34 @@ GRANT USAGE ON SCHEMA support TO daita_large_writer;
 GRANT SELECT ON support.tickets TO daita_large_writer;
 GRANT UPDATE (priority) ON support.tickets TO daita_large_writer;
 
+-- Isolated release canary. The original reader and update-only writer retain
+-- their exact privileges and catalog shape. Tests reset only these canaries.
+CREATE SCHEMA write_acceptance;
+CREATE ROLE daita_large_write_tester
+    LOGIN PASSWORD 'daita_large_write_tester_fixture_password'
+    NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE TABLE write_acceptance.companies (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    domain text COLLATE "C" NOT NULL UNIQUE,
+    name text NOT NULL,
+    evidence_url text COLLATE "C" NOT NULL UNIQUE,
+    notes text
+);
+GRANT CONNECT ON DATABASE daita_large_fixture TO daita_large_write_tester;
+GRANT USAGE ON SCHEMA write_acceptance TO daita_large_write_tester;
+-- Table-level UPDATE is required by PostgreSQL's EXCLUSIVE table lock.
+-- Daita's separate permission scopes still restrict operations and columns.
+GRANT SELECT, UPDATE ON write_acceptance.companies TO daita_large_write_tester;
+GRANT INSERT (domain, name, evidence_url, notes)
+    ON write_acceptance.companies TO daita_large_write_tester;
+GRANT USAGE ON SEQUENCE write_acceptance.companies_id_seq
+    TO daita_large_write_tester;
+-- A narrow batch can reach the row ceiling while retaining the byte and exact
+-- approval bounds. Wider company batches must still obey those same bounds.
+CREATE TABLE write_acceptance.cells (k integer PRIMARY KEY, v integer NOT NULL);
+GRANT SELECT, UPDATE ON write_acceptance.cells TO daita_large_write_tester;
+GRANT INSERT (k, v) ON write_acceptance.cells TO daita_large_write_tester;
+
 CREATE TABLE private.fixture_status (
     ready boolean PRIMARY KEY
 );

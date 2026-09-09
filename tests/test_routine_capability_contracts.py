@@ -179,7 +179,7 @@ async def test_mutation_receipt_is_bounded_and_full_contract_stays_inspectable(a
     from daita.routines.capabilities import (
         _mutation_receipt,
         _mutation_receipt_schema,
-        _routine_payload,
+        routine_projection,
     )
 
     store = _Store()
@@ -192,7 +192,7 @@ async def test_mutation_receipt_is_bounded_and_full_contract_stays_inspectable(a
     assert isinstance(compact, dict)
     assert compact["routine_id"] == proposal.routine_id
     assert compact["revision"] == proposal.revision
-    full = _routine_payload(proposal)
+    full = routine_projection(proposal)
     for key in (
         "contract_bindings",
         "authorized_instruction",

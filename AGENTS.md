@@ -90,6 +90,7 @@ src/daita/
   config.py                   # immutable runtime and model configuration
   workspace.py                # runtime-only local workspace admission
   cli.py                      # CLI over the public embedded API
+  tui/                        # source-free navigation, approvals and human controls
 tests/                        # deterministic and opt-in live tests
 examples/                     # offline examples
 docs/                         # user-facing guides
@@ -730,3 +731,22 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/storage/sqlite_migrations/` | checksummed migration engine |
 | `src/daita/llm/routing.py` | normalized provider routing |
 | `tests/test_architecture.py` | architecture and public-surface checks |
+
+## Product control surfaces
+
+CLI and TUI routine inspection reuse the routine domain's current projections.
+Approval summaries derive only from the exact validated request and retain its
+complete bounded details. An explicit `confirmation_handler` reviews direct routine
+create/update controls before mutation; typed Python callers without that callback
+remain the authorizing owner. CLI create/update supplies this callback. Approval cannot grant missing connector permission.
+
+The source permission editor authors one exact table scope through existing
+preview/apply APIs. Catalog-backed column/key choices are presentation, not a
+second validator or proof of live database readiness. Apply confirms the complete
+before/after state, including required read additions; it performs no source write.
+
+Receipt list, inspect and human recovery controls call the existing Agent APIs.
+Recovery never calls the model or an external executor. The original observation
+and separate immutable resolution stay owned by SQLite. Product host status must
+distinguish saved assignments, queued/running occurrences and the lifetime of the
+currently open TUI or headless command; no host means no execution progress.

@@ -47,6 +47,37 @@ operation, changes its evidence basis, grants connector access, or proves that t
 original action failed or succeeded. Resolution is a human control, unavailable to
 model tools and scheduled instructions.
 
-The common receipt, frozen-grant and required-effect outcome lifecycle is
-implemented. Unattended production effects remain disabled pending the concrete
-native/MCP action implementations and their later conformance and product gates.
+## Terminal inspection and recovery
+
+In the TUI, `/effects` opens unresolved receipts. **Show all**, **Previous**, and
+**Next** page through at most 20 records at a time. `/effects inspect <receipt-id>`
+opens an exact agent-owned receipt independently of the current conversation.
+The review shows the original observation, evidence basis, normalized payload,
+run/occurrence IDs, digest and any separate human resolution.
+
+After investigation, enter a note and optional exact receipt/artifact evidence IDs.
+Choose **Close without retry** or **Allow future work**, then review and approve
+the complete recovery document. No model is called. Denial, cancellation, a stale
+digest or unavailable evidence leaves the observation unresolved.
+
+The headless controls use the same Agent APIs:
+
+```bash
+daita effects list atlas --unresolved --limit 20 --offset 0
+daita effects inspect atlas <receipt-id>
+daita effects resolve atlas <receipt-id> \
+  --expected-digest <receipt-digest> \
+  --decision close_without_retry \
+  --note 'Investigated the remote system; close without repeating the operation.'
+```
+
+Use `--decision allow_future_work` for the other decision. Optional repeatable
+`--evidence <id>` accepts exact agent-owned terminal receipt or artifact references.
+There is no `--yes` shortcut: resolution presents the exact document for approval.
+Stop any resident host before using these commands or reopening the TUI. The
+command's host closes on exit; use `daita host --agent atlas` to continue scheduled
+work after the command finishes.
+
+Uncertainty stays in the original receipt even after recovery. Future authorized
+work may still duplicate an action whose original result was lost. Native and MCP
+implementation acceptance does not constitute production release approval.

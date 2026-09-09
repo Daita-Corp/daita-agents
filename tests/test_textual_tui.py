@@ -197,34 +197,18 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
     controls: list[tuple[str, int, str]] = []
 
     def inspection() -> ScheduledRoutineInspection:
-        routine = SimpleNamespace(
-            routine_id=current.routine_id,
+        from test_routine_storage import routine_record
+
+        routine = replace(
+            routine_record(
+                routine_id=current.routine_id,
+                state=current.state,
+                next_due_at=current.next_due_at,
+            ),
             title=current.title,
-            state=current.state,
             revision=current.revision,
-            schedule=IntervalSchedule(3600, observed),
-            next_due_at=current.next_due_at,
-            reporting_mode=ReportingMode.ALWAYS,
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            instruction_digest="sha256:" + "1" * 64,
-            authorized_instruction="Read and report the exact invoice count.",
-            allowed_source_ids=("source-1",),
-            allowed_connector_binding_ids=(),
-            allowed_resource_ids=("resource-1",),
-            allowed_capability_ids=("catalog.inspect",),
-            skill_bindings=(),
-            charged_tokens=0,
-            cumulative_max_tokens=1000,
-            charged_cost_usd=Decimal("0"),
-            cumulative_max_cost_usd=Decimal("1"),
-            occurrence_count=0,
-            consecutive_failures=0,
-            expires_at=observed,
         )
-        return cast(
-            ScheduledRoutineInspection,
-            SimpleNamespace(routine=routine, recent_occurrences=()),
-        )
+        return ScheduledRoutineInspection(routine, ())
 
     async def list_routines() -> tuple[ScheduledRoutineSummary, ...]:
         return (current,)
@@ -260,7 +244,7 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
         manager = app.screen
         assert isinstance(manager, RoutinesScreen)
         assert manager.query_one("#routines-list", OptionList).option_count == 1
-        assert "Instruction digest" in str(
+        assert "instruction_digest" in str(
             manager.query_one("#routines-detail", Static).content
         )
         assert await pilot.click("#routines-pause") is True
@@ -1610,7 +1594,7 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         resource_kind="table",
         eligible_assignment_columns=("priority", "ticket_status"),
         relational_update_eligible=True,
-        requires_advanced_column_selection=False,
+        upsert_conflict_keys=(),
     )
     inspection = SimpleNamespace(
         source_id="source-postgresql",
@@ -1690,13 +1674,11 @@ async def test_source_permissions_configures_exact_relational_write_scope():
         permissions = app.screen
         assert isinstance(permissions, PermissionsScreen)
 
-        assert await pilot.click("#perm-update") is True
+        assert await pilot.click("#perm-write") is True
         await pilot.pause()
-        choose_single(app, "selected")
+        choose_single(app, tickets.resource_id)
         await pilot.pause()
-        choose_multi(app, tickets.resource_id)
-        await pilot.pause()
-        choose_single(app, "advanced")
+        choose_single(app, "update")
         await pilot.pause()
         choose_multi(app, "priority")
         await pilot.pause()
@@ -1714,14 +1696,15 @@ async def test_source_permissions_configures_exact_relational_write_scope():
                         "allowed_update_columns": ("priority",),
                         "key_columns": ("ticket_id",),
                         "generated_identity_columns": (),
-                        "max_rows": 10000,
+                        "max_rows": 100,
                     },
                 },
             }
         ]
         body = str(permissions.query_one("#perm-body", Static).content)
-        assert "Relational write tables: 0 → 1" in body
-        assert "support.tickets: update; keys: ticket_id; update: priority" in body
+        assert "Before → after" in body
+        assert '"table": "support.tickets"' in body
+        assert '"max_rows": 100' in body
 
         assert await pilot.click("#perm-apply") is True
         await pilot.pause()

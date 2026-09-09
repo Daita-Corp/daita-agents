@@ -299,7 +299,7 @@ recovery records a receipt-linked decision without invoking anything. See
 [scheduled assignments](SCHEDULED_ROUTINES.md). This implementation and its
 deterministic fake-I/O acceptance are not production release approval.
 
-For real-model tool selection, grant construction, uncertainty reporting, and
-usage measurements against controlled MCP responses, see the opt-in
-[Phase F live evaluation](MCP_LIVE_EVALUATION.md). It complements deterministic
-execution safeguards and the separately authorized remote MCP smoke test.
+The [offline assignment and recovery walkthrough](../examples/03_offline_assignments_and_recovery.py)
+uses the production MCP client with an in-memory HTTP transport. It demonstrates
+research, artifacts, a fixed-destination standing action, response loss and human
+recovery without a live service. Live model and service validation remains opt-in.

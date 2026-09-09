@@ -32,6 +32,7 @@ from test_mcp_actions import ActionModel, response
 from live.benchmarks._support import RecordingProvider
 
 from daita._json import canonical_json
+from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     ModelUsage,
     ToolCall,
@@ -501,6 +502,67 @@ async def test_stream_cancellation_retains_timing_and_closes_only_request():
     assert timing["usage_complete"] is False
     assert timing["first_event_seconds"] is not None
     assert timing["input_tokens"] is None
+    await recorder.close()
+    assert model.closed
+
+
+@pytest.mark.parametrize("stage", ["completed", "partial", "cleanup_failure"])
+async def test_recorder_distinguishes_terminal_close_from_interruption(stage):
+    released = False
+    completed = response(text="Recorded terminal evidence.")
+
+    class ClosingModel(StreamingHarnessModel):
+        async def stream(self, request):
+            nonlocal released
+            try:
+                if stage == "partial":
+                    yield ModelTextDelta("partial")
+                else:
+                    yield ModelStreamCompleted(completed)
+            finally:
+                released = True
+                if stage == "cleanup_failure":
+                    raise RuntimeError("fixture cleanup failed")
+
+    model = ClosingModel()
+    recorder = RecordingProvider(model)
+    stream = recorder.stream(
+        ModelRequest(
+            messages=(
+                CanonicalMessage(
+                    role=MessageRole.USER, content=(TextBlock("fixture"),)
+                ),
+            )
+        )
+    )
+    # Use the same terminal-close boundary as the production router.
+    async with closing_stream(stream) as events:
+        await anext(events)
+        if stage == "cleanup_failure":
+            with pytest.raises(RuntimeError, match="fixture cleanup failed"):
+                await anext(events)
+    assert released and not model.closed
+    assert len(recorder.timings) == 1
+    timing = recorder.timings[0]
+    assert (
+        timing["outcome"]
+        == {
+            "completed": "completed",
+            "partial": "cancelled",
+            "cleanup_failure": "failed",
+        }[stage]
+    )
+    assert (
+        timing["failure_type"]
+        == {
+            "completed": None,
+            "partial": "GeneratorExit",
+            "cleanup_failure": "RuntimeError",
+        }[stage]
+    )
+    assert recorder.responses == ([] if stage == "partial" else [completed])
+    assert recorder.usages == ([] if stage == "partial" else [completed.usage])
+    assert timing["usage_complete"] is (stage != "partial")
     await recorder.close()
     assert model.closed
 

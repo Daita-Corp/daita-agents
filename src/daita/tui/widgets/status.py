@@ -59,7 +59,8 @@ class StatusBar(Horizontal):
         background.display = False
         background.tooltip = (
             "Background jobs, autonomous reporting, and unacknowledged inbox "
-            "results. Use /jobs or /inbox."
+            "results. Saved assignments execute only while this host is open and share "
+            "the run lock. Use /jobs, /routines, /effects or /inbox."
         )
         yield background
         context = Static(context_window_text(None, None), id="context-window")
@@ -78,6 +79,7 @@ class StatusBar(Horizontal):
         context_used: int | None = None,
         context_total: int | None = None,
         active_jobs: int = 0,
+        saved_routines: int = 0,
         active_reports: int = 0,
         inbox_items: int = 0,
         too_small: bool = False,
@@ -96,6 +98,7 @@ class StatusBar(Horizontal):
         self._update_background(
             background,
             active_jobs=active_jobs,
+            saved_routines=saved_routines,
             active_reports=active_reports,
             inbox_items=inbox_items,
         )
@@ -123,17 +126,24 @@ class StatusBar(Horizontal):
         target: Static,
         *,
         active_jobs: int,
+        saved_routines: int,
         active_reports: int,
         inbox_items: int,
     ) -> None:
         for value, name in (
             (active_jobs, "active_jobs"),
+            (saved_routines, "saved_routines"),
             (active_reports, "active_reports"),
             (inbox_items, "inbox_items"),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
         labels: list[tuple[str, str]] = []
+        if saved_routines:
+            count = (
+                f"{saved_routines}+" if saved_routines == 50 else str(saved_routines)
+            )
+            labels.append((f"assignments {count}", "bold #ACFD21"))
         if active_jobs:
             labels.append((f"jobs {active_jobs}", "bold #ACFD21"))
         if active_reports:

@@ -468,8 +468,16 @@ class Agent:
             basis_run_id=basis_run_id,
         )
 
-    async def create_routine(self, proposal: ScheduledRoutine) -> ScheduledRoutine:
-        return await self._embedded.create_routine(proposal)
+    async def create_routine(
+        self,
+        proposal: ScheduledRoutine,
+        *,
+        confirmation_handler: ApprovalHandler | None = None,
+    ) -> ScheduledRoutine:
+        """Authorize an exact owner proposal, optionally reviewing it before admission."""
+        return await self._embedded.create_routine(
+            proposal, confirmation_handler=confirmation_handler
+        )
 
     async def list_routines(
         self,
@@ -491,12 +499,14 @@ class Agent:
         expected_revision: int,
         draft: ScheduledRoutineDraft,
         basis_run_id: str | None = None,
+        confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
         return await self._embedded.update_routine(
             routine_id,
             expected_revision=expected_revision,
             draft=draft,
             basis_run_id=basis_run_id,
+            confirmation_handler=confirmation_handler,
         )
 
     async def pause_routine(

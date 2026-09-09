@@ -618,6 +618,44 @@ async def test_insert_readiness_rejects_privileges_and_target_features_before_sc
     assert db.next_id == 1 and not db.rows
 
 
+class GuardrailRecord:
+    """asyncpg-style keyed record without Mapping inheritance."""
+
+    def __init__(self, values):
+        self.values = values
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+
+
+async def test_upsert_accepts_driver_record_guardrails_through_preview_and_commit(
+    setup,
+):
+    from collections.abc import Mapping
+
+    backend, db, _ = setup
+    db.guardrails = GuardrailRecord(db.guardrails)
+    assert not isinstance(db.guardrails, Mapping)
+    preview = await backend.preview_upsert(agent_id="agent-preview", intent=intent())
+    result = await execute(backend, intent(), preview)
+    assert result.effect_observation.outcome is EffectOutcome.SUCCEEDED
+    assert len(db.rows) == 1
+
+
+@pytest.mark.parametrize(
+    "field", ["can_insert_columns", "can_lock_table", "unsupported_insert_features"]
+)
+async def test_upsert_driver_record_requires_every_guardrail_fact(setup, field):
+    backend, db, _ = setup
+    db.guardrails.pop(field)
+    db.guardrails = GuardrailRecord(db.guardrails)
+    with pytest.raises(CapabilityInputError) as error:
+        await backend.preview_upsert(agent_id="agent-preview", intent=intent())
+    assert error.value.code == "write_preview_failed"
+    assert not any(entry[0] == "fetch" for entry in db.log)
+    assert not db.rows
+
+
 def test_native_guardrails_include_foreign_keys_referencing_the_target():
     # An incoming ON UPDATE CASCADE must not mutate an unapproved second table.
     assert (

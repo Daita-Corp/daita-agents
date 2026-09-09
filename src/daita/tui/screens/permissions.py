@@ -1,4 +1,4 @@
-"""Review and edit source read scopes and PostgreSQL update permissions."""
+"""Author exact read, update and upsert permissions through preview/apply."""
 
 from __future__ import annotations
 
@@ -6,9 +6,11 @@ from typing import Any
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Label, Static
+from textual.widgets import Button, Footer, Input, Label, Static
+
+from daita.capabilities import render_approval_arguments
 
 from ..models import PickerOption
 from ..sanitization import sanitize_terminal_text
@@ -22,21 +24,35 @@ class PermissionsScreen(Screen[bool]):
         super().__init__()
         self._source_id = source_id
         self._preview: Any = None
+        self._reviewable = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="permissions", classes="control-panel"):
             yield Label("Source permissions", id="onboard-title", markup=False)
             yield Static(
-                "Review exact read and update scopes.", id="perm-help", markup=False
+                "Choose exact read, update or upsert scopes. Permissions do not execute a write.",
+                id="perm-help",
+                markup=False,
             )
             with VerticalScroll(id="perm-preview"):
                 yield Static("", id="perm-body", markup=False)
             yield Button("Choose source", id="perm-source")
-            yield Button("Read: all resources", id="perm-read-all")
-            yield Button("Read: selected resources", id="perm-read-selected")
-            yield Button("Read: none", id="perm-read-none")
-            yield Button("PostgreSQL update access", id="perm-update")
-            yield Button("Apply", id="perm-apply", variant="primary")
+            with Horizontal(classes="permission-actions"):
+                yield Button("Read: all resources", id="perm-read-all")
+                yield Button("Read: selected resources", id="perm-read-selected")
+                yield Button("Read: none", id="perm-read-none")
+            yield Label(
+                "Maximum rows per call (update ≤10,000; upsert ≤1,000)", markup=False
+            )
+            yield Input(
+                value="100",
+                placeholder="Maximum rows per call",
+                id="perm-max-rows",
+                type="integer",
+            )
+            with Horizontal(classes="permission-actions"):
+                yield Button("Edit table write access", id="perm-write")
+                yield Button("Apply", id="perm-apply", variant="primary")
             yield Footer()
 
     def action_cancel(self) -> None:
@@ -47,11 +63,26 @@ class PermissionsScreen(Screen[bool]):
         if button_id is None:
             return
         self.run_worker(
-            self._handle_button(button_id),
+            self._handle_safely(button_id),
             name="permissions-action",
             group="permissions-interaction",
             exclusive=True,
         )
+
+    async def _handle_safely(self, button_id: str) -> None:
+        try:
+            await self._handle_button(button_id)
+        except (ValueError, RuntimeError, PermissionError, OSError) as error:
+            self._preview = None
+            self._reviewable = False
+            self.query_one("#perm-help", Static).update(
+                sanitize_terminal_text(
+                    str(error),
+                    maximum=2048,
+                    preserve_lines=True,
+                    fallback="Permission change failed. Preview again.",
+                )
+            )
 
     async def _handle_button(self, button_id: str) -> None:
         app = self.app
@@ -68,10 +99,10 @@ class PermissionsScreen(Screen[bool]):
             await self._preview_selected(controller)
         elif button_id == "perm-read-none":
             await self._preview_mode(controller, "none", ())
-        elif button_id == "perm-update":
-            await self._preview_updates(controller)
+        elif button_id == "perm-write":
+            await self._preview_write(controller)
         elif button_id == "perm-apply":
-            if self._preview is None:
+            if self._preview is None or not self._reviewable:
                 self.query_one("#perm-help", Static).update("Preview a change first.")
                 return
             await controller.apply_source_permissions(
@@ -114,146 +145,159 @@ class PermissionsScreen(Screen[bool]):
             return
         await self._preview_mode(controller, "selected", selected)
 
-    async def _preview_updates(self, controller: Any) -> None:
+    async def _preview_write(self, controller: Any) -> None:
         inspection = await controller.inspect_source_permissions(self._source_id)
         if inspection.adapter_id != "postgresql":
-            self.query_one("#perm-help", Static).update(
-                "Update access is available only for PostgreSQL sources."
+            raise ValueError(
+                "Native write access is available only for PostgreSQL sources."
             )
-            return
-        eligible = tuple(
+        state = self._proposal_state(inspection)
+        scopes = {
+            scope.resource_id: {
+                key: value
+                for key, value in scope.constraints().items()
+                if key != "resource_revision"
+            }
+            for scope in state.relational_write_scopes
+        }
+        resources = tuple(
             resource
             for resource in inspection.resources
-            if resource.relational_update_eligible
+            if resource.resource_kind == "table"
         )
-        access_options = [
-            PickerOption("none", "No update access", "Remove all update scopes")
-        ]
-        if eligible:
-            access_options.extend(
-                (
-                    PickerOption(
-                        "selected",
-                        "Selected current tables",
-                        "Choose exact tables",
-                    ),
-                    PickerOption(
-                        "all",
-                        "All current eligible tables",
-                        "Future tables remain excluded",
-                    ),
-                )
-            )
-        access = await self.app._await_modal(  # type: ignore[attr-defined]
+        chosen = await self.app._await_modal(  # type: ignore[attr-defined]
             SelectionScreen(
-                title="PostgreSQL update access",
-                options=tuple(access_options),
+                title="Choose an exact table",
+                options=tuple(
+                    PickerOption(resource.resource_id, resource.display_name)
+                    for resource in resources
+                ),
             )
         )
-        if access is None:
+        if chosen is None:
             return
-        if access[0] == "none":
-            await self._preview_update_mapping(controller, inspection, {})
-            return
-
-        selected_resources = eligible
-        if access[0] == "selected":
-            selected = await self.app._await_modal(  # type: ignore[attr-defined]
-                SelectionScreen(
-                    title="Select update tables",
-                    options=tuple(
-                        PickerOption(
-                            resource.resource_id,
-                            resource.display_name,
-                            f"{len(resource.eligible_assignment_columns)} eligible columns",
-                        )
-                        for resource in eligible
-                    ),
-                    multi=True,
+        resource = next(item for item in resources if item.resource_id == chosen[0])
+        options = [
+            PickerOption(
+                "none",
+                "No write access",
+                "Remove this table's update and upsert permission",
+            )
+        ]
+        if resource.relational_update_eligible:
+            options.append(
+                PickerOption(
+                    "update", "Update existing rows", "Insertion remains forbidden"
                 )
             )
-            if selected is None:
-                return
-            selected_ids = set(selected)
-            selected_resources = tuple(
-                resource
-                for resource in eligible
-                if resource.resource_id in selected_ids
-            )
-
-        advanced_required = any(
-            resource.requires_advanced_column_selection
-            for resource in selected_resources
-        )
-        column_mode = "advanced"
-        if not advanced_required:
-            selected_mode = await self.app._await_modal(  # type: ignore[attr-defined]
-                SelectionScreen(
-                    title="Choose assignment columns",
-                    options=(
-                        PickerOption(
-                            "all",
-                            "All eligible columns",
-                            "Broadest scope for the selected tables",
-                        ),
-                        PickerOption(
-                            "advanced",
-                            "Advanced column selection",
-                            "Choose an exact subset for each table",
-                        ),
-                    ),
+        if resource.upsert_conflict_keys:
+            options.append(
+                PickerOption(
+                    "upsert",
+                    "Upsert rows",
+                    "Insert missing keys and update existing rows",
                 )
             )
-            if selected_mode is None:
-                return
-            column_mode = selected_mode[0]
-
-        updates: dict[str, tuple[str, ...]] = {}
-        for resource in selected_resources:
-            columns = resource.eligible_assignment_columns
-            if column_mode == "advanced":
-                selected_columns = await self.app._await_modal(  # type: ignore[attr-defined]
-                    SelectionScreen(
-                        title=f"Select update columns: {resource.display_name}",
-                        options=tuple(
-                            PickerOption(column, column) for column in columns
-                        ),
-                        multi=True,
+            if (
+                resource.key_columns in resource.upsert_conflict_keys
+                and resource.relational_update_eligible
+            ):
+                options.append(
+                    PickerOption(
+                        "both", "Update and upsert", "Explicitly permit both operations"
                     )
                 )
-                if selected_columns is None:
+        operation = await self.app._await_modal(  # type: ignore[attr-defined]
+            SelectionScreen(
+                title=f"Write operations: {resource.display_name}",
+                options=tuple(options),
+            )
+        )
+        if operation is None:
+            return
+        if operation[0] == "none":
+            scopes.pop(resource.resource_id, None)
+        else:
+            operations = ("update", "upsert") if operation[0] == "both" else operation
+            keys = resource.key_columns
+            inserts: tuple[str, ...] = ()
+            identities: tuple[str, ...] = ()
+            columns = resource.eligible_assignment_columns
+            if "upsert" in operations:
+                if "update" not in operations:
+                    selected_key = await self.app._await_modal(  # type: ignore[attr-defined]
+                        SelectionScreen(
+                            title="Choose a supported unique conflict key",
+                            options=tuple(
+                                PickerOption(str(index), ", ".join(key))
+                                for index, key in enumerate(
+                                    resource.upsert_conflict_keys
+                                )
+                            ),
+                        )
+                    )
+                    if selected_key is None:
+                        return
+                    keys = resource.upsert_conflict_keys[int(selected_key[0])]
+                selected_inserts = await self.app._await_modal(  # type: ignore[attr-defined]
+                    SelectionScreen(
+                        title="Insert columns (include every conflict key)",
+                        multi=True,
+                        options=tuple(
+                            PickerOption(column, column)
+                            for column in resource.eligible_insert_columns
+                        ),
+                    )
+                )
+                if selected_inserts is None:
                     return
-                columns = selected_columns
-            updates[resource.resource_id] = columns
-        await self._preview_update_mapping(controller, inspection, updates)
-
-    async def _preview_update_mapping(
-        self,
-        controller: Any,
-        inspection: Any,
-        updates: dict[str, tuple[str, ...]],
-    ) -> None:
-        proposal = self._proposal_state(inspection)
+                inserts = selected_inserts
+                columns = tuple(
+                    column
+                    for column in resource.eligible_upsert_update_columns
+                    if column in inserts and column not in keys
+                )
+                if resource.generated_identity_columns:
+                    identity_choice = await self.app._await_modal(  # type: ignore[attr-defined]
+                        SelectionScreen(
+                            title="Permit identity generation for missing rows?",
+                            options=(
+                                PickerOption("cancel", "Cancel upsert authoring"),
+                                PickerOption(
+                                    "allow",
+                                    "Allow database-generated identities",
+                                    ", ".join(resource.generated_identity_columns),
+                                ),
+                            ),
+                        )
+                    )
+                    if identity_choice != ("allow",):
+                        return
+                    identities = resource.generated_identity_columns
+            selected_columns = await self.app._await_modal(  # type: ignore[attr-defined]
+                SelectionScreen(
+                    title=f"Update columns: {resource.display_name}",
+                    multi=True,
+                    options=tuple(PickerOption(column, column) for column in columns),
+                )
+            )
+            if selected_columns is None:
+                return
+            max_rows = int(self.query_one("#perm-max-rows", Input).value)
+            scopes[resource.resource_id] = {
+                "allowed_operations": operations,
+                "allowed_insert_columns": inserts,
+                "allowed_update_columns": selected_columns,
+                "key_columns": keys,
+                "generated_identity_columns": identities,
+                "max_rows": max_rows,
+            }
         await self._preview_permissions(
             controller,
             inspection,
-            read_mode=proposal.read_scope.mode.value,
-            read_resource_ids=proposal.read_scope.resource_ids,
-            updates={
-                resource_id: {
-                    "allowed_operations": ("update",),
-                    "allowed_insert_columns": (),
-                    "allowed_update_columns": columns,
-                    "key_columns": next(
-                        resource.key_columns
-                        for resource in inspection.resources
-                        if resource.resource_id == resource_id
-                    ),
-                    "generated_identity_columns": (),
-                    "max_rows": 10000,
-                }
-                for resource_id, columns in updates.items()
-            },
+            read_mode=state.read_scope.mode.value,
+            read_resource_ids=state.read_scope.resource_ids,
+            updates=scopes,
         )
 
     async def _preview_mode(
@@ -320,52 +364,56 @@ class PermissionsScreen(Screen[bool]):
             f"Relational write tables: "
             f"{len(inspection.state.relational_write_scopes)}"
             f"{update_lines}",
-            maximum=2_048,
+            maximum=32768,
             preserve_lines=True,
             fallback="permissions",
         )
 
     def _preview_text(self, preview: Any, inspection: Any) -> str:
-        update_lines = self._update_scope_lines(
-            preview.after.relational_write_scopes,
-            inspection,
-        )
-        return sanitize_terminal_text(
-            "Before → after\n"
-            f"Read: {preview.before.read_scope.mode.value} → {preview.after.read_scope.mode.value}\n"
-            "Relational write tables: "
-            f"{len(preview.before.relational_write_scopes)} → "
-            f"{len(preview.after.relational_write_scopes)}"
-            f"{update_lines}\n"
-            f"Fingerprint: {preview.confirmation_fingerprint}",
-            maximum=2_048,
-            preserve_lines=True,
-            fallback="preview",
-        )
-
-    def _update_scope_lines(self, scopes: tuple[Any, ...], inspection: Any) -> str:
         names = {
             resource.resource_id: resource.display_name
             for resource in inspection.resources
         }
-        if not scopes:
-            return ""
-        lines = [
-            "\n  "
-            + names.get(scope.resource_id, scope.resource_id)
-            + ": "
-            + ", ".join(scope.allowed_operations)
-            + "; keys: "
-            + ", ".join(scope.key_columns)
-            + "; update: "
-            + ", ".join(scope.allowed_update_columns)
-            + "; insert: "
-            + ", ".join(scope.allowed_insert_columns)
-            + "; identities: "
-            + ", ".join(scope.generated_identity_columns)
-            + f"; max rows: {scope.max_rows}"
-            for scope in scopes[:5]
-        ]
-        if len(scopes) > 5:
-            lines.append(f"\n  +{len(scopes) - 5} more tables")
-        return "".join(lines)
+
+        def state_document(state: Any) -> dict[str, object]:
+            return {
+                "read_mode": state.read_scope.mode.value,
+                "read_resource_ids": state.read_scope.resource_ids,
+                "write_scopes": tuple(
+                    {
+                        "resource_id": scope.resource_id,
+                        "table": names.get(scope.resource_id, scope.resource_id),
+                        **scope.constraints(),
+                    }
+                    for scope in state.relational_write_scopes
+                ),
+            }
+
+        document = render_approval_arguments(
+            {
+                "before": state_document(preview.before),
+                "after": state_document(preview.after),
+                "confirmation_fingerprint": preview.confirmation_fingerprint,
+            }
+        )
+        self._reviewable = document is not None
+        return (
+            "Before → after. Apply authorizes exactly these permissions; it executes no write. "
+            "Review read additions as well as operations, keys, columns, identities and row ceilings.\n\n"
+            + document
+            if document is not None
+            else "Exact permission details exceed the review bound. Apply is unavailable; choose a smaller scope."
+        )
+
+    def _update_scope_lines(self, scopes: Any, inspection: Any) -> str:
+        names = {
+            resource.resource_id: resource.display_name
+            for resource in inspection.resources
+        }
+        return "".join(
+            f"\n  {names.get(scope.resource_id, scope.resource_id)}: {', '.join(scope.allowed_operations)}; "
+            f"keys: {', '.join(scope.key_columns)}; update: {', '.join(scope.allowed_update_columns)}; "
+            f"insert: {', '.join(scope.allowed_insert_columns)}; identities: {', '.join(scope.generated_identity_columns)}; "
+            f"max rows: {scope.max_rows}"
+            for scope in scopes
+        )

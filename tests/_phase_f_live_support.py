@@ -486,13 +486,15 @@ class Evaluation:
         receipts = await self.agent.list_effects() if hasattr(self, "agent") else ()
         routine_states = []
         if hasattr(self, "agent") and self.routine:
-            from daita.routines.capabilities import _inspection_payload
+            from daita.routines.capabilities import routine_inspection_projection
 
             for routine in await self.agent.list_routines():
                 inspection = await self.agent.inspect_routine(routine.routine_id)
                 assert inspection is not None
                 routine_states.append(
-                    json.loads(canonical_json(_inspection_payload(inspection)))
+                    json.loads(
+                        canonical_json(routine_inspection_projection(inspection))
+                    )
                 )
         runs = [
             {

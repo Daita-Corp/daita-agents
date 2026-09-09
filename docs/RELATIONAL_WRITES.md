@@ -8,6 +8,10 @@ writes SQL.
 
 Updates can affect one row or many rows within the explicitly approved row ceiling (at most 10,000). Upserts permit one uniform batch of at most 1,000 rows, further narrowed by the permission and routine grant. PostgreSQL is the initial native backend.
 
+For release evaluation with real model generation and a disposable PostgreSQL
+database, see [live model acceptance](LIVE_LLM_ACCEPTANCE.md). Its evidence is
+separate from the scripted-model database conformance suite.
+
 ## What Daita can update
 
 Daita supports parameterized PostgreSQL `UPDATE` statements built from:
@@ -105,30 +109,36 @@ Choose a different table or role, or have a DBA change the external database
 configuration. Daita does not accept an administrator credential to remediate
 readiness failures.
 
-## Enable update access
+## Author update and upsert access
 
-Attaching a PostgreSQL source starts with read access and no update access.
-During interactive attachment, Daita offers to configure update access after
-the source is cataloged. To configure or change it later:
+Attaching a PostgreSQL source grants no native write permission. Open
+`/source permissions`, choose the source, and set the maximum rows per call
+(default 100). Select **Edit table write access**, then one exact table.
 
-```text
-/source permissions
-```
+Choose **Update existing rows**, **Upsert rows**, or **Update and upsert** when
+both are supported by the same key. Update permission does not imply insertion.
+For upsert, select a supported unique conflict key, explicit insert columns
+including that key, and explicit update columns. If the table uses supported
+integer identities, separately approve database-generated identities for missing
+rows. Columns omitted from the uniform batch follow the native upsert rules below.
 
-Then:
+The editor uses current catalog choices; the existing preview validates the whole
+proposal, including types, defaults, keys and row ceilings. A catalog choice does
+not establish current database privileges or runtime readiness. Update scopes may
+allow at most 10,000 rows; upsert scopes at most 1,000, further narrowed by your
+chosen limit. Unsupported tables offer removal only.
 
-1. Select the PostgreSQL source.
-2. Select **PostgreSQL update access**.
-3. Choose selected current tables or all current eligible tables.
-4. Choose all eligible assignment columns or **Advanced** to select an exact
-   subset for each table. Advanced selection gives the narrowest access.
-5. Review the before/after permission summary.
-6. Confirm only if the exact tables and columns are correct.
+Review the complete **before/after** document, then select **Apply**. It shows
+exact table IDs and names, read additions, operations, columns, keys, generated
+identities, row limits and the confirmation fingerprint. Apply executes no write.
+An oversized review cannot be applied. A changed catalog or permission state
+requires a fresh preview. Editing one table preserves the other table scopes;
+future tables never become write-enabled automatically.
 
-Enabling update access can also add the read access required for preview and
-revalidation. Future tables are never automatically write-enabled. Changing a
-source connection clears all PostgreSQL update scopes; review and enable them
-again only after validating the replacement connection.
+Enabling writes can add read access required for preview and revalidation. A
+replacement source connection clears native write scopes. Review the replacement
+connection before enabling them again. Routine approval cannot supply missing
+source or connector permissions.
 
 For automation or diagnostics, readiness can be checked without changing
 permissions or data:
@@ -215,8 +225,9 @@ When an outcome is unknown:
    result.
 5. Review PostgreSQL logs and operational evidence through the authorized DBA
    process.
-6. Decide separately whether a corrective update is required, and require a
-   new human preview and approval for it.
+6. Open `/effects inspect <receipt-id>` and record an exact human recovery
+   decision after investigation. Recovery performs no action. A corrective update
+   requires a separate current preview, permission and approval.
 
 Seeing the intended state in a later read does not prove that this particular
 attempt caused it. The original receipt remains immutable and is never changed
@@ -224,9 +235,9 @@ from `outcome_unknown` to `committed` or `not_committed`.
 
 ## Disable update access
 
-Use `/source permissions`, select **PostgreSQL update access**, and choose
-**No update access**. This removes Daita's update scopes but does not revoke the
-database role's PostgreSQL grants.
+Use `/source permissions`, select **Edit table write access**, choose the exact
+table and **No write access**, then review and apply. This removes that table's
+update and upsert permission without revoking the database role's PostgreSQL grants.
 
 For incident response, remove the Daita scope first, then revoke or rotate the
 database credential through the external DBA or secret-management process.
@@ -317,9 +328,9 @@ readiness = await agent.relational_upsert_readiness(source_id, companies_resourc
 
 The table must already have a supported unique `domain` key and the admitted
 integer identity `id`. The API binds current structural facts rather than accepting
-a caller's replacement schema. Current TUI column selection configures update-only
-permission; explicit upsert configuration uses this typed API. Permission inspection
-shows both operations and their exact constraints.
+a caller's replacement schema. The TUI uses these same preview/apply APIs for
+guided update and upsert authoring. Permission inspection shows both operations
+and their exact constraints.
 
 Before write preparation and dispatch, the full request classification must fit
 the target's current admitted classification. Higher-classified research/context
@@ -343,5 +354,11 @@ unsatisfied when research yields no batch.
 
 This native implementation has deterministic acceptance coverage with fake external
 I/O. It is not production release approval or live PostgreSQL certification.
-Shared MCP external actions and the remaining product/recovery integration are
-separate later work. Routines execute only while an eligible host is open.
+Guided authoring and [receipt inspection/recovery](EFFECT_RECEIPTS.md) are available
+in the terminal. Routines execute only while an eligible host is open.
+
+The opt-in [PostgreSQL write release checks](../tests/fixtures/postgres-large/README.md#native-write-release-checks)
+exercise real transactions and independent readback using the existing disposable
+fixture and a scripted model. They cover conflict handling, rollback, locks,
+revocation, cancellation, lost commit confirmation, receipts, and human recovery.
+Their offline harness checks do not replace a passing authorized database run.

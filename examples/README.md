@@ -24,6 +24,7 @@ Run a walkthrough from the repository root:
 ```bash
 PYTHONPATH=src .venv/bin/python examples/00_quickstart_sqlite_from_db.py
 PYTHONPATH=src .venv/bin/python examples/02_catalog_assisted_joins.py
+PYTHONPATH=src .venv/bin/python examples/03_offline_assignments_and_recovery.py
 PYTHONPATH=src .venv/bin/python examples/10_csv_to_sqlite_data_app.py
 ```
 
@@ -51,3 +52,22 @@ These CLI writes are explicit caller mutations, so they require no model
 approval. A memory or skill change requested by the model during an interactive
 run remains on the exact once-only in-process approval path. The non-interactive
 `run` command never installs an approval handler.
+
+The assignment walkthrough uses `httpx.MockTransport`, a scripted model with
+explicit fictional usage, and a fresh temporary agent home. It approves one
+immediate and weekly research/briefing/notification assignment, closes and reopens
+the host, simulates a lost action response, and records human recovery without
+another dispatch. Its automatic approval callback is for simulated I/O only;
+use the TUI or an exact human approval handler for real actions. No live service,
+credentials, model call, or external database is used.
+
+Native company research/upsert is exercised offline by
+`tests/test_native_write_public.py`, with the real data/runtime/scheduler owners
+and deterministic PostgreSQL I/O. The guided permission acceptance is in
+`tests/test_product_integration.py`. See [relational write authoring](../docs/RELATIONAL_WRITES.md)
+for the runnable public API pattern against a separately admitted target.
+
+A reusable research procedure can follow [the procedure example](research_and_store/SKILL.md).
+Importing that Markdown never supplies a connector or write permission. Scheduled
+assignments retain exact skill content; adopting an edit requires an approved
+routine revision.

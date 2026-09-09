@@ -1231,26 +1231,24 @@ class PostgreSQLWriteBackend:
             timeout=self._statement_timeout_seconds,
         )
         guardrails = _admitted_guardrails(raw)
+        insert_facts = {
+            name: _record_value(raw, name)
+            for name in (
+                "can_insert_columns",
+                "can_lock_table",
+                "unsupported_insert_features",
+            )
+        }
         if (
-            not isinstance(raw, Mapping)
-            or raw.get("can_insert_columns") is not True
-            or raw.get("can_lock_table") is not True
-            or raw.get("unsupported_insert_features") is not False
+            insert_facts["can_insert_columns"] is not True
+            or insert_facts["can_lock_table"] is not True
+            or insert_facts["unsupported_insert_features"] is not False
         ):
             raise CapabilityInputError(
                 "upsert_guardrail_rejected",
                 "The insert branch or exclusive-lock permission has unsupported target features or privileges.",
             )
-        guardrails.update(
-            {
-                name: raw[name]
-                for name in (
-                    "can_insert_columns",
-                    "can_lock_table",
-                    "unsupported_insert_features",
-                )
-            }
-        )
+        guardrails.update(insert_facts)
         return table, guardrails
 
     async def _upsert_preview_on_connection(

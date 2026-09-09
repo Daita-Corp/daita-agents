@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 
-from daita import ConversationRun, LoopExit, LoopExitKind, Transcript
+from daita import ConversationRun, EffectReceipt, LoopExit, LoopExitKind, Transcript
+from daita._json import FrozenJsonObject
 from daita.llm.models import MessageRole, ToolCall, ToolResultBlock
 
 from .models import ToolCardDetails, ToolCardState, ToolTablePreview, TranscriptBlock
@@ -661,14 +662,201 @@ def approval_review_document(
             if reason is not None
             else ""
         )
-        + "Arguments:\n"
     )
-    document = header + arguments_text
+    document = (
+        header
+        + (
+            approval_summary(arguments_text)
+            if capability_id
+            in {"routines.create", "routines.update", "control.resolve_effect"}
+            else ""
+        )
+        + "Exact validated details:\n"
+        + arguments_text
+    )
     if looks_secret_shaped(arguments_text):
         return document, False
     return document, True
 
 
 def looks_secret_shaped(value: str) -> bool:
-    folded = value.casefold()
-    return any(part in folded for part in SENSITIVE_KEY_PARTS)
+    # Inspect credential fields, not prose or legitimate budget/digest names.
+    # The exact JSON remains visible; this is a display guard, never authority.
+    def contains_secret(item: object) -> bool:
+        if isinstance(item, dict):
+            return any(
+                str(key).casefold()
+                in {
+                    "api_key",
+                    "authorization",
+                    "credential",
+                    "password",
+                    "private_key",
+                    "secret",
+                    "token",
+                    "access_token",
+                    "refresh_token",
+                }
+                or contains_secret(child)
+                for key, child in item.items()
+            )
+        if isinstance(item, list):
+            return any(contains_secret(child) for child in item)
+        return False
+
+    try:
+        return contains_secret(json.loads(value))
+    except ValueError:
+        return True
+
+
+def approval_summary(arguments_text: str) -> str:
+    """Summarize only the frozen document handed to the approval handler."""
+    try:
+        document = json.loads(arguments_text)
+    except ValueError:
+        return ""
+    if not isinstance(document, dict):
+        return ""
+    routine = document.get("proposal")
+    if isinstance(routine, dict):
+        schedule = routine.get("schedule", {})
+        if not isinstance(schedule, dict):
+            return ""
+        kind = schedule.get("kind")
+        when = (
+            f"Once at {schedule.get('exact_at')}"
+            if kind == "once"
+            else (
+                f"Every {schedule.get('interval_seconds')} seconds from {schedule.get('anchor_at')}"
+                if kind == "interval"
+                else f"Calendar {schedule.get('hour')}:{str(schedule.get('minute')).zfill(2)} "
+                f"in {schedule.get('timezone')}; {schedule.get('day_selector')}; "
+                f"weekdays {schedule.get('weekdays')}, month days {schedule.get('month_days')}, "
+                f"months {schedule.get('months')}; DST gap {schedule.get('nonexistent_time_policy')}, "
+                f"overlap {schedule.get('ambiguous_time_policy')}"
+            )
+        )
+        lines = [
+            f"Assignment: {routine.get('title')} · revision {routine.get('revision')}",
+            f"Instruction: {routine.get('authorized_instruction')}",
+            f"Schedule: {when}; missed slots: {routine.get('misfire_policy')}",
+            "Immediate occurrence: "
+            + (
+                "one, within the same limits"
+                if routine.get("run_immediately")
+                else "none"
+            ),
+            f"Per run: {routine.get('per_run_max_tokens')} tokens, ${routine.get('per_run_max_cost_usd')} estimated model cost.",
+            f"Total: {routine.get('cumulative_max_tokens')} tokens, ${routine.get('cumulative_max_cost_usd')}; "
+            f"{routine.get('cumulative_max_attempts')} attempts, {routine.get('cumulative_max_occurrences')} occurrences; "
+            f"expires {routine.get('expires_at')}.",
+            f"Sensitivity ceiling: {routine.get('sensitivity_ceiling')}; model routes: {routine.get('eligible_model_routes')}.",
+            "Connections, exact resources, operations, columns, keys, argument restrictions, call ceilings, "
+            "retained skills and required effects/artifacts are listed below.",
+            "Results go to the originating conversation inbox. Execution requires an open host and shares its run lock.",
+            "This revision grants no missing connector permissions. Uncertain actions pause work; actions are never automatically replayed.",
+            "Model-cost limits do not cap third-party service fees.",
+        ]
+        authority = document.get("authority", {})
+        if isinstance(authority, dict):
+            for resource in authority.get("resources", ()):
+                if isinstance(resource, dict):
+                    lines.append(
+                        f"Table: {resource.get('display_name', resource.get('resource_id'))} [{resource.get('sensitivity')}]."
+                    )
+            for binding in authority.get("bindings", ()):
+                if isinstance(binding, dict):
+                    lines.append(
+                        f"Connection: {binding.get('display_name', binding.get('binding_id'))}; outbound ceiling {binding.get('maximum_outbound_sensitivity')}."
+                    )
+        for grant in routine.get("capability_grants", ()):
+            if not isinstance(grant, dict):
+                continue
+            lines.append(
+                f"Action: {grant.get('capability_id')}; at most {grant.get('max_calls_per_occurrence')} call(s) per occurrence."
+            )
+            constraints = grant.get("constraints", {})
+            if not isinstance(constraints, dict):
+                continue
+            if "allowed_operations" in constraints:
+                lines.append(
+                    f"Native operations {constraints.get('allowed_operations')}; keys {constraints.get('key_columns')}; "
+                    f"insert {constraints.get('allowed_insert_columns')}; update {constraints.get('allowed_update_columns')}; "
+                    f"generated identities {constraints.get('generated_identity_columns')}; maximum rows {constraints.get('max_rows')}."
+                )
+            if "fixed_arguments" in constraints:
+                lines.append(
+                    "Fixed arguments: "
+                    + json.dumps(
+                        constraints["fixed_arguments"],
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    )
+                    + "; variable scalar arguments: "
+                    + str(constraints.get("variable_argument_names"))
+                    + "."
+                )
+        outcome = routine.get("outcome_contract", {})
+        if isinstance(outcome, dict):
+            for effect in outcome.get("effect_requirements", ()):
+                if isinstance(effect, dict):
+                    minimum = effect.get("minimum_successful_calls")
+                    lines.append(
+                        f"Completion: {effect.get('capability_id')} requires {minimum} successful call(s) "
+                        f"with evidence {effect.get('accepted_evidence_bases')}. "
+                        + (
+                            "An approved no-action path may succeed."
+                            if minimum == 0
+                            else "No findings or a final answer alone cannot satisfy this action requirement."
+                        )
+                    )
+            for artifact in outcome.get("artifact_requirements", ()):
+                if isinstance(artifact, dict):
+                    lines.append(
+                        f"Artifact: {'required' if artifact.get('required') else 'optional'}; "
+                        f"formats {artifact.get('allowed_media_types')}; count {artifact.get('minimum_count')}–{artifact.get('maximum_count')}."
+                    )
+        lines.append(
+            "Server-reported evidence confirms invocation, not verified downstream delivery or business completion. Configured step and wall-time limits also apply."
+        )
+        return (
+            sanitize_terminal_text(
+                "\n".join(lines),
+                maximum=12000,
+                preserve_lines=True,
+                fallback="Assignment review",
+            )
+            + "\n\n"
+        )
+    if "receipt" in document and "decision" in document:
+        return (
+            "Recovery: " + str(document.get("consequence", document["decision"])) + "\n"
+            "The original observation stays unchanged. This records a human decision, performs no action, "
+            "and grants no connector permission.\n\n"
+        )
+    return ""
+
+
+def effect_receipt_mapping(receipt: EffectReceipt) -> dict[str, object]:
+    """Project evidence and the separate human decision without a storage codec."""
+    resolution = receipt.resolution
+    return FrozenJsonObject.from_mapping(
+        {
+            **receipt.material(),
+            "receipt_digest": receipt.receipt_digest,
+            "resolution": (
+                None
+                if resolution is None
+                else {
+                    "decision": resolution.decision.value,
+                    "note": resolution.note,
+                    "evidence_references": resolution.evidence_references,
+                    "approving_principal_id": resolution.approving_principal_id,
+                    "control_id": resolution.control_id,
+                    "resolved_at": resolution.resolved_at.isoformat(),
+                    "receipt_digest": resolution.receipt_digest,
+                }
+            ),
+        }
+    ).to_dict()

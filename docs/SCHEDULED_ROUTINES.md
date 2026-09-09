@@ -166,7 +166,10 @@ digest and preview, scope, pinned skills, budget use, next due time, recent
 occurrences, failures, expiration, revision, and lifecycle state. Its pause,
 resume, run-now, and disable controls call the public `Agent` methods directly.
 Create and update use the normal foreground routine tools and existing approval
-card.
+card. The status bar counts saved assignments separately from active background
+reasoning. A saved or queued assignment is not completed work. Receipt-linked
+failures remain inspectable through `/effects`; recovery is a separate human
+control and never performs an action.
 
 The headless CLI exposes the same record-owned lifecycle:
 
@@ -238,7 +241,19 @@ definition. For example:
 The IDs and model routes must already be admitted to that agent. Create and
 update fail closed if any identity, capability contract, sensitivity, route,
 pricing, outcome, destination, or skill binding is unavailable. Use
-`daita routines --help` for the command surface.
+`daita routines --help` for the command surface. CLI creation, promotion and
+revision present the exact validated proposal before saving it. Python callers
+can pass `confirmation_handler=` to create/update for that review. Without this
+explicit confirmation callback, typed Python create/update calls are already
+owner-authorized control operations. Model-originated changes always use the
+runtime approval handler.
+
+The review summarizes the instruction, schedule, immediate occurrence, budgets,
+permissions and completion requirements, followed by the complete validated
+authority snapshot. Connector names are presentation; exact identities and
+digests remain visible. An approval cannot add a connector permission or promise
+stronger evidence than the selected producer supports. Model cost ceilings do not
+cap third-party service fees.
 
 ## Inbox lifecycle and retention
 
@@ -283,6 +298,11 @@ resident host cannot own the same agent home concurrently: stop the current
 host, open the other process, then restart the resident host. The resident host
 does not add IPC, a remote API, a transparent client gateway, a multi-host
 queue, or a competing writer.
+
+A headless control command holds its host only for the command lifetime. The TUI
+shows its local host as open and identifies background reasoning separately from
+foreground activity. Both share one run lock, so one can delay the other. There is
+no continuous cloud execution or host availability service.
 
 If a host stops, persisted routines and occurrences remain inspectable but no
 new due work runs. On reopen, Daita fences stale claims, finalizes a run that

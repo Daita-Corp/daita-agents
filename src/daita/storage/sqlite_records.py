@@ -27,7 +27,6 @@ _SOURCE_PERMISSION_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{6
 _SOURCE_PERMISSION_MAX_RESOURCE_IDS = 10_000
 _SOURCE_PERMISSION_MAX_CATALOG_COLUMNS = 512
 _SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS = _SOURCE_PERMISSION_MAX_CATALOG_COLUMNS
-_SOURCE_PERMISSION_ADVANCED_COLUMN_THRESHOLD = 32
 _SOURCE_PERMISSION_MAX_SUMMARY_EXAMPLES = 5
 
 
@@ -210,6 +209,10 @@ class SourcePermissionResource:
     resource_kind: str
     eligible_assignment_columns: tuple[str, ...] = ()
     key_columns: tuple[str, ...] = ()
+    upsert_conflict_keys: tuple[tuple[str, ...], ...] = ()
+    eligible_insert_columns: tuple[str, ...] = ()
+    eligible_upsert_update_columns: tuple[str, ...] = ()
+    generated_identity_columns: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -230,6 +233,39 @@ class SourcePermissionResource:
             maximum_characters=256,
         )
         object.__setattr__(self, "eligible_assignment_columns", columns)
+        for name in (
+            "eligible_insert_columns",
+            "eligible_upsert_update_columns",
+            "generated_identity_columns",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _canonical_permission_texts(
+                    getattr(self, name),
+                    name,
+                    maximum_items=512,
+                    maximum_characters=256,
+                ),
+            )
+        if (
+            not isinstance(self.upsert_conflict_keys, tuple)
+            or len(self.upsert_conflict_keys) > 512
+        ):
+            raise ValueError("upsert conflict keys must be bounded")
+        object.__setattr__(
+            self,
+            "upsert_conflict_keys",
+            tuple(
+                _canonical_permission_texts(
+                    key,
+                    "upsert conflict key",
+                    maximum_items=512,
+                    maximum_characters=256,
+                )
+                for key in self.upsert_conflict_keys
+            ),
+        )
         object.__setattr__(
             self,
             "key_columns",
@@ -245,16 +281,10 @@ class SourcePermissionResource:
     def relational_update_eligible(self) -> bool:
         return bool(self.eligible_assignment_columns)
 
-    @property
-    def requires_advanced_column_selection(self) -> bool:
-        return len(self.eligible_assignment_columns) > (
-            _SOURCE_PERMISSION_ADVANCED_COLUMN_THRESHOLD
-        )
-
 
 @dataclass(frozen=True, slots=True)
 class SourcePermissionState:
-    """One exact read/update-scope state returned by the control plane."""
+    """One exact read/write-scope state returned by the control plane."""
 
     read_scope: SourceReadScope
     relational_write_scopes: tuple[RelationalWriteScope, ...]

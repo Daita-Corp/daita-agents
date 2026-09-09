@@ -15,6 +15,7 @@ context does not have to be explained again.
 [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) ·
 [Remote MCP](docs/MCP_CONNECTIVITY.md) ·
 [Scheduled routines](docs/SCHEDULED_ROUTINES.md) ·
+[Action receipts and recovery](docs/EFFECT_RECEIPTS.md) ·
 [Examples](examples/README.md)
 
 ```text
@@ -69,7 +70,16 @@ Summarize the CSV files in this workspace.
 Run `daita` again for a returning launch. Daita reopens the only agent or shows
 a picker when several exist. Use `daita --agent atlas` to select one directly.
 Inside the terminal, `/help` lists commands and controls, `/` opens the command
-palette, and `@` selects a source for one question.
+palette, and `@` narrows one question to a source. Ordinary questions can discover
+and compare all admitted connections without a selection. `/routines` shows saved
+assignments and occurrence evidence, `/inbox` shows results, and `/effects` opens
+action receipts and human recovery. `/source permissions` guides exact PostgreSQL
+update/upsert authoring.
+
+Saved assignments execute while the TUI or `daita host --agent atlas` keeps the
+agent open. Exit the current host before opening another; no work progresses
+while all hosts are closed. Routine approval grants no missing connector
+permission, and recovering an uncertain action performs no retry.
 
 ## Read-first by design
 

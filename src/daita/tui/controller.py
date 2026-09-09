@@ -18,6 +18,8 @@ from daita import (
     ConversationRun,
     DeliveryInspection,
     DistributionDestination,
+    EffectReceipt,
+    EffectResolutionDecision,
     InboxView,
     JobInspection,
     JobResultView,
@@ -649,6 +651,33 @@ class PresentationController:
     async def list_routines(self) -> tuple[ScheduledRoutineSummary, ...]:
         return await self.require_agent().list_routines(limit=50)
 
+    async def list_effects(
+        self, *, unresolved_only: bool = False, limit: int = 20, offset: int = 0
+    ) -> tuple[EffectReceipt, ...]:
+        return await self.require_agent().list_effects(
+            unresolved_only=unresolved_only, limit=limit, offset=offset
+        )
+
+    async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
+        return await self.require_agent().inspect_effect(receipt_id)
+
+    async def resolve_effect(
+        self,
+        receipt_id: str,
+        *,
+        expected_digest: str,
+        decision: EffectResolutionDecision,
+        note: str,
+        evidence_references: tuple[str, ...] = (),
+    ) -> EffectReceipt:
+        return await self.require_agent().resolve_effect(
+            receipt_id,
+            expected_digest=expected_digest,
+            decision=decision,
+            note=note,
+            evidence_references=evidence_references,
+        )
+
     async def inspect_routine(
         self, routine_id: str
     ) -> ScheduledRoutineInspection | None:
@@ -787,6 +816,19 @@ class PresentationController:
             return await self._jobs_command(parts)
         if name == "/routines":
             return await self._routines_command(parts, command)
+        if name == "/effects":
+            if len(parts) == 1 or (len(parts) == 3 and parts[1] == "inspect"):
+                return CommandOutcome(
+                    "screen",
+                    screen="effects",
+                    conversation_id=conversation_id,
+                    payload={} if len(parts) == 1 else {"receipt_id": parts[2]},
+                )
+            return CommandOutcome(
+                "notice",
+                "Usage: /effects | /effects inspect <receipt-id>",
+                conversation_id=conversation_id,
+            )
         if name == "/inbox":
             if len(parts) == 1:
                 return CommandOutcome(
@@ -959,7 +1001,7 @@ class PresentationController:
             return CommandOutcome(
                 "run",
                 run_message=(
-                    "Create a scheduled read routine for this self-contained "
+                    "Create a saved assignment for this self-contained "
                     "instruction, eliciting any missing schedule or scope details and "
                     "using the routine management tools: " + instruction
                 ),
@@ -972,7 +1014,7 @@ class PresentationController:
                 run_message=(
                     "Promote completed run "
                     + parts[2]
-                    + " into a scheduled read routine with this self-contained "
+                    + " into a saved assignment with this self-contained "
                     "instruction, using exact promotion evidence: " + instruction
                 ),
                 conversation_id=conversation_id,
@@ -982,7 +1024,7 @@ class PresentationController:
             return CommandOutcome(
                 "run",
                 run_message=(
-                    "Inspect and update scheduled read routine "
+                    "Inspect and update saved assignment "
                     + parts[2]
                     + " using its exact current revision and the routine management "
                     "tools. The replacement self-contained instruction is: "
@@ -1611,7 +1653,9 @@ class PresentationController:
         return (
             f"Agent      {safe_display(agent.name, fallback='agent')}\n"
             f"Model      {safe_display(self.model_label(), fallback='model')}\n"
-            f"Source     {source}\n"
+            f"Sources    {source}\n"
+            "Host       open in this TUI; background reasoning shares the run lock.\n"
+            "Handoff    exit this TUI, then start daita host --agent <name>. No progress while all hosts are closed.\n"
             f"Workspace  {safe_display(str(self.workspace.root), fallback='admitted')} "
             f"[{self.workspace.sensitivity.value}]\n"
             "Conversation  " + safe_display(self.conversation_id, fallback="new")

@@ -65,6 +65,7 @@ from ..autonomy import (
     create_terminal_job_followup,
 )
 from ..capabilities import (
+    CapabilityInputError,
     AccessMode,
     ApprovalHandler,
     ApprovalDecision,
@@ -232,7 +233,7 @@ from ..routines.models import (
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
-from ..routines.owner import RoutineError, RoutineOwner
+from ..routines.owner import RoutineError, RoutineOwner, routine_approval_arguments
 from ..routines.supervisor import RoutineSupervisor
 from ..security import (
     CredentialSession,
@@ -2858,13 +2859,42 @@ class EmbeddedAgent:
             basis_run_id=basis_run_id,
         )
 
-    async def create_routine(self, proposal: ScheduledRoutine) -> ScheduledRoutine:
-        """Persist one previously inspected exact proposal."""
+    async def create_routine(
+        self,
+        proposal: ScheduledRoutine,
+        *,
+        confirmation_handler: ApprovalHandler | None = None,
+    ) -> ScheduledRoutine:
+        """Persist one exact proposal, presenting it to an explicit human confirmation handler."""
 
+        self._require_open()
+        if proposal.agent_id != self.identity.id:
+            raise ValueError("routine proposal belongs to another agent")
+        authority = await self._routine_owner.proposal_authority_snapshot(proposal)
+        if confirmation_handler is not None:
+            control_id = self._id_factory("routine-approval")
+            request = ApprovalRequest(
+                run_id=control_id,
+                call_id=control_id,
+                tool_name="routine_create",
+                capability_id="routines.create",
+                arguments=routine_approval_arguments(authority),
+                reason="Approve this exact saved assignment, its standing actions, and its schedule?",
+            )
+            if (
+                request.render_arguments_for_review() is None
+                or await confirmation_handler(request) is not ApprovalDecision.APPROVE
+            ):
+                raise PermissionError("the routine creation was not approved")
         async with self._mutation_lock:
             self._require_open()
-            if proposal.agent_id != self.identity.id:
-                raise ValueError("routine proposal belongs to another agent")
+            if (
+                await self._routine_owner.proposal_authority_snapshot(proposal)
+                != authority
+            ):
+                raise ValueError(
+                    "routine authority changed during approval; propose again"
+                )
             return await self._routine_owner.admit(proposal)
 
     async def list_routines(
@@ -2889,25 +2919,47 @@ class EmbeddedAgent:
         expected_revision: int,
         draft: ScheduledRoutineDraft,
         basis_run_id: str | None = None,
+        confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
-        """Conditionally replace one routine with a newly authorized definition."""
+        """Prepare, review and conditionally replace one exact routine revision."""
 
+        self._require_open()
+        inspection = await self._routine_owner.inspect(routine_id)
+        if inspection is None or inspection.routine.revision != expected_revision:
+            raise RoutineError(
+                "routine_revision_changed",
+                "The routine changed or is no longer owned by this agent.",
+            )
+        proposal = await self._prepare_routine_revision(
+            inspection.routine, draft, basis_run_id=basis_run_id
+        )
+        authority = await self._routine_owner.proposal_authority_snapshot(proposal)
+        if confirmation_handler is not None:
+            control_id = self._id_factory("routine-approval")
+            request = ApprovalRequest(
+                run_id=control_id,
+                call_id=control_id,
+                tool_name="routine_update",
+                capability_id="routines.update",
+                arguments=routine_approval_arguments(authority),
+                reason="Replace this saved assignment with the exact proposed revision?",
+            )
+            if (
+                request.render_arguments_for_review() is None
+                or await confirmation_handler(request) is not ApprovalDecision.APPROVE
+            ):
+                raise PermissionError("the routine revision was not approved")
         async with self._mutation_lock:
             self._require_open()
-            inspection = await self._routine_owner.inspect(routine_id)
-            if inspection is None or inspection.routine.revision != expected_revision:
-                raise RoutineError(
-                    "routine_revision_changed",
-                    "The routine changed or is no longer owned by this agent.",
+            if (
+                await self._routine_owner.proposal_authority_snapshot(proposal)
+                != authority
+            ):
+                raise ValueError(
+                    "routine authority changed during approval; propose again"
                 )
-            proposal = await self._prepare_routine_revision(
-                inspection.routine,
-                draft,
-                basis_run_id=basis_run_id,
-            )
             return await self._routine_owner.revise(
-                proposal,
-                expected_revision=expected_revision,
+                proposal, expected_revision=expected_revision
             )
 
     async def pause_routine(
@@ -4136,8 +4188,14 @@ class EmbeddedAgent:
         )
         schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
         choices: list[SourcePermissionResource] = []
+        from ..domains.data.sql.relational_upsert import (
+            validate_relational_upsert_scope,
+        )
+
         for resource in resources:
             eligible_columns: tuple[str, ...] = ()
+            insert_columns: tuple[str, ...] = ()
+            upsert_keys: list[tuple[str, ...]] = []
             schema = schemas_by_resource_id.get(resource.id)
             if schema is not None and resource.kind is ResourceKind.TABLE:
                 eligible_columns = tuple(
@@ -4150,6 +4208,32 @@ class EmbeddedAgent:
                         resources=(schema,),
                     ).valid
                 )
+                insert_columns = tuple(
+                    column
+                    for column in schema.columns
+                    if column not in schema.identity_columns
+                )
+                for keys in schema.conflict_keys:
+                    try:
+                        validate_relational_upsert_scope(
+                            schema,
+                            key_columns=keys,
+                            insert_columns=insert_columns,
+                            update_columns=tuple(
+                                column
+                                for column in schema.updatable_columns
+                                if column
+                                not in (
+                                    *keys,
+                                    *schema.primary_key_columns,
+                                    *schema.identity_columns,
+                                )
+                            ),
+                            generated_identity_columns=schema.identity_columns,
+                        )
+                    except CapabilityInputError:
+                        continue
+                    upsert_keys.append(keys)
             choices.append(
                 SourcePermissionResource(
                     resource_id=resource.id,
@@ -4157,6 +4241,26 @@ class EmbeddedAgent:
                     resource_kind=resource.kind.value,
                     eligible_assignment_columns=eligible_columns,
                     key_columns=() if schema is None else schema.primary_key_columns,
+                    upsert_conflict_keys=tuple(upsert_keys),
+                    eligible_insert_columns=insert_columns if upsert_keys else (),
+                    eligible_upsert_update_columns=(
+                        ()
+                        if schema is None or not upsert_keys
+                        else tuple(
+                            column
+                            for column in schema.updatable_columns
+                            if column
+                            not in (
+                                *schema.primary_key_columns,
+                                *schema.identity_columns,
+                            )
+                        )
+                    ),
+                    generated_identity_columns=(
+                        ()
+                        if schema is None or not upsert_keys
+                        else schema.identity_columns
+                    ),
                 )
             )
         return SourcePermissionsInspection(

@@ -56,6 +56,8 @@ from .screens.onboarding import (
     SourceSetupScreen,
 )
 from .screens.permissions import PermissionsScreen
+from .screens.effects import EffectsScreen
+from .widgets.approval import ApprovalPanel
 from .screens.routines import RoutinesScreen
 from .screens.selection import SelectionScreen
 from .screens.source_edit import SourceEditScreen
@@ -147,6 +149,8 @@ class DaitaApp(App[int]):
         self._start_bootstrap = start_bootstrap
         self._startup_error: Exception | None = None
         self._active_job_count = 0
+        self._routine_count = 0
+        self._foreground_state = "ready"
         self._inbox_item_count = 0
         self._autonomous_run_ids: set[str] = set()
         self._known_inbox_ids: set[str] | None = None
@@ -196,6 +200,9 @@ class DaitaApp(App[int]):
             return
         self._shutting_down = True
         self._observer.close()
+        for screen in self.screen_stack:
+            for panel in screen.query(ApprovalPanel):
+                panel.action_cancel()
         pending = self._modal_future
         if pending is not None and not pending.done():
             pending.set_result(None)
@@ -217,6 +224,11 @@ class DaitaApp(App[int]):
             raise asyncio.CancelledError
         if self.size.height < 15:
             raise RuntimeError("terminal is too small to review this change")
+        if isinstance(self.screen, EffectsScreen):
+            decision = await self.screen.request_approval(request)
+            if decision is None:
+                raise asyncio.CancelledError
+            return decision
         screen = self.chat()
         if screen is None:
             raise RuntimeError("chat view is unavailable for approval review")
@@ -329,6 +341,7 @@ class DaitaApp(App[int]):
 
     def _reset_background_status(self) -> None:
         self._active_job_count = 0
+        self._routine_count = 0
         self._inbox_item_count = 0
         self._autonomous_run_ids.clear()
         self._known_inbox_ids = None
@@ -348,6 +361,12 @@ class DaitaApp(App[int]):
         async with self._background_refresh_lock:
             jobs = None
             inbox = None
+            try:
+                self._routine_count = len(await self.controller.list_routines())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
             try:
                 jobs = await self.controller.list_jobs()
             except asyncio.CancelledError:
@@ -451,8 +470,11 @@ class DaitaApp(App[int]):
         return None
 
     async def _refresh_status(
-        self, *, running: bool = False, state: str = "ready"
+        self, *, running: bool | None = None, state: str = "ready"
     ) -> None:
+        if running is not None:
+            self._foreground_state = state if running else "ready"
+        running = self._foreground_state != "ready"
         screen = self.chat()
         if screen is None or self.controller.agent is None:
             return
@@ -465,12 +487,21 @@ class DaitaApp(App[int]):
             agent=self.controller.require_agent().name,
             model=self.controller.model_label(),
             source=await self.controller.source_summary(),
-            state=state if running else "ready",
+            state=(
+                "queued behind background"
+                if running and self._autonomous_run_ids
+                else (
+                    self._foreground_state
+                    if running
+                    else "background running" if self._autonomous_run_ids else "ready"
+                )
+            ),
             context_used=self._context_input_tokens,
             context_total=(
                 profile.context_window_tokens if profile is not None else None
             ),
             active_jobs=self._active_job_count,
+            saved_routines=self._routine_count,
             active_reports=len(self._autonomous_run_ids),
             inbox_items=self._inbox_item_count,
             too_small=too_small,
@@ -676,6 +707,17 @@ class DaitaApp(App[int]):
         if screen_name == "routines":
             await self._await_modal(RoutinesScreen())
             await self.refresh_background_status(notify_new=False)
+            return
+        if screen_name == "effects":
+            await self._await_modal(
+                EffectsScreen(
+                    receipt_id=(
+                        str(payload["receipt_id"])
+                        if isinstance(payload.get("receipt_id"), str)
+                        else None
+                    )
+                )
+            )
             return
         if screen_name == "inbox":
             await self._await_modal(InboxScreen())
@@ -1055,7 +1097,7 @@ class DaitaApp(App[int]):
             if chat is not None:
                 chat.clear_activity()
                 chat.set_submitting(False)
-            await self._refresh_status()
+            await self._refresh_status(running=False)
 
     def _on_run_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():

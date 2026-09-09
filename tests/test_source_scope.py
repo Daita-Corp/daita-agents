@@ -199,6 +199,7 @@ async def test_source_edit_rejection_leaves_current_source_untouched(
         await agent.close()
 
 
+@pytest.mark.acceptance
 async def test_one_run_filter_narrows_sources_and_preserves_classified_history(
     tmp_path: Path,
 ):
@@ -470,6 +471,7 @@ async def test_private_continuity_survives_detach_compression_and_restart(tmp_pa
         await reopened.close()
 
 
+@pytest.mark.acceptance
 async def test_one_foreground_run_compares_two_exact_sources_without_selection(
     tmp_path,
 ):

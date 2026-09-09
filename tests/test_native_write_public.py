@@ -95,7 +95,7 @@ class ScriptedResearchModel:
         return step(request) if callable(step) else step
 
 
-async def create_fixture(tmp_path, monkeypatch):
+async def create_fixture(tmp_path, monkeypatch, *, sensitivity=Sensitivity.RESTRICTED):
     clock = [NOW]
     db = Database()
     alpha, _ = conformance_identities()
@@ -192,8 +192,7 @@ async def create_fixture(tmp_path, monkeypatch):
     snapshot = replace(
         snapshot,
         resources=tuple(
-            replace(item, sensitivity=Sensitivity.RESTRICTED)
-            for item in snapshot.resources
+            replace(item, sensitivity=sensitivity) for item in snapshot.resources
         ),
     )
     await agent._embedded._store.commit_snapshot(snapshot, registration=registration)
@@ -438,6 +437,7 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         "insert_column",
     ],
 )
+@pytest.mark.acceptance
 async def test_immediate_and_weekly_research_upsert_production_path(
     tmp_path, monkeypatch, mode
 ):

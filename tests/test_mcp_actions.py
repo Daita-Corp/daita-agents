@@ -571,6 +571,7 @@ async def test_possible_dispatch_failures_are_uncertain_and_never_replayed(
     assert len(action.server.calls) == 1
 
 
+@pytest.mark.acceptance
 async def test_immediate_and_recurring_mcp_only_assignment_uses_standing_grant(action):
     proposal = await action.agent.propose_routine(await action.draft())
     from daita.routines.capabilities import _spec_schema
@@ -648,6 +649,7 @@ async def test_immediate_and_recurring_mcp_only_assignment_uses_standing_grant(a
     "minimum,no_action,error",
     [(1, True, False), (0, True, False), (1, False, True), (0, False, True)],
 )
+@pytest.mark.acceptance
 async def test_required_action_and_partial_research_are_reported_honestly(
     action, minimum, no_action, error
 ):
@@ -671,6 +673,7 @@ async def test_required_action_and_partial_research_are_reported_honestly(
     assert "research.test/report" in canonical_json(research.output)
 
 
+@pytest.mark.acceptance
 async def test_server_reported_action_cannot_promise_adapter_verified_completion(
     action,
 ):
@@ -1192,6 +1195,7 @@ async def test_guided_ui_explicit_action_permissions_reach_public_admission(tmp_
         EffectResolutionDecision.CLOSE_WITHOUT_RETRY,
     ],
 )
+@pytest.mark.acceptance
 async def test_disconnect_blocks_restart_future_slots_controls_revision_clones_until_exact_recovery(
     action, decision
 ):

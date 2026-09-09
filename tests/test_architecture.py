@@ -2413,3 +2413,56 @@ def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
     }
     assert not hasattr(daita, "PostgreSQLUpdateScope")
     assert not (PACKAGE / "domains/data/sql/postgresql_update.py").exists()
+
+
+def test_product_recovery_and_permissions_keep_existing_execution_and_state_owners():
+    for relative in (
+        "tui/screens/effects.py",
+        "tui/screens/permissions.py",
+        "tui/screens/routines.py",
+    ):
+        tree = ast.parse((PACKAGE / relative).read_text(encoding="utf-8"))
+        imports = {
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+        assert not any(
+            module.startswith(
+                (
+                    "daita.storage",
+                    "daita.adapters",
+                    "daita.loop.driver",
+                    "daita.capability_runtime",
+                )
+            )
+            for module in imports
+        )
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert calls.isdisjoint(
+            {
+                "execute",
+                "execute_internal",
+                "reserve_effect_receipt",
+                "resolve_effect_receipt",
+                "connect",
+            }
+        )
+    controller = (PACKAGE / "tui/controller.py").read_text(encoding="utf-8")
+    for name in (
+        "inspect_effect",
+        "list_effects",
+        "resolve_effect",
+        "preview_source_permissions",
+        "apply_source_permissions",
+    ):
+        assert f"self.require_agent().{name}(" in controller
+    assert _class_owners("ApprovalPanel") == {"tui/widgets/approval.py"}
+    assert _class_owners("EffectResolution") == {"storage/sqlite_records.py"}
+    cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
+    assert "routine_inspection_projection" in cli
+    assert "def _routine_mapping" not in cli

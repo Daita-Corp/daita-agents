@@ -465,7 +465,16 @@ class DataCapabilityDomain:
                 run.agent_id, arguments, request_sensitivity
             )
         if capability.id in _UPSERT_CAPABILITIES:
-            intent = RelationalUpsertIntent.from_mapping(arguments)
+            try:
+                intent = RelationalUpsertIntent.from_mapping(arguments)
+            except ValueError:
+                raise CapabilityInputError(
+                    "upsert_invalid_batch",
+                    "Upsert requires uniform scalar rows with explicit columns, "
+                    "at most 1,000 rows, and a batch within 64 KiB and the exact "
+                    "approval display bound. Reduce the batch or correct its shape; "
+                    "no write was dispatched.",
+                ) from None
             permission = await self._catalog.load_relational_write_scope(
                 run.agent_id, intent.source_id, intent.resource_id
             )

@@ -77,6 +77,7 @@ from .owner import (
     RoutineOwner,
     _routine_proposal_payload,
     _schedule_payload,
+    routine_approval_arguments,
 )
 
 ROUTINE_DOMAIN_OWNER_ID = "routines"
@@ -158,7 +159,7 @@ class RoutineInspectExecutor(_RoutineExecutor):
                 "authority": "agent_owned_routine",
                 "routine_id": routine_id,
             },
-            data=_inspection_payload(inspection),
+            data=routine_inspection_projection(inspection),
         )
 
 
@@ -369,14 +370,12 @@ class RoutineCapabilityDomain:
             reason = "Replace this routine with the exact proposed revision once?"
         else:
             reason = "Apply this exact routine control action once?"
-        proposal = fingerprint.get("routine")
-        approval_arguments = (
-            FrozenJsonObject.from_mapping({"proposal": proposal})
-            if isinstance(proposal, Mapping)
-            else fingerprint
-        )
         return SideEffectPlan(
-            approval_arguments=approval_arguments,
+            approval_arguments=(
+                routine_approval_arguments(fingerprint)
+                if "routine" in fingerprint
+                else fingerprint
+            ),
             approval_reason=reason,
             recheck_after_approval=True,
         )
@@ -1355,7 +1354,7 @@ def _mutation_receipt_schema() -> dict[str, object]:
     }
 
 
-def _routine_payload(item: ScheduledRoutine) -> dict[str, object]:
+def routine_projection(item: ScheduledRoutine) -> dict[str, object]:
     payload = _routine_proposal_payload(item)
     payload.update(
         {
@@ -1390,9 +1389,11 @@ def _occurrence_payload(item: RoutineOccurrence) -> dict[str, object]:
     }
 
 
-def _inspection_payload(item: ScheduledRoutineInspection) -> dict[str, object]:
+def routine_inspection_projection(
+    item: ScheduledRoutineInspection,
+) -> dict[str, object]:
     return {
-        "routine": _routine_payload(item.routine),
+        "routine": routine_projection(item.routine),
         "recent_occurrences": tuple(
             _occurrence_payload(occurrence) for occurrence in item.recent_occurrences
         ),
