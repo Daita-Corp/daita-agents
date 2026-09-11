@@ -546,6 +546,13 @@ payloads end inside provider adapters. `daita.llm.routing` handles retry and
 fallback decisions from normalized failures; `AgentLoop` does not retry a
 whole run or inspect provider-specific failures.
 
+`daita.llm.provider_definitions` is the sole static source for built-in provider
+identity, display metadata, authentication and endpoint modes, lazy construction,
+request-policy facts, and unreviewed-profile capability defaults. The factory,
+embedded host, and TUI derive their views from those definitions; do not add a
+parallel provider list or vendor dispatch branch. Reviewed model limits and
+prices remain in `profiles.py` and `pricing.py`.
+
 One immutable `ModelCallPolicy` in `AgentConfig` and `ModelRequest` governs
 configured and conforming injected providers, both delivery modes, foreground,
 routines, follow-ups, validation and candidate review. Defaults are 180 seconds
@@ -615,13 +622,32 @@ tests rather than assuming that closing a public SDK generator releases it.
 
 To add a provider:
 
-1. implement `ManagedModelProvider` under `src/daita/llm/providers/` with an
-   idempotent `close()` method;
-2. keep native wire models and translation inside that adapter;
-3. import the SDK lazily and provide normalized pipx repair guidance;
-4. register construction in `src/daita/llm/factory.py`;
-5. add the bounded SDK version to default production dependencies; and
-6. add focused translation, error, and routing tests.
+1. implement `ManagedModelProvider` under `src/daita/llm/providers/`, delegating
+   common attempt and once-only close behavior to `llm._lifecycle`; use a
+   provider-named package with `adapter.py`, `messages.py`, and `stream.py` when
+   the protocol has substantial translation or stream grammar, while a small
+   specialization of an existing adapter remains one module;
+2. keep client ownership and native calls in the package's orchestration
+   adapter, message translation in its message module, and substantial stream
+   grammar in its decoder; the package `__init__.py` exports only the supported
+   provider classes so the public provider import stays stable;
+3. reuse `providers._fields` for identical native-field validation and import a
+   new SDK only at client construction, with normalized pipx repair guidance;
+4. add one immutable `ProviderDefinition`, including its explicit lazy
+   construction callable, in `llm/provider_definitions.py`; factory, host, and
+   TUI provider choices require no provider-specific edit;
+5. add a bounded SDK dependency only when the protocol needs one; and
+6. add focused definition, lazy-import, translation, lifecycle, accounting,
+   routing, and architecture tests.
+
+Unknown configured names continue through the explicit OpenAI-compatible path
+and require a base URL; they never inherit built-in authentication, endpoint, or
+profile privileges. Subscription subprocess mechanics live in
+`providers.subscription_cli.process`, the canonical envelope in
+`providers.subscription_cli.envelope`, and vendor flags, inspection, and
+decoding in the package's Claude or Grok adapters. Preserve dispatch-time
+revalidation even when it uses the same definition fact as lazy route preflight:
+those checks protect different boundaries.
 
 Do not add provider branches to `AgentLoop`.
 

@@ -169,11 +169,11 @@ from ..learning_candidates import (
 from ..llm.errors import ModelProviderError, ProviderErrorCode
 from ..llm.factory import create_model_route_provider
 from ..llm.models import (
+    _DEFAULT_CALL_POLICY,
     CanonicalMessage,
     FinishReason,
     MessageRole,
     ModelCallPolicy,
-    _DEFAULT_CALL_POLICY,
     ModelProfile,
     ModelRequest,
     ModelSensitivity,
@@ -182,6 +182,11 @@ from ..llm.models import (
 )
 from ..llm.profiles import reviewed_model_profile
 from ..llm.protocols import ManagedModelProvider, ModelProvider
+from ..llm.provider_definitions import (
+    AuthenticationMode,
+    admit_model_selection,
+    provider_definition,
+)
 from ..llm.routing import (
     ModelProviderRegistration,
     ModelRoute,
@@ -354,13 +359,7 @@ _MODEL_VALIDATION_TOOL_NAME = "daita_validate_tool_support"
 _MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 16
 _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
 _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
-_PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
-_SUBSCRIPTION_PROVIDERS = frozenset({"codex", "claude-code", "grok-build"})
-_SUBSCRIPTION_CREDENTIAL_PROVIDERS = frozenset({"codex"})
-_BUILTIN_PROVIDERS = frozenset(
-    {"openai", "anthropic", "gemini", "grok", "ollama", *_SUBSCRIPTION_PROVIDERS}
-)
 _T = TypeVar("_T")
 _STAGE_C_ALLOWED_CAPABILITY_IDS = (
     CATALOG_INSPECT_CAPABILITY_ID,
@@ -1924,7 +1923,11 @@ class EmbeddedAgent:
         """Run one provider-owned subscription login without persisting it."""
 
         self._require_open()
-        if provider != "codex":
+        definition = provider_definition(provider)
+        if (
+            definition is None
+            or definition.authentication is not AuthenticationMode.CODEX_SUBSCRIPTION
+        ):
             raise ValueError(
                 "integrated subscription login is available only for Codex"
             )
@@ -1951,14 +1954,16 @@ class EmbeddedAgent:
         """
 
         provider_name, model_name, endpoint, requires_credential = (
-            _admit_model_selection(
+            admit_model_selection(
                 provider,
                 model,
                 base_url,
             )
         )
+        definition = provider_definition(provider_name)
         requires_subscription_credential = (
-            provider_name in _SUBSCRIPTION_CREDENTIAL_PROVIDERS
+            definition is not None
+            and definition.authentication is AuthenticationMode.CODEX_SUBSCRIPTION
         )
         if requires_subscription_credential:
             if api_key is not None:
@@ -5036,52 +5041,6 @@ def _configuration_was_injected(
     )
 
 
-def _admit_model_selection(
-    provider: str,
-    model: str,
-    base_url: str | None,
-) -> tuple[str, str, str | None, bool]:
-    if not isinstance(provider, str):
-        raise TypeError("provider must be a string")
-    provider_name = provider.strip().lower()
-    if _PROVIDER_NAME.fullmatch(provider_name) is None:
-        raise ValueError("provider must be a bounded lowercase identifier")
-    if not isinstance(model, str) or not model.strip():
-        raise ValueError("model identifier must be non-empty")
-    model_name = model.strip()
-    if any(
-        character.isspace() or ord(character) < 32 or ord(character) == 127
-        for character in model_name
-    ):
-        raise ValueError("model identifier cannot contain whitespace or controls")
-    endpoint: str | None = None
-    if base_url is not None:
-        if not isinstance(base_url, str) or not base_url.strip():
-            raise ValueError("base URL must be non-empty when provided")
-        endpoint = base_url.strip()
-        if (
-            len(endpoint) > 2_048
-            or any(
-                ord(character) < 32 or ord(character) == 127 for character in endpoint
-            )
-            or not endpoint.startswith(("http://", "https://"))
-        ):
-            raise ValueError("base URL must be a bounded HTTP or HTTPS URL")
-    if provider_name in _BUILTIN_PROVIDERS - {"ollama"} and endpoint is not None:
-        raise ValueError(f"{provider_name} uses its fixed endpoint")
-    if provider_name not in _BUILTIN_PROVIDERS and endpoint is None:
-        raise ValueError("custom providers require an explicit base URL")
-    provider_id = f"{provider_name}:{model_name}"
-    if len(provider_id) > 256:
-        raise ValueError("model identity exceeds its 256 character bound")
-    return (
-        provider_name,
-        model_name,
-        endpoint,
-        provider_name not in {"ollama", "claude-code", "grok-build"},
-    )
-
-
 def _model_profile(
     provider: str,
     model: str,
@@ -5099,17 +5058,26 @@ def _model_profile(
         raise ValueError(
             "unreviewed models require explicit context and output token limits"
         )
+    definition = provider_definition(provider)
     return ModelProfile(
         id=provider_id,
         context_window_tokens=context_window_tokens,
         max_output_tokens=max_output_tokens,
         supports_tools=True,
-        supports_parallel_tools=provider in _SUBSCRIPTION_PROVIDERS,
-        supports_structured_output=provider in _SUBSCRIPTION_PROVIDERS,
-        supports_streaming=(
-            provider in _BUILTIN_PROVIDERS and provider not in _SUBSCRIPTION_PROVIDERS
+        supports_parallel_tools=(
+            False if definition is None else definition.profile_supports_parallel_tools
         ),
-        supports_reasoning=provider in _SUBSCRIPTION_PROVIDERS,
+        supports_structured_output=(
+            False
+            if definition is None
+            else definition.profile_supports_structured_output
+        ),
+        supports_streaming=(
+            False if definition is None else definition.profile_supports_streaming
+        ),
+        supports_reasoning=(
+            False if definition is None else definition.profile_supports_reasoning
+        ),
     )
 
 
@@ -5668,7 +5636,7 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         provider_name, separator, model_name = provider_id.partition(":")
         if not separator:
             raise ValueError("provider ID is incomplete")
-        _, _, admitted_url, requires_credential = _admit_model_selection(
+        _, _, admitted_url, requires_credential = admit_model_selection(
             provider_name,
             model_name,
             base_url,

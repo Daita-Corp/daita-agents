@@ -8,10 +8,10 @@ from decimal import Decimal
 
 from ..models import ModelRequest, ModelUsage
 from ..pricing import provider_reported_cost_estimate
-from .openai_compatible import (
+from ._fields import field as _field
+from .openai_compatible.adapter import (
     OpenAICompatibleProvider,
     _decode_usage,
-    _field,
     _OpenAICompatibleClient,
 )
 

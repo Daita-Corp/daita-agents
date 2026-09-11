@@ -19,22 +19,22 @@ from daita.llm.pricing import (
     aggregate_cost_estimates,
     format_cost_estimate,
 )
-from daita.llm.providers.anthropic import (
-    AnthropicProvider,
+from daita.llm.providers.anthropic.usage import (
     _decode_usage as decode_anthropic_usage,
 )
-from daita.llm.providers.gemini import (
+from daita.llm.providers.anthropic import AnthropicProvider
+from daita.llm.providers.gemini.adapter import (
     GeminiProvider,
     _decode_usage as decode_gemini_usage,
 )
 from daita.llm.providers.grok import GrokProvider
 from daita.llm.providers.mock import MockModelProvider
 from daita.llm.providers.ollama import OllamaProvider
-from daita.llm.providers.openai import (
+from daita.llm.providers.openai.adapter import (
     OpenAIProvider,
     _decode_usage as decode_openai_usage,
 )
-from daita.llm.providers.openai_compatible import (
+from daita.llm.providers.openai_compatible.adapter import (
     OpenAICompatibleProvider,
     _decode_usage as decode_compatible_usage,
 )

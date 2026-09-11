@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .openai_compatible import (
+from .openai_compatible.adapter import (
     OpenAICompatibleProvider,
     _OpenAICompatibleClient,
     _validate_base_url,

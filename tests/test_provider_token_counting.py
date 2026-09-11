@@ -767,7 +767,7 @@ async def test_uncounted_routes_preserve_usage_based_progression(kind):
 
 
 def test_subscription_cli_separates_request_bytes_and_token_allowance():
-    from daita.llm.providers.subscription_cli import _request_document
+    from daita.llm.providers.subscription_cli.envelope import _request_document
 
     request = input_request(remaining=7000)
     document = _request_document(request, 8192)

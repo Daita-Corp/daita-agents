@@ -58,7 +58,8 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.profiles import reviewed_model_profile
-from daita.llm.providers.gemini import GeminiProvider, _argument_snapshot_grew
+from daita.llm.providers.gemini.stream import _argument_snapshot_grew
+from daita.llm.providers.gemini import GeminiProvider
 from daita.llm.providers.openai import OpenAIResponsesProvider
 from daita.llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy
 from daita.loop.models import LoopExitKind, validate_completed_transcript

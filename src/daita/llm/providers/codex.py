@@ -26,7 +26,7 @@ from ..subscription_auth import (
     CodexOAuthCredential,
     refresh_codex_subscription,
 )
-from .openai import OpenAIResponsesProvider, _OpenAIClient
+from .openai.adapter import OpenAIResponsesProvider, _OpenAIClient
 
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
@@ -74,7 +74,7 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
 
     @property
     def client(self) -> _OpenAIClient:
-        if self._close_task is not None:
+        if self._close.started:
             raise RuntimeError("Codex subscription provider is closed")
         if self._client is None:
             try:

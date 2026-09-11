@@ -6,25 +6,21 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from ..llm.provider_definitions import (
+    BUILTIN_PROVIDER_IDS as _DEFINED_BUILTIN_PROVIDER_IDS,
+    PROVIDER_PRESENTATION,
+    SUBSCRIPTION_PROVIDER_IDS as _DEFINED_SUBSCRIPTION_PROVIDER_IDS,
+)
+
 MAX_COMPOSER_CHARACTERS = 16_384
 MIN_USABLE_COLUMNS = 32
 MIN_READY_ROWS = 8
 MIN_APPROVAL_ROWS = 15
 MAX_QUEUED_EVENTS = 4_096
 
-PROVIDERS = (
-    ("openai", "OpenAI API"),
-    ("anthropic", "Anthropic API"),
-    ("gemini", "Gemini API"),
-    ("grok", "xAI (Grok) API"),
-    ("ollama", "Ollama local"),
-    ("codex", "Codex subscription"),
-    ("claude-code", "Claude Code subscription"),
-    ("grok-build", "Grok Build subscription"),
-    ("custom", "Custom API (OpenAI-compatible)"),
-)
-BUILTIN_PROVIDER_IDS = frozenset(provider for provider, _ in PROVIDERS[:-1])
-SUBSCRIPTION_PROVIDER_IDS = frozenset({"codex", "claude-code", "grok-build"})
+PROVIDERS = (*PROVIDER_PRESENTATION, ("custom", "Custom API (OpenAI-compatible)"))
+BUILTIN_PROVIDER_IDS = _DEFINED_BUILTIN_PROVIDER_IDS
+SUBSCRIPTION_PROVIDER_IDS = _DEFINED_SUBSCRIPTION_PROVIDER_IDS
 SOURCE_TYPES = (
     ("sqlite", "SQLite file"),
     ("postgresql", "PostgreSQL"),

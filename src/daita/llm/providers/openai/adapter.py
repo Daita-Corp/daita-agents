@@ -12,45 +12,37 @@ from hashlib import sha256
 from typing import Protocol, cast
 from uuid import uuid4
 
-from ..._installation import repair_guidance
-from ..._json import FrozenJsonObject, canonical_json, thaw_json
-from .._lifecycle import (
+from ...._installation import repair_guidance
+from ...._json import FrozenJsonObject
+from ..._lifecycle import (
     AttemptLifecycle,
+    CloseCoordinator,
     NativeOwner,
-    await_cleanup,
     closing_stream,
+    execute_generate_attempt,
+    execute_stream_attempt,
     native_events,
-    shutdown_deadline,
     transport_timeout,
 )
-from ..errors import (
+from ...errors import (
     ModelProviderError,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
     before_generation,
-    detached_provider_error,
-    interrupted_model_usage,
     retry_after_from_headers,
     token_count_error,
     with_cancelled_model_usage,
 )
-from ..models import (
-    CanonicalMessage,
+from ...models import (
     FinishReason,
-    MessageRole,
     ModelRequest,
     ModelResponse,
-    ModelStreamCompleted,
     ModelStreamEvent,
-    ModelTextDelta,
-    ModelToolCallDelta,
     ModelUsage,
-    TextBlock,
     ToolCall,
-    ToolResultBlock,
 )
-from ..pricing import (
+from ...pricing import (
     BillableQuantity,
     CostEstimate,
     PricingSchedule,
@@ -61,6 +53,16 @@ from ..pricing import (
     validate_pricing_schedules,
     with_request_admission,
 )
+from ...provider_definitions import supports_builtin_request_policy
+from .._fields import (
+    MISSING as _MISSING,
+    field as _field,
+    nonnegative_int as _nonnegative_int,
+    optional_text as _optional_text,
+    required_text as _required_text,
+    safe_structural_token as _safe_structural_token,
+)
+from .messages import _response_input
 
 
 class _ResponsesResource(Protocol):
@@ -150,8 +152,8 @@ class OpenAIResponsesProvider:
         self._max_output_tokens = max_output_tokens
         self._client = client
         self._owns_client = client is None
-        self._close_task: asyncio.Task[None] | None = None
         self._native_owner = NativeOwner()
+        self._close = CloseCoordinator(self._native_owner)
         self._id_factory = _new_id if id_factory is None else id_factory
         self._service_tier = service_tier
         self._region = region
@@ -169,7 +171,9 @@ class OpenAIResponsesProvider:
     def supports_request_policy(self, request: ModelRequest) -> bool:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
-        return True
+        return supports_builtin_request_policy(
+            self.provider_id.partition(":")[0], request
+        )
 
     def has_complete_pricing(self, request: ModelRequest) -> bool:
         if not isinstance(request, ModelRequest):
@@ -195,7 +199,7 @@ class OpenAIResponsesProvider:
 
     @property
     def client(self) -> _OpenAIClient:
-        if self._close_task is not None:
+        if self._close.started:
             raise RuntimeError("OpenAI provider is closed")
         if self._client is None:
             try:
@@ -218,13 +222,7 @@ class OpenAIResponsesProvider:
     async def close(self, *, deadline: float | None = None) -> None:
         """Join the once-only cleanup of this provider's owned SDK client."""
 
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._finish_close())
-        await await_cleanup(
-            self._close_task,
-            deadline=shutdown_deadline(deadline),
-            owner=self._native_owner,
-        )
+        await self._close.close(self._finish_close, deadline=deadline)
 
     async def _finish_close(self) -> None:
         client = self._client
@@ -233,50 +231,14 @@ class OpenAIResponsesProvider:
         self._client = None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
-        if not isinstance(request, ModelRequest):
-            raise TypeError("request must be a canonical ModelRequest")
-        attempt = AttemptLifecycle(self._native_owner, request, headers_supported=True)
-        request = attempt.request
-        failure: ModelProviderError | None = None
-        try:
-            request.remaining_after(
-                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
-            )
-            async with attempt:
-                response = await self._generate(request, attempt)
-                attempt.response(response)
-                attempt.check_execution()
-            attempt.finish(None)
-            return attempt.observation.response(response)
-        except TimeoutError as error:
-            failure = ModelProviderError(
-                ProviderErrorCode.TIMEOUT,
-                "The model request deadline expired.",
-                usage=interrupted_model_usage(error),
-            )
-        except (asyncio.CancelledError, GeneratorExit) as error:
-            attempt.finish(error)
-            raise
-        except ImportError as error:
-            attempt.finish(error)
-            raise
-        except ModelProviderError as error:
-            failure = error
-        except Exception:
-            failure = ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "OpenAI provider boundary failed",
-                diagnostic=ProviderFailureDiagnostic(
-                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
-                    code="unexpected_provider_boundary_failure",
-                ),
-            )
-        if failure is None:
-            raise AssertionError("OpenAI provider failed without an error")
-        if attempt.terminal_response is not None:
-            failure.usage = attempt.usage()
-        attempt.finish(failure)
-        raise detached_provider_error(failure, provider_id=self.provider_id)
+        return await execute_generate_attempt(
+            self._native_owner,
+            request,
+            provider_id=self.provider_id,
+            boundary_name="OpenAI",
+            operation=self._generate,
+            headers_supported=True,
+        )
 
     async def _generate(
         self, request: ModelRequest, attempt: AttemptLifecycle
@@ -328,69 +290,16 @@ class OpenAIResponsesProvider:
                 ),
             ) from error
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         """Translate ordered Responses API events into canonical stream events."""
-
-        if not isinstance(request, ModelRequest):
-            raise TypeError("request must be a canonical ModelRequest")
-        attempt = AttemptLifecycle(
-            self._native_owner, request, headers_supported=True, observable=True
+        return execute_stream_attempt(
+            self._native_owner,
+            request,
+            provider_id=self.provider_id,
+            boundary_name="OpenAI",
+            operation=self._stream,
+            headers_supported=True,
         )
-        terminal_usage: ModelUsage | None = None
-        request = attempt.request
-        failure: ModelProviderError | None = None
-        try:
-            request.remaining_after(
-                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
-            )
-            async with attempt:
-                async with closing_stream(self._stream(request, attempt)) as events:
-                    async for event in events:
-                        if isinstance(event, ModelStreamCompleted):
-                            terminal_usage = event.response.usage
-                            terminal = attempt.response(event.response)
-                            break
-                        attempt.canonical(event)
-                        yield event
-                attempt.check_execution()
-                if terminal_usage is not None:
-                    attempt.finish(None)
-                    yield ModelStreamCompleted(attempt.observation.response(terminal))
-            attempt.finish(None)
-            return
-        except TimeoutError as error:
-            failure = ModelProviderError(
-                ProviderErrorCode.TIMEOUT,
-                "The model request deadline expired.",
-                usage=interrupted_model_usage(error),
-            )
-        except (asyncio.CancelledError, GeneratorExit) as error:
-            if isinstance(error, asyncio.CancelledError) and terminal_usage is not None:
-                with_cancelled_model_usage(error, terminal_usage)
-            attempt.finish(error)
-            raise
-        except ImportError as error:
-            attempt.finish(error)
-            raise
-        except ModelProviderError as error:
-            failure = error
-        except Exception:
-            failure = ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "OpenAI provider boundary failed",
-                diagnostic=ProviderFailureDiagnostic(
-                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
-                    code="unexpected_provider_boundary_failure",
-                ),
-            )
-        if failure is None:
-            raise AssertionError("OpenAI provider failed without an error")
-        if terminal_usage is not None:
-            failure.usage = terminal_usage
-        if attempt.terminal_response is not None:
-            failure.usage = attempt.usage()
-        attempt.finish(failure)
-        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _stream(
         self,
@@ -429,243 +338,21 @@ class OpenAIResponsesProvider:
             attempt.transport_failure(error, phase="generation")
             raise _normalize_error(error) from error
 
-        canonical_ids_by_index: dict[int, str] = {}
-        canonical_ids_by_provider_call_id: dict[str, str] = {}
-        provider_call_ids_by_index: dict[int, str] = {}
-        names_by_index: dict[int, str] = {}
-        completed_items_by_index: dict[int, object] = {}
-        allocated_ids: set[str] = set()
-        completed = False
-        current_event_type: str | None = None
-        terminal_diagnostic: ProviderFailureDiagnostic | None = None
-        sequence_number: int | None = None
-        response_identity: str | None = None
-        async with attempt.stream(source) as stream:
-            try:
-                async for event in cast(AsyncIterator[object], stream):
-                    attempt.native(
-                        _safe_field(event, "type"),
-                        _safe_field(_safe_field(event, "response"), "id"),
-                    )
-                    current_event_type = None
-                    event_type = _required_text(
-                        _field(event, "type"), "stream event type"
-                    )
-                    current_event_type = _safe_structural_token(event_type)
-                    sequence = _field(event, "sequence_number", None)
-                    if sequence is not None:
-                        sequence = _nonnegative_int(sequence, "stream sequence number")
-                        if sequence_number is not None and sequence <= sequence_number:
-                            raise ValueError("stream sequence did not advance")
-                        sequence_number = sequence
-                    native_response = _field(event, "response", None)
-                    native_identity = _optional_stream_identity(
-                        _field(native_response, "id", None), "stream response id"
-                    )
-                    if native_identity is not None:
-                        if (
-                            response_identity is not None
-                            and native_identity != response_identity
-                        ):
-                            raise ValueError("stream response identity changed")
-                        response_identity = native_identity
-                    if event_type == "response.output_text.delta":
-                        delta = _stream_fragment(_field(event, "delta"), "text delta")
-                        if delta:
-                            attempt.progress(delta)
-                            yield ModelTextDelta(delta)
-                    elif event_type == "response.output_item.added":
-                        item = _field(event, "item")
-                        if _field(item, "type", None) != "function_call":
-                            continue
-                        index = _nonnegative_int(
-                            _field(event, "output_index"), "output index"
-                        )
-                        provider_call_id = _optional_stream_identity(
-                            _field(item, "call_id", None), "provider call_id"
-                        )
-                        name = _optional_stream_identity(
-                            _field(item, "name", None), "function name"
-                        )
-                        canonical_id = canonical_ids_by_index.get(index)
-                        if canonical_id is None:
-                            canonical_id = self._id_factory("call")
-                            if canonical_id in allocated_ids:
-                                raise ValueError(
-                                    "id_factory returned a duplicate call ID"
-                                )
-                            allocated_ids.add(canonical_id)
-                            canonical_ids_by_index[index] = canonical_id
-                        if provider_call_id is not None:
-                            canonical_ids_by_provider_call_id[provider_call_id] = (
-                                canonical_id
-                            )
-                            provider_call_ids_by_index[index] = provider_call_id
-                        if name is not None:
-                            names_by_index[index] = name
-                        yield ModelToolCallDelta(
-                            index=index,
-                            arguments_delta="",
-                            id=canonical_id,
-                            name=name,
-                            provider_call_id=provider_call_id,
-                        )
-                    elif event_type == "response.function_call_arguments.delta":
-                        index = _nonnegative_int(
-                            _field(event, "output_index"), "output index"
-                        )
-                        arguments_delta = _stream_fragment(
-                            _field(event, "delta"), "function arguments delta"
-                        )
-                        if not arguments_delta:
-                            continue
-                        canonical_id = canonical_ids_by_index.get(index)
-                        if canonical_id is None:
-                            canonical_id = self._id_factory("call")
-                            if canonical_id in allocated_ids:
-                                raise ValueError(
-                                    "id_factory returned a duplicate call ID"
-                                )
-                            allocated_ids.add(canonical_id)
-                            canonical_ids_by_index[index] = canonical_id
-                        attempt.progress(arguments_delta)
-                        yield ModelToolCallDelta(
-                            index=index,
-                            arguments_delta=arguments_delta,
-                            id=canonical_id,
-                            name=names_by_index.get(index),
-                            provider_call_id=provider_call_ids_by_index.get(index),
-                        )
-                    elif event_type == "response.output_item.done":
-                        index = _nonnegative_int(
-                            _field(event, "output_index"), "output index"
-                        )
-                        completed_items_by_index[index] = _field(event, "item")
-                    elif event_type in {
-                        "response.completed",
-                        "response.incomplete",
-                        "response.failed",
-                    }:
-                        native_response = _field(event, "response")
-                        terminal_diagnostic = _openai_failure_diagnostic(
-                            native_response,
-                            phase=ProviderFailurePhase.STREAM_TERMINAL,
-                            code="terminal_response_decode_failed",
-                            event_type=event_type,
-                        )
-                        native_output = _field(native_response, "output", ())
-                        if (
-                            isinstance(native_output, Sequence)
-                            and not isinstance(native_output, (str, bytes))
-                            and completed_items_by_index
-                        ):
-                            output_count = max(
-                                len(native_output),
-                                max(completed_items_by_index) + 1,
-                            )
-                            completed_output: list[object] = []
-                            for output_index in range(output_count):
-                                completed_item = completed_items_by_index.get(
-                                    output_index
-                                )
-                                if completed_item is not None:
-                                    completed_output.append(completed_item)
-                                elif output_index < len(native_output):
-                                    completed_output.append(native_output[output_index])
-                                else:
-                                    terminal_diagnostic = _openai_failure_diagnostic(
-                                        native_response,
-                                        phase=ProviderFailurePhase.STREAM_TERMINAL,
-                                        code="terminal_output_reconstruction_invalid",
-                                        event_type=event_type,
-                                    )
-                                    raise ValueError(
-                                        "completed stream output contains an index gap"
-                                    )
-                            native_response = _ResponseOutputOverride(
-                                native_response,
-                                tuple(completed_output),
-                            )
-                        try:
-                            response = self._decode_response(
-                                native_response,
-                                requested_at=requested_at,
-                                canonical_ids_by_index=canonical_ids_by_index,
-                                canonical_ids_by_provider_call_id=(
-                                    canonical_ids_by_provider_call_id
-                                ),
-                            )
-                        except _OpenAIResponseDecodeFailure as error:
-                            terminal_diagnostic = _openai_failure_diagnostic(
-                                native_response,
-                                phase=ProviderFailurePhase.STREAM_TERMINAL,
-                                code=error.diagnostic_code,
-                                event_type=event_type,
-                            )
-                            raise
-                        yield ModelStreamCompleted(
-                            with_request_admission(
-                                response,
-                                request,
-                                input_tokens=counted_input_tokens,
-                                output_cap=cast(
-                                    int | None, arguments.get("max_output_tokens")
-                                ),
-                            )
-                        )
-                        completed = True
-                        return
-                    elif event_type in {
-                        "response.reasoning_summary_text.delta",
-                        "response.reasoning_text.delta",
-                    }:
-                        attempt.progress(
-                            _stream_fragment(_field(event, "delta"), "reasoning delta")
-                        )
-                    elif event_type == "error":
-                        code = _optional_text(
-                            _field(event, "code", None), "stream error code"
-                        )
-                        raise ModelProviderError(
-                            _code_from_provider_value(code),
-                            "OpenAI stream failed",
-                        )
-            except asyncio.CancelledError:
-                raise
-            except ImportError:
-                raise
-            except ModelProviderError:
-                raise
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise ModelProviderError(
-                    ProviderErrorCode.MALFORMED_RESPONSE,
-                    "OpenAI returned a malformed stream",
-                    provider_id=self.provider_id,
-                    diagnostic=(
-                        terminal_diagnostic
-                        or ProviderFailureDiagnostic(
-                            phase=ProviderFailurePhase.STREAM_EVENT,
-                            code="event_decode_failed",
-                            event_type=current_event_type,
-                        )
-                    ),
-                ) from error
-            except Exception as error:
-                self._observe_headers(
-                    attempt, "generation", _safe_field(error, "response"), arrived=False
-                )
-                attempt.transport_failure(error, phase="generation")
-                raise _normalize_error(error) from error
-        if not completed:
-            raise ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "OpenAI stream ended without a terminal response",
-                provider_id=self.provider_id,
-                diagnostic=ProviderFailureDiagnostic(
-                    phase=ProviderFailurePhase.STREAM_TERMINAL,
-                    code="terminal_completion_missing",
-                ),
+        from .stream import decode_openai_stream
+
+        async with closing_stream(
+            decode_openai_stream(
+                self,
+                source,
+                request,
+                attempt,
+                arguments=arguments,
+                requested_at=requested_at,
+                counted_input_tokens=counted_input_tokens,
             )
+        ) as events:
+            async for event in events:
+                yield event
 
     @staticmethod
     def _observe_headers(
@@ -1031,73 +718,6 @@ class OpenAIResponsesProvider:
 OpenAIProvider = OpenAIResponsesProvider
 
 
-def _response_input(
-    messages: tuple[CanonicalMessage, ...],
-    provider_id: str,
-) -> list[dict[str, object]]:
-    items: list[dict[str, object]] = []
-    provider_call_ids: dict[str, str] = {}
-    for message in messages:
-        same_origin = message.provider_id == provider_id
-        if same_origin:
-            metadata = FrozenJsonObject.from_mapping(message.provider_metadata)
-            replay_value = metadata.get("openai_replay_items")
-            if replay_value is not None:
-                replay_items = thaw_json(replay_value)
-                if not isinstance(replay_items, list):
-                    raise ModelProviderError(
-                        ProviderErrorCode.INVALID_REQUEST,
-                        "OpenAI replay metadata must contain JSON objects",
-                    )
-                decoded_replay_items: list[dict[str, object]] = []
-                for replay_item in replay_items:
-                    if not isinstance(replay_item, dict):
-                        raise ModelProviderError(
-                            ProviderErrorCode.INVALID_REQUEST,
-                            "OpenAI replay metadata must contain JSON objects",
-                        )
-                    decoded_replay_items.append(replay_item)
-                items.extend(decoded_replay_items)
-        text = "\n".join(
-            block.text for block in message.content if isinstance(block, TextBlock)
-        ).strip()
-        if text:
-            items.append({"role": message.role.value, "content": text})
-        if message.role is MessageRole.ASSISTANT:
-            for call in message.tool_calls:
-                provider_call_id = (
-                    call.provider_call_id if same_origin else None
-                ) or call.id
-                provider_call_ids[call.id] = provider_call_id
-                items.append(
-                    {
-                        "type": "function_call",
-                        "call_id": provider_call_id,
-                        "name": call.name,
-                        "arguments": canonical_json(call.arguments),
-                    }
-                )
-        if message.role is MessageRole.TOOL:
-            for block in message.content:
-                if not isinstance(block, ToolResultBlock):
-                    continue
-                items.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": provider_call_ids.get(block.call_id, block.call_id),
-                        "output": canonical_json(
-                            {"is_error": block.is_error, "output": block.output}
-                        ),
-                    }
-                )
-    if not items:
-        raise ModelProviderError(
-            ProviderErrorCode.INVALID_REQUEST,
-            "canonical request produced no OpenAI input items",
-        )
-    return items
-
-
 def _plain_provider_item(item: object) -> dict[str, object]:
     if isinstance(item, FrozenJsonObject):
         return item.to_dict()
@@ -1320,51 +940,6 @@ def _safe_field(value: object, name: str) -> object | None:
         return None
 
 
-def _safe_structural_token(value: object) -> str | None:
-    if not isinstance(value, str) or not 1 <= len(value) <= 96:
-        return None
-    if (
-        not value[0].isascii()
-        or not value[0].isalnum()
-        or any(
-            not character.isascii() or not (character.isalnum() or character in "._:-")
-            for character in value
-        )
-    ):
-        return None
-    return value
-
-
-_MISSING = object()
-
-
-def _field(value: object, name: str, default: object = _MISSING) -> object:
-    if value is None:
-        if default is not _MISSING:
-            return default
-        raise KeyError(name)
-    if isinstance(value, Mapping):
-        if name in value:
-            return value[name]
-    elif hasattr(value, name):
-        return getattr(value, name)
-    if default is not _MISSING:
-        return default
-    raise KeyError(name)
-
-
-def _required_text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label} must be a non-empty string")
-    return value
-
-
-def _optional_text(value: object, label: str) -> str | None:
-    if value is None:
-        return None
-    return _required_text(value, label)
-
-
 def _stream_fragment(value: object, label: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{label} must be text")
@@ -1374,12 +949,6 @@ def _stream_fragment(value: object, label: str) -> str:
 def _optional_stream_identity(value: object, label: str) -> str | None:
     fragment = _stream_fragment(value, label) if value is not None else ""
     return fragment if fragment.strip() else None
-
-
-def _nonnegative_int(value: object, label: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
-    return value
 
 
 __all__ = ["OpenAIProvider", "OpenAIResponsesProvider"]

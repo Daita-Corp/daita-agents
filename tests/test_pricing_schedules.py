@@ -34,12 +34,12 @@ from daita.llm.pricing import (
     validate_pricing_schedules,
 )
 from daita.llm.providers.anthropic import AnthropicProvider
-from daita.llm.providers.gemini import (
+from daita.llm.providers.gemini.adapter import (
     GeminiProvider,
     _decode_usage as decode_gemini_usage,
 )
 from daita.llm.providers.grok import GrokProvider
-from daita.llm.providers.openai import (
+from daita.llm.providers.openai.adapter import (
     OpenAIProvider,
     _billable_quantities as openai_billable_quantities,
     _decode_usage as decode_openai_usage,

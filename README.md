@@ -164,6 +164,7 @@ For the full implementation boundaries, see the
 | Managed installer release status | [Managed installer](docs/MANAGED_INSTALLER_RELEASE.md) |
 | Public Python API walkthroughs | [Offline examples](examples/README.md) |
 | Development and architecture contracts | [Repository guide](AGENTS.md) |
+| Model provider implementation | [Provider implementation guide](docs/MODEL_PROVIDERS.md) |
 | Contribution workflow | [Contributing](CONTRIBUTING.md) |
 | Private vulnerability reporting | [Security policy](SECURITY.md) |
 

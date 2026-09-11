@@ -11,6 +11,7 @@ from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import Button, Footer, Input, Label, Select, Static
 
+from ...llm.provider_definitions import AuthenticationMode, provider_definition
 from ..commands import parse_postgresql_connection_url
 from ..models import (
     BUILTIN_PROVIDER_IDS,
@@ -19,7 +20,6 @@ from ..models import (
     PROVIDERS,
     SOURCE_TYPES,
     SSL_MODES,
-    SUBSCRIPTION_PROVIDER_IDS,
     PickerOption,
 )
 from ..sanitization import sanitize_terminal_text
@@ -162,7 +162,11 @@ class ModelSetupScreen(Screen[bool]):
             base_url = self.query_one("#model-base-url", Input).value.strip() or None
             if selected_provider == "custom" and base_url is None:
                 raise ValueError("A custom provider requires a base URL.")
-            if provider == "codex":
+            definition = provider_definition(provider)
+            if (
+                definition is not None
+                and definition.authentication is AuthenticationMode.CODEX_SUBSCRIPTION
+            ):
                 api_key = None
                 self._subscription_prompt = None
                 subscription_credential = await self.app.controller.authenticate_model_subscription(  # type: ignore[attr-defined]
@@ -170,7 +174,10 @@ class ModelSetupScreen(Screen[bool]):
                     on_verification=self._show_subscription_verification,
                     on_progress=self._show_subscription_progress,
                 )
-            elif provider in SUBSCRIPTION_PROVIDER_IDS or provider == "ollama":
+            elif definition is not None and definition.authentication in {
+                AuthenticationMode.OFFICIAL_CLIENT,
+                AuthenticationMode.LOCAL,
+            }:
                 api_key = None
             else:
                 if api_key is None:

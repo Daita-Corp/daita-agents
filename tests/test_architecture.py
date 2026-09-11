@@ -1689,10 +1689,16 @@ def test_streaming_keeps_partial_state_disposable_and_provider_neutral():
 def test_native_stream_grammars_end_inside_provider_adapters():
     provider_root = PACKAGE / "llm" / "providers"
     owners = {
-        "response.output_text.delta": provider_root / "openai.py",
-        "content_block_delta": provider_root / "anthropic.py",
-        "generate_content_stream": provider_root / "gemini.py",
-        "stream_options": provider_root / "openai_compatible.py",
+        "response.output_text.delta": (provider_root / "openai" / "stream.py",),
+        "content_block_delta": (provider_root / "anthropic" / "stream.py",),
+        "generate_content_stream": (
+            provider_root / "gemini" / "adapter.py",
+            provider_root / "gemini" / "stream.py",
+        ),
+        "stream_options": (
+            provider_root / "openai_compatible" / "adapter.py",
+            provider_root / "openai_compatible" / "stream.py",
+        ),
     }
     generic_runtime = "\n".join(
         (
@@ -1703,14 +1709,109 @@ def test_native_stream_grammars_end_inside_provider_adapters():
         )
     )
 
-    for native_marker, owner in owners.items():
-        assert native_marker in owner.read_text(encoding="utf-8")
+    for native_marker, owner_paths in owners.items():
+        owner_text = "\n".join(
+            owner.read_text(encoding="utf-8") for owner in owner_paths
+        )
+        assert native_marker in owner_text
         assert native_marker not in generic_runtime
 
     for specialization in ("grok.py", "ollama.py"):
         text = (provider_root / specialization).read_text(encoding="utf-8")
         assert "OpenAICompatibleProvider" in text
         assert "async def stream(" not in text
+
+
+def test_substantial_provider_families_are_cohesive_packages():
+    provider_root = PACKAGE / "llm" / "providers"
+    expected = {
+        "openai": {"__init__.py", "adapter.py", "messages.py", "stream.py"},
+        "anthropic": {
+            "__init__.py",
+            "adapter.py",
+            "messages.py",
+            "stream.py",
+            "usage.py",
+        },
+        "gemini": {"__init__.py", "adapter.py", "messages.py", "stream.py"},
+        "openai_compatible": {
+            "__init__.py",
+            "adapter.py",
+            "messages.py",
+            "stream.py",
+        },
+        "subscription_cli": {
+            "__init__.py",
+            "claude.py",
+            "envelope.py",
+            "grok.py",
+            "process.py",
+        },
+    }
+    for family, filenames in expected.items():
+        path = provider_root / family
+        assert {item.name for item in path.iterdir() if item.is_file()} == filenames
+
+    superseded = {
+        "openai.py",
+        "anthropic.py",
+        "gemini.py",
+        "openai_compatible.py",
+        "subscription_cli.py",
+    }
+    assert not superseded & {
+        item.name for item in provider_root.iterdir() if item.is_file()
+    }
+
+
+def test_provider_definitions_are_the_only_generic_provider_catalog():
+    definitions = (PACKAGE / "llm" / "provider_definitions.py").read_text(
+        encoding="utf-8"
+    )
+    factory = (PACKAGE / "llm" / "factory.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    tui_models = (PACKAGE / "tui" / "models.py").read_text(encoding="utf-8")
+    onboarding = (PACKAGE / "tui" / "screens" / "onboarding.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert _class_owners("ProviderDefinition") == {"llm/provider_definitions.py"}
+    assert "PROVIDER_DEFINITIONS" in definitions
+    assert "provider_definition(" in factory
+    assert "provider_definition(" in embedded
+    assert "PROVIDER_PRESENTATION" in tui_models
+    assert "provider_definition(" in onboarding
+    for obsolete in (
+        "_BUILTIN_PROVIDERS",
+        "_SUBSCRIPTION_PROVIDERS",
+        "_SUBSCRIPTION_CREDENTIAL_PROVIDERS",
+        "_fixed_endpoint",
+        "_subscription_auth_only",
+    ):
+        assert obsolete not in factory + embedded + tui_models + onboarding
+    for provider in (
+        "openai",
+        "anthropic",
+        "gemini",
+        "grok",
+        "ollama",
+        "codex",
+        "claude-code",
+        "grok-build",
+    ):
+        assert f'provider_name == "{provider}"' not in factory
+
+
+def test_subscription_process_and_envelope_have_single_owners():
+    process_owner = "llm/providers/subscription_cli/process.py"
+    assert _class_owners("_Command") == {process_owner}
+    assert _class_owners("_CompletedCommand") == {process_owner}
+    assert _class_owners("_SubscriptionExecution") == {process_owner}
+    facade = (
+        PACKAGE / "llm" / "providers" / "subscription_cli" / "__init__.py"
+    ).read_text(encoding="utf-8")
+    assert "create_subprocess_exec" not in facade
+    assert "_decode_model_output" not in facade
 
 
 def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
@@ -2362,10 +2463,11 @@ def test_phase_three_xlsx_dependencies_are_scoped_and_integrations_remain_lazy()
 
 def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
     from dataclasses import fields
+
     from daita.capabilities import AutomationEligibility
     from daita.domains.data.capabilities import (
-        relational_update_preview_capability_declarations,
         relational_update_capability_declarations,
+        relational_update_preview_capability_declarations,
         relational_upsert_capability_declarations,
     )
 

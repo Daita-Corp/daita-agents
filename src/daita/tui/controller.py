@@ -51,6 +51,7 @@ from daita.learning_candidates import (
     learning_candidate_content_to_mapping,
 )
 from daita.llm import ModelSensitivity
+from daita.llm.provider_definitions import SUBSCRIPTION_CLIENTS
 from daita.observation import AgentObserver
 from daita.security import (
     CredentialSession,
@@ -109,11 +110,6 @@ SUBSCRIPTION_VALIDATION_ERRORS = {
     "output_limit": (
         "The model exhausted its validation output budget before proposing the tool."
     ),
-}
-SUBSCRIPTION_CLIENTS = {
-    "codex": ("ChatGPT", "sign in through Daita"),
-    "claude-code": ("Claude Code", "claude auth login"),
-    "grok-build": ("Grok Build", "grok login"),
 }
 MODEL_SETUP_ERRORS = {
     "secret_provider_unavailable": (

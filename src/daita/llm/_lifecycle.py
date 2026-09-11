@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from typing import Any, TypeVar
 
-from .models import ModelRequest
+from .models import ModelRequest, ModelResponse, ModelStreamEvent
 
 _T = TypeVar("_T")
 _NATIVE_EOF = object()
@@ -124,6 +124,53 @@ class NativeOwner:
 
         task.add_done_callback(drained)
         return task
+
+
+class CloseCoordinator:
+    """Own one retained provider close operation and its never-renewed outcome."""
+
+    def __init__(self, owner: NativeOwner) -> None:
+        self._owner = owner
+        self._task: asyncio.Future[None] | None = None
+
+    @property
+    def started(self) -> bool:
+        return self._task is not None
+
+    async def close(
+        self,
+        operation: Callable[[], Awaitable[None]],
+        *,
+        deadline: float | None = None,
+    ) -> None:
+        if self._task is None:
+            self._task = asyncio.ensure_future(operation())
+        await await_cleanup(
+            self._task,
+            deadline=shutdown_deadline(deadline),
+            owner=self._owner,
+        )
+
+    async def drain(self, *, deadline: float | None = None) -> None:
+        """Close admission after the native work already owned by this provider."""
+        limit = shutdown_deadline(deadline)
+        if self._task is None:
+            active = tuple(self._owner.tasks)
+
+            async def finish() -> None:
+                results = await asyncio.gather(
+                    *(
+                        await_cleanup(task, deadline=limit, owner=self._owner)
+                        for task in active
+                    ),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+
+            self._task = asyncio.create_task(finish())
+        await await_cleanup(self._task, deadline=limit, owner=self._owner)
 
 
 async def join_until(task: asyncio.Future[_T], deadline: float) -> _T:
@@ -735,6 +782,159 @@ class AttemptLifecycle:
                         ProviderErrorCode.CLEANUP_FAILED, usage=self.usage()
                     ) from None
                 self.check_execution()
+
+
+async def execute_generate_attempt(
+    owner: NativeOwner,
+    request: ModelRequest,
+    *,
+    provider_id: str,
+    boundary_name: str,
+    operation: Callable[[ModelRequest, AttemptLifecycle], Awaitable[ModelResponse]],
+    headers_supported: bool,
+) -> ModelResponse:
+    """Run the common canonical boundary around one native generate attempt."""
+    from decimal import Decimal
+
+    from .errors import (
+        ModelProviderError,
+        ProviderErrorCode,
+        ProviderFailureDiagnostic,
+        ProviderFailurePhase,
+        detached_provider_error,
+        interrupted_model_usage,
+    )
+    from .models import ModelUsage
+    from .pricing import CostEstimate
+
+    if not isinstance(request, ModelRequest):
+        raise TypeError("request must be a canonical ModelRequest")
+    attempt = AttemptLifecycle(owner, request, headers_supported=headers_supported)
+    request = attempt.request
+    failure: ModelProviderError | None = None
+    try:
+        request.remaining_after(
+            ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+        )
+        async with attempt:
+            response = await operation(request, attempt)
+            attempt.response(response)
+            attempt.check_execution()
+        attempt.finish(None)
+        return attempt.observation.response(response)
+    except TimeoutError as error:
+        failure = ModelProviderError(
+            ProviderErrorCode.TIMEOUT,
+            "The model request deadline expired.",
+            usage=interrupted_model_usage(error),
+        )
+    except (asyncio.CancelledError, GeneratorExit) as error:
+        attempt.finish(error)
+        raise
+    except ImportError as error:
+        attempt.finish(error)
+        raise
+    except ModelProviderError as error:
+        failure = error
+    except Exception:
+        failure = ModelProviderError(
+            ProviderErrorCode.MALFORMED_RESPONSE,
+            f"{boundary_name} provider boundary failed",
+            diagnostic=ProviderFailureDiagnostic(
+                phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                code="unexpected_provider_boundary_failure",
+            ),
+        )
+    if attempt.terminal_response is not None:
+        failure.usage = attempt.usage()
+    attempt.finish(failure)
+    raise detached_provider_error(failure, provider_id=provider_id)
+
+
+async def execute_stream_attempt(
+    owner: NativeOwner,
+    request: ModelRequest,
+    *,
+    provider_id: str,
+    boundary_name: str,
+    operation: Callable[
+        [ModelRequest, AttemptLifecycle], AsyncIterator[ModelStreamEvent]
+    ],
+    headers_supported: bool,
+) -> AsyncIterator[ModelStreamEvent]:
+    """Run the common canonical boundary around one native streaming attempt."""
+    from decimal import Decimal
+
+    from .errors import (
+        ModelProviderError,
+        ProviderErrorCode,
+        ProviderFailureDiagnostic,
+        ProviderFailurePhase,
+        detached_provider_error,
+        interrupted_model_usage,
+        with_cancelled_model_usage,
+    )
+    from .models import ModelStreamCompleted, ModelUsage
+    from .pricing import CostEstimate
+
+    if not isinstance(request, ModelRequest):
+        raise TypeError("request must be a canonical ModelRequest")
+    attempt = AttemptLifecycle(
+        owner, request, headers_supported=headers_supported, observable=True
+    )
+    terminal_usage = None
+    request = attempt.request
+    failure: ModelProviderError | None = None
+    try:
+        request.remaining_after(
+            ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+        )
+        async with attempt:
+            async with closing_stream(operation(request, attempt)) as events:
+                async for event in events:
+                    if isinstance(event, ModelStreamCompleted):
+                        terminal_usage = event.response.usage
+                        terminal = attempt.response(event.response)
+                        break
+                    attempt.canonical(event)
+                    yield event
+            attempt.check_execution()
+            if terminal_usage is not None:
+                attempt.finish(None)
+                yield ModelStreamCompleted(attempt.observation.response(terminal))
+        attempt.finish(None)
+        return
+    except TimeoutError as error:
+        failure = ModelProviderError(
+            ProviderErrorCode.TIMEOUT,
+            "The model request deadline expired.",
+            usage=interrupted_model_usage(error),
+        )
+    except (asyncio.CancelledError, GeneratorExit) as error:
+        if isinstance(error, asyncio.CancelledError) and terminal_usage is not None:
+            with_cancelled_model_usage(error, terminal_usage)
+        attempt.finish(error)
+        raise
+    except ImportError as error:
+        attempt.finish(error)
+        raise
+    except ModelProviderError as error:
+        failure = error
+    except Exception:
+        failure = ModelProviderError(
+            ProviderErrorCode.MALFORMED_RESPONSE,
+            f"{boundary_name} provider boundary failed",
+            diagnostic=ProviderFailureDiagnostic(
+                phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                code="unexpected_provider_boundary_failure",
+            ),
+        )
+    if terminal_usage is not None:
+        failure.usage = terminal_usage
+    if attempt.terminal_response is not None:
+        failure.usage = attempt.usage()
+    attempt.finish(failure)
+    raise detached_provider_error(failure, provider_id=provider_id)
 
 
 async def native_events(create, *, manager: bool = False, observe=None):

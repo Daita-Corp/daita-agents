@@ -12,8 +12,8 @@ import openai
 import pytest
 from _workspace_support import workspace_for
 
+import daita.llm.providers.subscription_cli.process as subscription_process
 import daita.llm.providers.codex as codex_provider
-import daita.llm.providers.subscription_cli as claude_cli
 import daita.llm.subscription_auth as subscription_auth
 from daita import Agent
 from daita.llm.errors import (
@@ -402,7 +402,7 @@ async def test_claude_subscription_remains_an_official_client_transport(monkeypa
 
     async def run(command):
         commands.append(command)
-        return claude_cli._CompletedCommand(
+        return subscription_process._CompletedCommand(
             0,
             json.dumps(
                 {
@@ -485,7 +485,7 @@ async def test_claude_subscription_total_attempt_timeout_is_normalized():
 async def test_claude_subscription_malformed_output_retains_bounded_diagnostic():
     async def run(command):
         del command
-        return claude_cli._CompletedCommand(0, b"not-json", b"")
+        return subscription_process._CompletedCommand(0, b"not-json", b"")
 
     provider = ClaudeCodeSubscriptionProvider("claude-test", runner=run)
 

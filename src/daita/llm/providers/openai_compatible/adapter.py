@@ -14,46 +14,36 @@ from typing import Protocol, cast
 from urllib.parse import urlsplit
 from uuid import uuid4
 
-from ..._installation import repair_guidance
-from ..._json import FrozenJsonObject, canonical_json
-from .._lifecycle import (
+from ...._installation import repair_guidance
+from ...._json import FrozenJsonObject
+from ..._lifecycle import (
     AttemptLifecycle,
+    CloseCoordinator,
     NativeOwner,
-    await_cleanup,
     closing_stream,
+    execute_generate_attempt,
+    execute_stream_attempt,
     native_events,
-    shutdown_deadline,
     transport_timeout,
 )
-from ..errors import (
+from ...errors import (
     ModelProviderError,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
-    detached_provider_error,
-    interrupted_model_usage,
     retry_after_from_headers,
-    with_cancelled_model_usage,
 )
-from ..models import (
-    CanonicalMessage,
+from ...models import (
     FinishReason,
-    MessageRole,
     ModelRequest,
     ModelResponse,
-    ModelStreamCompleted,
     ModelStreamEvent,
-    ModelTextDelta,
-    ModelToolCallDelta,
     ModelUsage,
-    TextBlock,
     ToolCall,
-    ToolResultBlock,
 )
-from ..pricing import (
+from ...pricing import (
     BillableQuantity,
     CostBasis,
-    CostEstimate,
     PricingQualifier,
     PricingSchedule,
     bound_request_output,
@@ -61,9 +51,15 @@ from ..pricing import (
     has_complete_pricing_coverage,
     validate_pricing_schedules,
 )
+from .._fields import (
+    field as _field,
+    optional_text as _optional_text,
+    required_text as _required_text,
+    usage_int as _usage_int,
+)
+from .messages import _CONTINUATION_KEY, _chat_messages
 
 _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
-_CONTINUATION_KEY = "openai_compatible_continuation"
 
 
 class _CompletionsResource(Protocol):
@@ -158,8 +154,8 @@ class OpenAICompatibleProvider:
         self._max_tokens = max_tokens
         self._client = client
         self._owns_client = client is None
-        self._close_task: asyncio.Task[None] | None = None
         self._native_owner = NativeOwner()
+        self._close = CloseCoordinator(self._native_owner)
         self._id_factory = _new_id if id_factory is None else id_factory
         self._pricing_schedules = admitted_schedules
         self._pricing_qualifiers = admitted_qualifiers
@@ -195,7 +191,7 @@ class OpenAICompatibleProvider:
 
     @property
     def client(self) -> _OpenAICompatibleClient:
-        if self._close_task is not None:
+        if self._close.started:
             raise RuntimeError(f"{self.provider} provider is closed")
         if self._client is None:
             try:
@@ -221,13 +217,7 @@ class OpenAICompatibleProvider:
     async def close(self, *, deadline: float | None = None) -> None:
         """Join the once-only cleanup of this provider's owned SDK client."""
 
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(self._finish_close())
-        await await_cleanup(
-            self._close_task,
-            deadline=shutdown_deadline(deadline),
-            owner=self._native_owner,
-        )
+        await self._close.close(self._finish_close, deadline=deadline)
 
     async def _finish_close(self) -> None:
         client = self._client
@@ -236,50 +226,14 @@ class OpenAICompatibleProvider:
         self._client = None
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
-        if not isinstance(request, ModelRequest):
-            raise TypeError("request must be a canonical ModelRequest")
-        attempt = AttemptLifecycle(self._native_owner, request, headers_supported=False)
-        request = attempt.request
-        failure: ModelProviderError | None = None
-        try:
-            request.remaining_after(
-                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
-            )
-            async with attempt:
-                response = await self._generate(request, attempt)
-                attempt.response(response)
-                attempt.check_execution()
-            attempt.finish(None)
-            return attempt.observation.response(response)
-        except TimeoutError as error:
-            failure = ModelProviderError(
-                ProviderErrorCode.TIMEOUT,
-                "The model request deadline expired.",
-                usage=interrupted_model_usage(error),
-            )
-        except (asyncio.CancelledError, GeneratorExit) as error:
-            attempt.finish(error)
-            raise
-        except ImportError as error:
-            attempt.finish(error)
-            raise
-        except ModelProviderError as error:
-            failure = error
-        except Exception:
-            failure = ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "Compatible provider boundary failed",
-                diagnostic=ProviderFailureDiagnostic(
-                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
-                    code="unexpected_provider_boundary_failure",
-                ),
-            )
-        if failure is None:
-            raise AssertionError("Compatible provider failed without an error")
-        if attempt.terminal_response is not None:
-            failure.usage = attempt.usage()
-        attempt.finish(failure)
-        raise detached_provider_error(failure, provider_id=self.provider_id)
+        return await execute_generate_attempt(
+            self._native_owner,
+            request,
+            provider_id=self.provider_id,
+            boundary_name="Compatible",
+            operation=self._generate,
+            headers_supported=False,
+        )
 
     async def _generate(
         self, request: ModelRequest, attempt: AttemptLifecycle
@@ -318,69 +272,16 @@ class OpenAICompatibleProvider:
                 ),
             ) from error
 
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         """Translate ordered Responses API events into canonical stream events."""
-
-        if not isinstance(request, ModelRequest):
-            raise TypeError("request must be a canonical ModelRequest")
-        attempt = AttemptLifecycle(
-            self._native_owner, request, headers_supported=False, observable=True
+        return execute_stream_attempt(
+            self._native_owner,
+            request,
+            provider_id=self.provider_id,
+            boundary_name="Compatible",
+            operation=self._stream,
+            headers_supported=False,
         )
-        terminal_usage: ModelUsage | None = None
-        request = attempt.request
-        failure: ModelProviderError | None = None
-        try:
-            request.remaining_after(
-                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
-            )
-            async with attempt:
-                async with closing_stream(self._stream(request, attempt)) as events:
-                    async for event in events:
-                        if isinstance(event, ModelStreamCompleted):
-                            terminal_usage = event.response.usage
-                            terminal = attempt.response(event.response)
-                            break
-                        attempt.canonical(event)
-                        yield event
-                attempt.check_execution()
-                if terminal_usage is not None:
-                    attempt.finish(None)
-                    yield ModelStreamCompleted(attempt.observation.response(terminal))
-            attempt.finish(None)
-            return
-        except TimeoutError as error:
-            failure = ModelProviderError(
-                ProviderErrorCode.TIMEOUT,
-                "The model request deadline expired.",
-                usage=interrupted_model_usage(error),
-            )
-        except (asyncio.CancelledError, GeneratorExit) as error:
-            if isinstance(error, asyncio.CancelledError) and terminal_usage is not None:
-                with_cancelled_model_usage(error, terminal_usage)
-            attempt.finish(error)
-            raise
-        except ImportError as error:
-            attempt.finish(error)
-            raise
-        except ModelProviderError as error:
-            failure = error
-        except Exception:
-            failure = ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "Compatible provider boundary failed",
-                diagnostic=ProviderFailureDiagnostic(
-                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
-                    code="unexpected_provider_boundary_failure",
-                ),
-            )
-        if failure is None:
-            raise AssertionError("Compatible provider failed without an error")
-        if terminal_usage is not None:
-            failure.usage = terminal_usage
-        if attempt.terminal_response is not None:
-            failure.usage = attempt.usage()
-        attempt.finish(failure)
-        raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _stream(
         self,
@@ -405,257 +306,19 @@ class OpenAICompatibleProvider:
         except Exception as error:
             raise _normalize_error(error, self.provider) from error
 
-        text_fragments: list[str] = []
-        tool_states: dict[int, _StreamedToolCall] = {}
-        finish_reason: str | None = None
-        usage_value: object | None = None
-        response_id: str | None = None
-        response_model: str | None = None
-        service_tier: str | None = None
-        async with attempt.stream(source) as iterator:
-            while True:
-                try:
-                    chunk = await anext(iterator)
-                except StopAsyncIteration:
-                    break
-                except asyncio.CancelledError:
-                    raise
-                except ModelProviderError:
-                    raise
-                except Exception as error:
-                    raise _normalize_error(error, self.provider) from error
-                try:
-                    chunk_id = _optional_text(_field(chunk, "id", None), "chunk id")
-                    if chunk_id is not None:
-                        if response_id is not None and response_id != chunk_id:
-                            raise ValueError("stream response ID changed")
-                        response_id = chunk_id
-                    chunk_model = _optional_text(
-                        _field(chunk, "model", None),
-                        "stream response model",
-                    )
-                    if chunk_model is not None:
-                        if response_model is not None and response_model != chunk_model:
-                            raise ValueError("stream response model changed")
-                        response_model = chunk_model
-                    chunk_service_tier = _optional_text(
-                        _field(chunk, "service_tier", None),
-                        "stream service tier",
-                    )
-                    if chunk_service_tier is not None:
-                        if (
-                            service_tier is not None
-                            and service_tier != chunk_service_tier
-                        ):
-                            raise ValueError("stream service tier changed")
-                        service_tier = chunk_service_tier
-                    chunk_usage = _field(chunk, "usage", None)
-                    if chunk_usage is not None:
-                        usage_value = chunk_usage
-                    choices = _sequence(
-                        _field(chunk, "choices", ()),
-                        "stream choices",
-                    )
-                    if len(choices) > 1:
-                        raise ValueError("stream must contain at most one choice")
-                    if not choices:
-                        # OpenAI-compatible servers may emit metadata-only or
-                        # heartbeat chunks. Terminal validity is checked below.
-                        continue
-                    choice = choices[0]
-                    choice_index = _field(choice, "index", 0)
-                    if choice_index != 0:
-                        raise ValueError("stream choice index must be zero")
-                    delta = _field(choice, "delta")
-                    refusal = _optional_text(
-                        _field(delta, "refusal", None),
-                        "stream refusal",
-                    )
-                    if refusal is not None:
-                        raise ModelProviderError(
-                            ProviderErrorCode.CONTENT_BLOCKED,
-                            f"{self.provider} blocked the response",
-                        )
-                    content = _field(delta, "content", None)
-                    if content is not None:
-                        if not isinstance(content, str):
-                            raise ValueError("stream content must be text")
-                        text_fragments.append(content)
-                        if content:
-                            attempt.progress(content)
-                            yield ModelTextDelta(content)
-                    for field in ("reasoning", "reasoning_content"):
-                        reasoning = _field(delta, field, None)
-                        if reasoning is not None:
-                            if not isinstance(reasoning, str):
-                                raise ValueError("reasoning delta must be text")
-                            attempt.progress(reasoning)
-                    raw_calls = _field(delta, "tool_calls", ())
-                    if raw_calls is None:
-                        raw_calls = ()
-                    for item in _sequence(raw_calls, "stream tool calls"):
-                        index = _nonnegative_int(
-                            _field(item, "index"),
-                            "stream tool index",
-                        )
-                        state = tool_states.get(index)
-                        is_first = state is None
-                        if state is None:
-                            state = _StreamedToolCall(self._id_factory("call"))
-                            tool_states[index] = state
-                        native_id = _optional_text(
-                            _field(item, "id", None),
-                            "stream provider call ID",
-                        )
-                        if native_id is not None:
-                            if (
-                                state.provider_call_id is not None
-                                and state.provider_call_id != native_id
-                            ):
-                                raise ValueError("stream provider call ID changed")
-                            state.provider_call_id = native_id
-                        function = _field(item, "function", None)
-                        name: str | None = None
-                        argument_delta = ""
-                        if function is not None:
-                            name = _optional_text(
-                                _field(function, "name", None),
-                                "stream tool name",
-                            )
-                            if name is not None:
-                                if state.name is not None and state.name != name:
-                                    raise ValueError("stream tool name changed")
-                                state.name = name
-                            raw_arguments = _field(function, "arguments", None)
-                            if raw_arguments is not None:
-                                if not isinstance(raw_arguments, str):
-                                    raise ValueError(
-                                        "stream tool arguments must be text"
-                                    )
-                                argument_delta = raw_arguments
-                        state.argument_fragments.append(argument_delta)
-                        attempt.progress(argument_delta or "")
-                        yield ModelToolCallDelta(
-                            index=index,
-                            arguments_delta=argument_delta,
-                            id=state.canonical_id if is_first else None,
-                            name=name,
-                            provider_call_id=native_id,
-                        )
-                    native_finish = _field(choice, "finish_reason", None)
-                    if native_finish is not None:
-                        decoded_finish = _required_text(
-                            native_finish,
-                            "stream finish reason",
-                        )
-                        if (
-                            finish_reason is not None
-                            and finish_reason != decoded_finish
-                        ):
-                            raise ValueError("stream finish reason changed")
-                        finish_reason = decoded_finish
-                except asyncio.CancelledError:
-                    raise
-                except ModelProviderError:
-                    raise
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                    raise ModelProviderError(
-                        ProviderErrorCode.MALFORMED_RESPONSE,
-                        f"{self.provider} returned a malformed stream",
-                        provider_id=self.provider_id,
-                        diagnostic=ProviderFailureDiagnostic(
-                            phase=ProviderFailurePhase.STREAM_EVENT,
-                            code="event_decode_failed",
-                            terminal_status=_safe_structural_token(finish_reason),
-                        ),
-                    ) from error
+        from .stream import decode_compatible_stream
 
-            if finish_reason is None:
-                raise ModelProviderError(
-                    ProviderErrorCode.MALFORMED_RESPONSE,
-                    f"{self.provider} stream ended without a finish reason",
-                    provider_id=self.provider_id,
-                    diagnostic=ProviderFailureDiagnostic(
-                        phase=ProviderFailurePhase.STREAM_TERMINAL,
-                        code="terminal_completion_missing",
-                    ),
-                )
-            try:
-                if finish_reason == "content_filter":
-                    raise ModelProviderError(
-                        ProviderErrorCode.CONTENT_BLOCKED,
-                        f"{self.provider} blocked the response",
-                    )
-                canonical_finish = _finish_reason(finish_reason)
-                if sorted(tool_states) != list(range(len(tool_states))):
-                    raise ValueError("stream tool indexes must be contiguous")
-                calls: list[ToolCall] = []
-                for index in sorted(tool_states):
-                    state = tool_states[index]
-                    if state.provider_call_id is None or state.name is None:
-                        raise ValueError("stream tool call is missing identity")
-                    encoded_arguments = "".join(state.argument_fragments)
-                    arguments_value = (
-                        {} if not encoded_arguments else json.loads(encoded_arguments)
-                    )
-                    if not isinstance(arguments_value, dict):
-                        raise ValueError(
-                            "stream tool arguments must decode to an object"
-                        )
-                    calls.append(
-                        ToolCall(
-                            id=state.canonical_id,
-                            provider_call_id=state.provider_call_id,
-                            name=state.name,
-                            arguments=arguments_value,
-                        )
-                    )
-                if calls and canonical_finish is not FinishReason.TOOL_CALLS:
-                    raise ValueError("stream tool calls require tool_calls finish")
-                text = "".join(text_fragments).strip() or None
-                if (
-                    not calls
-                    and text is None
-                    and canonical_finish is FinishReason.LENGTH
-                ):
-                    raise ModelProviderError(
-                        ProviderErrorCode.OUTPUT_LIMIT,
-                        f"{self.provider} exhausted the output token limit",
-                    )
-                response = ModelResponse(
-                    finish_reason=canonical_finish,
-                    text=text,
-                    tool_calls=tuple(calls),
-                    usage=self._decode_priced_usage(
-                        usage_value,
-                        response_model=response_model,
-                        service_tier=service_tier,
-                        requested_at=requested_at,
-                    ),
-                    provider_id=self.provider_id,
-                    provider_response_id=response_id,
-                    provider_metadata={
-                        _CONTINUATION_KEY: {"provider_id": self.provider_id},
-                        "pricing_dimensions": {
-                            "response_model": response_model,
-                            "service_tier": service_tier,
-                        },
-                    },
-                )
-            except ModelProviderError:
-                raise
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise ModelProviderError(
-                    ProviderErrorCode.MALFORMED_RESPONSE,
-                    f"{self.provider} returned a malformed stream",
-                    provider_id=self.provider_id,
-                    diagnostic=ProviderFailureDiagnostic(
-                        phase=ProviderFailurePhase.STREAM_TERMINAL,
-                        code="terminal_response_decode_failed",
-                        terminal_status=_safe_structural_token(finish_reason),
-                    ),
-                ) from error
-            yield ModelStreamCompleted(response)
+        async with closing_stream(
+            decode_compatible_stream(
+                self,
+                source,
+                request,
+                attempt,
+                requested_at=requested_at,
+            )
+        ) as events:
+            async for event in events:
+                yield event
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
         try:
@@ -844,86 +507,6 @@ class OpenAICompatibleProvider:
         )
 
 
-def _chat_messages(
-    messages: tuple[CanonicalMessage, ...],
-    provider_id: str,
-) -> list[dict[str, object]]:
-    result: list[dict[str, object]] = []
-    call_ids: dict[str, str] = {}
-    for message in messages:
-        text = "\n".join(
-            block.text for block in message.content if isinstance(block, TextBlock)
-        ).strip()
-        if message.role is MessageRole.ASSISTANT:
-            same_origin = _same_origin(message, provider_id)
-            native_calls: list[dict[str, object]] = []
-            for call in message.tool_calls:
-                native_id = (
-                    call.provider_call_id
-                    if same_origin and call.provider_call_id is not None
-                    else call.id
-                )
-                call_ids[call.id] = native_id
-                native_calls.append(
-                    {
-                        "id": native_id,
-                        "type": "function",
-                        "function": {
-                            "name": call.name,
-                            "arguments": canonical_json(call.arguments),
-                        },
-                    }
-                )
-            native_message: dict[str, object] = {
-                "role": "assistant",
-                "content": text or None,
-            }
-            if native_calls:
-                native_message["tool_calls"] = native_calls
-            result.append(native_message)
-            continue
-        if message.role is MessageRole.TOOL:
-            for block in message.content:
-                if not isinstance(block, ToolResultBlock):
-                    raise ValueError("tool message contains a non-tool result")
-                result.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call_ids.get(block.call_id, block.call_id),
-                        "content": canonical_json(
-                            {"is_error": block.is_error, "output": block.output}
-                        ),
-                    }
-                )
-            continue
-        if not text:
-            raise ValueError("canonical text message produced no content")
-        result.append({"role": message.role.value, "content": text})
-    if not result:
-        raise ModelProviderError(
-            ProviderErrorCode.INVALID_REQUEST,
-            "canonical request produced no compatible chat messages",
-        )
-    return result
-
-
-def _same_origin(message: CanonicalMessage, provider_id: str) -> bool:
-    if message.provider_id != provider_id:
-        return False
-    continuation = message.provider_metadata.get(_CONTINUATION_KEY)
-    if continuation is None:
-        return True
-    if (
-        not isinstance(continuation, Mapping)
-        or continuation.get("provider_id") != provider_id
-    ):
-        raise ModelProviderError(
-            ProviderErrorCode.INVALID_REQUEST,
-            "compatible continuation origin does not match canonical provider",
-        )
-    return True
-
-
 def _decode_usage(value: object) -> ModelUsage:
     if value is None:
         return ModelUsage()
@@ -1087,39 +670,6 @@ def _is_loopback_host(value: str) -> bool:
         return False
 
 
-def _safe_structural_token(value: object) -> str | None:
-    if not isinstance(value, str) or not 1 <= len(value) <= 96:
-        return None
-    if (
-        not value[0].isascii()
-        or not value[0].isalnum()
-        or any(
-            not character.isascii() or not (character.isalnum() or character in "._:-")
-            for character in value
-        )
-    ):
-        return None
-    return value
-
-
-_MISSING = object()
-
-
-def _field(value: object, name: str, default: object = _MISSING) -> object:
-    if value is None:
-        if default is not _MISSING:
-            return default
-        raise KeyError(name)
-    if isinstance(value, Mapping):
-        if name in value:
-            return value[name]
-    elif hasattr(value, name):
-        return getattr(value, name)
-    if default is not _MISSING:
-        return default
-    raise KeyError(name)
-
-
 def _lenient_field(value: object, name: str) -> object | None:
     try:
         return _field(value, name, None)
@@ -1131,30 +681,6 @@ def _sequence(value: object, label: str) -> Sequence[object]:
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         raise ValueError(f"{label} must be a sequence")
     return value
-
-
-def _required_text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"{label} must be a non-empty string")
-    return value
-
-
-def _optional_text(value: object, label: str) -> str | None:
-    if value is None:
-        return None
-    return _required_text(value, label)
-
-
-def _nonnegative_int(value: object, label: str) -> int:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValueError(f"{label} must be a non-negative integer")
-    return value
-
-
-def _usage_int(value: object, label: str) -> int:
-    if value is None:
-        return 0
-    return _nonnegative_int(value, label)
 
 
 __all__ = ["OpenAICompatibleProvider"]

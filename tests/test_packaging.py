@@ -44,7 +44,7 @@ def test_default_distribution_contains_every_supported_production_dependency():
     assert set(project["dependencies"]) == {
         "anthropic>=0.116.0,<1.0.0",
         "asyncpg>=0.30.0,<1.0.0",
-        "google-genai>=1.73.1,<2.0.0",
+        "google-genai>=2.22.0,<3.0.0",
         "keyring>=25.0.0,<26.0.0",
         "openai>=2.45.0,<3.0.0",
         "rich>=15.0.0,<16.0.0",
