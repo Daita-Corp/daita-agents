@@ -459,9 +459,9 @@ def test_scope_codec_rejects_missing_extra_and_malformed_execution_bindings() ->
             decode_execution_scope(altered)
     for invalid in ({}, {"test.scheduled": "not-a-digest"}):
         altered = copy.deepcopy(encoded)
-        altered["fields"]["contract_bindings"]["fields"]["capability_contracts"] = (
-            invalid
-        )
+        altered["fields"]["contract_bindings"]["fields"][
+            "capability_contracts"
+        ] = invalid
         with pytest.raises(ValueError):
             decode_execution_scope(altered)
     assert binding_fields["tool_origins"] == {}
