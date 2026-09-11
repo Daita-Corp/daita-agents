@@ -31,8 +31,8 @@ from daita import (
 )
 from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters.mcp import (
-    MCPCompletionSemantics,
     MCP_MAX_ACTIVE_TOOLS_PER_AGENT,
+    MCPCompletionSemantics,
     MCPServerBinding,
     MCPToolBinding,
     StreamableHTTPMCPClientFactory,

@@ -21,6 +21,7 @@ from .artifacts.models import (
 )
 from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
+    RESERVED_TOOL_NAMES,
     TOOLBOX_DEFINITIONS,
     AccessMode,
     ApprovalDecision,
@@ -29,16 +30,15 @@ from .capabilities import (
     AutomationEligibility,
     AutomationScopeProposal,
     Capability,
-    CapabilityGrant,
     CapabilityDeclarations,
+    CapabilityGrant,
     CapabilityInputError,
     CapabilityRegistry,
-    RESERVED_TOOL_NAMES,
-    Executor,
-    ExecutionContractReader,
+    EffectEvidenceBasis,
     EffectObservation,
     EffectOutcome,
-    EffectEvidenceBasis,
+    ExecutionContractReader,
+    Executor,
     OperationalEffect,
     SideEffectExecutor,
     ToolboxId,
@@ -49,7 +49,6 @@ from .capabilities import (
     ToolView,
     validate_tool_schema_value,
 )
-from .scope import EffectiveSourceScope
 from .errors import DaitaError
 from .llm.errors import (
     ToolCatalogLimitExceeded,
@@ -73,6 +72,7 @@ from .loop.models import (
     ToolBatchOutcome,
 )
 from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
+from .scope import EffectiveSourceScope
 
 if TYPE_CHECKING:
     from .storage.sqlite_records import EffectReceipt

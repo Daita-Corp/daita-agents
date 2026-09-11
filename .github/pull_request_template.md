@@ -21,5 +21,5 @@ Describe how you tested this change. If you added tests, point to them.
 ## Checklist
 
 - [ ] Tests pass (`pytest tests/ -m "not requires_llm and not requires_db"`)
-- [ ] Python is formatted with `black`
+- [ ] Pre-commit checks pass (`pre-commit run --all-files`)
 - [ ] Public API changes are documented

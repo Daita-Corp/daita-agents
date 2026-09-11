@@ -2,8 +2,9 @@
 
 from collections.abc import Sequence
 from dataclasses import replace
-from daita.catalog.models import CatalogFacet, CatalogResource, TabularFacet
+
 from daita.adapters.models import SourceRegistration
+from daita.catalog.models import CatalogFacet, CatalogResource, TabularFacet
 from daita.storage.sqlite_records import (
     RelationalWriteScope,
     relational_write_authorization_fingerprint,

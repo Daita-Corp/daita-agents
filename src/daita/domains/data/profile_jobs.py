@@ -18,8 +18,8 @@ from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
     AutomationEligibility,
-    Capability,
     AutomationScopeProposal,
+    Capability,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
@@ -46,8 +46,8 @@ from ...jobs.models import (
 )
 from ...jobs.owner import JobError, JobOwner
 from ...llm.models import ModelSensitivity, ToolCall
-from ...scope import resolve_effective_source_scope
 from ...loop.models import RunInput
+from ...scope import resolve_effective_source_scope
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .capabilities import SqlReadBackend, SqlReadResult

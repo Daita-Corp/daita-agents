@@ -7,9 +7,9 @@ from .common import (
     dump_payload,
     integer,
     load_payload,
+    plain_encode,
     record,
     record_fields,
-    plain_encode,
     sequence,
     text,
 )

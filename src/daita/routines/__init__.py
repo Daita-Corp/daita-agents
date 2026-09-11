@@ -9,6 +9,7 @@ from .models import (
     NonexistentTimePolicy,
     OnceSchedule,
     ReportingMode,
+    RequestedCapabilityGrant,
     ResourceRevisionObservation,
     ResourceRevisionPrecheck,
     RoutineControlAction,
@@ -19,7 +20,6 @@ from .models import (
     RoutineState,
     ScheduledRoutine,
     ScheduledRoutineDraft,
-    RequestedCapabilityGrant,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )

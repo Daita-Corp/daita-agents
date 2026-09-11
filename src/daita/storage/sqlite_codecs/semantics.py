@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from ...llm.models import ModelSensitivity
-
 from ...semantics import (
     ResourceRevisionBinding,
     SemanticAnnotation,

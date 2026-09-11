@@ -10,7 +10,6 @@ from hashlib import sha256
 from typing import TypeVar
 
 from .._json import FrozenJsonObject, canonical_json
-from ..llm.models import ModelSensitivity
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
@@ -20,6 +19,7 @@ from ..catalog.models import (
     SourceCatalogSnapshot,
     catalog_resource_id,
 )
+from ..llm.models import ModelSensitivity
 
 _SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")

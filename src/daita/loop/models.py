@@ -12,8 +12,7 @@ from hashlib import sha256
 
 from .._json import FrozenJsonObject, canonical_json
 from ..artifacts.models import ArtifactDeliveryReceipt, ArtifactRef
-from ..capabilities import ExecutionScope, RESERVED_TOOL_NAMES
-from ..scope import EffectiveSourceScope
+from ..capabilities import RESERVED_TOOL_NAMES, ExecutionScope
 from ..llm.errors import ProviderFailureDiagnostic
 from ..llm.models import (
     CanonicalMessage,
@@ -24,6 +23,7 @@ from ..llm.models import (
     ToolCall,
     ToolResultBlock,
 )
+from ..scope import EffectiveSourceScope
 
 _MIN_TOOL_RESULT_BYTES = 128
 _MIN_TOOL_RESULT_DEPTH = 3

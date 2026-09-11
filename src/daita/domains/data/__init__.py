@@ -9,9 +9,9 @@ from .capabilities import (
     RELATIONAL_UPDATE_TOOL_NAME,
     DataQueryDeclarations,
     DataQueryExecutor,
-    RelationalPreviewFingerprint,
     PostgreSQLReadBackend,
     PostgreSQLReadResult,
+    RelationalPreviewFingerprint,
     RelationalUpdateBackend,
     RelationalUpdateDeclarations,
     RelationalUpdateExecutor,
@@ -27,10 +27,10 @@ from .capabilities import (
     data_query_declarations,
     relational_update_capability_declarations,
     relational_update_declarations,
-    relational_upsert_declarations,
-    relational_upsert_capability_declarations,
     relational_update_preview_capability_declarations,
     relational_update_preview_declarations,
+    relational_upsert_capability_declarations,
+    relational_upsert_declarations,
 )
 from .catalog import CatalogDataView
 from .controller import (
@@ -45,8 +45,8 @@ from .controller import (
     CatalogSchemaReader,
     DataCapabilityDomain,
     DataDomainCatalog,
-    RelationalWriteCatalogReader,
     ReadScopedCatalogReader,
+    RelationalWriteCatalogReader,
 )
 from .export_capabilities import (
     ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
@@ -115,9 +115,9 @@ from .sql import (
     RelationalUpdateCommand,
     RelationalUpdateFilter,
     RelationalUpdateIntent,
-    RelationalWriteScopeValidationResult,
     RelationalUpdateStatement,
     RelationalUpdateValidationResult,
+    RelationalWriteScopeValidationResult,
     ResourceSchema,
     SqlAnalysis,
     SqlAnalysisError,

@@ -1,13 +1,13 @@
 """Executable model-facing schedule and automation-discovery contracts."""
 
-from typing import Any, cast
 from collections.abc import Mapping
+from typing import Any, cast
 
 import pytest
 
+from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import ToolOutputValidationError, validate_tool_schema_value
 from daita.routines.capabilities import _parse_schedule, _spec_schema
-from daita._json import FrozenJsonObject, canonical_json
 
 
 @pytest.mark.parametrize("update", [False, True])
@@ -15,7 +15,8 @@ from daita._json import FrozenJsonObject, canonical_json
 async def test_model_immediate_choice_is_explicit_on_create_and_cannot_run_a_revision(
     update, immediate
 ):
-    from test_routine_owner import _Store, _owner, _proposal
+    from test_routine_owner import _owner, _proposal, _Store
+
     from daita.routines.capabilities import _parsed_spec
     from daita.routines.owner import _routine_proposal_payload
 
@@ -209,7 +210,8 @@ def test_routine_schema_retains_typed_constraints_with_a_bounded_wire_footprint(
     "action", ["create", "update", "pause", "resume", "run_now", "disable"]
 )
 async def test_mutation_receipt_is_bounded_and_full_contract_stays_inspectable(action):
-    from test_routine_owner import _Store, _owner, _proposal
+    from test_routine_owner import _owner, _proposal, _Store
+
     from daita.routines.capabilities import (
         _mutation_receipt,
         _mutation_receipt_schema,
@@ -244,9 +246,11 @@ async def test_mutation_receipt_is_bounded_and_full_contract_stays_inspectable(a
 async def test_draft_and_record_share_budget_relationship_and_equal_boundary(budget):
     from dataclasses import replace
     from decimal import Decimal
-    from test_routine_owner import _Store, _owner, _proposal
-    from daita.routines.models import ScheduledRoutineDraft
+
+    from test_routine_owner import _owner, _proposal, _Store
+
     from daita.routines.capabilities import _parsed_spec
+    from daita.routines.models import ScheduledRoutineDraft
     from daita.routines.owner import _routine_proposal_payload
 
     proposal = await _proposal(_owner(_Store()))

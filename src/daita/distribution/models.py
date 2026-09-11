@@ -15,7 +15,7 @@ from ..artifacts.models import (
     ArtifactRef,
     artifact_provenance_to_mapping,
 )
-from ..capabilities import EffectEvidenceBasis, MAX_EXECUTION_SCOPE_IDENTITIES
+from ..capabilities import MAX_EXECUTION_SCOPE_IDENTITIES, EffectEvidenceBasis
 from ..llm.models import ModelSensitivity
 
 MAX_OUTCOME_ARTIFACT_REQUIREMENTS = 4

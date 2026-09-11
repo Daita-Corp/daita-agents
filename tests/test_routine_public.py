@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
-
 from _distribution_support import no_artifact_outcome_contract
 from _workspace_support import workspace_for
 
@@ -51,6 +50,7 @@ async def test_routine_reporting_input_error_precedes_binding_and_approval(
     tmp_path, monkeypatch, update, mode
 ):
     from _capability_runtime_support import execute_projected
+
     from daita.capabilities import ApprovalDecision
     from daita.distribution import outcome_contract_projection
     from daita.llm.models import ToolCall
@@ -280,9 +280,10 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
         assert await agent.inspect_routine(created.routine_id) is not None
 
         from test_stage_m3_tool_catalog import _load
-        from daita.loop.models import RunInput
-        from daita.llm.models import TextBlock
+
         from daita._json import canonical_json
+        from daita.llm.models import TextBlock
+        from daita.loop.models import RunInput
 
         authoring_run = RunInput(
             id="revision-facts",
@@ -462,6 +463,7 @@ async def test_public_source_free_once_routine_commits_required_document(
     tmp_path, classification
 ):
     from _toolbox_model_support import ToolboxAwareMockModelProvider
+
     from daita import OnceSchedule
     from daita.artifacts.models import ArtifactAuthorship
     from daita.distribution.models import ArtifactRequirement, OutcomeState
@@ -610,6 +612,7 @@ async def test_routine_budget_error_precedes_preparation_and_next_step_corrects(
 ):
     from _capability_runtime_support import execute_projected
     from _toolbox_model_support import ToolboxAwareMockModelProvider
+
     from daita.capabilities import ApprovalDecision
     from daita.distribution import outcome_contract_projection
     from daita.llm.models import ToolCall, ToolResultBlock

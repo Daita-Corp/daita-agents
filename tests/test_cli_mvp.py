@@ -1632,8 +1632,8 @@ def test_cli_4_shell_mutations_delegate_through_public_agent_methods_only():
 
 
 def test_cli_stopped_run_retains_committed_routine_without_dumping_contract():
-    from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
     from daita.llm.models import CanonicalMessage, ToolResultBlock
+    from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
 
     run = RunInput(
         id="run-stopped",

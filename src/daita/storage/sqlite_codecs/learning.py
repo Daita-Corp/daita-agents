@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from ...llm.models import ModelSensitivity
-
 from ...learning_candidates import (
     DocumentCandidateContent,
     LearningCandidate,
@@ -16,6 +14,7 @@ from ...learning_candidates import (
     SemanticCandidateContent,
     SkillCandidateContent,
 )
+from ...llm.models import ModelSensitivity
 from ...semantics import SemanticKind
 from .common import (
     JsonValue,

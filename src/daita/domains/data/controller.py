@@ -18,12 +18,12 @@ from ...artifacts.models import (
 )
 from ...capabilities import (
     AccessMode,
-    Capability,
     AutomationScopeProposal,
+    Capability,
     CapabilityDeclarations,
-    CapabilityRegistry,
     CapabilityGrant,
     CapabilityInputError,
+    CapabilityRegistry,
     OperationalEffect,
     ToolExecution,
     ToolOutput,
@@ -38,19 +38,14 @@ from ...catalog.capabilities import (
 )
 from ...catalog.models import Sensitivity
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
-from ...scope import resolve_effective_source_scope
 from ...loop.models import RunInput, RunOrigin, Transcript
+from ...scope import resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .file_capabilities import (
     LOCAL_FILE_CAPABILITY_IDS,
     LOCAL_FILE_QUERY_CAPABILITY_ID,
     LOCAL_FILE_READ_CAPABILITY_ID,
-)
-from .sql.relational_upsert import (
-    RelationalUpsertIntent,
-    validate_relational_upsert_intent,
-    validate_relational_upsert_scope,
 )
 from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
 from .sql import (
@@ -62,6 +57,11 @@ from .sql import (
     validate_postgresql_read,
     validate_relational_update_intent,
     validate_sqlite_read,
+)
+from .sql.relational_upsert import (
+    RelationalUpsertIntent,
+    validate_relational_upsert_intent,
+    validate_relational_upsert_scope,
 )
 
 DATA_DOMAIN_OWNER_ID = "data"
@@ -948,8 +948,8 @@ class DataCapabilityDomain:
     ) -> CapabilityFailure | None:
         del call
         from ...adapters.postgresql_write import (
-            RelationalUpdateExecutionError,
             RelationalUpdateExecutionCancelled,
+            RelationalUpdateExecutionError,
         )
 
         if isinstance(error, RelationalUpdateExecutionError):

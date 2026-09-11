@@ -15,16 +15,6 @@ from ...models import (
     ModelUsage,
     ToolCall,
 )
-from .messages import (
-    _CONTINUATION_KEY,
-    _plain_opaque_block,
-    _validate_opaque_block,
-)
-from .usage import (
-    _anthropic_inference_geo,
-    _anthropic_service_tier,
-    _AnthropicBillingUsage,
-)
 from .._fields import (
     field as _field,
     nonnegative_int as _nonnegative_int,
@@ -37,6 +27,16 @@ from .adapter import (
     _STREAM_MISSING,
     _code_from_error_type,
     _text_value,
+)
+from .messages import (
+    _CONTINUATION_KEY,
+    _plain_opaque_block,
+    _validate_opaque_block,
+)
+from .usage import (
+    _anthropic_inference_geo,
+    _anthropic_service_tier,
+    _AnthropicBillingUsage,
 )
 
 

@@ -18,8 +18,8 @@ from daita.adapters.mcp import MCPCompletionSemantics, MCPToolBinding, MCPToolSe
 from daita.capabilities import (
     TOOLBOX_DEFINITIONS,
     AccessMode,
-    AutomationEligibility,
     ApprovalDecision,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityRegistry,
@@ -1946,6 +1946,7 @@ async def test_routine_authoring_choices_are_complete_frozen_and_mandatory(
     tmp_path, monkeypatch, routes, cost
 ):
     from decimal import Decimal
+
     from daita.llm.errors import ContextWindowExceeded
 
     agent = await Agent.create(

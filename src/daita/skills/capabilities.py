@@ -9,8 +9,8 @@ from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
-    Capability,
     AutomationScopeProposal,
+    Capability,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,

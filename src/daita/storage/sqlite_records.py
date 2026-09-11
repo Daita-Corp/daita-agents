@@ -10,9 +10,8 @@ from enum import Enum
 from hashlib import sha256
 
 from .._json import FrozenJsonObject, canonical_json
-from ..capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
-from ..llm.models import ModelSensitivity
 from ..adapters.models import SourceRegistration
+from ..capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
 from ..catalog.models import (
     CatalogFacet,
     CatalogResource,
@@ -20,6 +19,7 @@ from ..catalog.models import (
     ResourceKind,
     TabularFacet,
 )
+from ..llm.models import ModelSensitivity
 
 _SOURCE_PERMISSION_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")

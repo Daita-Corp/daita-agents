@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from _relational_write_support import update_constraints
-
 from dataclasses import asdict
 from datetime import UTC, datetime
 
 import pytest
+from _relational_write_support import update_constraints
 from _workspace_support import workspace_for
 
 from daita import Agent

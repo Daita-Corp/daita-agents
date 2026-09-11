@@ -70,8 +70,8 @@ from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
     AutomationEligibility,
-    Capability,
     AutomationScopeProposal,
+    Capability,
     CapabilityDeclarations,
     CapabilityInputError,
     CapabilityRegistry,
@@ -89,8 +89,8 @@ from ...capabilities import (
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
 from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
-from ...scope import SourceScopeCatalog, resolve_effective_source_scope
 from ...loop.models import RunInput, RunOrigin, Transcript
+from ...scope import SourceScopeCatalog, resolve_effective_source_scope
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _capability_runtime_support import frozen_execution_bindings
-
 import asyncio
 from collections.abc import Callable
 from dataclasses import replace
@@ -10,6 +8,7 @@ from decimal import Decimal
 from typing import cast
 
 import pytest
+from _capability_runtime_support import frozen_execution_bindings
 from _distribution_support import (
     inbox_distribution_plan,
     no_artifact_outcome_contract,
@@ -29,8 +28,8 @@ from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
     ModelSensitivity,
-    TextBlock,
     ModelUsage,
+    TextBlock,
 )
 from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopExit, LoopExitKind, RunInput

@@ -29,12 +29,12 @@ from ..capabilities import (
     ToolExecution,
 )
 from ..domains.data.capabilities import (
-    RelationalUpsertResult,
     RelationalPreviewFingerprint,
     RelationalUpdatePreview,
     RelationalUpdatePreviewChecks,
     RelationalUpdateResult,
     RelationalUpdateSample,
+    RelationalUpsertResult,
 )
 from ..domains.data.controller import (
     RELATIONAL_UPDATE_CAPABILITY_ID,
@@ -42,27 +42,27 @@ from ..domains.data.controller import (
     RelationalWriteCatalogReader,
 )
 from ..domains.data.sql import (
-    ResourceSchema,
     RelationalUpdateCell,
     RelationalUpdateCommand,
     RelationalUpdateIntent,
+    ResourceSchema,
     ValidatedRelationalUpdate,
     render_relational_update_statement,
     validate_relational_update_intent,
     validate_relational_write_scope,
 )
+from ..domains.data.sql.relational_update import _qualified_identity
 from ..domains.data.sql.relational_upsert import (
     RelationalUpsertIntent,
     ValidatedRelationalUpsert,
     validate_relational_upsert_intent,
     validate_relational_upsert_scope,
 )
-from ..domains.data.sql.relational_update import _qualified_identity
-from ..llm.models import ModelSensitivity
-from .models import SourceRegistration
 from ..errors import DaitaError
+from ..llm.models import ModelSensitivity
 from ..security import SecretProvider, default_secret_provider
 from ..storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
+from .models import SourceRegistration
 from .postgresql import (
     _DEFAULT_MAX_COLUMNS,
     _DEFAULT_MAX_INDEXES,

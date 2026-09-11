@@ -15,9 +15,9 @@ from textual.widgets import Button, Footer, Input, Label, Select, Static
 from daita import (
     MCPBindingState,
     MCPBindingStatus,
+    MCPCompletionSemantics,
     MCPServerInspection,
     MCPToolSelection,
-    MCPCompletionSemantics,
 )
 from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
 from daita.llm.models import ModelSensitivity

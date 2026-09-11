@@ -25,22 +25,22 @@ from .duckdb_read import (
     ValidatedDuckDBRead,
     validate_duckdb_read,
 )
+from .read_validation import validate_postgresql_read, validate_sqlite_read
 from .relational_update import (
     RELATIONAL_UPDATE_MAX_CANONICAL_BYTES,
     RelationalUpdateCell,
     RelationalUpdateCommand,
     RelationalUpdateFilter,
     RelationalUpdateIntent,
-    RelationalWriteScopeValidationResult,
     RelationalUpdateStatement,
     RelationalUpdateValidationResult,
+    RelationalWriteScopeValidationResult,
     ValidatedRelationalUpdate,
     ValidatedRelationalWriteScope,
     render_relational_update_statement,
     validate_relational_update_intent,
     validate_relational_write_scope,
 )
-from .read_validation import validate_postgresql_read, validate_sqlite_read
 
 __all__ = [
     "MAX_SQL_CHARACTERS",

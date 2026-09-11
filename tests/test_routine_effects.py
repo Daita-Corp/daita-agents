@@ -26,12 +26,12 @@ from daita.capabilities import (
     CapabilityInputError,
     CapabilityRegistry,
     EffectEvidenceBasis,
+    EffectObservation,
     EffectOutcome,
     ExecutionContractBindings,
+    OperationalEffect,
     ToolLoadMode,
     ToolView,
-    OperationalEffect,
-    EffectObservation,
 )
 from daita.capability_runtime import CapabilityRuntime, SideEffectPlan
 from daita.distribution import (
@@ -48,8 +48,8 @@ from daita.llm.models import (
     ModelUsage,
     ToolCall,
 )
-from daita.loop import AgentLoop, LoopLimits
 from daita.llm.pricing import CostEstimate
+from daita.loop import AgentLoop, LoopLimits
 from daita.routines.models import (
     IntervalSchedule,
     MisfirePolicy,
@@ -217,9 +217,9 @@ async def _assignment(
     domain = _StandingDomain((capability,), (view,))
     executor = _RoutineExecutor(store=store, mode=mode, basis=basis)
     from daita.domains.data.export_capabilities import (
-        artifact_capability_declarations,
-        DocumentArtifactExecutor,
         DOCUMENT_CREATE_CAPABILITY_ID,
+        DocumentArtifactExecutor,
+        artifact_capability_declarations,
     )
 
     declarations = artifact_capability_declarations(
@@ -386,8 +386,8 @@ async def _assignment(
         ),
     )
     if document_minimum:
-        from daita.distribution.models import ArtifactRequirement
         from daita.artifacts.models import ArtifactAuthorship
+        from daita.distribution.models import ArtifactRequirement
 
         contract = replace(
             contract,
@@ -455,6 +455,7 @@ async def _assignment(
     )
     if through_tool:
         from _capability_runtime_support import execute_projected
+
         from daita.routines.capabilities import _spec_schema
         from daita.routines.owner import _routine_proposal_payload
 
@@ -658,6 +659,7 @@ async def test_uncertain_or_unusable_required_effect_never_reports_success(
 
 async def test_durable_grant_ceiling_counts_a_distinct_second_operation(tmp_path):
     from collections.abc import Mapping
+
     from daita.llm.models import ToolResultBlock
 
     store, owner, runtime, executor, model, inspection, proposal, supervisor = (
@@ -736,8 +738,8 @@ async def test_uncertainty_blocks_resume_manual_claim_and_new_clones_after_reope
 async def test_unresolved_effect_blocks_expanding_an_unrelated_assignment(
     tmp_path, expansion
 ):
-    from daita.storage.sqlite_records import EffectUnresolvedError
     from daita.routines.models import text_digest
+    from daita.storage.sqlite_records import EffectUnresolvedError
 
     store, owner, runtime, executor, model, inspection, proposal, supervisor = (
         await _assignment(tmp_path, mode="disconnect", defer=True)
@@ -1092,8 +1094,9 @@ async def test_failed_assignment_keeps_authenticated_partial_artifacts(
 
 async def test_corrupted_tool_result_cannot_satisfy_an_effect_requirement(tmp_path):
     import sqlite3
+
+    from daita.llm.models import MessageRole, ToolResultBlock
     from daita.storage.sqlite_codecs import decode_message, encode_message
-    from daita.llm.models import ToolResultBlock, MessageRole
 
     async def corrupt_result(store, run, result):
         with sqlite3.connect(store.path) as connection:

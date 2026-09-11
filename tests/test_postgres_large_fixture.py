@@ -1,5 +1,4 @@
 from __future__ import annotations
-from _relational_write_support import update_constraints
 
 import os
 from collections.abc import Mapping
@@ -7,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from _relational_write_support import update_constraints
 from _workspace_support import workspace_for
 
 from daita import Agent, ApprovalDecision, ApprovalRequest

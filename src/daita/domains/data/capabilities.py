@@ -13,10 +13,10 @@ from ...capabilities import (
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
-    Executor,
-    EffectReceiptPolicy,
-    EffectObservation,
     EffectEvidenceBasis,
+    EffectObservation,
+    EffectReceiptPolicy,
+    Executor,
     OperationalEffect,
     ToolboxId,
     ToolExecution,
@@ -36,7 +36,6 @@ from .controller import (
     native_preview_capability,
 )
 from .results import BoundedResultProjection
-from .sql.relational_upsert import RelationalUpsertIntent
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
@@ -45,6 +44,7 @@ from .sql import (
     RelationalUpdateFilter,
     RelationalUpdateIntent,
 )
+from .sql.relational_upsert import RelationalUpsertIntent
 
 DATA_QUERY_EXECUTOR_ID = "data.query.executor"
 DATA_QUERY_TOOL_NAME = "data_query"

@@ -9,15 +9,14 @@ remain deterministic contracts in ``tests/test_local_text_edit.py``.
 
 from __future__ import annotations
 
-import os
 import json
+import os
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
 from _workspace_support import workspace_for
-from live.benchmarks._support import RecordingProvider
 
 from daita import (
     Agent,
@@ -26,6 +25,7 @@ from daita import (
     LoopLimits,
     create_llm_provider,
 )
+from daita._json import canonical_json
 from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from daita.llm.profiles import reviewed_model_profile
@@ -35,8 +35,8 @@ from daita.loop.models import (
     Transcript,
     validate_completed_transcript,
 )
-from daita._json import canonical_json
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
+from live.benchmarks._support import RecordingProvider
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_LOCAL_TEXT_EDIT"
 _MODEL_ID = "DAITA_LOCAL_TEXT_EDIT_LIVE_MODEL_ID"

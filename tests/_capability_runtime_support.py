@@ -8,10 +8,10 @@ from dataclasses import replace
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
     AccessMode,
-    Capability,
-    CapabilityInputError,
     AutomationScopeProposal,
+    Capability,
     CapabilityDeclarations,
+    CapabilityInputError,
     CapabilityRegistry,
     ExecutionContractBindings,
     Executor,

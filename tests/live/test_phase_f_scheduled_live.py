@@ -9,22 +9,22 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-
 from _phase_f_live_support import (
-    NOW,
     NEXT_SLOT,
+    NOW,
     REPORT_INSTRUCTION,
-    SOURCE,
     RESEARCH_TOKEN,
+    SOURCE,
     assert_action,
     assert_completed,
     evaluate,
     live_provider,
     owner_routine_draft,
 )
-from daita.loop.models import RunInput, LoopExit, LoopExitKind
-from daita.llm.models import CanonicalMessage, MessageRole, TextBlock, ModelSensitivity
+
 from daita.distribution.models import OutcomeState
+from daita.llm.models import CanonicalMessage, MessageRole, ModelSensitivity, TextBlock
+from daita.loop.models import LoopExit, LoopExitKind, RunInput
 
 # Shared opt-in and collection parameters; no import executes a provider.
 from .test_phase_f_mcp_live import (

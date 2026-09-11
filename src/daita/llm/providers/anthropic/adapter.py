@@ -52,6 +52,12 @@ from ...pricing import (
     with_request_admission,
 )
 from ...provider_definitions import supports_builtin_request_policy
+from .._fields import (
+    field as _field,
+    optional_text as _optional_text,
+    required_text as _required_text,
+    safe_structural_token as _safe_structural_token,
+)
 from .messages import (
     _CONTINUATION_KEY,
     _OPAQUE_BLOCK_TYPES,
@@ -61,12 +67,6 @@ from .messages import (
 from .usage import (
     _AnthropicBillingUsage,
     _decode_anthropic_billing_usage,
-)
-from .._fields import (
-    field as _field,
-    optional_text as _optional_text,
-    required_text as _required_text,
-    safe_structural_token as _safe_structural_token,
 )
 
 _NONCONTENT_STREAM_BLOCK_TYPES = frozenset({"fallback"})

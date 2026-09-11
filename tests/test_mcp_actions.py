@@ -48,8 +48,8 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
-from daita.routines.owner import RoutineError
 from daita.routines.models import RoutineState
+from daita.routines.owner import RoutineError
 from daita.storage.sqlite_records import EffectResolutionDecision
 
 NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
@@ -1315,7 +1315,7 @@ async def test_revocation_after_reservation_proves_local_non_dispatch(
 
 async def test_binding_codec_and_origin_retain_authority_but_exclude_hints(action):
     from daita.adapters.mcp import mcp_execution_origin_digest
-    from daita.storage.sqlite_codecs import encode_mcp_binding, decode_mcp_binding
+    from daita.storage.sqlite_codecs import decode_mcp_binding, encode_mcp_binding
 
     binding = action.binding
     encoded = encode_mcp_binding(binding)
@@ -1370,6 +1370,7 @@ async def test_binding_codec_and_origin_retain_authority_but_exclude_hints(actio
 
 async def test_guided_ui_explicit_action_permissions_reach_public_admission(tmp_path):
     from textual.widgets import Input, OptionList, Select
+
     from daita.tui.app import DaitaApp
     from daita.tui.screens.confirm import ConfirmScreen
     from daita.tui.screens.mcp import MCPSetupScreen, MCPToolAdmissionScreen

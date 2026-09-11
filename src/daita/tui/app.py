@@ -47,6 +47,7 @@ from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
+from .screens.effects import EffectsScreen
 from .screens.inbox import InboxScreen
 from .screens.jobs import JobsScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
@@ -56,11 +57,10 @@ from .screens.onboarding import (
     SourceSetupScreen,
 )
 from .screens.permissions import PermissionsScreen
-from .screens.effects import EffectsScreen
-from .widgets.approval import ApprovalPanel
 from .screens.routines import RoutinesScreen
 from .screens.selection import SelectionScreen
 from .screens.source_edit import SourceEditScreen
+from .widgets.approval import ApprovalPanel
 from .widgets.composer import (
     ComposerExitRequested,
     ComposerLimitReached,

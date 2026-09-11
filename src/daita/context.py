@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from hashlib import sha256
@@ -12,7 +11,6 @@ from typing import Protocol, cast
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import ArtifactDestination, artifact_destination_to_mapping
 from .capabilities import OperationalEffect, ToolLoadMode
-from .scope import SourceScopeCatalog, resolve_effective_source_scope
 from .capability_runtime import (
     EffectReceiptStore,
     RunToolCatalog,
@@ -27,50 +25,6 @@ from .catalog.capabilities import (
 from .catalog.models import (
     CATALOG_CONTEXT_DEFAULT_LIMIT,
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
-)
-from .jobs.capabilities import (
-    JOB_CANCEL_CAPABILITY_ID,
-    JOB_INSPECT_CAPABILITY_ID,
-    JOB_LIST_CAPABILITY_ID,
-    JOB_READ_RESULTS_CAPABILITY_ID,
-)
-from .llm.errors import (
-    ContextEvidencePressureExceeded,
-    ContextWindowExceeded,
-    RequestSensitivityUnavailable,
-    ToolManifestLimitExceeded,
-)
-from .llm.models import (
-    CanonicalMessage,
-    MessageRole,
-    ModelProfile,
-    ModelRequest,
-    ModelSensitivity,
-    TextBlock,
-    ToolCall,
-    ToolDefinition,
-    ToolResultBlock,
-)
-from .loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
-from .memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
-from .semantics import (
-    SEMANTIC_DELETE_OUTPUT_KIND,
-    SEMANTIC_DELETE_TOOL_NAME,
-    SEMANTIC_SAVE_CAPABILITY_ID,
-    SEMANTIC_SAVE_OUTPUT_KIND,
-    SEMANTIC_SAVE_TOOL_NAME,
-    SemanticAnnotation,
-    SemanticAnnotationView,
-    SemanticResourceFact,
-    inspect_semantic_annotations,
-    render_semantic_recall,
-)
-from .skills.capabilities import (
-    SKILL_DELETE_OUTPUT_KIND,
-    SKILL_DELETE_TOOL_NAME,
-    SKILL_SAVE_OUTPUT_KIND,
-    SKILL_SAVE_TOOL_NAME,
-    SKILL_VIEW_OUTPUT_KIND,
 )
 from .domains.data.capabilities import (
     DATA_QUERY_TOOL_NAME,
@@ -104,6 +58,51 @@ from .domains.data.file_capabilities import (
     LOCAL_FILE_SEARCH_CAPABILITY_ID,
 )
 from .domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
+from .jobs.capabilities import (
+    JOB_CANCEL_CAPABILITY_ID,
+    JOB_INSPECT_CAPABILITY_ID,
+    JOB_LIST_CAPABILITY_ID,
+    JOB_READ_RESULTS_CAPABILITY_ID,
+)
+from .llm.errors import (
+    ContextEvidencePressureExceeded,
+    ContextWindowExceeded,
+    RequestSensitivityUnavailable,
+    ToolManifestLimitExceeded,
+)
+from .llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    ModelProfile,
+    ModelRequest,
+    ModelSensitivity,
+    TextBlock,
+    ToolCall,
+    ToolDefinition,
+    ToolResultBlock,
+)
+from .loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
+from .memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
+from .scope import SourceScopeCatalog, resolve_effective_source_scope
+from .semantics import (
+    SEMANTIC_DELETE_OUTPUT_KIND,
+    SEMANTIC_DELETE_TOOL_NAME,
+    SEMANTIC_SAVE_CAPABILITY_ID,
+    SEMANTIC_SAVE_OUTPUT_KIND,
+    SEMANTIC_SAVE_TOOL_NAME,
+    SemanticAnnotation,
+    SemanticAnnotationView,
+    SemanticResourceFact,
+    inspect_semantic_annotations,
+    render_semantic_recall,
+)
+from .skills.capabilities import (
+    SKILL_DELETE_OUTPUT_KIND,
+    SKILL_DELETE_TOOL_NAME,
+    SKILL_SAVE_OUTPUT_KIND,
+    SKILL_SAVE_TOOL_NAME,
+    SKILL_VIEW_OUTPUT_KIND,
+)
 from .skills.store import Skill, SkillSummary, render_skill_index
 
 _MAXIMUM_PRIOR_COMPLETED_RUNS = 8

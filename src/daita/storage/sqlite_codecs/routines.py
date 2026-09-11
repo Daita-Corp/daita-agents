@@ -50,12 +50,12 @@ from .distribution import (
     encode_outcome_contract,
 )
 from .execution_scope import (
-    decode_execution_scope,
-    encode_execution_scope,
-    decode_execution_contract_bindings,
-    encode_execution_contract_bindings,
     decode_capability_grant,
+    decode_execution_contract_bindings,
+    decode_execution_scope,
     encode_capability_grant,
+    encode_execution_contract_bindings,
+    encode_execution_scope,
 )
 
 _ROUTINE_VERSION = 1

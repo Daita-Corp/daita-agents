@@ -111,9 +111,9 @@ from ..learning_candidates import (
     LearningReviewRunTail,
 )
 from ..llm.models import (
-    ModelSensitivity,
     CanonicalMessage,
     MessageRole,
+    ModelSensitivity,
     ToolResultBlock,
 )
 from ..llm.pricing import CostEstimateStatus
@@ -169,8 +169,8 @@ from .sqlite_codecs import (
     decode_loop_exit,
     decode_mcp_binding,
     decode_message,
-    decode_relational_write_scope,
     decode_receipt,
+    decode_relational_write_scope,
     decode_review_stamps,
     decode_routine_occurrence,
     decode_run_input,
@@ -188,8 +188,8 @@ from .sqlite_codecs import (
     encode_loop_exit,
     encode_mcp_binding,
     encode_message,
-    encode_relational_write_scope,
     encode_receipt,
+    encode_relational_write_scope,
     encode_review_stamps,
     encode_routine_occurrence,
     encode_run_input,
@@ -211,9 +211,9 @@ from .sqlite_records import (
     EffectOutcome,
     EffectReceipt,
     EffectReceiptConflictError,
-    EffectUnresolvedError,
     EffectResolution,
     EffectResolutionDecision,
+    EffectUnresolvedError,
     RelationalWriteScope,
     SourcePermissionStateError,
     SourceReadMode,

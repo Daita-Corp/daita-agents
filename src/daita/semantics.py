@@ -16,8 +16,8 @@ from ._json import FrozenJsonObject, canonical_json
 from .capabilities import (
     AccessMode,
     AutomationEligibility,
-    Capability,
     AutomationScopeProposal,
+    Capability,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,
@@ -35,8 +35,8 @@ from .capability_runtime import CapabilityFailure, SideEffectPlan
 from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
 from .domains.learning import LearningCandidateGuard
 from .llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
-from .scope import resolve_effective_source_scope
 from .loop.models import RunInput, Transcript
+from .scope import resolve_effective_source_scope
 from .storage.sqlite_records import SourcePermissionStateError
 
 SEMANTIC_MAX_ANNOTATIONS = 256

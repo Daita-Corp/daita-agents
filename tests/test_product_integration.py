@@ -8,6 +8,9 @@ from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
+from _workspace_support import workspace_for
+from test_mcp_actions import ActionFixture, response
+from test_native_write_public import create_fixture
 from textual.widgets import Input, OptionList, Static
 
 from daita import (
@@ -15,9 +18,9 @@ from daita import (
     ApprovalDecision,
     EffectResolutionDecision,
     OnceSchedule,
+    cli,
 )
 from daita._json import FrozenJsonObject
-from daita import cli
 from daita.artifacts.models import ArtifactAuthorship
 from daita.distribution import ArtifactRequirement, OutcomeState
 from daita.llm.models import ModelSensitivity, ToolCall
@@ -28,9 +31,6 @@ from daita.tui.screens.permissions import PermissionsScreen
 from daita.tui.screens.routines import render_routine_inspection
 from daita.tui.screens.selection import SelectionScreen
 from daita.tui.widgets.approval import ApprovalPanel
-from _workspace_support import workspace_for
-from test_mcp_actions import ActionFixture, response
-from test_native_write_public import create_fixture
 
 pytestmark = pytest.mark.acceptance
 
@@ -329,7 +329,7 @@ def test_approval_rejects_secret_fields_without_confusing_token_budgets(
 
 @pytest.mark.parametrize("operation", ("update", "upsert"))
 def test_native_review_sanitizes_preview_text_and_denies_oversized_details(operation):
-    from daita.capabilities import ApprovalRequest, MAX_APPROVAL_DOCUMENT_CHARACTERS
+    from daita.capabilities import MAX_APPROVAL_DOCUMENT_CHARACTERS, ApprovalRequest
 
     arguments = {
         "arguments": {"assignments": [{"column": "name", "value": "\x1b[2JNew"}]},

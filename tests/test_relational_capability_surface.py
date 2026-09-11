@@ -31,10 +31,10 @@ from daita.domains.data import (
     SQLiteReadResult,
     data_export_tabular_capability_declarations,
     data_query_capability_declarations,
-    relational_update_capability_declarations,
-    relational_upsert_capability_declarations,
-    relational_update_preview_capability_declarations,
     project_result_rows,
+    relational_update_capability_declarations,
+    relational_update_preview_capability_declarations,
+    relational_upsert_capability_declarations,
     resource_revision_observation_declarations,
 )
 from daita.domains.data.routine_precheck import ResourceRevisionCatalog

@@ -12,8 +12,8 @@ import openai
 import pytest
 from _workspace_support import workspace_for
 
-import daita.llm.providers.subscription_cli.process as subscription_process
 import daita.llm.providers.codex as codex_provider
+import daita.llm.providers.subscription_cli.process as subscription_process
 import daita.llm.subscription_auth as subscription_auth
 from daita import Agent
 from daita.llm.errors import (

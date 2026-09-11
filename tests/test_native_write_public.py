@@ -19,14 +19,14 @@ from test_relational_upsert import Database
 
 from daita import (
     Agent,
-    CalendarSchedule,
     CalendarDaySelector,
+    CalendarSchedule,
+    EffectRequirement,
     MCPToolSelection,
-    ScheduledRoutineDraft,
     MisfirePolicy,
     ReportingMode,
     RequestedCapabilityGrant,
-    EffectRequirement,
+    ScheduledRoutineDraft,
 )
 from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters import postgresql as pg, postgresql_write as native
@@ -34,9 +34,9 @@ from daita.adapters.mcp import StreamableHTTPMCPClientFactory
 from daita.adapters.models import DiscoveryRequest, SourceRegistration
 from daita.capabilities import (
     ApprovalDecision,
+    CapabilityInputError,
     EffectEvidenceBasis,
     EffectOutcome,
-    CapabilityInputError,
 )
 from daita.catalog.models import ResourceKind, Sensitivity, TabularColumn, TabularIndex
 from daita.distribution.models import OutcomeState
@@ -46,11 +46,11 @@ from daita.llm.models import (
     ModelProfile,
     ModelRequest,
     ModelResponse,
-    ModelUsage,
     ModelSensitivity,
+    ModelUsage,
+    TextBlock,
     ToolCall,
     ToolResultBlock,
-    TextBlock,
 )
 from daita.llm.pricing import CostEstimate
 
@@ -348,6 +348,7 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
     tmp_path, monkeypatch, review_action
 ):
     from test_relational_update_runtime import _Connection, _row
+
     from daita.tui.projection import approval_review_document
 
     agent, provider, db, _, _, resource, _, batch, _, _ = await create_fixture(

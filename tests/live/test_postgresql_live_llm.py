@@ -17,10 +17,10 @@ from _postgresql_live_llm_support import (
     AUTHORIZATION,
     EXPIRES,
     FIXTURE_SENSITIVITY,
+    LIMITS,
     NEXT_SLOT,
     NOW,
     REPORT_INSTRUCTION,
-    LIMITS,
     USER_FLOW_LIMITS,
     assert_exact_preview,
     assert_preview_binding,
@@ -37,10 +37,10 @@ from daita import EffectRequirement, ScheduledRoutineDraft
 from daita._json import FrozenJsonObject
 from daita.capabilities import EffectEvidenceBasis, EffectOutcome
 from daita.distribution.models import OutcomeState, outcome_contract_projection
-from daita.storage.sqlite_records import EffectResolutionDecision
 from daita.llm.models import CanonicalMessage, MessageRole, TextBlock
-from daita.loop.models import RunInput, LoopExit, LoopExitKind
+from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.routines.capabilities import _parsed_spec
+from daita.storage.sqlite_records import EffectResolutionDecision
 
 pytestmark = [
     pytest.mark.acceptance,

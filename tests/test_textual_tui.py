@@ -61,7 +61,6 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.routines.models import ScheduleKind
 from daita.security import CredentialSession, SecretReference, SecretResolutionError
 from daita.tui.app import DaitaApp
-from daita.tui.projection import run_failure_notice
 from daita.tui.clipboard import (
     MAX_CLIPBOARD_UTF8_BYTES,
     ClipboardResult,
@@ -93,6 +92,7 @@ from daita.tui.projection import (
     approval_review_document,
     project_tool_details,
     redact_presentation_value,
+    run_failure_notice,
 )
 from daita.tui.sanitization import sanitize_terminal_text
 from daita.tui.screens.catalog import CatalogScreen
@@ -3081,8 +3081,8 @@ def test_stopped_run_reports_effect_receipt_without_inventing_business_success(o
 
 
 def test_interrupted_transcript_never_marks_unanswered_tool_done():
-    from daita.loop.models import Transcript, RunInput
     from daita.llm.models import CanonicalMessage, MessageRole
+    from daita.loop.models import RunInput, Transcript
     from daita.tui.projection import project_transcript
 
     run = RunInput(

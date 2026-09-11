@@ -57,7 +57,6 @@ from .artifacts.models import (
     artifact_destination_to_mapping,
     artifact_ref_to_mapping,
 )
-from .routines.capabilities import routine_projection, routine_inspection_projection
 from .cli_text import (
     _edit_learning_candidate,
 )
@@ -79,12 +78,13 @@ from .llm import (
 )
 from .llm.profiles import reviewed_model_profile
 from .llm.protocols import ManagedModelProvider
+from .routines.capabilities import routine_inspection_projection, routine_projection
 from .security import SecretReference
 from .terminal import run_terminal_application
-from .tui.projection import run_failure_notice, tool_outcome_summary
 from .tui.models import (
     validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
 )
+from .tui.projection import run_failure_notice, tool_outcome_summary
 from .workspace import paths_overlap
 
 _CANDIDATE_REVIEW_COST_LIMIT_ENV = "DAITA_CANDIDATE_REVIEW_MAX_COST_USD"

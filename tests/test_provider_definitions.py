@@ -19,8 +19,8 @@ from daita.llm.provider_definitions import (
     admit_model_selection,
     provider_definition,
 )
-from daita.llm.providers.openai_compatible import OpenAICompatibleProvider
 from daita.llm.providers.mock import MockModelProvider
+from daita.llm.providers.openai_compatible import OpenAICompatibleProvider
 from daita.security import SecretReference
 from daita.tui.models import PROVIDERS
 

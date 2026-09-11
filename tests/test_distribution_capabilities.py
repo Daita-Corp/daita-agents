@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from _capability_runtime_support import frozen_execution_bindings
-
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 
+from _capability_runtime_support import frozen_execution_bindings
 from _distribution_support import inbox_distribution_plan
 from _workspace_support import workspace_for
 

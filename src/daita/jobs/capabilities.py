@@ -10,8 +10,8 @@ from ..artifacts.models import artifact_ref_to_mapping
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
-    Capability,
     AutomationScopeProposal,
+    Capability,
     CapabilityDeclarations,
     CapabilityInputError,
     Executor,

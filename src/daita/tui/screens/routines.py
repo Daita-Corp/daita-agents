@@ -4,13 +4,6 @@ from __future__ import annotations
 
 import json
 
-from daita._json import FrozenJsonObject
-from daita.routines.capabilities import (
-    routine_inspection_projection,
-    routine_projection,
-)
-from ..projection import approval_summary
-
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -24,7 +17,13 @@ from daita import (
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
+from daita._json import FrozenJsonObject
+from daita.routines.capabilities import (
+    routine_inspection_projection,
+    routine_projection,
+)
 
+from ..projection import approval_summary
 from ..sanitization import safe_display, sanitize_terminal_text
 from .confirm import ConfirmScreen
 

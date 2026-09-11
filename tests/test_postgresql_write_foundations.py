@@ -19,13 +19,13 @@ from daita.catalog.models import (
     TabularColumn,
     TabularFacet,
 )
+from daita.context import _tool_guidance
 from daita.domains.data.capabilities import (
     RELATIONAL_UPDATE_CAPABILITY_ID,
     RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
     relational_update_capability_declarations,
     relational_update_preview_capability_declarations,
 )
-from daita.context import _tool_guidance
 from daita.hosting import embedded as embedded_module
 from daita.security import EmptySecretProvider, SecretReference
 from daita.storage.sqlite_records import SourceReadMode, SourceReadScope

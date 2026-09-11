@@ -6,6 +6,16 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from test_relational_update_preview import (
+    NOW,
+    RESOURCE_ID,
+    RESOURCE_REVISION,
+    SOURCE_ID,
+    SOURCE_REVISION,
+    _guardrails,
+    _registration,
+    _SourceStore,
+)
 
 from daita._json import FrozenJsonObject
 from daita.adapters import postgresql_write as native
@@ -19,16 +29,6 @@ from daita.domains.data.sql.relational_upsert import (
 from daita.llm.models import ModelSensitivity
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite_records import RelationalWriteScope
-from test_relational_update_preview import (
-    _registration,
-    _SourceStore,
-    _guardrails,
-    NOW,
-    SOURCE_ID,
-    RESOURCE_ID,
-    SOURCE_REVISION,
-    RESOURCE_REVISION,
-)
 
 
 def resource() -> ResourceSchema:

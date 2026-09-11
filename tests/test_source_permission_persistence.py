@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _relational_write_support import update_scope
-
 import asyncio
 import json
 import sqlite3
@@ -11,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from _relational_write_support import update_scope
 
 from daita.adapters.models import SourceRegistration
 from daita.catalog.models import (

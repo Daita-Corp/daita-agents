@@ -4,44 +4,43 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import os
-import inspect
 import subprocess
 import sys
 from collections import Counter
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from statistics import mean, median
 from time import perf_counter
 from typing import cast
-from statistics import mean, median
 from uuid import uuid4
 
 import httpx
+from _distribution_support import no_artifact_outcome_contract
 from _mcp_fixtures import MCPConformanceTransport, MCPFixtureIdentity
 from _workspace_support import workspace_for
 from live.benchmarks._support import RecordingProvider
 
 from daita import (
     Agent,
-    LoopLimits,
-    MCPToolSelection,
-    create_llm_provider,
     CalendarDaySelector,
     CalendarSchedule,
-    ScheduledRoutineDraft,
+    EffectRequirement,
+    LoopLimits,
+    MCPToolSelection,
     MisfirePolicy,
     ReportingMode,
     RequestedCapabilityGrant,
-    EffectRequirement,
+    ScheduledRoutineDraft,
+    create_llm_provider,
 )
-from _distribution_support import no_artifact_outcome_contract
-from daita._json import FrozenJsonObject
-from dataclasses import replace
-from daita._json import canonical_json
+from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters.mcp import StreamableHTTPMCPClientFactory
 from daita.capabilities import (
     AccessMode,

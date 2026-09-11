@@ -8,19 +8,19 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters import (
     postgresql as postgresql_module,
     postgresql_write as write_module,
 )
 from daita.adapters.models import SourceRegistration, source_registration_id
+from daita.capabilities import ToolExecution
 from daita.catalog.models import ResourceKind, TabularColumn
-from daita.domains.data.sql import RelationalUpdateIntent, ResourceSchema
 from daita.domains.data.capabilities import (
     RelationalUpdateBackend,
     RelationalUpdateExecutor,
 )
-from daita.capabilities import ToolExecution
-from daita._json import FrozenJsonObject, canonical_json
+from daita.domains.data.sql import RelationalUpdateIntent, ResourceSchema
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite_records import RelationalWriteScope
 
