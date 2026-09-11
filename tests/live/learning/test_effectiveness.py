@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import Sequence
 from contextlib import AsyncExitStack
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -27,23 +27,14 @@ from daita.evaluation import (
     build_learning_effectiveness_report,
     measure_observer_events,
 )
-from daita.llm._lifecycle import closing_stream
 from daita.llm.models import (
     CanonicalMessage,
-    ModelRequest,
-    ModelResponse,
-    ModelStreamEvent,
     TextBlock,
     ToolCall,
     ToolResultBlock,
 )
 from daita.llm.profiles import reviewed_model_profile
-from daita.llm.protocols import (
-    ManagedModelProvider,
-    StreamingModelProvider,
-    provider_has_complete_pricing,
-)
-from daita.loop.models import LoopExit, LoopExitKind, Transcript
+from daita.loop.models import Transcript
 from daita.observation import AgentEvent
 from daita.security import EnvironmentSecretProvider, SecretReference
 from tests.support.learning_evaluation import (

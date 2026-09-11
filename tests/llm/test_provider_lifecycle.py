@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from collections.abc import AsyncGenerator
 from contextvars import ContextVar
 from dataclasses import replace

@@ -18,7 +18,6 @@ from tests.tui._support import (
     FinishReason,
     FrozenJsonObject,
     LoopExit,
-    LoopExitKind,
     MockModelProvider,
     ModelResponse,
     ObserverEvent,

@@ -11,11 +11,8 @@ from daita._json import FrozenJsonObject
 from daita.capabilities import (
     ApprovalDecision,
     EffectEvidenceBasis,
-    EffectObservation,
     EffectOutcome,
-    ToolExecution,
     ToolLoadMode,
-    ToolOutput,
     ToolView,
 )
 from daita.capability_runtime import CapabilityRuntime, SideEffectPlan

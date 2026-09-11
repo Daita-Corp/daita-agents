@@ -2,41 +2,25 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import replace
-from decimal import Decimal
 from typing import Any, cast
 
 import anthropic
 import httpx
 import openai
-import pytest
 from google import genai
 from google.genai import types
 
-from daita.llm.errors import (
-    ModelProviderError,
-    ProviderErrorCode,
-    interrupted_attempt_diagnostic,
-    interrupted_model_usage,
-)
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
-    ModelCallPolicy,
     ModelRequest,
     TextBlock,
-    ToolCall,
     ToolDefinition,
-    ToolResultBlock,
 )
 from daita.llm.providers.anthropic import AnthropicMessagesProvider
 from daita.llm.providers.gemini import GeminiProvider
 from daita.llm.providers.openai import OpenAIResponsesProvider
-from tests.support.job_benchmarks import RecordingProvider
 
 
 @asynccontextmanager

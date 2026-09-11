@@ -15,9 +15,11 @@ from tests.support.product_workflows import (
     effect_receipt_mapping,
     patch,
     pytest,
-    pytestmark,
+    pytestmark as _pytestmark,
     workspace_for,
 )
+
+pytestmark = _pytestmark
 
 
 @pytest.mark.parametrize("surface", ("cli", "tui"))

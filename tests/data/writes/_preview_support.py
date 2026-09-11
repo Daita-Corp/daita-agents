@@ -2,29 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import UTC, datetime
-from types import SimpleNamespace
-from typing import cast
-from unittest.mock import AsyncMock
 
-import pytest
-
-from daita._json import FrozenJsonObject, canonical_json
-from daita.adapters import (
-    postgresql as postgresql_module,
-    postgresql_write as write_module,
-)
 from daita.adapters.models import SourceRegistration, source_registration_id
-from daita.capabilities import ToolExecution
-from daita.catalog.models import ResourceKind, TabularColumn
-from daita.domains.data.capabilities import (
-    RelationalUpdateBackend,
-    RelationalUpdateExecutor,
-)
-from daita.domains.data.sql import RelationalUpdateIntent, ResourceSchema
-from daita.security import EmptySecretProvider
-from daita.storage.sqlite_records import RelationalWriteScope
 
 NOW = datetime(2026, 8, 14, 12, 0, tzinfo=UTC)
 SOURCE_ID = source_registration_id(

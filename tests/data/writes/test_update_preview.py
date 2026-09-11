@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -13,7 +12,6 @@ from daita.adapters import (
     postgresql as postgresql_module,
     postgresql_write as write_module,
 )
-from daita.adapters.models import SourceRegistration, source_registration_id
 from daita.capabilities import ToolExecution
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.capabilities import (
@@ -24,7 +22,6 @@ from daita.domains.data.sql import RelationalUpdateIntent, ResourceSchema
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite_records import RelationalWriteScope
 from tests.data.writes._preview_support import (
-    NOW,
     RESOURCE_ID,
     RESOURCE_REVISION,
     SOURCE_ID,

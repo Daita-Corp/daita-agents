@@ -3,24 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from pathlib import Path
 from uuid import uuid4
 
-import pytest
-
-from daita.distribution.models import OutcomeState
 from daita.llm.models import CanonicalMessage, MessageRole, ModelSensitivity, TextBlock
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from tests.support.mcp_routine_harness import (
-    NEXT_SLOT,
     NOW,
     REPORT_INSTRUCTION,
-    RESEARCH_TOKEN,
-    SOURCE,
-    assert_action,
-    assert_completed,
-    evaluate,
-    live_provider,
     owner_routine_draft,
 )
 

@@ -13,10 +13,12 @@ from tests.support.product_workflows import (
     cli,
     patch,
     pytest,
-    pytestmark,
+    pytestmark as _pytestmark,
     replace,
     workspace_for,
 )
+
+pytestmark = _pytestmark
 
 
 async def test_background_refresh_preserves_foreground_approval_state(tmp_path):

@@ -11,9 +11,7 @@ from daita.llm.errors import (
 )
 from daita.llm.factory import create_model_route_provider
 from daita.llm.models import (
-    CanonicalMessage,
     FinishReason,
-    MessageRole,
     ModelProfile,
     ModelRequest,
     ModelResponse,
@@ -21,7 +19,6 @@ from daita.llm.models import (
     ModelStreamCompleted,
     ModelTextDelta,
     ModelUsage,
-    TextBlock,
 )
 from daita.llm.pricing import (
     CostBasis,

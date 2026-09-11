@@ -4,20 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from time import monotonic
 from typing import Any
 
 import pytest
 
 from daita import Agent, ApprovalDecision, ApprovalRequest
-from daita._json import thaw_json
 from daita.adapters import postgresql_write as native
 from daita.capabilities import EffectEvidenceBasis, EffectOutcome
 from daita.security import SecretReference
-from daita.storage.sqlite_records import EffectReceipt, EffectResolutionDecision
+from daita.storage.sqlite_records import EffectReceipt
 from tests.support.postgresql_write_release import DriverProbe, WriteModel
 from tests.support.workspace import workspace_for
 

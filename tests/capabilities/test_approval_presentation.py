@@ -7,9 +7,11 @@ from tests.support.product_workflows import (
     approval_review_document,
     json,
     pytest,
-    pytestmark,
+    pytestmark as _pytestmark,
     replace,
 )
+
+pytestmark = _pytestmark
 
 
 @pytest.mark.parametrize("field", ("password", "api_key", "access_token"))

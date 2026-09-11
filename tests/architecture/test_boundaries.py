@@ -1,12 +1,10 @@
 import ast
 import inspect
-import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
 
 import daita
 from daita.capabilities import AccessMode, OperationalEffect
-from daita.storage.sqlite import SQLiteStateStore
 from tests.support.workspace import workspace_for
 
 PACKAGE = Path(daita.__file__).parent

@@ -17,13 +17,15 @@ from tests.support.product_workflows import (
     approval_review_document,
     choose,
     create_fixture,
-    pytestmark,
+    pytestmark as _pytestmark,
     render_routine_inspection,
     replace,
     response,
     timedelta,
     workspace_for,
 )
+
+pytestmark = _pytestmark
 
 
 async def test_guided_upsert_authoring_applies_exact_preview(tmp_path, monkeypatch):

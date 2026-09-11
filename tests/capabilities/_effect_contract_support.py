@@ -2,34 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import UTC, datetime, timedelta
-from decimal import Decimal
-
-import pytest
-
-from daita._json import FrozenJsonObject
 from daita.capabilities import (
     AccessMode,
     AutomationEligibility,
     AutomationGrantPolicy,
-    AutomationScopeProposal,
     Capability,
-    CapabilityInputError,
     EffectEvidenceBasis,
-    EffectObservation,
-    EffectOutcome,
     EffectReceiptPolicy,
-    ExecutionContractBindings,
     OperationalEffect,
-    ToolExecution,
-    ToolOutput,
-    ToolOutputValidationError,
-    capability_contract_digest,
 )
-from daita.capability_runtime import CapabilityRuntime
-from daita.llm.models import ModelSensitivity
-from tests.support.capability_runtime import StaticTestDomain, static_registry
 
 _SCHEMA = {
     "type": "object",

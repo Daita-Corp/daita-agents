@@ -1,7 +1,6 @@
 import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
-from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 from typing import cast
@@ -44,7 +43,6 @@ from daita.loop import (
     RunInput,
     RunOrigin,
     RunStartEnvelope,
-    ToolBatchOutcome,
     ToolRuntime,
 )
 from daita.observation import AgentEvent, AgentEventKind

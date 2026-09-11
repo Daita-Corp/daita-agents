@@ -9,9 +9,11 @@ from tests.support.product_workflows import (
     approval_review_document,
     json,
     pytest,
-    pytestmark,
+    pytestmark as _pytestmark,
     replace,
 )
+
+pytestmark = _pytestmark
 
 
 async def test_routine_control_api_reviews_exact_validated_revision_and_denial_saves_nothing(
