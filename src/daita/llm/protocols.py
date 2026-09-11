@@ -9,6 +9,13 @@ from .models import ModelRequest, ModelResponse, ModelStreamEvent
 
 
 class ModelProvider(Protocol):
+    """Honor call_policy and absolute deadlines, including bounded native retirement.
+
+    supports_request_policy covers this entire contract for both delivery modes.
+    An injected implementation remains caller-owned; a false declaration cannot
+    turn arbitrary cancellation-resistant application code into native I/O.
+    """
+
     @property
     def provider_id(self) -> str: ...
 
@@ -21,7 +28,7 @@ class ModelProvider(Protocol):
 class ManagedModelProvider(ModelProvider, Protocol):
     """A provider whose creator owns and can deterministically release it."""
 
-    async def close(self) -> None: ...
+    async def close(self, *, deadline: float | None = None) -> None: ...
 
 
 @runtime_checkable

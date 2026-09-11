@@ -14,18 +14,26 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json, thaw_json
-from .._lifecycle import await_cleanup, closing_stream, input_count_deadline
+from .._lifecycle import (
+    AttemptLifecycle,
+    NativeOwner,
+    await_cleanup,
+    closing_stream,
+    native_events,
+    shutdown_deadline,
+    transport_timeout,
+)
 from ..errors import (
     ModelProviderError,
-    interrupted_model_usage,
-    with_cancelled_model_usage,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
-    detached_provider_error,
-    token_count_error,
     before_generation,
+    detached_provider_error,
+    interrupted_model_usage,
     retry_after_from_headers,
+    token_count_error,
+    with_cancelled_model_usage,
 )
 from ..models import (
     CanonicalMessage,
@@ -43,20 +51,16 @@ from ..models import (
     ToolResultBlock,
 )
 from ..pricing import (
-    bound_request_output,
-    with_request_admission,
     BillableQuantity,
     CostEstimate,
     PricingSchedule,
+    bound_request_output,
     calculate_cost_estimate,
     has_complete_pricing_coverage,
     load_bundled_pricing_schedules,
     validate_pricing_schedules,
+    with_request_admission,
 )
-
-
-class _NativeStream(Protocol):
-    async def close(self) -> None: ...
 
 
 class _ResponsesResource(Protocol):
@@ -147,6 +151,7 @@ class OpenAIResponsesProvider:
         self._client = client
         self._owns_client = client is None
         self._close_task: asyncio.Task[None] | None = None
+        self._native_owner = NativeOwner()
         self._id_factory = _new_id if id_factory is None else id_factory
         self._service_tier = service_tier
         self._region = region
@@ -210,12 +215,16 @@ class OpenAIResponsesProvider:
                 return cast(_OpenAIClient, with_options(max_retries=0))
         return self._client
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Join the once-only cleanup of this provider's owned SDK client."""
 
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._finish_close())
-        await await_cleanup(self._close_task)
+        await await_cleanup(
+            self._close_task,
+            deadline=shutdown_deadline(deadline),
+            owner=self._native_owner,
+        )
 
     async def _finish_close(self) -> None:
         client = self._client
@@ -226,22 +235,30 @@ class OpenAIResponsesProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        attempt = AttemptLifecycle(self._native_owner, request, headers_supported=True)
+        request = attempt.request
         failure: ModelProviderError | None = None
         try:
             request.remaining_after(
                 ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
             )
-            async with asyncio.timeout_at(request.deadline):
-                return await self._generate(request)
+            async with attempt:
+                response = await self._generate(request, attempt)
+                attempt.response(response)
+                attempt.check_execution()
+            attempt.finish(None)
+            return attempt.observation.response(response)
         except TimeoutError as error:
             failure = ModelProviderError(
                 ProviderErrorCode.TIMEOUT,
                 "The model request deadline expired.",
                 usage=interrupted_model_usage(error),
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            attempt.finish(error)
             raise
-        except ImportError:
+        except ImportError as error:
+            attempt.finish(error)
             raise
         except ModelProviderError as error:
             failure = error
@@ -256,18 +273,27 @@ class OpenAIResponsesProvider:
             )
         if failure is None:
             raise AssertionError("OpenAI provider failed without an error")
+        if attempt.terminal_response is not None:
+            failure.usage = attempt.usage()
+        attempt.finish(failure)
         raise detached_provider_error(failure, provider_id=self.provider_id)
 
-    async def _generate(self, request: ModelRequest) -> ModelResponse:
+    async def _generate(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         arguments = self._request_arguments(request)
         requested_at = self._clock()
         counted_input_tokens = await self._admit_request(
-            request, arguments, requested_at=requested_at
+            request, arguments, attempt, requested_at=requested_at
         )
         try:
-            response = await self.client.responses.create(**arguments)
+            attempt.values["output_cap"] = arguments.get("max_output_tokens")
+            attempt.dispatch()
+            response = await self._sdk_call(
+                self.client.responses, "create", arguments, attempt, "generation"
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -275,6 +301,7 @@ class OpenAIResponsesProvider:
         except ModelProviderError:
             raise
         except Exception as error:
+            attempt.transport_failure(error, phase="generation")
             raise _normalize_error(error) from error
         try:
             return with_request_admission(
@@ -306,15 +333,30 @@ class OpenAIResponsesProvider:
 
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        attempt = AttemptLifecycle(
+            self._native_owner, request, headers_supported=True, observable=True
+        )
+        terminal_usage: ModelUsage | None = None
+        request = attempt.request
         failure: ModelProviderError | None = None
         try:
             request.remaining_after(
                 ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
             )
-            async with asyncio.timeout_at(request.deadline):
-                async with closing_stream(self._stream(request)) as events:
+            async with attempt:
+                async with closing_stream(self._stream(request, attempt)) as events:
                     async for event in events:
+                        if isinstance(event, ModelStreamCompleted):
+                            terminal_usage = event.response.usage
+                            terminal = attempt.response(event.response)
+                            break
+                        attempt.canonical(event)
                         yield event
+                attempt.check_execution()
+                if terminal_usage is not None:
+                    attempt.finish(None)
+                    yield ModelStreamCompleted(attempt.observation.response(terminal))
+            attempt.finish(None)
             return
         except TimeoutError as error:
             failure = ModelProviderError(
@@ -322,9 +364,13 @@ class OpenAIResponsesProvider:
                 "The model request deadline expired.",
                 usage=interrupted_model_usage(error),
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            if isinstance(error, asyncio.CancelledError) and terminal_usage is not None:
+                with_cancelled_model_usage(error, terminal_usage)
+            attempt.finish(error)
             raise
-        except ImportError:
+        except ImportError as error:
+            attempt.finish(error)
             raise
         except ModelProviderError as error:
             failure = error
@@ -339,22 +385,37 @@ class OpenAIResponsesProvider:
             )
         if failure is None:
             raise AssertionError("OpenAI provider failed without an error")
+        if terminal_usage is not None:
+            failure.usage = terminal_usage
+        if attempt.terminal_response is not None:
+            failure.usage = attempt.usage()
+        attempt.finish(failure)
         raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _stream(
         self,
         request: ModelRequest,
+        attempt: AttemptLifecycle,
     ) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         arguments = self._request_arguments(request)
         requested_at = self._clock()
         counted_input_tokens = await self._admit_request(
-            request, arguments, requested_at=requested_at
+            request, arguments, attempt, requested_at=requested_at
         )
         arguments["stream"] = True
         try:
-            stream = await self.client.responses.create(**arguments)
+            attempt.values["output_cap"] = arguments.get("max_output_tokens")
+            attempt.dispatch()
+            source = native_events(
+                lambda: self.client.responses.create(
+                    **arguments, timeout=transport_timeout(request)
+                ),
+                observe=lambda stream: self._observe_headers(
+                    attempt, "generation", _safe_field(stream, "response")
+                ),
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -362,6 +423,10 @@ class OpenAIResponsesProvider:
         except ModelProviderError:
             raise
         except Exception as error:
+            response = _safe_field(error, "response")
+            if response is not None:
+                self._observe_headers(attempt, "generation", response, arrived=False)
+            attempt.transport_failure(error, phase="generation")
             raise _normalize_error(error) from error
 
         canonical_ids_by_index: dict[int, str] = {}
@@ -373,20 +438,41 @@ class OpenAIResponsesProvider:
         completed = False
         current_event_type: str | None = None
         terminal_diagnostic: ProviderFailureDiagnostic | None = None
-        async with closing_stream(
-            cast(AsyncIterator[object], stream),
-            close=cast(_NativeStream, stream).close,
-        ):
+        sequence_number: int | None = None
+        response_identity: str | None = None
+        async with attempt.stream(source) as stream:
             try:
                 async for event in cast(AsyncIterator[object], stream):
+                    attempt.native(
+                        _safe_field(event, "type"),
+                        _safe_field(_safe_field(event, "response"), "id"),
+                    )
                     current_event_type = None
                     event_type = _required_text(
                         _field(event, "type"), "stream event type"
                     )
                     current_event_type = _safe_structural_token(event_type)
+                    sequence = _field(event, "sequence_number", None)
+                    if sequence is not None:
+                        sequence = _nonnegative_int(sequence, "stream sequence number")
+                        if sequence_number is not None and sequence <= sequence_number:
+                            raise ValueError("stream sequence did not advance")
+                        sequence_number = sequence
+                    native_response = _field(event, "response", None)
+                    native_identity = _optional_stream_identity(
+                        _field(native_response, "id", None), "stream response id"
+                    )
+                    if native_identity is not None:
+                        if (
+                            response_identity is not None
+                            and native_identity != response_identity
+                        ):
+                            raise ValueError("stream response identity changed")
+                        response_identity = native_identity
                     if event_type == "response.output_text.delta":
                         delta = _stream_fragment(_field(event, "delta"), "text delta")
                         if delta:
+                            attempt.progress(delta)
                             yield ModelTextDelta(delta)
                     elif event_type == "response.output_item.added":
                         item = _field(event, "item")
@@ -442,6 +528,7 @@ class OpenAIResponsesProvider:
                                 )
                             allocated_ids.add(canonical_id)
                             canonical_ids_by_index[index] = canonical_id
+                        attempt.progress(arguments_delta)
                         yield ModelToolCallDelta(
                             index=index,
                             arguments_delta=arguments_delta,
@@ -528,6 +615,13 @@ class OpenAIResponsesProvider:
                         )
                         completed = True
                         return
+                    elif event_type in {
+                        "response.reasoning_summary_text.delta",
+                        "response.reasoning_text.delta",
+                    }:
+                        attempt.progress(
+                            _stream_fragment(_field(event, "delta"), "reasoning delta")
+                        )
                     elif event_type == "error":
                         code = _optional_text(
                             _field(event, "code", None), "stream error code"
@@ -557,6 +651,10 @@ class OpenAIResponsesProvider:
                     ),
                 ) from error
             except Exception as error:
+                self._observe_headers(
+                    attempt, "generation", _safe_field(error, "response"), arrived=False
+                )
+                attempt.transport_failure(error, phase="generation")
                 raise _normalize_error(error) from error
         if not completed:
             raise ModelProviderError(
@@ -568,6 +666,70 @@ class OpenAIResponsesProvider:
                     code="terminal_completion_missing",
                 ),
             )
+
+    @staticmethod
+    def _observe_headers(
+        attempt: AttemptLifecycle, phase: str, response: object, *, arrived: bool = True
+    ) -> None:
+        try:
+            headers = getattr(response, "headers", None)
+            request_id = (
+                headers.get("x-request-id") if isinstance(headers, Mapping) else None
+            )
+            attempt.headers(
+                phase,
+                getattr(response, "status_code", None),
+                request_id,
+                arrived=arrived,
+            )
+        except Exception:
+            pass  # Optional SDK metadata cannot change request behavior.
+
+    async def _sdk_call(
+        self,
+        resource: object,
+        method: str,
+        arguments: dict[str, object],
+        attempt: AttemptLifecycle,
+        phase: str,
+    ) -> object:
+        arguments = {
+            **arguments,
+            "timeout": transport_timeout(
+                attempt.request, deadline=attempt._phase_deadline
+            ),
+        }
+
+        async def scope():
+            view = getattr(resource, "with_streaming_response", None)
+            if view is None:
+                attempt.values[f"{phase}_headers_availability"] = "unsupported"
+                yield await getattr(resource, method)(**arguments)
+                return
+            try:
+                async with getattr(view, method)(**arguments) as raw:
+                    attempt.track_response_release(_safe_field(raw, "http_response"))
+                    self._observe_headers(attempt, phase, raw)
+                    yield await raw.parse()
+            except Exception as error:
+                self._observe_headers(
+                    attempt, phase, _safe_field(error, "response"), arrived=False
+                )
+                raise
+
+        if phase == "count":
+
+            async def count():
+                async with closing_stream(scope()) as results:
+                    return await anext(results)
+
+            return await attempt.run_native(count())
+        async with attempt.stream(scope()) as results:
+            response = await anext(results)
+            attempt.response(
+                self._decode_response(response, requested_at=self._clock())
+            )
+            return response
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
         arguments: dict[str, object] = {
@@ -611,6 +773,7 @@ class OpenAIResponsesProvider:
         self,
         request: ModelRequest,
         arguments: dict[str, object],
+        attempt: AttemptLifecycle,
         *,
         requested_at: datetime,
     ) -> int | None:
@@ -644,13 +807,15 @@ class OpenAIResponsesProvider:
             for key, value in arguments.items()
             if key not in {"max_output_tokens", "service_tier", "store", "include"}
         }
+        attempt.start_count()
         try:
             counter = cast(
                 _InputTokensResource,
                 getattr(self.client.responses, "input_tokens", None),
             )
-            async with asyncio.timeout_at(input_count_deadline(request)):
-                counted = await counter.count(**count_arguments)
+            counted = await self._sdk_call(
+                counter, "count", count_arguments, attempt, "count"
+            )
         except asyncio.CancelledError as error:
             raise with_cancelled_model_usage(
                 error, ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
@@ -660,6 +825,7 @@ class OpenAIResponsesProvider:
         except (TypeError, ValueError):
             raise token_count_error(invalid=True) from None
         except Exception as error:
+            attempt.transport_failure(error, phase="count")
             raise before_generation(
                 _normalize_error(error),
                 code="input_token_count_failed",
@@ -667,7 +833,9 @@ class OpenAIResponsesProvider:
         tokens = _field(counted, "input_tokens", None)
         if type(tokens) is not int or tokens < 0:
             raise token_count_error(invalid=True)
+        attempt.counted(tokens)
         arguments["max_output_tokens"] = output_limit(tokens)
+        attempt.values["output_cap"] = arguments["max_output_tokens"]
         return tokens
 
     def _decode_response(
@@ -1048,6 +1216,8 @@ def _billable_quantities(usage: ModelUsage) -> tuple[BillableQuantity, ...]:
 
 
 def _normalize_error(error: Exception) -> ModelProviderError:
+    if isinstance(error, ModelProviderError):
+        return error
     status_value = _field(error, "status_code", None)
     status = (
         status_value

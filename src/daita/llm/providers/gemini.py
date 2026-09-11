@@ -13,18 +13,25 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
-from .._lifecycle import await_cleanup, closing_stream, input_count_deadline
+from .._lifecycle import (
+    AttemptLifecycle,
+    NativeOwner,
+    await_cleanup,
+    closing_stream,
+    native_events,
+    shutdown_deadline,
+)
 from ..errors import (
     ModelProviderError,
-    interrupted_model_usage,
-    with_cancelled_model_usage,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
-    detached_provider_error,
-    token_count_error,
     before_generation,
+    detached_provider_error,
+    interrupted_model_usage,
     retry_after_from_headers,
+    token_count_error,
+    with_cancelled_model_usage,
 )
 from ..models import (
     CanonicalMessage,
@@ -42,15 +49,15 @@ from ..models import (
     ToolResultBlock,
 )
 from ..pricing import (
-    bound_request_output,
-    with_request_admission,
     BillableQuantity,
     CostEstimate,
     PricingSchedule,
+    bound_request_output,
     calculate_cost_estimate,
     has_complete_pricing_coverage,
     load_bundled_pricing_schedules,
     validate_pricing_schedules,
+    with_request_admission,
 )
 
 _CONTINUATION_KEY = "gemini_continuation"
@@ -85,6 +92,25 @@ def _new_id(prefix: str) -> str:
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _argument_snapshot_grew(previous: object, current: object) -> bool:
+    """Validate monotone cumulative argument snapshots without counting repeats."""
+    if previous == current:
+        return False
+    if isinstance(previous, Mapping) and isinstance(current, Mapping):
+        if not previous.keys() <= current.keys():
+            raise ValueError("function argument snapshot lost fields")
+        for key, value in previous.items():
+            _argument_snapshot_grew(value, current[key])
+        return True
+    if (
+        isinstance(previous, str)
+        and isinstance(current, str)
+        and current.startswith(previous)
+    ):
+        return True
+    raise ValueError("function argument snapshot changed existing values")
 
 
 class GeminiProvider:
@@ -123,6 +149,7 @@ class GeminiProvider:
         self._client = client
         self._owns_client = client is None
         self._close_task: asyncio.Task[None] | None = None
+        self._native_owner = NativeOwner()
         self._id_factory = _new_id if id_factory is None else id_factory
         self._pricing_schedules = (
             load_bundled_pricing_schedules()
@@ -173,12 +200,16 @@ class GeminiProvider:
             self._client = cast(_GeminiClient, genai.Client(api_key=self._api_key))
         return self._client
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Join the once-only cleanup of this provider's owned SDK client."""
 
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._finish_close())
-        await await_cleanup(self._close_task)
+        await await_cleanup(
+            self._close_task,
+            deadline=shutdown_deadline(deadline),
+            owner=self._native_owner,
+        )
 
     async def _finish_close(self) -> None:
         client = self._client
@@ -200,22 +231,30 @@ class GeminiProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        attempt = AttemptLifecycle(self._native_owner, request, headers_supported=False)
+        request = attempt.request
         failure: ModelProviderError | None = None
         try:
             request.remaining_after(
                 ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
             )
-            async with asyncio.timeout_at(request.deadline):
-                return await self._generate(request)
+            async with attempt:
+                response = await self._generate(request, attempt)
+                attempt.response(response)
+                attempt.check_execution()
+            attempt.finish(None)
+            return attempt.observation.response(response)
         except TimeoutError as error:
             failure = ModelProviderError(
                 ProviderErrorCode.TIMEOUT,
                 "The model request deadline expired.",
                 usage=interrupted_model_usage(error),
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            attempt.finish(error)
             raise
-        except ImportError:
+        except ImportError as error:
+            attempt.finish(error)
             raise
         except ModelProviderError as error:
             failure = error
@@ -230,19 +269,41 @@ class GeminiProvider:
             )
         if failure is None:
             raise AssertionError("Gemini provider failed without an error")
+        if attempt.terminal_response is not None:
+            failure.usage = attempt.usage()
+        attempt.finish(failure)
         raise detached_provider_error(failure, provider_id=self.provider_id)
 
-    async def _generate(self, request: ModelRequest) -> ModelResponse:
+    async def _generate(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
+        cast(dict, arguments["config"])["http_options"]["timeout"] = max(
+            1,
+            int(
+                min(
+                    request.call_policy.read_timeout_seconds,
+                    cast(float, request.attempt_deadline)
+                    - asyncio.get_running_loop().time(),
+                )
+                * 1000
+            ),
+        )
         requested_at = self._clock()
         counted_input_tokens = await self._admit_request(
-            request, arguments, requested_at=requested_at
+            request, arguments, attempt, requested_at=requested_at
         )
         try:
-            response = await self.client.aio.models.generate_content(**arguments)
+            attempt.values["output_cap"] = cast(
+                dict[str, object], arguments["config"]
+            ).get("max_output_tokens")
+            attempt.dispatch()
+            response = await attempt.run_native(
+                self.client.aio.models.generate_content(**arguments)
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -250,6 +311,7 @@ class GeminiProvider:
         except ModelProviderError:
             raise
         except Exception as error:
+            attempt.transport_failure(error, phase="generation")
             raise _normalize_error(error) from error
         try:
             return with_request_admission(
@@ -282,15 +344,30 @@ class GeminiProvider:
     ) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        attempt = AttemptLifecycle(
+            self._native_owner, request, headers_supported=False, observable=True
+        )
+        terminal_usage: ModelUsage | None = None
+        request = attempt.request
         failure: ModelProviderError | None = None
         try:
             request.remaining_after(
                 ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
             )
-            async with asyncio.timeout_at(request.deadline):
-                async with closing_stream(self._stream(request)) as events:
+            async with attempt:
+                async with closing_stream(self._stream(request, attempt)) as events:
                     async for event in events:
+                        if isinstance(event, ModelStreamCompleted):
+                            terminal_usage = event.response.usage
+                            terminal = attempt.response(event.response)
+                            break
+                        attempt.canonical(event)
                         yield event
+                attempt.check_execution()
+                if terminal_usage is not None:
+                    attempt.finish(None)
+                    yield ModelStreamCompleted(attempt.observation.response(terminal))
+            attempt.finish(None)
             return
         except TimeoutError as error:
             failure = ModelProviderError(
@@ -298,9 +375,13 @@ class GeminiProvider:
                 "The model request deadline expired.",
                 usage=interrupted_model_usage(error),
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            if isinstance(error, asyncio.CancelledError) and terminal_usage is not None:
+                with_cancelled_model_usage(error, terminal_usage)
+            attempt.finish(error)
             raise
-        except ImportError:
+        except ImportError as error:
+            attempt.finish(error)
             raise
         except ModelProviderError as error:
             failure = error
@@ -315,23 +396,44 @@ class GeminiProvider:
             )
         if failure is None:
             raise AssertionError("Gemini provider failed without an error")
+        if terminal_usage is not None:
+            failure.usage = terminal_usage
+        if attempt.terminal_response is not None:
+            failure.usage = attempt.usage()
+        attempt.finish(failure)
         raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _stream(
         self,
         request: ModelRequest,
+        attempt: AttemptLifecycle,
     ) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
+        cast(dict, arguments["config"])["http_options"]["timeout"] = max(
+            1,
+            int(
+                min(
+                    request.call_policy.read_timeout_seconds,
+                    cast(float, request.attempt_deadline)
+                    - asyncio.get_running_loop().time(),
+                )
+                * 1000
+            ),
+        )
         requested_at = self._clock()
         counted_input_tokens = await self._admit_request(
-            request, arguments, requested_at=requested_at
+            request, arguments, attempt, requested_at=requested_at
         )
         try:
-            raw_stream = await self.client.aio.models.generate_content_stream(
-                **arguments
+            attempt.values["output_cap"] = cast(
+                dict[str, object], arguments["config"]
+            ).get("max_output_tokens")
+            attempt.dispatch()
+            source = native_events(
+                lambda: self.client.aio.models.generate_content_stream(**arguments)
             )
         except asyncio.CancelledError:
             raise
@@ -340,28 +442,17 @@ class GeminiProvider:
         except ModelProviderError:
             raise
         except Exception as error:
+            attempt.transport_failure(error, phase="generation")
             raise _normalize_error(error) from error
-        iterator_method = getattr(raw_stream, "__aiter__", None)
-        if not callable(iterator_method):
-            raise ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "Gemini returned a malformed stream",
-                provider_id=self.provider_id,
-                diagnostic=ProviderFailureDiagnostic(
-                    phase=ProviderFailurePhase.STREAM_TERMINAL,
-                    code="stream_not_iterable",
-                ),
-            )
-
         text_fragments: list[str] = []
         provider_parts: list[dict[str, object]] = []
         canonical_call_ids: list[str] = []
+        calls_by_native_id: dict[str, dict[str, object]] = {}
         finish_reason: str | None = None
         usage_value: object | None = None
         response_id: str | None = None
         model_version: str | None = None
-        iterator = cast(AsyncIterator[object], iterator_method())
-        async with closing_stream(iterator):
+        async with attempt.stream(source) as iterator:
             while True:
                 try:
                     chunk = await anext(iterator)
@@ -372,7 +463,13 @@ class GeminiProvider:
                 except ModelProviderError:
                     raise
                 except Exception as error:
+                    attempt.transport_failure(error, phase="generation")
                     raise _normalize_error(error) from error
+                try:
+                    native_id = _field(chunk, "response_id", None)
+                except Exception:
+                    native_id = None
+                attempt.native("generate_content_chunk", native_id)
                 try:
                     chunk_model = _optional_text(
                         _field(chunk, "model_version", None),
@@ -456,6 +553,7 @@ class GeminiProvider:
                         if part_text is not None:
                             if not isinstance(part_text, str):
                                 raise ValueError("stream part text must be text")
+                            attempt.progress(part_text)
                             provider_part["text"] = part_text
                             if not thought:
                                 text_fragments.append(part_text)
@@ -463,6 +561,16 @@ class GeminiProvider:
                                     yield ModelTextDelta(part_text)
                         function_call = _field(part, "function_call", None)
                         if function_call is not None:
+                            # Vertex partial-argument messages are not supported
+                            # by this Gemini API adapter. Never treat a partial
+                            # JSON object as an executable complete function call.
+                            if (
+                                _field(function_call, "partial_args", None) is not None
+                                or _field(function_call, "will_continue", None) is True
+                            ):
+                                raise ValueError(
+                                    "partial function protocol is unsupported"
+                                )
                             if part_text is not None:
                                 raise ValueError(
                                     "stream part cannot contain text and a function call"
@@ -488,6 +596,21 @@ class GeminiProvider:
                             }
                             if native_id is not None:
                                 native_call["id"] = native_id
+                                previous_call = calls_by_native_id.get(native_id)
+                                if previous_call is not None:
+                                    if previous_call["name"] != name:
+                                        raise ValueError(
+                                            "stream function identity changed"
+                                        )
+                                    if _argument_snapshot_grew(
+                                        previous_call["args"], native_call["args"]
+                                    ):
+                                        previous_call["args"] = native_call["args"]
+                                        attempt.progress(
+                                            canonical_json(arguments_value)
+                                        )
+                                    continue
+                                calls_by_native_id[native_id] = native_call
                             provider_part["function_call"] = native_call
                             canonical_id = self._id_factory("call")
                             if canonical_id in canonical_call_ids:
@@ -495,12 +618,10 @@ class GeminiProvider:
                                     "id_factory returned a duplicate call ID"
                                 )
                             canonical_call_ids.append(canonical_id)
-                            yield ModelToolCallDelta(
-                                index=len(canonical_call_ids) - 1,
-                                arguments_delta=canonical_json(arguments_value),
-                                id=canonical_id,
-                                name=name,
-                                provider_call_id=native_id,
+                            attempt.progress(
+                                canonical_json(arguments_value)
+                                if arguments_value
+                                else ""
                             )
                         if not provider_part:
                             raise ValueError("stream contains an empty part")
@@ -548,59 +669,71 @@ class GeminiProvider:
                         ),
                     ) from error
 
-        if finish_reason is None:
-            raise ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "Gemini stream ended without a finish reason",
-                provider_id=self.provider_id,
-                diagnostic=ProviderFailureDiagnostic(
-                    phase=ProviderFailurePhase.STREAM_TERMINAL,
-                    code="terminal_completion_missing",
-                ),
-            )
-        try:
-            response = self._decode_response(
-                {
-                    "response_id": response_id,
-                    "candidates": [
-                        {
-                            "finish_reason": finish_reason,
-                            "content": {"parts": provider_parts},
-                        }
-                    ],
-                    "prompt_feedback": None,
-                    "usage_metadata": usage_value,
-                    "model_version": model_version,
-                },
-                canonical_call_ids=canonical_call_ids,
-                requested_at=requested_at,
-            )
-        except ModelProviderError:
-            raise
-        except (KeyError, TypeError, ValueError) as error:
-            raise ModelProviderError(
-                ProviderErrorCode.MALFORMED_RESPONSE,
-                "Gemini returned a malformed stream",
-                provider_id=self.provider_id,
-                diagnostic=ProviderFailureDiagnostic(
-                    phase=ProviderFailurePhase.STREAM_TERMINAL,
-                    code="terminal_response_decode_failed",
-                    terminal_status=_safe_structural_token(finish_reason),
-                ),
-            ) from error
-        yield ModelStreamCompleted(
-            with_request_admission(
-                response,
-                request,
-                input_tokens=counted_input_tokens,
-                output_cap=cast(
-                    int | None,
-                    cast(dict[str, object], arguments["config"]).get(
-                        "max_output_tokens"
+            if finish_reason is None:
+                raise ModelProviderError(
+                    ProviderErrorCode.MALFORMED_RESPONSE,
+                    "Gemini stream ended without a finish reason",
+                    provider_id=self.provider_id,
+                    diagnostic=ProviderFailureDiagnostic(
+                        phase=ProviderFailurePhase.STREAM_TERMINAL,
+                        code="terminal_completion_missing",
                     ),
-                ),
+                )
+            try:
+                response = self._decode_response(
+                    {
+                        "response_id": response_id,
+                        "candidates": [
+                            {
+                                "finish_reason": finish_reason,
+                                "content": {"parts": provider_parts},
+                            }
+                        ],
+                        "prompt_feedback": None,
+                        "usage_metadata": usage_value,
+                        "model_version": model_version,
+                    },
+                    canonical_call_ids=canonical_call_ids,
+                    requested_at=requested_at,
+                )
+            except ModelProviderError:
+                raise
+            except (KeyError, TypeError, ValueError) as error:
+                raise ModelProviderError(
+                    ProviderErrorCode.MALFORMED_RESPONSE,
+                    "Gemini returned a malformed stream",
+                    provider_id=self.provider_id,
+                    diagnostic=ProviderFailureDiagnostic(
+                        phase=ProviderFailurePhase.STREAM_TERMINAL,
+                        code="terminal_response_decode_failed",
+                        terminal_status=_safe_structural_token(finish_reason),
+                    ),
+                ) from error
+            # Whole-object native snapshots are emitted once, after their final
+            # response has validated; replayed snapshots cannot renew progress
+            # or produce duplicate/partially executable canonical calls.
+            attempt.response(response)
+            for index, call in enumerate(response.tool_calls):
+                yield ModelToolCallDelta(
+                    index=index,
+                    arguments_delta=canonical_json(call.arguments),
+                    id=call.id,
+                    name=call.name,
+                    provider_call_id=call.provider_call_id,
+                )
+            yield ModelStreamCompleted(
+                with_request_admission(
+                    response,
+                    request,
+                    input_tokens=counted_input_tokens,
+                    output_cap=cast(
+                        int | None,
+                        cast(dict[str, object], arguments["config"]).get(
+                            "max_output_tokens"
+                        ),
+                    ),
+                )
             )
-        )
 
     def _require_supported_request_policy(self, request: ModelRequest) -> None:
         if not self.supports_request_policy(request):
@@ -659,6 +792,7 @@ class GeminiProvider:
         self,
         request: ModelRequest,
         arguments: dict[str, object],
+        attempt: AttemptLifecycle,
         *,
         requested_at: datetime,
     ) -> int | None:
@@ -683,23 +817,35 @@ class GeminiProvider:
             )
 
         output_limit(0, counted=False)
+        attempt.start_count()
         try:
             # google-genai's Developer API count config rejects tools/system
             # fields. Its public extra_body option supports the documented full
             # generateContentRequest instead. Use the already prepared content.
-            async with asyncio.timeout_at(input_count_deadline(request)):
-                counted = await self.client.aio.models.count_tokens(
+            counted = await attempt.run_native(
+                self.client.aio.models.count_tokens(
                     model=self.model,
                     contents=None,
                     config={
                         "http_options": {
                             "retry_options": {"attempts": 1},
+                            "timeout": max(
+                                1,
+                                int(
+                                    (
+                                        attempt.execution_deadline
+                                        - asyncio.get_running_loop().time()
+                                    )
+                                    * 1000
+                                ),
+                            ),
                             "extra_body": {
                                 "generateContentRequest": _count_request(arguments),
                             },
                         },
                     },
                 )
+            )
         except asyncio.CancelledError as error:
             raise with_cancelled_model_usage(
                 error, ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
@@ -709,6 +855,7 @@ class GeminiProvider:
         except (TypeError, ValueError):
             raise token_count_error(invalid=True) from None
         except Exception as error:
+            attempt.transport_failure(error, phase="count")
             raise before_generation(
                 _normalize_error(error),
                 code="input_token_count_failed",
@@ -716,9 +863,13 @@ class GeminiProvider:
         tokens = _field(counted, "total_tokens", None)
         if type(tokens) is not int or tokens < 0:
             raise token_count_error(invalid=True)
+        attempt.counted(tokens)
         cast(dict[str, object], arguments["config"])["max_output_tokens"] = (
             output_limit(tokens)
         )
+        attempt.values["output_cap"] = cast(dict[str, object], arguments["config"])[
+            "max_output_tokens"
+        ]
         return tokens
 
     def _decode_response(
@@ -1297,6 +1448,17 @@ def _finish_reason(value: str) -> FinishReason:
 
 
 def _normalize_error(error: Exception) -> ModelProviderError:
+    if isinstance(error, ModelProviderError):
+        return error
+    if isinstance(error, (ValueError, TypeError, KeyError)):
+        return ModelProviderError(
+            ProviderErrorCode.MALFORMED_RESPONSE,
+            "Gemini returned an undecodable native response",
+            diagnostic=ProviderFailureDiagnostic(
+                phase=ProviderFailurePhase.STREAM_EVENT,
+                code="native_response_decode_failed",
+            ),
+        )
     code_value = _lenient_field(error, "code")
     status = (
         code_value

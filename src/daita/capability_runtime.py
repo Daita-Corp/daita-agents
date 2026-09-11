@@ -22,6 +22,7 @@ from .artifacts.models import (
 from .artifacts.store import AgentHomeArtifactStore
 from .capabilities import (
     TOOLBOX_DEFINITIONS,
+    AccessMode,
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
@@ -32,6 +33,7 @@ from .capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     CapabilityRegistry,
+    RESERVED_TOOL_NAMES,
     Executor,
     ExecutionContractReader,
     EffectObservation,
@@ -279,6 +281,8 @@ class ToolboxManifestEntry:
     summary: str
     pinned_count: int
     on_demand_count: int
+    access_modes: tuple[AccessMode, ...]
+    operational_effects: tuple[OperationalEffect, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,12 +407,14 @@ class _ToolOutcomeUnknown(RuntimeError):
     pass
 
 
-_CONTROL_TOOL_NAMES = frozenset({"toolbox_search", "toolbox_load"})
+_CONTROL_TOOL_NAMES = RESERVED_TOOL_NAMES
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 
-def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
-    return (
+def _control_definitions(
+    limits: LoopLimits, entries: tuple[RunToolCatalogEntry, ...]
+) -> tuple[ToolDefinition, ...]:
+    definitions = (
         ToolDefinition(
             name="toolbox_search",
             description=(
@@ -440,7 +446,8 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
             description=(
                 "Atomically load an exact on-demand working set. A successful load "
                 "replaces the prior set on the next model step; ordinary validation "
-                "and governance still apply."
+                "and governance still apply. Retains bounded contracts in the result; "
+                "use toolbox_inspect for omitted contracts without changing this set."
             ),
             input_schema={
                 "type": "object",
@@ -457,6 +464,41 @@ def _control_definitions(limits: LoopLimits) -> tuple[ToolDefinition, ...]:
                 "additionalProperties": False,
             },
         ),
+        ToolDefinition(
+            name="toolbox_inspect",
+            description=(
+                "Inspect an exact prepared tool contract without loading or executing it. "
+                "The result retains schemas for later composition. For a partial result, "
+                "use its exact contract_digest, child path or next_offset to retrieve more. "
+                "Paths use JSON Pointer; inspection grants no authority."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "tool_name": {"type": "string", "minLength": 1, "maxLength": 128},
+                    "contract_digest": {
+                        "type": "string",
+                        "pattern": r"^sha256:[0-9a-f]{64}$",
+                    },
+                    "path": {"type": "string", "maxLength": 2048},
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 2 * 1024 * 1024,
+                    },
+                },
+                "required": ["tool_name"],
+                "additionalProperties": False,
+            },
+        ),
+    )
+
+    if any(entry.load_mode is ToolLoadMode.ON_DEMAND for entry in entries):
+        return definitions
+    return (
+        tuple(tool for tool in definitions if tool.name == "toolbox_inspect")
+        if entries
+        else ()
     )
 
 
@@ -888,11 +930,7 @@ class CapabilityRuntime:
             )
         )
         _validate_pinned_surface(pinned_definitions, self._limits)
-        controls = (
-            _control_definitions(self._limits)
-            if any(entry.load_mode is ToolLoadMode.ON_DEMAND for entry in entries)
-            else ()
-        )
+        controls = _control_definitions(self._limits, entries)
         _validate_step_surface(
             tuple(sorted((*pinned_definitions, *controls), key=lambda item: item.name)),
             self._limits,
@@ -1247,11 +1285,7 @@ class CapabilityRuntime:
                 call.arguments,
             )
         except (TypeError, ValueError, RuntimeError):
-            code = (
-                "toolbox_load_invalid"
-                if call.name == "toolbox_load"
-                else "toolbox_search_invalid"
-            )
+            code = f"{call.name}_invalid"
             return _ResolvedCall(
                 call,
                 call,
@@ -1346,6 +1380,10 @@ class CapabilityRuntime:
             result = prepared_result
         elif control_name == "toolbox_search":
             result = self._toolbox_search(call, projection, sensitivity=sensitivity)
+        elif control_name == "toolbox_inspect":
+            result = await self._toolbox_inspect(
+                run, call, projection, sensitivity=sensitivity
+            )
         else:
             result = _error(
                 call,
@@ -1362,6 +1400,96 @@ class CapabilityRuntime:
             catalog_entry=None,
         )
         return result
+
+    async def _toolbox_inspect(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        projection: StepToolProjection,
+        *,
+        sensitivity: ModelSensitivity,
+    ) -> ToolResultBlock:
+        name = call.arguments["tool_name"]
+        entry = next(
+            (item for item in projection.catalog_entries if item.view.name == name),
+            None,
+        )
+        if entry is None:
+            return _error(
+                call,
+                "toolbox_tool_not_available",
+                "The tool is outside this run's prepared candidates.",
+            )
+        if not _entry_resolves_exactly(entry, self._registry):
+            return _error(
+                call,
+                "toolbox_inspect_stale",
+                "The prepared contract no longer resolves exactly.",
+            )
+        # Local admission only: domain projection performs no executor or remote call.
+        # Intersect with the frozen candidates; later attachment cannot expand inspection.
+        try:
+            current_names = await self._domains[entry.domain_owner_id].project(run)
+        except Exception:
+            return _error(
+                call,
+                "toolbox_inspect_unavailable",
+                "Current local admission could not be checked; no contract was returned.",
+            )
+        if name not in current_names:
+            return _error(
+                call,
+                "toolbox_inspect_stale",
+                "The prepared tool is no longer locally applicable.",
+            )
+        contract = _tool_contract(entry)
+        expected = call.arguments.get("contract_digest")
+        path = cast(str, call.arguments.get("path", ""))
+        offset = cast(int, call.arguments.get("offset", 0))
+        if expected is not None and expected != contract["contract_digest"]:
+            return _error(
+                call,
+                "toolbox_inspect_stale",
+                "The requested contract digest does not match this prepared tool.",
+            )
+        if (path or offset) and expected is None:
+            return _error(
+                call,
+                "toolbox_inspect_reference_required",
+                "Subtree and page retrieval require the exact returned contract_digest.",
+            )
+        try:
+            data = _inspection_page(
+                contract,
+                path,
+                offset,
+                maximum_bytes=self._limits.max_toolbox_load_result_bytes,
+                maximum_children=self._limits.max_toolbox_search_results,
+                maximum_depth=self._limits.max_tool_result_depth - 1,
+            )
+        except KeyError:
+            return _error(
+                call,
+                "toolbox_inspect_path_invalid",
+                "The exact contract path or offset does not exist.",
+            )
+        except ValueError:
+            return _error(
+                call,
+                "toolbox_inspect_limit_exceeded",
+                "The requested inspection cannot fit the configured result bound.",
+            )
+        return _control_success(
+            call,
+            "toolbox_inspection_result",
+            data,
+            sensitivity=max(
+                (sensitivity, entry.view.presentation_sensitivity),
+                key=lambda item: item.routing_rank,
+            ),
+            run_id=projection.run_id,
+            catalog_digest=projection.catalog_digest,
+        )
 
     def _toolbox_search(
         self,
@@ -1434,6 +1562,7 @@ class CapabilityRuntime:
             if (
                 len(canonical_json(data).encode("utf-8"))
                 <= self._limits.max_toolbox_search_result_bytes
+                and _json_depth(data) < self._limits.max_tool_result_depth
             ) and (matches or total == 0):
                 return _control_success(
                     call,
@@ -1546,14 +1675,7 @@ class CapabilityRuntime:
             for entry in projection.catalog_entries
             if entry.load_mode is ToolLoadMode.PINNED
         )
-        controls = (
-            _control_definitions(self._limits)
-            if any(
-                entry.load_mode is ToolLoadMode.ON_DEMAND
-                for entry in projection.catalog_entries
-            )
-            else ()
-        )
+        controls = _control_definitions(self._limits, projection.catalog_entries)
         next_definitions = tuple(
             sorted(
                 (
@@ -1586,8 +1708,11 @@ class CapabilityRuntime:
             "loaded_names": [entry.view.name for entry in loaded],
             "definition_bytes": definition_bytes,
             "activation_digest": activation_digest,
-            "contracts": [_automation_contract(entry) for entry in loaded],
+            "contracts": [
+                _tool_contract(entry, include_schemas=False) for entry in loaded
+            ],
         }
+        _fit_load_contracts(data, loaded, self._limits)
         if (
             len(canonical_json(data).encode("utf-8"))
             > self._limits.max_toolbox_load_result_bytes
@@ -2682,7 +2807,7 @@ def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
         "tool_name": entry.view.name,
         "capability_id": entry.capability.id,
         "automation_eligibility": entry.capability.automation_eligibility.value,
-        "requires_grant": policy is not None,
+        "requires_automation_grant": policy is not None,
         "grant_policy": (
             None
             if policy is None
@@ -2696,6 +2821,175 @@ def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
         ),
         "connector": entry.view.connector_presentation,
     }
+
+
+def _tool_contract_reference(entry: RunToolCatalogEntry) -> dict[str, object]:
+    return {
+        "tool_name": entry.view.name,
+        "capability_id": entry.capability.id,
+        "contract_digest": _sha256_digest(
+            {
+                "entry": _catalog_entry_material(entry),
+                "output_schema": entry.capability.output_schema,
+            }
+        ),
+        "input_schema_digest": entry.input_schema_digest,
+        "origin_revision_digest": entry.origin_revision_digest,
+        "complete": False,
+        "inspection_tool": "toolbox_inspect",
+    }
+
+
+def _tool_contract(
+    entry: RunToolCatalogEntry, *, include_schemas: bool = True
+) -> dict[str, object]:
+    """One registered declaration projection shared by search, load and inspection."""
+    contract = {
+        **_automation_contract(entry),
+        **_tool_contract_reference(entry),
+    }
+    if include_schemas:
+        contract.update(
+            complete=True,
+            input_schema=entry.capability.input_schema,
+            output_schema=entry.capability.output_schema,
+            output_kind=entry.capability.output_kind,
+            data_access=entry.capability.access_mode.value,
+            operational_effect=entry.capability.operational_effect.value,
+        )
+    return contract
+
+
+def _fit_load_contracts(
+    data: dict[str, object],
+    entries: tuple[RunToolCatalogEntry, ...],
+    limits: LoopLimits,
+) -> None:
+    """Omit whole schemas deterministically; verification uses the same projection."""
+    contracts = cast(list[dict[str, object]], data["contracts"])
+    remaining = list(range(len(contracts)))
+    while remaining and (
+        len(canonical_json(data).encode("utf-8")) > limits.max_toolbox_load_result_bytes
+        or _json_depth(data) >= limits.max_tool_result_depth
+    ):
+        index = max(
+            remaining,
+            key=lambda i: (
+                (
+                    _json_depth(contracts[i])
+                    if _json_depth(data) >= limits.max_tool_result_depth
+                    else 0
+                ),
+                len(canonical_json(contracts[i]).encode("utf-8")),
+            ),
+        )
+        contracts[index] = _tool_contract_reference(entries[index])
+        remaining.remove(index)
+
+
+def _inspection_page(
+    contract: dict[str, object],
+    path: str,
+    offset: int,
+    *,
+    maximum_bytes: int,
+    maximum_children: int,
+    maximum_depth: int,
+) -> dict[str, object]:
+    """Read a bounded part of one immutable contract; paths cannot address state."""
+    value: object = contract
+    if path:
+        if not path.startswith("/"):
+            raise KeyError(path)
+        for encoded in path[1:].split("/"):
+            if re.search(r"~(?![01])", encoded):
+                raise KeyError(path)
+            token = encoded.replace("~1", "/").replace("~0", "~")
+            if isinstance(value, Mapping) and token in value:
+                value = value[token]
+            elif isinstance(value, (tuple, list)) and re.fullmatch(
+                r"0|[1-9][0-9]*", token
+            ):
+                index = int(token)
+                if index >= len(value):
+                    raise KeyError(path)
+                value = value[index]
+            else:
+                raise KeyError(path)
+    base = {
+        "tool_name": contract["tool_name"],
+        "contract_digest": contract["contract_digest"],
+        "path": path,
+        "offset": offset,
+    }
+    full = {**base, "complete": True, "value": value}
+    if (
+        offset == 0
+        and len(canonical_json(full).encode("utf-8")) <= maximum_bytes
+        and _json_depth(full) <= maximum_depth
+    ):
+        return full
+    if isinstance(value, str):
+        if offset >= len(value):
+            raise KeyError(path)
+        end = min(len(value), offset + maximum_bytes)
+        while end > offset:
+            page = {
+                **base,
+                "complete": False,
+                "value_type": "string",
+                "text": value[offset:end],
+                "next_offset": end if end < len(value) else None,
+                "total_characters": len(value),
+            }
+            if (
+                len(canonical_json(page).encode("utf-8")) <= maximum_bytes
+                and _json_depth(page) <= maximum_depth
+            ):
+                return page
+            end = offset + (end - offset) // 2
+        raise ValueError("inspection string fragment cannot fit")
+    if isinstance(value, Mapping):
+        children = sorted(value.items())
+        kind = "object"
+    elif isinstance(value, (tuple, list)):
+        children = [(str(index), child) for index, child in enumerate(value)]
+        kind = "array"
+    else:
+        raise ValueError("inspection scalar cannot fit")
+    if offset >= len(children):
+        raise KeyError(path)
+    items: list[dict[str, object]] = []
+    page = {
+        **base,
+        "complete": False,
+        "value_type": kind,
+        "children": items,
+        "total_children": len(children),
+        "next_offset": offset,
+    }
+    for key, child in children[offset : offset + maximum_children]:
+        child_path = path + "/" + key.replace("~", "~0").replace("/", "~1")
+        item = {"path": child_path, "complete": True, "value": child}
+        items.append(item)
+        page["next_offset"] = (
+            offset + len(items) if offset + len(items) < len(children) else None
+        )
+        if (
+            len(canonical_json(page).encode("utf-8")) > maximum_bytes
+            or _json_depth(page) > maximum_depth
+        ):
+            items[-1] = {"path": child_path, "complete": False}
+        if (
+            len(canonical_json(page).encode("utf-8")) > maximum_bytes
+            or _json_depth(page) > maximum_depth
+        ):
+            items.pop()
+            page["next_offset"] = offset + len(items)
+            break
+    if not items:
+        raise ValueError("inspection child reference cannot fit")
+    return page
 
 
 def _toolbox_manifest(
@@ -2717,6 +3011,26 @@ def _toolbox_manifest(
                 and entry.load_mode is ToolLoadMode.ON_DEMAND
                 for entry in entries
             ),
+            access_modes=tuple(
+                sorted(
+                    {
+                        entry.capability.access_mode
+                        for entry in entries
+                        if entry.toolbox_id is definition.id
+                    },
+                    key=lambda mode: mode.value,
+                )
+            ),
+            operational_effects=tuple(
+                sorted(
+                    {
+                        entry.capability.operational_effect
+                        for entry in entries
+                        if entry.toolbox_id is definition.id
+                    },
+                    key=lambda effect: effect.value,
+                )
+            ),
         )
         for definition in TOOLBOX_DEFINITIONS
         if definition.id in available
@@ -2733,6 +3047,10 @@ def _manifest_material(
             "summary": item.summary,
             "pinned_count": item.pinned_count,
             "on_demand_count": item.on_demand_count,
+            "access_modes": tuple(mode.value for mode in item.access_modes),
+            "operational_effects": tuple(
+                effect.value for effect in item.operational_effects
+            ),
         }
         for item in manifest
     ]
@@ -2928,10 +3246,15 @@ def _verified_loaded_entries(
     definitions = tuple(registry.tool_definition(entry.view.name) for entry in entries)
     definition_bytes = _definition_bytes(definitions)
     expected_activation = _activation_digest(run_id, catalog_digest, entries)
+    expected_data: dict[str, object] = dict(data)
+    expected_data["contracts"] = [
+        _tool_contract(entry, include_schemas=False) for entry in entries
+    ]
+    _fit_load_contracts(expected_data, entries, limits)
     if (
         data.get("definition_bytes") != definition_bytes
         or canonical_json(data.get("contracts"))
-        != canonical_json([_automation_contract(entry) for entry in entries])
+        != canonical_json(expected_data["contracts"])
         or definition_bytes > limits.max_loaded_tool_definition_bytes
         or data.get("activation_digest") != expected_activation
         or len(canonical_json(data).encode("utf-8"))
@@ -2995,7 +3318,8 @@ def _toolbox_search_match(
         "toolbox_id": entry.toolbox_id.value,
         "capability_id": entry.capability.id,
         "automation_eligibility": entry.capability.automation_eligibility.value,
-        "requires_grant": entry.capability.automation_grant_policy is not None,
+        "requires_automation_grant": entry.capability.automation_grant_policy
+        is not None,
         "summary": entry.view.presentation.summary,
         "when_to_use": entry.view.presentation.when_to_use,
         "text_trust": entry.view.presentation.text_trust.value,
@@ -3006,7 +3330,8 @@ def _toolbox_search_match(
         "match_status": "matched" if score > 0 else "unmatched_fallback",
     }
     if entry.capability.automation_grant_policy is not None:
-        match["automation_contract"] = _automation_contract(entry)
+        match["automation_contract"] = _tool_contract(entry)
+    match["inspection_tool"] = "toolbox_inspect"
     return match
 
 
@@ -3100,14 +3425,7 @@ def _validate_step_projection(
         or projection.loaded_definition_bytes != _definition_bytes(loaded_definitions)
     ):
         raise ValueError("step projection loaded definitions exceed their bounds")
-    controls = (
-        _control_definitions(limits)
-        if any(
-            entry.load_mode is ToolLoadMode.ON_DEMAND
-            for entry in projection.catalog_entries
-        )
-        else ()
-    )
+    controls = _control_definitions(limits, projection.catalog_entries)
     expected_definitions = tuple(
         sorted(
             (

@@ -9,8 +9,8 @@ cancel, or corrupt the independently admitted job.
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from _workspace_support import workspace_for
@@ -132,7 +132,7 @@ async def test_transient_retry_after_start_receipt_does_not_reexecute_job_start(
     )
     router = ModelRouter(
         (_registration(scripted),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
     agent = await _open(home, router, router.model_profile)
     try:
@@ -165,7 +165,7 @@ async def test_permanent_provider_failure_after_receipt_leaves_one_durable_job(
     )
     router = ModelRouter(
         (_registration(scripted),),
-        retry_policy=RetryPolicy(attempts=5, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=5, backoff_seconds=0),
     )
     agent = await _open(home, router, router.model_profile)
     try:

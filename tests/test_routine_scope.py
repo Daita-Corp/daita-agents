@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from _capability_runtime_support import frozen_execution_bindings
-
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -11,6 +9,7 @@ from hashlib import sha256
 import pytest
 from _capability_runtime_support import (
     StaticTestDomain,
+    frozen_execution_bindings,
     presentation_metadata,
     static_registry,
 )
@@ -37,11 +36,11 @@ from daita.loop.models import (
     RunOrigin,
     RunStartEnvelope,
 )
+from daita.scope import resolve_effective_source_scope
 from daita.storage.sqlite_codecs.execution_scope import (
     decode_execution_scope,
     encode_execution_scope,
 )
-from daita.scope import resolve_effective_source_scope
 
 NOW = datetime(2026, 8, 27, 12, tzinfo=UTC)
 
@@ -322,10 +321,20 @@ def test_scheduled_origin_rejects_code_owned_instruction_authority() -> None:
     "changed_family",
     ("capability_contracts", "resource_revisions", "model_routes", "tool_origins"),
 )
+@pytest.mark.parametrize(
+    "machine_origin", [RunOrigin.SCHEDULED_ROUTINE, RunOrigin.JOB_EVENT]
+)
 async def test_machine_calls_revalidate_retained_contracts_after_preparation(
     changed_family: str,
+    machine_origin: RunOrigin,
 ) -> None:
     from daita.capabilities import CapabilityInputError, ExecutionContractBindings
+    from daita.hosting.embedded import _model_execution_contracts
+    from daita.llm import ModelCallPolicy
+    from daita.llm.providers.mock import MockModelProvider
+
+    model = MockModelProvider((), provider_id="mock:routine")
+    policy = ModelCallPolicy()
 
     capability = _capability("test.scheduled", AutomationEligibility.AUTOMATION_DIRECT)
     origin = "sha256:" + "d" * 64
@@ -350,7 +359,9 @@ async def test_machine_calls_revalidate_retained_contracts_after_preparation(
         capability_contracts={capability.id: registry.contract_digest(capability.id)},
         tool_origins={capability.id: origin},
         resource_revisions={"resource-1": "sha256:" + "e" * 64},
-        model_routes={"mock:routine": "sha256:" + "f" * 64},
+        model_routes=_model_execution_contracts(
+            model, model.model_profile, None, policy
+        ),
     )
     current = bindings
 
@@ -367,6 +378,26 @@ async def test_machine_calls_revalidate_retained_contracts_after_preparation(
         contract_bindings=bindings,
     )
     run = _scheduled_run(scope)
+    if machine_origin is RunOrigin.JOB_EVENT:
+        scope = replace(
+            scope,
+            routine_id=None,
+            routine_revision=None,
+            occurrence_id=None,
+            job_id="job-1",
+            job_revision=1,
+            allowed_connector_binding_ids=(),
+        )
+        assert run.start is not None
+        run = replace(
+            run,
+            start=replace(
+                run.start,
+                origin=machine_origin,
+                instruction_authority=InstructionAuthority.CODE_OWNED,
+                execution_scope=scope,
+            ),
+        )
     messages = (run.start_message(),)
     catalog = await runtime.prepare_run(run)
     projection = runtime.project(catalog, messages)
@@ -379,7 +410,12 @@ async def test_machine_calls_revalidate_retained_contracts_after_preparation(
     )
     assert not first[0].is_error
     values = dict(getattr(bindings, changed_family))
-    values[next(iter(values))] = "sha256:" + "0" * 64
+    if changed_family == "model_routes":
+        values = _model_execution_contracts(
+            model, model.model_profile, None, replace(policy, cleanup_timeout_seconds=6)
+        )
+    else:
+        values[next(iter(values))] = "sha256:" + "0" * 64
     current = replace(bindings, **{changed_family: values})
     blocked = await runtime.execute_all(
         run,

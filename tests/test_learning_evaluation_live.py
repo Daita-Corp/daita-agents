@@ -109,7 +109,7 @@ class _RecordingProvider:
             async for event in events:
                 yield event
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 

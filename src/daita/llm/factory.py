@@ -6,7 +6,6 @@ import asyncio
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
 from decimal import Decimal
-from typing import cast
 
 from ..security import (
     KeychainStore,
@@ -14,7 +13,14 @@ from ..security import (
     SecretResolutionError,
     default_secret_provider,
 )
-from ._lifecycle import await_cleanup, closing_stream
+from ._lifecycle import (
+    AttemptLifecycle,
+    NativeOwner,
+    await_cleanup,
+    closing_stream,
+    materialize_request,
+    shutdown_deadline,
+)
 from .errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -150,6 +156,7 @@ class _LazyProvider:
         self._secrets = secrets
         self._provider: ModelProvider | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._native_owner = NativeOwner()
 
     @property
     def provider_id(self) -> str:
@@ -189,10 +196,12 @@ class _LazyProvider:
         return provider_has_complete_pricing(provider, request)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
+        request = materialize_request(request)
         provider = await self._resolve(request)
         return await provider.generate(request)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        request = materialize_request(request)
         provider = await self._resolve(request)
         if not self._candidate.profile.supports_streaming or not isinstance(
             provider, StreamingModelProvider
@@ -207,9 +216,10 @@ class _LazyProvider:
                 yield event
 
     async def _resolve(self, request: ModelRequest) -> ModelProvider:
+        attempt = AttemptLifecycle(self._native_owner, request)
         try:
-            async with asyncio.timeout_at(request.deadline):
-                return await self._resolve_before_generation(request)
+            async with attempt:
+                return await self._resolve_before_generation(attempt.request, attempt)
         except TimeoutError:
             raise before_generation(
                 ModelProviderError(
@@ -220,14 +230,18 @@ class _LazyProvider:
                 code="provider_resolution_timeout",
             ) from None
         except asyncio.CancelledError as error:
+            attempt.finish(error)
             raise with_cancelled_model_usage(
                 error,
                 ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0))),
             ) from None
         except ModelProviderError as error:
+            attempt.finish(error)
             raise before_generation(error, code="provider_resolution_failed") from None
 
-    async def _resolve_before_generation(self, request: ModelRequest) -> ModelProvider:
+    async def _resolve_before_generation(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelProvider:
         request.remaining_after(
             ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
         )
@@ -249,7 +263,7 @@ class _LazyProvider:
                 credential = (
                     None
                     if reference is None
-                    else await self._secrets.resolve(reference)
+                    else await attempt.run_native(self._secrets.resolve(reference))
                 )
             except SecretResolutionError as error:
                 raise ModelProviderError(
@@ -257,6 +271,8 @@ class _LazyProvider:
                     "The configured provider credential could not be resolved.",
                     provider_id=self.provider_id,
                 ) from None
+            attempt.check_execution()
+            self._native_owner.require_available()
             credential_updater: Callable[[str], Awaitable[None]] | None = None
             if provider_name == "codex" and reference is not None:
 
@@ -291,18 +307,21 @@ class _LazyProvider:
                 )
         return self._provider
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Join once-only cleanup without activating unused delegates."""
 
+        deadline = shutdown_deadline(deadline)
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._finish_close())
-        await await_cleanup(self._close_task)
+            self._close_task = asyncio.create_task(self._finish_close(deadline))
+        await await_cleanup(
+            self._close_task, deadline=deadline, owner=self._native_owner
+        )
 
-    async def _finish_close(self) -> None:
+    async def _finish_close(self, deadline: float) -> None:
         provider = self._provider
         if provider is not None:
             assert isinstance(provider, ManagedModelProvider)
-            await provider.close()
+            await provider.close(deadline=deadline)
         self._provider = None
 
 
@@ -333,8 +352,6 @@ def create_model_route_provider(
         )
         for candidate in route.candidates
     )
-    if len(registrations) == 1 and route.retry_policy.attempts == 1:
-        return cast(ManagedModelProvider, registrations[0].provider)
     return ModelRouter(registrations, retry_policy=route.retry_policy)
 
 

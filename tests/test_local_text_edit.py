@@ -137,6 +137,71 @@ def _profile(provider: _EditWorkflowProvider) -> ModelProfile:
     )
 
 
+@pytest.mark.parametrize("profile", ["strict", "user_flow"])
+async def test_live_text_edit_report_captures_real_offline_workflow(
+    tmp_path, monkeypatch, profile
+):
+    """Exercise the live harness's new recorder without a provider credential."""
+    import json
+    from dataclasses import replace
+
+    from live import test_local_text_edit_live as live_case
+
+    from daita.llm.models import ModelUsage
+    from daita.llm.pricing import CostEstimate
+
+    class RecordedEdit(_EditWorkflowProvider):
+        def has_complete_pricing(self, request):
+            return True
+
+        async def close(self, *, deadline: float | None = None):
+            pass
+
+        async def generate(self, request):
+            result = await super().generate(request)
+            if result.text == "done":
+                result = replace(
+                    result,
+                    text=f"Saved {live_case._RELATIVE_PATH}: timeout 45, marker {live_case._MARKER}.",
+                )
+            return replace(
+                result,
+                usage=ModelUsage(
+                    input_tokens=5,
+                    output_tokens=3,
+                    cost_estimate=CostEstimate.complete(Decimal(0)),
+                ),
+            )
+
+    provider = RecordedEdit(
+        (
+            {
+                "old_text": "timeout_seconds: 30",
+                "new_text": "timeout_seconds: 45",
+                "expected_occurrences": 1,
+            },
+        ),
+        target_path=live_case._RELATIVE_PATH,
+    )
+    monkeypatch.setattr(
+        live_case, "_live_model", lambda: (_profile(provider), provider)
+    )
+    monkeypatch.setenv("DAITA_LOCAL_TEXT_EDIT_REPORT_DIR", str(tmp_path / "reports"))
+    monkeypatch.setenv("DAITA_LOCAL_TEXT_EDIT_LIVE_PROFILE", profile)
+    await live_case.test_live_model_reads_edits_approves_and_replaces_exact_bound_file(
+        tmp_path
+    )
+    report = json.loads((tmp_path / "reports/local-file-contract.json").read_text())
+    assert len(report["approvals"]) == 1
+    assert report["final_file_content"] == live_case._EXPECTED_CONTENT
+    assert report["requests"] and report["physical_attempts"]
+    assert report["result"] is not None
+    assert report["evaluation_profile"] == profile
+    assert report["limits"]["max_tokens"] == (
+        100000 if profile == "user_flow" else 30000
+    )
+
+
 def _call(call_id: str, name: str, arguments: Mapping[str, object]) -> ModelResponse:
     return ModelResponse(
         finish_reason=FinishReason.TOOL_CALLS,
@@ -1044,6 +1109,7 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
     agent, _workspace = await _agent(tmp_path, provider)
     embedded = agent._embedded
     import sqlite3
+
     from daita import SQLiteSource
 
     database = tmp_path / "scope.sqlite"

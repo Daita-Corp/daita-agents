@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.metadata
 import json
 import os
+import platform
 import re
 import subprocess
-from collections import defaultdict
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
@@ -21,13 +22,14 @@ from decimal import Decimal
 from pathlib import Path
 from time import perf_counter
 
+from _workspace_support import workspace_for
 from live.benchmarks._support import RecordingProvider
 from test_postgresql_write_release import _Secrets
 
 from daita import Agent, AgentConfig, ApprovalDecision, LoopLimits
 from daita._json import canonical_json
 from daita.llm import factory
-from daita.llm.models import ModelSensitivity, ToolResultBlock
+from daita.llm.models import ModelRequest, ModelSensitivity, ToolResultBlock
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.routing import ModelRoute, ModelRouteCandidate
 from daita.loop.models import LoopExitKind, validate_completed_transcript
@@ -38,13 +40,13 @@ from daita.security import (
     SecretReference,
 )
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
-from _workspace_support import workspace_for
 
 AUTHORIZATION = "DAITA_RUN_POSTGRES_LIVE_LLM"
 KEY_ENV = "DAITA_POSTGRES_LIVE_LLM_API_KEY"
 MODEL_ENV = "DAITA_POSTGRES_LIVE_MODEL_IDS"
 REPEAT_ENV = "DAITA_POSTGRES_LIVE_REPEATS"
 REPORT_ENV = "DAITA_POSTGRES_LIVE_REPORT_DIR"
+PROFILE_ENV = "DAITA_POSTGRES_LIVE_PROFILE"
 NOW = datetime(2026, 9, 13, 12, tzinfo=UTC)
 NEXT_SLOT = datetime(2026, 9, 14, 14, tzinfo=UTC)
 EXPIRES = datetime(2026, 9, 20, 12, tzinfo=UTC)
@@ -55,6 +57,7 @@ LIMITS = LoopLimits(
     max_wall_time_seconds=180,
     max_estimated_cost_usd=Decimal("0.15"),
 )
+USER_FLOW_LIMITS = replace(LoopLimits(), max_estimated_cost_usd=Decimal("0.50"))
 REPORT_INSTRUCTION = (
     'Return only JSON with "status" ("succeeded", "not_applied", or "uncertain"), '
     '"inserted_count", "updated_count", "unchanged_count" (integer or null), '
@@ -83,10 +86,21 @@ def repeats():
     return count
 
 
-def live_config(model_id):
+def evaluation_profile():
+    profile = os.environ.get(PROFILE_ENV, "strict")
+    if profile not in {"strict", "user_flow"}:
+        raise ValueError(f"{PROFILE_ENV} must be strict or user_flow")
+    return profile
+
+
+def live_config(model_id, *, limits=LIMITS):
     # Recheck at construction: a key or direct fixture invocation grants nothing.
     if os.environ.get(AUTHORIZATION) != "1":
         raise ValueError(f"{AUTHORIZATION}=1 requires explicit paid-run authorization")
+    if limits.max_estimated_cost_usd is None or limits.max_estimated_cost_usd <= 0:
+        raise ValueError(
+            "Live diagnostics require an explicit positive finite cost cap"
+        )
     profile = reviewed_model_profile(model_id)
     provider = model_id.partition(":")[0]
     if (
@@ -117,7 +131,7 @@ def live_config(model_id):
                 ),
             )
         ),
-        limits=LIMITS,
+        limits=limits,
     )
 
 
@@ -136,6 +150,10 @@ def calls_for(transcript, tool_name):
 
 
 def assert_report(result, status, counts=None):
+    assert result.final_text, (
+        getattr(result, "reason", "missing_final_answer"),
+        "A terminal run without an answer cannot satisfy reporting acceptance.",
+    )
     report = json.loads(result.final_text or "")
     assert report["status"] == status, report
     assert isinstance(report["explanation"], str) and report["explanation"].strip()
@@ -147,9 +165,34 @@ def assert_report(result, status, counts=None):
 
 
 class Evaluation:
-    def __init__(self, database, config, recordings, max_runs):
+    def __init__(
+        self,
+        database,
+        config,
+        recordings,
+        max_runs,
+        *,
+        setup_mode="model_authored",
+        profile="strict",
+    ):
+        assert 1 <= max_runs <= 3
+        assert setup_mode in {
+            "model_authored",
+            "owner_admitted_routine",
+            "injected_commit_loss_fixture",
+        }
         self.db, self.config, self.recordings = database, config, recordings
         self.max_runs = max_runs
+        self.setup_mode = setup_mode
+        assert profile in {"strict", "user_flow"}
+        self.profile = profile
+        self.answer_reviews = []
+        self.setup_request_count = (
+            len(database.model.requests)
+            if setup_mode == "injected_commit_loss_fixture"
+            else 0
+        )
+        self.stages = []
         self.clock = NOW
         self.captures = []
         self.approvals = []
@@ -164,6 +207,18 @@ class Evaluation:
     @property
     def agent(self):
         return self.db.agent
+
+    @property
+    def routine_budgets(self):
+        limits = self.config.limits
+        return {
+            "per_run_max_tokens": limits.max_total_tokens,
+            "per_run_max_cost_usd": str(limits.max_estimated_cost_usd),
+            "cumulative_max_tokens": 2 * limits.max_total_tokens,
+            "cumulative_max_cost_usd": str(2 * limits.max_estimated_cost_usd),
+            "cumulative_max_attempts": 2,
+            "cumulative_max_occurrences": 2,
+        }
 
     async def reopen(self):
         await self.agent.close()
@@ -189,7 +244,12 @@ class Evaluation:
             "rows": rows,
         }
 
-    def expect_update(self):
+    def expect_update(self, *, intended_row=None, unique_keys=(("id",), ("domain",))):
+        # Owner-authored fixture identity, never inferred from model claims.
+        self.intended_update_row = dict(
+            intended_row or {"id": 1, "domain": "existing.test", "name": "Before"}
+        )
+        self.intended_update_keys = tuple(tuple(key) for key in unique_keys)
         self.expected_write = {
             "source_id": self.db.source_id,
             "resource_id": self.db.resource_id,
@@ -207,7 +267,17 @@ class Evaluation:
             or request.capability_id != f"data.{operation}_rows"
         ):
             return False
-        args = request.arguments.to_dict()
+        review = request.arguments.to_dict()
+        if set(review) != {"arguments", "target", "preview"}:
+            return False
+        args = review["arguments"]
+        if not isinstance(args, dict):
+            return False
+        if not isinstance(review["target"], dict) or (
+            review["target"].get("source_id") != self.db.source_id
+            or review["target"].get("resource_id") != self.db.resource_id
+        ):
+            return False
         fingerprint = args.pop("preview_fingerprint", None)
         if (
             not isinstance(fingerprint, str)
@@ -218,11 +288,109 @@ class Evaluation:
         # approval. Its presence cannot change the approved target or row values.
         args.pop("evidence_call_ids", None)
         expected = dict(self.expected_write)
+        domain_selector = [
+            {"column": "domain", "operator": "eq", "value": "existing.test"}
+        ]
+        if operation == "update" and self.profile == "user_flow":
+            if set(review["target"]) - {
+                "source_id",
+                "resource_id",
+                "name",
+                "aliases",
+                "source_name",
+                "revision",
+            }:
+                return False
+            where = args.get("where")
+            if not isinstance(where, list) or not 1 <= len(where) <= 16:
+                return False
+            cells = []
+            for predicate in where:
+                if (
+                    not isinstance(predicate, dict)
+                    or set(predicate) != {"column", "operator", "value"}
+                    or predicate["operator"] != "eq"
+                ):
+                    return False
+                cells.append(
+                    {"column": predicate["column"], "value": predicate["value"]}
+                )
+            if not self._intended_update_cells(cells, require_key=True):
+                return False
+            preview = review["preview"]
+            if not isinstance(preview, dict) or set(preview) != {
+                "matched_rows",
+                "samples",
+                "warnings",
+            }:
+                return False
+            if (
+                type(preview["matched_rows"]) is not int
+                or preview["matched_rows"] != expected["expected_affected_rows"]
+            ):
+                return False
+            samples = preview["samples"]
+            if (
+                not isinstance(samples, list)
+                or len(samples) != 1
+                or not isinstance(preview["warnings"], list)
+            ):
+                return False
+            sample = samples[0]
+            if not isinstance(sample, dict) or set(sample) != {
+                "primary_key",
+                "before",
+                "after",
+            }:
+                return False
+            if not self._intended_update_cells(
+                sample["primary_key"], require_key=True
+            ) or not self._intended_update_cells(sample["before"]):
+                return False
+            if canonical_json(sample["after"]) != canonical_json(
+                expected["assignments"]
+            ):
+                return False
+            expected["where"] = where
+        elif operation == "update" and canonical_json(
+            args.get("where")
+        ) == canonical_json(domain_selector):
+            # This fixture's unique domain identifies the same approved row as
+            # id=1. No other predicate, count or assignment becomes acceptable.
+            expected["where"] = domain_selector
         for key in ("rows", "key_columns", "insert_columns", "update_columns"):
             if key in args and key in expected:
                 args[key] = sorted(args[key], key=canonical_json)
                 expected[key] = sorted(expected[key], key=canonical_json)
         return canonical_json(args) == canonical_json(expected)
+
+    def _intended_update_cells(self, cells, *, require_key=False):
+        """Bounded fixture equality, not a SQL evaluator or execution authority."""
+        if not isinstance(cells, list) or not 1 <= len(cells) <= 16:
+            return False
+        columns = set()
+        for cell in cells:
+            if not isinstance(cell, dict) or set(cell) != {"column", "value"}:
+                return False
+            column, value = cell["column"], cell["value"]
+            if (
+                not isinstance(column, str)
+                or column in columns
+                or column not in self.intended_update_row
+            ):
+                return False
+            intended = self.intended_update_row[column]
+            if (
+                value is None
+                or type(value) not in (str, int, float)
+                or type(value) is not type(intended)
+                or value != intended
+            ):
+                return False
+            columns.add(column)
+        return not require_key or any(
+            set(key) <= columns for key in self.intended_update_keys
+        )
 
     def routine_is_exact(self, request):
         if (
@@ -256,6 +424,21 @@ class Evaluation:
                     return False
                 continue
             if key == "allowed_capability_ids" and isinstance(actual, tuple):
+                if self.profile == "user_flow":
+                    # A user allowing this table does not prescribe the tool
+                    # sequence. Permit ordinary reads of that exact frozen
+                    # source/resource alongside the same single native grant.
+                    required = set(value)
+                    allowed = required | {
+                        "catalog.search",
+                        "catalog.inspect",
+                        "catalog.schema",
+                        "catalog.traverse",
+                        "data.query",
+                    }
+                    if not required <= set(actual) <= allowed:
+                        return False
+                    continue
                 actual = sorted(actual)
             if canonical_json(actual) != canonical_json(value):
                 return False
@@ -294,8 +477,15 @@ class Evaluation:
             await hook()
         return ApprovalDecision.APPROVE if accepted else ApprovalDecision.DENY
 
-    async def run(self, prompt):
+    async def run(self, prompt, *, user_prompt=None):
+        self.assert_completed_runs()
         assert len(self.captures) < self.max_runs, "No unbudgeted evaluation run"
+        if self.profile == "user_flow":
+            assert isinstance(user_prompt, str) and user_prompt.strip(), (
+                "User-flow cases require an explicit ordinary user request; "
+                "never fall back to the structured test prompt."
+            )
+            prompt = user_prompt
         started = perf_counter()
         result = await self.agent.run(prompt, conversation_id=self.conversation_id)
         self.conversation_id = result.conversation_id
@@ -304,16 +494,45 @@ class Evaluation:
     async def capture(self, result, elapsed=None):
         transcript = await self.agent.transcript(result.run_id)
         self.captures.append((result, transcript, elapsed))
-        assert result.kind is LoopExitKind.COMPLETED, (result.reason, result.final_text)
-        validate_completed_transcript(transcript, result)
-        assert 0 < result.usage.total_tokens <= LIMITS.max_total_tokens
-        assert 0 < result.steps <= LIMITS.max_steps
-        assert result.usage.cost_estimate.status.value == "complete"
-        assert result.usage.cost_estimate.amount_usd <= LIMITS.max_estimated_cost_usd
         return result, transcript
 
+    def assert_report(self, result, status, counts=None):
+        self.assert_completed_runs()
+        if self.profile == "strict":
+            assert_report(result, status, counts)
+        else:
+            # Exact state/effect assertions remain in the case. Prose semantics
+            # require a separate evidence review, not a permissive regex or a
+            # hidden model judge. A pytest pass is not an answer-accuracy pass.
+            assert result.kind is LoopExitKind.COMPLETED and result.final_text
+            self.answer_reviews.append(
+                {
+                    "run_id": result.run_id,
+                    "expected_status": status,
+                    "expected_counts": counts,
+                    "final_text": result.final_text,
+                    "status": "pending_evidence_review",
+                }
+            )
+
+    def assert_completed_runs(self):
+        for result, transcript, _ in self.captures:
+            assert result.kind is LoopExitKind.COMPLETED, (
+                result.reason,
+                result.final_text,
+            )
+            validate_completed_transcript(transcript, result)
+            assert 0 < result.usage.total_tokens <= self.config.limits.max_total_tokens
+            assert 0 < result.steps <= self.config.limits.max_steps
+            assert result.usage.cost_estimate.status.value == "complete"
+            assert (
+                result.usage.cost_estimate.amount_usd
+                <= self.config.limits.max_estimated_cost_usd
+            )
+
     async def scheduled_result(self, count):
-        async with asyncio.timeout(LIMITS.max_wall_time_seconds + 30):
+        self.assert_completed_runs()
+        async with asyncio.timeout(self.config.limits.max_wall_time_seconds + 30):
             while True:
                 routines = await self.agent.list_routines()
                 assert len(routines) == 1
@@ -342,8 +561,8 @@ class Evaluation:
 
     def assert_accounting(self):
         assert (
-            not self.db.model.requests
-        ), "The setup-only scripted model must never run"
+            len(self.db.model.requests) == self.setup_request_count
+        ), "The setup-only scripted model must never run during evaluation"
         assert 0 < len(self.captures) <= self.max_runs
         usages = [usage for recording in self.recordings for usage in recording.usages]
         requests = [
@@ -368,16 +587,35 @@ class Evaluation:
         assert sum(
             result.usage.cost_estimate.amount_usd for result, _, _ in self.captures
         ) == sum(usage.cost_estimate.amount_usd for usage in usages)
-        groups = defaultdict(list)
+        groups: list[list[ModelRequest]] = [[]]
         for request in requests:
             assert request.deadline is not None
-            assert 0 < request.max_total_tokens <= LIMITS.max_total_tokens
-            assert 0 < request.max_estimated_cost_usd <= LIMITS.max_estimated_cost_usd
-            groups[request.deadline].append(request)
-        assert len(groups) == len(self.captures), "One shared absolute deadline per run"
-        for group in groups.values():
+            assert 0 < request.max_total_tokens <= self.config.limits.max_total_tokens
+            assert (
+                0
+                < request.max_estimated_cost_usd
+                <= self.config.limits.max_estimated_cost_usd
+            )
+            assert request.attempt_deadline is not None
+            assert request.attempt_deadline <= request.deadline
+            assert request.call_policy == self.config.model_call_policy
+            # Logical model requests can have a stricter, earlier ceiling than
+            # their enclosing run. A fresh run resets its cumulative allowance;
+            # a fresh attempt does not.
+            if (
+                groups[-1]
+                and request.max_total_tokens > groups[-1][-1].max_total_tokens
+            ):
+                groups.append([])
+            groups[-1].append(request)
+        assert len(groups) <= len(self.captures)
+        for group in groups:
             assert all(
-                later.max_total_tokens <= earlier.max_total_tokens
+                later.max_total_tokens is not None
+                and earlier.max_total_tokens is not None
+                and later.max_estimated_cost_usd is not None
+                and earlier.max_estimated_cost_usd is not None
+                and later.max_total_tokens <= earlier.max_total_tokens
                 and later.max_estimated_cost_usd <= earlier.max_estimated_cost_usd
                 for earlier, later in zip(group, group[1:])
             )
@@ -400,9 +638,36 @@ class Evaluation:
             "case_id": case_id,
             "status": status,
             "failure": failure,
+            "evaluation_profile": self.profile,
+            "answer_accuracy": {
+                "status": (
+                    "requires_separate_review"
+                    if self.profile == "user_flow"
+                    else "structured_assertions"
+                ),
+                "reviews": self.answer_reviews,
+            },
             "recorded_at": datetime.now(UTC).isoformat(),
+            "dependencies": {
+                "python": platform.python_version(),
+                **{
+                    name: importlib.metadata.version(name)
+                    for name in (
+                        "openai",
+                        "anthropic",
+                        "google-genai",
+                        "httpx",
+                        "httpcore",
+                    )
+                },
+            },
             "composition": "AgentConfig.model_route; real API counting/generation; real asyncpg/PostgreSQL",
             "model_id": self.config.model_route.candidates[0].provider_id,
+            "setup": {
+                "mode": self.setup_mode,
+                "scripted_requests": self.setup_request_count,
+            },
+            "verified_stages": self.stages,
             "revision": subprocess.run(
                 ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
             ).stdout.strip(),
@@ -417,10 +682,14 @@ class Evaluation:
                 )
             },
             "limits": {
-                "steps": 14,
-                "tokens": 30000,
-                "seconds": 180,
-                "estimated_cost_usd": "0.15",
+                "steps": self.config.limits.max_steps,
+                "tokens": self.config.limits.max_total_tokens,
+                "seconds": self.config.limits.max_wall_time_seconds,
+                "estimated_cost_usd": str(self.config.limits.max_estimated_cost_usd),
+                "profile": "strict" if self.config.limits == LIMITS else "diagnostic",
+                "output_tokens": self.config.model_route.candidates[
+                    0
+                ].profile.max_output_tokens,
                 "maximum_runs": self.max_runs,
             },
             "runs": [
@@ -518,9 +787,19 @@ class Evaluation:
 
 @asynccontextmanager
 async def evaluate(
-    database, monkeypatch, model_id, evidence_path, case_id, *, max_runs=1
+    database,
+    monkeypatch,
+    model_id,
+    evidence_path,
+    case_id,
+    *,
+    max_runs=1,
+    limits=LIMITS,
+    setup_mode="model_authored",
+    profile="strict",
+    origin=None,
 ):
-    config = live_config(model_id)
+    config = live_config(model_id, limits=limits)
     recordings = []
     original = factory.create_llm_provider
 
@@ -530,13 +809,17 @@ async def evaluate(
         return recording
 
     monkeypatch.setattr(factory, "create_llm_provider", record)
-    scenario = Evaluation(database, config, recordings, max_runs)
+    scenario = Evaluation(
+        database, config, recordings, max_runs, setup_mode=setup_mode, profile=profile
+    )
+    if origin is not None:
+        assert origin.conversation_id, "An origin run must retain its conversation"
+        scenario.conversation_id = origin.conversation_id
     status, failure = "passed", None
+    validation_error = None
     try:
         await scenario.reopen()
         yield scenario
-        await scenario.agent._embedded._routine_supervisor.close()
-        scenario.assert_accounting()
     except BaseException as error:
         status, failure = "failed", f"{type(error).__name__}: {error}"
         raise
@@ -563,12 +846,33 @@ async def evaluate(
                                     None,
                                 )
                             )
+            accounting = {"status": "passed", "failure": None}
+            try:
+                scenario.assert_accounting()
+            except Exception as error:
+                accounting = {
+                    "status": "failed",
+                    "failure": f"{type(error).__name__}: {error}",
+                }
+                if failure is None:
+                    validation_error = error
+            if failure is None:
+                try:
+                    if validation_error is not None:
+                        raise validation_error
+                    scenario.assert_completed_runs()
+                except Exception as error:
+                    validation_error = error
+                    status, failure = "failed", f"{type(error).__name__}: {error}"
             report = await scenario.report(case_id, status, failure)
+            report["accounting"] = accounting
         finally:
             await scenario.agent.close()  # drains and closes the owned router/delegates
         report["agent_closed"] = True
         evidence_path.parent.mkdir(parents=True, exist_ok=True)
         evidence_path.write_text(json.dumps(report, indent=2, default=str) + "\n")
+        if validation_error is not None:
+            raise validation_error
 
 
 def assert_preview_binding(transcript, operation="upsert"):
@@ -602,4 +906,35 @@ def assert_exact_preview(scenario, transcript, operation="upsert"):
     call = assert_preview_binding(transcript, operation)
     matching = [item for item in scenario.approvals if item["call_id"] == call.id]
     assert len(matching) == 1 and matching[0]["approved"]
-    assert canonical_json(matching[0]["arguments"]) == canonical_json(call.arguments)
+    assert canonical_json(matching[0]["arguments"]["arguments"]) == canonical_json(
+        call.arguments
+    )
+    previews = [
+        block.output["data"]
+        for message in transcript.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock)
+        and block.capability_id == f"data.preview_{operation}_rows"
+        and not block.is_error
+        and isinstance(block.output["data"], Mapping)
+        and block.output["data"]["preview_fingerprint"]
+        == call.arguments["preview_fingerprint"]
+    ]
+    assert previews
+    review = matching[0]["arguments"]["preview"]
+    fields = (
+        ("matched_rows", "samples", "warnings")
+        if operation == "update"
+        else (
+            "input_count",
+            "inserted_count",
+            "updated_count",
+            "unchanged_count",
+            "identity_sequence_gaps_possible",
+            "classifications",
+        )
+    )
+    expected = {key: previews[-1][key] for key in fields}
+    if operation == "upsert":
+        expected["classifications"] = expected["classifications"][:5]
+    assert canonical_json(review) == canonical_json(expected)

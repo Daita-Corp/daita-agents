@@ -6,19 +6,23 @@ import asyncio
 import math
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from enum import Enum
+from hashlib import sha256
+from time import monotonic
 from typing import cast
 
+from .._json import FrozenJsonObject, canonical_json
 from ..errors import (
     AuthenticationError,
     ErrorRetryability,
     LLMError,
     RateLimitError,
 )
-from .models import ModelUsage
+from .models import ModelRequest, ModelResponse, ModelUsage
 
 
 class ContextWindowExceeded(LLMError):
@@ -123,6 +127,9 @@ class ProviderErrorCode(str, Enum):
     INVALID_REQUEST = "invalid_request"
     CONTENT_BLOCKED = "content_blocked"
     TIMEOUT = "timeout"
+    CLEANUP_FAILED = "cleanup_failed"
+    CLEANUP_TIMEOUT = "cleanup_timeout"
+    OWNER_UNAVAILABLE = "owner_unavailable"
     CANCELLED = "cancelled"
     OUTPUT_LIMIT = "output_limit"
     MALFORMED_RESPONSE = "malformed_response"
@@ -152,6 +159,216 @@ _STRUCTURAL_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,95}\Z")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _MAX_OUTPUT_ITEM_TYPES = 8
 
+# One immutable final snapshot in the current task, never a request/event history.
+# The recorder clears it before entry and consumes it after generator cleanup.
+# Responses/errors carry their own snapshots; this slot also covers normal aclose,
+# which cannot return metadata through an already yielded immutable response.
+_last_attempt: ContextVar[FrozenJsonObject | None] = ContextVar(
+    "daita_last_provider_attempt", default=None
+)
+
+
+def take_provider_attempt_diagnostic() -> FrozenJsonObject | None:
+    value = _last_attempt.get()
+    _last_attempt.set(None)
+    return value
+
+
+class ProviderAttempt:
+    """Bounded local phase observations shared by the three API adapters.
+
+    No payloads, vendor errors, raw IDs, callbacks, I/O, or execution decisions.
+    Native/header extraction stays with the adapter that understands its SDK.
+    """
+
+    def __init__(self, request: ModelRequest, *, headers_supported: bool) -> None:
+        self.started = monotonic()
+        self.events: dict[str, int] = {}
+        self.values: dict[str, object] = {
+            "deadline_remaining_seconds": (
+                None
+                if request.deadline is None
+                else max(0.0, request.deadline - self.started)
+            ),
+            "count_state": "not_requested",
+            "count_started_seconds": None,
+            "count_finished_seconds": None,
+            "counted_input_tokens": None,
+            "output_cap": None,
+            "generation_submitted_seconds": None,
+            "first_native_event_seconds": None,
+            "first_native_event_type": None,
+            "last_native_event_seconds": None,
+            "last_native_event_type": None,
+            "native_event_overflow": 0,
+            "response_id_digest": None,
+            "terminal_observed": False,
+            "cleanup_started_seconds": None,
+            "cleanup_finished_seconds": None,
+            "cleanup_failure": None,
+            "failure_code": None,
+            "transport_error_kind": None,
+            "transport_error_phase": None,
+        }
+        for phase in ("count", "generation"):
+            self.values.update(
+                {
+                    f"{phase}_headers_availability": (
+                        "not_observed" if headers_supported else "unsupported"
+                    ),
+                    f"{phase}_headers_seconds": None,
+                    f"{phase}_http_status": None,
+                    f"{phase}_request_id_digest": None,
+                }
+            )
+        _last_attempt.set(None)
+
+    def mark(self, field: str) -> None:
+        self.values[field] = round(max(0.0, monotonic() - self.started), 6)
+
+    def start_count(self) -> None:
+        self.values["count_state"] = "started"
+        self.mark("count_started_seconds")
+
+    def counted(self, tokens: int) -> None:
+        self.values["count_state"] = "succeeded"
+        self.values["counted_input_tokens"] = tokens
+        self.mark("count_finished_seconds")
+
+    def transport_failure(self, error: BaseException, *, phase: str) -> None:
+        """Retain public transport exception categories before SDK causes are detached.
+
+        No exception messages, requests or URLs are retained. This observation
+        cannot affect normalization, retries, accounting or execution.
+        """
+        try:
+            import httpx
+
+            if phase not in {"count", "generation"}:
+                return
+            current: BaseException | None = error
+            visited: set[int] = set()
+            for _ in range(8):
+                if current is None or id(current) in visited:
+                    break
+                visited.add(id(current))
+                for error_type, kind in (
+                    (httpx.ConnectTimeout, "connect_timeout"),
+                    (httpx.ReadTimeout, "read_timeout"),
+                    (httpx.WriteTimeout, "write_timeout"),
+                    (httpx.PoolTimeout, "pool_timeout"),
+                    (httpx.ConnectError, "connect_error"),
+                    (httpx.RemoteProtocolError, "remote_protocol_error"),
+                ):
+                    if isinstance(current, error_type):
+                        self.values["transport_error_kind"] = kind
+                        self.values["transport_error_phase"] = phase
+                        return
+                current = current.__cause__ or current.__context__
+        except Exception:
+            # Diagnostics are best effort, including unusual exception chains.
+            return
+
+    def headers(
+        self, phase: str, status: object, request_id: object, *, arrived: bool = True
+    ) -> None:
+        if type(status) is int and 100 <= status <= 599:
+            if arrived:
+                self.mark(f"{phase}_headers_seconds")
+            self.values[f"{phase}_http_status"] = status
+            self.values[f"{phase}_headers_availability"] = (
+                "observed" if arrived else "status_only"
+            )
+        self.values[f"{phase}_request_id_digest"] = self._id_digest(request_id)
+
+    @staticmethod
+    def _id_digest(value: object) -> str | None:
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._:-]{1,256}", value):
+            return "sha256:" + sha256(value.encode("ascii")).hexdigest()
+        return None
+
+    def native(self, event_type: object, response_id: object = None) -> None:
+        token = (
+            event_type
+            if isinstance(event_type, str) and _STRUCTURAL_TOKEN.fullmatch(event_type)
+            else "unavailable"
+        )
+        if self.values["first_native_event_seconds"] is None:
+            self.mark("first_native_event_seconds")
+            self.values["first_native_event_type"] = token
+        self.mark("last_native_event_seconds")
+        self.values["last_native_event_type"] = token
+        if token in self.events or len(self.events) < 16:
+            self.events[token] = min(self.events.get(token, 0) + 1, 2**31 - 1)
+        else:
+            self.values["native_event_overflow"] = min(
+                cast(int, self.values["native_event_overflow"]) + 1, 2**31 - 1
+            )
+        digest = self._id_digest(response_id)
+        if digest is not None:
+            self.values["response_id_digest"] = digest
+
+    def snapshot(self) -> FrozenJsonObject:
+        value = FrozenJsonObject.from_mapping(
+            {**self.values, "native_event_counts": self.events}
+        )
+        # Fixed field count and capped counters/identifiers keep this below 8 KiB.
+        if len(canonical_json(value).encode("utf-8")) > 8192:
+            return FrozenJsonObject.from_mapping(
+                {"measurement_availability": "unavailable"}
+            )
+        return value
+
+    def response(self, response: ModelResponse) -> ModelResponse:
+        self.values["terminal_observed"] = True
+        try:
+            return replace(
+                response,
+                provider_metadata={
+                    **response.provider_metadata,
+                    "attempt_diagnostic": self.snapshot(),
+                },
+            )
+        except Exception:
+            return response
+
+    def finish(self, error: BaseException | None) -> None:
+        if self.values["count_state"] == "started":
+            self.values["count_state"] = "failed"
+            self.mark("count_finished_seconds")
+        if error is not None and not (
+            isinstance(error, GeneratorExit) and self.values["terminal_observed"]
+        ):
+            self.values["failure_code"] = (
+                error.code.value
+                if isinstance(error, ModelProviderError)
+                else (
+                    "cancelled"
+                    if isinstance(error, (asyncio.CancelledError, GeneratorExit))
+                    else "provider_boundary_failure"
+                )
+            )
+        try:
+            snapshot = self.snapshot()
+        except Exception:
+            snapshot = FrozenJsonObject.from_mapping(
+                {"measurement_availability": "unavailable"}
+            )
+        _last_attempt.set(snapshot)
+        if isinstance(error, ModelProviderError):
+            diagnostic = error.diagnostic or ProviderFailureDiagnostic(
+                phase=ProviderFailurePhase.PROVIDER_BOUNDARY, code=error.code.value
+            )
+            error.diagnostic = replace(diagnostic, attempt=snapshot)
+        elif isinstance(error, asyncio.CancelledError):
+            setattr(error, "_daita_attempt_diagnostic", snapshot)
+
+
+def interrupted_attempt_diagnostic(error: BaseException) -> FrozenJsonObject | None:
+    cancellation = error.__cause__ if isinstance(error, TimeoutError) else error
+    value = getattr(cancellation, "_daita_attempt_diagnostic", None)
+    return value if isinstance(value, FrozenJsonObject) else None
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderFailureDiagnostic:
@@ -166,8 +383,14 @@ class ProviderFailureDiagnostic:
     input_tokens: int | None = None
     remaining_tokens: int | None = None
     maximum_output_tokens: int | None = None
+    attempt: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
+        if self.attempt is not None and (
+            not isinstance(self.attempt, FrozenJsonObject)
+            or len(canonical_json(self.attempt).encode("utf-8")) > 8192
+        ):
+            raise ValueError("provider attempt diagnostic exceeds its bound")
         if not isinstance(self.phase, ProviderFailurePhase):
             raise TypeError("provider failure phase must be ProviderFailurePhase")
         if not isinstance(self.code, str) or not _DIAGNOSTIC_CODE.fullmatch(self.code):
@@ -228,8 +451,20 @@ class ModelProviderError(LLMError):
         retry_after_seconds: float | None = None,
         usage: ModelUsage = ModelUsage(),
         diagnostic: ProviderFailureDiagnostic | None = None,
+        terminal_observed: bool = False,
+        cleanup_unresolved: bool = False,
+        canonical_emitted: bool = False,
     ) -> ModelProviderError:
-        del message, provider_id, retry_after_seconds, usage, diagnostic
+        del (
+            message,
+            provider_id,
+            retry_after_seconds,
+            usage,
+            diagnostic,
+            terminal_observed,
+            cleanup_unresolved,
+            canonical_emitted,
+        )
         concrete: type[ModelProviderError] = cls
         if cls is ModelProviderError:
             if code is ProviderErrorCode.RATE_LIMIT_ERROR:
@@ -247,6 +482,9 @@ class ModelProviderError(LLMError):
         retry_after_seconds: float | None = None,
         usage: ModelUsage = ModelUsage(),
         diagnostic: ProviderFailureDiagnostic | None = None,
+        terminal_observed: bool = False,
+        cleanup_unresolved: bool = False,
+        canonical_emitted: bool = False,
     ) -> None:
         if not isinstance(code, ProviderErrorCode):
             raise TypeError("code must be a ProviderErrorCode")
@@ -255,6 +493,17 @@ class ModelProviderError(LLMError):
         ):
             raise ValueError("message must be a non-empty string when provided")
         self.code = code
+        for name, value in (
+            ("terminal_observed", terminal_observed),
+            ("cleanup_unresolved", cleanup_unresolved),
+            ("canonical_emitted", canonical_emitted),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be boolean")
+            setattr(self, name, value)
+        self.terminal_observed: bool = terminal_observed
+        self.cleanup_unresolved: bool = cleanup_unresolved
+        self.canonical_emitted: bool = canonical_emitted
         if retry_after_seconds is not None:
             if code not in {
                 ProviderErrorCode.RATE_LIMIT_ERROR,
@@ -336,6 +585,7 @@ def token_count_error(*, invalid: bool = False) -> ModelProviderError:
 def before_generation(error: ModelProviderError, *, code: str) -> ModelProviderError:
     """Preserve normalized failure semantics with proven zero generation usage."""
     from decimal import Decimal
+
     from .pricing import CostEstimate
 
     return ModelProviderError(
@@ -347,7 +597,11 @@ def before_generation(error: ModelProviderError, *, code: str) -> ModelProviderE
         diagnostic=ProviderFailureDiagnostic(
             phase=ProviderFailurePhase.REQUEST_ADMISSION,
             code=code,
+            attempt=None if error.diagnostic is None else error.diagnostic.attempt,
         ),
+        terminal_observed=error.terminal_observed,
+        cleanup_unresolved=error.cleanup_unresolved,
+        canonical_emitted=error.canonical_emitted,
     )
 
 
@@ -434,6 +688,9 @@ def detached_provider_error(
             retry_after_seconds=error.retry_after_seconds,
             usage=error.usage,
             diagnostic=error.diagnostic,
+            terminal_observed=error.terminal_observed,
+            cleanup_unresolved=error.cleanup_unresolved,
+            canonical_emitted=error.canonical_emitted,
         )
     error.__traceback__ = None
     error.__cause__ = None

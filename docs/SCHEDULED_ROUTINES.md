@@ -26,8 +26,11 @@ host restarts converge on the existing occurrence.
 
 `toolbox_search` exposes exact capability IDs, automation eligibility, and the
 domain-owned `automation_contract` for tools requiring grants: constraints schemas,
-connector references, and evidence bases. Scheduling does not require activating
-the assignment's execution tools. If a contract exceeds the bounded discovery
+connector references, and evidence bases. `requires_automation_grant` refers to
+scheduled execution; foreground actions request exact approval when invoked.
+Load an execution tool when its exact argument schema is needed to author fixed
+or variable grant arguments. The generic grant schema alone does not define an
+MCP action's argument names or types. If a contract exceeds the bounded discovery
 page, `automation_contract_omitted` directs the model to `toolbox_load` for its
 complete declaration. Load also returns these contracts for selected tools.
 These declarations support proposal authoring; they do not grant execution
@@ -37,6 +40,21 @@ schedule shapes, including calendar day selectors and daylight-saving policies.
 Cron and RRULE strings are not accepted schedule alternatives. Resource prechecks
 require exact capability, contract, source, and resource references; an MCP binding
 revision is not a resource precheck.
+
+`always` reporting requires omitting the precheck; `changes_only` requires one.
+Prechecks track structural revisions, not changing row values, and cannot skip
+effectful or MCP assignments. Creation and revision validate these rules before
+grant preparation or execution-contract binding and return actionable errors.
+Admission rechecks the same rules; drafts and persisted records share their
+reporting/precheck invariant.
+
+Per-run token and estimated-cost ceilings must not exceed their corresponding
+cumulative ceilings. Drafts and stored routines share that invariant. The routine
+owner rejects inconsistent create/revision proposals with `routine_budget_invalid`
+before grant preparation, connector readiness, contract binding, approval or
+mutation. The error names both fields so the next ordinary model step can submit
+the user's exact authorized budgets. Daita never repairs or enlarges them. The
+remaining foreground allowance is distinct from a future routine's budgets.
 
 Admission validates and retains the exact agent, conversation, source,
 resource, MCP binding, capability contract, model route, sensitivity, budget,
@@ -109,6 +127,13 @@ the ordinary supervisor, run budget and action limits. The original calendar or
 interval anchor retains its next future slot. Approval covers this one assignment;
 there is no separate foreground write and no second immediate occurrence on a
 retry with the same creation identity. Revisions use explicit run-now instead.
+
+Model-authored creation must explicitly supply `run_immediately`: `false` means
+scheduled-only (and is required for a one-time schedule). Omitting the choice
+fails validation. Model-authored revisions may omit it or supply `false`; `true`
+is rejected. Typed Python owner inputs keep their default of `false`. Review the
+actual saved schedule and immediate choice; explicit syntax alone cannot verify
+that the model understood the requested timing.
 
 Every permitted effect has one completion requirement. A positive minimum requires
 that many unique successful, validated invocations; zero explicitly permits no
@@ -335,3 +360,16 @@ foreground recovery. No automatic replay or chunking is supported.
 
 This native path is a development implementation with deterministic acceptance;
 production release gates and the separate shared MCP external-action work remain.
+
+Authoring and revision validate exact eligible model routes before connector
+readiness or contract binding. Invalid choices return a structured error; current
+contract and approval rechecks still reject drift. The model sees complete local
+route choices and host budget ceilings while an authoring tool is callable.
+
+Native write admission requires the corresponding read-only preview capability in
+the same proposal: `data.preview_update_rows` for `data.update_rows`, or
+`data.preview_upsert_rows` for `data.upsert_rows`. Admission does not perform or
+authorize a future preview; every occurrence must obtain its own authenticated
+preview. Structural discovery is separate. A natural assignment that needs table
+structure must explicitly request bounded `catalog.schema` access to its approved
+source/table. Daita never adds that permission automatically.

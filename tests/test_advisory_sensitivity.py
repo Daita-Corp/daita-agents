@@ -117,7 +117,9 @@ async def test_model_retained_advice_keeps_full_request_floor_across_reopen(
                 allowed_sensitivities=frozenset({ModelSensitivity.PUBLIC}),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
     reopened = await Agent.open(
         "advisory-floor",

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -12,6 +14,9 @@ from daita.adapters import (
 from daita.adapters.models import SourceRegistration, source_registration_id
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.sql import RelationalUpdateIntent, ResourceSchema
+from daita.domains.data.capabilities import RelationalUpdateExecutor
+from daita.capabilities import ToolExecution
+from daita._json import FrozenJsonObject, canonical_json
 from daita.security import EmptySecretProvider
 from daita.storage.sqlite_records import RelationalWriteScope
 
@@ -346,6 +351,43 @@ async def test_single_row_uses_the_same_preview_contract(monkeypatch):
     )
     assert preview.matched_rows == 1
     assert preview.samples[0].primary_key[0].value == 42
+
+
+async def test_update_preflight_retains_bounded_review_without_another_read(
+    monkeypatch,
+):
+    connection = _Connection(tuple(_row(index) for index in range(1, 9)))
+    _patch_io(monkeypatch, connection)
+    intent = _intent()
+    preview = await _backend().preview_update(agent_id="agent-preview", intent=intent)
+    backend = SimpleNamespace(
+        preview_update=AsyncMock(return_value=preview), execute_update=AsyncMock()
+    )
+    execution = ToolExecution(
+        run_id="run-review",
+        call_id="call-review",
+        capability_id="data.update_rows",
+        arguments={
+            **intent.to_payload(),
+            "preview_fingerprint": preview.fingerprint.preview_fingerprint,
+            "expected_affected_rows": 8,
+        },
+    )
+    fingerprint = await RelationalUpdateExecutor("agent-preview", backend).preflight(
+        execution
+    )
+    review = fingerprint["review"]
+    assert isinstance(review, FrozenJsonObject)
+    assert review["matched_rows"] == 8
+    assert canonical_json(review["samples"]) == canonical_json(
+        tuple(sample.to_payload() for sample in preview.samples)
+    )
+    samples = review["samples"]
+    assert isinstance(samples, tuple) and len(samples) == 5
+    backend.preview_update.assert_awaited_once_with(
+        agent_id="agent-preview", intent=intent
+    )
+    backend.execute_update.assert_not_awaited()
 
 
 async def test_zero_row_preview_is_successful_but_warns(monkeypatch):

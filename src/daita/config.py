@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from .llm.models import ModelCallPolicy
 from .llm.routing import ModelRoute
 from .loop.models import LoopLimits
 
@@ -12,12 +13,15 @@ from .loop.models import LoopLimits
 class AgentConfig:
     model_route: ModelRoute | None = None
     limits: LoopLimits = LoopLimits()
+    model_call_policy: ModelCallPolicy = field(default_factory=ModelCallPolicy)
 
     def __post_init__(self) -> None:
         if self.model_route is not None and not isinstance(
             self.model_route, ModelRoute
         ):
             raise TypeError("model_route must be ModelRoute or None")
+        if not isinstance(self.model_call_policy, ModelCallPolicy):
+            raise TypeError("model_call_policy must be ModelCallPolicy")
         if not isinstance(self.limits, LoopLimits):
             raise TypeError("limits must be LoopLimits")
 

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import inspect
 import subprocess
 import sys
 from collections import Counter
@@ -51,6 +52,7 @@ from daita.capabilities import (
     EffectOutcome,
     OperationalEffect,
 )
+from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import ModelProfile, ModelSensitivity
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider
@@ -66,6 +68,7 @@ AUTHORIZATION = "DAITA_RUN_LIVE_PHASE_F_MCP"
 MODEL_IDS_ENV = "DAITA_PHASE_F_LIVE_MODEL_IDS"
 REPEATS_ENV = "DAITA_PHASE_F_LIVE_REPEATS"
 COST_ENV = "DAITA_PHASE_F_LIVE_MAX_COST_USD"
+PROFILE_ENV = "DAITA_PHASE_F_LIVE_PROFILE"
 REPORT_ENV = "DAITA_PHASE_F_LIVE_REPORT_DIR"
 NOW = datetime(2026, 9, 6, 12, tzinfo=UTC)
 NEXT_SLOT = datetime(2026, 9, 7, 14, tzinfo=UTC)
@@ -100,17 +103,25 @@ def repeats() -> int:
     return value
 
 
+def evaluation_profile() -> str:
+    selected = os.environ.get(PROFILE_ENV, "strict")
+    if selected not in {"strict", "user_flow"}:
+        raise ValueError(f"{PROFILE_ENV} must be strict or user_flow")
+    return selected
+
+
 def limits() -> LoopLimits:
+    user_flow = evaluation_profile() == "user_flow"
     try:
-        amount = Decimal(os.environ.get(COST_ENV, "0.15"))
+        amount = Decimal(os.environ.get(COST_ENV, "0.50" if user_flow else "0.15"))
     except InvalidOperation as error:
         raise ValueError(f"{COST_ENV} must be a finite positive decimal") from error
     if not amount.is_finite() or amount <= 0:
         raise ValueError(f"{COST_ENV} must be a finite positive decimal")
     return LoopLimits(
-        max_steps=14,
-        max_total_tokens=30_000,
-        max_wall_time_seconds=180,
+        max_steps=24 if user_flow else 14,
+        max_total_tokens=100_000 if user_flow else 30_000,
+        max_wall_time_seconds=300 if user_flow else 180,
         max_estimated_cost_usd=amount,
     )
 
@@ -258,11 +269,37 @@ class Evaluation:
         tool_count: int = 2,
         fault: str = "success",
         routine: bool = False,
+        run_immediately: bool = True,
+        action_argument_names: tuple[str, str] = ("destination", "content"),
     ) -> None:
         self.root = root
+        expected_runtime_root = os.environ.get("DAITA_EXPECTED_RUNTIME_ROOT")
+        if expected_runtime_root and not Path(
+            inspect.getfile(CapabilityRuntime)
+        ).resolve().is_relative_to(Path(expected_runtime_root).resolve()):
+            raise ValueError(
+                "qualification imported a different production source root"
+            )
         self.provider = RecordingProvider(provider)
         self.profile = profile
+        self.evaluation_profile = evaluation_profile()
+        if (
+            len(action_argument_names) != 2
+            or len(set(action_argument_names)) != 2
+            or any(
+                not name.isidentifier() or len(name) > 64
+                for name in action_argument_names
+            )
+        ):
+            raise ValueError("fixture action needs two distinct bounded argument names")
+        if self.evaluation_profile != "user_flow" and (
+            not run_immediately or action_argument_names != ("destination", "content")
+        ):
+            raise ValueError("contract comparisons require explicit user_flow profile")
+        self.run_immediately = run_immediately
+        self.action_argument_names = action_argument_names
         self.limits = limits()
+        self.answer_reviews: list[dict[str, object]] = []
         assert self.limits.max_estimated_cost_usd is not None
         self.cost_limit = self.limits.max_estimated_cost_usd
         self.conversation_id: str | None = None
@@ -270,6 +307,14 @@ class Evaluation:
         self.routine = routine
         self.setup_mode = "model_authored"
         self.server = identity(tool_count, fault)
+        if action_argument_names != ("destination", "content"):
+            schema = cast(
+                dict[str, object], self.server.tool("notify_release")["inputSchema"]
+            )
+            schema["properties"] = {
+                name: {"type": "string"} for name in action_argument_names
+            }
+            schema["required"] = list(action_argument_names)
         self.transport = EvaluationTransport(self.server, fault)
         self.approvals: list[dict[str, object]] = []
         self.captures: list[tuple[LoopExit, Transcript, float | None]] = []
@@ -350,8 +395,8 @@ class Evaluation:
                     "binding_id": self.binding.binding_id,
                     "binding_revision": self.binding.revision,
                     "remote_tool_name": self.action.remote_name,
-                    "fixed_arguments": {"destination": DESTINATION},
-                    "variable_argument_names": ["content"],
+                    "fixed_arguments": {self.action_argument_names[0]: DESTINATION},
+                    "variable_argument_names": [self.action_argument_names[1]],
                 }
             )
         )
@@ -394,7 +439,7 @@ class Evaluation:
                 and schedule.get("hour") == 9
                 and schedule.get("minute") == 0
                 and schedule.get("weekdays") == (1,)
-                and arguments.get("run_immediately") is True
+                and arguments.get("run_immediately") is self.run_immediately
                 and arguments.get("allowed_connector_binding_ids")
                 == (self.binding.binding_id,)
                 and isinstance(capabilities, tuple)
@@ -455,7 +500,72 @@ class Evaluation:
                             return result, transcript
                 await asyncio.sleep(0.05)
 
+    def action_prompt(self, phrasing: int) -> str:
+        prompts = (
+            f'Post a release-readiness notification to {DESTINATION} with exactly this content: "{CONTENT}".',
+            f'Let {DESTINATION} know this release-readiness message: "{CONTENT}". Preserve that text exactly.',
+        )
+        if self.evaluation_profile == "user_flow":
+            return (
+                prompts[phrasing] + " Do not perform research. Tell me what happened."
+            )
+        return (
+            prompts[phrasing]
+            + " Do not perform research. Set citation and finding to null. "
+            + REPORT_INSTRUCTION
+        )
+
+    def research_prompt(self) -> str:
+        prompt = (
+            f"Research current release readiness and post the finding, its verification marker, "
+            f"and its citation to {DESTINATION}. Preserve the research in your answer even if "
+            "the notification cannot be confirmed. "
+        )
+        return prompt + (
+            "Tell me what happened and what remains unconfirmed."
+            if self.evaluation_profile == "user_flow"
+            else REPORT_INSTRUCTION
+        )
+
+    def check_answer(self, result: LoopExit, *, status: str, research: bool) -> None:
+        assert result.kind is LoopExitKind.COMPLETED, result
+        if self.evaluation_profile == "strict":
+            assert_report(result, status=status, research=research)
+        else:
+            assert result.final_text and result.final_text.strip()
+            self.answer_reviews.append(
+                {
+                    "run_id": result.run_id,
+                    "expected_status": status,
+                    "research": research,
+                    "review": "pending_evidence_review",
+                }
+            )
+
     def routine_prompt(self) -> str:
+        if self.evaluation_profile == "user_flow":
+            timing = (
+                "now and every Monday at 09:00 America/Chicago. "
+                if self.run_immediately
+                else "every Monday at 09:00 America/Chicago, starting next Monday; do not run it today. "
+            )
+            return (
+                "Set up a saved assignment using our connected release research and notifications: "
+                f"research current release readiness and post the finding, verification marker, and citation to {DESTINATION} "
+                + timing
+                + "Allow one notification each time, "
+                "always to that room; only the message content may change. Use the current model. "
+                "Keep the information internal and put each run's report in this conversation's inbox. "
+                "Use no database tables, files, saved procedures, or artifacts. "
+                "Always report what happened, including unconfirmed results. Require confirmation "
+                "from the notification service, without claiming downstream delivery was verified. "
+                "If a scheduled time is missed, run only the latest missed occurrence. "
+                "Stop after two occurrences or two attempts, or one consecutive failure, "
+                f"and expire at {EXPIRES.isoformat()}. "
+                f"Use exactly {self.limits.max_total_tokens} tokens and ${self.cost_limit} per run, "
+                f"{2 * self.limits.max_total_tokens} tokens and ${2 * self.cost_limit} total. "
+                "Tell me when the assignment is saved. Do not send an additional notification while setting it up."
+            )
         contract = {
             "binding_id": self.binding.binding_id,
             "binding_revision": self.binding.revision,
@@ -539,6 +649,14 @@ class Evaluation:
             "tool_count": len(self.server.tools),
             "fault": self.transport.fault,
             "setup_mode": self.setup_mode,
+            "evaluation_profile": self.evaluation_profile,
+            "action_argument_names": list(self.action_argument_names),
+            "run_immediately": self.run_immediately,
+            "production_runtime_file": inspect.getfile(CapabilityRuntime),
+            "production_runtime_sha256": hashlib.sha256(
+                Path(inspect.getfile(CapabilityRuntime)).read_bytes()
+            ).hexdigest(),
+            "answer_reviews": self.answer_reviews,
             "routine_states": routine_states,
             "metrics": {
                 "model_requests": len(self.provider.requests),
@@ -719,7 +837,7 @@ def owner_routine_draft(
         cumulative_max_occurrences=2,
         maximum_consecutive_failures=1,
         expires_at=EXPIRES,
-        run_immediately=True,
+        run_immediately=scenario.run_immediately,
         requested_capability_grants=(
             RequestedCapabilityGrant(
                 scenario.action.capability_id,
@@ -728,8 +846,10 @@ def owner_routine_draft(
                         "binding_id": scenario.binding.binding_id,
                         "binding_revision": scenario.binding.revision,
                         "remote_tool_name": scenario.action.remote_name,
-                        "fixed_arguments": {"destination": DESTINATION},
-                        "variable_argument_names": ["content"],
+                        "fixed_arguments": {
+                            scenario.action_argument_names[0]: DESTINATION
+                        },
+                        "variable_argument_names": [scenario.action_argument_names[1]],
                     }
                 ),
                 1,
@@ -809,6 +929,7 @@ async def evaluate(
                                 "_mcp_fixtures.py",
                                 "live/benchmarks/_support.py",
                                 "live/test_phase_f_mcp_live.py",
+                                "live/test_phase_f_scheduled_live.py",
                             )
                         )
                     ).hexdigest(),
@@ -841,6 +962,8 @@ async def evaluate(
 
 def report_path(node_id: str) -> Path:
     root = Path(os.environ.get(REPORT_ENV, "test-results/phase-f"))
+    if evaluation_profile() == "user_flow":
+        root = root / "user_flow"
     key = hashlib.sha256(node_id.encode()).hexdigest()[:16]
     return root / f"phase-f-{key}-{uuid4().hex[:8]}.json"
 
@@ -853,23 +976,31 @@ def summarize_reports(directory: Path) -> list[dict[str, object]]:
         family = report["case_id"].partition("[")[0].split("::")[-1]
         key = (
             report["model_id"],
+            report.get("evaluation_profile", "strict"),
             family,
             report["tool_count"],
             report["fault"],
             report["revision"],
             report["harness_sha256"],
             report["working_tree_diff_sha256"],
+            tuple(report.get("action_argument_names", ("destination", "content"))),
+            report.get("run_immediately", True),
+            report.get("production_runtime_sha256"),
         )
         groups.setdefault(key, []).append(report)
     output: list[dict[str, object]] = []
     for (
         model,
+        selected_profile,
         family,
         tools,
         fault,
         revision,
         harness,
         diff,
+        argument_names,
+        run_immediately,
+        runtime_sha256,
     ), reports in groups.items():
         metrics = [report["metrics"] for report in reports]
         passed = sum(report["status"] == "passed" for report in reports)
@@ -881,12 +1012,16 @@ def summarize_reports(directory: Path) -> list[dict[str, object]]:
         output.append(
             {
                 "model_id": model,
+                "evaluation_profile": selected_profile,
                 "scenario": family,
                 "tool_count": tools,
                 "fault": fault,
                 "revision": revision,
                 "harness_sha256": harness,
                 "working_tree_diff_sha256": diff,
+                "action_argument_names": argument_names,
+                "run_immediately": run_immediately,
+                "production_runtime_sha256": runtime_sha256,
                 "cases": len(reports),
                 "passed": passed,
                 "failed": len(reports) - passed,

@@ -231,8 +231,15 @@ The separate [live model acceptance suite](../../../docs/LIVE_LLM_ACCEPTANCE.md)
 uses actual API generation and the production router with these same canaries.
 It covers model-driven discovery, writes, refusals, failure interpretation,
 recovery and immediate/weekly routine authoring. It requires its own paid-run
-authorization and environment credential; the default nine cases admit at most
-thirteen bounded agent runs and $1.95 estimated cost. Database-only results above
+authorization and environment credential; the default twelve cases admit at most
+seventeen bounded agent runs and $2.55 estimated cost per model/repetition.
+The explicit `user_flow` profile uses ordinary requests and prose answers,
+with thirteen cases, at most nineteen runs and $9.50 estimated per
+model/repetition. It uses the production 100,000-token, 24-request, 300-second
+outer limits with a $0.50 estimated per-run ceiling; the strict profile remains
+unchanged. Exact execution assertions and separate answer review are required.
+Independent owner-seeded recovery and scheduled cases are labeled separately
+from model-authored end-to-end cases. Database-only results above
 do not substitute for a passing live model run.
 
 ## Stop and discard it

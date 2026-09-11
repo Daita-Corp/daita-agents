@@ -5,9 +5,8 @@ from time import perf_counter
 
 import httpx
 import openai
-
-from test_mcp_actions import ActionFixture
 from live.benchmarks._support import RecordingProvider
+from test_mcp_actions import ActionFixture
 
 from daita.config import AgentConfig
 from daita.llm import factory
@@ -26,7 +25,9 @@ class ConfiguredActionFixture(ActionFixture):
                         secret_reference=secret_reference,
                     ),
                 ),
-                retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+                retry_policy=RetryPolicy(
+                    max_attempts_per_candidate=2, backoff_seconds=0
+                ),
             ),
             limits=limits,
         )

@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import stat
 import sys
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 from _workspace_support import workspace_for
@@ -22,6 +25,7 @@ from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelCallPolicy,
     ModelRequest,
     ModelResponse,
     TextBlock,
@@ -620,11 +624,23 @@ async def test_grok_subscription_total_attempt_timeout_is_normalized():
     provider = GrokBuildSubscriptionProvider(
         "grok-4.5",
         runner=hang,
-        timeout_seconds=0.01,
     )
 
     with pytest.raises(ModelProviderError) as caught:
-        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+        await asyncio.wait_for(
+            provider.generate(
+                replace(
+                    _request(),
+                    call_policy=ModelCallPolicy(
+                        max_attempt_seconds=0.01,
+                        first_progress_timeout_seconds=0.01,
+                        progress_idle_timeout_seconds=0.01,
+                        cleanup_timeout_seconds=0.1,
+                    ),
+                )
+            ),
+            timeout=0.5,
+        )
 
     assert caught.value.code is ProviderErrorCode.TIMEOUT
     assert caught.value.provider_id == "grok-build:grok-4.5"
@@ -665,7 +681,7 @@ async def test_command_timeout_and_cancellation_terminate_subprocess_trees(tmp_p
         stdin=b"",
         cwd=tmp_path,
         environment={"PATH": os.environ.get("PATH", "")},
-        timeout_seconds=0.2,
+        deadline=asyncio.get_running_loop().time() + 0.2,
     )
 
     with pytest.raises(ModelProviderError) as caught:
@@ -680,7 +696,7 @@ async def test_command_timeout_and_cancellation_terminate_subprocess_trees(tmp_p
         stdin=b"",
         cwd=tmp_path,
         environment={"PATH": os.environ.get("PATH", "")},
-        timeout_seconds=60,
+        deadline=asyncio.get_running_loop().time() + 60,
     )
     task = asyncio.create_task(subscription_cli._run_command(cancel_command))
     cancel_child = await _wait_for_file(cancel_pid_path)
@@ -703,7 +719,7 @@ async def test_command_timeout_terminates_descendants_after_leader_exit(tmp_path
         stdin=b"",
         cwd=tmp_path,
         environment={"PATH": os.environ.get("PATH", "")},
-        timeout_seconds=0.2,
+        deadline=asyncio.get_running_loop().time() + 0.2,
     )
 
     with pytest.raises(ModelProviderError) as caught:
@@ -728,7 +744,7 @@ async def test_command_output_limit_terminates_subprocess_tree(tmp_path):
         stdin=b"",
         cwd=tmp_path,
         environment={"PATH": os.environ.get("PATH", "")},
-        timeout_seconds=5,
+        deadline=asyncio.get_running_loop().time() + 5,
     )
 
     with pytest.raises(ModelProviderError) as caught:
@@ -794,3 +810,138 @@ async def test_subscription_route_persists_without_credentials(
         assert reopened.model_route.candidates[0].provider_id == provider_id
     finally:
         await reopened.close()
+
+
+async def test_unreaped_process_returns_bounded_failure_and_retains_waiter(monkeypatch):
+    from types import SimpleNamespace
+
+    from daita.llm._lifecycle import NativeOwner, await_cleanup
+
+    release = asyncio.Event()
+    signals = []
+    owner = NativeOwner()
+
+    async def wait():
+        await release.wait()
+        return 0
+
+    process = SimpleNamespace(pid=987654321, wait=wait)
+    monkeypatch.setattr(subscription_cli.os, "name", "posix")
+    monkeypatch.setattr(
+        subscription_cli.os, "killpg", lambda pid, sig: signals.append((pid, sig))
+    )
+    monkeypatch.setattr(subscription_cli, "_process_group_exists", lambda pid: False)
+    start = asyncio.get_running_loop().time()
+    task = asyncio.create_task(
+        subscription_cli._stop_process(
+            cast(asyncio.subprocess.Process, process),
+            deadline=start + 0.04,
+            owner=owner,
+        )
+    )
+    try:
+        with pytest.raises(ModelProviderError) as caught:
+            await await_cleanup(task, deadline=start + 0.05, owner=owner)
+        assert caught.value.code is ProviderErrorCode.CLEANUP_TIMEOUT
+        assert asyncio.get_running_loop().time() - start < 0.2
+        assert owner.poisoned
+        assert any(not task.done() for task in owner.tasks)
+        assert signals == [(987654321, signal.SIGTERM)]
+    finally:
+        pending = tuple(owner.tasks)
+        release.set()
+        await asyncio.gather(task, *pending, return_exceptions=True)
+
+
+async def test_late_process_start_is_owned_and_terminated_without_returning_output(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from daita.llm._lifecycle import NativeOwner
+
+    release = asyncio.Event()
+    stopped = []
+    owner = NativeOwner()
+
+    async def spawn(*args, **kwargs):
+        await release.wait()
+        return SimpleNamespace(pid=123456789)
+
+    async def stop(process, *, deadline, owner):
+        stopped.append(process.pid)
+
+    monkeypatch.setattr(subscription_cli.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(subscription_cli, "_stop_process", stop)
+    start = asyncio.get_running_loop().time()
+    command = subscription_cli._Command(
+        (sys.executable,),
+        b"",
+        tmp_path,
+        {"PATH": os.environ.get("PATH", "")},
+        start + 0.04,
+        cleanup_timeout_seconds=0.04,
+        native_owner=owner,
+    )
+    try:
+        with pytest.raises(ModelProviderError) as caught:
+            await subscription_cli._run_command(command)
+        assert caught.value.code is ProviderErrorCode.TIMEOUT
+        assert owner.poisoned and stopped == []
+        assert asyncio.get_running_loop().time() - start < 0.2
+    finally:
+        pending = tuple(owner.tasks)
+        release.set()
+        await asyncio.gather(*pending, return_exceptions=True)
+    assert stopped == [123456789]
+
+
+async def test_command_cancellation_survives_failed_process_cleanup(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from daita.llm._lifecycle import NativeOwner
+
+    started = asyncio.Event()
+    owner = NativeOwner()
+
+    async def drain():
+        started.set()
+        await asyncio.Event().wait()
+
+    async def read(size):
+        await asyncio.Event().wait()
+
+    async def spawn(*args, **kwargs):
+        return SimpleNamespace(
+            stdin=SimpleNamespace(
+                write=lambda data: None, drain=drain, close=lambda: None
+            ),
+            stdout=SimpleNamespace(read=read),
+            stderr=SimpleNamespace(read=read),
+        )
+
+    async def stop(process, *, deadline, owner):
+        raise ModelProviderError(ProviderErrorCode.CLEANUP_TIMEOUT)
+
+    monkeypatch.setattr(subscription_cli.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(subscription_cli, "_stop_process", stop)
+    command = subscription_cli._Command(
+        (sys.executable,),
+        b"",
+        tmp_path,
+        {},
+        asyncio.get_running_loop().time() + 1,
+        cleanup_timeout_seconds=0.05,
+        native_owner=owner,
+    )
+    task = asyncio.create_task(subscription_cli._run_command(command))
+    try:
+        await started.wait()
+        task.cancel("user cancelled")
+        with pytest.raises(asyncio.CancelledError, match="user cancelled"):
+            await task
+        assert owner.poisoned
+    finally:
+        await asyncio.gather(task, *tuple(owner.tasks), return_exceptions=True)

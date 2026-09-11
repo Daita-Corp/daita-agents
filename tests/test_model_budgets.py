@@ -1,36 +1,36 @@
 """Budget and retry boundaries exercised with actual SDK HTTP requests, offline."""
 
+import json
 from decimal import Decimal
 from typing import Any, cast
 
-import httpx
-import json
 import anthropic
+import httpx
 import openai
+import pytest
 from google import genai
 from google.genai import types
-import pytest
-
 from test_provider_lifecycle import _ResponseBody
+
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     CanonicalMessage,
+    FinishReason,
     MessageRole,
     ModelRequest,
     ModelResponse,
     ModelStreamCompleted,
     ModelUsage,
     TextBlock,
-    FinishReason,
     ToolDefinition,
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.profiles import reviewed_model_profile
-from daita.llm.providers.openai import OpenAIResponsesProvider
 from daita.llm.providers.anthropic import AnthropicMessagesProvider
 from daita.llm.providers.gemini import GeminiProvider
-from daita.llm.providers.openai_compatible import OpenAICompatibleProvider
 from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
+from daita.llm.providers.openai import OpenAIResponsesProvider
+from daita.llm.providers.openai_compatible import OpenAICompatibleProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 
 
@@ -245,7 +245,7 @@ async def test_actual_sdk_cannot_multiply_router_attempts(stream):
     assert profile is not None
     router = ModelRouter(
         (ModelProviderRegistration(provider=provider, profile=profile),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
     try:
         with pytest.raises(ModelProviderError):
@@ -290,7 +290,7 @@ async def test_router_accounts_failed_attempts_before_another_request(stream, un
     )
     router = ModelRouter(
         (ModelProviderRegistration(provider=provider, profile=provider.model_profile),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
     bounded = request(max_total_tokens=100, max_estimated_cost_usd=Decimal("0.10"))
 

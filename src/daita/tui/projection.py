@@ -666,9 +666,15 @@ def approval_review_document(
     document = (
         header
         + (
-            approval_summary(arguments_text)
+            approval_summary(arguments_text, capability_id)
             if capability_id
-            in {"routines.create", "routines.update", "control.resolve_effect"}
+            in {
+                "routines.create",
+                "routines.update",
+                "control.resolve_effect",
+                "data.update_rows",
+                "data.upsert_rows",
+            }
             else ""
         )
         + "Exact validated details:\n"
@@ -710,7 +716,7 @@ def looks_secret_shaped(value: str) -> bool:
         return True
 
 
-def approval_summary(arguments_text: str) -> str:
+def approval_summary(arguments_text: str, capability_id: str) -> str:
     """Summarize only the frozen document handed to the approval handler."""
     try:
         document = json.loads(arguments_text)
@@ -718,6 +724,61 @@ def approval_summary(arguments_text: str) -> str:
         return ""
     if not isinstance(document, dict):
         return ""
+    if capability_id in {"data.update_rows", "data.upsert_rows"}:
+        arguments, target, preview = (
+            document.get("arguments"),
+            document.get("target"),
+            document.get("preview"),
+        )
+        if not all(isinstance(item, dict) for item in (arguments, target, preview)):
+            return ""
+        assert isinstance(arguments, dict)
+        assert isinstance(target, dict)
+        assert isinstance(preview, dict)
+        lines = [
+            f"Connection: {target.get('source_name')}",
+            f"Table: {target.get('name')}",
+            "Catalog aliases: " + json.dumps(target.get("aliases"), ensure_ascii=True),
+        ]
+        if capability_id == "data.update_rows":
+            lines.extend(
+                (
+                    "Select rows where: "
+                    + json.dumps(arguments.get("where"), ensure_ascii=True),
+                    "Set: "
+                    + json.dumps(arguments.get("assignments"), ensure_ascii=True),
+                    f"Preview: {preview.get('matched_rows')} matching row(s); expected {arguments.get('expected_affected_rows')}.",
+                    "Bounded samples of primary keys and before/after values: "
+                    + json.dumps(preview.get("samples"), ensure_ascii=True),
+                )
+            )
+        else:
+            lines.extend(
+                (
+                    "Match keys: "
+                    + json.dumps(arguments.get("key_columns"), ensure_ascii=True),
+                    "Insert columns: "
+                    + json.dumps(arguments.get("insert_columns"), ensure_ascii=True),
+                    "Update columns: "
+                    + json.dumps(arguments.get("update_columns"), ensure_ascii=True),
+                    f"Preview: {preview.get('inserted_count')} insert, {preview.get('updated_count')} update, {preview.get('unchanged_count')} unchanged; {preview.get('input_count')} input row(s).",
+                    "Bounded samples of keys and planned actions: "
+                    + json.dumps(preview.get("classifications"), ensure_ascii=True),
+                    "The complete supplied batch is in the exact details below. Omitted update values stay unchanged; explicit null clears an admitted nullable value.",
+                )
+            )
+        lines.append(
+            "Check that these are the intended entities and values. Samples are not a complete inventory or proof of business meaning. Approval permits this exact operation once; changed state is rechecked before execution."
+        )
+        return (
+            sanitize_terminal_text(
+                "\n".join(lines),
+                maximum=12000,
+                preserve_lines=True,
+                fallback="Native write review",
+            )
+            + "\n\n"
+        )
     routine = document.get("proposal")
     if isinstance(routine, dict):
         schedule = routine.get("schedule", {})

@@ -520,7 +520,10 @@ async def test_job_context_is_agent_scoped_and_result_first(tmp_path: Path) -> N
             in system.text
         )
         assert "even when the numbers happen to match" in system.text
-        assert "Use job_inspect only" in system.text
+        assert (
+            "For requested lifecycle details, call job_inspect when needed"
+            in system.text
+        )
         search = next(
             item for item in provider.requests[0].tools if item.name == "toolbox_search"
         )

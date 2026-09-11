@@ -251,7 +251,9 @@ async def test_sensitive_admitted_source_excludes_route_before_provider_io(tmp_p
                 allowed_sensitivities=frozenset({ModelSensitivity.PUBLIC}),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
     agent = await Agent.create(
         "stage0-vertical-route-admission",

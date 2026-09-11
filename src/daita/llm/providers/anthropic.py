@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
-from contextlib import AsyncExitStack
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -14,18 +13,26 @@ from uuid import uuid4
 
 from ..._installation import repair_guidance
 from ..._json import FrozenJsonObject, canonical_json
-from .._lifecycle import await_cleanup, closing_stream, input_count_deadline
+from .._lifecycle import (
+    AttemptLifecycle,
+    NativeOwner,
+    await_cleanup,
+    closing_stream,
+    native_events,
+    shutdown_deadline,
+    transport_timeout,
+)
 from ..errors import (
     ModelProviderError,
-    interrupted_model_usage,
-    with_cancelled_model_usage,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
-    detached_provider_error,
-    token_count_error,
     before_generation,
+    detached_provider_error,
+    interrupted_model_usage,
     retry_after_from_headers,
+    token_count_error,
+    with_cancelled_model_usage,
 )
 from ..models import (
     CanonicalMessage,
@@ -43,14 +50,14 @@ from ..models import (
     ToolResultBlock,
 )
 from ..pricing import (
-    bound_request_output,
-    with_request_admission,
     BillableQuantity,
     CostEstimate,
     PricingSchedule,
+    bound_request_output,
     calculate_cost_estimate,
     load_bundled_pricing_schedules,
     validate_pricing_schedules,
+    with_request_admission,
 )
 
 _CONTINUATION_KEY = "anthropic_continuation"
@@ -129,6 +136,7 @@ class AnthropicMessagesProvider:
         self._client = client
         self._owns_client = client is None
         self._close_task: asyncio.Task[None] | None = None
+        self._native_owner = NativeOwner()
         self._id_factory = _new_id if id_factory is None else id_factory
         self._pricing_schedules = (
             load_bundled_pricing_schedules()
@@ -177,12 +185,16 @@ class AnthropicMessagesProvider:
                 return cast(_AnthropicClient, with_options(max_retries=0))
         return self._client
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Join the once-only cleanup of this provider's owned SDK client."""
 
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._finish_close())
-        await await_cleanup(self._close_task)
+        await await_cleanup(
+            self._close_task,
+            deadline=shutdown_deadline(deadline),
+            owner=self._native_owner,
+        )
 
     async def _finish_close(self) -> None:
         client = self._client
@@ -193,22 +205,30 @@ class AnthropicMessagesProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        attempt = AttemptLifecycle(self._native_owner, request, headers_supported=True)
+        request = attempt.request
         failure: ModelProviderError | None = None
         try:
             request.remaining_after(
                 ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
             )
-            async with asyncio.timeout_at(request.deadline):
-                return await self._generate(request)
+            async with attempt:
+                response = await self._generate(request, attempt)
+                attempt.response(response)
+                attempt.check_execution()
+            attempt.finish(None)
+            return attempt.observation.response(response)
         except TimeoutError as error:
             failure = ModelProviderError(
                 ProviderErrorCode.TIMEOUT,
                 "The model request deadline expired.",
                 usage=interrupted_model_usage(error),
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            attempt.finish(error)
             raise
-        except ImportError:
+        except ImportError as error:
+            attempt.finish(error)
             raise
         except ModelProviderError as error:
             failure = error
@@ -223,17 +243,26 @@ class AnthropicMessagesProvider:
             )
         if failure is None:
             raise AssertionError("Anthropic provider failed without an error")
+        if attempt.terminal_response is not None:
+            failure.usage = attempt.usage()
+        attempt.finish(failure)
         raise detached_provider_error(failure, provider_id=self.provider_id)
 
-    async def _generate(self, request: ModelRequest) -> ModelResponse:
+    async def _generate(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         requested_at = self._clock()
-        counted_input_tokens = await self._admit_request(request, arguments)
+        counted_input_tokens = await self._admit_request(request, arguments, attempt)
         try:
-            response = await self.client.messages.create(**arguments)
+            attempt.values["output_cap"] = arguments.get("max_tokens")
+            attempt.dispatch()
+            response = await self._sdk_call(
+                self.client.messages, "create", arguments, attempt, "generation"
+            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -241,6 +270,7 @@ class AnthropicMessagesProvider:
         except ModelProviderError:
             raise
         except Exception as error:
+            attempt.transport_failure(error, phase="generation")
             raise _normalize_error(error) from error
         try:
             return with_request_admission(
@@ -268,15 +298,30 @@ class AnthropicMessagesProvider:
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        attempt = AttemptLifecycle(
+            self._native_owner, request, headers_supported=True, observable=True
+        )
+        terminal_usage: ModelUsage | None = None
+        request = attempt.request
         failure: ModelProviderError | None = None
         try:
             request.remaining_after(
                 ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
             )
-            async with asyncio.timeout_at(request.deadline):
-                async with closing_stream(self._stream(request)) as events:
+            async with attempt:
+                async with closing_stream(self._stream(request, attempt)) as events:
                     async for event in events:
+                        if isinstance(event, ModelStreamCompleted):
+                            terminal_usage = event.response.usage
+                            terminal = attempt.response(event.response)
+                            break
+                        attempt.canonical(event)
                         yield event
+                attempt.check_execution()
+                if terminal_usage is not None:
+                    attempt.finish(None)
+                    yield ModelStreamCompleted(attempt.observation.response(terminal))
+            attempt.finish(None)
             return
         except TimeoutError as error:
             failure = ModelProviderError(
@@ -284,9 +329,13 @@ class AnthropicMessagesProvider:
                 "The model request deadline expired.",
                 usage=interrupted_model_usage(error),
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit) as error:
+            if isinstance(error, asyncio.CancelledError) and terminal_usage is not None:
+                with_cancelled_model_usage(error, terminal_usage)
+            attempt.finish(error)
             raise
-        except ImportError:
+        except ImportError as error:
+            attempt.finish(error)
             raise
         except ModelProviderError as error:
             failure = error
@@ -301,28 +350,46 @@ class AnthropicMessagesProvider:
             )
         if failure is None:
             raise AssertionError("Anthropic provider failed without an error")
+        if terminal_usage is not None:
+            failure.usage = terminal_usage
+        if attempt.terminal_response is not None:
+            failure.usage = attempt.usage()
+        attempt.finish(failure)
         raise detached_provider_error(failure, provider_id=self.provider_id)
 
     async def _stream(
         self,
         request: ModelRequest,
+        attempt: AttemptLifecycle,
     ) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
         self._require_supported_request_policy(request)
         arguments = self._request_arguments(request)
         requested_at = self._clock()
-        counted_input_tokens = await self._admit_request(request, arguments)
+        counted_input_tokens = await self._admit_request(request, arguments, attempt)
         decoder = _AnthropicStreamDecoder(
             provider_id=self.provider_id,
             id_factory=self._id_factory,
         )
         try:
-            manager = self.client.messages.stream(**arguments)
-            stack = AsyncExitStack()
-            native_stream = await stack.enter_async_context(manager)
-            async with closing_stream(native_stream, close=stack.aclose):
+            attempt.values["output_cap"] = arguments.get("max_tokens")
+            attempt.dispatch()
+            source = native_events(
+                lambda: self.client.messages.stream(
+                    **arguments, timeout=transport_timeout(request)
+                ),
+                manager=True,
+                observe=lambda stream: self._observe_headers(
+                    attempt, "generation", _safe_field(stream, "response")
+                ),
+            )
+            async with attempt.stream(source) as native_stream:
                 async for native_event in native_stream:
+                    attempt.native(
+                        _safe_field(native_event, "type"),
+                        _safe_field(_safe_field(native_event, "message"), "id"),
+                    )
                     event_type = _safe_structural_token(
                         _safe_field(native_event, "type")
                     )
@@ -337,32 +404,44 @@ class AnthropicMessagesProvider:
                             provider_id=self.provider_id,
                             event_type=event_type,
                         ) from error
+                    delta = _safe_field(native_event, "delta")
+                    if event_type == "content_block_delta":
+                        delta_type = _safe_structural_token(_safe_field(delta, "type"))
+                        field = {
+                            "text_delta": "text",
+                            "input_json_delta": "partial_json",
+                            "thinking_delta": "thinking",
+                        }.get(delta_type or "")
+                        if field is not None:
+                            fragment = _safe_field(delta, field)
+                            if isinstance(fragment, str):
+                                attempt.progress(fragment)
                     for canonical_event in canonical_events:
                         yield canonical_event
-            try:
-                response = decoder.finish()
-                response = self._with_priced_usage(
-                    response,
-                    billing=decoder.billing_usage(),
-                    response_model=decoder.response_model,
-                    requested_at=requested_at,
+                try:
+                    response = decoder.finish()
+                    response = self._with_priced_usage(
+                        response,
+                        billing=decoder.billing_usage(),
+                        response_model=decoder.response_model,
+                        requested_at=requested_at,
+                    )
+                except ModelProviderError:
+                    raise
+                except (KeyError, TypeError, ValueError) as error:
+                    raise _malformed_stream(
+                        phase=ProviderFailurePhase.STREAM_TERMINAL,
+                        code="terminal_completion_missing",
+                        provider_id=self.provider_id,
+                    ) from error
+                yield ModelStreamCompleted(
+                    with_request_admission(
+                        response,
+                        request,
+                        input_tokens=counted_input_tokens,
+                        output_cap=cast(int | None, arguments.get("max_tokens")),
+                    )
                 )
-            except ModelProviderError:
-                raise
-            except (KeyError, TypeError, ValueError) as error:
-                raise _malformed_stream(
-                    phase=ProviderFailurePhase.STREAM_TERMINAL,
-                    code="terminal_completion_missing",
-                    provider_id=self.provider_id,
-                ) from error
-            yield ModelStreamCompleted(
-                with_request_admission(
-                    response,
-                    request,
-                    input_tokens=counted_input_tokens,
-                    output_cap=cast(int | None, arguments.get("max_tokens")),
-                )
-            )
         except asyncio.CancelledError:
             raise
         except ImportError:
@@ -370,6 +449,12 @@ class AnthropicMessagesProvider:
         except ModelProviderError:
             raise
         except Exception as error:
+            error_response = _safe_field(error, "response")
+            if error_response is not None:
+                self._observe_headers(
+                    attempt, "generation", error_response, arrived=False
+                )
+            attempt.transport_failure(error, phase="generation")
             raise _normalize_error(error) from error
 
     def _require_supported_request_policy(self, request: ModelRequest) -> None:
@@ -378,6 +463,70 @@ class AnthropicMessagesProvider:
                 ProviderErrorCode.INVALID_REQUEST,
                 "Anthropic cannot enforce the requested tool-call policy",
             )
+
+    @staticmethod
+    def _observe_headers(
+        attempt: AttemptLifecycle, phase: str, response: object, *, arrived: bool = True
+    ) -> None:
+        try:
+            headers = getattr(response, "headers", None)
+            request_id = (
+                headers.get("request-id") if isinstance(headers, Mapping) else None
+            )
+            attempt.headers(
+                phase,
+                getattr(response, "status_code", None),
+                request_id,
+                arrived=arrived,
+            )
+        except Exception:
+            pass  # Optional SDK metadata cannot change request behavior.
+
+    async def _sdk_call(
+        self,
+        resource: object,
+        method: str,
+        arguments: dict[str, object],
+        attempt: AttemptLifecycle,
+        phase: str,
+    ) -> object:
+        arguments = {
+            **arguments,
+            "timeout": transport_timeout(
+                attempt.request, deadline=attempt._phase_deadline
+            ),
+        }
+
+        async def scope():
+            view = getattr(resource, "with_streaming_response", None)
+            if view is None:
+                attempt.values[f"{phase}_headers_availability"] = "unsupported"
+                yield await getattr(resource, method)(**arguments)
+                return
+            try:
+                async with getattr(view, method)(**arguments) as raw:
+                    attempt.track_response_release(_safe_field(raw, "http_response"))
+                    self._observe_headers(attempt, phase, raw)
+                    yield await raw.parse()
+            except Exception as error:
+                self._observe_headers(
+                    attempt, phase, _safe_field(error, "response"), arrived=False
+                )
+                raise
+
+        if phase == "count":
+
+            async def count():
+                async with closing_stream(scope()) as results:
+                    return await anext(results)
+
+            return await attempt.run_native(count())
+        async with attempt.stream(scope()) as results:
+            response = await anext(results)
+            attempt.response(
+                self._decode_response(response, requested_at=self._clock())
+            )
+            return response
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
         system, messages = _message_input(request.messages, self.provider_id)
@@ -411,7 +560,10 @@ class AnthropicMessagesProvider:
         return arguments
 
     async def _admit_request(
-        self, request: ModelRequest, arguments: dict[str, object]
+        self,
+        request: ModelRequest,
+        arguments: dict[str, object],
+        attempt: AttemptLifecycle,
     ) -> int | None:
         request.remaining_after(
             ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
@@ -429,9 +581,15 @@ class AnthropicMessagesProvider:
         count_arguments = {
             key: value for key, value in arguments.items() if key != "max_tokens"
         }
+        attempt.start_count()
         try:
-            async with asyncio.timeout_at(input_count_deadline(request)):
-                counted = await self.client.messages.count_tokens(**count_arguments)
+            counted = await self._sdk_call(
+                self.client.messages,
+                "count_tokens",
+                count_arguments,
+                attempt,
+                "count",
+            )
         except asyncio.CancelledError as error:
             raise with_cancelled_model_usage(
                 error, ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
@@ -441,6 +599,7 @@ class AnthropicMessagesProvider:
         except (TypeError, ValueError):
             raise token_count_error(invalid=True) from None
         except Exception as error:
+            attempt.transport_failure(error, phase="count")
             raise before_generation(
                 _normalize_error(error),
                 code="input_token_count_failed",
@@ -448,9 +607,11 @@ class AnthropicMessagesProvider:
         tokens = _field(counted, "input_tokens", None)
         if type(tokens) is not int or tokens < 0:
             raise token_count_error(invalid=True)
+        attempt.counted(tokens)
         arguments["max_tokens"] = bound_request_output(
             request, input_tokens=tokens, maximum_output_tokens=self.max_tokens
         )
+        attempt.values["output_cap"] = arguments["max_tokens"]
         return tokens
 
     def _decode_response(
@@ -1147,7 +1308,9 @@ class _AnthropicStreamDecoder:
             ("output_tokens", "_output_tokens", "output tokens"),
         ):
             value = _field(usage, name, _STREAM_MISSING)
-            if value is not _STREAM_MISSING:
+            # SDK delta models expose omitted optional counters as None. They
+            # carry no new measurement and must not erase earlier usage.
+            if value is not _STREAM_MISSING and value is not None:
                 setattr(self, attribute, _usage_int(value, label))
                 self._usage_fields_seen.add(name)
         cache_creation = _field(usage, "cache_creation", _STREAM_MISSING)
@@ -1514,6 +1677,8 @@ def _code_from_error_type(error_type: str) -> ProviderErrorCode:
 
 
 def _normalize_error(error: Exception) -> ModelProviderError:
+    if isinstance(error, ModelProviderError):
+        return error
     status_value = _field(error, "status_code", None)
     status = (
         status_value

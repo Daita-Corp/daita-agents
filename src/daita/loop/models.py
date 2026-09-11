@@ -12,7 +12,7 @@ from hashlib import sha256
 
 from .._json import FrozenJsonObject, canonical_json
 from ..artifacts.models import ArtifactDeliveryReceipt, ArtifactRef
-from ..capabilities import ExecutionScope
+from ..capabilities import ExecutionScope, RESERVED_TOOL_NAMES
 from ..scope import EffectiveSourceScope
 from ..llm.errors import ProviderFailureDiagnostic
 from ..llm.models import (
@@ -276,7 +276,7 @@ class LoopLimits:
     max_toolbox_manifest_tokens: int = 2_000
     max_pinned_tools: int = 32
     max_pinned_tool_definition_bytes: int = 96 * 1_024
-    max_loaded_tools: int = 16
+    max_loaded_tools: int = 15
     max_loaded_tool_definition_bytes: int = 96 * 1_024
     max_step_tools: int = 50
     max_step_tool_definition_bytes: int = 128 * 1_024
@@ -340,7 +340,10 @@ class LoopLimits:
                 raise ValueError(f"{field_name} must be a positive integer")
         if self.max_toolbox_manifest_entries > 6:
             raise ValueError("max_toolbox_manifest_entries cannot exceed 6")
-        if self.max_pinned_tools + self.max_loaded_tools + 2 > self.max_step_tools:
+        if (
+            self.max_pinned_tools + self.max_loaded_tools + len(RESERVED_TOOL_NAMES)
+            > self.max_step_tools
+        ):
             raise ValueError(
                 "pinned, loaded, and toolbox controls cannot exceed max_step_tools"
             )

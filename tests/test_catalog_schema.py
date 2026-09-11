@@ -514,7 +514,7 @@ class _InventoryProvider:
             assert (
                 "catalog_schema first for SQL (bounded bridges and paths)" in guidance
             )
-            assert "Only then use catalog_traverse" in guidance
+            assert "reported unresolved paths after schema inspection" in guidance
             assert "never call both together" in guidance
             assert "catalog_inspect gives full facets" in guidance
             self.catalog_tool_call_count += 1

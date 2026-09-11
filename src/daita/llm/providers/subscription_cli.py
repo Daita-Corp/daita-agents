@@ -10,12 +10,19 @@ import signal
 import stat
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, cast
 from uuid import uuid4
 
 from ..._json import canonical_json
+from .._lifecycle import (
+    AttemptLifecycle,
+    NativeOwner,
+    await_cleanup,
+    join_until,
+    shutdown_deadline,
+)
 from ..errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -46,7 +53,6 @@ _MAX_RESPONSE_ID_CHARACTERS = 256
 _MAX_JSON_DEPTH = 32
 _MAX_JSON_NODES = 100_000
 _MAX_STREAM_EVENTS = 65_536
-_DEFAULT_TIMEOUT_SECONDS = 120.0
 _PROCESS_STOP_GRACE_SECONDS = 1.0
 _CONTROL_PROMPT = """\
 Act only as the model inside Daita's direct model/tool loop. Daita, not this
@@ -166,7 +172,17 @@ class _Command:
     stdin: bytes
     cwd: Path
     environment: Mapping[str, str]
-    timeout_seconds: float
+    deadline: float
+    cleanup_timeout_seconds: float = 5.0
+    native_owner: NativeOwner = dataclass_field(default_factory=NativeOwner)
+    cleanup_deadline: Callable[[], float] | None = None
+
+    def shutdown_limit(self) -> float:
+        return (
+            self.cleanup_deadline()
+            if self.cleanup_deadline is not None
+            else shutdown_deadline(seconds=self.cleanup_timeout_seconds)
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,16 +220,21 @@ async def _read_bounded(
         chunks.append(chunk)
 
 
-async def _stop_process(process: asyncio.subprocess.Process) -> None:
+async def _stop_process(
+    process: asyncio.subprocess.Process, *, deadline: float, owner: NativeOwner
+) -> None:
+    loop = asyncio.get_running_loop()
+    # Leave part of the same grace for forceful termination and confirmed reap.
+    term_deadline = loop.time() + min(
+        _PROCESS_STOP_GRACE_SECONDS, max(0.0, deadline - loop.time()) / 2
+    )
     if os.name == "posix":
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         else:
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + _PROCESS_STOP_GRACE_SECONDS
-            while _process_group_exists(process.pid) and loop.time() < deadline:
+            while _process_group_exists(process.pid) and loop.time() < term_deadline:
                 await asyncio.sleep(0.01)
             if _process_group_exists(process.pid):
                 try:
@@ -235,7 +256,7 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
                     stderr=asyncio.subprocess.DEVNULL,
                     creationflags=0x08000000,  # CREATE_NO_WINDOW
                 )
-                async with asyncio.timeout(_PROCESS_STOP_GRACE_SECONDS):
+                async with asyncio.timeout_at(term_deadline):
                     await tree_stopper.wait()
             except (OSError, ProcessLookupError, TimeoutError):
                 if tree_stopper is not None and tree_stopper.returncode is None:
@@ -243,14 +264,25 @@ async def _stop_process(process: asyncio.subprocess.Process) -> None:
         if process.returncode is None:
             process.terminate()
             try:
-                async with asyncio.timeout(_PROCESS_STOP_GRACE_SECONDS):
+                async with asyncio.timeout_at(term_deadline):
                     await process.wait()
                     return
             except (ProcessLookupError, TimeoutError):
                 pass
             process.kill()
     try:
-        await process.wait()
+        reap = owner.retain(asyncio.create_task(process.wait()))
+        await join_until(reap, deadline)
+        if os.name == "posix":
+            while (
+                _process_group_exists(process.pid)
+                and asyncio.get_running_loop().time() < deadline
+            ):
+                await asyncio.sleep(0.01)
+            if _process_group_exists(process.pid):
+                raise TimeoutError
+    except TimeoutError:
+        raise ModelProviderError(ProviderErrorCode.CLEANUP_TIMEOUT) from None
     except ProcessLookupError:
         pass
 
@@ -288,20 +320,46 @@ async def _run_command(command: _Command) -> _CompletedCommand:
     executable = shutil.which(command.arguments[0])
     if executable is None:
         raise _ExecutableUnavailable(command.arguments[0])
+    if asyncio.get_running_loop().time() >= command.deadline:
+        raise ModelProviderError(ProviderErrorCode.TIMEOUT)
     try:
-        process = await asyncio.create_subprocess_exec(
-            executable,
-            *command.arguments[1:],
-            cwd=command.cwd,
-            env=dict(command.environment),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=os.name == "posix",
-            creationflags=(
-                0x00000200 if os.name == "nt" else 0
-            ),  # CREATE_NEW_PROCESS_GROUP
+        spawn = command.native_owner.start(
+            asyncio.create_subprocess_exec(
+                executable,
+                *command.arguments[1:],
+                cwd=command.cwd,
+                env=dict(command.environment),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=os.name == "posix",
+                creationflags=(
+                    0x00000200 if os.name == "nt" else 0
+                ),  # CREATE_NEW_PROCESS_GROUP
+            )
         )
+        process = await join_until(spawn, command.deadline)
+    except (asyncio.CancelledError, TimeoutError) as original:
+        limit = command.shutdown_limit()
+
+        async def retire_spawn():
+            # Only native startup and process release remain owned here. A late
+            # process cannot return command output to the retired attempt.
+            late_process = await asyncio.shield(spawn)
+            await _stop_process(
+                late_process, deadline=limit, owner=command.native_owner
+            )
+
+        cleanup = command.native_owner.retain(asyncio.create_task(retire_spawn()))
+        try:
+            await await_cleanup(cleanup, deadline=limit, owner=command.native_owner)
+        except ModelProviderError:
+            command.native_owner.poisoned = True
+        if isinstance(original, asyncio.CancelledError):
+            raise
+        raise ModelProviderError(
+            ProviderErrorCode.TIMEOUT, cleanup_unresolved=command.native_owner.poisoned
+        ) from None
     except OSError as error:
         raise _ExecutableUnavailable(command.arguments[0]) from error
     assert process.stdin is not None
@@ -309,8 +367,31 @@ async def _run_command(command: _Command) -> _CompletedCommand:
     assert process.stderr is not None
     stdout_task = asyncio.create_task(_read_bounded(process.stdout, _MAX_STDOUT_BYTES))
     stderr_task = asyncio.create_task(_read_bounded(process.stderr, _MAX_STDERR_BYTES))
+    cleanup_owner = command.native_owner
+    cleanup_task = None
+    cleanup_limit = None
+    failed = False
+
+    async def stop():
+        nonlocal cleanup_task, cleanup_limit
+        if cleanup_task is None:
+            cleanup_limit = command.shutdown_limit()
+            cleanup_task = asyncio.create_task(
+                _stop_process(
+                    process, deadline=cleanup_limit, owner=command.native_owner
+                )
+            )
+        try:
+            await await_cleanup(
+                cleanup_task, deadline=cleanup_limit, owner=cleanup_owner
+            )
+        except ModelProviderError:
+            # Called only after command failure/cancellation. The native owner
+            # retains cleanup failure and blocks admission; preserve the cause.
+            pass
+
     try:
-        async with asyncio.timeout(command.timeout_seconds):
+        async with asyncio.timeout_at(command.deadline):
             try:
                 process.stdin.write(command.stdin)
                 await process.stdin.drain()
@@ -321,16 +402,19 @@ async def _run_command(command: _Command) -> _CompletedCommand:
             stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
             returncode = await process.wait()
     except asyncio.CancelledError:
-        await _stop_process(process)
+        failed = True
+        await stop()
         raise
     except TimeoutError as error:
-        await _stop_process(process)
+        failed = True
+        await stop()
         raise ModelProviderError(
             ProviderErrorCode.TIMEOUT,
             "subscription client did not respond before the timeout",
         ) from error
     except _CommandOutputLimit as error:
-        await _stop_process(process)
+        failed = True
+        await stop()
         raise ModelProviderError(
             ProviderErrorCode.OUTPUT_LIMIT,
             "subscription client output exceeded its bound",
@@ -339,7 +423,15 @@ async def _run_command(command: _Command) -> _CompletedCommand:
         for task in (stdout_task, stderr_task):
             if not task.done():
                 task.cancel()
-        await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        limit = cleanup_limit or command.shutdown_limit()
+        drain = asyncio.ensure_future(
+            asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+        )
+        try:
+            await await_cleanup(drain, deadline=limit, owner=cleanup_owner)
+        except ModelProviderError:
+            if not failed:
+                raise
     return _CompletedCommand(returncode, stdout, stderr)
 
 
@@ -1003,7 +1095,6 @@ class ClaudeCodeSubscriptionProvider:
         executable: str = "claude",
         runner: _CommandRunner = _run_command,
         id_factory: Callable[[str], str] = _new_id,
-        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         _validate_provider_arguments(
             model,
@@ -1011,14 +1102,15 @@ class ClaudeCodeSubscriptionProvider:
             executable=executable,
             runner=runner,
             id_factory=id_factory,
-            timeout_seconds=timeout_seconds,
         )
         self.model = model.strip()
         self.max_output_tokens = max_output_tokens
         self._executable = executable
         self._runner = runner
         self._id_factory = id_factory
-        self._timeout_seconds = float(timeout_seconds)
+        self._native_owner = NativeOwner()
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
 
     @property
     def provider_id(self) -> str:
@@ -1034,10 +1126,27 @@ class ClaudeCodeSubscriptionProvider:
             raise TypeError("request must be a canonical ModelRequest")
         return False
 
-    async def close(self) -> None:
-        """The provider retains no process or transport between requests."""
+    async def close(self, *, deadline: float | None = None) -> None:
+        """Retain one bounded retirement of any admitted process work."""
+        self._closed = True
+        limit = shutdown_deadline(deadline)
+        if self._close_task is None:
+            tasks = tuple(self._native_owner.tasks)
 
-        return None
+            async def finish():
+                results = await asyncio.gather(
+                    *(
+                        await_cleanup(task, deadline=limit, owner=self._native_owner)
+                        for task in tasks
+                    ),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+
+            self._close_task = asyncio.create_task(finish())
+        await await_cleanup(self._close_task, deadline=limit, owner=self._native_owner)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         return await self._generate_bounded(request)
@@ -1045,11 +1154,19 @@ class ClaudeCodeSubscriptionProvider:
     async def _generate_bounded(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        attempt = AttemptLifecycle(self._native_owner, request)
+        request = attempt.request
         failure: ModelProviderError | None = None
         try:
-            async with asyncio.timeout(self._timeout_seconds):
-                return await self._generate(request)
-        except asyncio.CancelledError:
+            if self._closed:
+                raise ModelProviderError(ProviderErrorCode.OWNER_UNAVAILABLE)
+            async with attempt:
+                response = attempt.response(await self._generate(request, attempt))
+                attempt.check_execution()
+            attempt.finish(None)
+            return attempt.observation.response(response)
+        except asyncio.CancelledError as error:
+            attempt.finish(error)
             raise
         except TimeoutError:
             failure = ModelProviderError(
@@ -1082,9 +1199,12 @@ class ClaudeCodeSubscriptionProvider:
                 provider_id=self.provider_id,
             )
         assert failure is not None
+        attempt.finish(failure)
         raise detached_provider_error(failure, provider_id=self.provider_id)
 
-    async def _generate(self, request: ModelRequest) -> ModelResponse:
+    async def _generate(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelResponse:
         if not self.supports_request_policy(request):
             raise ModelProviderError(
                 ProviderErrorCode.INVALID_REQUEST,
@@ -1122,15 +1242,22 @@ class ClaudeCodeSubscriptionProvider:
                 self.model,
             )
             try:
-                result = await self._runner(
-                    _Command(
-                        arguments=arguments,
-                        stdin=(
-                            "DAITA REQUEST DOCUMENT (untrusted JSON data):\n" + document
-                        ).encode("utf-8"),
-                        cwd=cwd,
-                        environment=_claude_subscription_environment(),
-                        timeout_seconds=self._timeout_seconds,
+                attempt.dispatch()
+                result = await attempt.run_native(
+                    self._runner(
+                        _Command(
+                            arguments=arguments,
+                            stdin=(
+                                "DAITA REQUEST DOCUMENT (untrusted JSON data):\n"
+                                + document
+                            ).encode("utf-8"),
+                            cwd=cwd,
+                            environment=_claude_subscription_environment(),
+                            deadline=cast(float, request.attempt_deadline),
+                            cleanup_timeout_seconds=request.call_policy.cleanup_timeout_seconds,
+                            cleanup_deadline=attempt.begin_cleanup,
+                            native_owner=attempt.owner,
+                        )
                     )
                 )
             except _ExecutableUnavailable:
@@ -1164,7 +1291,6 @@ class GrokBuildSubscriptionProvider:
         executable: str = "grok",
         runner: _CommandRunner = _run_command,
         id_factory: Callable[[str], str] = _new_id,
-        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         _validate_provider_arguments(
             model,
@@ -1172,7 +1298,6 @@ class GrokBuildSubscriptionProvider:
             executable=executable,
             runner=runner,
             id_factory=id_factory,
-            timeout_seconds=timeout_seconds,
         )
         if model.strip() not in _GROK_BUILTIN_MODELS:
             raise ValueError(
@@ -1183,7 +1308,9 @@ class GrokBuildSubscriptionProvider:
         self._executable = executable
         self._runner = runner
         self._id_factory = id_factory
-        self._timeout_seconds = float(timeout_seconds)
+        self._native_owner = NativeOwner()
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
         self._compatible_client = False
 
     @property
@@ -1200,19 +1327,44 @@ class GrokBuildSubscriptionProvider:
             raise TypeError("request must be a canonical ModelRequest")
         return False
 
-    async def close(self) -> None:
-        """The provider retains no process or transport between requests."""
+    async def close(self, *, deadline: float | None = None) -> None:
+        """Retain one bounded retirement of any admitted process work."""
+        self._closed = True
+        limit = shutdown_deadline(deadline)
+        if self._close_task is None:
+            tasks = tuple(self._native_owner.tasks)
 
-        return None
+            async def finish():
+                results = await asyncio.gather(
+                    *(
+                        await_cleanup(task, deadline=limit, owner=self._native_owner)
+                        for task in tasks
+                    ),
+                    return_exceptions=True,
+                )
+                for result in results:
+                    if isinstance(result, BaseException):
+                        raise result
+
+            self._close_task = asyncio.create_task(finish())
+        await await_cleanup(self._close_task, deadline=limit, owner=self._native_owner)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        attempt = AttemptLifecycle(self._native_owner, request)
+        request = attempt.request
         failure: ModelProviderError | None = None
         try:
-            async with asyncio.timeout(self._timeout_seconds):
-                return await self._generate(request)
-        except asyncio.CancelledError:
+            if self._closed:
+                raise ModelProviderError(ProviderErrorCode.OWNER_UNAVAILABLE)
+            async with attempt:
+                response = attempt.response(await self._generate(request, attempt))
+                attempt.check_execution()
+            attempt.finish(None)
+            return attempt.observation.response(response)
+        except asyncio.CancelledError as error:
+            attempt.finish(error)
             raise
         except TimeoutError:
             failure = ModelProviderError(
@@ -1245,9 +1397,12 @@ class GrokBuildSubscriptionProvider:
                 provider_id=self.provider_id,
             )
         assert failure is not None
+        attempt.finish(failure)
         raise detached_provider_error(failure, provider_id=self.provider_id)
 
-    async def _generate(self, request: ModelRequest) -> ModelResponse:
+    async def _generate(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelResponse:
         if not self.supports_request_policy(request):
             raise ModelProviderError(
                 ProviderErrorCode.INVALID_REQUEST,
@@ -1267,67 +1422,73 @@ class GrokBuildSubscriptionProvider:
                 process_home=process_home,
             )
             try:
-                await self._ensure_compatible_client(cwd, environment)
-                result = await self._runner(
-                    _Command(
-                        arguments=(
-                            self._executable,
-                            "--prompt-file",
-                            str(prompt_path),
-                            "--verbatim",
-                            "--model",
-                            self.model,
-                            "--cwd",
-                            str(cwd),
-                            "--output-format",
-                            "streaming-json",
-                            "--json-schema",
-                            schema,
-                            "--system-prompt-override",
-                            _CONTROL_PROMPT,
-                            "--tools",
-                            "",
-                            "--disallowed-tools",
-                            _GROK_DENIED_TOOLS,
-                            "--max-turns",
-                            "1",
-                            "--permission-mode",
-                            "dontAsk",
-                            "--deny",
-                            "Bash",
-                            "--deny",
-                            "Edit",
-                            "--deny",
-                            "Write",
-                            "--deny",
-                            "Read",
-                            "--deny",
-                            "Grep",
-                            "--deny",
-                            "Glob",
-                            "--deny",
-                            "NotebookRead",
-                            "--deny",
-                            "NotebookEdit",
-                            "--deny",
-                            "WebFetch",
-                            "--deny",
-                            "WebSearch",
-                            "--deny",
-                            "MCPTool",
-                            "--sandbox",
-                            "strict",
-                            "--no-plan",
-                            "--no-subagents",
-                            "--no-memory",
-                            "--disable-web-search",
-                            "--no-auto-update",
-                            "--no-alt-screen",
-                        ),
-                        stdin=b"",
-                        cwd=cwd,
-                        environment=environment,
-                        timeout_seconds=self._timeout_seconds,
+                await self._ensure_compatible_client(cwd, environment, attempt)
+                attempt.dispatch()
+                result = await attempt.run_native(
+                    self._runner(
+                        _Command(
+                            arguments=(
+                                self._executable,
+                                "--prompt-file",
+                                str(prompt_path),
+                                "--verbatim",
+                                "--model",
+                                self.model,
+                                "--cwd",
+                                str(cwd),
+                                "--output-format",
+                                "streaming-json",
+                                "--json-schema",
+                                schema,
+                                "--system-prompt-override",
+                                _CONTROL_PROMPT,
+                                "--tools",
+                                "",
+                                "--disallowed-tools",
+                                _GROK_DENIED_TOOLS,
+                                "--max-turns",
+                                "1",
+                                "--permission-mode",
+                                "dontAsk",
+                                "--deny",
+                                "Bash",
+                                "--deny",
+                                "Edit",
+                                "--deny",
+                                "Write",
+                                "--deny",
+                                "Read",
+                                "--deny",
+                                "Grep",
+                                "--deny",
+                                "Glob",
+                                "--deny",
+                                "NotebookRead",
+                                "--deny",
+                                "NotebookEdit",
+                                "--deny",
+                                "WebFetch",
+                                "--deny",
+                                "WebSearch",
+                                "--deny",
+                                "MCPTool",
+                                "--sandbox",
+                                "strict",
+                                "--no-plan",
+                                "--no-subagents",
+                                "--no-memory",
+                                "--disable-web-search",
+                                "--no-auto-update",
+                                "--no-alt-screen",
+                            ),
+                            stdin=b"",
+                            cwd=cwd,
+                            environment=environment,
+                            deadline=cast(float, request.attempt_deadline),
+                            cleanup_timeout_seconds=request.call_policy.cleanup_timeout_seconds,
+                            cleanup_deadline=attempt.begin_cleanup,
+                            native_owner=attempt.owner,
+                        )
                     )
                 )
             except _ExecutableUnavailable:
@@ -1353,15 +1514,24 @@ class GrokBuildSubscriptionProvider:
         self,
         cwd: Path,
         environment: Mapping[str, str],
+        attempt: AttemptLifecycle,
     ) -> None:
         if not self._compatible_client:
-            help_result = await self._runner(
-                _Command(
-                    arguments=(self._executable, "--help"),
-                    stdin=b"",
-                    cwd=cwd,
-                    environment=environment,
-                    timeout_seconds=min(self._timeout_seconds, 30.0),
+            help_result = await attempt.run_native(
+                self._runner(
+                    _Command(
+                        arguments=(self._executable, "--help"),
+                        stdin=b"",
+                        cwd=cwd,
+                        environment=environment,
+                        deadline=min(
+                            cast(float, attempt.request.attempt_deadline),
+                            asyncio.get_running_loop().time() + 30,
+                        ),
+                        cleanup_timeout_seconds=attempt.policy.cleanup_timeout_seconds,
+                        cleanup_deadline=attempt.begin_cleanup,
+                        native_owner=attempt.owner,
+                    )
                 )
             )
             if help_result.returncode != 0:
@@ -1382,20 +1552,29 @@ class GrokBuildSubscriptionProvider:
                     provider_id=self.provider_id,
                 )
             self._compatible_client = True
-        await self._inspect_configuration(cwd, environment)
+        await self._inspect_configuration(cwd, environment, attempt)
 
     async def _inspect_configuration(
         self,
         cwd: Path,
         environment: Mapping[str, str],
+        attempt: AttemptLifecycle,
     ) -> None:
-        result = await self._runner(
-            _Command(
-                arguments=(self._executable, "inspect", "--json"),
-                stdin=b"",
-                cwd=cwd,
-                environment=environment,
-                timeout_seconds=min(self._timeout_seconds, 30.0),
+        result = await attempt.run_native(
+            self._runner(
+                _Command(
+                    arguments=(self._executable, "inspect", "--json"),
+                    stdin=b"",
+                    cwd=cwd,
+                    environment=environment,
+                    deadline=min(
+                        cast(float, attempt.request.attempt_deadline),
+                        asyncio.get_running_loop().time() + 30,
+                    ),
+                    cleanup_timeout_seconds=attempt.policy.cleanup_timeout_seconds,
+                    cleanup_deadline=attempt.begin_cleanup,
+                    native_owner=attempt.owner,
+                )
             )
         )
         if result.returncode != 0:
@@ -1424,7 +1603,6 @@ def _validate_provider_arguments(
     executable: str,
     runner: _CommandRunner,
     id_factory: Callable[[str], str],
-    timeout_seconds: float,
 ) -> None:
     if not isinstance(model, str) or not model.strip():
         raise ValueError("model must be a non-empty string")
@@ -1440,12 +1618,6 @@ def _validate_provider_arguments(
         raise TypeError("runner must be callable")
     if not callable(id_factory):
         raise TypeError("id_factory must be callable")
-    if (
-        not isinstance(timeout_seconds, (int, float))
-        or isinstance(timeout_seconds, bool)
-        or timeout_seconds <= 0
-    ):
-        raise ValueError("timeout_seconds must be positive")
 
 
 def _decode_claude_result(stdout: bytes) -> tuple[object, str | None, ModelUsage]:

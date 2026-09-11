@@ -44,11 +44,10 @@ from daita.autonomy import (
     terminal_job_event_payload,
 )
 from daita.capabilities import AccessMode, ExecutionContractBindings, OperationalEffect
-from daita.hosting.embedded import _model_execution_contracts
-from daita.jobs.models import JobRun
 from daita.distribution.models import MAX_OUTCOME_CONCLUSION_PREVIEW_BYTES
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
-from daita.jobs.models import MAX_JOB_RESOURCE_BINDINGS
+from daita.hosting.embedded import _model_execution_contracts
+from daita.jobs.models import MAX_JOB_RESOURCE_BINDINGS, JobRun
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -561,7 +560,9 @@ async def test_injected_router_fallback_is_scoped_sticky_and_delivers_once(
                 allowed_sensitivities=frozenset(ModelSensitivity),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
+        ),
     )
     agent = await Agent.open(
         "stage-c-router-fallback",

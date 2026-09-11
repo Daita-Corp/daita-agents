@@ -30,7 +30,7 @@ from daita import (
     RequestedCapabilityGrant,
     EffectRequirement,
 )
-from daita._json import FrozenJsonObject
+from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters import postgresql as pg, postgresql_write as native
 from daita.adapters.mcp import StreamableHTTPMCPClientFactory
 from daita.adapters.models import DiscoveryRequest, SourceRegistration
@@ -44,12 +44,14 @@ from daita.catalog.models import ResourceKind, Sensitivity, TabularColumn, Tabul
 from daita.distribution.models import OutcomeState
 from daita.llm.models import (
     FinishReason,
+    MessageRole,
     ModelProfile,
     ModelResponse,
     ModelUsage,
     ModelSensitivity,
     ToolCall,
     ToolResultBlock,
+    TextBlock,
 )
 from daita.llm.pricing import CostEstimate
 
@@ -277,7 +279,252 @@ async def create_fixture(tmp_path, monkeypatch, *, sensitivity=Sensitivity.RESTR
     )
 
 
-def script(provider, binding, batch, *, write=True, duplicate=False):
+async def test_initial_native_discovery_names_are_available_without_search_or_activation(
+    tmp_path, monkeypatch
+):
+    (
+        agent,
+        provider,
+        db,
+        _server,
+        _binding,
+        _resource,
+        _constraints,
+        batch,
+        _clock,
+        _approvals,
+    ) = await create_fixture(tmp_path, monkeypatch)
+    try:
+        provider.replace_script((response(text="Inspection only."),))
+        await agent.run("Save the requested company.")
+        request = provider.requests[-1]
+        system = "\n".join(
+            b.text for b in request.messages[0].content if isinstance(b, TextBlock)
+        )
+        assert "data_preview_upsert_rows" in system
+        assert "data_upsert_rows" in system
+        assert "data_update_rows" not in system
+        assert "load the needed preview and execution tools together" in system
+        assert "data_upsert_rows" not in {tool.name for tool in request.tools}
+        query = next(tool for tool in request.tools if tool.name == "data_query")
+        parameters = query.input_schema["properties"]["parameters"]["description"]
+        assert "$1" in parameters and "SQLite" in parameters
+        assert not await agent.list_effects()
+        permission = await agent.preview_source_permissions(
+            source_id=batch["source_id"],
+            read_mode="all",
+            read_resource_ids=(),
+            relational_write_scopes={},
+        )
+        await agent.apply_source_permissions(
+            source_id=batch["source_id"],
+            confirmation_fingerprint=permission.confirmation_fingerprint,
+        )
+        provider.replace_script((response(text="Inspection only."),))
+        await agent.run("Save the requested company.")
+        request = provider.requests[-1]
+        system = "\n".join(
+            b.text for b in request.messages[0].content if isinstance(b, TextBlock)
+        )
+        assert "Native row mutation is unavailable" in system
+        assert "data_upsert_rows" not in system
+        assert "data_update_rows" not in system
+        assert not await agent.list_effects()
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize(
+    "review_action", ["approve", "deny", "drift", "short_id", "unknown_id"]
+)
+async def test_update_review_preserves_exact_selection_and_rechecks_without_replay(
+    tmp_path, monkeypatch, review_action
+):
+    from test_relational_update_runtime import _Connection, _row
+    from daita.tui.projection import approval_review_document
+
+    agent, provider, db, _, _, resource, _, batch, _, _ = await create_fixture(
+        tmp_path, monkeypatch
+    )
+    connections, approvals = [], []
+    changed = False
+
+    async def connect(*args, **kwargs):
+        connection = _Connection(
+            (_row(1, before="Concurrent writer" if changed else "Before"),),
+            update_status="UPDATE 1",
+        )
+        connections.append(connection)
+        return connection
+
+    async def approve(request):
+        nonlocal changed
+        approvals.append(request)
+        if review_action == "drift":
+            changed = True
+        return (
+            ApprovalDecision.DENY
+            if review_action == "deny"
+            else ApprovalDecision.APPROVE
+        )
+
+    try:
+        permission = await agent.preview_source_permissions(
+            source_id=batch["source_id"],
+            read_mode="all",
+            read_resource_ids=(),
+            relational_write_scopes={
+                resource.id: {
+                    "allowed_operations": ("update",),
+                    "allowed_insert_columns": (),
+                    "allowed_update_columns": ("name",),
+                    "key_columns": ("id",),
+                    "generated_identity_columns": (),
+                    "max_rows": 1,
+                }
+            },
+        )
+        await agent.apply_source_permissions(
+            source_id=batch["source_id"],
+            confirmation_fingerprint=permission.confirmation_fingerprint,
+        )
+        monkeypatch.setattr(native, "_connect", connect)
+        agent._embedded._capability_runtime._approval_handler = approve
+        arguments = {
+            "source_id": batch["source_id"],
+            "resource_id": (
+                resource.id[:-3]
+                if review_action == "short_id"
+                else (
+                    resource.id[:-1] + ("0" if resource.id[-1] != "0" else "1")
+                    if review_action == "unknown_id"
+                    else resource.id
+                )
+            ),
+            "where": (
+                {"column": "domain", "operator": "eq", "value": "existing.test"},
+            ),
+            "assignments": ({"column": "name", "value": "Updated"},),
+        }
+
+        def apply(request):
+            preview = next(
+                block
+                for message in request.messages
+                for block in message.content
+                if isinstance(block, ToolResultBlock) and block.call_id == "preview"
+            )
+            if review_action in {"short_id", "unknown_id"}:
+                assert preview.is_error
+                error = preview.output["error"]
+                assert isinstance(error, Mapping)
+                assert error["code"] == (
+                    "invalid_argument_value"
+                    if review_action == "short_id"
+                    else "resource_read_not_allowed"
+                )
+                if review_action == "unknown_id":
+                    assert "without shortening" in str(error["message"])
+                assert resource.id not in canonical_json(error)
+                return response(text="The exact target is unresolved; no change made.")
+            assert not preview.is_error, preview.output
+            data = preview.output["data"]
+            assert isinstance(data, Mapping)
+            return response(
+                ToolCall(
+                    id="write",
+                    name="data_update_rows",
+                    arguments={
+                        **arguments,
+                        "preview_fingerprint": data["preview_fingerprint"],
+                        "expected_affected_rows": data["matched_rows"],
+                    },
+                )
+            )
+
+        provider.replace_script(
+            [
+                response(
+                    ToolCall(
+                        id="load",
+                        name="toolbox_load",
+                        arguments={
+                            "tool_names": (
+                                "data_preview_update_rows",
+                                "data_update_rows",
+                            )
+                        },
+                    )
+                ),
+                response(
+                    ToolCall(
+                        id="preview",
+                        name="data_preview_update_rows",
+                        arguments=arguments,
+                    )
+                ),
+                apply,
+                response(text="Report the exact returned effect evidence."),
+            ]
+        )
+        result = await agent.run(
+            "Change the name of the company whose domain is existing.test."
+        )
+        assert result.reason == "completed"
+        transcript = await agent.transcript(result.run_id)
+        receipts = await agent.list_effects()
+        mutations = [
+            entry
+            for connection in connections
+            for entry in connection.log
+            if entry[0] == "execute" and str(entry[1]).startswith("UPDATE")
+        ]
+        if review_action in {"short_id", "unknown_id"}:
+            assert not approvals and not connections and not receipts
+            return
+        assert len(approvals) == 1, [
+            block.output
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.is_error
+        ]
+        approval = approvals[0]
+        call = next(
+            call
+            for message in transcript.messages
+            for call in message.tool_calls
+            if call.name == "data_update_rows"
+        )
+        assert approval.arguments["arguments"] == call.arguments
+        document, reviewable = approval_review_document(
+            tool_name=approval.tool_name,
+            capability_id=approval.capability_id,
+            arguments_text=approval.render_arguments_for_review(),
+            reason=approval.reason,
+        )
+        assert reviewable and document is not None
+        for text in (
+            "Connection: Company research",
+            "Table: companies",
+            "existing.test",
+            "Before",
+            "Updated",
+            "1 matching row(s)",
+            "Bounded samples",
+        ):
+            assert text in document
+        assert "EXCLUSIVE" not in document and "sequence gaps" not in document
+        assert "locks matching rows" in document
+        assert len(mutations) == (1 if review_action == "approve" else 0)
+        assert len(receipts) == (1 if review_action == "approve" else 0)
+        assert (
+            not db.rows
+        )  # The existing update I/O fixture owns this test's source calls.
+    finally:
+        await agent.close()
+
+
+def script(provider, binding, batch, *, write=True, duplicate=False, schema=False):
     research_name = binding.tools[0].local_name
 
     def apply(request):
@@ -332,6 +579,17 @@ def script(provider, binding, batch, *, write=True, duplicate=False):
             ToolCall(id="preview", name="data_preview_upsert_rows", arguments=batch)
         ),
     ]
+    if schema:
+        steps.insert(
+            1,
+            response(
+                ToolCall(
+                    id="schema",
+                    name="catalog_schema",
+                    arguments={"resource_ids": [batch["resource_id"]]},
+                )
+            ),
+        )
     if write:
         steps.append(apply)
     if duplicate:
@@ -366,6 +624,45 @@ async def wait_delivery(agent, conversation_id, count):
         await asyncio.sleep(0.005)
     inspection = await agent.list_routines()
     pytest.fail(f"Native routine did not deliver: {inspection}")
+
+
+async def test_native_insert_discovery_keeps_catalog_and_export_queries_distinct(
+    tmp_path, monkeypatch
+):
+    agent, provider, db, *_ = await create_fixture(tmp_path, monkeypatch)
+    cases = (
+        (
+            "Insert one row into an admitted catalog database table with exact supplied fields, preserving omitted columns, and return effect evidence.",
+            "data_upsert_rows",
+            3,
+        ),
+        ("catalog schema columns", "catalog_schema", 1),
+        ("export all database rows csv", "data_export_tabular", 1),
+    )
+    provider.replace_script(
+        (
+            response(
+                *(
+                    ToolCall(f"search-{index}", "toolbox_search", {"query": query})
+                    for index, (query, _, _) in enumerate(cases)
+                )
+            ),
+            response(text="Discovery only."),
+        )
+    )
+    try:
+        result = await agent.run("Discover the admitted tools without executing work.")
+        assert result.reason == "completed"
+        transcript = await agent.transcript(result.run_id)
+        results = dict((call.id, block) for call, block in transcript.tool_pairs)
+        for index, (query, expected, rank) in enumerate(cases):
+            block = results[f"search-{index}"]
+            assert block is not None and not block.is_error
+            names = [item["tool_name"] for item in block.output["data"]["matches"]]
+            assert expected in names[:rank], (query, names)
+        assert not db.rows and not await agent.list_effects()
+    finally:
+        await agent.close()
 
 
 async def test_foreground_research_upsert_uses_authenticated_preview_and_one_receipt(
@@ -418,6 +715,37 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert isinstance(write_results[0].output["data"], Mapping)
         assert write_results[0].output["data"]["authorship"] == "model_derived"
         assert write_results[0].output["data"]["evidence_call_ids"] == ("research",)
+        approval = next(
+            item for item in approvals if item.capability_id == "data.upsert_rows"
+        )
+        write_call = next(
+            call
+            for message in transcript.messages
+            for call in message.tool_calls
+            if call.id == "write"
+        )
+        assert approval.arguments["arguments"] == write_call.arguments
+        assert approval.arguments["target"]["name"] == "companies"
+        assert approval.arguments["target"]["source_name"] == "Company research"
+        assert approval.arguments["preview"]["inserted_count"] == 1
+        assert approval.arguments["preview"]["updated_count"] == 0
+        assert approval.arguments["preview"]["unchanged_count"] == 0
+        assert canonical_json(
+            approval.arguments["preview"]["classifications"]
+        ) == canonical_json(({"key": {"domain": "new.test"}, "action": "insert"},))
+        from daita.tui.projection import approval_review_document
+
+        document, reviewable = approval_review_document(
+            tool_name=approval.tool_name,
+            capability_id=approval.capability_id,
+            arguments_text=approval.render_arguments_for_review(),
+            reason=approval.reason,
+        )
+        assert reviewable and document is not None
+        assert "Table: companies" in document
+        assert "Connection: Company research" in document
+        assert "Preview: 1 insert, 0 update, 0 unchanged" in document
+        assert "Exact validated details:" in document
     finally:
         await agent.close()
 
@@ -426,6 +754,8 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
     "mode",
     [
         "success",
+        "natural_schema",
+        "model_schema",
         "missing_effect",
         "commit_loss",
         "zero_budget",
@@ -500,6 +830,11 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 binding.tools[0].capability_id,
                 "data.preview_upsert_rows",
                 "data.upsert_rows",
+                *(
+                    ("catalog.schema",)
+                    if mode in {"natural_schema", "model_schema"}
+                    else ()
+                ),
             ),
             sensitivity_ceiling=ModelSensitivity.RESTRICTED,
             outcome_contract=replace(
@@ -584,16 +919,103 @@ async def test_immediate_and_weekly_research_upsert_production_path(
             batch,
             write=mode != "missing_effect",
             duplicate=mode == "commit_loss",
+            schema=mode in {"natural_schema", "model_schema"},
         )
         if mode == "commit_loss":
             db.commit_error = ConnectionError("commit response lost")
-        routine = await agent.create_routine(proposal)
+        if mode == "model_schema":
+            from daita.routines.capabilities import _spec_schema
+            from daita.routines.owner import _routine_proposal_payload
+
+            properties = _spec_schema(update=False)["properties"]
+            assert isinstance(properties, Mapping)
+            arguments = {
+                key: value
+                for key, value in _routine_proposal_payload(proposal).items()
+                if key in properties and value is not None
+            }
+            arguments.update(
+                skill_names=[],
+                distribution_destination_id=destination.destination_id,
+                requested_capability_grants=[
+                    {
+                        "capability_id": "data.upsert_rows",
+                        "constraints": grant_constraints,
+                        "max_calls_per_occurrence": 1,
+                    }
+                ],
+            )
+
+            def correct_route(request):
+                errors = [
+                    block
+                    for message in request.messages
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock)
+                    and block.call_id == "invalid-route"
+                ]
+                assert len(errors) == 1 and errors[0].is_error
+                error = errors[0].output["error"]
+                assert isinstance(error, Mapping)
+                assert error["code"] == "routine_model_route_revoked"
+                system = canonical_json(request.messages[0].content[0].text)
+                assert provider.provider_id in system
+                return response(ToolCall("create", "routine_create", arguments))
+
+            def authoring_complete(request):
+                created = [
+                    block
+                    for message in request.messages
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock) and block.call_id == "create"
+                ]
+                assert len(created) == 1 and not created[0].is_error, created
+                script(provider, binding, batch, schema=True)
+                return response(
+                    text="The immediate and weekly assignment is saved; its hosted runs will report the results."
+                )
+
+            provider.replace_script(
+                (
+                    response(
+                        ToolCall(
+                            "load-authoring",
+                            "toolbox_load",
+                            {"tool_names": ["routine_create"]},
+                        )
+                    ),
+                    response(
+                        ToolCall(
+                            "invalid-route",
+                            "routine_create",
+                            {**arguments, "eligible_model_routes": ["current"]},
+                        )
+                    ),
+                    correct_route,
+                    authoring_complete,
+                )
+            )
+            authored = await agent.run(
+                "Keep the researched companies current now and every Monday, using the approved table and permissions.",
+                conversation_id=origin.conversation_id,
+            )
+            assert authored.kind.value == "completed"
+            routines = await agent.list_routines()
+            assert len(routines) == 1
+            inspection = await agent.inspect_routine(routines[0].routine_id)
+            assert inspection is not None
+            routine = inspection.routine
+            assert set(routine.allowed_capability_ids) == set(
+                draft.allowed_capability_ids
+            )
+        else:
+            routine = await agent.create_routine(proposal)
         delivery = await wait_delivery(agent, origin.conversation_id, 1)
         assert delivery is not None
         inspection = await agent.inspect_routine(routine.routine_id)
         assert inspection is not None
         occurrence = inspection.recent_occurrences[0]
-        if mode == "success":
+        if mode in {"success", "natural_schema", "model_schema"}:
             transcript = await agent._embedded._store.load(occurrence.reserved_run_id)
             assert (
                 delivery.delivery.outcome.conclusion_state is OutcomeState.SUCCEEDED
@@ -609,7 +1031,12 @@ async def test_immediate_and_weekly_research_upsert_production_path(
             )
             assert db.rows["new.test"]["name"] == "New Co"
             assert len(occurrence.effect_receipt_ids) == 1
-            script(provider, binding, batch)
+            script(
+                provider,
+                binding,
+                batch,
+                schema=mode in {"natural_schema", "model_schema"},
+            )
             clock[0] = datetime(2026, 9, 7, 14, tzinfo=UTC)
             agent._embedded._routine_supervisor.wake()
             weekly = await wait_delivery(agent, origin.conversation_id, 2)
@@ -623,6 +1050,58 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 receipt.payload["unchanged_count"] for receipt in receipts
             ) == [0, 1]
             assert len(research.calls) == 2
+            for request in provider.requests[(5 if mode == "model_schema" else 1) :]:
+                system = "\n".join(
+                    block.text
+                    for message in request.messages
+                    if message.role is MessageRole.SYSTEM
+                    for block in message.content
+                    if isinstance(block, TextBlock)
+                )
+                assert "Routine authoring facts" not in system
+                assert "catalog_inspect gives" not in system
+                if mode == "success":
+                    assert "catalog_schema first" not in system
+                    assert "catalog_schema" not in {tool.name for tool in request.tools}
+                    assert "Missing structure is unknown" in system
+                else:
+                    assert "catalog_schema first" in system
+                    assert "catalog_schema" in {tool.name for tool in request.tools}
+            inspection = await agent.inspect_routine(routine.routine_id)
+            assert inspection is not None
+            assert (
+                len({item.reserved_run_id for item in inspection.recent_occurrences})
+                == 2
+            )
+            for item in inspection.recent_occurrences:
+                transcript = await agent._embedded._store.load(item.reserved_run_id)
+                results = [
+                    block
+                    for message in transcript.messages
+                    for block in message.content
+                    if isinstance(block, ToolResultBlock)
+                ]
+                previews = [
+                    block
+                    for block in results
+                    if block.capability_id == "data.preview_upsert_rows"
+                ]
+                writes = [
+                    block
+                    for block in results
+                    if block.capability_id == "data.upsert_rows"
+                ]
+                assert len(previews) == len(writes) == 1
+                assert not previews[0].is_error and not writes[0].is_error
+                schemas = [
+                    block
+                    for block in results
+                    if block.capability_id == "catalog.schema"
+                ]
+                assert len(schemas) == (
+                    1 if mode in {"natural_schema", "model_schema"} else 0
+                )
+                assert all(not block.is_error for block in schemas)
             assert (
                 len(
                     [

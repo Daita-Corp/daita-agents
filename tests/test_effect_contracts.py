@@ -5,8 +5,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-
 from _capability_runtime_support import StaticTestDomain, static_registry
+
 from daita._json import FrozenJsonObject
 from daita.capabilities import (
     AccessMode,
@@ -278,6 +278,9 @@ def test_model_execution_bindings_cover_declared_routes_profiles_and_retry_confi
                 ),
             ),
         ),
-        replace(route, retry_policy=RetryPolicy(attempts=2, backoff_seconds=0)),
+        replace(
+            route,
+            retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
+        ),
     ):
         assert _model_execution_contracts(model, profile, changed) != original

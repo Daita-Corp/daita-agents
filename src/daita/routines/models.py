@@ -328,6 +328,36 @@ class CalendarSchedule:
 RoutineSchedule: TypeAlias = OnceSchedule | IntervalSchedule | CalendarSchedule
 
 
+def validate_budget_relationships(
+    per_run_max_tokens: int,
+    cumulative_max_tokens: int,
+    per_run_max_cost_usd: Decimal,
+    cumulative_max_cost_usd: Decimal,
+) -> None:
+    """Share the per-run/cumulative invariant across proposals and retained records."""
+    for per_run, cumulative, field in (
+        (per_run_max_tokens, cumulative_max_tokens, "tokens"),
+        (per_run_max_cost_usd, cumulative_max_cost_usd, "cost_usd"),
+    ):
+        if per_run > cumulative:
+            raise ValueError(
+                f"per_run_max_{field} must not exceed cumulative_max_{field}. "
+                "Resubmit the exact user-authorized budgets; do not automatically increase a ceiling."
+            )
+
+
+def validate_reporting_precheck(
+    reporting_mode: ReportingMode, precheck: ResourceRevisionPrecheck | None
+) -> None:
+    """One invariant shared by authoring admission, drafts and stored records."""
+    if reporting_mode is ReportingMode.ALWAYS and precheck is not None:
+        raise ValueError("reporting_mode=always requires omitting precheck.")
+    if reporting_mode is ReportingMode.CHANGES_ONLY and not isinstance(
+        precheck, ResourceRevisionPrecheck
+    ):
+        raise ValueError("reporting_mode=changes_only requires an exact precheck.")
+
+
 @dataclass(frozen=True, slots=True)
 class ResourceRevisionPrecheck:
     """Opt in to skipping solely on one structural catalog/resource revision."""
@@ -421,12 +451,7 @@ class ScheduledRoutineDraft:
             raise TypeError("routine draft misfire policy is invalid")
         if not isinstance(self.reporting_mode, ReportingMode):
             raise TypeError("routine draft reporting mode is invalid")
-        if self.reporting_mode is ReportingMode.ALWAYS and self.precheck is not None:
-            raise ValueError("always-reporting draft cannot contain a precheck")
-        if self.reporting_mode is ReportingMode.CHANGES_ONLY and not isinstance(
-            self.precheck, ResourceRevisionPrecheck
-        ):
-            raise ValueError("changes-only draft requires an exact precheck")
+        validate_reporting_precheck(self.reporting_mode, self.precheck)
         sources = _identities(self.allowed_source_ids, "draft allowed_source_ids")
         bindings = _identities(
             self.allowed_connector_binding_ids,
@@ -527,10 +552,12 @@ class ScheduledRoutineDraft:
             "draft cumulative cost",
             maximum=MAX_ROUTINE_CUMULATIVE_COST_USD,
         )
-        if self.per_run_max_tokens > self.cumulative_max_tokens:
-            raise ValueError("draft per-run token ceiling exceeds cumulative ceiling")
-        if self.per_run_max_cost_usd > self.cumulative_max_cost_usd:
-            raise ValueError("draft per-run cost ceiling exceeds cumulative ceiling")
+        validate_budget_relationships(
+            self.per_run_max_tokens,
+            self.cumulative_max_tokens,
+            self.per_run_max_cost_usd,
+            self.cumulative_max_cost_usd,
+        )
         _utc(self.expires_at, "routine draft expires_at")
         object.__setattr__(self, "allowed_source_ids", sources)
         object.__setattr__(self, "allowed_connector_binding_ids", bindings)
@@ -695,12 +722,7 @@ class ScheduledRoutine:
             raise TypeError("routine misfire policy is invalid")
         if not isinstance(self.reporting_mode, ReportingMode):
             raise TypeError("routine reporting mode is invalid")
-        if self.reporting_mode is ReportingMode.ALWAYS and self.precheck is not None:
-            raise ValueError("always-reporting routine cannot contain a precheck")
-        if self.reporting_mode is ReportingMode.CHANGES_ONLY and not isinstance(
-            self.precheck, ResourceRevisionPrecheck
-        ):
-            raise ValueError("changes-only routine requires its exact precheck")
+        validate_reporting_precheck(self.reporting_mode, self.precheck)
         if (
             self.last_acknowledged_precheck_observation is not None
             and self.precheck is None
@@ -907,10 +929,12 @@ class ScheduledRoutine:
             "charged cost amount",
             maximum=None,
         )
-        if self.per_run_max_tokens > self.cumulative_max_tokens:
-            raise ValueError("per-run token ceiling exceeds cumulative ceiling")
-        if self.per_run_max_cost_usd > self.cumulative_max_cost_usd:
-            raise ValueError("per-run cost ceiling exceeds cumulative ceiling")
+        validate_budget_relationships(
+            self.per_run_max_tokens,
+            self.cumulative_max_tokens,
+            self.per_run_max_cost_usd,
+            self.cumulative_max_cost_usd,
+        )
         if (
             self.reserved_tokens
             and self.reserved_tokens + self.charged_tokens > self.cumulative_max_tokens

@@ -447,13 +447,21 @@ async def test_discovery_exposes_exact_automation_contract_without_granting_auth
         item for item in matches if item["tool_name"] == action.tool.local_name
     )
     assert match["capability_id"] == action.tool.capability_id
-    assert match["requires_grant"] is True
+    assert match["requires_automation_grant"] is True
+    assert "requires_grant" not in match
     contracts = {
         item["tool_name"]: item
         for item in results["load-contract"].output["data"]["contracts"]
     }
     contract = contracts[action.tool.local_name]
-    assert match["automation_contract"] == contract
+    assert contract["complete"] is False
+    assert match["automation_contract"]["complete"] is True
+    assert match["automation_contract"]["input_schema"] == action.tool.input_schema
+    assert all(
+        match["automation_contract"][key] == value
+        for key, value in contract.items()
+        if key != "complete"
+    )
     assert (
         contract["grant_policy"]["constraints_schema"]
         == MCP_GRANT_POLICY.constraints_schema
@@ -462,7 +470,7 @@ async def test_discovery_exposes_exact_automation_contract_without_granting_auth
     assert contract["connector"]["binding_revision"] == action.binding.revision
     assert contract["connector"]["remote_tool_name"] == "notify"
     assert contract["effect_evidence_basis"] == "server_reported"
-    assert contracts[action.research.local_name]["requires_grant"] is False
+    assert contracts[action.research.local_name]["requires_automation_grant"] is False
     assert contracts[action.research.local_name]["grant_policy"] is None
     assert action.server.calls == []
     assert action.approvals == []
@@ -505,9 +513,266 @@ async def test_search_omits_whole_authoring_contract_before_losing_candidates(ac
     )
     assert match["automation_contract_omitted"] is True
     assert "automation_contract" not in match
-    assert match["requires_grant"] is True
+    assert match["requires_automation_grant"] is True
     assert action.server.calls == action.approvals == []
     assert await action.receipts() == ()
+
+
+@pytest.mark.parametrize(
+    "fixed,variable,missing,unknown",
+    [
+        (
+            {"room": "fixed-room"},
+            ["message"],
+            ["content", "destination"],
+            ["message", "room"],
+        ),
+        (
+            {"destination": "fixed-room", "require_confirmation": True},
+            ["content"],
+            [],
+            ["require_confirmation"],
+        ),
+    ],
+)
+async def test_grant_argument_errors_identify_exact_correction(
+    action, fixed, variable, missing, unknown
+):
+    from daita.domains.mcp import MCPCapabilityDomain
+
+    constraints = FrozenJsonObject.from_mapping(
+        {
+            "binding_id": action.binding.binding_id,
+            "binding_revision": action.binding.revision,
+            "remote_tool_name": action.tool.remote_name,
+            "fixed_arguments": fixed,
+            "variable_argument_names": variable,
+        }
+    )
+    with pytest.raises(CapabilityInputError) as failure:
+        MCPCapabilityDomain._validate_constraints(
+            action.binding, action.tool, constraints
+        )
+    assert failure.value.code == "mcp_grant_constraints_invalid"
+    details = failure.value.details
+    assert details["missing_argument_names"] == tuple(missing)
+    assert details["unknown_argument_names"] == tuple(unknown)
+    assert details["inspect_tool_name"] == action.tool.local_name
+    assert action.server.calls == action.approvals == []
+    assert await action.receipts() == ()
+
+
+async def test_mcp_contract_survives_authoring_switch_and_exact_inspection(action):
+    action.model.steps = [
+        response(
+            ToolCall(
+                "inspect-via-load",
+                "toolbox_load",
+                {"tool_names": [action.tool.local_name, action.research.local_name]},
+            )
+        ),
+        response(
+            ToolCall("authoring", "toolbox_load", {"tool_names": ["routine_create"]})
+        ),
+        response(
+            ToolCall(
+                "inspect-exact",
+                "toolbox_inspect",
+                {"tool_name": action.tool.local_name},
+            )
+        ),
+        response(text="Inspection only; no assignment or notification was created."),
+    ]
+    result = await action.agent.run(
+        "Inspect the connected action and then prepare to author an assignment."
+    )
+    assert result.kind.value == "completed"
+    request = action.model.requests[2]
+    assert "routine_create" in {tool.name for tool in request.tools}
+    assert action.tool.local_name not in {tool.name for tool in request.tools}
+    retained = next(
+        block
+        for message in request.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.call_id == "inspect-via-load"
+    )
+    retained_data = json.loads(canonical_json(retained.output))["data"]
+    contracts = {item["tool_name"]: item for item in retained_data["contracts"]}
+    for contract in contracts.values():
+        assert contract["complete"] is False
+        assert "input_schema" not in contract
+        assert contract["inspection_tool"] == "toolbox_inspect"
+    inspected = next(
+        block
+        for block in await action.results(result.run_id)
+        if block.call_id == "inspect-exact"
+    )
+    inspected_contract = inspected.output["data"]["value"]
+    assert inspected_contract["input_schema"] == action.tool.input_schema
+    assert (
+        inspected_contract["contract_digest"]
+        == contracts[action.tool.local_name]["contract_digest"]
+    )
+    retained_request = action.model.requests[3]
+    assert any(
+        isinstance(block, ToolResultBlock) and block == inspected
+        for message in retained_request.messages
+        for block in message.content
+    )
+    assert {tool.name for tool in action.model.requests[3].tools} == {
+        tool.name for tool in request.tools
+    }
+    assert action.server.calls == action.approvals == []
+    assert await action.receipts() == ()
+
+
+async def test_exact_inspection_rechecks_revocation_without_remote_io(action):
+    from daita.loop.models import RunInput
+
+    run = RunInput(
+        id="inspection-revocation",
+        agent_id=action.agent.id,
+        message="Inspect admitted contracts",
+        created_at=NOW,
+    )
+    runtime = action.agent._embedded._capability_runtime
+    catalog = await runtime.prepare_run(run)
+    assert action.tool.local_name in {entry.view.name for entry in catalog.entries}
+    projection = runtime.project(catalog, ())
+    await action.agent.revoke_mcp_server(action.binding.binding_id)
+    methods = list(action.server.request_methods)
+    outcome = await runtime.execute_all(
+        run,
+        (
+            ToolCall(
+                "inspect-revoked",
+                "toolbox_inspect",
+                {"tool_name": action.tool.local_name},
+            ),
+        ),
+        projection=projection,
+        messages=(),
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
+    result = outcome.ordered_results[0]
+    assert result.is_error
+    assert result.output["error"]["code"] == "toolbox_inspect_stale"
+    assert action.server.request_methods == methods
+    assert action.server.calls == action.approvals == []
+
+
+@pytest.mark.parametrize("extra_confirmation", [False, True])
+async def test_grant_correction_details_reach_next_real_request_before_any_approval(
+    action, extra_confirmation
+):
+    from daita.routines.capabilities import _spec_schema
+    from daita.routines.owner import _routine_proposal_payload
+
+    proposal = await action.agent.propose_routine(
+        replace(await action.draft(), run_immediately=False)
+    )
+    properties = _spec_schema(update=False)["properties"]
+    assert isinstance(properties, Mapping)
+    arguments = {
+        key: value
+        for key, value in _routine_proposal_payload(proposal).items()
+        if key in properties and value is not None
+    }
+    grant = proposal.capability_grants[0]
+    arguments.update(
+        skill_names=(),
+        distribution_destination_id=proposal.distribution_plan.targets[
+            0
+        ].destination_id,
+        requested_capability_grants=[
+            {
+                "capability_id": grant.capability_id,
+                "constraints": grant.constraints,
+                "max_calls_per_occurrence": grant.max_calls_per_occurrence,
+            }
+        ],
+    )
+    invalid = json.loads(canonical_json(arguments))
+    constraints = invalid["requested_capability_grants"][0]["constraints"]
+    if extra_confirmation:
+        constraints["fixed_arguments"]["require_confirmation"] = True
+    else:
+        constraints["fixed_arguments"] = {"room": "fixed-room"}
+        constraints["variable_argument_names"] = ["message"]
+    before = len(action.model.requests)
+    action.model.steps = [
+        response(
+            ToolCall(
+                "action-schema",
+                "toolbox_load",
+                {"tool_names": [action.tool.local_name]},
+            )
+        ),
+        response(
+            ToolCall(
+                "routine-schema", "toolbox_load", {"tool_names": ["routine_create"]}
+            )
+        ),
+        response(ToolCall("invalid-grant", "routine_create", invalid)),
+        response(ToolCall("correct-grant", "routine_create", arguments)),
+        response(text="Assignment saved; no notification was sent."),
+    ]
+    approvals_before_correction = []
+    original_generate = action.model.generate
+
+    async def generate(request):
+        if len(action.model.requests) == before + 3:
+            approvals_before_correction.extend(action.approvals)
+            assert await action.agent.list_routines() == ()
+        return await original_generate(request)
+
+    action.model.generate = generate
+    result = await action.agent.run(
+        "Save the reviewed assignment for next Monday.",
+        conversation_id=action.origin.conversation_id,
+    )
+    assert result.kind.value == "completed"
+    correction_request = action.model.requests[before + 3]
+    error = next(
+        block
+        for message in correction_request.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.call_id == "invalid-grant"
+    )
+    error_payload = json.loads(canonical_json(error.output))
+    assert error_payload["error"]["code"] == "mcp_grant_constraints_invalid"
+    assert error_payload["error"]["details"]["unknown_argument_names"] == (
+        ["require_confirmation"] if extra_confirmation else ["message", "room"]
+    )
+    assert approvals_before_correction == []
+    assert len(action.approvals) == 1
+    assert len(await action.agent.list_routines()) == 1
+    assert action.server.calls == []
+    assert await action.receipts() == ()
+
+
+async def test_grant_diagnostic_names_are_bounded_and_omission_is_explicit(action):
+    from daita.domains.mcp import MCPCapabilityDomain
+
+    constraints = FrozenJsonObject.from_mapping(
+        {
+            "binding_id": action.binding.binding_id,
+            "binding_revision": action.binding.revision,
+            "remote_tool_name": action.tool.remote_name,
+            "fixed_arguments": {f"bad_{i}_" + "é" * 200: "unused" for i in range(40)},
+            "variable_argument_names": ["content"],
+        }
+    )
+    with pytest.raises(CapabilityInputError) as failure:
+        MCPCapabilityDomain._validate_constraints(
+            action.binding, action.tool, constraints
+        )
+    details = json.loads(canonical_json(failure.value.details))
+    assert details["names_truncated"] is True
+    assert len(details["unknown_argument_names"]) == 32
+    assert details["argument_counts"]["unknown_argument_names"] == 40
+    assert all(len(name) <= 128 for name in details["unknown_argument_names"])
+    assert len(canonical_json(details).encode()) < 16 * 1024
 
 
 @pytest.mark.parametrize(

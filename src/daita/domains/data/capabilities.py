@@ -33,6 +33,7 @@ from .controller import (
     RELATIONAL_UPDATE_EVIDENCE_KIND,
     RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
     RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND,
+    native_preview_capability,
 )
 from .results import BoundedResultProjection
 from .sql.relational_upsert import RelationalUpsertIntent
@@ -597,6 +598,11 @@ class RelationalUpdateExecutor:
                 "target_set_sha256": preview.fingerprint.target_set_sha256,
                 "source_revision": preview.source_revision,
                 "statement_sha256": preview.fingerprint.statement_sha256,
+                "review": {
+                    "matched_rows": preview.matched_rows,
+                    "samples": tuple(sample.to_payload() for sample in preview.samples),
+                    "warnings": preview.warnings,
+                },
             }
         )
 
@@ -666,7 +672,8 @@ def data_query_capability_declarations() -> CapabilityDeclarations:
             text_trust=ToolTextTrust.CODE,
             summary="Run one bounded validated read-only relational query.",
             when_to_use=(
-                "Use after catalog_schema provides the exact source and resource IDs."
+                "Use exact source/resource IDs and columns from current catalog evidence; "
+                "obtain missing structure only through admitted, callable tools."
             ),
             keywords=("data", "query", "relational", "sql"),
         ),
@@ -712,9 +719,10 @@ def relational_update_preview_capability_declarations() -> CapabilityDeclaration
         description=(
             "Validate and preview one structured PostgreSQL update over an exact "
             "catalog-scoped target set without changing the database. When the "
-            "user requested approval or execution, pass the exact successful "
-            "preview immediately to data_update_rows; preview alone does "
-            "not request approval."
+            "user requested approval or execution, ground the intended target "
+            "and pass its exact positive preview to data_update_rows when the run "
+            "can proceed. Zero matches require correction or explanation; "
+            "preview alone does not request approval."
         ),
         input_schema={
             "type": "object",
@@ -915,6 +923,7 @@ def _query_declarations(
                 "parameters": {
                     "type": "array",
                     "maxItems": MAX_SQL_PARAMETERS,
+                    "description": "Positional values: PostgreSQL uses $1, $2, ...; SQLite uses ?. Match the current source's SQL dialect.",
                 },
             },
             "required": ["source_id", "resource_ids", "sql"],
@@ -1146,6 +1155,12 @@ NATIVE_WRITE_GRANT_POLICY = AutomationGrantPolicy(
     constraints_kind="data.relational_write",
     constraints_schema={
         "type": "object",
+        "description": "The proposed allowed_capability_ids must include the matching preview: "
+        + "; ".join(
+            f"{capability_id} requires {native_preview_capability(capability_id)}"
+            for capability_id in (RELATIONAL_UPDATE_CAPABILITY_ID, "data.upsert_rows")
+        )
+        + ". Each occurrence must obtain its own authenticated preview before writing.",
         "properties": {
             "source_id": {"type": "string", "maxLength": 256},
             "resource_id": {"type": "string", "maxLength": 256},
@@ -1228,14 +1243,31 @@ class RelationalUpsertExecutor:
             )
         return FrozenJsonObject.from_mapping(
             {
-                key: preview[key]
-                for key in (
-                    "intent_sha256",
-                    "preview_fingerprint",
-                    "resource_revision",
-                    "target_set_sha256",
-                    "permission_fingerprint",
-                )
+                **{
+                    key: preview[key]
+                    for key in (
+                        "intent_sha256",
+                        "preview_fingerprint",
+                        "resource_revision",
+                        "target_set_sha256",
+                        "permission_fingerprint",
+                    )
+                },
+                "review": {
+                    **{
+                        key: preview[key]
+                        for key in (
+                            "input_count",
+                            "inserted_count",
+                            "updated_count",
+                            "unchanged_count",
+                            "identity_sequence_gaps_possible",
+                        )
+                    },
+                    "classifications": cast(
+                        tuple[object, ...], preview["classifications"]
+                    )[:5],
+                },
             }
         )
 
@@ -1394,6 +1426,9 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
                         "insert",
                         "update",
                         "rows",
+                        "row",
+                        "table",
+                        "batch",
                         "research",
                         *action_keywords,
                     ),
@@ -1402,13 +1437,13 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
             for cap, summary, when_to_use, action_keywords in (
                 (
                     preview,
-                    "Preview which relational rows would be inserted, updated, or unchanged.",
+                    "Preview an exact relational batch: insert missing rows, update existing rows, or leave them unchanged.",
                     "Use before applying an admitted upsert batch identified by exact conflict keys.",
                     ("preview",),
                 ),
                 (
                     write,
-                    "Apply an exact previewed relational upsert, inserting or updating rows atomically.",
+                    "Insert missing rows or update existing rows in a relational table using one exact previewed batch.",
                     "Use after a successful upsert preview, with approval or an exact standing grant.",
                     ("apply", "save", "approval"),
                 ),

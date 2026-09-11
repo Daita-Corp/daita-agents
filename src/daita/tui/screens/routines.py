@@ -269,7 +269,8 @@ def render_routine_inspection(inspection: ScheduledRoutineInspection) -> Text:
     )
     lines = [
         approval_summary(
-            json.dumps({"proposal": FrozenJsonObject.from_mapping(routine).to_dict()})
+            json.dumps({"proposal": FrozenJsonObject.from_mapping(routine).to_dict()}),
+            "routines.inspect",
         )
     ]
     for item in inspection.recent_occurrences:

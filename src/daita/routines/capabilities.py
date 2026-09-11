@@ -959,7 +959,18 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "maxLength": MAX_ROUTINE_INSTRUCTION_BYTES,
         },
         "schedule": _schedule_schema(),
-        "run_immediately": {"type": "boolean"},
+        "run_immediately": (
+            {
+                "type": "boolean",
+                "enum": [False],
+                "description": "Omit or use false for a revision. Immediate execution belongs to creation; use the existing run-now control separately.",
+            }
+            if update
+            else {
+                "type": "boolean",
+                "description": "True adds one immediate interval/calendar occurrence; false is scheduled-only, including once schedules.",
+            }
+        ),
         "requested_capability_grants": {
             "type": "array",
             "maxItems": MAX_ROUTINE_IDENTITY_ITEMS,
@@ -973,7 +984,7 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
                     },
                     "constraints": {
                         "type": "object",
-                        "description": "Exact domain-owned grant constraints from toolbox_load. Supply grants only for effects that require them; effect-free reads belong only in allowed_capability_ids.",
+                        "description": "Use the exact search automation_contract, or direct load if needed. Grants are for effects; reads use allowed_capability_ids.",
                     },
                     "max_calls_per_occurrence": {
                         "type": "integer",
@@ -999,7 +1010,7 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         },
         "precheck": {
             "type": "object",
-            "description": "Optional exact resource-revision precheck. Omit for MCP-only routines; connector revisions are not a resource precheck.",
+            "description": "changes_only requires this; always/actions/MCP forbid it. Tracks structure, not rows. Use capability contract_digest.",
             "properties": {
                 "capability_id": {"type": "string", "minLength": 1, "maxLength": 1024},
                 "contract_digest": {
@@ -1104,6 +1115,8 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             }
         )
         required.extend(("routine_id", "expected_revision"))
+    else:
+        required.append("run_immediately")
     return {
         "type": "object",
         "properties": properties,

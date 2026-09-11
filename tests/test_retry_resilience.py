@@ -1,30 +1,35 @@
 """Retry accounting and failure recovery with actual SDKs and offline transports."""
 
 import asyncio
+import json
 from dataclasses import replace
 from decimal import Decimal
 
 import httpx
 import pytest
-
 from test_provider_token_counting import (
-    provider_at,
-    input_request,
     count_response,
+    input_request,
     is_count,
+    provider_at,
 )
 from test_routing import registration, request
+
+from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import (
     ModelProviderError,
     ProviderErrorCode,
     interrupted_model_usage,
+    retry_after_from_headers,
 )
 from daita.llm.factory import create_model_route_provider
 from daita.llm.models import (
     FinishReason,
+    ModelCallPolicy,
     ModelProfile,
     ModelResponse,
     ModelStreamCompleted,
+    ModelTextDelta,
     ModelUsage,
 )
 from daita.llm.pricing import CostEstimate
@@ -36,9 +41,6 @@ from daita.llm.routing import (
     RetryPolicy,
 )
 from daita.security import SecretReference, SecretResolutionError
-from daita.llm._lifecycle import closing_stream
-from daita.llm.models import ModelTextDelta
-from daita.llm.errors import retry_after_from_headers
 
 
 def usage(tokens=30, cost="0.01"):
@@ -74,7 +76,7 @@ async def test_backoff_interruption_retains_prior_usage(stream, deadline):
     )
     router = ModelRouter(
         (registration(provider, streaming=stream),),
-        retry_policy=RetryPolicy(attempts=2),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2),
         sleep=sleep,
     )
     bounded = replace(request(), max_total_tokens=100)
@@ -185,7 +187,7 @@ async def test_completion_cleanup_failure_cannot_restart_generation():
     provider = Provider(())
     router = ModelRouter(
         (registration(provider, streaming=True),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
     events = []
     try:
@@ -195,7 +197,7 @@ async def test_completion_cleanup_failure_cannot_restart_generation():
         except ModelProviderError:
             pass  # Cleanup may fail; it cannot generate another response.
         assert provider.attempts == 1
-        assert len(events) == 1
+        assert events == []
     finally:
         await router.close()
 
@@ -244,7 +246,7 @@ async def test_known_local_secret_failure_can_retry_before_generation(
                     secret_reference=SecretReference.environment("OFFLINE_KEY"),
                 ),
             ),
-            retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+            retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
         ),
         secret_provider=secrets,
     )
@@ -283,7 +285,7 @@ async def test_temporary_count_outage_retries_only_admission_before_generation(k
                     ),
                 ),
             ),
-            retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+            retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
         )
         try:
             with pytest.raises(ModelProviderError) as caught:
@@ -294,6 +296,48 @@ async def test_temporary_count_outage_retries_only_admission_before_generation(k
             assert all(is_count(path) for path in paths)
             assert caught.value.code is ProviderErrorCode.TOKEN_BUDGET_INSUFFICIENT
             assert caught.value.usage.total_tokens == 0
+        finally:
+            await router.close()
+
+
+@pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
+async def test_count_response_close_failure_blocks_retry(kind):
+    paths = []
+    consumed = []
+    closes = []
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield json.dumps(count_response(kind, 5000)).encode()
+            consumed.append(1)
+
+        async def aclose(self):
+            closes.append(1)
+            raise RuntimeError("synthetic native close failure")
+
+    def respond(req):
+        paths.append(req.url.path)
+        return httpx.Response(
+            200, stream=Body(), headers={"content-type": "application/json"}
+        )
+
+    async with provider_at(kind, respond) as provider:
+        entry = registration(provider)
+        router = ModelRouter(
+            (replace(entry, profile=replace(entry.profile, supports_tools=True)),),
+            retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
+        )
+        try:
+            with pytest.raises(ModelProviderError) as caught:
+                await router.generate(replace(input_request(), response_schema=None))
+            assert caught.value.code is ProviderErrorCode.CLEANUP_FAILED
+            assert caught.value.cleanup_unresolved
+            assert caught.value.usage.total_tokens == 0
+            assert caught.value.usage.cost_estimate.status.value == "complete"
+            assert provider._native_owner.poisoned
+            assert len(paths) == 1 and is_count(paths[0])
+            assert consumed == [1]
+            assert closes == [1]
         finally:
             await router.close()
 
@@ -321,13 +365,13 @@ async def test_count_timeout_releases_request_and_retries_inside_same_deadline(
         entry = registration(provider, streaming=stream)
         router = ModelRouter(
             (replace(entry, profile=replace(entry.profile, supports_tools=True)),),
-            retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+            retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
         )
         bounded = replace(
             input_request(remaining=5000),
             response_schema=None,
             deadline=asyncio.get_running_loop().time() + 1,
-            input_count_timeout_seconds=0.02,
+            call_policy=ModelCallPolicy(input_count_timeout_seconds=0.02),
         )
         try:
             with pytest.raises(ModelProviderError) as caught:
@@ -373,7 +417,7 @@ async def test_request_deadline_during_backoff_preserves_usage(stream):
     )
     router = ModelRouter(
         (registration(provider, streaming=stream),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0.001),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0.001),
         sleep=sleep,
     )
     try:
@@ -416,7 +460,7 @@ async def test_consumer_cancellation_between_stream_events_retains_attempt_usage
     )
     router = ModelRouter(
         (registration(provider, streaming=True),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
 
     async def consume():
@@ -520,7 +564,7 @@ async def test_single_attempt_lazy_resolution_uses_request_deadline(stream):
                 secret_reference=SecretReference("env", "OFFLINE_KEY"),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=1, max_total_attempts=1),
     )
     provider = create_model_route_provider(route, secret_provider=secrets)
     try:
@@ -544,7 +588,8 @@ async def test_single_attempt_lazy_resolution_uses_request_deadline(stream):
 
 @pytest.mark.parametrize("mode", ["cancel", "cleanup_failure"])
 async def test_loop_retains_completion_usage_through_stream_shutdown(mode):
-    from test_loop import TranscriptContext, ScriptedTools, NOW
+    from test_loop import NOW, ScriptedTools, TranscriptContext
+
     from daita.loop import AgentLoop, InMemoryTranscriptStore, RunInput
 
     class Provider(MockStreamingModelProvider):
@@ -588,7 +633,7 @@ async def test_loop_retains_completion_usage_through_stream_shutdown(mode):
 
 
 def test_retry_after_http_date():
-    from datetime import datetime, UTC
+    from datetime import UTC, datetime
 
     now = datetime(2026, 9, 8, 12, 0, tzinfo=UTC)
     assert (
@@ -620,7 +665,7 @@ async def test_malformed_native_count_response_is_terminal(kind, content):
         entry = registration(provider)
         router = ModelRouter(
             (replace(entry, profile=replace(entry.profile, supports_tools=True)),),
-            retry_policy=RetryPolicy(attempts=2),
+            retry_policy=RetryPolicy(max_attempts_per_candidate=2),
         )
         try:
             with pytest.raises(ModelProviderError) as caught:
@@ -628,5 +673,6 @@ async def test_malformed_native_count_response_is_terminal(kind, content):
             assert caught.value.code is ProviderErrorCode.TOKEN_COUNT_UNAVAILABLE
             assert caught.value.usage.cost_estimate.status.value == "complete"
             assert len(paths) == 1 and is_count(paths[0])
+            assert not provider._native_owner.poisoned
         finally:
             await router.close()

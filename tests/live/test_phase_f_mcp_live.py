@@ -17,12 +17,10 @@ from _phase_f_live_support import (
     COST_ENV,
     DESTINATION,
     NEXT_SLOT,
-    REPORT_INSTRUCTION,
     RESEARCH_TOKEN,
     SOURCE,
     assert_action,
     assert_completed,
-    assert_report,
     evaluate,
     live_provider,
     model_ids,
@@ -94,15 +92,7 @@ async def test_live_action_discovery_and_catalog_scale(
         tool_count=tool_count,
         case_id=request.node.nodeid,
     ) as scenario:
-        prompts = (
-            f'Post a release-readiness notification to {DESTINATION} with exactly this content: "{CONTENT}".',
-            f'Let {DESTINATION} know this release-readiness message: "{CONTENT}". Preserve that text exactly.',
-        )
-        result, transcript = await scenario.run(
-            prompts[phrasing]
-            + " Do not perform research. Set citation and finding to null. "
-            + REPORT_INSTRUCTION
-        )
+        result, transcript = await scenario.run(scenario.action_prompt(phrasing))
         assert_completed(result, transcript)
         assert result.usage.total_tokens > 0
         capture = RunCapture(result, transcript, tuple(scenario.provider.requests))
@@ -117,7 +107,7 @@ async def test_live_action_discovery_and_catalog_scale(
         assert (
             len(scenario.approvals) == 1 and scenario.approvals[0]["approved"] is True
         )
-        assert_report(result, status="server_reported", research=False)
+        scenario.check_answer(result, status="server_reported", research=False)
 
 
 @pytest.mark.parametrize("fault", ["success", "tool_error", "disconnect"])
@@ -138,11 +128,7 @@ async def test_live_research_and_honest_action_evidence(
         fault=fault,
         case_id=request.node.nodeid,
     ) as scenario:
-        result, transcript = await scenario.run(
-            f"Research current release readiness and post the finding, its verification marker, "
-            f"and its citation to {DESTINATION}. Preserve the research in your answer even if "
-            f"the notification cannot be confirmed. {REPORT_INSTRUCTION}"
-        )
+        result, transcript = await scenario.run(scenario.research_prompt())
         assert_completed(result, transcript)
         assert result.usage.total_tokens > 0
         await assert_action(scenario, uncertain=fault != "success")
@@ -172,7 +158,7 @@ async def test_live_research_and_honest_action_evidence(
             for message in transcript.messages
             for block in message.content
         )
-        assert_report(
+        scenario.check_answer(
             result,
             status="server_reported" if fault == "success" else "uncertain",
             research=True,
@@ -199,6 +185,8 @@ async def test_live_model_authors_grant_and_runs_immediate_and_weekly_occurrence
     ) as scenario:
         creation, transcript = await scenario.run(scenario.routine_prompt())
         assert_completed(creation, transcript)
+        if scenario.evaluation_profile == "user_flow":
+            scenario.check_answer(creation, status="routine_saved", research=False)
         routines = await scenario.agent.list_routines()
         assert len(routines) == 1, creation.final_text
         inspection = await scenario.agent.inspect_routine(routines[0].routine_id)
@@ -222,14 +210,14 @@ async def test_live_model_authors_grant_and_runs_immediate_and_weekly_occurrence
 
         immediate, immediate_transcript = await scenario.scheduled_result(1)
         assert_completed(immediate, immediate_transcript)
-        assert_report(immediate, status="server_reported", research=True)
+        scenario.check_answer(immediate, status="server_reported", research=True)
         await assert_action(scenario)
 
         scenario.clock = NEXT_SLOT
         scenario.agent._embedded._routine_supervisor.wake()
         weekly, weekly_transcript = await scenario.scheduled_result(2)
         assert_completed(weekly, weekly_transcript)
-        assert_report(weekly, status="server_reported", research=True)
+        scenario.check_answer(weekly, status="server_reported", research=True)
         await assert_action(scenario, count=2)
         for transcript in (immediate_transcript, weekly_transcript):
             assert results_for(transcript, scenario.research.local_name)

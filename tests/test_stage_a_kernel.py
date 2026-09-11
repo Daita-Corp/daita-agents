@@ -875,7 +875,9 @@ async def test_successful_fallback_provider_is_sticky_for_run():
 
     router = ModelRouter(
         (registration(first), registration(second)),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
+        ),
     )
     route = router.begin_run(ModelSensitivity.INTERNAL)
     request = ModelRequest(
@@ -930,7 +932,9 @@ async def test_selected_route_rejects_raised_sensitivity_without_new_fallback():
             ),
             registration(later, ModelSensitivity),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
+        ),
     )
     route = router.begin_run(ModelSensitivity.INTERNAL)
     internal = ModelRequest(

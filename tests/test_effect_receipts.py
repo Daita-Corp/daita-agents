@@ -359,3 +359,134 @@ async def test_public_recovery_requires_exact_approval_and_keeps_original_observ
         assert await agent.list_effects(unresolved_only=True) == ()
     finally:
         await agent.close()
+
+
+async def test_reopened_foreground_context_reports_bounded_durable_effect_block(
+    tmp_path,
+):
+    from daita import Agent
+    from daita.capabilities import ApprovalDecision
+    from daita.llm.models import FinishReason, ModelProfile, ModelResponse, TextBlock
+    from daita.llm.providers.mock import MockModelProvider
+
+    provider = MockModelProvider(
+        tuple(
+            ModelResponse(
+                finish_reason=FinishReason.STOP, text="Report current evidence."
+            )
+            for _ in range(2)
+        )
+    )
+    profile = ModelProfile(
+        id=provider.provider_id,
+        context_window_tokens=64000,
+        max_output_tokens=1000,
+        supports_tools=True,
+    )
+
+    async def approve(request):
+        return ApprovalDecision.APPROVE
+
+    agent = await Agent.create(
+        "effect-context",
+        root=tmp_path,
+        hosted=True,
+        model=provider,
+        model_profile=profile,
+        approval_handler=approve,
+    )
+    receipts = []
+    try:
+        store = agent._embedded._store
+        for index in range(21):
+            original = _started(
+                f"call-{index}", operation_key="sha256:" + f"{index:064x}"
+            )
+            started = replace(
+                original,
+                agent_id=agent.id,
+                sensitivity=ModelSensitivity.RESTRICTED,
+                receipt_id=effect_receipt_id(
+                    agent_id=agent.id,
+                    run_id=original.run_id,
+                    call_id=original.call_id,
+                    operation_key=original.operation_key,
+                ),
+            )
+            # Fixture insertion models existing evidence; production admission correctly
+            # forbids a new effect while an earlier one is unresolved.
+            if index == 0:
+                await store.start(
+                    RunInput(
+                        id=started.run_id,
+                        agent_id=agent.id,
+                        message="earlier action",
+                        created_at=STARTED_AT,
+                        conversation_id="earlier-conversation",
+                    )
+                )
+            uncertain = started.finish(
+                EffectObservation(
+                    EffectOutcome.UNCERTAIN,
+                    EffectEvidenceBasis.UNKNOWN,
+                    payload=FrozenJsonObject.from_mapping(
+                        {"private_detail": "DO_NOT_PROJECT_RECEIPT_PAYLOAD"}
+                    ),
+                ),
+                finished_at=COMPLETED_AT,
+            )
+            with sqlite3.connect(store.path) as connection:
+                connection.execute(
+                    "INSERT INTO effect_receipts(agent_id,id,run_id,call_id,operation_key,routine_id,occurrence_id,grant_digest,unresolved,data) VALUES (?,?,?,?,?,NULL,NULL,NULL,1,?)",
+                    (
+                        agent.id,
+                        uncertain.receipt_id,
+                        uncertain.run_id,
+                        uncertain.call_id,
+                        uncertain.operation_key,
+                        encode_receipt(uncertain),
+                    ),
+                )
+            receipts.append(uncertain)
+    finally:
+        await agent.close()
+    agent = await Agent.open(
+        "effect-context",
+        root=tmp_path,
+        hosted=True,
+        model=provider,
+        model_profile=profile,
+        approval_handler=approve,
+    )
+    try:
+        await agent.run("Are the requested values present? Do not repeat any action.")
+        system = "\n".join(
+            block.text
+            for block in provider.requests[-1].messages[0].content
+            if isinstance(block, TextBlock)
+        )
+        assert '"unresolved_effects"' in system
+        assert '"omitted_count":1' in system
+        assert sum(receipt.receipt_id in system for receipt in receipts) == 20
+        assert "DO_NOT_PROJECT_RECEIPT_PAYLOAD" not in system
+        assert "Current values do not resolve an earlier operation" in system
+        assert provider.requests[-1].sensitivity is ModelSensitivity.INTERNAL
+        assert len(await agent.list_effects(unresolved_only=True)) == 20
+        for receipt in receipts:
+            await agent.resolve_effect(
+                receipt.receipt_id,
+                expected_digest=receipt.receipt_digest,
+                decision=EffectResolutionDecision.CLOSE_WITHOUT_RETRY,
+                note="Close without action.",
+            )
+        assert len(provider.requests) == 1
+        await agent.run("Report current status.")
+        system = "\n".join(
+            block.text
+            for block in provider.requests[-1].messages[0].content
+            if isinstance(block, TextBlock)
+        )
+        assert '"unresolved_effects"' not in system
+        assert not await agent.list_effects(unresolved_only=True)
+    finally:
+        await agent.close()

@@ -65,14 +65,14 @@ from ..autonomy import (
     create_terminal_job_followup,
 )
 from ..capabilities import (
-    CapabilityInputError,
     AccessMode,
-    ApprovalHandler,
     ApprovalDecision,
+    ApprovalHandler,
     ApprovalRequest,
-    EffectOutcome,
     CapabilityDeclarations,
+    CapabilityInputError,
     CapabilityRegistry,
+    EffectOutcome,
     ExecutionContractBindings,
     ExecutionContractReader,
     OperationalEffect,
@@ -95,6 +95,7 @@ from ..catalog.models import (
 )
 from ..catalog.service import CatalogService
 from ..config import AgentConfig
+from ..context import AgentContextBuilder, _project_completed_history
 from ..distribution import (
     DISTRIBUTION_DOMAIN_OWNER_ID,
     DeliveryInspection,
@@ -105,7 +106,6 @@ from ..distribution import (
     OutcomeContract,
     distribution_capability_declarations,
 )
-from ..context import AgentContextBuilder
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
     DATA_QUERY_CAPABILITY_ID,
@@ -121,12 +121,10 @@ from ..domains.data import (
     data_query_declarations,
     local_file_declarations,
     relational_update_declarations,
-    relational_upsert_declarations,
     relational_update_preview_declarations,
+    relational_upsert_declarations,
     resource_revision_observation_declarations,
 )
-from ..scope import resolve_effective_source_scope
-from ..context import _project_completed_history
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.data.profile_jobs import (
     DATA_PROFILE_DOMAIN_OWNER_ID,
@@ -174,6 +172,8 @@ from ..llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelCallPolicy,
+    _DEFAULT_CALL_POLICY,
     ModelProfile,
     ModelRequest,
     ModelSensitivity,
@@ -221,6 +221,7 @@ from ..routines.capabilities import (
 from ..routines.models import (
     MisfirePolicy,
     ReportingMode,
+    RequestedCapabilityGrant,
     ResourceRevisionObservation,
     ResourceRevisionPrecheck,
     RoutineControlAction,
@@ -229,12 +230,12 @@ from ..routines.models import (
     RoutineState,
     ScheduledRoutine,
     ScheduledRoutineDraft,
-    RequestedCapabilityGrant,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
 from ..routines.owner import RoutineError, RoutineOwner, routine_approval_arguments
 from ..routines.supervisor import RoutineSupervisor
+from ..scope import resolve_effective_source_scope
 from ..security import (
     CredentialSession,
     KeychainSecretProvider,
@@ -264,7 +265,6 @@ from ..storage.sqlite_records import (
     EffectReceipt,
     EffectResolution,
     EffectResolutionDecision,
-    validate_effect_receipt_id,
     RelationalWriteScope,
     SourcePermissionResource,
     SourcePermissionsInspection,
@@ -274,6 +274,7 @@ from ..storage.sqlite_records import (
     SourceReadMode,
     SourceReadScope,
     relational_write_authorization_fingerprint,
+    validate_effect_receipt_id,
 )
 from ..workspace import LocalWorkspace
 
@@ -406,6 +407,7 @@ def _model_execution_contracts(
     model: ModelProvider | None,
     profile: ModelProfile | None,
     route: ModelRoute | None,
+    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
 ) -> dict[str, str]:
     """Digest declared non-secret execution configuration, never SDK state."""
 
@@ -425,7 +427,8 @@ def _model_execution_contracts(
                 for candidate in model.candidates
             ],
             "retry_policy": {
-                "attempts": model.retry_policy.attempts,
+                "max_attempts_per_candidate": model.retry_policy.max_attempts_per_candidate,
+                "max_total_attempts": model.retry_policy.max_total_attempts,
                 "backoff_seconds": model.retry_policy.backoff_seconds,
             },
         }
@@ -447,6 +450,7 @@ def _model_execution_contracts(
                 {
                     "route_id": route_id,
                     "execution_configuration": material,
+                    "model_call_policy": _encode_call_policy(call_policy),
                 }
             ).encode("utf-8")
         ).hexdigest()
@@ -733,6 +737,7 @@ class EmbeddedAgent:
         model_route: ModelRoute | None,
         owned_model_provider: ManagedModelProvider | None,
         limits: LoopLimits,
+        model_call_policy: ModelCallPolicy,
         secret_provider: SecretProvider,
         keychain: CredentialSession,
         owns_credential_session: bool,
@@ -750,6 +755,7 @@ class EmbeddedAgent:
         self.model_route = model_route
         self._owned_model_provider = owned_model_provider
         self._limits = limits
+        self._model_call_policy = model_call_policy
         self._secret_provider = secret_provider
         self._keychain = keychain
         self._owns_credential_session = owns_credential_session
@@ -940,12 +946,14 @@ class EmbeddedAgent:
             keychain
         )
         runtime_secrets = secret_provider or credential_session
-        model, model_profile, model_route, limits = _resolve_configuration(
-            config,
-            model=model,
-            model_profile=model_profile,
-            limits=limits,
-            secret_provider=runtime_secrets,
+        model, model_profile, model_route, limits, model_call_policy = (
+            _resolve_configuration(
+                config,
+                model=model,
+                model_profile=model_profile,
+                limits=limits,
+                secret_provider=runtime_secrets,
+            )
         )
         _validate_custom_loop(model, model_profile, context_builder, tools)
         (home, writer_lock), cancelled = await _await_sync_completion(
@@ -1011,6 +1019,7 @@ class EmbeddedAgent:
                 context_builder=context_builder,
                 tools=tools,
                 limits=limits,
+                model_call_policy=model_call_policy,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
                 secret_provider=runtime_secrets,
@@ -1094,12 +1103,14 @@ class EmbeddedAgent:
             tools=tools,
         )
         if explicit_configuration:
-            model, model_profile, model_route, limits = _resolve_configuration(
-                config,
-                model=model,
-                model_profile=model_profile,
-                limits=limits,
-                secret_provider=runtime_secrets,
+            model, model_profile, model_route, limits, model_call_policy = (
+                _resolve_configuration(
+                    config,
+                    model=model,
+                    model_profile=model_profile,
+                    limits=limits,
+                    secret_provider=runtime_secrets,
+                )
             )
         else:
             model = None
@@ -1148,12 +1159,14 @@ class EmbeddedAgent:
                 )
                 if cancelled:
                     raise asyncio.CancelledError
-                model, model_profile, model_route, limits = _resolve_configuration(
-                    persisted,
-                    model=None,
-                    model_profile=None,
-                    limits=limit_override,
-                    secret_provider=runtime_secrets,
+                model, model_profile, model_route, limits, model_call_policy = (
+                    _resolve_configuration(
+                        persisted,
+                        model=None,
+                        model_profile=None,
+                        limits=limit_override,
+                        secret_provider=runtime_secrets,
+                    )
                 )
             artifact_store = await AgentHomeArtifactStore.open(
                 agent_id=identity.id,
@@ -1190,6 +1203,7 @@ class EmbeddedAgent:
                 context_builder=context_builder,
                 tools=tools,
                 limits=limits,
+                model_call_policy=model_call_policy,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
                 secret_provider=runtime_secrets,
@@ -1231,6 +1245,7 @@ class EmbeddedAgent:
         context_builder: ContextBuilder | None,
         tools: ToolRuntime | None,
         limits: LoopLimits,
+        model_call_policy: ModelCallPolicy,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         secret_provider: SecretProvider,
@@ -1344,6 +1359,7 @@ class EmbeddedAgent:
             profile=resolved_reviewer_profile,
             max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
             clock=clock,
+            call_policy=model_call_policy,
         )
         memory = memory_set_declarations(memory_store)
         skills = skill_declarations(skill_store)
@@ -1576,7 +1592,9 @@ class EmbeddedAgent:
             distribution_declaration_bundle,
             distribution_owner,
         )
-        model_contracts = _model_execution_contracts(model, model_profile, model_route)
+        model_contracts = _model_execution_contracts(
+            model, model_profile, model_route, model_call_policy
+        )
 
         async def read_execution_contracts(
             *,
@@ -1709,6 +1727,8 @@ class EmbeddedAgent:
             resolved_context = AgentContextBuilder(
                 data_view,
                 profile=model_profile,
+                routine_authoring_facts=routine_owner.authoring_facts,
+                effect_receipts=store,
                 memory=memory_store,
                 skills=skill_store,
                 scheduled_skill_bindings=skill_domain.scheduled_bindings,
@@ -1739,6 +1759,7 @@ class EmbeddedAgent:
                 tools=_require_value(resolved_tools),
                 transcripts=transcripts,
                 limits=limits,
+                model_call_policy=model_call_policy,
                 clock=clock,
                 observer=observer,
                 stream_model_calls=(
@@ -1869,6 +1890,7 @@ class EmbeddedAgent:
             model_route=model_route,
             owned_model_provider=owned_model_provider,
             limits=limits,
+            model_call_policy=model_call_policy,
             secret_provider=secret_provider,
             keychain=keychain,
             owns_credential_session=owns_credential_session,
@@ -1996,7 +2018,11 @@ class EmbeddedAgent:
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
             )
-            replacement = AgentConfig(model_route=route, limits=self._limits)
+            replacement = AgentConfig(
+                model_route=route,
+                limits=self._limits,
+                model_call_policy=self._model_call_policy,
+            )
             committed = False
             try:
                 if reference is not None:
@@ -2012,6 +2038,7 @@ class EmbeddedAgent:
                     route,
                     secret_provider=self._secret_provider or self._keychain,
                     injected_provider=self._model_validator,
+                    call_policy=self._model_call_policy,
                 )
                 await _await_sync_completion(
                     lambda: _write_model_configuration(self.home, replacement)
@@ -4678,13 +4705,25 @@ class EmbeddedAgent:
             async with self._mutation_lock:
                 pass
         owned_model_provider = self._owned_model_provider
-        self._owned_model_provider = None
+        model_shutdown_deadline = (
+            asyncio.get_running_loop().time()
+            + self._model_call_policy.cleanup_timeout_seconds
+        )
+        reviewer_close = asyncio.create_task(
+            self._candidate_reviewer.close(deadline=model_shutdown_deadline)
+        )
         if owned_model_provider is not None:
             try:
-                await owned_model_provider.close()
+                await owned_model_provider.close(deadline=model_shutdown_deadline)
+                self._owned_model_provider = None
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        try:
+            await reviewer_close
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         activated_bindings = tuple(self._mcp_activated_bindings.values())
         self._mcp_activated_bindings.clear()
         for activated in activated_bindings:
@@ -4700,7 +4739,6 @@ class EmbeddedAgent:
                 if first_error is None:
                     first_error = error
         for store in (
-            self._candidate_reviewer,
             self._memory_store,
             self._skill_store,
             *(
@@ -4832,10 +4870,12 @@ def _resolve_candidate_reviewer_profile(
         if profile is not None:
             raise ValueError("reviewer_profile requires reviewer_model")
         return None
-    if isinstance(model, ModelRouter):
-        raise ValueError(
-            "candidate reviewer requires one direct provider without fallback"
-        )
+    if isinstance(model, ModelRouter) and (
+        len(model.candidates) != 1
+        or model.retry_policy.max_attempts_per_candidate != 1
+        or model.retry_policy.max_total_attempts != 1
+    ):
+        raise ValueError("candidate reviewer requires one attempt without fallback")
     resolved = profile
     if resolved is None:
         candidate = getattr(model, "model_profile", None)
@@ -4875,7 +4915,9 @@ def _candidate_reviewer_from_route(
                 allowed_sensitivities=primary.allowed_sensitivities,
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
     return (
         create_model_route_provider(
@@ -4933,7 +4975,13 @@ def _resolve_configuration(
     model_profile: ModelProfile | None,
     limits: LoopLimits | None,
     secret_provider: SecretProvider | None,
-) -> tuple[ModelProvider | None, ModelProfile | None, ModelRoute | None, LoopLimits]:
+) -> tuple[
+    ModelProvider | None,
+    ModelProfile | None,
+    ModelRoute | None,
+    LoopLimits,
+    ModelCallPolicy,
+]:
     if config is not None and not isinstance(config, AgentConfig):
         raise TypeError("config must be AgentConfig or None")
     route = None if config is None else config.model_route
@@ -4951,7 +4999,13 @@ def _resolve_configuration(
         assert model_profile is not None
         if model.provider_id != model_profile.id:
             raise AgentNotConfiguredError("model and profile identities differ")
-    return model, model_profile, route, resolved_limits
+    return (
+        model,
+        model_profile,
+        route,
+        resolved_limits,
+        (ModelCallPolicy() if config is None else config.model_call_policy),
+    )
 
 
 def _resolve_credential_session(
@@ -5270,6 +5324,7 @@ async def _validate_model_route(
     *,
     secret_provider: SecretProvider,
     injected_provider: ModelProvider | None,
+    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
 ) -> None:
     validation_candidates = tuple(
         replace(
@@ -5289,7 +5344,12 @@ async def _validate_model_route(
         )
         for candidate in route.candidates
     )
-    validation_route = ModelRoute(validation_candidates, route.retry_policy)
+    validation_route = ModelRoute(
+        validation_candidates,
+        RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
+    )
     owns_provider = injected_provider is None
     if owns_provider:
         provider = create_model_route_provider(
@@ -5318,24 +5378,43 @@ async def _validate_model_route(
             retry_policy=validation_route.retry_policy,
         )
     try:
-        await _require_validated_model_provider(provider)
+        await _require_validated_model_provider(
+            provider,
+            call_policy=call_policy,
+            deadline=asyncio.get_running_loop().time()
+            + call_policy.max_request_seconds,
+        )
     except BaseException:
         if owns_provider:
             assert isinstance(provider, ManagedModelProvider)
             try:
-                await provider.close()
-            except BaseException:
-                pass
+                await provider.close(
+                    deadline=asyncio.get_running_loop().time()
+                    + call_policy.cleanup_timeout_seconds
+                )
+            except BaseException:  # noqa: BLE001
+                # Retain the original validation failure.
+                pass  # Cleanup's once-only outcome stays on the provider owner.
         raise
     else:
         if owns_provider:
             assert isinstance(provider, ManagedModelProvider)
-            await provider.close()
+            await provider.close(
+                deadline=asyncio.get_running_loop().time()
+                + call_policy.cleanup_timeout_seconds
+            )
 
 
-async def _require_validated_model_provider(provider: ModelProvider) -> None:
+async def _require_validated_model_provider(
+    provider: ModelProvider,
+    *,
+    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
+    deadline: float | None = None,
+) -> None:
     response = await provider.generate(
         ModelRequest(
+            call_policy=call_policy,
+            deadline=deadline,
             messages=(
                 CanonicalMessage(
                     role=MessageRole.USER,
@@ -5475,10 +5554,24 @@ def _write_model_configuration(home: Path, config: AgentConfig) -> None:
             pass
 
 
+def _encode_call_policy(policy: ModelCallPolicy) -> dict[str, object]:
+    from dataclasses import asdict
+
+    return asdict(policy)
+
+
+def _decode_call_policy(value: object) -> ModelCallPolicy:
+    from dataclasses import fields
+
+    values = _strict_mapping(value, {item.name for item in fields(ModelCallPolicy)})
+    return ModelCallPolicy(**cast(Mapping[str, float], values))
+
+
 def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
     route = config.model_route
     assert route is not None
     return {
+        "model_call_policy": _encode_call_policy(config.model_call_policy),
         "limits": {
             "max_estimated_cost_usd": (
                 None
@@ -5508,7 +5601,8 @@ def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
                 for candidate in route.candidates
             ],
             "retry_policy": {
-                "attempts": route.retry_policy.attempts,
+                "max_attempts_per_candidate": route.retry_policy.max_attempts_per_candidate,
+                "max_total_attempts": route.retry_policy.max_total_attempts,
                 "backoff_seconds": route.retry_policy.backoff_seconds,
             },
         },
@@ -5538,7 +5632,7 @@ def _encode_model_profile(profile: ModelProfile) -> dict[str, object]:
 
 
 def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
-    document = _strict_mapping(value, {"limits", "model_route"})
+    document = _strict_mapping(value, {"limits", "model_route", "model_call_policy"})
     route_value = _strict_mapping(
         document["model_route"],
         {"candidates", "retry_policy"},
@@ -5631,12 +5725,15 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         )
     raw_retry = _strict_mapping(
         route_value["retry_policy"],
-        {"attempts", "backoff_seconds"},
+        {"max_attempts_per_candidate", "max_total_attempts", "backoff_seconds"},
     )
     route = ModelRoute(
         tuple(candidates),
         RetryPolicy(
-            attempts=cast(int, raw_retry["attempts"]),
+            max_attempts_per_candidate=cast(
+                int, raw_retry["max_attempts_per_candidate"]
+            ),
+            max_total_attempts=cast(int, raw_retry["max_total_attempts"]),
             backoff_seconds=cast(float, raw_retry["backoff_seconds"]),
         ),
     )
@@ -5654,6 +5751,7 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         raise TypeError("estimated cost must be text or null")
     return AgentConfig(
         model_route=route,
+        model_call_policy=_decode_call_policy(document["model_call_policy"]),
         limits=LoopLimits(
             max_steps=cast(int, raw_limits["max_steps"]),
             max_total_tokens=cast(int, raw_limits["max_total_tokens"]),

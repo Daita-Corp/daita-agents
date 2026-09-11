@@ -146,7 +146,7 @@ class _RecordingProvider:
                     self.responses.append(event.response)
                 yield event
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 
@@ -747,7 +747,9 @@ async def test_live_followup_uses_sticky_fallback_and_delivers_exactly_once(
                 allowed_sensitivities=frozenset(ModelSensitivity),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
     agent = await Agent.open(
         name,

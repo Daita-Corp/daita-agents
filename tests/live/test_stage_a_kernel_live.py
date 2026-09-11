@@ -115,7 +115,7 @@ class _RecordingProvider:
                     self.responses.append(event.response)
                 yield event
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 
@@ -426,7 +426,9 @@ async def test_live_fallback_provider_stays_sticky_through_tool_completion(
                     allowed_sensitivities=frozenset(ModelSensitivity),
                 ),
             ),
-            retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+            retry_policy=RetryPolicy(
+                max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+            ),
         )
         database = tmp_path / "stage-a-fallback.sqlite"
         _database(database)

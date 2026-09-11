@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Iterable
 
+from .._lifecycle import AttemptLifecycle, NativeOwner
 from ..models import (
     ModelProfile,
     ModelRequest,
@@ -79,6 +80,7 @@ class MockModelProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
+        AttemptLifecycle(NativeOwner(), request).check_execution()
         self._requests.append(request)
         if self._cursor >= len(self._script):
             raise MockScriptExhausted(
@@ -90,7 +92,7 @@ class MockModelProvider:
             raise item
         return item
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Release no resources; deterministic mock instances retain none."""
 
         return None
@@ -179,6 +181,7 @@ class MockStreamingModelProvider:
         return self._complete_pricing
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
+        AttemptLifecycle(NativeOwner(), request).check_execution()
         events = self._start(request)
         completion: ModelResponse | None = None
         for event in events:
@@ -193,14 +196,17 @@ class MockStreamingModelProvider:
         return completion
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        attempt = AttemptLifecycle(NativeOwner(), request)
+        attempt.check_execution()
         events = self._start(request)
         for event in events:
             await asyncio.sleep(0)
+            attempt.check_execution()
             if isinstance(event, Exception):
                 raise event
             yield event
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Release no resources; deterministic mock instances retain none."""
 
         return None

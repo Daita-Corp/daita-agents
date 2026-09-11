@@ -18,7 +18,6 @@ from _phase_f_live_support import (
     RESEARCH_TOKEN,
     assert_action,
     assert_completed,
-    assert_report,
     evaluate,
     live_provider,
     owner_routine_draft,
@@ -54,7 +53,7 @@ async def test_live_owner_admitted_routine_runs_immediate_and_weekly(
                 scenario.agent._embedded._routine_supervisor.wake()
             result, transcript = await scenario.scheduled_result(count)
             assert_completed(result, transcript)
-            assert_report(result, status="server_reported", research=True)
+            scenario.check_answer(result, status="server_reported", research=True)
             await assert_action(scenario, count=count)
             assert result.usage.total_tokens > 0
         assert scenario.approvals == []  # exact typed owner authorization is standing
@@ -111,10 +110,13 @@ async def admit_owner_routine(scenario):
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
     )
     draft = owner_routine_draft(scenario, origin.id, destinations[0].destination_id)
-    draft = replace(
-        draft,
-        authorized_instruction=draft.authorized_instruction + " " + REPORT_INSTRUCTION,
-    )
+    if scenario.evaluation_profile == "strict":
+        draft = replace(
+            draft,
+            authorized_instruction=draft.authorized_instruction
+            + " "
+            + REPORT_INSTRUCTION,
+        )
     proposal = await scenario.agent.propose_routine(draft)
     stored = await scenario.agent.create_routine(proposal)
     assert len(stored.capability_grants) == 1

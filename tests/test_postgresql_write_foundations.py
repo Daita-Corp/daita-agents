@@ -39,7 +39,8 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
 
     preview_description = preview.tool_views[0].description
     update_description = update.tool_views[0].description
-    assert "pass the exact successful preview immediately" in preview_description
+    assert "pass its exact positive preview" in preview_description
+    assert "Zero matches require correction or explanation" in preview_description
     assert "preview alone does not request approval" in preview_description
     assert "Calling this tool opens the approval interaction" in update_description
     assert "approved structured PostgreSQL update" not in update_description
@@ -53,14 +54,14 @@ def test_model_contract_makes_update_tool_call_the_only_approval_trigger() -> No
         ),
         (),
     )
-    assert "a successful preview is not a terminal answer" in prompt
+    assert "matched_rows > 0" in prompt
     assert "in the same run, call data_update_rows" in prompt
     assert "is what requests runtime approval and opens the approval card" in prompt
     assert "preview alone does neither" in prompt
     assert "Never claim that an approval card is displayed" in prompt
-    assert (
-        "Stop after preview only when the user explicitly requested preview" in prompt
-    )
+    assert "zero-match preview is not an executable update" in prompt
+    assert "positive count alone does not establish the intended entity" in prompt
+    assert "preview-only requests, unresolved targets or budget pressure" in prompt
 
 
 class _Keychain:

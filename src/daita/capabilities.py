@@ -28,7 +28,7 @@ MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS = 256
 MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS = 512
 MAX_TOOL_PRESENTATION_KEYWORDS = 16
 MAX_TOOL_PRESENTATION_KEYWORD_CHARACTERS = 64
-RESERVED_TOOL_NAMES = frozenset({"toolbox_search", "toolbox_load"})
+RESERVED_TOOL_NAMES = frozenset({"toolbox_search", "toolbox_load", "toolbox_inspect"})
 MAX_EXECUTION_SCOPE_IDENTITIES = 256
 MAX_EXECUTION_SCOPE_IDENTITY_CHARACTERS = 2_048
 
@@ -661,32 +661,32 @@ TOOLBOX_DEFINITIONS = (
     ToolboxDefinition(
         ToolboxId.FILES,
         "Files",
-        "Search, read, and analyze files in an admitted local workspace.",
+        "Admitted workspace files.",
     ),
     ToolboxDefinition(
         ToolboxId.SOURCES,
         "Sources",
-        "Discover, inspect, read, query, or update admitted external systems.",
+        "Admitted connector tools.",
     ),
     ToolboxDefinition(
         ToolboxId.ARTIFACTS,
         "Artifacts",
-        "Create, inspect, convert, export, and deliver Daita-owned outputs.",
+        "Daita-owned outputs.",
     ),
     ToolboxDefinition(
         ToolboxId.KNOWLEDGE,
         "Knowledge",
-        "Read or change advisory memory, skills, and semantic annotations.",
+        "Advisory memory, skills, semantics.",
     ),
     ToolboxDefinition(
         ToolboxId.JOBS,
         "Jobs",
-        "Start, inspect, read results from, or cancel durable work.",
+        "Durable work and results.",
     ),
     ToolboxDefinition(
         ToolboxId.ROUTINES,
         "Routines",
-        "Create, inspect, update, and control bounded scheduled assignments and their exact action grants.",
+        "Scheduled assignments and grants.",
     ),
 )
 
@@ -1704,6 +1704,8 @@ def _validate_object(
     schema: Mapping[str, object],
     value: Mapping[str, object],
     error_type: type[ValueError] | type[RuntimeError],
+    *,
+    path: str,
 ) -> None:
     properties = schema.get("properties", {})
     required = schema.get("required", ())
@@ -1720,7 +1722,7 @@ def _validate_object(
             raise CapabilityInputError(
                 "missing_arguments",
                 "Missing required tool arguments.",
-                {"names": missing},
+                {"names": missing, "path": path},
             )
         raise error_type(f"missing output fields: {', '.join(missing)}")
     if additional is False:
@@ -1730,14 +1732,14 @@ def _validate_object(
                 raise CapabilityInputError(
                     "unexpected_arguments",
                     "Unexpected tool arguments.",
-                    {"names": unexpected},
+                    {"names": unexpected, "path": path},
                 )
             raise error_type(f"unexpected output fields: {', '.join(unexpected)}")
     for name, item in value.items():
         rule = properties.get(name)
         if not isinstance(rule, Mapping):
             continue
-        _validate_rule(name, item, rule, error_type)
+        _validate_rule(name, item, rule, error_type, path=f"{path}.{name}")
 
 
 def validate_tool_schema_value(
@@ -1758,14 +1760,18 @@ def _validate_rule(
     item: object,
     rule: Mapping[str, object],
     error_type: type[ValueError] | type[RuntimeError],
+    *,
+    path: str | None = None,
 ) -> None:
+    if path is None:
+        path = name
     alternatives = rule.get("oneOf")
     if isinstance(alternatives, (tuple, list)):
         matched = 0
         for alternative in alternatives:
             assert isinstance(alternative, Mapping)
             try:
-                _validate_rule(name, item, alternative, error_type)
+                _validate_rule(name, item, alternative, error_type, path=path)
             except error_type:
                 continue
             matched += 1
@@ -1833,9 +1839,10 @@ def _validate_rule(
                     value,
                     item_rule,
                     error_type,
+                    path=f"{path}[{index}]",
                 )
     if isinstance(item, Mapping) and expected == "object":
-        _validate_object(rule, item, error_type)
+        _validate_object(rule, item, error_type, path=path)
 
 
 def _constraint_error(

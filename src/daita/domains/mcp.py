@@ -661,20 +661,59 @@ class MCPCapabilityDomain:
             Mapping[str, Mapping[str, object]], tool.input_schema.get("properties", {})
         )
         names = set(fixed) | set(variable)
-        if (
-            constraints["binding_id"] != binding.binding_id
-            or constraints["binding_revision"] != binding.revision
-            or constraints["remote_tool_name"] != tool.remote_name
-            or len(fixed) > 128
-            or set(fixed) & set(variable)
-            or len(variable) != len(set(variable))
-            or not names <= set(properties)
-            or not set(cast(tuple[str, ...], tool.input_schema.get("required", ())))
-            <= names
-        ):
+        identity_fields = [
+            name
+            for name, expected in (
+                ("binding_id", binding.binding_id),
+                ("binding_revision", binding.revision),
+                ("remote_tool_name", tool.remote_name),
+            )
+            if constraints[name] != expected
+        ]
+        if identity_fields:
             raise CapabilityInputError(
                 "mcp_grant_constraints_invalid",
-                "MCP grants require the exact binding/tool and disjoint, declared top-level argument names covering all required arguments.",
+                "The grant must use this exact admitted binding, revision and tool.",
+                {
+                    "identity_fields": identity_fields,
+                    "inspect_tool_name": tool.local_name,
+                },
+            )
+        missing = (
+            set(cast(tuple[str, ...], tool.input_schema.get("required", ()))) - names
+        )
+        unknown = names - set(properties)
+        overlapping = set(fixed) & set(variable)
+        if (
+            len(fixed) > 128
+            or overlapping
+            or len(variable) != len(set(variable))
+            or unknown
+            or missing
+        ):
+            groups = {
+                "missing_argument_names": missing,
+                "unknown_argument_names": unknown,
+                "overlapping_argument_names": overlapping,
+            }
+            details: dict[str, object] = {
+                key: [name[:128] for name in sorted(values)[:32]]
+                for key, values in groups.items()
+            }
+            details.update(
+                inspect_tool_name=tool.local_name,
+                argument_counts={key: len(values) for key, values in groups.items()},
+                names_truncated=any(
+                    len(values) > 32 or any(len(name) > 128 for name in values)
+                    for values in groups.values()
+                ),
+                fixed_argument_limit=128,
+            )
+            raise CapabilityInputError(
+                "mcp_grant_constraints_invalid",
+                "Correct the listed missing, unknown or overlapping grant arguments. "
+                "Use toolbox_inspect for the exact declared names and types; do not invent fields.",
+                details,
             )
         # A variable object/array cannot enforce a nested recipient or table limit.
         # This release admits scalar variables; fix composite values in full.
@@ -686,6 +725,15 @@ class MCPCapabilityDomain:
             raise CapabilityInputError(
                 "mcp_grant_nested_variable_unsupported",
                 "Fix the entire nested argument; variable JSON cannot enforce nested restrictions.",
+                {
+                    "argument_names": sorted(
+                        name
+                        for name in variable
+                        if properties[name].get("type")
+                        not in {"string", "integer", "number", "boolean"}
+                    )[:32],
+                    "inspect_tool_name": tool.local_name,
+                },
             )
         partial_schema = tool.input_schema.to_dict()
         partial_schema["required"] = list(fixed)

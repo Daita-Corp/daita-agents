@@ -92,6 +92,17 @@ _UPSERT_CAPABILITIES = frozenset({"data.preview_upsert_rows", "data.upsert_rows"
 _NATIVE_WRITE_CAPABILITIES = frozenset(
     {RELATIONAL_UPDATE_CAPABILITY_ID, "data.upsert_rows"}
 )
+
+
+def native_preview_capability(capability_id: str) -> str:
+    """The two native operations own their exact current-run preview prerequisite."""
+    if capability_id == RELATIONAL_UPDATE_CAPABILITY_ID:
+        return RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID
+    if capability_id == "data.upsert_rows":
+        return "data.preview_upsert_rows"
+    raise ValueError("not a native write capability")
+
+
 _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
     {
         *_UPSERT_CAPABILITIES,
@@ -103,6 +114,10 @@ _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
 )
 _RESOURCE_LIST_ARGUMENT_CAPABILITIES = _RELATIONAL_READ_CAPABILITIES
 _RELATIONAL_ADAPTER_IDS = frozenset({"sqlite", "postgresql"})
+_RESOURCE_READ_DENIED_MESSAGE = (
+    "The requested resource is not available for reading in this run. Copy exact "
+    "current catalog IDs without shortening them; do not guess or substitute another resource."
+)
 _ADAPTER_CAPABILITIES = {
     "postgresql": frozenset(
         {
@@ -565,6 +580,13 @@ class DataCapabilityDomain:
                 "automation_grant_unsupported",
                 "A routine may admit only one native write capability.",
             )
+        required_preview = native_preview_capability(capability.id)
+        if required_preview not in proposal.allowed_capability_ids:
+            raise CapabilityInputError(
+                "automation_grant_preview_required",
+                f"Include {required_preview} in the proposed scope. A corrected proposal "
+                "requires foreground review; execution still needs its own successful current-run preview.",
+            )
         source_id, resource_id = cast(str, constraints["source_id"]), cast(
             str, constraints["resource_id"]
         )
@@ -696,10 +718,70 @@ class DataCapabilityDomain:
                 None,
             )
         )
+        approval_arguments = None
+        if run.execution_scope is None:
+            source_id = cast(str, execution.arguments["source_id"])
+            resource_id = cast(str, execution.arguments["resource_id"])
+            resource = next(
+                (
+                    item
+                    for item in await self._catalog.resource_schemas(
+                        run.agent_id, source_id
+                    )
+                    if item.resource_id == resource_id
+                ),
+                None,
+            )
+            source = next(
+                (
+                    item
+                    for item in await self._catalog.source_routing_facts(
+                        run.agent_id, (source_id,)
+                    )
+                    if item["source_id"] == source_id
+                ),
+                None,
+            )
+            if (
+                resource is None
+                or source is None
+                or resource.revision != fingerprint["resource_revision"]
+            ):
+                raise CapabilityInputError(
+                    "write_state_changed",
+                    "The exact review target is no longer current.",
+                )
+            approval_arguments = FrozenJsonObject.from_mapping(
+                {
+                    "arguments": execution.arguments,
+                    "target": {
+                        "source_id": source_id,
+                        "resource_id": resource_id,
+                        "name": resource.name,
+                        "aliases": resource.aliases,
+                        "source_name": source["display_name"],
+                        "revision": resource.revision,
+                    },
+                    "preview": fingerprint["review"],
+                }
+            )
+        approval_reason = (
+            "Review the exact batch. Execution briefly holds an EXCLUSIVE table lock; ordinary reads may continue."
+            if capability.id == "data.upsert_rows"
+            else "Review the exact selected rows and assignments. Execution locks matching rows and rejects a changed preview."
+        )
+        if (
+            capability.id == "data.upsert_rows"
+            and cast(Mapping[str, object], fingerprint["review"])[
+                "identity_sequence_gaps_possible"
+            ]
+        ):
+            approval_reason += " Identity sequence gaps can remain after rollback."
         return SideEffectPlan(
             approval_required=run.execution_scope is None,
             capability_grant_digest=None if grant is None else grant.grant_digest,
-            approval_reason="Approve this exact native batch? Upsert briefly blocks other writers and row-locking readers; identity sequence gaps can remain after rollback.",
+            approval_reason=approval_reason,
+            approval_arguments=approval_arguments,
             recheck_after_approval=True,
             effect_intent=FrozenJsonObject.from_mapping(
                 {
@@ -938,7 +1020,7 @@ class DataCapabilityDomain:
             if identity is None or identity[0] not in selected_source_ids:
                 raise CapabilityInputError(
                     "resource_read_not_allowed",
-                    "The requested resource is not available for reading.",
+                    _RESOURCE_READ_DENIED_MESSAGE,
                 )
 
     async def _validate_resource_read_scope(
@@ -985,7 +1067,7 @@ class DataCapabilityDomain:
         if any(resource_id not in readable for resource_id in requested):
             raise CapabilityInputError(
                 "resource_read_not_allowed",
-                "The requested resource is not available for reading.",
+                _RESOURCE_READ_DENIED_MESSAGE,
             )
 
     async def _validate_sql(
@@ -1032,7 +1114,7 @@ class DataCapabilityDomain:
             if identity is None:
                 raise CapabilityInputError(
                     "resource_read_not_allowed",
-                    "The requested resource is not available for reading.",
+                    _RESOURCE_READ_DENIED_MESSAGE,
                 )
             if identity[0] != source_id:
                 raise CapabilityInputError(
@@ -1086,7 +1168,7 @@ class DataCapabilityDomain:
         }:
             raise CapabilityInputError(
                 "resource_read_not_allowed",
-                "One or more requested resources are not available for reading.",
+                _RESOURCE_READ_DENIED_MESSAGE,
             )
         raise CapabilityInputError(
             "sql_validation_failed",
@@ -1446,11 +1528,7 @@ class DataCapabilityDomain:
             )
         if not execution:
             return
-        expected = (
-            "data.preview_upsert_rows"
-            if capability.id == "data.upsert_rows"
-            else RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID
-        )
+        expected = native_preview_capability(capability.id)
         for result in results:
             data = result.output.get("data")
             if (

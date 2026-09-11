@@ -547,6 +547,7 @@ async def test_skill_view_is_fixed_and_projected_without_sources(tmp_path):
             "job_list",
             "routine_list",
             SKILL_VIEW_TOOL_NAME,
+            "toolbox_inspect",
             "toolbox_load",
             "toolbox_search",
         )
@@ -779,6 +780,7 @@ async def test_skill_claims_cannot_project_tools_or_bypass_runtime_validation(tm
             "job_list",
             "routine_list",
             "skill_view",
+            "toolbox_inspect",
             "toolbox_load",
             "toolbox_search",
         )

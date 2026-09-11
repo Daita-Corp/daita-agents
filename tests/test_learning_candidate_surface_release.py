@@ -60,7 +60,7 @@ def _route() -> ModelRoute:
                 ),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=5, backoff_seconds=1),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=5, backoff_seconds=1),
     )
 
 

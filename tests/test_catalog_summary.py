@@ -307,6 +307,21 @@ async def test_catalog_search_ranks_posting_candidates_before_unmatched_fallback
         )
         assert result.next_cursor is not None
         assert rank_count == 1
+        seen = {hit.resource_id for hit in result.hits}
+        while result.next_cursor is not None:
+            result = await agent.search_catalog(
+                CatalogSearchRequest(
+                    agent_id=agent.id,
+                    query="needle signal",
+                    limit=50,
+                    cursor=result.next_cursor,
+                )
+            )
+            assert len(result.hits) <= 50
+            for hit in result.hits:
+                assert hit.resource_id not in seen
+                seen.add(hit.resource_id)
+        assert len(seen) == 128
     finally:
         await agent.close()
 

@@ -10,6 +10,7 @@ import pytest
 from _workspace_support import workspace_for
 
 from daita import Agent, SQLiteSource
+from daita._json import canonical_json
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -447,7 +448,9 @@ async def test_private_continuity_survives_detach_compression_and_restart(tmp_pa
                 allowed_sensitivities=frozenset({ModelSensitivity.PUBLIC}),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
     reopened = await Agent.open(
         "history-classification",
@@ -472,8 +475,10 @@ async def test_private_continuity_survives_detach_compression_and_restart(tmp_pa
 
 
 @pytest.mark.acceptance
+@pytest.mark.parametrize("renamed", [False, True])
 async def test_one_foreground_run_compares_two_exact_sources_without_selection(
     tmp_path,
+    renamed,
 ):
     provider = MockModelProvider(())
     agent = await Agent.create(
@@ -485,13 +490,21 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
     )
     sources = []
     resources = []
-    for label, count in (("billing", 2), ("application", 3)):
+    keys = ("customer_key", "client_id") if renamed else ("id", "id")
+    table = "customer_records" if renamed else "customers"
+    for index, (label, count) in enumerate((("billing", 2), ("application", 3))):
         path = tmp_path / (label + ".sqlite")
-        _database(path, "customers")
         with sqlite3.connect(path) as connection:
+            # Same relation name, different structural keys and physical column
+            # order. The website-shaped name is deliberately not domain identity.
+            key = keys[index]
+            columns = [f"{key} INTEGER PRIMARY KEY", "domain TEXT", "name TEXT"]
+            if index:
+                columns.reverse()
+            connection.execute(f"CREATE TABLE {table} ({', '.join(columns)})")
             connection.executemany(
-                "INSERT INTO customers(id) VALUES (?)",
-                ((index,) for index in range(count)),
+                f"INSERT INTO {table}({key}, domain, name) VALUES (?, ?, ?)",
+                ((row, f"{label}-{row}.test", "other.test") for row in range(count)),
             )
         source = await agent.attach(SQLiteSource(path, name=label))
         sources.append(source)
@@ -509,6 +522,16 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
         ),
         ModelResponse(
             finish_reason=FinishReason.TOOL_CALLS,
+            tool_calls=(
+                ToolCall(
+                    "structure",
+                    "catalog_schema",
+                    {"resource_ids": tuple(resource.id for resource in resources)},
+                ),
+            ),
+        ),
+        ModelResponse(
+            finish_reason=FinishReason.TOOL_CALLS,
             tool_calls=tuple(
                 ToolCall(
                     f"count-{index}",
@@ -516,7 +539,7 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
                     {
                         "source_id": source.id,
                         "resource_ids": (resource.id,),
-                        "sql": "SELECT COUNT(*) AS customers FROM customers",
+                        "sql": f"SELECT COUNT({keys[index]}) AS customers FROM {table}",
                     },
                 )
                 for index, (source, resource) in enumerate(
@@ -542,7 +565,7 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
             if isinstance(block, ToolResultBlock)
         ]
         assert all(not block.is_error for block in results)
-        assert len(results) == 3
+        assert len(results) == 4
         catalog_data = results[0].output["data"]
         assert isinstance(catalog_data, Mapping)
         hits = catalog_data["hits"]
@@ -550,7 +573,9 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
         assert {hit["source_id"] for hit in hits if isinstance(hit, Mapping)} == {
             source.id for source in sources
         }
-        for block, count in zip(results[1:], (2, 3), strict=True):
+        structure = canonical_json(results[1].output)
+        assert all(key in structure for key in keys)
+        for block, count in zip(results[2:], (2, 3), strict=True):
             data = block.output["data"]
             assert isinstance(data, Mapping)
             rows = data["rows"]
@@ -558,5 +583,19 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
             assert isinstance(rows[0], Mapping)
             assert rows[0]["customers"] == count
         assert result.sensitivity is ModelSensitivity.INTERNAL
+        provider._script = (
+            *provider._script,
+            _stop(
+                "Only billing is in the new scope; the earlier definitions still differ."
+            ),
+        )
+        narrowed = await agent.run(
+            "Now use only billing.",
+            conversation_id=result.conversation_id,
+            source_scope_ids=(sources[0].id,),
+        )
+        assert narrowed.sensitivity is result.sensitivity
+        narrowed_transcript = await agent.transcript(narrowed.run_id)
+        assert narrowed_transcript.run.source_scope_ids == (sources[0].id,)
     finally:
         await agent.close()

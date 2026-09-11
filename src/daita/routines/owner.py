@@ -19,6 +19,7 @@ from ..capabilities import (
     AutomationScopeProposal,
     CapabilityGrant,
     CapabilityRegistry,
+    ExecutionContractBindings,
     ExecutionContractReader,
     OperationalEffect,
 )
@@ -62,6 +63,8 @@ from .models import (
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
     text_digest,
+    validate_reporting_precheck,
+    validate_budget_relationships,
 )
 from .schedule import validate_schedule
 
@@ -190,7 +193,9 @@ class RoutineOwner:
         if not callable(clock):
             raise TypeError("routine owner clock must be callable")
         routes = tuple(sorted(set(eligible_model_routes)))
-        if any(not isinstance(item, str) or not item for item in routes):
+        if len(routes) > MAX_ROUTINE_IDENTITY_ITEMS or any(
+            not isinstance(item, str) or not item or len(item) > 256 for item in routes
+        ):
             raise ValueError("routine owner model routes are invalid")
         if maximum_per_run_tokens < 1:
             raise ValueError("routine owner token limit must be positive")
@@ -217,6 +222,76 @@ class RoutineOwner:
             ]
             | None
         ) = None
+
+    def authoring_facts(self) -> FrozenJsonObject:
+        """Read complete bounded local choices without readiness or secret I/O."""
+        return FrozenJsonObject.from_mapping(
+            {
+                "eligible_model_routes": self._eligible_model_routes,
+                "maximum_per_run_tokens": self._maximum_per_run_tokens,
+                "maximum_per_run_cost_usd": (
+                    None
+                    if self._maximum_per_run_cost_usd is None
+                    else str(self._maximum_per_run_cost_usd)
+                ),
+            }
+        )
+
+    def _validate_model_routes(self, routes: tuple[str, ...]) -> None:
+        if not routes or not set(routes) <= set(self._eligible_model_routes):
+            choices = canonical_json(self._eligible_model_routes)
+            detail = (
+                f" Eligible choices: {choices}."
+                if len(choices) <= 512
+                else " Consult the complete routine authoring choices."
+            )
+            raise RoutineError(
+                "routine_model_route_revoked",
+                "Select exact currently eligible model route IDs; aliases are unsupported."
+                + detail,
+            )
+
+    @staticmethod
+    def _validate_budgets(
+        per_run_max_tokens: int,
+        cumulative_max_tokens: int,
+        per_run_max_cost_usd: Decimal,
+        cumulative_max_cost_usd: Decimal,
+    ) -> None:
+        try:
+            validate_budget_relationships(
+                per_run_max_tokens,
+                cumulative_max_tokens,
+                per_run_max_cost_usd,
+                cumulative_max_cost_usd,
+            )
+        except ValueError as error:
+            raise RoutineError("routine_budget_invalid", str(error)) from error
+
+    async def _bind_contracts(
+        self,
+        *,
+        agent_id: str,
+        source_ids: tuple[str, ...],
+        resource_ids: tuple[str, ...],
+        capability_ids: tuple[str, ...],
+        connector_binding_ids: tuple[str, ...],
+        model_route_ids: tuple[str, ...],
+    ) -> ExecutionContractBindings:
+        try:
+            return await self._execution_contract_reader(
+                agent_id=agent_id,
+                source_ids=source_ids,
+                resource_ids=resource_ids,
+                capability_ids=capability_ids,
+                connector_binding_ids=connector_binding_ids,
+                model_route_ids=model_route_ids,
+            )
+        except (KeyError, ValueError) as error:
+            raise RoutineError(
+                "routine_execution_contract_unavailable",
+                "An exact requested execution contract is unavailable.",
+            ) from error
 
     def bind_capability_registry(self, capabilities: CapabilityRegistry) -> None:
         """Bind the one complete immutable registry during composition."""
@@ -281,6 +356,21 @@ class RoutineOwner:
         run_immediately: bool = False,
     ) -> ScheduledRoutine:
         origin = await self._owned_run(run_id, conversation_id, sensitivity_ceiling)
+        self._validate_budgets(
+            per_run_max_tokens,
+            cumulative_max_tokens,
+            per_run_max_cost_usd,
+            cumulative_max_cost_usd,
+        )
+        self._validate_model_routes(eligible_model_routes)
+        self._validate_precheck(
+            reporting_mode,
+            precheck,
+            allowed_source_ids,
+            allowed_resource_ids,
+            allowed_connector_binding_ids,
+            allowed_capability_ids,
+        )
         promotion = (
             None
             if basis_run_id is None
@@ -338,7 +428,7 @@ class RoutineOwner:
                 requested_capability_grants,
             ),
             run_immediately=run_immediately,
-            contract_bindings=await self._execution_contract_reader(
+            contract_bindings=await self._bind_contracts(
                 agent_id=self.agent_id,
                 source_ids=allowed_source_ids,
                 resource_ids=allowed_resource_ids,
@@ -455,6 +545,21 @@ class RoutineOwner:
                 "routine_revision_changed",
                 "The routine changed after this foreground run began.",
             )
+        self._validate_budgets(
+            per_run_max_tokens,
+            cumulative_max_tokens,
+            per_run_max_cost_usd,
+            cumulative_max_cost_usd,
+        )
+        self._validate_model_routes(eligible_model_routes)
+        self._validate_precheck(
+            reporting_mode,
+            precheck,
+            allowed_source_ids,
+            allowed_resource_ids,
+            allowed_connector_binding_ids,
+            allowed_capability_ids,
+        )
         promotion = (
             current.promotion_evidence
             if basis_run_id is None
@@ -512,7 +617,7 @@ class RoutineOwner:
                 ),
                 requested_capability_grants,
             ),
-            contract_bindings=await self._execution_contract_reader(
+            contract_bindings=await self._bind_contracts(
                 agent_id=self.agent_id,
                 source_ids=allowed_source_ids,
                 resource_ids=allowed_resource_ids,
@@ -728,6 +833,14 @@ class RoutineOwner:
 
         if routine.agent_id != self.agent_id:
             raise RoutineError("routine_owner_mismatch", "The routine owner changed.")
+        self._validate_precheck(
+            routine.reporting_mode,
+            routine.precheck,
+            routine.allowed_source_ids,
+            routine.allowed_resource_ids,
+            routine.allowed_connector_binding_ids,
+            routine.allowed_capability_ids,
+        )
         validate_schedule(routine.schedule)
         if self._clock() >= routine.expires_at:
             raise RoutineError("routine_expired", "The routine has expired.")
@@ -755,11 +868,7 @@ class RoutineOwner:
                 "routine_distribution_destination_changed",
                 "The exact distribution destination revision changed.",
             )
-        if not set(routine.eligible_model_routes) <= set(self._eligible_model_routes):
-            raise RoutineError(
-                "routine_model_route_revoked",
-                "One or more exact model routes are no longer eligible.",
-            )
+        self._validate_model_routes(routine.eligible_model_routes)
         if routine.per_run_max_tokens > self._maximum_per_run_tokens:
             raise RoutineError(
                 "routine_token_budget_exceeded",
@@ -785,20 +894,14 @@ class RoutineOwner:
                 "routine_capability_invalid",
                 "The exact capability ceiling is no longer admitted.",
             ) from error
-        try:
-            current_contracts = await self._execution_contract_reader(
-                agent_id=self.agent_id,
-                source_ids=routine.allowed_source_ids,
-                resource_ids=routine.allowed_resource_ids,
-                capability_ids=routine.allowed_capability_ids,
-                connector_binding_ids=routine.allowed_connector_binding_ids,
-                model_route_ids=routine.eligible_model_routes,
-            )
-        except (KeyError, ValueError) as error:
-            raise RoutineError(
-                "routine_execution_contract_unavailable",
-                "An exact approved execution contract is unavailable.",
-            ) from error
+        current_contracts = await self._bind_contracts(
+            agent_id=self.agent_id,
+            source_ids=routine.allowed_source_ids,
+            resource_ids=routine.allowed_resource_ids,
+            capability_ids=routine.allowed_capability_ids,
+            connector_binding_ids=routine.allowed_connector_binding_ids,
+            model_route_ids=routine.eligible_model_routes,
+        )
         if routine.capability_grants:
             await self._store.require_effects_unblocked(
                 self.agent_id, routine_id=routine.routine_id
@@ -865,11 +968,6 @@ class RoutineOwner:
                     "routine_effect_requirement_unsupported",
                     "The requested completion evidence or call count cannot be established by this producer.",
                 )
-        if routine.precheck is not None and effectful:
-            raise RoutineError(
-                "routine_precheck_scope_invalid",
-                "An effectful assignment cannot skip work based on a resource revision.",
-            )
         capability_facts: list[dict[str, object]] = []
         mcp_capability_ids: set[str] = set()
         for capability_id in capability_ids:
@@ -1021,32 +1119,6 @@ class RoutineOwner:
                 "routine_mcp_capability_unbound",
                 "The exact MCP capability ceiling is not bound by the retained servers.",
             )
-        if routine.precheck is not None:
-            if not routine.allowed_source_ids or routine.allowed_connector_binding_ids:
-                raise RoutineError(
-                    "routine_precheck_scope_invalid",
-                    "Unchanged prechecks require an exact source-only assignment about its structural catalog revision.",
-                )
-            if (
-                routine.precheck.source_id not in routine.allowed_source_ids
-                or routine.precheck.resource_id not in routine.allowed_resource_ids
-            ):
-                raise RoutineError(
-                    "routine_precheck_scope_invalid",
-                    "The precheck is outside the exact resource ceiling.",
-                )
-            try:
-                expected = capabilities.contract_digest(routine.precheck.capability_id)
-            except KeyError as error:
-                raise RoutineError(
-                    "routine_precheck_unavailable",
-                    "The exact precheck capability is unavailable.",
-                ) from error
-            if expected != routine.precheck.contract_digest:
-                raise RoutineError(
-                    "routine_precheck_contract_changed",
-                    "The exact precheck contract changed.",
-                )
         skill_facts: list[dict[str, object]] = []
         for skill_binding in routine.skill_bindings:
             if self._skills is None:
@@ -1312,6 +1384,64 @@ class RoutineOwner:
                 )
             )
         return tuple(grants)
+
+    def _validate_precheck(
+        self,
+        reporting_mode: ReportingMode,
+        precheck: ResourceRevisionPrecheck | None,
+        source_ids: tuple[str, ...],
+        resource_ids: tuple[str, ...],
+        binding_ids: tuple[str, ...],
+        capability_ids: tuple[str, ...],
+    ) -> None:
+        """Check local proposal facts before binding; recheck the same rules at admission."""
+        try:
+            validate_reporting_precheck(reporting_mode, precheck)
+        except ValueError as error:
+            raise RoutineError("routine_precheck_invalid", str(error)) from error
+        if precheck is None:
+            return
+        capabilities = self._require_capability_registry()
+        try:
+            effectful = any(
+                capabilities.capability(item).operational_effect
+                is not OperationalEffect.NONE
+                for item in capability_ids
+            )
+        except KeyError as error:
+            raise RoutineError(
+                "routine_capability_invalid", "A requested capability is unknown."
+            ) from error
+        if effectful:
+            raise RoutineError(
+                "routine_precheck_scope_invalid",
+                "An effectful assignment cannot skip work based on a resource revision. Use reporting_mode=always and omit precheck.",
+            )
+        if not source_ids or binding_ids:
+            raise RoutineError(
+                "routine_precheck_scope_invalid",
+                "Unchanged prechecks require an exact source-only assignment about its structural catalog revision.",
+            )
+        if (
+            precheck.source_id not in source_ids
+            or precheck.resource_id not in resource_ids
+        ):
+            raise RoutineError(
+                "routine_precheck_scope_invalid",
+                "The precheck is outside the exact resource ceiling.",
+            )
+        try:
+            expected = capabilities.contract_digest(precheck.capability_id)
+        except KeyError as error:
+            raise RoutineError(
+                "routine_precheck_unavailable",
+                "The exact precheck capability is unavailable.",
+            ) from error
+        if expected != precheck.contract_digest:
+            raise RoutineError(
+                "routine_precheck_contract_changed",
+                "The exact precheck capability changed. Use its capability contract digest, not a resource revision.",
+            )
 
     def _access_modes(self, capability_ids: tuple[str, ...]) -> frozenset[AccessMode]:
         capabilities = self._require_capability_registry()

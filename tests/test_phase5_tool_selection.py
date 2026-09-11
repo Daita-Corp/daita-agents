@@ -6,7 +6,7 @@ import os
 import sqlite3
 from collections import defaultdict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1064,14 +1064,17 @@ def _definition_bytes(definitions: tuple[ToolDefinition, ...]) -> int:
     )
 
 
-def _generated_runtime() -> tuple[CapabilityRuntime, LoopLimits]:
+def _generated_runtime(
+    count: int | None = None,
+) -> tuple[CapabilityRuntime, LoopLimits]:
     limits = LoopLimits()
+    count = limits.max_run_tool_catalog_entries if count is None else count
     capabilities: list[Capability] = []
     views: list[ToolView] = []
     executors: list[_GeneratedExecutor] = []
     toolboxes = tuple(ToolboxId)
-    for index in range(limits.max_run_tool_catalog_entries):
-        name = "file_query" if index == 511 else f"generated_tool_{index:03d}"
+    for index in range(count):
+        name = "file_query" if index == count - 1 else f"generated_tool_{index:03d}"
         executor = _GeneratedExecutor(f"test.phase5.generated.executor.{index:03d}")
         capability = Capability(
             id=f"test.phase5.generated.capability.{index:03d}",
@@ -1226,7 +1229,7 @@ async def test_generated_maximum_catalog_is_bounded_searchable_and_replacing(
         assert _definition_bytes(catalog.pinned_provider_definitions) <= (
             limits.max_pinned_tool_definition_bytes
         )
-        assert len(initial.provider_definitions) == limits.max_pinned_tools + 2
+        assert len(initial.provider_definitions) == limits.max_pinned_tools + 3
         assert len(initial.provider_definitions) <= limits.max_step_tools
         assert _definition_bytes(initial.provider_definitions) <= (
             limits.max_step_tool_definition_bytes
@@ -1240,6 +1243,10 @@ async def test_generated_maximum_catalog_is_bounded_searchable_and_replacing(
                     "summary": item.summary,
                     "pinned_count": item.pinned_count,
                     "on_demand_count": item.on_demand_count,
+                    "access_modes": tuple(mode.value for mode in item.access_modes),
+                    "operational_effects": tuple(
+                        effect.value for effect in item.operational_effects
+                    ),
                 }
                 for item in catalog.toolbox_manifest
             ]
@@ -1283,6 +1290,44 @@ async def test_generated_maximum_catalog_is_bounded_searchable_and_replacing(
         assert 0 < len(matches) <= 5
         assert matches[0]["tool_name"] == "file_query"
         assert all("domain_owner_id" not in match for match in matches)
+        # Traverse every bounded page, including unmatched fallbacks. The same
+        # exact prepared catalog remains reachable under legal maximum pressure.
+        seen = set()
+        page = first
+        while True:
+            payload = _data(page)
+            page_matches = payload["matches"]
+            assert isinstance(page_matches, tuple)
+            for match in page_matches:
+                assert isinstance(match, Mapping)
+                assert match["tool_name"] not in seen
+                seen.add(match["tool_name"])
+            cursor = payload["next_cursor"]
+            if cursor is None:
+                break
+            page = await _execute_control(
+                runtime,
+                run,
+                initial,
+                replace(search, arguments={**search.arguments, "cursor": cursor}),
+                messages=(start,),
+            )
+            assert not page.is_error
+            assert (
+                len(canonical_json(page.output).encode())
+                <= limits.max_toolbox_search_result_bytes
+            )
+        assert seen == {entry.view.name for entry in catalog.entries}
+        repeated = await runtime.prepare_run(run)
+        assert repeated.catalog_digest == catalog.catalog_digest
+        repeated_snapshot = await builder.prepare(run, (start,), repeated)
+        repeated_request = builder.project(
+            repeated_snapshot,
+            (start,),
+            step=1,
+            tool_context=runtime.project(repeated, (start,)),
+        )
+        assert request == repeated_request
 
         load_query = ToolCall(
             id="maximum-load-query",
@@ -1335,7 +1380,31 @@ async def test_generated_maximum_catalog_is_bounded_searchable_and_replacing(
         names = {definition.name for definition in replaced.provider_definitions}
         assert replacement_name in names
         assert "file_query" not in names
-        assert len(names) == limits.max_pinned_tools + 2 + 1
+        assert len(names) == limits.max_pinned_tools + 3 + 1
+        inspect_call = ToolCall(
+            id="maximum-exact-inspection",
+            name="toolbox_inspect",
+            arguments={"tool_name": "file_query"},
+        )
+        inspected = await _execute_control(
+            runtime,
+            run,
+            replaced,
+            inspect_call,
+            messages=replaced_messages,
+        )
+        assert not inspected.is_error
+        inspected_data = inspected.output.get("data")
+        assert isinstance(inspected_data, Mapping)
+        assert inspected_data["complete"] is True
+        assert (
+            len(canonical_json(inspected_data).encode())
+            <= limits.max_toolbox_load_result_bytes
+        )
+        after_inspection = runtime.project(
+            catalog, _append_exchange(replaced_messages, inspect_call, inspected)
+        )
+        assert after_inspection.loaded_entries == replaced.loaded_entries
         assert _definition_bytes(replaced.provider_definitions) <= (
             limits.max_step_tool_definition_bytes
         )

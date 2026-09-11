@@ -313,6 +313,54 @@ class ModelUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class ModelCallPolicy:
+    """Finite code-owned model execution, progress, transport and shutdown bounds."""
+
+    max_request_seconds: float = 180.0
+    max_attempt_seconds: float = 120.0
+    first_progress_timeout_seconds: float = 60.0
+    progress_idle_timeout_seconds: float = 30.0
+    input_count_timeout_seconds: float = 15.0
+    connect_timeout_seconds: float = 5.0
+    read_timeout_seconds: float = 120.0
+    write_timeout_seconds: float = 30.0
+    pool_timeout_seconds: float = 5.0
+    cleanup_timeout_seconds: float = 5.0
+
+    def __post_init__(self) -> None:
+        from dataclasses import fields
+
+        for field_info in fields(self):
+            name = field_info.name
+            value = getattr(self, name)
+            maximum = (
+                60
+                if name == "input_count_timeout_seconds"
+                else 30 if name == "cleanup_timeout_seconds" else 3600
+            )
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 < value <= maximum
+            ):
+                raise ValueError(
+                    f"{name} must be finite, positive and at most {maximum}"
+                )
+            object.__setattr__(self, name, float(value))
+        if self.max_attempt_seconds > self.max_request_seconds:
+            raise ValueError("attempt duration cannot exceed request duration")
+        if (
+            max(self.first_progress_timeout_seconds, self.progress_idle_timeout_seconds)
+            > self.max_attempt_seconds
+        ):
+            raise ValueError("progress timeout cannot exceed attempt duration")
+
+
+_DEFAULT_CALL_POLICY = ModelCallPolicy()
+
+
+@dataclass(frozen=True, slots=True)
 class ModelRequest:
     messages: tuple[CanonicalMessage, ...]
     tools: tuple[ToolDefinition, ...] = ()
@@ -325,7 +373,8 @@ class ModelRequest:
     max_estimated_cost_usd: Decimal | None = None
     # Runtime-only absolute monotonic deadline; never sent to a provider API.
     deadline: float | None = None
-    input_count_timeout_seconds: float = 15.0
+    call_policy: ModelCallPolicy = ModelCallPolicy()
+    attempt_deadline: float | None = None
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -375,22 +424,27 @@ class ModelRequest:
             raise ValueError(
                 "model-request cost allowance must be finite and non-negative"
             )
-        if self.deadline is not None and (
-            isinstance(self.deadline, bool)
-            or not isinstance(self.deadline, (int, float))
-            or not math.isfinite(self.deadline)
-            or self.deadline < 0
-        ):
-            raise ValueError("model-request deadline must be finite and non-negative")
+        for name in ("deadline", "attempt_deadline"):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"model-request {name} must be finite and non-negative"
+                )
+            if value is not None:
+                object.__setattr__(self, name, float(value))
         if (
-            isinstance(self.input_count_timeout_seconds, bool)
-            or not isinstance(self.input_count_timeout_seconds, (int, float))
-            or not math.isfinite(self.input_count_timeout_seconds)
-            or not 0 < self.input_count_timeout_seconds <= 60
+            self.deadline is not None
+            and self.attempt_deadline is not None
+            and self.attempt_deadline > self.deadline
         ):
-            raise ValueError(
-                "input counting timeout must be positive and at most 60 seconds"
-            )
+            raise ValueError("attempt deadline cannot exceed logical deadline")
+        if not isinstance(self.call_policy, ModelCallPolicy):
+            raise TypeError("call_policy must be ModelCallPolicy")
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "response_schema", response_schema)

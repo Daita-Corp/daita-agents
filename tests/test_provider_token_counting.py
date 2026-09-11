@@ -1,38 +1,79 @@
 """Request admission counts real provider payloads, with all HTTP kept offline."""
 
-from contextlib import asynccontextmanager
+import asyncio
+import json
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from decimal import Decimal
 from typing import Any, cast
-import asyncio
-import json
 
 import anthropic
-from google import genai
-from google.genai import types
 import httpx
 import openai
 import pytest
+from google import genai
+from google.genai import types
 from live.benchmarks._support import RecordingProvider
 
 from daita.llm.errors import (
     ModelProviderError,
     ProviderErrorCode,
+    interrupted_attempt_diagnostic,
     interrupted_model_usage,
 )
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
+    ModelCallPolicy,
     ModelRequest,
     TextBlock,
-    ToolDefinition,
     ToolCall,
+    ToolDefinition,
     ToolResultBlock,
 )
 from daita.llm.providers.anthropic import AnthropicMessagesProvider
 from daita.llm.providers.gemini import GeminiProvider
 from daita.llm.providers.openai import OpenAIResponsesProvider
+
+
+@pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
+@pytest.mark.parametrize("stage", ["count", "generation"])
+@pytest.mark.parametrize(
+    "error_type,expected",
+    [
+        (httpx.ConnectTimeout, "connect_timeout"),
+        (httpx.ReadTimeout, "read_timeout"),
+        (httpx.WriteTimeout, "write_timeout"),
+        (httpx.PoolTimeout, "pool_timeout"),
+    ],
+)
+async def test_actual_sdk_retains_transport_timeout_cause_without_error_text(
+    kind, stage, error_type, expected
+):
+    paths = []
+
+    async def respond(request):
+        paths.append(request.url.path)
+        if is_count(request.url.path) and stage != "count":
+            return httpx.Response(200, json={"input_tokens": 5000, "totalTokens": 5000})
+        raise error_type("PRIVATE_TRANSPORT_DETAIL", request=request)
+
+    async with provider_at(kind, respond) as provider:
+        recording = RecordingProvider(provider)
+        with pytest.raises(ModelProviderError) as caught:
+            await invoke(recording, input_request(), True)
+    assert caught.value.code is ProviderErrorCode.TIMEOUT
+    assert len(paths) == (1 if stage == "count" else 2)
+    diagnostic = recording.timings[-1]["attempt_diagnostic"]
+    assert isinstance(diagnostic, Mapping)
+    assert diagnostic["transport_error_kind"] == expected
+    assert diagnostic["transport_error_phase"] == stage
+    assert "PRIVATE_TRANSPORT_DETAIL" not in json.dumps(recording.timings)
+    assert recording.timings[-1]["usage_complete"] is (stage == "count")
+    if stage == "count":
+        assert caught.value.usage.total_tokens == 0
+        assert diagnostic["generation_submitted_seconds"] is None
 
 
 @asynccontextmanager
@@ -138,6 +179,87 @@ async def invoke(provider, request, stream):
 
 @pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
 @pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("stage", ["count", "headers", "body", "native"])
+async def test_attempt_diagnostics_retain_interrupted_phases(kind, stream, stage):
+    """Real SDKs, synthetic requests, and no live HTTP or historical state."""
+    paths = []
+    closed = []
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            if stage == "native" and stream:
+                if kind == "openai":
+                    yield b'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_probe","status":"in_progress"}}\n\n'
+                elif kind == "anthropic":
+                    yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_probe","type":"message","role":"assistant","model":"fixture-model","content":[],"usage":{"input_tokens":5000,"output_tokens":0}}}\n\n'
+                else:
+                    yield b'data: {"responseId":"probe","modelVersion":"fixture-model"}\n\n'
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            closed.append(True)
+
+    async def respond(request):
+        paths.append(request.url.path)
+        if is_count(request.url.path):
+            if stage == "count":
+                await asyncio.Event().wait()
+            return httpx.Response(200, json=count_response(kind, 5000))
+        if stage == "headers":
+            await asyncio.Event().wait()
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-request-id": "req_probe",
+                "request-id": "req_probe",
+            },
+            stream=Body(),
+        )
+
+    async with provider_at(kind, respond) as provider:
+        recorder = RecordingProvider(provider)
+        request = replace(
+            input_request(),
+            response_schema=None,
+            deadline=asyncio.get_running_loop().time() + 0.8,
+            call_policy=ModelCallPolicy(input_count_timeout_seconds=0.3),
+        )
+        with pytest.raises(ModelProviderError) as caught:
+            await invoke(recorder, request, stream)
+        assert caught.value.code is ProviderErrorCode.TIMEOUT
+    timing = recorder.timings[0]
+    assert timing["first_event_seconds"] is None
+    assert timing["usage_complete"] is (stage == "count")
+    diagnostic = cast(Mapping[str, object], timing["attempt_diagnostic"])
+    assert diagnostic["count_state"] == ("failed" if stage == "count" else "succeeded")
+    assert diagnostic["count_started_seconds"] is not None
+    assert diagnostic["count_finished_seconds"] is not None
+    assert diagnostic["counted_input_tokens"] == (None if stage == "count" else 5000)
+    assert (diagnostic["generation_submitted_seconds"] is None) is (stage == "count")
+    assert len(paths) == (1 if stage == "count" else 2)
+    if kind != "gemini":
+        assert (diagnostic["generation_headers_seconds"] is not None) is (
+            stage in {"body", "native"}
+        )
+        assert diagnostic["generation_http_status"] == (
+            200 if stage in {"body", "native"} else None
+        )
+    else:
+        assert diagnostic["generation_headers_availability"] == "unsupported"
+    assert (diagnostic["first_native_event_seconds"] is not None) is (
+        stage == "native" and stream
+    )
+    assert diagnostic["terminal_observed"] is False
+    assert diagnostic["failure_code"] == "timeout"
+    assert len(json.dumps(diagnostic).encode()) <= 8192
+    assert "req_probe" not in json.dumps(diagnostic)
+    if stage in {"body", "native"}:
+        assert closed
+
+
+@pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
+@pytest.mark.parametrize("stream", [False, True])
 async def test_counted_payload_fits_despite_large_serialized_bytes(kind, stream):
     requests = []
 
@@ -212,9 +334,11 @@ async def test_insufficient_request_allowance_stops_before_generation(kind, toke
 
 @pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
 async def test_success_preserves_counted_admission_separately_from_actual_usage(kind):
-    def respond(request):
+    async def respond(request):
+        await asyncio.sleep(0)  # Interleave independent attempts on one borrowed SDK.
+        extra = 1000 if b"probe_right" in request.content else 0
         if is_count(request.url.path):
-            return httpx.Response(200, json=count_response(kind, 5000))
+            return httpx.Response(200, json=count_response(kind, 5000 + extra))
         if kind == "openai":
             payload = {
                 "id": "resp_offline",
@@ -234,9 +358,9 @@ async def test_success_preserves_counted_admission_separately_from_actual_usage(
                     }
                 ],
                 "usage": {
-                    "input_tokens": 5010,
+                    "input_tokens": 5010 + extra,
                     "output_tokens": 10,
-                    "total_tokens": 5020,
+                    "total_tokens": 5020 + extra,
                 },
             }
         elif kind == "anthropic":
@@ -248,7 +372,7 @@ async def test_success_preserves_counted_admission_separately_from_actual_usage(
                 "stop_reason": "end_turn",
                 "stop_sequence": None,
                 "content": [{"type": "text", "text": "Done."}],
-                "usage": {"input_tokens": 5010, "output_tokens": 10},
+                "usage": {"input_tokens": 5010 + extra, "output_tokens": 10},
             }
         else:
             payload = {
@@ -260,18 +384,36 @@ async def test_success_preserves_counted_admission_separately_from_actual_usage(
                 ],
                 "modelVersion": "fixture-model",
                 "usageMetadata": {
-                    "promptTokenCount": 5010,
+                    "promptTokenCount": 5010 + extra,
                     "candidatesTokenCount": 10,
-                    "totalTokenCount": 5020,
+                    "totalTokenCount": 5020 + extra,
                 },
             }
         return httpx.Response(200, json=payload)
 
     async with provider_at(kind, respond) as provider:
         recorder = RecordingProvider(provider)
-        response = await recorder.generate(
-            replace(input_request(), response_schema=None)
+        other = RecordingProvider(provider)
+        response, other_response = await asyncio.gather(
+            recorder.generate(replace(input_request(), response_schema=None)),
+            other.generate(
+                replace(
+                    input_request(),
+                    response_schema=None,
+                    messages=(
+                        CanonicalMessage(
+                            MessageRole.USER, content=(TextBlock("probe_right"),)
+                        ),
+                    ),
+                )
+            ),
         )
+        assert other_response.usage.total_tokens == 6020
+        other_attempt = cast(
+            Mapping[str, object], other.timings[0]["attempt_diagnostic"]
+        )
+        assert other_attempt["counted_input_tokens"] == 6000
+        assert other_attempt["terminal_observed"] is True
     assert response.usage.input_tokens == 5010
     assert response.usage.total_tokens == 5020
     assert dict(
@@ -287,6 +429,12 @@ async def test_success_preserves_counted_admission_separately_from_actual_usage(
     )
     assert saved["input_tokens"] == 5010
     assert saved["admission_failure"] is None
+    attempt = cast(Mapping[str, object], saved["attempt_diagnostic"])
+    assert attempt["terminal_observed"] is True
+    assert attempt["counted_input_tokens"] == 5000
+    assert attempt["output_cap"] == 2048
+    assert attempt["failure_code"] is None
+    assert "attempt_diagnostic" in response.provider_metadata
     json.dumps(saved)
 
 
@@ -305,6 +453,10 @@ async def test_count_request_failure_is_not_a_billed_generation_attempt(kind):
     assert caught.value.code is ProviderErrorCode.PROVIDER_UNAVAILABLE
     assert caught.value.diagnostic is not None
     assert caught.value.diagnostic.phase.value == "request_admission"
+    attempt = caught.value.diagnostic.attempt
+    assert attempt is not None
+    if kind != "gemini":
+        assert attempt["count_http_status"] == 503
     assert "private vendor text" not in str(caught.value)
     assert caught.value.usage.cost_estimate.amount_usd == Decimal(0)
 
@@ -385,6 +537,11 @@ async def test_count_cancellation_preserves_zero_usage_and_cancellation(kind, de
     assert usage.total_tokens == 0
     assert usage.cost_estimate.status.value == "complete"
     assert usage.cost_estimate.amount_usd == Decimal(0)
+    observation = interrupted_attempt_diagnostic(error)
+    assert observation is not None
+    assert observation["count_state"] == "failed"
+    assert observation["failure_code"] == "cancelled"
+    assert observation["generation_submitted_seconds"] is None
 
 
 @pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
@@ -547,13 +704,14 @@ async def test_count_preserves_opaque_reasoning_and_tool_results(kind):
 
 @pytest.mark.parametrize("kind", ["compatible", "grok", "ollama", "codex"])
 async def test_uncounted_routes_preserve_usage_based_progression(kind):
+    from test_subscription_providers import _credential
+
     from daita.llm.providers import (
-        OpenAICompatibleProvider,
+        CodexSubscriptionProvider,
         GrokProvider,
         OllamaProvider,
-        CodexSubscriptionProvider,
+        OpenAICompatibleProvider,
     )
-    from test_subscription_providers import _credential
 
     seen = []
 
@@ -629,6 +787,7 @@ def test_subscription_cli_separates_request_bytes_and_token_allowance():
 @pytest.mark.parametrize("stream", [False, True])
 async def test_loop_deadline_during_counting_retains_zero_charge(stream):
     from test_loop import NOW, ScriptedTools, TranscriptContext
+
     from daita.loop import AgentLoop, InMemoryTranscriptStore, LoopLimits, RunInput
 
     paths = []
@@ -660,7 +819,7 @@ async def test_loop_deadline_during_counting_retains_zero_charge(stream):
 @pytest.mark.parametrize("stream", [False, True])
 async def test_router_retains_prior_attempt_charges_when_counting_is_cancelled(stream):
     from daita.llm.errors import with_cancelled_model_usage
-    from daita.llm.models import ModelUsage, ModelStreamCompleted
+    from daita.llm.models import ModelStreamCompleted, ModelUsage
     from daita.llm.pricing import CostEstimate
     from daita.llm.providers.mock import MockStreamingModelProvider
     from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
@@ -694,7 +853,7 @@ async def test_router_retains_prior_attempt_charges_when_counting_is_cancelled(s
     provider = Provider((), complete_pricing=True)
     router = ModelRouter(
         (ModelProviderRegistration(provider=provider, profile=provider.model_profile),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
     try:
         task = asyncio.create_task(
@@ -711,3 +870,31 @@ async def test_router_retains_prior_attempt_charges_when_counting_is_cancelled(s
         assert provider.attempts == 2
     finally:
         await router.close()
+
+
+@pytest.mark.parametrize("kind", ["openai", "anthropic"])
+@pytest.mark.parametrize("stream", [False, True])
+async def test_generation_http_errors_retain_status_without_invented_header_time(
+    kind, stream
+):
+    paths = []
+
+    def respond(request):
+        paths.append(request.url.path)
+        if is_count(request.url.path):
+            return httpx.Response(200, json=count_response(kind, 5000))
+        return httpx.Response(503, json={"error": {"message": "private vendor text"}})
+
+    async with provider_at(kind, respond) as provider:
+        recorder = RecordingProvider(provider)
+        with pytest.raises(ModelProviderError) as caught:
+            await invoke(
+                recorder, replace(input_request(), response_schema=None), stream
+            )
+    assert caught.value.code is ProviderErrorCode.PROVIDER_UNAVAILABLE
+    attempt = cast(Mapping[str, object], recorder.timings[0]["attempt_diagnostic"])
+    assert attempt["counted_input_tokens"] == 5000
+    assert attempt["generation_http_status"] == 503
+    assert attempt["generation_headers_availability"] == "status_only"
+    assert attempt["generation_headers_seconds"] is None
+    assert len(paths) == 2 and recorder.timings[0]["usage_complete"] is False

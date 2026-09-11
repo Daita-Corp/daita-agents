@@ -5,13 +5,13 @@ from dataclasses import replace
 
 import httpx
 import pytest
-
 from _phase_f_live_support import limits
 from _retry_route_support import (
     ConfiguredActionFixture,
     CountFaultTransport,
     record_configured_route,
 )
+
 from daita.llm.profiles import reviewed_model_profile
 from daita.loop.models import LoopExitKind
 from daita.security import SecretReference
@@ -111,7 +111,9 @@ async def test_configured_route_retry_preserves_committed_action(
         assert len(recording.requests) == 4
         assert len(recording.responses) == 3
         assert len({item.deadline for item in recording.requests}) == 1
-        assert recording.requests[-1] == recording.requests[-2]
+        assert replace(recording.requests[-1], attempt_deadline=None) == replace(
+            recording.requests[-2], attempt_deadline=None
+        )
         assert [item.max_total_tokens for item in recording.requests] == [
             30000,
             29890,

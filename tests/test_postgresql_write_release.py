@@ -373,8 +373,10 @@ async def test_mixed_upsert_generated_identity_exact_receipt_and_unchanged_repea
     ]
     assert database.probe.mutations == 2 and database.probe.server_commits == 1
     assert len(database.approvals) == 1
+    approved_arguments = database.approvals[0].arguments["arguments"]
+    assert isinstance(approved_arguments, Mapping)
     assert (
-        database.approvals[0].arguments["preview_fingerprint"]
+        approved_arguments["preview_fingerprint"]
         == receipt.payload["preview_fingerprint"]
     )
     database.upsert(rows)
@@ -480,17 +482,38 @@ async def test_change_during_exact_approval_prevents_mutation(
     assert isinstance(error, Mapping) and error["code"] == "state_changed"
 
 
+@pytest.mark.parametrize("collision", ["within_batch", "after_preview"])
 async def test_second_insert_unique_violation_rolls_back_entire_batch(
     database: Fixture,
+    collision: str,
 ) -> None:
     # A second unique key is real server enforcement, independent of the
     # selected domain conflict key. The first insertion must also roll back.
-    database.upsert(
-        [
-            row("a.test"),
-            {**row("b.test"), "evidence_url": "https://evidence.test/a.test"},
+    rows = [
+        row("a.test"),
+        {**row("b.test"), "evidence_url": "https://evidence.test/a.test"},
+    ]
+    expected_rows = []
+    if collision == "after_preview":
+        rows = [row("a.test"), row("b.test")]
+
+        async def occupy_evidence_url() -> None:
+            await database.admin.execute(
+                f"INSERT INTO {_TABLE} (domain, name, evidence_url) VALUES "
+                "('collision.test', 'Concurrent writer', 'https://evidence.test/b.test')"
+            )
+
+        database.approval_hook = occupy_evidence_url
+        expected_rows = [
+            {
+                "id": 1,
+                "domain": "collision.test",
+                "name": "Concurrent writer",
+                "evidence_url": "https://evidence.test/b.test",
+                "notes": None,
+            }
         ]
-    )
+    database.upsert(rows)
     await database.run()
     receipt = await database.receipt(EffectOutcome.NOT_APPLIED)
     assert receipt.payload is not None
@@ -500,7 +523,7 @@ async def test_second_insert_unique_violation_rolls_back_entire_batch(
     )
     assert receipt.payload["identity_sequence_gaps_possible"] is True
     assert database.probe.mutations == 1 and database.probe.commit_attempts == 0
-    assert await database.rows() == []
+    assert await database.rows() == expected_rows
     # Sequences are intentionally not a rollback guarantee.
     assert (
         await database.admin.fetchval(

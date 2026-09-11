@@ -18,7 +18,11 @@ from _workspace_support import workspace_for
 from daita import Agent, JobStatus, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
-from daita.llm.errors import ModelProviderError, interrupted_model_usage
+from daita.llm.errors import (
+    ModelProviderError,
+    interrupted_model_usage,
+    take_provider_attempt_diagnostic,
+)
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -131,6 +135,7 @@ class RecordingProvider:
         return provider_has_complete_pricing(self._delegate, request)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
+        take_provider_attempt_diagnostic()
         index = len(self.requests)
         self.requests.append(request)
         started = perf_counter()
@@ -149,6 +154,7 @@ class RecordingProvider:
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live benchmark provider must support streaming")
+        take_provider_attempt_diagnostic()
         index = len(self.requests)
         self.requests.append(request)
         started = perf_counter()
@@ -205,9 +211,12 @@ class RecordingProvider:
         dimensions = (
             response.provider_metadata.get("pricing_dimensions") if response else None
         )
+        attempt = take_provider_attempt_diagnostic()
         self.timings.append(
             {
                 "request_index": index,
+                "provider_id": self.provider_id,
+                "attempt_diagnostic": None if attempt is None else attempt.to_dict(),
                 "seconds": perf_counter() - started,
                 "first_event_seconds": first_event_seconds,
                 "returned_response": response is not None,
@@ -245,6 +254,10 @@ class RecordingProvider:
                 and (
                     response is not None
                     or (
+                        isinstance(failure, ModelProviderError)
+                        and failure.terminal_observed
+                    )
+                    or (
                         usage is not None
                         and usage.cost_estimate.status.value == "complete"
                     )
@@ -272,7 +285,7 @@ class RecordingProvider:
             }
         )
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 

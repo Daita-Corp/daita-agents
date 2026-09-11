@@ -203,18 +203,32 @@ Catalog and toolbox search rank lexical matches first and include labeled
 unmatched fallbacks; bounded pages retain access to every scoped candidate.
 The framework context includes an ephemeral bounded connector directory built
 from current catalog, MCP binding, and skill metadata, alongside one compact toolbox
-manifest. Local discovery
+manifest. The manifest derives prepared-candidate access modes and operational effects
+from immutable capability metadata; compact group summaries do not imply missing
+connector permissions. Local discovery
 hints are untrusted presentation and never change execution authority.
 Toolbox grouping, access modes, and
 operational effects are metadata, not model-selected search filters. Improve
 discovery vocabulary in existing `ToolPresentation` records without changing
 capability execution contracts. `toolbox_load` accepts exact on-demand names
-directly; search is unnecessary when those names are known. Neither control
-grants authority or bypasses current admission and approval checks.
+directly; search is unnecessary when those names are known. `toolbox_inspect`
+reads an exact prepared contract without changing the callable set or executing
+a capability. These controls grant no authority and bypass no admission checks.
 Search includes the existing domain-owned automation contract for grant-requiring
 tools so scheduling can inspect constraints without activating execution schemas.
+Its `requires_automation_grant` flag refers to scheduled execution. Search,
+load receipts and exact inspection share one registered contract projection,
+with exact revision digests. Load retains compact incomplete references and grant
+metadata; explicit inspection supplies input/output schemas. Inspected contracts
+remain in the ordinary transcript after callable-set replacement. Foreground actions
+use ordinary approval at invocation.
 Byte pressure omits whole contracts with `automation_contract_omitted` before
-removing candidates; exact load retains access to the complete declaration.
+removing candidates. Load receipts omit their remaining grant metadata as a whole
+when byte/depth bounds require it, preserving exact inspection references. `toolbox_inspect` retrieves a complete
+contract or explicitly partial path/page/string fragments bound to its digest.
+Inspection intersects frozen candidates with current local domain applicability;
+it never refreshes remote state or replaces execution-time validation. The default
+50-tool surface reserves 32 pinned, 15 on-demand and three control slots.
 
 `daita.capability_runtime.CapabilityRuntime` is the sole production boundary
 between model tool calls and execution. For each call it:
@@ -267,6 +281,10 @@ routine. `Agent.inspect_effect`, bounded `Agent.list_effects`, and the human-onl
 `Agent.resolve_effect` expose evidence and exact foreground-approved recovery.
 One immutable resolution is retained separately from the original observation;
 resolution performs no retry and grants no connector permission.
+Foreground context reads this same durable blocking check at preparation and
+retains bounded receipt IDs/counts as internal operational metadata, without
+receipt payloads. Current row values do not resolve prior operation uncertainty.
+The frozen context informs reporting; execution still rechecks the store.
 
 Do not call source clients or executors directly from `AgentLoop`, `Agent`, a
 tool view, or model-authored text. Do not infer access, effects, or automation
@@ -528,10 +546,16 @@ payloads end inside provider adapters. `daita.llm.routing` handles retry and
 fallback decisions from normalized failures; `AgentLoop` does not retry a
 whole run or inspect provider-specific failures.
 
-Canonical requests carry one absolute monotonic deadline from the loop. Credential
-resolution, counting, generation, and retry waits consume that same allowance.
-API counting has a separate 15-second phase cap, bounded by the outer deadline;
-direct canonical callers can set `input_count_timeout_seconds` up to 60 seconds.
+One immutable `ModelCallPolicy` in `AgentConfig` and `ModelRequest` governs
+configured and conforming injected providers, both delivery modes, foreground,
+routines, follow-ups, validation and candidate review. Defaults are 180 seconds
+per logical request, 120 per attempt, 60 to first substantive progress, 30 idle,
+15 counting, 5 connect, 120 read, 30 write, 5 pool and 5 cleanup. Every logical
+request intersects its caller/run deadline before setup; retries retain that
+logical deadline and receive a fresh, narrower attempt deadline. Counting has
+its own phase cap (`call_policy.input_count_timeout_seconds`, at most 60).
+Monotonic deadlines are runtime-only; policy durations and both retry ceilings
+are serialized and included in frozen machine model-contract digests.
 Counting transport failures retain their canonical cause and proven zero generation
 usage; invalid count data and unsupported counting remain permanent admission
 failures. External cancellation remains cancellation.
@@ -559,8 +583,11 @@ Visible stream progress, including terminal completion, closes retry/fallback
 eligibility. Completed usage remains authoritative during shutdown. Valid HTTP
 retry delays are honored without shortening; waits exceeding 60 seconds or the
 remaining deadline stop recovery. Local exponential backoff uses bounded jitter.
-Configured routes default to two total attempts per candidate; caller-injected
-providers retain their own routing behavior. Tests must exercise both compositions.
+`RetryPolicy` defaults to `max_attempts_per_candidate=2` and
+`max_total_attempts=3`. Both limits are one for one-shot validation/review.
+Every configured route uses `ModelRouter`, including a one-candidate route.
+Injected providers retain caller ownership and must honor the canonical policy;
+they do not gain an implicit router. Tests exercise both compositions.
 
 Provider lifecycle follows explicit ownership. Providers constructed from an
 agent's persisted model route are closed by `EmbeddedAgent` after runs and
@@ -570,8 +597,16 @@ created; injected SDK clients remain borrowed. Temporary validation and
 candidate-review providers are closed by the component that creates them.
 
 Owners stop new work and drain active calls before closing a provider. Close
-callers join one cancellation-safe cleanup task; repeated calls observe the
-same completion or failure without retrying SDK cleanup. Adapters scope
+callers share one absolute cleanup deadline and a retained once-only outcome;
+repeated calls cannot retry native cleanup or renew grace. Native SDK scopes
+enter, iterate and exit in one owned task. A bounded supervisor retains native
+work that fails to retire, poisons its owner, discards late output and rejects
+replacement work. Only native I/O, never tools or persistence, can remain there.
+Transport bytes, decoded activity, substantive progress, canonical emission and
+terminal completion are separate facts. Empty introductions, snapshots without
+growth and keepalives do not reset progress. Opaque nonstreaming/CLI calls report
+progress as unobservable and obey fixed deadlines. Terminal usage survives
+cleanup failure; successful completion is published only after native release. Adapters scope
 request-stream cleanup to completion, failure, cancellation, or early exit.
 Canonical stream wrappers finalize in the iteration context and propagate
 closure to their delegate; releasing a request stream never closes a borrowed
@@ -739,6 +774,17 @@ Approval summaries derive only from the exact validated request and retain its
 complete bounded details. An explicit `confirmation_handler` reviews direct routine
 create/update controls before mutation; typed Python callers without that callback
 remain the authorizing owner. CLI create/update supplies this callback. Approval cannot grant missing connector permission.
+
+Native approval documents contain the exact execution `arguments`, catalog-backed
+`target`, and bounded `preview` review facts. The data domain reuses its existing
+preflight preview; rendering performs no I/O. Execution arguments and intent digests
+remain separate from review labels and samples. The runtime still approves and
+rechecks one exact plan before reserving an effect. A positive count alone does not
+prove the selected business entity; there is no second target authorization record.
+
+Model-authored routine creation requires an explicit `run_immediately` boolean.
+Model-authored updates accept omission or false and reject true; typed owner defaults
+remain false. Immediate creation and later run-now use the existing owner/supervisor.
 
 The source permission editor authors one exact table scope through existing
 preview/apply APIs. Catalog-backed column/key choices are presentation, not a

@@ -68,7 +68,7 @@ async def test_router_close_attempts_all_owned_delegates_and_retains_failure():
     attempts = []
 
     class Provider(MockModelProvider):
-        async def close(self):
+        async def close(self, *, deadline: float | None = None):
             attempts.append(self.provider_id)
             if self.provider_id == "mock:last":
                 raise RuntimeError("offline cleanup failure")
@@ -84,7 +84,7 @@ async def test_router_close_attempts_all_owned_delegates_and_retains_failure():
         )
     )
     for _ in range(2):
-        with pytest.raises(RuntimeError, match="offline cleanup failure"):
+        with pytest.raises(ModelProviderError, match="cleanup_failed"):
             await router.close()
     assert attempts == ["mock:last", "mock:first"]
 
@@ -148,10 +148,14 @@ def test_single_lazy_route_enforces_its_configured_sensitivity_set():
                     allowed_sensitivities=frozenset({ModelSensitivity.PUBLIC}),
                 ),
             ),
-            retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+            retry_policy=RetryPolicy(
+                max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+            ),
         )
     )
 
+    assert isinstance(provider, ModelRouter)
+    assert provider.retry_policy.max_total_attempts == 1
     assert provider.supports_request_policy(
         ModelRequest(
             messages=request().messages,
@@ -219,7 +223,7 @@ async def test_router_retries_transient_failure_then_returns():
 
     router = ModelRouter(
         (registration(provider),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0.1),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0.1),
         sleep=sleep,
     )
 
@@ -239,7 +243,7 @@ async def test_router_does_not_retry_permanent_failure_and_uses_fallback():
     )
     router = ModelRouter(
         (registration(first), registration(second)),
-        retry_policy=RetryPolicy(attempts=3, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=3, backoff_seconds=0),
     )
 
     assert (await router.generate(request())).text == "fallback"
@@ -275,7 +279,7 @@ async def test_router_aggregates_every_complete_attempt():
     )
     router = ModelRouter(
         (registration(provider),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
 
     response = await router.generate(request())
@@ -304,7 +308,9 @@ async def test_router_marks_known_success_partial_after_unpriced_failed_attempt(
     )
     router = ModelRouter(
         (registration(first), registration(second)),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
+        ),
     )
 
     response = await router.generate(request())
@@ -323,7 +329,7 @@ async def test_router_preserves_unavailable_estimate_when_all_attempts_fail():
     )
     router = ModelRouter(
         (registration(provider),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
 
     try:
@@ -353,14 +359,19 @@ async def test_router_preserves_final_bounded_provider_diagnostic():
     )
     router = ModelRouter(
         (registration(provider),),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
 
     with pytest.raises(ModelProviderError) as caught:
         await router.generate(request())
 
     assert caught.value.provider_id == "mock:diagnostic"
-    assert caught.value.diagnostic == diagnostic
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.attempt is not None
+    assert replace(caught.value.diagnostic, attempt=None) == diagnostic
+    assert caught.value.diagnostic.attempt["total_attempt_number"] == 1
 
 
 async def test_router_retries_stream_before_progress_and_aggregates_completion():
@@ -393,7 +404,7 @@ async def test_router_retries_stream_before_progress_and_aggregates_completion()
 
     router = ModelRouter(
         (registration(provider, streaming=True),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0.1),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0.1),
         sleep=sleep,
     )
 
@@ -434,7 +445,7 @@ async def test_router_never_retries_or_falls_back_after_stream_progress():
             registration(first, streaming=True),
             registration(second, streaming=True),
         ),
-        retry_policy=RetryPolicy(attempts=3, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=3, backoff_seconds=0),
     )
     events = []
 
@@ -449,3 +460,130 @@ async def test_router_never_retries_or_falls_back_after_stream_progress():
     assert events == [ModelTextDelta("visible")]
     assert len(first.requests) == 1
     assert second.requests == ()
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+@pytest.mark.parametrize(
+    "per_candidate,total,expected",
+    [(2, 3, [2, 1, 0]), (5, 1, [1, 0, 0]), (1, 3, [1, 1, 1])],
+)
+async def test_global_attempt_ceiling_spans_candidates_without_renewing_logical_deadline(
+    streaming, per_candidate, total, expected
+):
+    from daita.llm._lifecycle import closing_stream
+
+    providers = []
+    for index in range(3):
+        failures = tuple(
+            ModelProviderError(
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0))),
+            )
+            for _ in range(5)
+        )
+        kind = MockStreamingModelProvider if streaming else MockModelProvider
+        providers.append(kind(failures, provider_id=f"mock:limit-{index}"))
+    router = ModelRouter(
+        tuple(
+            ModelProviderRegistration(item, item.model_profile) for item in providers
+        ),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=per_candidate,
+            max_total_attempts=total,
+            backoff_seconds=0,
+        ),
+    )
+    with pytest.raises(ModelProviderError) as caught:
+        if streaming:
+            async with closing_stream(router.stream(request())) as events:
+                async for _ in events:
+                    pass
+        else:
+            await router.generate(request())
+    assert [len(item.requests) for item in providers] == expected
+    requests = [req for item in providers for req in item.requests]
+    assert len({req.deadline for req in requests}) == 1
+    assert all(
+        req.attempt_deadline is not None
+        and req.deadline is not None
+        and req.attempt_deadline <= req.deadline
+        for req in requests
+    )
+    assert (
+        caught.value.diagnostic is not None
+        and caught.value.diagnostic.attempt is not None
+    )
+    assert caught.value.diagnostic.attempt["total_attempt_number"] == total
+    await router.close()
+
+
+async def test_unresolved_lazy_secret_blocks_fallback_and_late_provider_construction(
+    monkeypatch,
+):
+    import asyncio
+
+    from daita.llm import ModelCallPolicy
+    from daita.security import SecretReference
+
+    release = asyncio.Event()
+    calls = []
+    made = []
+
+    class Secrets:
+        async def resolve(self, reference):
+            calls.append(reference)
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    pass
+            return "offline"
+
+    monkeypatch.setattr(
+        "daita.llm.factory.create_llm_provider", lambda *a, **kw: made.append(a)
+    )
+    profiles = [
+        ModelProfile(
+            id=f"openai:fixture-{i}", context_window_tokens=1000, max_output_tokens=100
+        )
+        for i in range(2)
+    ]
+    router = create_model_route_provider(
+        ModelRoute(
+            tuple(
+                ModelRouteCandidate(
+                    p.id, p, secret_reference=SecretReference.environment("OFFLINE_KEY")
+                )
+                for p in profiles
+            )
+        ),
+        secret_provider=Secrets(),
+    )
+    policy = ModelCallPolicy(
+        max_request_seconds=0.15,
+        max_attempt_seconds=0.05,
+        first_progress_timeout_seconds=0.03,
+        progress_idle_timeout_seconds=0.03,
+        cleanup_timeout_seconds=0.03,
+    )
+    try:
+        with pytest.raises(ModelProviderError) as caught:
+            await router.generate(replace(request(), call_policy=policy))
+        assert caught.value.cleanup_unresolved
+        assert caught.value.usage.cost_estimate.status is CostEstimateStatus.COMPLETE
+        assert len(calls) == 1 and made == []
+        assert isinstance(router, ModelRouter)
+        lazy = router.candidates[0].provider
+        from typing import Any, cast
+
+        lazy = cast(Any, lazy)
+        pending = tuple(lazy._native_owner.tasks)
+        release.set()
+        await asyncio.gather(*pending)
+        assert made == []
+        with pytest.raises(ModelProviderError):
+            await router.generate(replace(request(), call_policy=policy))
+        assert len(calls) == 1
+    finally:
+        release.set()
+        await router.close()

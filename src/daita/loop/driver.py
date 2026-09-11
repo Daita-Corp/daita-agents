@@ -30,9 +30,11 @@ from ..llm.errors import (
     with_cancelled_model_usage,
 )
 from ..llm.models import (
+    _DEFAULT_CALL_POLICY,
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelCallPolicy,
     ModelRequest,
     ModelResponse,
     ModelSensitivity,
@@ -258,6 +260,7 @@ class AgentLoop:
         tools: ToolRuntime,
         transcripts: TranscriptStore | None = None,
         limits: LoopLimits = LoopLimits(),
+        model_call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
         clock: Callable[[], datetime] = _utc_now,
         observer: AgentObserver | None = None,
         stream_model_calls: bool = False,
@@ -275,6 +278,9 @@ class AgentLoop:
         self._tools = tools
         self._transcripts = transcripts or InMemoryTranscriptStore()
         self._limits = limits
+        if not isinstance(model_call_policy, ModelCallPolicy):
+            raise TypeError("model_call_policy must be ModelCallPolicy")
+        self._model_call_policy = model_call_policy
         self._clock = clock
         self._observer = observer
         self._stream_model_calls = stream_model_calls
@@ -305,6 +311,12 @@ class AgentLoop:
                 tool_context=projection,
                 remaining_tokens=limits.max_total_tokens,
                 remaining_steps=limits.max_steps,
+            )
+            request = replace(
+                request,
+                call_policy=self._model_call_policy,
+                deadline=None,
+                attempt_deadline=None,
             )
             run_route = _begin_run_route(self._model, request)
             if not _provider_supports_run_request(self._model, run_route, request):
@@ -446,6 +458,8 @@ class AgentLoop:
                         max_total_tokens=limits.max_total_tokens,
                         max_estimated_cost_usd=limits.max_estimated_cost_usd,
                         deadline=deadline,
+                        attempt_deadline=None,
+                        call_policy=self._model_call_policy,
                     ).remaining_after(usage)
                 except ModelProviderError as error:
                     # Admission consumed nothing; retained usage is already cumulative.

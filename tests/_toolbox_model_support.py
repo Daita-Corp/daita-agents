@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
 
+from daita.capabilities import RESERVED_TOOL_NAMES
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -100,8 +101,7 @@ class ToolboxAwareMockModelProvider:
                 sorted(
                     name
                     for name in desired_names
-                    if name not in visible_names
-                    and name not in {"toolbox_search", "toolbox_load"}
+                    if name not in visible_names and name not in RESERVED_TOOL_NAMES
                 )
             )
             attempt = (self._logical_cursor, missing_names)
@@ -138,7 +138,7 @@ class ToolboxAwareMockModelProvider:
             self._logical_cursor += 1
             self._toolbox_load_attempt = None
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._scripted.close()
 
     def assert_consumed(self) -> None:

@@ -4,6 +4,8 @@ import asyncio
 import base64
 import json
 import time
+from collections.abc import Mapping
+from dataclasses import replace
 from typing import cast
 
 import openai
@@ -24,6 +26,7 @@ from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelCallPolicy,
     ModelRequest,
     ModelResponse,
     TextBlock,
@@ -224,7 +227,10 @@ async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     assert response.provider_response_id == "response-1"
     assert response.tool_calls[0].name == "catalog_schema"
     assert dict(response.tool_calls[0].arguments) == {"source_id": "source-1"}
-    assert dict(response.provider_metadata) == {
+    metadata = dict(response.provider_metadata)
+    attempt = metadata.pop("attempt_diagnostic")
+    assert isinstance(attempt, Mapping) and attempt["terminal_observed"] is True
+    assert metadata == {
         "auth_mode": "subscription",
         "transport": "chatgpt_responses",
     }
@@ -261,7 +267,7 @@ def test_codex_default_client_uses_bounded_transport_without_sdk_retries(monkeyp
     timeout = captured["timeout"]
     assert isinstance(timeout, openai.Timeout)
     assert timeout.connect == 5.0
-    assert timeout.read == 45.0
+    assert timeout.read == 120.0
     assert timeout.write == 30.0
     assert timeout.pool == 5.0
     assert captured["max_retries"] == 0
@@ -302,7 +308,10 @@ async def test_codex_refresh_closes_the_replaced_internal_client(monkeypatch):
     )
     assert provider.client is clients[0]
 
-    await provider._ensure_current_credential()
+    from daita.llm._lifecycle import AttemptLifecycle
+
+    async with AttemptLifecycle(provider._native_owner, _request()) as attempt:
+        await provider._ensure_current_credential(attempt)
 
     assert clients[0].close_calls == 1
     assert provider.client is clients[1]
@@ -311,7 +320,6 @@ async def test_codex_refresh_closes_the_replaced_internal_client(monkeypatch):
 
 
 async def test_codex_total_attempt_timeout_is_normalized(monkeypatch):
-    monkeypatch.setattr(codex_provider, "_CODEX_ATTEMPT_TIMEOUT_SECONDS", 0.01)
     provider = CodexSubscriptionProvider(
         "gpt-test",
         credential=_credential().to_secret(),
@@ -319,7 +327,20 @@ async def test_codex_total_attempt_timeout_is_normalized(monkeypatch):
     )
 
     with pytest.raises(ModelProviderError) as caught:
-        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+        await asyncio.wait_for(
+            provider.generate(
+                replace(
+                    _request(),
+                    call_policy=ModelCallPolicy(
+                        max_attempt_seconds=0.01,
+                        first_progress_timeout_seconds=0.01,
+                        progress_idle_timeout_seconds=0.01,
+                        cleanup_timeout_seconds=0.1,
+                    ),
+                )
+            ),
+            timeout=0.5,
+        )
 
     assert caught.value.code is ProviderErrorCode.TIMEOUT
     assert caught.value.provider_id == "codex:gpt-test"
@@ -412,10 +433,11 @@ async def test_claude_subscription_remains_an_official_client_transport(monkeypa
     assert response.provider_id == "claude-code:sonnet"
     assert response.finish_reason is FinishReason.TOOL_CALLS
     assert response.tool_calls[0].name == "catalog_schema"
-    assert dict(response.provider_metadata) == {
-        "auth_mode": "subscription",
-        "transport": "claude_code_cli",
-    }
+    assert response.provider_metadata["auth_mode"] == "subscription"
+    assert response.provider_metadata["transport"] == "claude_code_cli"
+    diagnostic = response.provider_metadata["attempt_diagnostic"]
+    assert isinstance(diagnostic, Mapping)
+    assert diagnostic["progress_mode"] == "unobservable"
     assert commands[0].arguments[0] == "claude"
     assert commands[0].environment["HOME"] == "/safe/home"
     assert commands[0].environment["HTTPS_PROXY"] == "https://proxy.invalid"
@@ -438,11 +460,23 @@ async def test_claude_subscription_total_attempt_timeout_is_normalized():
     provider = ClaudeCodeSubscriptionProvider(
         "claude-test",
         runner=hang,
-        timeout_seconds=0.01,
     )
 
     with pytest.raises(ModelProviderError) as caught:
-        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+        await asyncio.wait_for(
+            provider.generate(
+                replace(
+                    _request(),
+                    call_policy=ModelCallPolicy(
+                        max_attempt_seconds=0.01,
+                        first_progress_timeout_seconds=0.01,
+                        progress_idle_timeout_seconds=0.01,
+                        cleanup_timeout_seconds=0.1,
+                    ),
+                )
+            ),
+            timeout=0.5,
+        )
 
     assert caught.value.code is ProviderErrorCode.TIMEOUT
     assert caught.value.provider_id == "claude-code:claude-test"

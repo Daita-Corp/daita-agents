@@ -1,5 +1,4 @@
 from __future__ import annotations
-from _relational_write_support import update_constraints
 
 import os
 from collections.abc import Sequence
@@ -8,6 +7,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
+from _relational_write_support import update_constraints
 from _workspace_support import workspace_for
 
 from daita import Agent, LoopLimits, create_llm_provider
@@ -151,7 +151,7 @@ class _GuardedRecordingProvider:
             )
         return response
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 

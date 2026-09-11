@@ -996,8 +996,9 @@ async def test_context_requires_default_delivery_before_final_text_for_explicit_
         )
         assert "artifact_create_document" in system
         assert (
-            'artifact_save_local with mode="create_new" and '
-            'destination_id="default" before normal' in system
+            "artifact_save_local" in system
+            and 'mode="create_new" and destination_id="default"' in system
+            and "requested local delivery before normal text" in system
         )
         assert "Normal assistant text ends the run" in system
         assert "Ordinary user wording is not an exact stored value" in system

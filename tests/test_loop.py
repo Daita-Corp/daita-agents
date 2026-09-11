@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
@@ -37,8 +38,8 @@ from daita.llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
 from daita.llm.pricing import CostEstimate
+from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
 from daita.loop import (
     AgentLoop,
@@ -372,7 +373,17 @@ async def test_projected_tool_surface_limits_are_inclusive():
     )
 
     assert result.kind is LoopExitKind.COMPLETED
-    assert provider.requests[0].tools == definitions
+    assert (
+        tuple(
+            item
+            for item in provider.requests[0].tools
+            if item.name != "toolbox_inspect"
+        )
+        == definitions
+    )
+    assert (
+        sum(item.name == "toolbox_inspect" for item in provider.requests[0].tools) == 1
+    )
 
 
 def test_projected_tool_surface_limits_must_be_positive():
@@ -468,7 +479,7 @@ async def test_post_tool_model_retry_reuses_result_without_reexecuting_tool():
                 ),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
     tools = ScriptedTools({"one": ToolResultBlock(call_id="one", output={"value": 1})})
     loop = AgentLoop(
@@ -491,7 +502,9 @@ async def test_post_tool_model_retry_reuses_result_without_reexecuting_tool():
     assert result.final_text == "recovered answer"
     assert [call.id for call in tools.calls] == ["one"]
     assert len(provider.requests) == 3
-    assert provider.requests[1] == provider.requests[2]
+    assert replace(provider.requests[1], attempt_deadline=None) == replace(
+        provider.requests[2], attempt_deadline=None
+    )
 
 
 async def test_step_limit_stops_without_an_additional_model_call():
@@ -862,7 +875,9 @@ async def test_raised_tool_sensitivity_excludes_route_before_later_model_call():
                 ),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
     loop = AgentLoop(
         model=router,

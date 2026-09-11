@@ -1,10 +1,10 @@
 """Offline checks of the live evaluation's evidence and execution plumbing."""
 
-from dataclasses import replace
 import asyncio
-from decimal import Decimal
-from collections.abc import Mapping
 import json
+from collections.abc import Mapping
+from dataclasses import replace
+from decimal import Decimal
 from hashlib import sha256
 
 import pytest
@@ -28,24 +28,24 @@ from _phase_f_live_support import (
     repeats,
     summarize_reports,
 )
-from test_mcp_actions import ActionModel, response
 from live.benchmarks._support import RecordingProvider
+from test_mcp_actions import ActionModel, response
 
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
+from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
-    ModelUsage,
-    ToolCall,
+    CanonicalMessage,
+    FinishReason,
+    MessageRole,
+    ModelRequest,
+    ModelResponse,
     ModelStreamCompleted,
     ModelTextDelta,
-    ModelResponse,
-    ModelRequest,
-    FinishReason,
-    CanonicalMessage,
-    MessageRole,
+    ModelUsage,
     TextBlock,
+    ToolCall,
 )
-from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.pricing import CostEstimate
 from daita.routines.capabilities import _spec_schema
 from daita.routines.owner import _routine_proposal_payload
@@ -54,7 +54,7 @@ from daita.routines.owner import _routine_proposal_payload
 class HarnessModel(ActionModel):
     closed = False
 
-    async def close(self):
+    async def close(self, *, deadline: float | None = None) -> None:
         self.closed = True
 
 
@@ -63,6 +63,84 @@ class StreamingHarnessModel(HarnessModel):
 
     async def stream(self, request):
         yield ModelStreamCompleted(await self.generate(request))
+
+
+@pytest.mark.parametrize(
+    "names", [("destination", "content"), ("channel_ref", "body_text")]
+)
+async def test_contract_comparison_harness_freezes_schema_and_prevents_dispatch(
+    tmp_path, monkeypatch, names
+):
+    monkeypatch.setenv("DAITA_PHASE_F_LIVE_PROFILE", "user_flow")
+    model = HarnessModel()
+    path = tmp_path / "comparison.json"
+    async with evaluate(
+        tmp_path / "home",
+        model,
+        model.model_profile,
+        path,
+        routine=True,
+        run_immediately=False,
+        action_argument_names=names,
+    ) as scenario:
+        model.steps = [response(text="Prepare the assignment.")]
+        origin, _ = await scenario.run("Prepare the assignment.")
+        destination = (
+            await scenario.agent.distribution_destinations(
+                origin.conversation_id,
+                sensitivity_ceiling=scenario.binding.maximum_outbound_sensitivity,
+            )
+        )[0]
+        draft = owner_routine_draft(scenario, origin.run_id, destination.destination_id)
+        proposal = await scenario.agent.propose_routine(draft)
+        properties = _spec_schema(update=False)["properties"]
+        assert isinstance(properties, Mapping)
+        arguments = {
+            key: value
+            for key, value in _routine_proposal_payload(proposal).items()
+            if key in properties and value is not None
+        }
+        arguments.update(
+            skill_names=(),
+            distribution_destination_id=destination.destination_id,
+            requested_capability_grants=[
+                {
+                    "capability_id": grant.capability_id,
+                    "constraints": grant.constraints,
+                    "max_calls_per_occurrence": grant.max_calls_per_occurrence,
+                }
+                for grant in proposal.capability_grants
+            ],
+        )
+        model.steps = [
+            response(
+                ToolCall("load", "toolbox_load", {"tool_names": ["routine_create"]})
+            ),
+            response(ToolCall("create", "routine_create", arguments)),
+            response(
+                text="Assignment saved for next Monday; no notification was sent."
+            ),
+        ]
+        result, transcript = await scenario.run(scenario.routine_prompt())
+        assert_completed(result, transcript)
+        assert len(await scenario.agent.list_routines()) == 1
+        assert (
+            len(scenario.approvals) == 1 and scenario.approvals[0]["approved"] is True
+        )
+        assert scenario.server.calls == []
+        assert await scenario.agent.list_effects() == ()
+        schema_properties = scenario.action.input_schema["properties"]
+        assert isinstance(schema_properties, Mapping)
+        assert set(schema_properties) == set(names)
+        prompt = scenario.routine_prompt()
+        assert "do not run it today" in prompt
+        assert "channel_ref" not in prompt and "body_text" not in prompt
+        assert "binding_id" not in prompt and "fixed_arguments" not in prompt
+    report = json.loads(path.read_text())
+    assert report["status"] == "passed"
+    assert report["action_argument_names"] == list(names)
+    assert report["run_immediately"] is False
+    assert report["metrics"]["action_dispatches"] == 0
 
 
 async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_path):
@@ -121,7 +199,9 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
             replace(item, request_input_tokens=item.usage.input_tokens)
             for item in model.steps
         ]
-        result, transcript = await scenario.run(scenario.routine_prompt())
+        result, transcript = await scenario.run(
+            "Prepare a weekly test notification with the latest status and tell me when it can run."
+        )
         assert result.usage.total_tokens == 22417
         requests = scenario.provider.requests
         assert [r.max_total_tokens for r in requests] == [30000, 26276, 21696, 14765]
@@ -133,9 +213,19 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert "Available user-authorized procedural skill index" not in texts[0]
         assert len(texts[0].encode()) < 6000
         assert '"kind":"toolbox"' not in texts[0]
-        assert "Scheduling does not require loading" not in texts[0]
-        assert "Scheduling does not require loading" in texts[1]
-        assert "Scheduling does not require loading" not in texts[3]
+        assert "For scheduled work" not in texts[0]
+        assert "For scheduled work" in texts[1]
+        assert "For scheduled work" not in texts[3]
+        assert "exact argument schema" in texts[1]
+        assert "Foreground actions request approval when invoked" in texts[3]
+        assert "Framework inbox destinations" in texts[3]
+        assert "Framework inbox destinations" not in texts[0]
+        assert model.provider_id not in texts[0]
+        assert model.provider_id in texts[1]
+        assert '"maximum_per_run_tokens":30000' in texts[1]
+        assert '"maximum_per_run_cost_usd":"0.15"' in texts[1]
+        assert "Routine authoring choices" not in texts[3]
+        assert model.provider_id not in transcript.run.message
         for request in requests:
             assert (
                 request.messages[1:] == transcript.messages[: len(request.messages) - 1]
@@ -214,6 +304,17 @@ def action_script(scenario, *, uncertain=False, retry=False):
             )
         )
     )
+    if scenario.evaluation_profile == "user_flow":
+        steps[-1] = response(
+            text=(
+                f"Research found 7 of 9 checks passed ({RESEARCH_TOKEN}), source {SOURCE}. "
+                + (
+                    "The notification is unconfirmed; I did not retry it."
+                    if uncertain
+                    else "The service reports the notification was invoked; downstream delivery is unverified."
+                )
+            )
+        )
     return [
         replace(
             item,
@@ -227,11 +328,13 @@ def action_script(scenario, *, uncertain=False, retry=False):
     ]
 
 
+@pytest.mark.parametrize("profile_name", ["strict", "user_flow"])
 @pytest.mark.parametrize("streaming", [False, True])
 @pytest.mark.parametrize("fault", ["success", "tool_error", "disconnect"])
 async def test_phase_f_harness_measures_real_runtime_and_preserves_failure_evidence(
-    tmp_path, fault, streaming
+    tmp_path, fault, streaming, profile_name, monkeypatch
 ):
+    monkeypatch.setenv("DAITA_PHASE_F_LIVE_PROFILE", profile_name)
     model = StreamingHarnessModel() if streaming else HarnessModel()
     path = tmp_path / "phase-f-report.json"
     with pytest.raises(AssertionError, match="intentional evaluation failure"):
@@ -251,7 +354,7 @@ async def test_phase_f_harness_measures_real_runtime_and_preserves_failure_evide
             )
             assert_completed(result, transcript)
             await assert_action(scenario, uncertain=fault != "success")
-            assert_report(
+            scenario.check_answer(
                 result,
                 status="server_reported" if fault == "success" else "uncertain",
                 research=True,
@@ -277,8 +380,11 @@ async def test_phase_f_harness_measures_real_runtime_and_preserves_failure_evide
         (item["first_event_seconds"] is not None) == streaming
         for item in report["model_timings"]
     )
-    assert report["model_requests"][0]["remaining_tokens"] == 30_000
-    assert report["model_requests"][1]["remaining_tokens"] == 29_880
+    ceiling = 100_000 if profile_name == "user_flow" else 30_000
+    assert report["model_requests"][0]["remaining_tokens"] == ceiling
+    assert report["model_requests"][1]["remaining_tokens"] == ceiling - 120
+    assert report["evaluation_profile"] == profile_name
+    assert bool(report["answer_reviews"]) is (profile_name == "user_flow")
     assert report["runs"][0]["messages"]
     assert len(report["receipts"]) == 1
     assert report["approvals"][0]["approved"] is True
@@ -293,11 +399,15 @@ async def test_phase_f_harness_measures_real_runtime_and_preserves_failure_evide
     assert summary[0]["action_dispatches"] == 2
 
 
+@pytest.mark.parametrize("profile_name", ["strict", "user_flow"])
 @pytest.mark.parametrize("fail_confirmation", [False, True])
 async def test_phase_f_routine_harness_reaches_both_occurrences_with_one_approval(
     tmp_path,
     fail_confirmation,
+    profile_name,
+    monkeypatch,
 ):
+    monkeypatch.setenv("DAITA_PHASE_F_LIVE_PROFILE", profile_name)
     model = HarnessModel()
     original_generate = model.generate
 
@@ -332,6 +442,9 @@ async def test_phase_f_routine_harness_reaches_both_occurrences_with_one_approva
                 sensitivity_ceiling=scenario.binding.maximum_outbound_sensitivity,
             )
         )[0]
+        assert scenario.limits.max_total_tokens == (
+            100_000 if profile_name == "user_flow" else 30_000
+        )
         draft = owner_routine_draft(scenario, origin.run_id, destination.destination_id)
         proposal = await scenario.agent.propose_routine(draft)
         properties = _spec_schema(update=False)["properties"]
@@ -364,8 +477,8 @@ async def test_phase_f_routine_harness_reaches_both_occurrences_with_one_approva
             *action_script(scenario),
         ]
         result, transcript = await scenario.run(scenario.routine_prompt())
-        from daita.tui.projection import project_conversation
         from daita.loop.models import ConversationRun, LoopExitKind
+        from daita.tui.projection import project_conversation
 
         receipt = next(
             outcome
@@ -403,13 +516,13 @@ async def test_phase_f_routine_harness_reaches_both_occurrences_with_one_approva
         assert len(await scenario.agent.list_routines()) == 1, result
         immediate, transcript = await scenario.scheduled_result(1)
         assert_completed(immediate, transcript)
-        assert_report(immediate, status="server_reported", research=True)
+        scenario.check_answer(immediate, status="server_reported", research=True)
         model.steps = action_script(scenario)
         scenario.clock = NEXT_SLOT
         scenario.agent._embedded._routine_supervisor.wake()
         weekly, transcript = await scenario.scheduled_result(2)
         assert_completed(weekly, transcript)
-        assert_report(weekly, status="server_reported", research=True)
+        scenario.check_answer(weekly, status="server_reported", research=True)
         await assert_action(scenario, count=2)
         assert len(scenario.approvals) == 1
     report = json.loads(path.read_text())
@@ -664,3 +777,148 @@ async def test_independent_scheduled_live_fixture_needs_no_model_creation(tmp_pa
     assert len(report["routine_states"]) == 1
     assert len(report["runs"]) == 2
     assert report["metrics"]["tool_calls_by_name"].get("routine_create", 0) == 0
+
+
+@pytest.mark.parametrize("selected", [None, "strict", "user_flow", "unknown"])
+def test_phase_f_explicit_profile_preserves_strict_defaults(monkeypatch, selected):
+    monkeypatch.delenv(COST_ENV, raising=False)
+    if selected is None:
+        monkeypatch.delenv("DAITA_PHASE_F_LIVE_PROFILE", raising=False)
+    else:
+        monkeypatch.setenv("DAITA_PHASE_F_LIVE_PROFILE", selected)
+    if selected == "unknown":
+        with pytest.raises(ValueError, match="DAITA_PHASE_F_LIVE_PROFILE"):
+            limits()
+        return
+    value = limits()
+    assert (
+        value.max_steps,
+        value.max_total_tokens,
+        value.max_wall_time_seconds,
+        value.max_estimated_cost_usd,
+    ) == (
+        (24, 100_000, 300, Decimal("0.50"))
+        if selected == "user_flow"
+        else (14, 30_000, 180, Decimal("0.15"))
+    )
+
+
+async def test_phase_f_user_flow_prompts_and_review_remain_separate(
+    tmp_path, monkeypatch
+):
+    from _phase_f_live_support import REPORT_INSTRUCTION, report_path
+
+    monkeypatch.setenv("DAITA_PHASE_F_LIVE_PROFILE", "user_flow")
+    model = HarnessModel()
+    path = tmp_path / "natural.json"
+    async with evaluate(
+        tmp_path / "home", model, model.model_profile, path, routine=True
+    ) as scenario:
+        prompts = [
+            scenario.action_prompt(0),
+            scenario.action_prompt(1),
+            scenario.research_prompt(),
+            scenario.routine_prompt(),
+        ]
+        for prompt in prompts:
+            for internal in (
+                REPORT_INSTRUCTION,
+                scenario.binding.binding_id,
+                scenario.action.capability_id,
+                scenario.action.local_name,
+                model.provider_id,
+                "toolbox",
+                "JSON",
+                "fixed_arguments",
+            ):
+                assert internal not in prompt
+            assert DESTINATION in prompt
+        assert "100000" in prompts[-1] and "200000" in prompts[-1]
+        assert "Monday" in prompts[-1] and "09:00 America/Chicago" in prompts[-1]
+        assert "user_flow" in report_path("case").parts
+        model.steps = [response(text="The assignment could not be saved.")]
+        result, transcript = await scenario.run(prompts[-1])
+        assert_completed(result, transcript)
+        scenario.check_answer(result, status="not_dispatched", research=False)
+        # Changing the environment cannot change the already selected configuration.
+        monkeypatch.setenv("DAITA_PHASE_F_LIVE_PROFILE", "strict")
+        assert scenario.routine_prompt() == prompts[-1]
+        with pytest.raises((ValueError, AssertionError)):
+            assert_report(result, status="not_dispatched", research=False)
+    report = json.loads(path.read_text())
+    assert report["evaluation_profile"] == "user_flow"
+    assert report["answer_reviews"] == [
+        {
+            "run_id": result.run_id,
+            "expected_status": "not_dispatched",
+            "research": False,
+            "review": "pending_evidence_review",
+        }
+    ]
+    assert report["setup_mode"] == "model_authored"
+    assert not report["receipts"] and model.closed
+
+
+@pytest.mark.parametrize("stop", ["admission", "returned_usage"])
+async def test_committed_mcp_effect_survives_budget_stop_without_replay(tmp_path, stop):
+    from daita.loop.models import ConversationRun, LoopExitKind
+    from daita.tui.projection import project_conversation
+
+    model = HarnessModel()
+    path = tmp_path / "stopped-effect.json"
+    async with evaluate(
+        tmp_path / "home", model, model.model_profile, path
+    ) as scenario:
+        model.steps = action_script(scenario)
+        if stop == "admission":
+            original_generate = model.generate
+
+            async def fail_final(request):
+                if len(model.steps) == 1:
+                    model.steps.pop()
+                    raise ModelProviderError(
+                        ProviderErrorCode.TOKEN_BUDGET_INSUFFICIENT,
+                        usage=ModelUsage(
+                            cost_estimate=CostEstimate.complete(Decimal(0))
+                        ),
+                    )
+                return await original_generate(request)
+
+            model.generate = fail_final  # type: ignore[method-assign]
+        else:
+            model.steps[-1] = replace(
+                model.steps[-1],
+                usage=ModelUsage(
+                    input_tokens=scenario.limits.max_total_tokens,
+                    output_tokens=10,
+                    cost_estimate=CostEstimate.complete(Decimal("0.001")),
+                ),
+            )
+        result, transcript = await scenario.run(
+            "Research release readiness and notify release-room once."
+        )
+        assert result.kind is LoopExitKind.FAILED
+        assert (result.final_text is None) is (stop == "admission")
+        assert len(scenario.provider.requests) == 4 and not model.steps
+        assert result.usage.total_tokens == (
+            360 if stop == "admission" else scenario.limits.max_total_tokens + 370
+        )
+        await assert_action(scenario)
+        assert len(scenario.approvals) == 1
+        receipt = (await scenario.agent.list_effects())[0]
+        view = project_conversation((ConversationRun(0, transcript, result),))
+        text = " ".join(item.text for item in view)
+        assert receipt.receipt_id in text and "succeeded" in text
+        assert "downstream outcome unverified" in text
+        assert (
+            len([call for call in scenario.server.calls if call[0] == "notify_release"])
+            == 1
+        )
+    report = json.loads(path.read_text())
+    from daita.storage.sqlite_codecs.transcripts import decode_loop_exit
+
+    assert (
+        decode_loop_exit(json.dumps(report["runs"][0]["result"])).kind
+        is LoopExitKind.FAILED
+    )
+    assert len(report["receipts"]) == 1

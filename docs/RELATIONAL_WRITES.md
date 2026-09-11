@@ -167,6 +167,14 @@ bounded before/after samples. The samples help review the change; the matched
 count and complete target fingerprint cover every selected row, including rows
 not shown in the samples.
 
+Resolve the intended entity using current identifying columns and values. For
+example, a domain such as `existing.test` need not be stored in the column being
+edited. A positive row count does not prove the selected company is the intended
+one. Daita can use bounded reads to resolve ambiguity; an already explicit,
+grounded target needs no redundant read. Legitimate bulk filters remain supported.
+A zero-match update preview cannot be executed. Correct an unsupported selection
+from current evidence or clarify the target before requesting another preview.
+
 Before approving, verify:
 
 - the source and table;
@@ -178,6 +186,19 @@ Before approving, verify:
 Select **Approve once** only when all of those details are correct. Denying the
 card performs no update. Approval is bound to that exact plan, preview, and row
 count and cannot be reused for different arguments or a later run.
+
+CLI and TUI reviews show the catalog connection/table labels, aliases, exact
+selection or upsert keys, changed values, counts and bounded preview samples.
+Complete validated details remain visible. Labels help distinguish connections;
+the exact IDs and structural revision identify the target. Samples are not a
+complete inventory or independent proof of business meaning.
+
+Custom Python approval handlers receive one native review document in
+`ApprovalRequest.arguments`: `arguments` contains the exact execution arguments,
+`target` contains the catalog identity and labels, and `preview` contains bounded
+facts from the already-required preflight. Use `render_arguments_for_review()`
+and the exact request for review. Rendering makes no database query and creates
+no additional authority. The runtime rechecks the exact plan after approval.
 
 ## What happens after approval
 
@@ -194,6 +215,12 @@ An immutable local receipt records the exact run and call identity, target
 fingerprints, expected row count, terminal outcome, and affected count when
 known. Daita never automatically retries an update with uncertain commit
 status.
+
+The run's remaining allowance can prevent further model work. A preview is not
+a commit, and a committed effect can survive failure to produce a final answer.
+Inspect the receipt for execution evidence. Daita makes no post-limit model
+request and never repeats a denied, failed, uncertain or committed action to
+repair its report. Human receipt recovery performs no action.
 
 ## Outcomes and failures
 
@@ -294,6 +321,12 @@ retry, or replay. Unknown commits block future effects until explicit human
 recovery. A rollback describes table-row non-application; PostgreSQL identity
 sequence allocations can leave gaps and are not restored by rollback.
 
+Zero existing matches may legitimately insert the supplied upsert batch. Empty
+research findings are different from a nonempty unchanged batch: an empty result
+cannot satisfy a routine that requires a write invocation. Grants may permit new
+keys discovered in later research runs while retaining exact table, column,
+operation, row and call ceilings.
+
 ## Explicit relational write permissions
 
 `RelationalWriteScope` and the SQLite `relational_write_scopes` family bind one
@@ -362,3 +395,10 @@ exercise real transactions and independent readback using the existing disposabl
 fixture and a scripted model. They cover conflict handling, rollback, locks,
 revocation, cancellation, lost commit confirmation, receipts, and human recovery.
 Their offline harness checks do not replace a passing authorized database run.
+
+During native grant admission, the data owner requires the matching preview
+capability in `allowed_capability_ids` before checking write readiness. A missing
+or opposite-operation preview produces `automation_grant_preview_required`.
+The automation constraint description exposes this prerequisite without loading
+execution tools. Schema access remains a separately requested read capability;
+neither grant admission nor preview permission grants structural discovery.

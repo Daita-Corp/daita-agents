@@ -16,10 +16,13 @@ from typing import Protocol, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from .catalog.models import CatalogResource
+from .llm.errors import ModelProviderError, ProviderErrorCode, interrupted_model_usage
 from .llm.models import (
+    _DEFAULT_CALL_POLICY,
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelCallPolicy,
     ModelProfile,
     ModelRequest,
     ModelResponse,
@@ -823,6 +826,7 @@ class OneShotCandidateReviewer:
         profile: ModelProfile | None,
         max_estimated_cost_usd: Decimal | None,
         clock: Callable[[], datetime],
+        call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
     ) -> None:
         _identifier(agent_id, "candidate reviewer agent_id")
         if not callable(clock):
@@ -844,6 +848,7 @@ class OneShotCandidateReviewer:
                 "candidate reviewer cost ceiling must be finite and non-negative"
             )
         self._agent_id = agent_id
+        self._call_policy = call_policy
         self._store = store
         self._memory = memory
         self._skills = skills
@@ -973,14 +978,14 @@ class OneShotCandidateReviewer:
                     usage=progress.usage,
                 )
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Prevent new reviews and wait for an in-flight one to settle."""
 
         self._closed = True
         async with self._review_lock:
             owned_model = self._owned_model
             if owned_model is not None:
-                await owned_model.close()
+                await owned_model.close(deadline=deadline)
                 self._owned_model = None
 
     async def clear_conversations(self) -> int:
@@ -1045,14 +1050,33 @@ class OneShotCandidateReviewer:
                 skipped_run_count=progress.skipped_run_count,
                 duration_ms=_duration_ms(started),
             )
+        request = replace(
+            request,
+            call_policy=self._call_policy,
+            deadline=started + LEARNING_REVIEW_MAX_WALL_TIME_SECONDS,
+            max_total_tokens=LEARNING_REVIEW_MAX_TOTAL_TOKENS,
+            max_estimated_cost_usd=max_estimated_cost_usd,
+        )
         progress.model_calls = 1
         try:
             response = await model.generate(request)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            progress.usage = interrupted_model_usage(error)
             raise
-        except Exception:
+        except Exception as error:
+            progress.usage = (
+                error.usage
+                if isinstance(error, ModelProviderError)
+                else interrupted_model_usage(error)
+            )
             return LearningReviewResult(
-                status=LearningReviewStatus.PROVIDER_FAILED,
+                status=(
+                    LearningReviewStatus.TIMEOUT
+                    if isinstance(error, ModelProviderError)
+                    and error.code is ProviderErrorCode.TIMEOUT
+                    else LearningReviewStatus.PROVIDER_FAILED
+                ),
+                usage=progress.usage,
                 reviewed_run_ids=progress.reviewed_run_ids,
                 model_calls=progress.model_calls,
                 skipped_run_count=progress.skipped_run_count,
