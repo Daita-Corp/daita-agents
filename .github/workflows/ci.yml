@@ -18,7 +18,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest tests/ -m "not requires_llm and not requires_db"
+      - run: python -m pytest tests/ -m "not requires_llm and not requires_db and not requires_network and not slow"
 
   pipx-release:
     runs-on: ubuntu-latest
@@ -40,8 +40,8 @@ jobs:
           wheels=(dist/*.whl)
           test "${#wheels[@]}" -eq 1
           candidate="$(pwd)/${wheels[0]}"
-          python tests/managed_installer_lifecycle_smoke.py --candidate-wheel "$candidate"
-          python tests/pipx_lifecycle_smoke.py --candidate-wheel "$candidate"
+          python -m tests.packaging.managed_installer_lifecycle_smoke --candidate-wheel "$candidate"
+          python -m tests.packaging.pipx_lifecycle_smoke --candidate-wheel "$candidate"
 
   static:
     runs-on: ubuntu-latest

@@ -4,6 +4,9 @@
 dependency policy, and change discipline. Read it before changing production
 code.
 
+The canonical test layout, marker meanings, and live-selection commands are in
+[`docs/TESTING.md`](docs/TESTING.md).
+
 ## Setup
 
 Daita supports Python 3.11 and 3.12. Create a dedicated environment from the
@@ -49,12 +52,14 @@ methods. Use pre-commit to sort imports with Ruff and format Python with Black.
 
 ```bash
 .venv/bin/python -m pre_commit run --all-files
-.venv/bin/python -m pytest tests/ -m "not requires_llm and not requires_db"
+.venv/bin/python -m pytest
+.venv/bin/python -m pytest tests/ -m "not requires_llm and not requires_db and not requires_network and not slow"
 .venv/bin/python -m mypy src/daita tests
 ```
 
-Live model and external database tests require explicit authorization and
-credentials. Do not use paid tests to diagnose a deterministic failure.
+Live model, external database, and remote-network tests require explicit
+authorization and credentials. Extended offline soaks are also opt-in. Do not
+use paid tests to diagnose a deterministic failure.
 
 ## Add a model provider
 

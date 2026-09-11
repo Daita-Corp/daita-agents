@@ -62,9 +62,9 @@ use the TUI or an exact human approval handler for real actions. No live service
 credentials, model call, or external database is used.
 
 Native company research/upsert is exercised offline by
-`tests/test_native_write_public.py`, with the real data/runtime/scheduler owners
+`tests/data/writes/test_public_writes.py`, with the real data/runtime/scheduler owners
 and deterministic PostgreSQL I/O. The guided permission acceptance is in
-`tests/test_product_integration.py`. See [relational write authoring](../docs/RELATIONAL_WRITES.md)
+`tests/acceptance/test_product_workflows.py`. See [relational write authoring](../docs/RELATIONAL_WRITES.md)
 for the runnable public API pattern against a separately admitted target.
 
 A reusable research procedure can follow [the procedure example](research_and_store/SKILL.md).

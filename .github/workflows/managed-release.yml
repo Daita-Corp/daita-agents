@@ -82,8 +82,8 @@ jobs:
         shell: bash
         run: |
           candidate="$(pwd)/release-artifacts/${{ steps.release.outputs.wheel }}"
-          python tests/managed_installer_lifecycle_smoke.py --candidate-wheel "$candidate"
-          python tests/pipx_lifecycle_smoke.py --candidate-wheel "$candidate"
+          python -m tests.packaging.managed_installer_lifecycle_smoke --candidate-wheel "$candidate"
+          python -m tests.packaging.pipx_lifecycle_smoke --candidate-wheel "$candidate"
       - name: Record release checksums
         working-directory: release-artifacts
         shell: bash
@@ -155,7 +155,7 @@ jobs:
       - name: Exercise real managed lifecycle on ${{ matrix.target }}
         shell: bash
         run: |
-          python tests/managed_installer_lifecycle_smoke.py \
+          python -m tests.packaging.managed_installer_lifecycle_smoke \
             --candidate-wheel "$(pwd)/release-artifacts/${{ needs.build.outputs.wheel }}" \
             --real-uv-archive "$RUNNER_TEMP/${{ steps.runtime.outputs.uv_archive }}" \
             --real-uv-version "${{ steps.runtime.outputs.uv_version }}" \

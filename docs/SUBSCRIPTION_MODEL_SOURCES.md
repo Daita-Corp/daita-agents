@@ -177,5 +177,4 @@ uncertain shutdown. Caller-injected SDK clients remain caller-owned.
 The serialized policy replaces provider-specific constructor timeout settings.
 Changing it changes the model execution contract, so previously authorized
 routines and follow-ups must pass exact contract revalidation. See the
-[implementation plan](MODEL_CALL_RELIABILITY_IMPLEMENTATION_PLAN_2026-09-10.md)
-for field limits, retry ceilings and qualification requirements.
+[testing guide](TESTING.md) for selection and qualification requirements.

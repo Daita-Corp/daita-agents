@@ -69,7 +69,8 @@ Run its opt-in acceptance test only after starting the fixture:
 ```bash
 DAITA_RUN_POSTGRES_FIXTURE=1 \
 DAITA_FIXTURE_POSTGRES_PASSWORD=daita_fixture_password \
-.venv/bin/python -m pytest tests/test_postgresql_fixture.py -v
+.venv/bin/python -m pytest tests/live/data/test_fixture_read.py \
+  -o addopts="--tb=short -q --strict-markers" -v
 ```
 
 Stop and discard it with:

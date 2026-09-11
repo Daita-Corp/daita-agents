@@ -1,0 +1,2218 @@
+import ast
+import inspect
+from collections.abc import Mapping
+from pathlib import Path
+
+import daita
+from daita.capabilities import AccessMode, OperationalEffect
+from tests.support.workspace import workspace_for
+
+PACKAGE = Path(daita.__file__).parent
+ROOT = PACKAGE.parents[1]
+
+
+def test_public_agent_facade_cannot_replace_composed_context_or_tool_runtime():
+    for method in (daita.Agent.create, daita.Agent.open):
+        parameters = inspect.signature(method).parameters
+        assert "context_builder" not in parameters
+        assert "tools" not in parameters
+
+
+def _python_text(root: Path) -> str:
+    return "\n".join(
+        path.read_text(encoding="utf-8") for path in sorted(root.rglob("*.py"))
+    )
+
+
+def _class_methods(path: Path, class_name: str) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {
+                item.name
+                for item in node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+    raise AssertionError(f"missing class {class_name} in {path}")
+
+
+def _class_owners(class_name: str) -> set[str]:
+    owners = set()
+    for path in PACKAGE.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if any(
+            isinstance(node, ast.ClassDef) and node.name == class_name
+            for node in ast.walk(tree)
+        ):
+            owners.add(path.relative_to(PACKAGE).as_posix())
+    return owners
+
+
+def _imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.add(node.module)
+    return imported
+
+
+def test_common_runtime_has_one_owner_and_no_domain_dependencies():
+    runtime_path = PACKAGE / "capability_runtime.py"
+    runtime_tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
+
+    assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
+    assert not {
+        "adapters",
+        "catalog",
+        "domains.data",
+        "memory",
+        "semantics",
+        "skills",
+    } & _imports(runtime_path)
+    assert not {
+        node.id
+        for node in ast.walk(runtime_tree)
+        if isinstance(node, ast.Name) and node.id.endswith("_CAPABILITY_ID")
+    }
+
+
+def test_toolbox_catalog_and_activation_owners_are_explicit():
+    runtime_path = PACKAGE / "capability_runtime.py"
+    loop_path = PACKAGE / "loop" / "driver.py"
+
+    assert _class_owners("ToolboxId") == {"capabilities.py"}
+    assert _class_owners("ToolLoadMode") == {"capabilities.py"}
+    assert _class_owners("ToolTextTrust") == {"capabilities.py"}
+    assert _class_owners("ToolboxDefinition") == {"capabilities.py"}
+    assert _class_owners("ToolPresentation") == {"capabilities.py"}
+    assert _class_owners("RunToolCatalog") == {"capability_runtime.py"}
+    assert _class_owners("StepToolProjection") == {"capability_runtime.py"}
+    assert "definitions" not in _class_methods(loop_path, "ToolRuntime")
+    assert "definitions" not in _class_methods(runtime_path, "CapabilityRuntime")
+    assert "RunToolCatalog" not in _python_text(PACKAGE / "storage")
+    assert "StepToolProjection" not in _python_text(PACKAGE / "storage")
+
+    mcp_path = PACKAGE / "domains" / "mcp.py"
+    mcp_tree = ast.parse(mcp_path.read_text(encoding="utf-8"))
+    activation = next(
+        node
+        for node in mcp_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "activate_mcp_domain"
+    )
+    call_names = {
+        node.func.attr
+        for node in ast.walk(activation)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "inspect" not in call_names
+    assert "create" not in call_names
+
+
+def test_loop_context_and_composition_owners_are_exact():
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
+    assert _class_owners("AgentContextBuilder") == {"context.py"}
+    assert _class_owners("ToolRuntime") == {"loop/driver.py"}
+    assert "tools: ToolRuntime" in loop
+    assert "_capability_runtime" in embedded
+    assert "CapabilityRuntime(" in embedded
+    assert "capability_runtime" not in loop
+
+
+def test_local_workspace_backend_is_explicit_and_conditionally_composed():
+
+    embedded_path = PACKAGE / "hosting" / "embedded.py"
+    tree = ast.parse(embedded_path.read_text(encoding="utf-8"))
+    embedded_class = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "EmbeddedAgent"
+    )
+    compose = next(
+        node
+        for node in embedded_class.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_compose"
+    )
+    compose_text = ast.get_source_segment(
+        embedded_path.read_text(encoding="utf-8"), compose
+    )
+    assert compose_text is not None
+    assert "LocalDirectoryReadBackend" not in compose_text
+    assert "local_file_declarations(workspace_backend)" in compose_text
+    assert "if workspace_backend is None" in compose_text
+    assert "local_files.capabilities if local_files is not None else ()" in compose_text
+    assert "local_files.tool_views if local_files is not None else ()" in compose_text
+    assert "local_files.executors if local_files is not None else ()" in compose_text
+
+
+def test_bound_text_edit_has_one_artifact_producer_and_publication_owner():
+    from daita.domains.data.export_capabilities import (
+        ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
+        ARTIFACT_SAVE_LOCAL_CAPABILITY_ID,
+        artifact_capability_declarations,
+    )
+
+    declarations = artifact_capability_declarations()
+    capabilities = {item.id: item for item in declarations.capabilities}
+    edit_schema = capabilities[ARTIFACT_EDIT_TEXT_CAPABILITY_ID].input_schema
+    save_schema = capabilities[ARTIFACT_SAVE_LOCAL_CAPABILITY_ID].input_schema
+    edit_properties = edit_schema.get("properties")
+    edit_required = edit_schema.get("required")
+    save_properties = save_schema.get("properties")
+    save_required = save_schema.get("required")
+    assert isinstance(edit_properties, Mapping)
+    assert isinstance(edit_required, (tuple, list))
+    assert isinstance(save_properties, Mapping)
+    assert isinstance(save_required, (tuple, list))
+    assert set(edit_properties) == {"binding", "replacements"}
+    assert set(edit_required) == {"binding", "replacements"}
+    assert set(save_properties) == {
+        "artifact_id",
+        "mode",
+        "destination_id",
+        "filename",
+    }
+    assert set(save_required) == {"artifact_id", "mode"}
+    assert not {
+        "path",
+        "relative_path",
+        "revision",
+        "physical_revision",
+        "content",
+        "bytes",
+    } & set(edit_properties)
+    assert not {
+        "path",
+        "relative_path",
+        "revision",
+        "physical_revision",
+        "content",
+        "bytes",
+    } & set(save_properties)
+
+    workspace = (PACKAGE / "adapters" / "local_workspace.py").read_text(
+        encoding="utf-8"
+    )
+    artifact_domain = (
+        PACKAGE / "domains" / "data" / "export_capabilities.py"
+    ).read_text(encoding="utf-8")
+    delivery = (PACKAGE / "artifacts" / "delivery.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    production = _python_text(PACKAGE)
+    assert _class_owners("ArtifactEditTextExecutor") == {
+        "domains/data/export_capabilities.py"
+    }
+    assert _class_owners("LocalArtifactDelivery") == {"artifacts/delivery.py"}
+    assert "os.replace(" not in workspace
+    assert "os.replace(" not in artifact_domain
+    assert "os.replace(" in delivery
+    assert "subprocess" not in _imports(PACKAGE / "artifacts" / "delivery.py")
+    assert "subprocess" not in _imports(
+        PACKAGE / "domains" / "data" / "export_capabilities.py"
+    )
+    assert "file_write" not in production
+    assert "exact_target_resolver=workspace_backend" in embedded
+    assert "LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS" in embedded
+    assert "LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS" in embedded
+
+
+def test_mcp_is_server_neutral_lazy_and_uses_existing_runtime_owners():
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    adapter_path = PACKAGE / "adapters" / "mcp.py"
+    adapter = adapter_path.read_text(encoding="utf-8")
+    domain = (PACKAGE / "domains" / "mcp.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    production = _python_text(PACKAGE)
+
+    assert "MCP" not in runtime
+    assert "mcp" not in _imports(PACKAGE / "capability_runtime.py")
+    adapter_tree = ast.parse(adapter)
+    top_level_imports = {
+        alias.name.split(".")[0]
+        for node in adapter_tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "httpx" not in top_level_imports
+    assert _class_owners("StreamableHTTPMCPClient") == {"adapters/mcp.py"}
+    assert _class_owners("MCPCapabilityDomain") == {"domains/mcp.py"}
+    assert "CapabilityRuntime(" not in adapter
+    assert "CapabilityRuntime(" not in domain
+    assert _class_owners("MCPToolExecutor") == {"domains/mcp.py"}
+    for receipt_operation in ("start_effect_receipt", "finish_effect_receipt"):
+        assert receipt_operation not in domain
+        assert receipt_operation not in adapter
+    for action_extension in (
+        "tasks/get",
+        "tasks/result",
+        "idempotency_endpoint",
+        "preview_endpoint",
+    ):
+        assert action_extension not in adapter
+    assert "MCP_GRANT_POLICY" in domain
+    assert "MCP_RECEIPT_POLICY" in domain
+    assert "activate_mcp_domain" in embedded
+    assert "mcp_domain" in embedded
+    assert "mcp_server_bindings" in (
+        PACKAGE / "storage" / "sqlite_schema.py"
+    ).read_text(encoding="utf-8")
+
+    for fixture_only in (
+        "alpha.fixture.test",
+        "beta.fixture.test",
+        "fixture-alpha",
+        "fixture-beta",
+    ):
+        assert fixture_only not in production
+    for prohibited in (
+        "SupportedMCPServer",
+        "MCPRuntime",
+        "MCPRegistry",
+        "MCPContextBuilder",
+        "singleton_mcp",
+        "built_in_endpoint",
+    ):
+        assert prohibited not in production
+
+    public_operations = {
+        "inspect_mcp_server",
+        "attach_mcp_server",
+        "list_mcp_servers",
+        "refresh_mcp_server",
+        "revoke_mcp_server",
+    }
+    assert public_operations <= _class_methods(PACKAGE / "agent.py", "Agent")
+    assert public_operations <= _class_methods(
+        PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+    )
+
+
+def test_file_query_stays_lazy_private_and_inside_existing_owners():
+    adapter_path = PACKAGE / "adapters" / "local_file_query.py"
+    workspace_path = PACKAGE / "adapters" / "local_workspace.py"
+    capability_path = PACKAGE / "domains" / "data" / "file_capabilities.py"
+    controller_path = PACKAGE / "domains" / "data" / "controller.py"
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    adapter = adapter_path.read_text(encoding="utf-8")
+    workspace = workspace_path.read_text(encoding="utf-8")
+    capabilities = capability_path.read_text(encoding="utf-8")
+    controller = controller_path.read_text(encoding="utf-8")
+    tree = ast.parse(adapter)
+    top_level_imports = {
+        alias.name.split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    } | {
+        (node.module or "").split(".")[0]
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom)
+    }
+    assert "duckdb" not in top_level_imports
+    assert "subprocess" not in _imports(adapter_path)
+    assert "subprocess" not in _imports(workspace_path)
+    assert "shell=True" not in adapter + workspace
+    assert "os.system" not in adapter + workspace
+    assert _class_owners("LocalFileQueryBackend") == {"adapters/local_file_query.py"}
+    assert _class_owners("LocalFileQueryExecutor") == {
+        "domains/data/file_capabilities.py"
+    }
+    assert "CapabilityRuntime(" not in adapter + workspace + capabilities + controller
+    assert "CapabilityRegistry(" not in adapter + workspace + capabilities + controller
+    assert "ToolLoadMode.ON_DEMAND" in capabilities
+    assert 'LOCAL_FILE_QUERY_TOOL_NAME = "file_query"' in capabilities
+    assert "local_file_declarations(workspace_backend)" in embedded
+    assert "call.name == LOCAL_FILE_QUERY_TOOL_NAME" not in controller
+    for prohibited in (
+        "DuckDBRuntime",
+        "FileQueryRuntime",
+        "FileQueryRegistry",
+        "FileQueryPolicy",
+        "persistent_duckdb",
+        "prepared_parquet_cache",
+    ):
+        assert prohibited not in adapter + workspace + capabilities + controller
+
+
+async def test_registry_assigns_every_native_tool_to_one_static_owner(
+    tmp_path,
+):
+    agent = await daita.Agent.create(
+        "stage-m1-owners", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        registry = agent._embedded._capabilities
+        runtime = agent._embedded._capability_runtime
+        expected_owners = {
+            "artifacts",
+            "data",
+            "data_profile_jobs",
+            "distribution",
+            "jobs",
+            "memory",
+            "routines",
+            "semantics",
+            "skills",
+        }
+        assert registry.domain_owner_ids == expected_owners
+        assert set(runtime._domains) == expected_owners
+
+        resolved = {}
+        for name in registry.tool_names:
+            view, capability, owner_id = registry.resolve_tool_owner(name)
+            assert view.capability_id == capability.id
+            assert registry.resolve_domain_owner(capability.id) == owner_id
+            assert capability in runtime._domains[owner_id].declarations.capabilities
+            resolved[name] = owner_id
+
+        assert resolved["catalog_search"] == "data"
+        assert resolved["data_query"] == "data"
+        assert resolved["file_search"] == "data"
+        assert resolved["file_read"] == "data"
+        assert resolved["file_query"] == "data"
+        assert resolved["data_update_rows"] == "data"
+        assert resolved["memory_set"] == "memory"
+        assert resolved["skill_view"] == "skills"
+        assert resolved["semantic_list"] == "semantics"
+        assert resolved["artifact_create_document"] == "artifacts"
+        assert resolved["artifact_create_tabular"] == "artifacts"
+        assert resolved["start_data_profile"] == "data_profile_jobs"
+        assert resolved["job_list"] == "jobs"
+        assert resolved["routine_list"] == "routines"
+        assert resolved["distribution_destination_list"] == "distribution"
+        assert resolved["delivery_list"] == "distribution"
+        assert resolved["delivery_inspect"] == "distribution"
+    finally:
+        await agent.close()
+
+
+def test_final_src_layout_has_one_package_owner_and_no_replacement_alias():
+    assert PACKAGE == ROOT / "src" / "daita"
+    assert not (ROOT / "daita").exists()
+    assert not (ROOT / "next").exists()
+    packaging = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert 'package-dir = {"" = "src"}' in packaging
+    assert 'daita = "daita.cli:main"' in packaging
+
+
+def test_model_suggestions_remain_terminal_only_presentation_metadata():
+    models = (PACKAGE / "tui" / "models.py").read_text(encoding="utf-8")
+    assert "MODEL_SUGGESTIONS" in models
+    assert _class_owners("ModelSuggestion") == {"tui/models.py"}
+    for owner in ("catalog", "loop", "llm", "storage"):
+        text = _python_text(PACKAGE / owner)
+        assert "MODEL_SUGGESTIONS" not in text
+        assert "ModelSuggestion" not in text
+
+
+def test_public_surface_is_focused():
+    assert set(daita.__all__) == {
+        "EffectReceipt",
+        "EffectResolution",
+        "EffectResolutionDecision",
+        "EffectOutcome",
+        "EffectEvidenceBasis",
+        "Agent",
+        "AgentConfig",
+        "AgentEvent",
+        "AgentEventKind",
+        "AgentObserver",
+        "ArtifactDeliveryReceipt",
+        "ArtifactDestination",
+        "ArtifactError",
+        "ArtifactPayload",
+        "ArtifactRef",
+        "ArtifactRequirement",
+        "ApprovalDecision",
+        "ApprovalHandler",
+        "ApprovalRequest",
+        "AmbiguousTimePolicy",
+        "CalendarDaySelector",
+        "CalendarSchedule",
+        "ConversationInboxTarget",
+        "ConversationRun",
+        "CatalogSummary",
+        "DocumentCandidateContent",
+        "Delivery",
+        "DeliveryInspection",
+        "DeliverySubjectKind",
+        "DeliveryState",
+        "DistributionDestination",
+        "DistributionPlan",
+        "DistributionTargetBinding",
+        "LearningCandidate",
+        "LearningCandidateAction",
+        "LearningCandidateError",
+        "LearningCandidateRejectionReason",
+        "LearningCandidateStatus",
+        "LearningCandidateTarget",
+        "LearningCandidateView",
+        "LearningReviewResult",
+        "LearningReviewStatus",
+        "JobExecutionMode",
+        "InboxView",
+        "IntervalSchedule",
+        "JobInspection",
+        "JobResultView",
+        "JobStatus",
+        "JobSummary",
+        "LocalWorkspace",
+        "LoopExit",
+        "LoopExitKind",
+        "LoopLimits",
+        "TOOLBOX_DEFINITIONS",
+        "ToolLoadMode",
+        "ToolPresentation",
+        "ToolboxDefinition",
+        "ToolboxId",
+        "ToolTextTrust",
+        "MCPAdmissionError",
+        "MCPAuthentication",
+        "MCPAuthenticationMode",
+        "MCPBindingState",
+        "MCPBindingStatus",
+        "MCPCompletionSemantics",
+        "MCPError",
+        "MCPInspectedTool",
+        "MCPServerBinding",
+        "MCPServerInspection",
+        "MCPToolBinding",
+        "MCPToolSelection",
+        "MisfirePolicy",
+        "ModelRoute",
+        "ModelRouteCandidate",
+        "NonexistentTimePolicy",
+        "OnceSchedule",
+        "OutcomeConclusionKind",
+        "OutcomeArtifactReference",
+        "OutcomeContract",
+        "EffectRequirement",
+        "OutcomeReference",
+        "OutcomeState",
+        "PostgreSQLSource",
+        "RelationalUpdateReadiness",
+        "RelationalWriteScope",
+        "RetryPolicy",
+        "ReportingMode",
+        "ResidentReady",
+        "ResourceRevisionPrecheck",
+        "RoutineState",
+        "ResourceRevisionBinding",
+        "SQLiteSource",
+        "SemanticAnnotation",
+        "SemanticAnnotationState",
+        "SemanticAnnotationView",
+        "SemanticDigestMismatchError",
+        "SemanticEvidence",
+        "SemanticEvidenceKind",
+        "SemanticFieldReference",
+        "SemanticKind",
+        "SemanticSubject",
+        "SemanticValidationError",
+        "SemanticCandidateContent",
+        "Skill",
+        "SkillCandidateContent",
+        "SkillSummary",
+        "ScheduledRoutineDraft",
+        "RequestedCapabilityGrant",
+        "ScheduledRoutineInspection",
+        "ScheduledRoutineSummary",
+        "ScheduledRoutine",
+        "Transcript",
+        "__version__",
+        "create_llm_provider",
+        "run_resident_host",
+    }
+
+
+def test_confirmed_dead_error_and_learning_candidate_apis_do_not_return():
+    errors_tree = ast.parse((PACKAGE / "errors.py").read_text(encoding="utf-8"))
+    error_classes = {
+        node.name for node in errors_tree.body if isinstance(node, ast.ClassDef)
+    }
+    assert {
+        "SkillError",
+        "RetryableError",
+        "ValidationError",
+        "FocusDSLError",
+        "DataQualityError",
+    }.isdisjoint(error_classes)
+    daita_error = next(
+        node
+        for node in errors_tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "DaitaError"
+    )
+    daita_error_methods = {
+        node.name
+        for node in daita_error.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert {
+        "retry_hint",
+        "is_transient",
+        "is_retryable",
+        "is_permanent",
+    }.isdisjoint(daita_error_methods)
+
+    learning_tree = ast.parse(
+        (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
+    )
+    learning_functions = {
+        node.name
+        for node in learning_tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "candidate_matches_successful_mutation" not in learning_functions
+    assert {
+        "SkillError",
+        "RetryableError",
+        "ValidationError",
+        "FocusDSLError",
+        "DataQualityError",
+    }.isdisjoint(daita.__all__)
+
+
+def test_jobs_have_one_aggregate_and_no_parallel_execution_system():
+    assert _class_owners("JobRun") == {"jobs/models.py"}
+    assert _class_owners("JobOwner") == {"jobs/owner.py"}
+    assert _class_owners("JobSupervisor") == {"jobs/supervisor.py"}
+    assert _class_owners("InternalCapabilityRequest") == {"capability_runtime.py"}
+
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    assert "CREATE TABLE job_runs" in schema
+    for parallel_table in (
+        "job_attempts",
+        "job_results",
+        "job_workers",
+        "job_queue",
+        "job_events",
+        "job_schedules",
+    ):
+        assert f"CREATE TABLE {parallel_table}" not in schema
+
+
+def test_followups_and_distribution_have_single_owners_without_parallel_runtime():
+    assert _class_owners("AutonomousFollowup") == {"autonomy.py"}
+    assert _class_owners("Delivery") == {"distribution/models.py"}
+    assert _class_owners("DistributionOwner") == {"distribution/owner.py"}
+    assert _class_owners("RunStartEnvelope") == {"loop/models.py"}
+    assert _class_owners("InboxScreen") == {"tui/screens/inbox.py"}
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    assert "CREATE TABLE autonomous_followups" in schema
+    assert "CREATE TABLE deliveries" in schema
+    production = _python_text(PACKAGE)
+    assert "InboxItem" not in production
+    assert "conversation_inbox" not in schema
+    assert "allowed_read_capabilities" not in production
+    assert "mark_job_terminal_observed" not in production
+    sqlite = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    distribution_owner = (PACKAGE / "distribution" / "owner.py").read_text(
+        encoding="utf-8"
+    )
+    assert "OutcomeReference(" not in sqlite
+    assert "logical_delivery_key(" not in sqlite
+    assert "def construct_logical_delivery(" in distribution_owner
+    for table in (
+        "completion_events",
+        "followup_attempts",
+        "followup_claims",
+        "followup_budgets",
+        "delivery_attempts",
+        "completion_routes",
+    ):
+        assert f"CREATE TABLE {table}" not in schema
+
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+    providers = _python_text(PACKAGE / "llm" / "providers")
+    assert "data_profile" not in runtime
+    assert "JobRun" not in runtime
+    assert "JobRun" not in loop
+    assert "JobRun" not in providers
+    assert "execute_internal(" in supervisor
+    assert "executor.execute(" not in supervisor
+    assert "execute_read(" not in supervisor
+
+    inbox_screen = (PACKAGE / "tui" / "screens" / "inbox.py").read_text(
+        encoding="utf-8"
+    )
+    tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
+    tui_app = (PACKAGE / "tui" / "app.py").read_text(encoding="utf-8")
+    assert "require_agent().inbox(" in tui_controller
+    assert "require_agent().acknowledge_inbox(" in tui_controller
+    assert "event.run_origin" in tui_app
+    assert "Agent.run" not in inbox_screen
+    assert "_embedded" not in inbox_screen
+
+    production = _python_text(PACKAGE)
+    for forbidden in (
+        "class JobRegistry",
+        "class JobHandler",
+        "class Scheduler",
+        "class Workflow",
+        "class ExecutionGraph",
+        "class RecoveryService",
+        "class CompletionRouter",
+        "class ResidentDaemon",
+    ):
+        assert forbidden not in production
+
+
+def test_routine_records_and_supervision_have_single_owners():
+    assert _class_owners("ScheduledRoutine") == {"routines/models.py"}
+    assert _class_owners("RoutineOccurrence") == {"routines/models.py"}
+    assert _class_owners("RoutineOwner") == {"routines/owner.py"}
+    assert _class_owners("RoutineSupervisor") == {"routines/supervisor.py"}
+
+
+def test_public_exports_records_without_exporting_their_owners():
+    assert daita.ConversationRun.__module__ == "daita.loop.models"
+    assert daita.AgentEvent.__module__ == "daita.observation"
+    assert daita.AgentEventKind.__module__ == "daita.observation"
+    assert daita.AgentObserver.__module__ == "daita.observation"
+    assert daita.ApprovalDecision.__module__ == "daita.capabilities"
+    assert daita.ApprovalRequest.__module__ == "daita.capabilities"
+    assert daita.ApprovalHandler.__module__ == "daita.capabilities"
+    assert daita.Skill.__module__ == "daita.skills.store"
+    assert daita.SkillSummary.__module__ == "daita.skills.store"
+    assert daita.SemanticAnnotation.__module__ == "daita.semantics"
+    assert daita.SemanticAnnotationView.__module__ == "daita.semantics"
+    assert daita.ArtifactRef.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactPayload.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactDeliveryReceipt.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactDestination.__module__ == "daita.artifacts.models"
+    assert daita.ArtifactError.__module__ == "daita.artifacts.models"
+
+    assert set(daita.__all__).isdisjoint(
+        {
+            "CapabilityRegistry",
+            "AgentHomeArtifactStore",
+            "ArtifactDraft",
+            "ArtifactPolicy",
+            "LocalArtifactDelivery",
+            "MemoryStore",
+            "SideEffectExecutor",
+            "SkillStore",
+            "_emit_safely",
+        }
+    )
+
+
+def test_deleted_lifecycle_systems_remain_absent():
+    for package_name in (
+        "events",
+        "extensions",
+        "monitors",
+        "operations",
+        "telemetry",
+    ):
+        assert not any((PACKAGE / package_name).glob("*.py"))
+    for module_name in (
+        "approvals.py",
+        "governance.py",
+        "learning.py",
+        "sessions.py",
+    ):
+        assert not (PACKAGE / module_name).exists()
+
+
+def test_memory_keeps_storage_separate_from_one_fixed_write_identity():
+    memory = PACKAGE / "memory"
+    assert {path.name for path in memory.glob("*.py")} == {
+        "__init__.py",
+        "capabilities.py",
+        "store.py",
+    }
+    store_text = (memory / "store.py").read_text(encoding="utf-8")
+    capability_text = (memory / "capabilities.py").read_text(encoding="utf-8")
+    assert '"MEMORY.md"' in store_text
+    assert '"USER.md"' in store_text
+    for term in (
+        "Capability(",
+        "Executor(",
+        "ToolView(",
+        "memory_set",
+        "sqlite",
+        "catalog",
+        "approval",
+        "policy",
+        "telemetry",
+    ):
+        assert term not in store_text
+
+    assert 'MEMORY_SET_TOOL_NAME = "memory_set"' in capability_text
+    assert 'MEMORY_SET_CAPABILITY_ID = "memory.set"' in capability_text
+    assert 'MEMORY_SET_EXECUTOR_ID = "memory.set.executor"' in capability_text
+    assert 'MEMORY_SET_OUTPUT_KIND = "memory.replacement"' in capability_text
+    for forbidden in ("skill_save", "skill_delete", "SQLiteStateStore"):
+        assert forbidden not in capability_text
+
+    registry_text = (PACKAGE / "capabilities.py").read_text(encoding="utf-8")
+    controller_text = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    assert "daita.memory" not in registry_text
+    assert "MemoryStore" not in registry_text
+    assert "MemoryStore" not in controller_text
+
+    expected = {
+        "read_memory",
+        "set_memory",
+        "read_user_profile",
+        "set_user_profile",
+    }
+    assert expected <= _class_methods(PACKAGE / "agent.py", "Agent")
+    assert expected <= _class_methods(
+        PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+    )
+
+
+def test_skills_extend_the_advisory_owner_with_two_writes():
+    skills = PACKAGE / "skills"
+    assert {path.name for path in skills.glob("*.py")} == {
+        "__init__.py",
+        "capabilities.py",
+        "store.py",
+    }
+    store_text = (skills / "store.py").read_text(encoding="utf-8")
+    capability_text = (skills / "capabilities.py").read_text(encoding="utf-8")
+    assert '"skills"' in store_text
+    assert '"SKILL.md"' in store_text
+    assert 'SKILL_VIEW_TOOL_NAME = "skill_view"' in capability_text
+    assert 'SKILL_VIEW_CAPABILITY_ID = "skill.view"' in capability_text
+    assert 'SKILL_VIEW_EXECUTOR_ID = "skill.view.executor"' in capability_text
+    assert 'SKILL_VIEW_OUTPUT_KIND = "skill.document"' in capability_text
+    assert 'SKILL_SAVE_TOOL_NAME = "skill_save"' in capability_text
+    assert 'SKILL_SAVE_CAPABILITY_ID = "skill.save"' in capability_text
+    assert 'SKILL_SAVE_EXECUTOR_ID = "skill.save.executor"' in capability_text
+    assert 'SKILL_SAVE_OUTPUT_KIND = "skill.saved"' in capability_text
+    assert 'SKILL_DELETE_TOOL_NAME = "skill_delete"' in capability_text
+    assert 'SKILL_DELETE_CAPABILITY_ID = "skill.delete"' in capability_text
+    assert 'SKILL_DELETE_EXECUTOR_ID = "skill.delete.executor"' in capability_text
+    assert 'SKILL_DELETE_OUTPUT_KIND = "skill.deleted"' in capability_text
+    for forbidden in (
+        "CapabilityRegistry",
+        "CatalogResource",
+        "SQLiteStateStore",
+    ):
+        assert forbidden not in store_text
+    assert "SideEffectExecutor" not in store_text
+
+    expected = {"list_skills", "read_skill", "save_skill", "delete_skill"}
+    assert expected <= _class_methods(PACKAGE / "agent.py", "Agent")
+    assert expected <= _class_methods(
+        PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+    )
+
+    skill_capabilities = (PACKAGE / "skills" / "capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
+    assert "class SkillCapabilityDomain" in skill_capabilities
+    assert "SKILL_VIEW_CAPABILITY_ID" in skill_capabilities
+    assert "SKILL_SAVE_CAPABILITY_ID" in skill_capabilities
+    assert "SKILL_DELETE_CAPABILITY_ID" in skill_capabilities
+    assert "skill_index" in context
+    assert "historical skill body redacted" in context
+
+
+def test_semantics_use_existing_storage_context_and_runtime_owners():
+    semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
+
+    assert _class_owners("SemanticAnnotation") == {"semantics.py"}
+    assert _class_owners("SemanticSubject") == {"semantics.py"}
+    assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
+    assert 'SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"' in semantics
+    assert "CREATE TABLE semantic_annotations" in schema
+    assert "class SemanticCapabilityDomain" in semantics
+    assert "semantic_resource_facts" in semantics
+    assert "_annotation_issue" in semantics
+    assert "_bind_current_evidence" in semantics
+    assert "render_semantic_recall" in context
+    assert "semantic_declarations(identity.id, store)" in embedded
+    assert "mutation_lock=mutation_lock" in embedded
+    controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
+    assert "/memory [list|show <id>|edit [id]|accept <id>|" in controller
+    assert "/knowledge" not in _python_text(PACKAGE)
+
+    expected = {
+        "list_semantic_annotations",
+        "read_semantic_annotation",
+        "save_semantic_annotation",
+        "delete_semantic_annotation",
+    }
+    assert expected <= _class_methods(PACKAGE / "agent.py", "Agent")
+    assert expected <= _class_methods(
+        PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+    )
+    for forbidden in (
+        "BackgroundAgentLoop",
+        "KnowledgeGraph",
+        "LearningRuntime",
+        "MemoryProvider",
+        "SemanticExecutorKernel",
+        "VectorStore",
+        "reviewed_document",
+    ):
+        assert forbidden not in _python_text(PACKAGE)
+
+
+def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
+    semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
+    candidates = (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
+    package_text = _python_text(PACKAGE)
+
+    assert _class_owners("AgentLoop") == {"loop/driver.py"}
+    assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
+    assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
+    assert "semantic_duplicate_identity" in semantics
+    assert "SEMANTIC_MAINTENANCE_MAX_NOTICES" in semantics
+    assert "semantic-maintenance" in semantics
+    assert "review material only" in context
+    assert "_decorate_view" in semantics
+    assert "select_explicit_learning_run" in semantics
+    assert "_maintenance_requested" in semantics
+    assert "class LearningCandidateGuard" in learning
+    for capability_id in (
+        "semantics.list",
+        "semantics.view",
+        "semantics.save",
+        "semantics.delete",
+    ):
+        assert capability_id not in runtime
+    assert "semantic_annotations" in storage
+    assert "CREATE TABLE learning_candidates" in schema
+    assert "tools=()" in candidates
+    assert "AgentLoop" not in candidates
+    assert "CapabilityRuntime" not in candidates
+    assert "data_query" not in candidates
+    assert "evaluation" not in storage.lower()
+    assert "telemetry" not in storage.lower()
+    assert "from .storage" not in evaluation
+    assert "import sqlite3" not in evaluation.lower()
+    assert "raw_prompt" not in evaluation.lower()
+    assert "tool_arguments" not in evaluation.lower()
+
+    for forbidden in (
+        "class BackgroundReviewer",
+        "class CandidateStore",
+        "class LearningRuntime",
+        "class ReviewScheduler",
+        "class SemanticExecutorKernel",
+        "class TelemetryStore",
+        "class VectorRetriever",
+        "CREATE TABLE telemetry",
+        "/review-learning",
+        "/knowledge",
+    ):
+        assert forbidden not in package_text
+
+
+async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_branch(
+    tmp_path,
+):
+    agent = await daita.Agent.create(
+        "write-architecture", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        registry = agent._embedded._capabilities
+        effect_tools = set()
+        for name in registry.tool_names:
+            _, capability = registry.resolve_tool(name)
+            if capability.operational_effect is OperationalEffect.NONE:
+                continue
+            effect_tools.add(name)
+            _, executor = registry.resolve_execution(capability.id)
+            assert callable(getattr(executor, "preflight", None))
+        assert effect_tools == {
+            "artifact_save_local",
+            "artifact_set_export_location",
+            "data_update_rows",
+            "data_upsert_rows",
+            "job_cancel",
+            "memory_set",
+            "routine_control",
+            "routine_create",
+            "routine_update",
+            "semantic_delete",
+            "semantic_save",
+            "skill_save",
+            "skill_delete",
+            "start_data_profile",
+        }
+    finally:
+        await agent.close()
+
+
+async def test_database_writes_register_only_the_relational_write_slice(
+    tmp_path,
+):
+    agent = await daita.Agent.create(
+        "database-write-phase-two",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        registry = agent._embedded._capabilities
+        capability_ids = {
+            registry.resolve_tool(name)[1].id for name in registry.tool_names
+        }
+        preview_tool = "data_preview_update_rows"
+        preview_capability = "data.preview_update_rows"
+        update_tool = "data_update_rows"
+        update_capability = "data.update_rows"
+        forbidden_tools = {
+            "data_preview_sqlite_update",
+            "data_update_sqlite",
+        }
+        forbidden_capabilities = {
+            "data.sqlite.update_impact",
+            "data.sqlite.update",
+        }
+
+        assert preview_tool in registry.tool_names
+        preview = registry.resolve_tool(preview_tool)[1]
+        assert preview.id == preview_capability
+        assert preview.access_mode is AccessMode.READ
+        assert preview.operational_effect is OperationalEffect.NONE
+        assert update_tool in registry.tool_names
+        update = registry.resolve_tool(update_tool)[1]
+        assert update.id == update_capability
+        assert update.access_mode is AccessMode.WRITE
+        assert update.operational_effect is OperationalEffect.MUTATE_DATA
+        _, update_executor = registry.resolve_execution(update.id)
+        assert callable(getattr(update_executor, "preflight", None))
+        assert forbidden_tools.isdisjoint(registry.tool_names)
+        assert forbidden_capabilities.isdisjoint(capability_ids)
+
+        controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+            encoding="utf-8"
+        )
+        runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+        package_text = _python_text(PACKAGE)
+        for dormant_name in forbidden_tools | forbidden_capabilities:
+            assert f'"{dormant_name}"' not in package_text
+            assert f"'{dormant_name}'" not in package_text
+        assert "class RelationalUpdateExecutor" in package_text
+        write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
+            encoding="utf-8"
+        )
+        assert "start_effect_receipt" in runtime
+        assert "start_effect_receipt" not in write_backend
+        assert "finish_effect_receipt" in runtime
+        assert "finish_effect_receipt" not in write_backend
+        assert "effect_receipts" not in write_backend
+        assert "SideEffectExecutor" not in write_backend
+        assert "approval_handler" not in write_backend
+        assert "_execute_side_effect" in runtime
+        assert "ApprovalRequest" in runtime
+        capabilities_owner = (
+            PACKAGE / "domains" / "data" / "capabilities.py"
+        ).read_text(encoding="utf-8")
+        assert ".execute_update(" in capabilities_owner
+        assert ".execute_update(" not in controller
+        assert ".execute_update(" not in (PACKAGE / "loop" / "driver.py").read_text(
+            encoding="utf-8"
+        )
+        assert "pending_database_write" not in package_text
+        assert "database_write_events" not in package_text
+        assert "DbRuntime" not in package_text
+        assert "RuntimeKernel" not in package_text
+        for method in (
+            "inspect_source_permissions",
+            "preview_source_permissions",
+            "apply_source_permissions",
+        ):
+            assert method in _class_methods(PACKAGE / "agent.py", "Agent")
+            assert method in _class_methods(
+                PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
+            )
+            assert method not in controller
+            assert method not in (PACKAGE / "context.py").read_text(encoding="utf-8")
+    finally:
+        await agent.close()
+
+
+def test_database_write_control_plane_keeps_current_owners():
+    agent_methods = _class_methods(PACKAGE / "agent.py", "Agent")
+    embedded_methods = _class_methods(
+        PACKAGE / "hosting" / "embedded.py",
+        "EmbeddedAgent",
+    )
+    backend_methods = _class_methods(
+        PACKAGE / "adapters" / "postgresql_write.py",
+        "PostgreSQLWriteBackend",
+    )
+    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
+    cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
+    terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
+    tui_commands = (PACKAGE / "tui" / "commands.py").read_text(encoding="utf-8")
+    tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
+
+    assert "relational_update_readiness" in agent_methods
+    assert "relational_update_readiness" in embedded_methods
+    assert "relational_update_readiness" in backend_methods
+    assert _class_owners("RelationalUpdateReadiness") == {
+        "adapters/postgresql_write.py"
+    }
+    assert "relational_update_readiness" not in controller
+    assert "relational_update_readiness" not in context
+    assert ".relational_update_readiness(" in cli
+    assert ".relational_update_readiness(" not in terminal
+    assert "inspect_source_permissions" in tui_controller
+    assert "preview_source_permissions" in tui_controller
+    assert "apply_source_permissions" in tui_controller
+    assert '"/source permissions"' in tui_commands
+    for obsolete_terminal_command in (
+        "/source write inspect",
+        "/source write enable",
+        "/source write disable",
+        "/source write readiness",
+    ):
+        assert obsolete_terminal_command not in terminal
+        assert obsolete_terminal_command not in tui_commands
+    production = _python_text(PACKAGE)
+    for administration in (
+        "CREATE ROLE daita_writer",
+        "GRANT CONNECT ON DATABASE",
+        "administrator_password",
+    ):
+        assert administration not in production
+    for later_phase in (
+        "data_insert_postgresql",
+        "data_delete_postgresql",
+        "execute_postgresql_sql",
+        "reconcile_database_write",
+    ):
+        assert later_phase not in production
+
+
+def test_artifact_continuity_uses_current_context_and_export_owners():
+    controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
+        encoding="utf-8"
+    )
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    for obsolete in (
+        "_explicit_artifact_request",
+        "_explicit_default_location_request",
+        "_ARTIFACT_ACTION_WORDS",
+        "_ARTIFACT_OBJECT_WORDS",
+        "_intent_clauses",
+    ):
+        assert obsolete not in controller
+    for obsolete_history_owner in (
+        "ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND",
+        "DOCUMENT_CREATE_OUTPUT_KIND",
+        "TABULAR_EXPORT_OUTPUT_KIND",
+        "LOCAL_FILE_COPY_OUTPUT_KIND",
+    ):
+        assert obsolete_history_owner not in context
+    assert 'ARTIFACT_LIST_TOOL_NAME = "artifact_list"' in exports
+    assert 'ARTIFACT_READ_TOOL_NAME = "artifact_read"' in exports
+    assert 'ARTIFACT_CONVERT_TOOL_NAME = "artifact_convert"' in exports
+    assert "artifact_list" not in (PACKAGE / "agent.py").read_text(encoding="utf-8")
+    assert "artifact_list" not in (PACKAGE / "hosting" / "embedded.py").read_text(
+        encoding="utf-8"
+    )
+    assert "artifact_list" not in (PACKAGE / "cli.py").read_text(encoding="utf-8")
+
+
+def test_job_scope_has_one_agent_owner_and_no_conversation_gate():
+    capabilities = (PACKAGE / "jobs" / "capabilities.py").read_text(encoding="utf-8")
+    owner = (PACKAGE / "jobs" / "owner.py").read_text(encoding="utf-8")
+    models = (PACKAGE / "jobs" / "models.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+
+    for obsolete in (
+        "def _conversation(",
+        "_load_scoped",
+        "job_owner_conversation_scope",
+        "not available in this conversation scope",
+    ):
+        assert obsolete not in capabilities + owner
+    assert "job_owner_agent_scope" in capabilities
+    assert "origin_conversation_id" in capabilities
+    assert "origin_conversation_id" in models
+    assert (
+        "conversation_id: str | None = None"
+        not in owner.split("async def inspect", 1)[1]
+    )
+    assert "JobCapabilityDomain(job_declaration_bundle, job_owner)" in embedded
+    assert "ToolLoadMode.PINNED" in capabilities
+    assert "ToolLoadMode.ON_DEMAND" in capabilities
+    assert "item.id == JOB_CANCEL_CAPABILITY_ID" in capabilities
+
+
+def test_exact_artifact_read_is_agent_owned_while_list_and_convert_stay_conversation_scoped():
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    assert "payload = await self._artifacts.read(artifact_id)" in exports
+    assert "exact known artifact owned by" in exports
+    conversation_capabilities = exports.split(
+        "_CONVERSATION_ARTIFACT_CAPABILITIES =", 1
+    )[1].split("_ARTIFACT_PRODUCER_CAPABILITIES", 1)[0]
+    assert "ARTIFACT_LIST_CAPABILITY_ID" in conversation_capabilities
+    assert "ARTIFACT_CONVERT_CAPABILITY_ID" in conversation_capabilities
+    assert "ARTIFACT_READ_CAPABILITY_ID" not in conversation_capabilities
+    assert "await self._artifacts.find_ref(artifact_id)" in exports
+    assert "else await self._current_ref(run, artifact_id)" in exports
+
+
+def test_observation_owners_keep_tool_events_out_of_loop_and_storage():
+    storage = _python_text(PACKAGE / "storage")
+    runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
+    loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
+
+    assert "AgentEvent" not in storage
+    assert "AgentEventKind.TOOL_STARTED" in runtime
+    assert "AgentEventKind.TOOL_COMPLETED" in runtime
+    assert "AgentEventKind.APPROVAL_REQUESTED" in runtime
+    assert "AgentEventKind.APPROVAL_DECIDED" in runtime
+    assert "AgentEventKind.TOOL_STARTED" not in loop
+    assert "AgentEventKind.TOOL_COMPLETED" not in loop
+    assert "AgentEventKind.APPROVAL_REQUESTED" not in loop
+    assert "AgentEventKind.APPROVAL_DECIDED" not in loop
+
+
+def test_approval_contracts_have_one_runtime_boundary_owner():
+    assert _class_owners("ApprovalDecision") == {"capabilities.py"}
+    assert _class_owners("ApprovalRequest") == {"capabilities.py"}
+    assert _class_owners("ApprovalHandler") == {"capabilities.py"}
+    assert _class_owners("SideEffectExecutor") == {"capabilities.py"}
+    assert _class_owners("CapabilityRuntime") == {"capability_runtime.py"}
+
+
+def test_conversations_add_grouping_without_a_runtime_or_history_system():
+    text = _python_text(PACKAGE)
+    for term in (
+        "BackgroundWorker",
+        "CompressionCheckpoint",
+        "ConversationManager",
+        "ConversationRuntime",
+        "ConversationSearch",
+        "ConversationSummary",
+        "ConversationWorker",
+        "EventStore",
+        "PendingApproval",
+        "PersistedApproval",
+        "ResumeRuntime",
+        "ResumeState",
+        "SearchIndex",
+        "SessionManager",
+    ):
+        assert term not in text
+
+
+def test_cli_remains_a_presentation_over_the_public_agent_api():
+    path = PACKAGE / "cli.py"
+    text = path.read_text(encoding="utf-8")
+    tree = ast.parse(text)
+
+    forbidden_import_roots = {
+        "adapters",
+        "capabilities",
+        "catalog",
+        "domains",
+        "hosting",
+        "loop",
+        "storage",
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            assert node.module.split(".")[0] not in forbidden_import_roots
+        if isinstance(node, ast.Import):
+            assert all(alias.name.split(".")[0] != "sqlite3" for alias in node.names)
+
+    for forbidden in (
+        "._embedded",
+        "CapabilityRegistry",
+        "CapabilityRuntime",
+        "executor.execute(",
+        "resolve_execution(",
+        "SQLiteStateStore",
+    ):
+        assert forbidden not in text
+
+    public_methods = {
+        method
+        for method in _class_methods(PACKAGE / "agent.py", "Agent")
+        if not method.startswith("_")
+    }
+    agent_calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "agent"
+    }
+    assert agent_calls <= public_methods
+
+
+def test_terminal_application_remains_a_presentation_over_the_public_agent_api():
+    tui_root = PACKAGE / "tui"
+    text = _python_text(tui_root)
+    tree = ast.parse(text)
+
+    forbidden_import_roots = {
+        "adapters",
+        "catalog",
+        "domains",
+        "hosting",
+        "loop",
+        "storage",
+    }
+    for path in tui_root.rglob("*.py"):
+        module_tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(module_tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                root = node.module.split(".")[0]
+                if node.module.startswith("daita."):
+                    root = node.module.split(".")[1]
+                assert root not in forbidden_import_roots
+            if isinstance(node, ast.Import):
+                assert all(
+                    alias.name.split(".")[0] not in {"asyncpg", "keyring", "sqlite3"}
+                    for alias in node.names
+                )
+
+    for forbidden in (
+        "._embedded",
+        "AgentLoop",
+        "CapabilityRegistry",
+        "CapabilityRuntime",
+        "ResourceAdapter",
+        "SQLiteStateStore",
+        "agent.toml",
+        "state.db",
+        "CommandRegistry",
+        "ConversationRuntime",
+        "ReadinessService",
+        "SessionManager",
+        "Workflow",
+    ):
+        assert forbidden not in text
+
+    public_methods = {
+        method
+        for method in _class_methods(PACKAGE / "agent.py", "Agent")
+        if not method.startswith("_")
+    }
+    agent_calls = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "agent"
+    }
+    assert agent_calls <= public_methods
+    assert {
+        "catalog_preview",
+        "conversation_exists",
+        "refresh_source",
+    } <= public_methods
+    assert not (PACKAGE / "terminal_tui.py").exists()
+    assert not (PACKAGE / "terminal_selection.py").exists()
+    assert not (PACKAGE / "terminal_transcript.py").exists()
+
+
+def test_textual_and_rich_stay_behind_the_interactive_entry_boundary():
+    owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if "prompt_toolkit" in path.read_text(encoding="utf-8")
+    }
+    assert owners == set()
+
+    textual_owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if any(
+            line.lstrip().startswith(("from textual", "import textual"))
+            for line in path.read_text(encoding="utf-8").splitlines()
+        )
+    }
+    assert textual_owners
+    assert all(
+        owner.startswith("tui/") or owner == "terminal.py" for owner in textual_owners
+    )
+    assert "cli.py" not in textual_owners
+    terminal_tree = ast.parse((PACKAGE / "terminal.py").read_text(encoding="utf-8"))
+    top_level = {
+        node.module
+        for node in terminal_tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in terminal_tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "textual" not in top_level
+    assert not any(
+        module == "textual" or (module or "").startswith("textual.")
+        for module in top_level
+    )
+    tree = ast.parse((PACKAGE / "terminal.py").read_text(encoding="utf-8"))
+    assert any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "_load_textual_app"
+        for node in tree.body
+    )
+
+
+def test_cli_has_no_legacy_interactive_chat_controller():
+    tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
+    top_level_names = {
+        node.name
+        for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    top_level_names.update(
+        target.id
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name)
+    )
+    assert {
+        "_SKILL_DESCRIPTION_PLACEHOLDER",
+        "_SKILL_INSTRUCTIONS_PLACEHOLDER",
+        "_BUILTIN_CHAT_COMMANDS",
+        "_SourceSummary",
+        "_source_lines",
+        "_resume_command",
+        "_write_sources",
+        "_write_resume",
+        "_ChatTotals",
+        "_write_startup",
+        "_write_help",
+        "_write_memory",
+        "_write_skills",
+        "_write_skill",
+        "_create_skill",
+        "_create_skill_wizard",
+        "_confirm_skill_deletion",
+        "_handle_knowledge_chat_command",
+        "_skill_invocation_message",
+    }.isdisjoint(top_level_names)
+
+
+def test_textual_presentation_has_one_owner_per_concern():
+    assert _class_owners("ClipboardResult") == {"tui/clipboard.py"}
+    assert _class_owners("ToolCardState") == {"tui/models.py"}
+    assert _class_owners("DaitaApp") == {"tui/app.py"}
+    assert _class_owners("PresentationController") == {"tui/controller.py"}
+    assert _class_owners("ApprovalPanel") == {"tui/widgets/approval.py"}
+    assert _class_owners("TranscriptView") == {"tui/widgets/transcript.py"}
+    assert _class_owners("RunObserver") == {"tui/observer.py"}
+
+
+def test_rich_is_not_imported_outside_the_textual_boundary():
+    owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if any(
+            line.lstrip().startswith(("from rich", "import rich"))
+            for line in path.read_text(encoding="utf-8").splitlines()
+        )
+    }
+    assert all(owner.startswith("tui/") for owner in owners)
+
+
+def test_clipboard_stays_truthful_and_out_of_durable_owners():
+    clipboard = (PACKAGE / "tui" / "clipboard.py").read_text(encoding="utf-8")
+    storage = _python_text(PACKAGE / "storage")
+    loop = _python_text(PACKAGE / "loop")
+    assert _class_owners("ClipboardResult") == {"tui/clipboard.py"}
+    assert "OSC 52" not in storage + loop
+    tree = ast.parse(clipboard)
+    top_level_imports = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in tree.body
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    assert "subprocess" not in top_level_imports
+    pbcopy = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "copy_with_pbcopy"
+    )
+    assert any(
+        isinstance(node, ast.Import)
+        and any(alias.name == "subprocess" for alias in node.names)
+        for node in ast.walk(pbcopy)
+    )
+
+
+def test_streaming_keeps_partial_state_disposable_and_provider_neutral():
+    loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
+    app = (PACKAGE / "tui" / "app.py").read_text(encoding="utf-8")
+    observation = (PACKAGE / "observation.py").read_text(encoding="utf-8")
+    storage = _python_text(PACKAGE / "storage")
+
+    assert "ModelStreamCompleted" in loop
+    assert "ModelTextDelta" in loop
+    assert "stream_model_calls" in loop
+    assert "assistant.partial" in app
+    assert "MODEL_TEXT_DELTA" in observation
+    assert "assistant.partial" not in storage
+    assert "MODEL_TEXT_DELTA" not in storage
+    for provider in ("openai", "anthropic", "gemini", "grok", "ollama"):
+        assert provider not in loop.lower()
+
+    top_level_imports = _imports(PACKAGE / "tui" / "app.py")
+    assert not any(
+        module == sdk or module.startswith(f"{sdk}.")
+        for module in top_level_imports
+        for sdk in ("openai", "anthropic", "google", "google.genai")
+    )
+
+
+def test_native_stream_grammars_end_inside_provider_adapters():
+    provider_root = PACKAGE / "llm" / "providers"
+    owners = {
+        "response.output_text.delta": (provider_root / "openai" / "stream.py",),
+        "content_block_delta": (provider_root / "anthropic" / "stream.py",),
+        "generate_content_stream": (
+            provider_root / "gemini" / "adapter.py",
+            provider_root / "gemini" / "stream.py",
+        ),
+        "stream_options": (
+            provider_root / "openai_compatible" / "adapter.py",
+            provider_root / "openai_compatible" / "stream.py",
+        ),
+    }
+    generic_runtime = "\n".join(
+        (
+            (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8"),
+            (PACKAGE / "llm" / "routing.py").read_text(encoding="utf-8"),
+            (PACKAGE / "observation.py").read_text(encoding="utf-8"),
+            _python_text(PACKAGE / "storage"),
+        )
+    )
+
+    for native_marker, owner_paths in owners.items():
+        owner_text = "\n".join(
+            owner.read_text(encoding="utf-8") for owner in owner_paths
+        )
+        assert native_marker in owner_text
+        assert native_marker not in generic_runtime
+
+    for specialization in ("grok.py", "ollama.py"):
+        text = (provider_root / specialization).read_text(encoding="utf-8")
+        assert "OpenAICompatibleProvider" in text
+        assert "async def stream(" not in text
+
+
+def test_substantial_provider_families_are_cohesive_packages():
+    provider_root = PACKAGE / "llm" / "providers"
+    expected = {
+        "openai": {"__init__.py", "adapter.py", "messages.py", "stream.py"},
+        "anthropic": {
+            "__init__.py",
+            "adapter.py",
+            "messages.py",
+            "stream.py",
+            "usage.py",
+        },
+        "gemini": {"__init__.py", "adapter.py", "messages.py", "stream.py"},
+        "openai_compatible": {
+            "__init__.py",
+            "adapter.py",
+            "messages.py",
+            "stream.py",
+        },
+        "subscription_cli": {
+            "__init__.py",
+            "claude.py",
+            "envelope.py",
+            "grok.py",
+            "process.py",
+        },
+    }
+    for family, filenames in expected.items():
+        path = provider_root / family
+        assert {item.name for item in path.iterdir() if item.is_file()} == filenames
+
+    superseded = {
+        "openai.py",
+        "anthropic.py",
+        "gemini.py",
+        "openai_compatible.py",
+        "subscription_cli.py",
+    }
+    assert not superseded & {
+        item.name for item in provider_root.iterdir() if item.is_file()
+    }
+
+
+def test_provider_definitions_are_the_only_generic_provider_catalog():
+    definitions = (PACKAGE / "llm" / "provider_definitions.py").read_text(
+        encoding="utf-8"
+    )
+    factory = (PACKAGE / "llm" / "factory.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    tui_models = (PACKAGE / "tui" / "models.py").read_text(encoding="utf-8")
+    onboarding = (PACKAGE / "tui" / "screens" / "onboarding.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert _class_owners("ProviderDefinition") == {"llm/provider_definitions.py"}
+    assert "PROVIDER_DEFINITIONS" in definitions
+    assert "provider_definition(" in factory
+    assert "provider_definition(" in embedded
+    assert "PROVIDER_PRESENTATION" in tui_models
+    assert "provider_definition(" in onboarding
+    for obsolete in (
+        "_BUILTIN_PROVIDERS",
+        "_SUBSCRIPTION_PROVIDERS",
+        "_SUBSCRIPTION_CREDENTIAL_PROVIDERS",
+        "_fixed_endpoint",
+        "_subscription_auth_only",
+    ):
+        assert obsolete not in factory + embedded + tui_models + onboarding
+    for provider in (
+        "openai",
+        "anthropic",
+        "gemini",
+        "grok",
+        "ollama",
+        "codex",
+        "claude-code",
+        "grok-build",
+    ):
+        assert f'provider_name == "{provider}"' not in factory
+
+
+def test_subscription_process_and_envelope_have_single_owners():
+    process_owner = "llm/providers/subscription_cli/process.py"
+    assert _class_owners("_Command") == {process_owner}
+    assert _class_owners("_CompletedCommand") == {process_owner}
+    assert _class_owners("_SubscriptionExecution") == {process_owner}
+    facade = (
+        PACKAGE / "llm" / "providers" / "subscription_cli" / "__init__.py"
+    ).read_text(encoding="utf-8")
+    assert "create_subprocess_exec" not in facade
+    assert "_decode_model_output" not in facade
+
+
+def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
+    selector_path = PACKAGE / "tui" / "screens" / "selection.py"
+    selector_tree = ast.parse(selector_path.read_text(encoding="utf-8"))
+    imported_modules = {
+        node.module
+        for node in ast.walk(selector_tree)
+        if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(selector_tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    forbidden_fragments = (
+        "adapters",
+        "capabilities",
+        "catalog",
+        "executors",
+        "loop",
+        "postgresql",
+        "storage",
+    )
+    assert not any(
+        any(fragment in module.split(".") for fragment in forbidden_fragments)
+        for module in imported_modules
+    )
+    assert _class_owners("SelectionScreen") == {"tui/screens/selection.py"}
+
+    storage = _python_text(PACKAGE / "storage").casefold()
+    for persisted_state in (
+        "checked_state",
+        "highlight_position",
+        "onboarding_state",
+        "readiness_state",
+        "selected_schema",
+        "selector_position",
+    ):
+        assert persisted_state not in storage
+
+
+def test_catalog_summary_is_not_loop_or_storage_state():
+    assert _class_owners("CatalogSummary") == {"catalog/models.py"}
+    loop = _python_text(PACKAGE / "loop")
+    storage = _python_text(PACKAGE / "storage")
+    for field_name in (
+        "active_source_count",
+        "latest_successful_sync_completed_at",
+        "relationship_count",
+    ):
+        assert field_name not in loop
+    assert "readiness_state" not in storage.lower()
+
+
+def test_catalog_schema_slice_extends_existing_catalog_and_capability_owners():
+    assert _class_owners("CatalogSchemaRequest") == {"catalog/models.py"}
+    service_methods = _class_methods(
+        PACKAGE / "catalog" / "service.py",
+        "CatalogService",
+    )
+    assert "schema_slice" in service_methods
+    capabilities = (PACKAGE / "catalog" / "capabilities.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+    assert 'name="catalog_schema"' in capabilities
+    assert 'CATALOG_SCHEMA_EVIDENCE_KIND = "catalog.schema_slice"' in capabilities
+    assert "catalog_declarations(identity.id, data_view)" in embedded
+    assert "catalog_service = CatalogService(store, store)" in embedded
+    assert "catalog_schema" not in loop
+    for prohibited in (
+        "CatalogSchemaCache",
+        "CatalogSearchService",
+        "SchemaGraph",
+        "VectorStore",
+    ):
+        assert prohibited not in _python_text(PACKAGE)
+
+
+def test_catalog_snapshot_reuse_is_private_derived_storage_state():
+    assert _class_owners("CatalogSnapshotRef") == {"catalog/models.py"}
+    assert "CatalogSnapshotRef" not in daita.__all__
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    assert {
+        "list_current_snapshot_refs",
+        "load_current_snapshot",
+    } <= protocol_methods
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    assert "_decoded_catalog_snapshots" in storage
+    assert "CREATE TABLE IF NOT EXISTS decoded_catalog_snapshots" not in storage
+    for prohibited in (
+        "CatalogSchemaCache",
+        "CatalogSearchService",
+        "SchemaGraph",
+        "VectorStore",
+    ):
+        assert prohibited not in _python_text(PACKAGE)
+
+
+def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    storage_methods = _class_methods(
+        PACKAGE / "storage" / "sqlite.py",
+        "SQLiteStateStore",
+    )
+    service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+
+    assert "search" not in protocol_methods
+    assert "search" not in storage_methods
+    assert "_SourceCatalogIndex" in service
+    assert "_source_indexes" in service
+    assert "_compile_source_index" in service
+    assert "_catalog_search_reason" not in storage
+    assert "_SourceCatalogIndex" not in storage
+    assert "CatalogSearchHit" not in storage
+    assert "_SourceCatalogIndex" not in loop
+
+
+def test_catalog_bounded_traversal_is_catalog_owned_and_not_storage_owned():
+    protocol_methods = _class_methods(
+        PACKAGE / "catalog" / "protocols.py",
+        "CatalogStore",
+    )
+    storage_methods = _class_methods(
+        PACKAGE / "storage" / "sqlite.py",
+        "SQLiteStateStore",
+    )
+    service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop")
+
+    assert "traverse" not in protocol_methods
+    assert "traverse" not in storage_methods
+    assert "load_relationships" not in protocol_methods
+    assert "load_relationships" not in storage_methods
+    assert "_traverse_indexes" in service
+    assert "distance_by_resource" in service
+    assert "parents_by_resource" in service
+    assert "deque(admitted_sources)" in service
+    assert "CatalogPath" not in storage
+    assert "CatalogPathStep" not in storage
+    assert "distance_by_resource" not in storage
+    assert "CatalogTraversalRequest" not in storage
+    assert "CatalogTraversalRequest" not in loop
+
+
+def test_cli_adds_no_parallel_state_approval_or_observation_owner():
+    cli_tree = ast.parse((PACKAGE / "cli.py").read_text(encoding="utf-8"))
+    cli_classes = {
+        node.name for node in ast.walk(cli_tree) if isinstance(node, ast.ClassDef)
+    }
+    assert cli_classes.isdisjoint(
+        {
+            "ApprovalService",
+            "ApprovalStore",
+            "CommandRegistry",
+            "ConversationRuntime",
+            "EventDispatcher",
+            "EventStore",
+            "Session",
+            "SessionManager",
+        }
+    )
+
+    conversation_state_fields = {
+        node.target.id
+        for class_node in ast.walk(cli_tree)
+        if isinstance(class_node, ast.ClassDef)
+        for node in class_node.body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and "conversation" in node.target.id
+    }
+    assert conversation_state_fields <= {"conversation_id"}
+    assert _class_owners("ApprovalHandler") == {"capabilities.py"}
+    assert _class_owners("AgentObserver") == {"observation.py"}
+
+
+def test_pricing_semantics_have_one_provider_neutral_owner():
+    assert _class_owners("CostEstimate") == {"llm/pricing.py"}
+    assert _class_owners("CostComponent") == {"llm/pricing.py"}
+    models = (PACKAGE / "llm" / "models.py").read_text(encoding="utf-8")
+    loop = _python_text(PACKAGE / "loop").lower()
+    pricing = (PACKAGE / "llm" / "pricing.py").read_text(encoding="utf-8").lower()
+    # Requests carry an allowance; returned usage still has one CostEstimate.
+    for node in ast.walk(ast.parse(models)):
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assert node.target.id != "estimated_cost_usd"
+    assert "cost_per_million" not in models
+    for provider in ("openai", "anthropic", "gemini", "grok", "ollama"):
+        assert provider not in loop
+        assert provider not in pricing
+
+
+def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
+    pragma_owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if "PRAGMA user_version" in path.read_text(encoding="utf-8")
+    }
+    assert pragma_owners == set()
+    migration_files = {
+        path.name for path in (PACKAGE / "storage" / "sqlite_migrations").glob("*.py")
+    }
+    assert migration_files == {
+        "__init__.py",
+        "baseline.py",
+        "models.py",
+        "runner.py",
+    }
+    assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
+
+    candidates = [PACKAGE / "loop", PACKAGE / "hosting"]
+    candidates.extend(
+        path
+        for path in (PACKAGE / "memory", PACKAGE / "skills", PACKAGE / "observation.py")
+        if path.exists()
+    )
+    text = "\n".join(
+        _python_text(path) if path.is_dir() else path.read_text(encoding="utf-8")
+        for path in candidates
+    ).lower()
+    for term in (
+        "migration framework",
+        "schema_version",
+        "schema-version",
+        "user_version",
+        "sqlite_migrations",
+        "sqlite_codecs",
+    ):
+        assert term not in text
+
+    assert (PACKAGE / "storage" / "sqlite_migrations").is_dir()
+    assert (PACKAGE / "storage" / "sqlite_codecs").is_dir()
+    assert not (PACKAGE / "migrations").exists()
+    production = _python_text(PACKAGE)
+    for obsolete in (
+        "STATE_FORMAT_VERSION",
+        "_UNVERSIONED_STATE_FORMAT",
+        "_StateMigration",
+        "_STATE_MIGRATIONS",
+        "_state_migration_path",
+        "_unversioned_state_format",
+        "_migrate_existing_state",
+        "_migrate_v1_to_v2",
+        "_migrate_v2_to_v3",
+        "_require_current_source_records",
+        "_UNVERSIONED_STATE_SCHEMAS",
+        "_RECORD_TYPES",
+        "_ENUM_TYPES",
+        "def _pack(",
+        "def _unpack(",
+        "def _dumps(",
+        "def _loads(",
+    ):
+        assert obsolete not in production
+
+    for path in PACKAGE.rglob("*.py"):
+        relative = path.relative_to(PACKAGE).as_posix()
+        text = path.read_text(encoding="utf-8")
+        if not relative.startswith("storage/"):
+            assert "sqlite_migrations" not in text
+            assert "sqlite_codecs" not in text
+
+
+def test_knowledge_content_cannot_redefine_data_or_execution_authority():
+    catalog_text = _python_text(PACKAGE / "catalog")
+    assert "daita.memory" not in catalog_text
+    assert "daita.skills" not in catalog_text
+    assert "..memory" not in catalog_text
+    assert "..skills" not in catalog_text
+
+    forbidden_store_terms = (
+        "Approval",
+        "Capability(",
+        "CapabilityRegistry",
+        "CatalogResource",
+        "Executor",
+        "Policy",
+        "ToolView(",
+    )
+    for package_name in ("memory", "skills"):
+        store = PACKAGE / package_name / "store.py"
+        if not store.exists():
+            continue
+        text = store.read_text(encoding="utf-8")
+        for term in forbidden_store_terms:
+            assert term not in text
+
+
+def test_skill_save_delete_cannot_mutate_registered_execution_identities():
+    registry_methods = _class_methods(PACKAGE / "capabilities.py", "CapabilityRegistry")
+    assert registry_methods.isdisjoint(
+        {"add", "delete", "register", "remove", "save", "unregister", "update"}
+    )
+
+    skill_store = PACKAGE / "skills" / "store.py"
+    if skill_store.exists():
+        text = skill_store.read_text(encoding="utf-8")
+        for term in ("CapabilityRegistry", "Executor", "ToolView"):
+            assert term not in text
+
+
+def test_registry_and_common_runtime_keep_executor_resolution_ownership():
+    resolution_owners = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if "resolve_execution(" in path.read_text(encoding="utf-8")
+    }
+    resolved_executor_callers = {
+        path.relative_to(PACKAGE).as_posix()
+        for path in PACKAGE.rglob("*.py")
+        if "executor.execute(" in path.read_text(encoding="utf-8")
+    }
+    assert resolution_owners == {"capabilities.py", "capability_runtime.py"}
+    assert resolved_executor_callers == {"capability_runtime.py"}
+
+
+def test_artifacts_have_one_concrete_owner_and_no_storage_renderer_or_policy_registry():
+    assert _class_owners("AgentHomeArtifactStore") == {"artifacts/store.py"}
+    assert _class_owners("LocalArtifactDelivery") == {"artifacts/delivery.py"}
+    assert _class_owners("ArtifactPolicy") == {"capabilities.py"}
+    assert _class_owners("ArtifactDraft") == {"artifacts/models.py"}
+    artifact_text = _python_text(PACKAGE / "artifacts")
+    for prohibited in (
+        "ArtifactStoreRegistry",
+        "ArtifactRendererRegistry",
+        "ArtifactPolicyRegistry",
+        "ArtifactProvider",
+    ):
+        assert prohibited not in artifact_text
+
+
+def test_exact_tabular_extends_existing_adapter_capability_and_renderer_owners():
+    assert _class_owners("ExactCsvRenderer") == {"artifacts/renderers.py"}
+    assert _class_owners("ExactXlsxRenderer") == {"artifacts/renderers.py"}
+    for adapter, class_name in (
+        ("sqlite_query.py", "SQLiteQueryBackend"),
+        ("postgresql_query.py", "PostgreSQLQueryBackend"),
+    ):
+        methods = _class_methods(PACKAGE / "adapters" / adapter, class_name)
+        assert "execute_exact_tabular" in methods
+        assert "execute_exact_csv" not in methods
+        tree = ast.parse((PACKAGE / "adapters" / adapter).read_text(encoding="utf-8"))
+        method = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef)
+            and node.name == "execute_exact_tabular"
+        )
+        calls = {
+            node.func.id
+            for node in ast.walk(method)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "project_result_rows" not in calls
+        assert "_json_value" not in calls
+        assert "_unique_columns" not in calls
+
+    renderers = (PACKAGE / "artifacts" / "renderers.py").read_text(encoding="utf-8")
+    exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
+        encoding="utf-8"
+    )
+    assert "BoundedResultProjection" not in renderers
+    assert "BoundedResultProjection" not in exports
+    assert "ExactCsvRenderer" not in _python_text(PACKAGE / "loop")
+    assert "ArtifactRendererRegistry" not in renderers
+    package_text = _python_text(PACKAGE)
+    for obsolete in (
+        "ExactCsvExportBackend",
+        "ExactCsvExportResult",
+        "execute_exact_csv",
+        "_run_exact_csv",
+        "_execute_exact_csv",
+        "SQLITE_CSV_EXPORT_CAPABILITY_ID",
+        "POSTGRESQL_CSV_EXPORT_CAPABILITY_ID",
+        "data_query_" + "sqlite",
+        "data_query_" + "postgresql",
+        "data_export_" + "sqlite",
+        "data_export_" + "postgresql",
+    ):
+        assert obsolete not in package_text
+
+
+def test_exact_tabular_tool_arguments_contain_query_selection_but_never_rows_or_bytes():
+    from daita.domains.data.export_capabilities import (
+        DATA_EXPORT_TABULAR_CAPABILITY_ID,
+        data_export_tabular_capability_declarations,
+    )
+
+    declarations = data_export_tabular_capability_declarations()
+    for capability in declarations.capabilities:
+        if capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID:
+            continue
+        properties = capability.input_schema["properties"]
+        assert isinstance(properties, Mapping)
+        assert set(properties) == {
+            "source_id",
+            "resource_ids",
+            "sql",
+            "parameters",
+            "format",
+            "filename",
+        }
+        assert set(properties).isdisjoint(
+            {"rows", "content", "bytes", "provenance", "sensitivity", "path"}
+        )
+
+
+def test_agent_loop_carries_artifact_records_but_never_imports_renderers_delivery_or_filesystem_paths():
+    path = PACKAGE / "loop" / "driver.py"
+    imports = _imports(path)
+    assert "pathlib" not in imports
+    assert "os" not in imports
+    text = path.read_text(encoding="utf-8")
+    assert "artifacts.models" in text
+    assert "artifacts.delivery" not in text
+    assert "artifacts.renderers" not in text
+    assert "AgentHomeArtifactStore" not in text
+    assert "LocalArtifactDelivery" not in text
+
+
+def test_artifact_delivery_uses_no_bash_shell_subprocess_or_unrestricted_file_tool():
+    path = PACKAGE / "artifacts" / "delivery.py"
+    text = path.read_text(encoding="utf-8")
+    imports = _imports(path)
+    assert "subprocess" not in imports
+    assert "bash" not in text.casefold()
+    assert "shell=True" not in text
+    assert "os.system" not in text
+    assert "general_filesystem" not in text
+    assert "data.file.write" not in text
+
+
+def test_artifact_payloads_and_destination_grants_never_enter_sqlite_messages_or_model_requests():
+    sqlite_text = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    context_text = (PACKAGE / "context.py").read_text(encoding="utf-8")
+    assert "ArtifactPayload" not in sqlite_text
+    assert "ArtifactDraft" not in sqlite_text
+    assert "_DestinationGrant" not in sqlite_text
+    assert "ArtifactPayload" not in context_text
+    assert "_DestinationGrant" not in context_text
+    assert "grant_digest" not in context_text
+    assert "saved_path" not in context_text
+
+
+def test_local_workspace_read_path_never_imports_or_constructs_artifact_bytes():
+    for relative in (
+        "adapters/local_workspace.py",
+        "domains/data/file_capabilities.py",
+    ):
+        text = (PACKAGE / relative).read_text(encoding="utf-8")
+        assert "ToolArtifact" not in text
+        assert "ArtifactDraft" not in text
+        assert "artifact=" not in text
+        assert "artifacts." not in text
+
+
+def test_xlsx_dependencies_are_scoped_and_integrations_remain_lazy():
+    import tomllib
+
+    with (ROOT / "pyproject.toml").open("rb") as source:
+        project = tomllib.load(source)["project"]
+    assert "XlsxWriter>=3.2.5,<4.0.0" in project["dependencies"]
+    assert "openpyxl>=3.1.0,<4.0.0" in project["optional-dependencies"]["dev"]
+    assert "types-openpyxl>=3.1.0,<4.0.0" in project["optional-dependencies"]["dev"]
+    assert all("openpyxl" not in item.casefold() for item in project["dependencies"])
+    assert all("pandas" not in item.casefold() for item in project["dependencies"])
+    artifact_text = _python_text(PACKAGE / "artifacts")
+    assert "openpyxl" not in artifact_text
+    assert "xlsxwriter" in artifact_text
+    renderer = PACKAGE / "artifacts" / "renderers.py"
+    top_level_imports = _imports(renderer)
+    assert "xlsxwriter" not in top_level_imports
+    assert "ExactXlsxRenderer" not in _python_text(PACKAGE / "loop")
+    assert "ArtifactRendererRegistry" not in artifact_text
+
+
+def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
+    from dataclasses import fields
+
+    from daita.capabilities import AutomationEligibility
+    from daita.domains.data.capabilities import (
+        relational_update_capability_declarations,
+        relational_update_preview_capability_declarations,
+        relational_upsert_capability_declarations,
+    )
+
+    declarations = (
+        relational_update_preview_capability_declarations(),
+        relational_update_capability_declarations(),
+        relational_upsert_capability_declarations(),
+    )
+    assert {view.name for bundle in declarations for view in bundle.tool_views} == {
+        "data_preview_update_rows",
+        "data_update_rows",
+        "data_preview_upsert_rows",
+        "data_upsert_rows",
+    }
+    for bundle in declarations:
+        assert bundle.domain_owner_id == "data"
+        for capability in bundle.capabilities:
+            assert "postgresql" not in capability.id
+            assert (
+                capability.automation_eligibility
+                is AutomationEligibility.AUTOMATION_DIRECT
+            )
+            if capability.access_mode is AccessMode.WRITE:
+                assert capability.operational_effect is OperationalEffect.MUTATE_DATA
+                assert capability.automation_grant_policy is not None
+                assert (
+                    capability.automation_grant_policy.constraints_kind
+                    == "data.relational_write"
+                )
+                assert capability.effect_receipt_policy is not None
+            else:
+                assert capability.operational_effect is OperationalEffect.NONE
+    assert {field.name for field in fields(daita.RelationalWriteScope)} == {
+        "agent_id",
+        "source_id",
+        "resource_id",
+        "resource_revision",
+        "allowed_operations",
+        "allowed_insert_columns",
+        "allowed_update_columns",
+        "key_columns",
+        "generated_identity_columns",
+        "max_rows",
+        "authorization_fingerprint",
+    }
+    assert not hasattr(daita, "PostgreSQLUpdateScope")
+    assert not (PACKAGE / "domains/data/sql/postgresql_update.py").exists()
+
+
+def test_product_recovery_and_permissions_keep_existing_execution_and_state_owners():
+    for relative in (
+        "tui/screens/effects.py",
+        "tui/screens/permissions.py",
+        "tui/screens/routines.py",
+    ):
+        tree = ast.parse((PACKAGE / relative).read_text(encoding="utf-8"))
+        imports = {
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+        assert not any(
+            module.startswith(
+                (
+                    "daita.storage",
+                    "daita.adapters",
+                    "daita.loop.driver",
+                    "daita.capability_runtime",
+                )
+            )
+            for module in imports
+        )
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert calls.isdisjoint(
+            {
+                "execute",
+                "execute_internal",
+                "reserve_effect_receipt",
+                "resolve_effect_receipt",
+                "connect",
+            }
+        )
+    controller = (PACKAGE / "tui/controller.py").read_text(encoding="utf-8")
+    for name in (
+        "inspect_effect",
+        "list_effects",
+        "resolve_effect",
+        "preview_source_permissions",
+        "apply_source_permissions",
+    ):
+        assert f"self.require_agent().{name}(" in controller
+    assert _class_owners("ApprovalPanel") == {"tui/widgets/approval.py"}
+    assert _class_owners("EffectResolution") == {"storage/sqlite_records.py"}
+    cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
+    assert "routine_inspection_projection" in cli
+    assert "def _routine_mapping" not in cli

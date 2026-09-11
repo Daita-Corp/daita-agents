@@ -28,11 +28,9 @@ from unittest.mock import patch
 
 import httpx
 import openai
-from _stream_boundary_support import live_probe_fixture
 from dotenv import dotenv_values
 from google import genai
 from google.genai import types
-from live.benchmarks._support import RecordingProvider
 
 from daita import Agent, AgentConfig, LocalWorkspace, LoopLimits, SQLiteSource
 from daita._json import canonical_json, thaw_json
@@ -64,6 +62,8 @@ from daita.llm.providers.openai import OpenAIResponsesProvider
 from daita.llm.routing import ModelRoute, ModelRouteCandidate, RetryPolicy
 from daita.loop.models import LoopExitKind, validate_completed_transcript
 from daita.security import SecretReference
+from tests.support.job_benchmarks import RecordingProvider
+from tests.support.stream_boundaries import live_probe_fixture
 
 MODELS = {"openai": "gpt-5.6-terra", "gemini": "gemini-3.5-flash"}
 ENDPOINTS = {
@@ -1019,8 +1019,8 @@ def code_manifest() -> dict:
         {
             Path("pyproject.toml"),
             Path(__file__),
-            Path("tests/_stream_boundary_support.py"),
-            Path("tests/live/benchmarks/_support.py"),
+            Path("tests/support/stream_boundaries.py"),
+            Path("tests/support/job_benchmarks.py"),
             *Path("src/daita").rglob("*.py"),
             *Path("src/daita/llm").glob("*.json"),
         }
