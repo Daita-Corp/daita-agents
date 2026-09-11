@@ -9,7 +9,7 @@ writes SQL.
 Updates can affect one row or many rows within the explicitly approved row ceiling (at most 10,000). Upserts permit one uniform batch of at most 1,000 rows, further narrowed by the permission and routine grant. PostgreSQL is the initial native backend.
 
 For release evaluation with real model generation and a disposable PostgreSQL
-database, see [live model acceptance](LIVE_LLM_ACCEPTANCE.md). Its evidence is
+database, see the [live model acceptance suite](../tests/live/data/test_model_write_acceptance.py). Its evidence is
 separate from the scripted-model database conformance suite.
 
 ## What Daita can update

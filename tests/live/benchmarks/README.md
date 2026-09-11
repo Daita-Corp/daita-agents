@@ -14,29 +14,28 @@ release-reviewed model matrix. Supply credentials through the generic
 
 | Module | Purpose | Explicit authorization | Maximum live interactions |
 | --- | --- | --- | --- |
-| `test_stage_b_paraphrases_live.py` | Natural user phrasing for reads, starts, global status, result recovery, and cancellation | `DAITA_RUN_LIVE_STAGE_B_PARAPHRASE_BENCHMARK=1` | 16 for the default model |
-| `test_stage_b_catalog_scale_live.py` | Exact resource selection among 16, 64, and 128 look-alike tables | `DAITA_RUN_LIVE_STAGE_B_CATALOG_BENCHMARK=1` | 6 for the default model |
-| `test_stage_b_model_matrix_live.py` | Per-model immediate, cross-conversation result, start, and cancel certification | `DAITA_RUN_LIVE_STAGE_B_MODEL_MATRIX=1` | 4 per configured model |
-| `test_stage_b_provider_failures.py` | Job independence after deterministic provider failures | none; no paid calls | 0 |
-| `test_stage_b_concurrency_soak.py` | Concurrent admission, claims, source limits, cancellation, fencing, and reopen | `DAITA_RUN_STAGE_B_CONCURRENCY_SOAK=1` | 0 |
+| `test_paraphrases.py` | Natural user phrasing for reads, starts, global status, result recovery, and cancellation | `DAITA_RUN_LIVE_STAGE_B_PARAPHRASE_BENCHMARK=1` | 16 for the default model |
+| `test_catalog_scale.py` | Exact resource selection among 16, 64, and 128 look-alike tables | `DAITA_RUN_LIVE_STAGE_B_CATALOG_BENCHMARK=1` | 6 for the default model |
+| `test_model_matrix.py` | Per-model immediate, cross-conversation result, start, and cancel certification | `DAITA_RUN_LIVE_STAGE_B_MODEL_MATRIX=1` | 4 per configured model |
 
 Run collection without paid calls:
 
 ```bash
-pytest tests/live/benchmarks --collect-only
+pytest tests/live/benchmarks --collect-only -o addopts="--tb=short -q --strict-markers"
 ```
 
-Run the deterministic failure contracts:
+Deterministic provider-failure and benchmark-support qualification live in the
+default owner suite:
 
 ```bash
-pytest tests/live/benchmarks/test_stage_b_provider_failures.py -v
+pytest tests/jobs/test_provider_failure_after_admission.py tests/jobs/test_benchmark_harness.py -v
 ```
 
 Run the deterministic soak explicitly:
 
 ```bash
 DAITA_RUN_STAGE_B_CONCURRENCY_SOAK=1 \
-pytest tests/live/benchmarks/test_stage_b_concurrency_soak.py -v
+pytest tests/slow/test_job_concurrency.py -o addopts="--tb=short -q --strict-markers" -v
 ```
 
 For a live module, export its exact authorization variable and benchmark API

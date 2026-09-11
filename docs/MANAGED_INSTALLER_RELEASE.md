@@ -49,7 +49,7 @@ production dependencies resolved from PyPI. Supply all verification arguments
 together:
 
 ```bash
-.venv/bin/python tests/managed_installer_lifecycle_smoke.py \
+.venv/bin/python -m tests.packaging.managed_installer_lifecycle_smoke \
   --candidate-wheel /absolute/path/to/the-once-built-candidate.whl \
   --real-uv-archive /absolute/path/to/the-verified-official-uv.tar.gz \
   --real-uv-version <version> \
@@ -64,7 +64,7 @@ the wheel metadata. The selected `uv` binary downloads the managed Python and
 resolves the wheel's declared production dependencies from PyPI.
 
 Run the same once-built candidate wheel through
-`tests/pipx_lifecycle_smoke.py`. Release verification also includes syntax,
+`python -m tests.packaging.pipx_lifecycle_smoke`. Release verification also includes syntax,
 shellcheck, deterministic tests, architecture checks, formatting, typing, and
 clean-machine tests on every platform for which support will be claimed.
 

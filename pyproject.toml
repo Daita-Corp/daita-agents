@@ -64,10 +64,10 @@ include = ["daita*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src", "tests"]
+pythonpath = ["src", "."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-addopts = "--tb=short -q"
+addopts = "--tb=short -q --strict-markers --ignore=tests/live --ignore=tests/slow"
 markers = [
     "unit: fast isolated tests",
     "contract: portable contract tests",
@@ -75,6 +75,8 @@ markers = [
     "acceptance: black-box public behavior tests",
     "requires_llm: requires live model credentials",
     "requires_db: requires an external database",
+    "requires_network: contacts a real external service; local injected/loopback fixtures do not require it",
+    "slow: extended deterministic local stress or soak coverage excluded from the default suite",
 ]
 
 [tool.black]
@@ -83,7 +85,7 @@ target-version = ["py311"]
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
-known-first-party = ["_shared"]
+known-first-party = ["_shared", "tests"]
 
 [tool.pyright]
 include = ["src/daita", "tests"]

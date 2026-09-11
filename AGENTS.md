@@ -679,32 +679,85 @@ Python 3.11 and 3.12 are supported.
 
 ## Tests and checks
 
-Run commands from the repository root:
+Tests live under `tests/`, organized by their current production owner. Use
+`docs/TESTING.md` for the directory map, marker meanings, live requirements and
+examples. Put multi-owner public journeys in `tests/acceptance/`, external-service
+cases in `tests/live/`, and extended offline soaks in
+`tests/slow/`. Default pytest runs exclude live tests and extended soaks.
+
+Before adding or changing a test:
+
+1. Identify the current contract, its production owner, the defect to detect,
+   and the observable failure.
+2. Search that owner's suite and the relevant public acceptance cases for existing
+   coverage. Extend an existing case or parameter family when it protects the
+   same boundary; do not add another test merely for a new task or milestone.
+3. Exercise the real component responsible for the contract. Mock only
+   dependencies outside the behavior being asserted. Prefer real local state or
+   adapters, or installed SDKs with injected transport when their behavior is
+   the subject.
+4. State expected behavior independently of the production implementation. A
+   scripted model can verify framework execution and response forwarding; it
+   cannot establish model reasoning, tool-choice quality or grounded answers.
+5. Cover distinct boundaries and failure states without repeating the same
+   scenario at every layer. Preserve authorization, cancellation, exact usage,
+   rollback, receipt uncertainty, restart and no-replay distinctions.
+6. Use a behavior-based filename and descriptive test name. Do not introduce
+   phase, stage, milestone or obsolete MVP labels into collection names.
+
+Each retained test must protect a distinct current contract or materially
+different failure scenario. Remove a redundant test only after identifying its
+retained coverage; remove an obsolete or tautological test with a recorded
+reason. Replace a weak oracle before removing the only coverage of necessary
+behavior. Never remove unique coverage to achieve a count target or hide a
+failing or flaky test.
+
+Do not assert documentation wording, comments, exact private variable names or
+source-statement counts as proxies for behavior. Keep narrowly scoped structural
+tests for real import/public-surface boundaries and exact schema/dependency
+contracts where those are requirements.
+
+Use explicit `tests.<owner>...` or `tests.support...` imports. Test modules and
+support code must not import other `test_*.py` modules or `conftest.py`. Keep
+reusable ordinary helpers in support modules and fixtures in the narrowest
+applicable `conftest.py`. Do not introduce global auto-approval, permission
+bypasses, synthetic tool-loading behavior or mutable shared agent state through
+autouse fixtures. Shared test abstractions follow the same three-current-call-site
+rule as other repository abstractions.
+
+Use the existing `unit`, `contract`, `integration`, and `acceptance` markers
+according to what the test actually exercises. Use `requires_llm`, `requires_db`,
+`requires_network`, and `slow` for actual execution requirements. Preserve
+explicit live authorization and per-run limits. Importing or collecting test or
+support modules must not contact external services or resolve credentials.
+
+`asyncio_mode = "auto"` is configured; do not add `@pytest.mark.asyncio`. Use
+deterministic clocks/events and bounded waits where appropriate. Keep resource
+cleanup explicit and fixtures narrowly scoped. Do not replace tests of actual
+timeout or transport-release behavior with mocks of the mechanism being verified.
+
+Run from the repository root:
 
 ```bash
-# Complete deterministic suite
 .venv/bin/python -m pytest
-
-# Focused test
-.venv/bin/python -m pytest tests/test_loop.py -v
-
-# Exclude live model and external database tests explicitly
-.venv/bin/python -m pytest tests/ -m "not requires_llm and not requires_db"
-
-# Formatting and static checks
+.venv/bin/python -m pytest tests/loop -v
+.venv/bin/python -m pytest tests/architecture
 .venv/bin/python -m black --check src tests
+.venv/bin/python -m ruff check --select I .
 .venv/bin/python -m mypy src/daita tests
 ```
 
-`asyncio_mode = "auto"` is configured in `pyproject.toml`; do not add
-`@pytest.mark.asyncio` to individual tests. Markers are `unit`, `contract`,
-`integration`, `acceptance`, `requires_llm`, and `requires_db`.
+Use focused red/green validation for changed contracts, then run the full
+deterministic suite for cross-cutting changes and test-suite reorganizations. For
+moves, splits or deletions, reconcile original and final collected node IDs,
+parameter cases and markers; report intentional removals and their reasons. Do
+not count a skipped, deselected or fake-only test as evidence of a live
+integration.
 
-Live tests require explicit authorization and credentials. Diagnose a
-deterministic failure offline before spending model or database resources.
-Use focused red/green tests while changing a contract, then run the complete
-deterministic suite when practical. Architecture changes also require
-`tests/test_architecture.py`.
+Live model, remote service and external database execution requires explicit
+authorization and credentials. Use the selection override and resource-specific
+gates documented in `docs/TESTING.md`. Diagnose deterministic failures offline
+before using external resources.
 
 ## Default production dependencies
 
@@ -791,7 +844,7 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/storage/sqlite_codecs/` | current record-family codecs |
 | `src/daita/storage/sqlite_migrations/` | checksummed migration engine |
 | `src/daita/llm/routing.py` | normalized provider routing |
-| `tests/test_architecture.py` | architecture and public-surface checks |
+| `tests/architecture/test_boundaries.py` | architecture and public-surface boundaries |
 
 ## Product control surfaces
 

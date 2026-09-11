@@ -145,7 +145,8 @@ cost:
 DAITA_RUN_POSTGRES_LARGE_FIXTURE=1 \
 DAITA_LARGE_POSTGRES_PASSWORD=daita_large_fixture_password \
 DAITA_LARGE_POSTGRES_WRITER_PASSWORD=daita_large_writer_fixture_password \
-.venv/bin/python -m pytest tests/test_postgres_large_fixture.py -v
+.venv/bin/python -m pytest tests/live/data/test_large_fixture.py \
+  -o addopts="--tb=short -q --strict-markers" -v
 ```
 
 ## Native write release checks
@@ -187,7 +188,8 @@ Run serially from the repository root:
 
 ```bash
 DAITA_RUN_POSTGRES_WRITE_RELEASE=1 \
-.venv/bin/python -m pytest tests/test_postgresql_write_release.py -v \
+.venv/bin/python -m pytest tests/live/data/test_write_release.py -v \
+  -o addopts="--tb=short -q --strict-markers" \
   -o junit_family=xunit1 --junitxml=/private/tmp/daita-postgresql-write-release.xml
 ```
 
@@ -216,9 +218,10 @@ Run those checks separately for the intended deployment where applicable.
 Without database authorization, validate the test harness offline:
 
 ```bash
-.venv/bin/python -m pytest tests/test_postgresql_write_release_harness.py \
-  tests/test_postgresql_write_fixture_contract.py -v
-.venv/bin/python -m pytest tests/test_postgresql_write_release.py --collect-only
+.venv/bin/python -m pytest tests/data/postgresql/test_write_release_harness.py \
+  tests/data/postgresql/test_write_fixture_contract.py -v
+.venv/bin/python -m pytest tests/live/data/test_write_release.py --collect-only \
+  -o addopts="--tb=short -q --strict-markers"
 ```
 
 Release evidence requires a passing authorized database run and review of its
@@ -227,7 +230,7 @@ offline harness checks alone do not establish release readiness.
 
 ## Live LLM decisions with this fixture
 
-The separate [live model acceptance suite](../../../docs/LIVE_LLM_ACCEPTANCE.md)
+The separate [live model acceptance suite](../../live/data/test_model_write_acceptance.py)
 uses actual API generation and the production router with these same canaries.
 It covers model-driven discovery, writes, refusals, failure interpretation,
 recovery and immediate/weekly routine authoring. It requires its own paid-run

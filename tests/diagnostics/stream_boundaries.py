@@ -17,7 +17,6 @@ from typing import Any, cast
 
 import httpx
 import openai
-from _stream_boundary_support import HARD_SECONDS, MODEL, READ_SECONDS, endpoint
 
 from daita.llm._lifecycle import NativeOwner, await_cleanup
 from daita.llm.errors import ModelProviderError, interrupted_attempt_diagnostic
@@ -33,6 +32,7 @@ from daita.llm.models import (
 )
 from daita.llm.providers.openai import OpenAIResponsesProvider
 from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
+from tests.support.stream_boundaries import HARD_SECONDS, MODEL, READ_SECONDS, endpoint
 
 
 async def probe(layer, scenario, read_timeout):
