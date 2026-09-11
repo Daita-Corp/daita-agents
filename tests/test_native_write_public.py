@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -11,11 +11,9 @@ from decimal import Decimal
 import pytest
 from _distribution_support import no_artifact_outcome_contract
 from _mcp_fixtures import (
-    MCPConformanceTransport,
     conformance_identities,
     mock_transport,
 )
-from _toolbox_model_support import ToolboxAwareMockModelProvider
 from _workspace_support import workspace_for
 from test_relational_upsert import Database
 
@@ -46,6 +44,7 @@ from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelProfile,
+    ModelRequest,
     ModelResponse,
     ModelUsage,
     ModelSensitivity,
@@ -78,19 +77,22 @@ class ScriptedResearchModel:
     )
 
     def __init__(self):
-        self.steps = []
-        self.requests = []
+        self.steps: list[ModelResponse | Callable[[ModelRequest], ModelResponse]] = []
+        self.requests: list[ModelRequest] = []
 
-    def replace_script(self, steps):
+    def replace_script(
+        self,
+        steps: Iterable[ModelResponse | Callable[[ModelRequest], ModelResponse]],
+    ) -> None:
         self.steps = list(steps)
 
-    def supports_request_policy(self, request):
+    def supports_request_policy(self, request: ModelRequest) -> bool:
         return True
 
-    def has_complete_pricing(self, request):
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
         return True
 
-    async def generate(self, request):
+    async def generate(self, request: ModelRequest) -> ModelResponse:
         self.requests.append(request)
         assert self.steps, "script exhausted"
         step = self.steps.pop(0)
@@ -307,7 +309,12 @@ async def test_initial_native_discovery_names_are_available_without_search_or_ac
         assert "load the needed preview and execution tools together" in system
         assert "data_upsert_rows" not in {tool.name for tool in request.tools}
         query = next(tool for tool in request.tools if tool.name == "data_query")
-        parameters = query.input_schema["properties"]["parameters"]["description"]
+        properties = query.input_schema["properties"]
+        assert isinstance(properties, Mapping)
+        parameters_schema = properties["parameters"]
+        assert isinstance(parameters_schema, Mapping)
+        parameters = parameters_schema["description"]
+        assert isinstance(parameters, str)
         assert "$1" in parameters and "SQLite" in parameters
         assert not await agent.list_effects()
         permission = await agent.preview_source_permissions(
@@ -524,7 +531,15 @@ async def test_update_review_preserves_exact_selection_and_rechecks_without_repl
         await agent.close()
 
 
-def script(provider, binding, batch, *, write=True, duplicate=False, schema=False):
+def script(
+    provider: ScriptedResearchModel,
+    binding,
+    batch,
+    *,
+    write=True,
+    duplicate=False,
+    schema=False,
+) -> None:
     research_name = binding.tools[0].local_name
 
     def apply(request):
@@ -552,7 +567,7 @@ def script(provider, binding, batch, *, write=True, duplicate=False, schema=Fals
             )
         )
 
-    steps = [
+    steps: list[ModelResponse | Callable[[ModelRequest], ModelResponse]] = [
         response(
             ToolCall(
                 id="load",
@@ -658,7 +673,16 @@ async def test_native_insert_discovery_keeps_catalog_and_export_queries_distinct
         for index, (query, expected, rank) in enumerate(cases):
             block = results[f"search-{index}"]
             assert block is not None and not block.is_error
-            names = [item["tool_name"] for item in block.output["data"]["matches"]]
+            data = block.output["data"]
+            assert isinstance(data, Mapping)
+            matches = data["matches"]
+            assert isinstance(matches, tuple)
+            names = []
+            for item in matches:
+                assert isinstance(item, Mapping)
+                tool_name = item["tool_name"]
+                assert isinstance(tool_name, str)
+                names.append(tool_name)
             assert expected in names[:rank], (query, names)
         assert not db.rows and not await agent.list_effects()
     finally:
@@ -1015,6 +1039,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
         inspection = await agent.inspect_routine(routine.routine_id)
         assert inspection is not None
         occurrence = inspection.recent_occurrences[0]
+        assert occurrence.reserved_run_id is not None
         if mode in {"success", "natural_schema", "model_schema"}:
             transcript = await agent._embedded._store.load(occurrence.reserved_run_id)
             assert (
@@ -1046,9 +1071,14 @@ async def test_immediate_and_weekly_research_upsert_production_path(
             )
             receipts = await agent._embedded._store.list_effect_receipts(agent.id)
             assert len(receipts) == 2
-            assert sorted(
-                receipt.payload["unchanged_count"] for receipt in receipts
-            ) == [0, 1]
+            unchanged_counts: list[int] = []
+            for receipt in receipts:
+                payload = receipt.payload
+                assert payload is not None
+                count = payload["unchanged_count"]
+                assert type(count) is int
+                unchanged_counts.append(count)
+            assert sorted(unchanged_counts) == [0, 1]
             assert len(research.calls) == 2
             for request in provider.requests[(5 if mode == "model_schema" else 1) :]:
                 system = "\n".join(
@@ -1074,6 +1104,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 == 2
             )
             for item in inspection.recent_occurrences:
+                assert item.reserved_run_id is not None
                 transcript = await agent._embedded._store.load(item.reserved_run_id)
                 results = [
                     block
@@ -1121,6 +1152,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                     terminal = await agent._embedded._store.result(
                         occurrence.reserved_run_id
                     )
+                    assert terminal is not None
                     assert terminal.reason == "cost_limit_reached"
                 assert not occurrence.effect_receipt_ids and not db.rows
             else:

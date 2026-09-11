@@ -771,12 +771,12 @@ def test_subscription_cli_separates_request_bytes_and_token_allowance():
 
     request = input_request(remaining=7000)
     document = _request_document(request, 8192)
+    assert request.max_total_tokens is not None
     assert len(document.encode("utf-8")) > request.max_total_tokens
     assert json.loads(document)["maximum_output_tokens"] == 7000
-    assert (
-        json.loads(document)["messages"][1]["content"][0]["text"]
-        == request.messages[1].content[0].text
-    )
+    original = request.messages[1].content[0]
+    assert isinstance(original, TextBlock)
+    assert json.loads(document)["messages"][1]["content"][0]["text"] == original.text
     with pytest.raises(ModelProviderError) as caught:
         _request_document(
             replace(request, max_estimated_cost_usd=Decimal("0.15")), 8192

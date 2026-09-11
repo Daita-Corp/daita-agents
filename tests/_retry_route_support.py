@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 from time import perf_counter
+from typing import Any
 
 import httpx
 import openai
@@ -32,7 +33,7 @@ class ConfiguredActionFixture(ActionFixture):
             limits=limits,
         )
 
-    def kwargs(self):
+    def kwargs(self) -> dict[str, Any]:
         arguments = super().kwargs()
         arguments.pop("model")
         arguments.pop("model_profile")

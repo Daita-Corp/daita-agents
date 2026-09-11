@@ -49,13 +49,14 @@ def usage(tokens=30, cost="0.01"):
     )
 
 
-async def invoke(provider, request, stream):
+async def invoke(provider, request, stream) -> ModelResponse:
     if not stream:
         return await provider.generate(request)
     completed = None
     async for event in provider.stream(request):
         if isinstance(event, ModelStreamCompleted):
             completed = event.response
+    assert completed is not None
     return completed
 
 
@@ -545,9 +546,11 @@ async def test_single_attempt_lazy_resolution_uses_request_deadline(stream):
     class Secrets:
         calls = 0
 
-        async def resolve(self, reference):
+        async def resolve(self, reference: SecretReference) -> str:
+            del reference
             self.calls += 1
             await asyncio.Event().wait()
+            raise AssertionError("unreachable")
 
     secrets = Secrets()
     profile = ModelProfile(

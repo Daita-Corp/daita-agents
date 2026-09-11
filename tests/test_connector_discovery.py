@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Mapping
 from dataclasses import replace
 from pathlib import Path
 from typing import TypedDict

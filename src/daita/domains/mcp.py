@@ -24,7 +24,6 @@ from ..adapters.mcp import (
     mcp_execution_origin_digest,
 )
 from ..capabilities import (
-    AccessMode,
     AutomationEligibility,
     AutomationGrantPolicy,
     Capability,

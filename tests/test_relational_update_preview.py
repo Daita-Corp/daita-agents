@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,7 +15,10 @@ from daita.adapters import (
 from daita.adapters.models import SourceRegistration, source_registration_id
 from daita.catalog.models import ResourceKind, TabularColumn
 from daita.domains.data.sql import RelationalUpdateIntent, ResourceSchema
-from daita.domains.data.capabilities import RelationalUpdateExecutor
+from daita.domains.data.capabilities import (
+    RelationalUpdateBackend,
+    RelationalUpdateExecutor,
+)
 from daita.capabilities import ToolExecution
 from daita._json import FrozenJsonObject, canonical_json
 from daita.security import EmptySecretProvider
@@ -373,9 +377,9 @@ async def test_update_preflight_retains_bounded_review_without_another_read(
             "expected_affected_rows": 8,
         },
     )
-    fingerprint = await RelationalUpdateExecutor("agent-preview", backend).preflight(
-        execution
-    )
+    fingerprint = await RelationalUpdateExecutor(
+        "agent-preview", cast(RelationalUpdateBackend, backend)
+    ).preflight(execution)
     review = fingerprint["review"]
     assert isinstance(review, FrozenJsonObject)
     assert review["matched_rows"] == 8

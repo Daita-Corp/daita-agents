@@ -15,6 +15,8 @@ from _workspace_support import workspace_for
 
 from daita import (
     Agent,
+    ApprovalDecision,
+    ApprovalRequest,
     IntervalSchedule,
     MisfirePolicy,
     ReportingMode,
@@ -320,7 +322,9 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
             conversation_id=origin.conversation_id,
         )
 
-        async def forbidden_confirmation(proposal):
+        async def forbidden_confirmation(
+            request: ApprovalRequest,
+        ) -> ApprovalDecision:
             raise AssertionError("an invalid revision must not request approval")
 
         for route in ("current", "unknown", provider.provider_id):

@@ -12,7 +12,6 @@ from _phase_f_live_support import (
     AUTHORIZATION,
     COST_ENV,
     DESTINATION,
-    EXPIRES,
     NEXT_SLOT,
     REPEATS_ENV,
     RESEARCH_TOKEN,

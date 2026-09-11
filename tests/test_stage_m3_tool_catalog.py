@@ -709,7 +709,7 @@ async def test_inspection_retrieves_large_contract_exactly_with_bounded_pages(sh
     digest: str | None = None
     count = 0
 
-    async def retrieve(path=""):
+    async def retrieve(path="") -> Any:
         nonlocal messages, digest, count
         offset = 0
         reconstructed: Any = None

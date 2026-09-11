@@ -8,7 +8,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
-from textual.widgets import Button, Input, OptionList, Static
+from textual.widgets import Input, OptionList, Static
 
 from daita import (
     Agent,
@@ -408,9 +408,8 @@ async def test_routine_control_api_reviews_exact_validated_revision_and_denial_s
                 draft=replace(draft, title="Revised assignment"),
                 confirmation_handler=fixture.approve,
             )
-        assert (
-            await fixture.agent.inspect_routine(routine.routine_id)
-        ).routine == routine
+        unchanged = await fixture.agent.inspect_routine(routine.routine_id)
+        assert unchanged is not None and unchanged.routine == routine
         assert (
             fixture.approvals[-1].arguments["proposal"]["title"] == "Revised assignment"
         )
@@ -559,9 +558,8 @@ async def test_cli_routine_mutations_request_human_confirmation_before_saving(
         if routine is None:
             assert await fixture.agent.list_routines() == ()
         else:
-            assert (
-                await fixture.agent.inspect_routine(routine.routine_id)
-            ).routine == routine
+            unchanged = await fixture.agent.inspect_routine(routine.routine_id)
+            assert unchanged is not None and unchanged.routine == routine
         assert fixture.server.calls == []
     finally:
         await fixture.agent.close()

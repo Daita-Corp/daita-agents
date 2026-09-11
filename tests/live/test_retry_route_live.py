@@ -17,7 +17,11 @@ from daita.loop.models import LoopExitKind, validate_completed_transcript
 from daita.security import SecretReference
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
 
-from .test_phase_f_mcp_live import pytestmark, model_id, repetition
+from .test_phase_f_mcp_live import (
+    model_id as model_id,
+    pytestmark as pytestmark,
+    repetition as repetition,
+)
 
 
 @pytest.fixture

@@ -10,7 +10,7 @@ import pytest
 from daita._json import FrozenJsonObject
 from daita.adapters import postgresql_write as native
 from daita.capabilities import CapabilityInputError, EffectOutcome, ToolExecution
-from daita.catalog.models import ResourceKind, TabularColumn, TabularIndex
+from daita.catalog.models import ResourceKind
 from daita.domains.data.sql import ResourceSchema
 from daita.domains.data.sql.relational_upsert import (
     RelationalUpsertIntent,
@@ -142,7 +142,7 @@ class Database:
         self.before_lock = None
         self.lock_error = None
         self.mutation_error = None
-        self.commit_error = None
+        self.commit_error: BaseException | None = None
         self.rollback_error = None
         self.bad_count = False
         self.guardrails = {

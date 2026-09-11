@@ -88,7 +88,6 @@ from .domains.data.controller import (
 from .domains.data.export_capabilities import (
     ARTIFACT_CONVERT_CAPABILITY_ID,
     ARTIFACT_CREATE_TABULAR_CAPABILITY_ID,
-    ARTIFACT_CREATE_TABULAR_TOOL_NAME,
     ARTIFACT_EDIT_TEXT_CAPABILITY_ID,
     ARTIFACT_LIST_CAPABILITY_ID,
     ARTIFACT_READ_CAPABILITY_ID,
@@ -96,7 +95,6 @@ from .domains.data.export_capabilities import (
     ARTIFACT_SAVE_LOCAL_TOOL_NAME,
     ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID,
     ARTIFACT_SET_EXPORT_LOCATION_TOOL_NAME,
-    DATA_EXPORT_TABULAR_TOOL_NAME,
     DOCUMENT_CREATE_CAPABILITY_ID,
 )
 from .domains.data.file_capabilities import (

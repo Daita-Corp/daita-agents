@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
+from typing import Any, cast
 
 import pytest
 from _capability_runtime_support import (
@@ -440,7 +441,9 @@ async def test_machine_calls_revalidate_retained_contracts_after_preparation(
 def test_scope_codec_rejects_missing_extra_and_malformed_execution_bindings() -> None:
     import copy
 
-    encoded = encode_execution_scope(_scheduled_scope(("test.scheduled",)))
+    encoded = cast(
+        dict[str, Any], encode_execution_scope(_scheduled_scope(("test.scheduled",)))
+    )
     binding_fields = encoded["fields"]["contract_bindings"]["fields"]
     for family in (
         "capability_contracts",
@@ -456,9 +459,9 @@ def test_scope_codec_rejects_missing_extra_and_malformed_execution_bindings() ->
             decode_execution_scope(altered)
     for invalid in ({}, {"test.scheduled": "not-a-digest"}):
         altered = copy.deepcopy(encoded)
-        altered["fields"]["contract_bindings"]["fields"][
-            "capability_contracts"
-        ] = invalid
+        altered["fields"]["contract_bindings"]["fields"]["capability_contracts"] = (
+            invalid
+        )
         with pytest.raises(ValueError):
             decode_execution_scope(altered)
     assert binding_fields["tool_origins"] == {}

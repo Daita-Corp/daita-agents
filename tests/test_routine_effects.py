@@ -11,7 +11,6 @@ import pytest
 from _capability_runtime_support import (
     StaticTestDomain,
     presentation_metadata,
-    static_registry,
 )
 from _distribution_support import no_artifact_outcome_contract
 from _toolbox_model_support import ToolboxAwareMockModelProvider
@@ -25,6 +24,7 @@ from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import (
     AccessMode,
     CapabilityInputError,
+    CapabilityRegistry,
     EffectEvidenceBasis,
     EffectOutcome,
     ExecutionContractBindings,
@@ -216,7 +216,6 @@ async def _assignment(
     )
     domain = _StandingDomain((capability,), (view,))
     executor = _RoutineExecutor(store=store, mode=mode, basis=basis)
-    registry = static_registry(domain, (executor,))
     from daita.domains.data.export_capabilities import (
         artifact_capability_declarations,
         DocumentArtifactExecutor,
@@ -297,6 +296,7 @@ async def _assignment(
             ),
         )
     model = ToolboxAwareMockModelProvider(script, complete_pricing=True)
+    registry: CapabilityRegistry | None = None
 
     async def read_contracts(**kwargs):
         assert (
@@ -305,9 +305,12 @@ async def _assignment(
             == kwargs["connector_binding_ids"]
             == ()
         )
+        current_registry = registry
+        assert current_registry is not None
         return ExecutionContractBindings(
             capability_contracts={
-                key: registry.contract_digest(key) for key in kwargs["capability_ids"]
+                key: current_registry.contract_digest(key)
+                for key in kwargs["capability_ids"]
             },
             model_routes={
                 key: "sha256:" + "c" * 64 for key in kwargs["model_route_ids"]
@@ -331,7 +334,6 @@ async def _assignment(
     from daita.capabilities import (
         ApprovalDecision,
         CapabilityDeclarations,
-        CapabilityRegistry,
     )
     from daita.routines.capabilities import (
         ROUTINE_DOMAIN_OWNER_ID,
@@ -665,6 +667,7 @@ async def test_durable_grant_ceiling_counts_a_distinct_second_operation(tmp_path
         occurrence = inspection.recent_occurrences[0]
         assert executor.calls == 1
         assert len(await store.list_effect_receipts("agent-effect")) == 1
+        assert occurrence.terminal_run_id is not None
         transcript = await store.load(occurrence.terminal_run_id)
         second = next(
             block

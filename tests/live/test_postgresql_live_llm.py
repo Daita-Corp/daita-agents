@@ -31,7 +31,7 @@ from _postgresql_live_llm_support import (
     repeats,
     report_path,
 )
-from test_postgresql_write_release import database, row, _TABLE
+from test_postgresql_write_release import _TABLE, database as database, row
 
 from daita import EffectRequirement, ScheduledRoutineDraft
 from daita._json import FrozenJsonObject

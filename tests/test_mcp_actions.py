@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from typing import Any
 
 import httpx
 import pytest
@@ -185,7 +186,7 @@ class ActionFixture:
         self.approvals.append(request)
         return self.decision
 
-    def kwargs(self):
+    def kwargs(self) -> dict[str, Any]:
         return dict(
             root=self.root,
             workspace=workspace_for(self.root),

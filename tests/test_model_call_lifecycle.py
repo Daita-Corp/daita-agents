@@ -306,8 +306,6 @@ async def test_cancel_resistant_attempt_returns_poisoned_and_rejects_replacement
 
 @pytest.mark.parametrize("mode", ["success", "failure", "timeout", "cancel"])
 async def test_terminal_usage_is_held_until_bounded_close(mode):
-    from types import SimpleNamespace
-
     from test_model_call_policy import request
     from test_provider_streaming import _openai_text_response
 
@@ -334,12 +332,17 @@ async def test_terminal_usage_is_held_until_bounded_close(mode):
                 raise RuntimeError("private failure")
             closed.append("finished")
 
-    async def create(**kwargs):
-        return Stream()
+    class Responses:
+        async def create(self, **kwargs: object) -> object:
+            return Stream()
 
-    provider = OpenAIResponsesProvider(
-        "test", client=SimpleNamespace(responses=SimpleNamespace(create=create))
-    )
+    class Client:
+        responses = Responses()
+
+        async def close(self) -> None:
+            pass
+
+    provider = OpenAIResponsesProvider("test", client=Client())
     policy = ModelCallPolicy(cleanup_timeout_seconds=0.05)
     events = []
 

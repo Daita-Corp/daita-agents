@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 
 from .models import ModelRequest, ModelResponse, ModelStreamEvent
 
@@ -56,7 +56,7 @@ async def closing_stream(
         throw = getattr(stream, "athrow", None)
         if callable(throw):
             try:
-                await throw(error)
+                await cast(Callable[[BaseException], Awaitable[object]], throw)(error)
             except asyncio.CancelledError as cancelled:
                 if cancelled is not error:
                     from .errors import (
@@ -191,7 +191,10 @@ class NativeStream:
     """
 
     def __init__(
-        self, owner: NativeOwner, source: AsyncIterator[_T], lifecycle=None
+        self,
+        owner: NativeOwner,
+        source: AsyncIterator[_T],
+        lifecycle: AttemptLifecycle | None = None,
     ) -> None:
         self._source = source
         self.lifecycle = lifecycle
@@ -236,19 +239,19 @@ class NativeStream:
         self._result = asyncio.get_running_loop().create_future()
         self._demand.set()
         timeout = None
-        if self.lifecycle is not None:
-            self.lifecycle.check_execution()
-            timeout = max(
-                0, self.lifecycle._expiry()[0] - asyncio.get_running_loop().time()
-            )
+        lifecycle = self.lifecycle
+        if lifecycle is not None:
+            lifecycle.check_execution()
+            timeout = max(0, lifecycle._expiry()[0] - asyncio.get_running_loop().time())
         done, _ = await asyncio.wait(
             (self._result, self.task),
             timeout=timeout,
             return_when=asyncio.FIRST_COMPLETED,
         )
         if not done:
-            self.lifecycle.timeout_reason = self.lifecycle._expiry()[1]
-            raise self.lifecycle._timeout_error()
+            assert lifecycle is not None
+            lifecycle.timeout_reason = lifecycle._expiry()[1]
+            raise lifecycle._timeout_error()
         if self._result in done:
             present, value = self._result.result()
             if present:

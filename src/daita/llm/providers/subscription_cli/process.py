@@ -304,6 +304,7 @@ async def _run_command(command: _Command) -> _CompletedCommand:
                     process, deadline=cleanup_limit, owner=command.native_owner
                 )
             )
+        assert cleanup_limit is not None
         try:
             await await_cleanup(
                 cleanup_task, deadline=cleanup_limit, owner=cleanup_owner

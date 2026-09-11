@@ -27,7 +27,12 @@ from daita.llm.models import CanonicalMessage, MessageRole, TextBlock, ModelSens
 from daita.distribution.models import OutcomeState
 
 # Shared opt-in and collection parameters; no import executes a provider.
-from .test_phase_f_mcp_live import pytestmark, model_id, repetition, evidence_path
+from .test_phase_f_mcp_live import (
+    evidence_path as evidence_path,
+    model_id as model_id,
+    pytestmark as pytestmark,
+    repetition as repetition,
+)
 
 
 async def test_live_owner_admitted_routine_runs_immediate_and_weekly(

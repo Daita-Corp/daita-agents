@@ -11,7 +11,6 @@ from .common import (
     datetime_decode,
     datetime_encode,
     dump_payload,
-    integer,
     load_payload,
     optional_datetime_decode,
     optional_datetime_encode,

@@ -14,7 +14,7 @@ import os
 import platform
 import re
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
@@ -198,9 +198,9 @@ class Evaluation:
         self.approvals = []
         self.expected_write = None
         self.deny_write = False
-        self.approval_hook = None
-        self.routine_contract = None
-        self.routine_grant = None
+        self.approval_hook: Callable[[], Awaitable[object]] | None = None
+        self.routine_contract: Mapping[str, object] | None = None
+        self.routine_grant: object | None = None
         self.recovery_digest = None
         self.conversation_id = None
 
@@ -420,10 +420,16 @@ class Evaluation:
         for key, value in self.routine_contract.items():
             actual = proposal.get(key)
             if key in {"per_run_max_cost_usd", "cumulative_max_cost_usd"}:
-                if not isinstance(actual, str) or Decimal(actual) != Decimal(value):
+                if (
+                    not isinstance(actual, str)
+                    or not isinstance(value, str)
+                    or Decimal(actual) != Decimal(value)
+                ):
                     return False
                 continue
             if key == "allowed_capability_ids" and isinstance(actual, tuple):
+                if not isinstance(value, (list, tuple)):
+                    return False
                 if self.profile == "user_flow":
                     # A user allowing this table does not prescribe the tool
                     # sequence. Permit ordinary reads of that exact frozen

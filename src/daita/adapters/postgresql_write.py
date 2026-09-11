@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, Protocol, cast
+from typing import Any, cast
 from uuid import UUID
 
 from .._json import (

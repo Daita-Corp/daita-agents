@@ -286,10 +286,13 @@ def test_live_config_preserves_router_budgets_and_lazy_secret_reference(monkeypa
         LIMITS.max_wall_time_seconds,
         LIMITS.max_estimated_cost_usd,
     ) == (14, 30000, 180, Decimal("0.15"))
-    assert config.model_route.retry_policy.max_attempts_per_candidate == 2
-    candidate = config.model_route.candidates[0]
+    route = config.model_route
+    assert route is not None
+    assert route.retry_policy.max_attempts_per_candidate == 2
+    candidate = route.candidates[0]
     assert candidate.profile.max_output_tokens == 2048
-    assert candidate.secret_reference.name == KEY_ENV
+    secret_reference = candidate.secret_reference
+    assert secret_reference is not None and secret_reference.name == KEY_ENV
     assert "offline-sentinel" not in repr(config)
     with pytest.raises(ValueError):
         live_config("mock:postgresql-write-release")
@@ -351,7 +354,8 @@ def test_live_matrix_bounds_are_explicit(monkeypatch, models, count):
     monkeypatch.setenv(MODEL_ENV, models)
     monkeypatch.setenv(REPEAT_ENV, count)
     with pytest.raises(ValueError):
-        model_ids(), repeats()
+        model_ids()
+        repeats()
 
 
 @pytest.mark.parametrize(
@@ -463,6 +467,8 @@ async def test_routine_approval_checks_grant_and_validated_proposal(tamper, prof
         "per_run_max_cost_usd": "0.15",
         "outcome_contract": {"effect_requirements": ["adapter_verified"]},
     }
+    assert scenario.routine_contract is not None
+    assert scenario.routine_grant is not None
     proposal = {
         **scenario.routine_contract,
         "capability_grants": [
