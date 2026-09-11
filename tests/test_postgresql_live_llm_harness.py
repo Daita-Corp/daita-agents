@@ -469,7 +469,7 @@ async def test_routine_approval_checks_grant_and_validated_proposal(tamper, prof
     }
     assert scenario.routine_contract is not None
     assert scenario.routine_grant is not None
-    proposal = {
+    proposal: dict[str, Any] = {
         **scenario.routine_contract,
         "capability_grants": [
             {

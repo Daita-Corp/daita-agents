@@ -211,9 +211,9 @@ async def test_retired_attempt_cannot_restart_or_accept_late_output(phase):
         life.progress("first")
     life.phase = phase
     prior_progress = life.last_progress
-    for action in (life.__aenter__,):
+    for async_action in (life.__aenter__,):
         with pytest.raises(RuntimeError):
-            await action()
+            await async_action()
     for action in (life.start_count, life.dispatch, lambda: life.response(None)):
         with pytest.raises(RuntimeError):
             action()
