@@ -528,8 +528,13 @@ class CatalogDataView:
         limit: int,
         source_ids: tuple[str, ...] = (),
         resource_ids: tuple[str, ...] = (),
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
+        """Project exact IDs or rank within a current-readable frozen ceiling."""
+
         readable = await self.readable_resource_ids(agent_id, source_ids)
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         unreadable_resource_id = next(
             (
                 resource_id

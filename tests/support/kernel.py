@@ -196,8 +196,10 @@ class _SnapshotCatalog:
         limit,
         source_ids=(),
         resource_ids=(),
+        readable_resource_ids=None,
     ):
-        del agent_id, query, prior_query, limit, source_ids, resource_ids
+        del agent_id, query, prior_query, limit
+        del source_ids, resource_ids, readable_resource_ids
         self.context_reads += 1
         return FrozenJsonObject.from_mapping(
             {

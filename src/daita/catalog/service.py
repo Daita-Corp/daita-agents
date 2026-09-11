@@ -2371,13 +2371,18 @@ class CatalogService:
         resource_ids: tuple[str, ...] = (),
         readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
+        """Project exact IDs, or query-rank indexes inside a resource ceiling."""
+
         request_limit = (
             CATALOG_MAX_LIMIT if resource_ids else min(limit, CATALOG_MAX_LIMIT)
         )
         current_request = CatalogSearchRequest(
             agent_id=agent_id,
             query=query,
-            source_ids=source_ids,
+            # This private request ranks only the indexes scoped below. Keeping
+            # its selector empty avoids applying the public 64-source request
+            # bound to a frozen run scope that may contain up to 256 sources.
+            source_ids=(),
             limit=request_limit,
         )
         prior_request = (
@@ -2386,7 +2391,7 @@ class CatalogService:
             else CatalogSearchRequest(
                 agent_id=agent_id,
                 query=prior_query,
-                source_ids=source_ids,
+                source_ids=(),
                 limit=request_limit,
             )
         )

@@ -5,6 +5,7 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -405,6 +406,96 @@ async def test_prepared_scope_rejects_late_attachment_and_new_resource_permissio
     narrowed = await resolve_effective_source_scope(prepared, catalog)
     assert narrowed.source_ids == frozenset({"first"})
     assert narrowed.resource_ids == frozenset({"first-row"})
+
+
+async def test_frozen_catalog_ceiling_blocks_expansion_and_revocation_narrows(
+    tmp_path: Path,
+):
+    database = tmp_path / "frozen-catalog-ceiling.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE frozen_record (id INTEGER PRIMARY KEY);
+            CREATE TABLE later_target (id INTEGER PRIMARY KEY);
+            """)
+    agent = await Agent.create(
+        "frozen-catalog-ceiling", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        resources = {
+            resource.name: resource
+            for resource in await agent.list_catalog_resources(source_id=source.id)
+        }
+
+        selected = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="selected",
+            read_resource_ids=(resources["frozen_record"].id,),
+            relational_write_scopes={},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=selected.confirmation_fingerprint,
+        )
+        run = RunInput(
+            "frozen-context",
+            agent.id,
+            "Compare frozen_record with later_target.",
+            datetime.now(UTC),
+        )
+        frozen_scope = await resolve_effective_source_scope(
+            run, agent._embedded._data_view
+        )
+        assert frozen_scope.resource_ids == frozenset({resources["frozen_record"].id})
+
+        expanded = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="all",
+            read_resource_ids=(),
+            relational_write_scopes={},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=expanded.confirmation_fingerprint,
+        )
+        expanded_context = await agent._embedded._data_view.catalog_context(
+            agent.id,
+            run.message,
+            limit=12,
+            source_ids=tuple(sorted(frozen_scope.source_ids)),
+            resource_ids=(),
+            readable_resource_ids=frozen_scope.resource_ids,
+        )
+        expanded_resources = expanded_context["resources"]
+        assert isinstance(expanded_resources, tuple)
+        expanded_records = cast(tuple[Mapping[str, object], ...], expanded_resources)
+        assert tuple(item["resource_id"] for item in expanded_records) == (
+            resources["frozen_record"].id,
+        )
+        assert resources["later_target"].id not in str(expanded_context)
+
+        revoked = await agent.preview_source_permissions(
+            source_id=source.id,
+            read_mode="none",
+            read_resource_ids=(),
+            relational_write_scopes={},
+        )
+        await agent.apply_source_permissions(
+            source_id=source.id,
+            confirmation_fingerprint=revoked.confirmation_fingerprint,
+        )
+        revoked_context = await agent._embedded._data_view.catalog_context(
+            agent.id,
+            run.message,
+            limit=12,
+            source_ids=tuple(sorted(frozen_scope.source_ids)),
+            resource_ids=(),
+            readable_resource_ids=frozen_scope.resource_ids,
+        )
+        assert revoked_context["resources"] == ()
+        assert revoked_context["total_matches"] == 0
+    finally:
+        await agent.close()
 
 
 async def test_prepared_empty_and_files_only_scope_never_expand():

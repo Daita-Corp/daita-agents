@@ -177,6 +177,7 @@ class CatalogContextReader(SourceScopeCatalog, Protocol):
         limit: int,
         source_ids: tuple[str, ...] = (),
         resource_ids: tuple[str, ...] = (),
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject: ...
 
 
@@ -725,7 +726,8 @@ class AgentContextBuilder:
                 prior_query=prior_catalog_query,
                 limit=self._catalog_limit,
                 source_ids=tuple(sorted(source_scope.source_ids)),
-                resource_ids=tuple(sorted(source_scope.resource_ids)),
+                resource_ids=(),
+                readable_resource_ids=source_scope.resource_ids,
             )
         catalog_payload = catalog.to_dict()
         source_presentations = (
