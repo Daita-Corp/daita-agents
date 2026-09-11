@@ -279,6 +279,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
             "Convert the workbook we just made to CSV and save it.",
             conversation_id=first.conversation_id,
         )
+        assert converted.kind.value == "completed", converted
         assert xlsx_id not in str(provider.requests[follow_up_request])
 
         listed = await _result(agent, converted.run_id, "list")

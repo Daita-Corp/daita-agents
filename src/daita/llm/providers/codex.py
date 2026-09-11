@@ -9,27 +9,26 @@ from datetime import datetime
 from typing import cast
 
 from ..._installation import repair_guidance
-from .._lifecycle import await_cleanup, closing_stream
+from .._lifecycle import (
+    AttemptLifecycle,
+    await_cleanup,
+    closing_stream,
+    shutdown_deadline,
+    transport_timeout,
+)
 from ..errors import (
     ModelProviderError,
     ProviderErrorCode,
-    ProviderFailureDiagnostic,
-    ProviderFailurePhase,
 )
 from ..models import ModelRequest, ModelResponse, ModelStreamCompleted
-from ..pricing import CostEstimate
+from ..pricing import CostEstimate, bound_request_output
 from ..subscription_auth import (
     CodexOAuthCredential,
     refresh_codex_subscription,
 )
-from .openai import OpenAIResponsesProvider, _OpenAIClient
+from .openai.adapter import OpenAIResponsesProvider, _OpenAIClient
 
 _CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
-_CODEX_ATTEMPT_TIMEOUT_SECONDS = 120.0
-_CODEX_CONNECT_TIMEOUT_SECONDS = 5.0
-_CODEX_READ_TIMEOUT_SECONDS = 45.0
-_CODEX_WRITE_TIMEOUT_SECONDS = 30.0
-_CODEX_POOL_TIMEOUT_SECONDS = 5.0
 
 
 class CodexSubscriptionProvider(OpenAIResponsesProvider):
@@ -75,11 +74,11 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
 
     @property
     def client(self) -> _OpenAIClient:
-        if self._close_task is not None:
+        if self._close.started:
             raise RuntimeError("Codex subscription provider is closed")
         if self._client is None:
             try:
-                from openai import AsyncOpenAI, Timeout
+                from openai import AsyncOpenAI
             except ImportError as error:
                 raise ImportError(
                     "Daita's OpenAI runtime dependency is unavailable. "
@@ -96,55 +95,54 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
                         "User-Agent": "daita",
                         "originator": "daita",
                     },
-                    timeout=Timeout(
-                        connect=_CODEX_CONNECT_TIMEOUT_SECONDS,
-                        read=_CODEX_READ_TIMEOUT_SECONDS,
-                        write=_CODEX_WRITE_TIMEOUT_SECONDS,
-                        pool=_CODEX_POOL_TIMEOUT_SECONDS,
-                    ),
+                    timeout=transport_timeout(),
                     max_retries=0,
                 ),
             )
-        return self._client
+        return super().client
 
-    async def _generate(self, request: ModelRequest) -> ModelResponse:
-        try:
-            async with asyncio.timeout(_CODEX_ATTEMPT_TIMEOUT_SECONDS):
-                await self._ensure_current_credential()
-                completed: ModelResponse | None = None
-                async with closing_stream(super()._stream(request)) as events:
-                    async for event in events:
-                        if isinstance(event, ModelStreamCompleted):
-                            completed = event.response
-                if completed is None:
-                    raise ModelProviderError(
-                        ProviderErrorCode.MALFORMED_RESPONSE,
-                        "Codex stream ended without a terminal response",
-                        provider_id=self.provider_id,
-                        diagnostic=ProviderFailureDiagnostic(
-                            phase=ProviderFailurePhase.STREAM_TERMINAL,
-                            code="terminal_completion_missing",
-                        ),
-                    )
-                return completed
-        except TimeoutError as error:
+    async def _generate(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelResponse:
+        attempt.observable = True
+        completed = None
+        async with closing_stream(super()._stream(request, attempt)) as events:
+            async for event in events:
+                if isinstance(event, ModelStreamCompleted):
+                    completed = attempt.response(event.response)
+                    break
+        if completed is None:
             raise ModelProviderError(
-                ProviderErrorCode.TIMEOUT,
-                "Codex subscription request exceeded its attempt deadline",
-                provider_id=self.provider_id,
-            ) from error
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "Codex stream ended without a terminal response",
+            )
+        attempt.check_execution()
+        return completed
 
-    async def _ensure_current_credential(self) -> None:
+    async def _ensure_current_credential(self, attempt: AttemptLifecycle) -> None:
         if not self._credential.needs_refresh:
             return
-        async with self._refresh_lock:
+        try:
+            async with asyncio.timeout_at(attempt.request.attempt_deadline):
+                await self._refresh_lock.acquire()
+        except TimeoutError:
+            attempt.check_execution()
+            raise
+        try:
             if not self._credential.needs_refresh:
                 return
-            refreshed = await refresh_codex_subscription(self._credential)
+            refreshed = await attempt.run_native(
+                refresh_codex_subscription(self._credential)
+            )
+            attempt.check_execution()
             updater = self._credential_updater
             if updater is not None:
                 try:
-                    await updater(refreshed.to_secret())
+                    # Credential persistence is caller-task work; it never enters a
+                    # potentially unresolved native-task owner.
+                    async with asyncio.timeout_at(attempt.request.attempt_deadline):
+                        await updater(refreshed.to_secret())
+                    attempt.check_execution()
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
@@ -156,9 +154,20 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
             self._api_key = refreshed.access_token
             if self._owns_client:
                 previous_client = self._client
-                self._client = None
                 if previous_client is not None:
-                    await await_cleanup(asyncio.create_task(previous_client.close()))
+                    await await_cleanup(
+                        asyncio.create_task(previous_client.close()),
+                        deadline=min(
+                            cast(float, attempt.request.attempt_deadline),
+                            shutdown_deadline(
+                                seconds=attempt.policy.cleanup_timeout_seconds
+                            ),
+                        ),
+                        owner=self._native_owner,
+                    )
+                self._client = None
+        finally:
+            self._refresh_lock.release()
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
         arguments = super()._request_arguments(request)
@@ -186,6 +195,25 @@ class CodexSubscriptionProvider(OpenAIResponsesProvider):
         if request.tools:
             arguments["tool_choice"] = "auto"
         return arguments
+
+    async def _admit_request(
+        self,
+        request: ModelRequest,
+        arguments: dict[str, object],
+        attempt: AttemptLifecycle,
+        *,
+        requested_at: datetime,
+    ) -> int | None:
+        await self._ensure_current_credential(attempt)
+        # ChatGPT's subscription endpoint has neither the API token-count
+        # resource nor a wire output cap. Retain usage-based loop stopping;
+        # never send subscription credentials to the public counting endpoint.
+        bound_request_output(
+            request,
+            input_tokens=None,
+            maximum_output_tokens=self._max_output_tokens or 1024,
+        )
+        return None
 
     def _decode_response(
         self,

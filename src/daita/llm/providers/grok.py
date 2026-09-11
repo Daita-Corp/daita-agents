@@ -8,10 +8,10 @@ from decimal import Decimal
 
 from ..models import ModelRequest, ModelUsage
 from ..pricing import provider_reported_cost_estimate
-from .openai_compatible import (
+from ._fields import field as _field
+from .openai_compatible.adapter import (
     OpenAICompatibleProvider,
     _decode_usage,
-    _field,
     _OpenAICompatibleClient,
 )
 
@@ -42,7 +42,9 @@ class GrokProvider(OpenAICompatibleProvider):
     def has_complete_pricing(self, request: ModelRequest) -> bool:
         if not isinstance(request, ModelRequest):
             raise TypeError("request must be a canonical ModelRequest")
-        return True
+        # The response reports a charge, but supplies no rate contract with
+        # which to admit an as-yet unbilled request against a cost ceiling.
+        return False
 
     def _decode_usage(self, value: object) -> ModelUsage:
         usage = _decode_usage(value)

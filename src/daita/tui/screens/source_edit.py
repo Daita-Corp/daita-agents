@@ -71,9 +71,9 @@ class SourceEditScreen(Screen[bool]):
 
     async def _load_initial_source(self) -> None:
         controller = self.app.controller  # type: ignore[attr-defined]
-        source = await controller.active_source()
-        if source is not None:
-            self._load_source(source)
+        sources = tuple(item for item in await controller.list_sources() if item.active)
+        if len(sources) == 1:
+            self._load_source(sources[0])
             return
         await self._choose_source()
 
@@ -302,7 +302,7 @@ class SourceEditScreen(Screen[bool]):
             lines.append(f"Not carried forward: {shown}{suffix}")
         if preview.adapter_id == "postgresql":
             lines.append(
-                "PostgreSQL update access: none; exact scopes must be enabled again"
+                "PostgreSQL update/upsert access: none; exact scopes must be enabled again"
             )
         lines.append("A new conversation will start; existing history is retained.")
         accepted = await self.app._await_modal(  # type: ignore[attr-defined]

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
+
+if TYPE_CHECKING:
+    from .adapters.mcp import MCPServerBinding
 
 from ._json import FrozenJsonObject
 from .adapters.job_profiles import ConnectedJobProfile
@@ -23,7 +26,7 @@ from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
 )
-from .adapters.postgresql_write import PostgreSQLUpdateReadiness
+from .adapters.postgresql_write import RelationalUpdateReadiness
 from .adapters.protocols import (
     ResourceAdapterError as SourceRefreshError,
     ResourceSource,
@@ -55,7 +58,6 @@ from .hosting.embedded import (
     SourceEditConfirmationHandler,
     SourceEditPreview as SourceEditPreview,
     SourceEditResult,
-    SourceSelectionError,
 )
 from .jobs.models import (
     JobExecutionMode,
@@ -93,6 +95,8 @@ from .semantics import (
 )
 from .skills import Skill, SkillSummary
 from .storage.sqlite_records import (
+    EffectReceipt,
+    EffectResolutionDecision,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
     SourceReadMode,
@@ -321,14 +325,14 @@ class Agent:
         message: str,
         *,
         conversation_id: str | None = None,
-        source_id: str | None = None,
+        source_scope_ids: tuple[str, ...] = (),
         files_only: bool = False,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
             message,
             conversation_id=conversation_id,
-            source_id=source_id,
+            source_scope_ids=source_scope_ids,
             files_only=files_only,
             job_executor_profile_id=job_executor_profile_id,
         )
@@ -338,14 +342,14 @@ class Agent:
         message: str,
         *,
         conversation_id: str | None = None,
-        source_id: str | None = None,
+        source_scope_ids: tuple[str, ...] = (),
     ) -> LoopExit:
         """Run one explicit user-authorized foreground learning action."""
 
         return await self._embedded.learn(
             message,
             conversation_id=conversation_id,
-            source_id=source_id,
+            source_scope_ids=source_scope_ids,
         )
 
     async def transcript(self, run_id: str) -> Transcript:
@@ -411,6 +415,36 @@ class Agent:
     ) -> tuple[JobSummary, ...]:
         return await self._embedded.list_jobs(statuses=statuses, limit=limit)
 
+    async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
+        """Inspect one exact agent-owned external-effect receipt."""
+        return await self._embedded.inspect_effect(receipt_id)
+
+    async def list_effects(
+        self, *, unresolved_only: bool = False, limit: int = 20, offset: int = 0
+    ) -> tuple[EffectReceipt, ...]:
+        """Read one bounded page of external-effect evidence."""
+        return await self._embedded.list_effects(
+            unresolved_only=unresolved_only, limit=limit, offset=offset
+        )
+
+    async def resolve_effect(
+        self,
+        receipt_id: str,
+        *,
+        expected_digest: str,
+        decision: EffectResolutionDecision,
+        note: str,
+        evidence_references: tuple[str, ...] = (),
+    ) -> EffectReceipt:
+        """Request exact foreground recovery approval without retrying any action."""
+        return await self._embedded.resolve_effect(
+            receipt_id,
+            expected_digest=expected_digest,
+            decision=decision,
+            note=note,
+            evidence_references=evidence_references,
+        )
+
     async def inspect_job(self, job_id: str) -> JobInspection | None:
         return await self._embedded.inspect_job(job_id)
 
@@ -434,8 +468,16 @@ class Agent:
             basis_run_id=basis_run_id,
         )
 
-    async def create_routine(self, proposal: ScheduledRoutine) -> ScheduledRoutine:
-        return await self._embedded.create_routine(proposal)
+    async def create_routine(
+        self,
+        proposal: ScheduledRoutine,
+        *,
+        confirmation_handler: ApprovalHandler | None = None,
+    ) -> ScheduledRoutine:
+        """Authorize an exact owner proposal, optionally reviewing it before admission."""
+        return await self._embedded.create_routine(
+            proposal, confirmation_handler=confirmation_handler
+        )
 
     async def list_routines(
         self,
@@ -457,12 +499,14 @@ class Agent:
         expected_revision: int,
         draft: ScheduledRoutineDraft,
         basis_run_id: str | None = None,
+        confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
         return await self._embedded.update_routine(
             routine_id,
             expected_revision=expected_revision,
             draft=draft,
             basis_run_id=basis_run_id,
+            confirmation_handler=confirmation_handler,
         )
 
     async def pause_routine(
@@ -537,36 +581,26 @@ class Agent:
     async def reset_export_destination(self) -> ArtifactDestination:
         return await self._embedded.reset_export_destination()
 
-    async def active_source(
-        self,
-        *,
-        conversation_id: str | None = None,
-    ) -> SourceRegistration | None:
-        """Return the default or conversation-pinned active source."""
-
-        return await self._embedded.active_source(conversation_id=conversation_id)
-
     async def resolve_source(self, selector: str) -> SourceRegistration:
         """Resolve one active source ID, display name, or display-name alias."""
 
         return await self._embedded.resolve_source(selector)
 
-    async def select_source(self, selector: str) -> SourceRegistration:
-        """Persist one source as the default for subsequent conversations."""
-
-        return await self._embedded.select_source(selector)
-
     async def read_memory(self) -> str:
         return await self._embedded.read_memory()
 
-    async def set_memory(self, text: str) -> None:
-        await self._embedded.set_memory(text)
+    async def set_memory(
+        self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    ) -> None:
+        await self._embedded.set_memory(text, sensitivity=sensitivity)
 
     async def read_user_profile(self) -> str:
         return await self._embedded.read_user_profile()
 
-    async def set_user_profile(self, text: str) -> None:
-        await self._embedded.set_user_profile(text)
+    async def set_user_profile(
+        self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    ) -> None:
+        await self._embedded.set_user_profile(text, sensitivity=sensitivity)
 
     async def review_learning_candidates(
         self,
@@ -682,8 +716,12 @@ class Agent:
         name: str,
         description: str,
         instructions: str,
+        *,
+        sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED,
     ) -> bool:
-        return await self._embedded.save_skill(name, description, instructions)
+        return await self._embedded.save_skill(
+            name, description, instructions, sensitivity=sensitivity
+        )
 
     async def delete_skill(self, name: str) -> bool:
         return await self._embedded.delete_skill(name)
@@ -709,6 +747,11 @@ class Agent:
         local_label: str | None = None,
         binding_id: str | None = None,
     ) -> MCPBindingStatus:
+        """Admit exact locally classified tools; actions default to per-call approval.
+
+        Remote metadata never supplies authority. Unattended eligibility needs an
+        explicit local selection and a separately approved routine grant.
+        """
         return await self._embedded.attach_mcp_server(
             endpoint=endpoint,
             selections=selections,
@@ -716,6 +759,31 @@ class Agent:
             maximum_outbound_sensitivity=maximum_outbound_sensitivity,
             local_label=local_label,
             binding_id=binding_id,
+        )
+
+    async def update_mcp_discovery(
+        self,
+        binding_id: str,
+        *,
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...] = (),
+    ) -> MCPServerBinding:
+        """Edit local hints; reopened MCP discovery uses them without a new admission revision."""
+        return await self._embedded.update_mcp_discovery(
+            binding_id, summary=summary, when_to_use=when_to_use, keywords=keywords
+        )
+
+    async def update_source_discovery(
+        self,
+        source_id: str,
+        *,
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...] = (),
+    ) -> SourceRegistration:
+        return await self._embedded.update_source_discovery(
+            source_id, summary=summary, when_to_use=when_to_use, keywords=keywords
         )
 
     async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
@@ -872,7 +940,7 @@ class Agent:
         source_id: str,
         read_mode: SourceReadMode | str,
         read_resource_ids: tuple[str, ...],
-        postgresql_update_scopes: Mapping[str, Sequence[str]],
+        relational_write_scopes: Mapping[str, Mapping[str, object]],
     ) -> SourcePermissionsPreview:
         """Preview one exact final scope state without changing durable state."""
 
@@ -890,26 +958,20 @@ class Agent:
             for resource_id in read_resource_ids
         ):
             raise TypeError("read_resource_ids must be a tuple of non-empty strings")
-        if not isinstance(postgresql_update_scopes, Mapping):
-            raise TypeError("postgresql_update_scopes must be a mapping")
-        normalized_updates: dict[str, tuple[str, ...]] = {}
-        for resource_id, columns in postgresql_update_scopes.items():
-            if not isinstance(resource_id, str) or not resource_id:
-                raise ValueError("update scope resource ids must be non-empty strings")
-            if isinstance(columns, (str, bytes)) or not isinstance(
-                columns,
-                (list, tuple),
-            ):
-                raise TypeError("update scope columns must be lists or tuples")
-            normalized = tuple(columns)
-            if any(not isinstance(column, str) or not column for column in normalized):
-                raise TypeError("update scope columns must be non-empty strings")
-            normalized_updates[resource_id] = normalized
+        if not isinstance(relational_write_scopes, Mapping):
+            raise TypeError("relational_write_scopes must be a mapping")
+        if any(
+            not isinstance(resource_id, str) or not isinstance(value, Mapping)
+            for resource_id, value in relational_write_scopes.items()
+        ):
+            raise TypeError(
+                "relational_write_scopes must map exact resource IDs to explicit write constraints"
+            )
         return await self._embedded.preview_source_permissions(
             source_id=source_id,
             read_mode=read_mode,
             read_resource_ids=read_resource_ids,
-            postgresql_update_scopes=normalized_updates,
+            relational_write_scopes=relational_write_scopes,
         )
 
     async def apply_source_permissions(
@@ -932,12 +994,25 @@ class Agent:
             confirmation_fingerprint=confirmation_fingerprint,
         )
 
-    async def postgresql_update_readiness(
+    async def relational_upsert_readiness(
+        self, source_id: str, resource_id: str
+    ) -> Mapping[str, object]:
+        """Inspect exact admitted upsert structure and privileges without writing."""
+        if (
+            not isinstance(source_id, str)
+            or not source_id
+            or not isinstance(resource_id, str)
+            or not resource_id
+        ):
+            raise ValueError("upsert readiness requires exact source and resource IDs")
+        return await self._embedded.relational_upsert_readiness(source_id, resource_id)
+
+    async def relational_update_readiness(
         self,
         source_id: str,
         resource_id: str,
         assignment_columns: tuple[str, ...],
-    ) -> PostgreSQLUpdateReadiness:
+    ) -> RelationalUpdateReadiness:
         """Return bounded non-mutating readiness for one exact update scope."""
 
         if not isinstance(source_id, str) or not source_id:
@@ -946,7 +1021,7 @@ class Agent:
             raise ValueError("resource_id must be a non-empty string")
         if not isinstance(assignment_columns, tuple):
             raise TypeError("assignment_columns must be a tuple")
-        return await self._embedded.postgresql_update_readiness(
+        return await self._embedded.relational_update_readiness(
             source_id,
             resource_id,
             assignment_columns,
@@ -1032,6 +1107,5 @@ __all__ = [
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
     "SourceRefreshError",
-    "SourceSelectionError",
     "CatalogSummary",
 ]

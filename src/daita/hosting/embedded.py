@@ -18,8 +18,11 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Self, TypedDict, TypeVar, cast
+from typing import TYPE_CHECKING, Self, TypedDict, TypeVar, cast
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from ..adapters.mcp import MCPServerBinding
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.job_profiles import ConnectedJobProfile
@@ -34,13 +37,14 @@ from ..adapters.mcp import (
     StreamableHTTPMCPClientFactory,
     mcp_binding_drift_reason,
     mcp_binding_from_inspection,
+    mcp_execution_origin_digest,
 )
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
 from ..adapters.postgresql_query import PostgreSQLQueryBackend
 from ..adapters.postgresql_write import (
-    PostgreSQLUpdatePreviewBackend,
-    PostgreSQLUpdateReadiness,
+    PostgreSQLWriteBackend,
+    RelationalUpdateReadiness,
 )
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
@@ -62,9 +66,15 @@ from ..autonomy import (
 )
 from ..capabilities import (
     AccessMode,
+    ApprovalDecision,
     ApprovalHandler,
+    ApprovalRequest,
     CapabilityDeclarations,
+    CapabilityInputError,
     CapabilityRegistry,
+    EffectOutcome,
+    ExecutionContractBindings,
+    ExecutionContractReader,
     OperationalEffect,
 )
 from ..capability_runtime import CapabilityRuntime
@@ -85,6 +95,7 @@ from ..catalog.models import (
 )
 from ..catalog.service import CatalogService
 from ..config import AgentConfig
+from ..context import AgentContextBuilder, _project_completed_history
 from ..distribution import (
     DISTRIBUTION_DOMAIN_OWNER_ID,
     DeliveryInspection,
@@ -105,16 +116,15 @@ from ..domains.data import (
     ArtifactCapabilityDomain,
     CatalogDataView,
     DataCapabilityDomain,
-    DataContextBuilder,
     artifact_declarations,
     data_export_tabular_declarations,
     data_query_declarations,
     local_file_declarations,
-    postgresql_update_declarations,
-    postgresql_update_preview_declarations,
+    relational_update_declarations,
+    relational_update_preview_declarations,
+    relational_upsert_declarations,
     resource_revision_observation_declarations,
 )
-from ..domains.data.context import _project_completed_history
 from ..domains.data.controller import DATA_DOMAIN_OWNER_ID
 from ..domains.data.profile_jobs import (
     DATA_PROFILE_DOMAIN_OWNER_ID,
@@ -123,7 +133,7 @@ from ..domains.data.profile_jobs import (
     data_profile_declarations,
 )
 from ..domains.data.sql import (
-    validate_postgresql_update_scope,
+    validate_relational_write_scope,
 )
 from ..domains.learning import LearningCandidateGuard
 from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
@@ -159,9 +169,11 @@ from ..learning_candidates import (
 from ..llm.errors import ModelProviderError, ProviderErrorCode
 from ..llm.factory import create_model_route_provider
 from ..llm.models import (
+    _DEFAULT_CALL_POLICY,
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelCallPolicy,
     ModelProfile,
     ModelRequest,
     ModelSensitivity,
@@ -170,6 +182,11 @@ from ..llm.models import (
 )
 from ..llm.profiles import reviewed_model_profile
 from ..llm.protocols import ManagedModelProvider, ModelProvider
+from ..llm.provider_definitions import (
+    AuthenticationMode,
+    admit_model_selection,
+    provider_definition,
+)
 from ..llm.routing import (
     ModelProviderRegistration,
     ModelRoute,
@@ -209,6 +226,7 @@ from ..routines.capabilities import (
 from ..routines.models import (
     MisfirePolicy,
     ReportingMode,
+    RequestedCapabilityGrant,
     ResourceRevisionObservation,
     ResourceRevisionPrecheck,
     RoutineControlAction,
@@ -220,8 +238,9 @@ from ..routines.models import (
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
 )
-from ..routines.owner import RoutineError, RoutineOwner
+from ..routines.owner import RoutineError, RoutineOwner, routine_approval_arguments
 from ..routines.supervisor import RoutineSupervisor
+from ..scope import resolve_effective_source_scope
 from ..security import (
     CredentialSession,
     KeychainSecretProvider,
@@ -248,7 +267,10 @@ from ..skills.capabilities import (
 )
 from ..storage.sqlite import SQLiteStateStore
 from ..storage.sqlite_records import (
-    PostgreSQLUpdateScope,
+    EffectReceipt,
+    EffectResolution,
+    EffectResolutionDecision,
+    RelationalWriteScope,
     SourcePermissionResource,
     SourcePermissionsInspection,
     SourcePermissionsPreview,
@@ -256,7 +278,8 @@ from ..storage.sqlite_records import (
     SourcePermissionSummary,
     SourceReadMode,
     SourceReadScope,
-    postgresql_update_authorization_fingerprint,
+    relational_write_authorization_fingerprint,
+    validate_effect_receipt_id,
 )
 from ..workspace import LocalWorkspace
 
@@ -285,6 +308,8 @@ class _RoutineDraftValues(TypedDict):
     maximum_consecutive_failures: int
     expires_at: datetime
     skill_names: tuple[str, ...]
+    requested_capability_grants: tuple[RequestedCapabilityGrant, ...]
+    run_immediately: bool
 
 
 def _routine_draft_values(draft: ScheduledRoutineDraft) -> _RoutineDraftValues:
@@ -312,6 +337,8 @@ def _routine_draft_values(draft: ScheduledRoutineDraft) -> _RoutineDraftValues:
         "maximum_consecutive_failures": draft.maximum_consecutive_failures,
         "expires_at": draft.expires_at,
         "skill_names": draft.skill_names,
+        "requested_capability_grants": draft.requested_capability_grants,
+        "run_immediately": draft.run_immediately,
     }
 
 
@@ -332,13 +359,7 @@ _MODEL_VALIDATION_TOOL_NAME = "daita_validate_tool_support"
 _MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 16
 _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
 _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
-_PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _SOURCE_ALIAS_SEPARATOR = re.compile(r"[^a-z0-9]+")
-_SUBSCRIPTION_PROVIDERS = frozenset({"codex", "claude-code", "grok-build"})
-_SUBSCRIPTION_CREDENTIAL_PROVIDERS = frozenset({"codex"})
-_BUILTIN_PROVIDERS = frozenset(
-    {"openai", "anthropic", "gemini", "grok", "ollama", *_SUBSCRIPTION_PROVIDERS}
-)
 _T = TypeVar("_T")
 _STAGE_C_ALLOWED_CAPABILITY_IDS = (
     CATALOG_INSPECT_CAPABILITY_ID,
@@ -381,6 +402,134 @@ def _stage_c_model_routes(
     return (model.provider_id,)
 
 
+def _model_execution_contracts(
+    model: ModelProvider | None,
+    profile: ModelProfile | None,
+    route: ModelRoute | None,
+    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
+) -> dict[str, str]:
+    """Digest declared non-secret execution configuration, never SDK state."""
+
+    if route is not None:
+        material = _encode_agent_config(AgentConfig(model_route=route))["model_route"]
+        route_ids = tuple(candidate.provider_id for candidate in route.candidates)
+    elif isinstance(model, ModelRouter):
+        material = {
+            "candidates": [
+                {
+                    "provider_id": candidate.provider.provider_id,
+                    "profile": _encode_model_profile(candidate.profile),
+                    "allowed_sensitivities": sorted(
+                        item.value for item in candidate.allowed_sensitivities
+                    ),
+                }
+                for candidate in model.candidates
+            ],
+            "retry_policy": {
+                "max_attempts_per_candidate": model.retry_policy.max_attempts_per_candidate,
+                "max_total_attempts": model.retry_policy.max_total_attempts,
+                "backoff_seconds": model.retry_policy.backoff_seconds,
+            },
+        }
+        route_ids = tuple(
+            candidate.provider.provider_id for candidate in model.candidates
+        )
+    elif model is not None and profile is not None:
+        material = {
+            "provider_id": model.provider_id,
+            "profile": _encode_model_profile(profile),
+        }
+        route_ids = (model.provider_id,)
+    else:
+        return {}
+    return {
+        route_id: "sha256:"
+        + hashlib.sha256(
+            canonical_json(
+                {
+                    "route_id": route_id,
+                    "execution_configuration": material,
+                    "model_call_policy": _encode_call_policy(call_policy),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+        for route_id in route_ids
+    }
+
+
+async def _current_execution_contracts(
+    store: SQLiteStateStore,
+    registry: CapabilityRegistry,
+    model_contracts: Mapping[str, str],
+    *,
+    agent_id: str,
+    source_ids: tuple[str, ...],
+    resource_ids: tuple[str, ...],
+    capability_ids: tuple[str, ...],
+    connector_binding_ids: tuple[str, ...],
+    model_route_ids: tuple[str, ...],
+) -> ExecutionContractBindings:
+    """Read exact current structural/admission references at the composition boundary."""
+
+    identity = await store.load_identity()
+    if identity is None or identity.id != agent_id:
+        raise ValueError("execution contract agent identity changed")
+    resources: dict[str, str] = {}
+    for resource_id in resource_ids:
+        resource = await store.load_resource(agent_id, resource_id)
+        if (
+            resource is None
+            or resource.agent_id != agent_id
+            or resource.source_id not in source_ids
+        ):
+            raise ValueError("execution contract resource identity changed")
+        resources[resource_id] = resource.current_revision
+    expected_origins = {
+        view.capability_id: view.origin_revision_digest
+        for name in registry.tool_names
+        for view, _ in (registry.resolve_tool(name),)
+        if view.origin_revision_digest is not None
+        and view.capability_id in capability_ids
+    }
+    origins: dict[str, str] = {}
+    for binding_id in connector_binding_ids:
+        binding = await store.load_mcp_binding(agent_id, binding_id)
+        if (
+            binding is None
+            or binding.agent_id != agent_id
+            or binding.state is not MCPBindingState.ACTIVE
+        ):
+            raise ValueError("execution contract MCP binding is unavailable")
+        for tool in binding.tools:
+            if tool.capability_id not in capability_ids:
+                continue
+            origin = mcp_execution_origin_digest(binding, tool)
+            if (
+                expected_origins.get(tool.capability_id) != origin
+                or tool.capability_id in origins
+            ):
+                raise ValueError("execution contract MCP origin changed")
+            origins[tool.capability_id] = origin
+    result = ExecutionContractBindings(
+        capability_contracts={
+            capability_id: registry.contract_digest(capability_id)
+            for capability_id in capability_ids
+        },
+        tool_origins=origins,
+        resource_revisions=resources,
+        model_routes={
+            route_id: model_contracts[route_id] for route_id in model_route_ids
+        },
+    )
+    result.validate_coverage(
+        capability_ids=capability_ids,
+        resource_ids=resource_ids,
+        route_ids=model_route_ids,
+        mcp_capability_ids=expected_origins,
+    )
+    return result
+
+
 def _safe_followup_failure_code(error: Exception) -> str:
     candidate = getattr(error, "code", None)
     if not isinstance(candidate, str):
@@ -403,17 +552,15 @@ def _resolve_source_selector(
     sources: tuple[SourceRegistration, ...],
 ) -> SourceRegistration:
     if not isinstance(selector, str) or not (candidate := selector.strip()):
-        raise SourceSelectionError("Source selector must be non-empty terminal text.")
+        raise ValueError("Source selector must be non-empty terminal text.")
     try:
         encoded_length = len(candidate.encode("utf-8"))
     except UnicodeEncodeError:
-        raise SourceSelectionError(
-            "Source selector must be non-empty terminal text."
-        ) from None
+        raise ValueError("Source selector must be non-empty terminal text.") from None
     if encoded_length > 1_024 or any(
         ord(character) < 32 or ord(character) == 127 for character in candidate
     ):
-        raise SourceSelectionError("Source selector must be non-empty terminal text.")
+        raise ValueError("Source selector must be non-empty terminal text.")
     exact_id = tuple(source for source in sources if source.id == candidate)
     if exact_id:
         return exact_id[0]
@@ -425,13 +572,11 @@ def _resolve_source_selector(
         or _source_alias(source.display_name) == folded
     }
     if not matches:
-        raise SourceSelectionError(
+        raise ValueError(
             "No active source matches that name. Use /sources to list choices."
         )
     if len(matches) > 1:
-        raise SourceSelectionError(
-            "That source name is ambiguous. Use /source to choose one."
-        )
+        raise ValueError("That source name is ambiguous. Use /source to choose one.")
     return next(iter(matches.values()))
 
 
@@ -465,10 +610,6 @@ class HostActiveError(AgentHomeError):
 
 class AgentNotConfiguredError(AgentHomeError):
     pass
-
-
-class SourceSelectionError(AgentError, ValueError):
-    """A requested source is missing, ambiguous, or outside current admission."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -568,6 +709,7 @@ class EmbeddedAgent:
         catalog_service: CatalogService,
         data_view: CatalogDataView,
         capability_runtime: CapabilityRuntime,
+        approval_handler: ApprovalHandler | None,
         job_owner: JobOwner,
         routine_owner: RoutineOwner,
         routine_supervisor: RoutineSupervisor,
@@ -575,14 +717,15 @@ class EmbeddedAgent:
         data_profile_admission: DataProfileAdmission,
         followup_wake: asyncio.Event,
         followup_model_routes: tuple[str, ...],
+        execution_contract_reader: ExecutionContractReader,
         data_profile_job_domain: DataProfileCapabilityDomain,
         learning_candidate_guard: LearningCandidateGuard,
         semantic_domain: SemanticCapabilityDomain,
-        postgresql_update_backend: PostgreSQLUpdatePreviewBackend,
+        relational_update_backend: PostgreSQLWriteBackend,
         memory_store: MemoryStore,
         skill_store: SkillStore,
         candidate_reviewer: OneShotCandidateReviewer,
-        data_context_builder: DataContextBuilder | None,
+        context_builder: AgentContextBuilder | None,
         files_only_run_ids: set[str],
         artifact_store: AgentHomeArtifactStore,
         artifact_delivery: LocalArtifactDelivery | None,
@@ -593,6 +736,7 @@ class EmbeddedAgent:
         model_route: ModelRoute | None,
         owned_model_provider: ManagedModelProvider | None,
         limits: LoopLimits,
+        model_call_policy: ModelCallPolicy,
         secret_provider: SecretProvider,
         keychain: CredentialSession,
         owns_credential_session: bool,
@@ -610,6 +754,7 @@ class EmbeddedAgent:
         self.model_route = model_route
         self._owned_model_provider = owned_model_provider
         self._limits = limits
+        self._model_call_policy = model_call_policy
         self._secret_provider = secret_provider
         self._keychain = keychain
         self._owns_credential_session = owns_credential_session
@@ -627,6 +772,7 @@ class EmbeddedAgent:
         self._catalog_service = catalog_service
         self._data_view = data_view
         self._capability_runtime = capability_runtime
+        self._approval_handler = approval_handler
         self._job_owner = job_owner
         self._routine_owner = routine_owner
         self._routine_supervisor = routine_supervisor
@@ -634,15 +780,16 @@ class EmbeddedAgent:
         self._data_profile_admission = data_profile_admission
         self._followup_wake = followup_wake
         self._followup_model_routes = followup_model_routes
+        self._execution_contract_reader = execution_contract_reader
         self._followup_driver: asyncio.Task[None] | None = None
         self._data_profile_job_domain = data_profile_job_domain
         self._learning_candidate_guard = learning_candidate_guard
         self._semantic_domain = semantic_domain
-        self._postgresql_update_backend = postgresql_update_backend
+        self._relational_update_backend = relational_update_backend
         self._memory_store = memory_store
         self._skill_store = skill_store
         self._candidate_reviewer = candidate_reviewer
-        self._data_context_builder = data_context_builder
+        self._context_builder = context_builder
         self._files_only_run_ids = files_only_run_ids
         self._artifact_store = artifact_store
         self._artifact_delivery = artifact_delivery
@@ -798,12 +945,14 @@ class EmbeddedAgent:
             keychain
         )
         runtime_secrets = secret_provider or credential_session
-        model, model_profile, model_route, limits = _resolve_configuration(
-            config,
-            model=model,
-            model_profile=model_profile,
-            limits=limits,
-            secret_provider=runtime_secrets,
+        model, model_profile, model_route, limits, model_call_policy = (
+            _resolve_configuration(
+                config,
+                model=model,
+                model_profile=model_profile,
+                limits=limits,
+                secret_provider=runtime_secrets,
+            )
         )
         _validate_custom_loop(model, model_profile, context_builder, tools)
         (home, writer_lock), cancelled = await _await_sync_completion(
@@ -869,6 +1018,7 @@ class EmbeddedAgent:
                 context_builder=context_builder,
                 tools=tools,
                 limits=limits,
+                model_call_policy=model_call_policy,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
                 secret_provider=runtime_secrets,
@@ -952,12 +1102,14 @@ class EmbeddedAgent:
             tools=tools,
         )
         if explicit_configuration:
-            model, model_profile, model_route, limits = _resolve_configuration(
-                config,
-                model=model,
-                model_profile=model_profile,
-                limits=limits,
-                secret_provider=runtime_secrets,
+            model, model_profile, model_route, limits, model_call_policy = (
+                _resolve_configuration(
+                    config,
+                    model=model,
+                    model_profile=model_profile,
+                    limits=limits,
+                    secret_provider=runtime_secrets,
+                )
             )
         else:
             model = None
@@ -1006,12 +1158,14 @@ class EmbeddedAgent:
                 )
                 if cancelled:
                     raise asyncio.CancelledError
-                model, model_profile, model_route, limits = _resolve_configuration(
-                    persisted,
-                    model=None,
-                    model_profile=None,
-                    limits=limit_override,
-                    secret_provider=runtime_secrets,
+                model, model_profile, model_route, limits, model_call_policy = (
+                    _resolve_configuration(
+                        persisted,
+                        model=None,
+                        model_profile=None,
+                        limits=limit_override,
+                        secret_provider=runtime_secrets,
+                    )
                 )
             artifact_store = await AgentHomeArtifactStore.open(
                 agent_id=identity.id,
@@ -1048,6 +1202,7 @@ class EmbeddedAgent:
                 context_builder=context_builder,
                 tools=tools,
                 limits=limits,
+                model_call_policy=model_call_policy,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
                 secret_provider=runtime_secrets,
@@ -1089,6 +1244,7 @@ class EmbeddedAgent:
         context_builder: ContextBuilder | None,
         tools: ToolRuntime | None,
         limits: LoopLimits,
+        model_call_policy: ModelCallPolicy,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         secret_provider: SecretProvider,
@@ -1134,20 +1290,22 @@ class EmbeddedAgent:
             if artifact_store.available
             else None
         )
-        postgresql_preview_backend = PostgreSQLUpdatePreviewBackend(
+        postgresql_preview_backend = PostgreSQLWriteBackend(
             store,
             data_view,
             secret_provider or keychain,
-            receipt_store=store,
             clock=clock,
         )
-        postgresql_preview = postgresql_update_preview_declarations(
+        postgresql_preview = relational_update_preview_declarations(
             identity.id,
             postgresql_preview_backend,
         )
-        postgresql_update = postgresql_update_declarations(
+        relational_update = relational_update_declarations(
             identity.id,
             postgresql_preview_backend,
+        )
+        relational_upsert = relational_upsert_declarations(
+            identity.id, postgresql_preview_backend
         )
         routine_precheck = resource_revision_observation_declarations(
             agent_id=identity.id,
@@ -1200,6 +1358,7 @@ class EmbeddedAgent:
             profile=resolved_reviewer_profile,
             max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
             clock=clock,
+            call_policy=model_call_policy,
         )
         memory = memory_set_declarations(memory_store)
         skills = skill_declarations(skill_store)
@@ -1242,7 +1401,8 @@ class EmbeddedAgent:
                     else ()
                 ),
                 *postgresql_preview.capabilities,
-                *postgresql_update.capabilities,
+                *relational_update.capabilities,
+                *relational_upsert.capabilities,
                 *routine_precheck.capabilities,
                 *(local_files.capabilities if local_files is not None else ()),
             ),
@@ -1257,7 +1417,8 @@ class EmbeddedAgent:
                         else ()
                     ),
                     *postgresql_preview.capabilities,
-                    *postgresql_update.capabilities,
+                    *relational_update.capabilities,
+                    *relational_upsert.capabilities,
                     *routine_precheck.capabilities,
                     *(local_files.capabilities if local_files is not None else ()),
                 )
@@ -1271,7 +1432,8 @@ class EmbeddedAgent:
                     else ()
                 ),
                 *postgresql_preview.tool_views,
-                *postgresql_update.tool_views,
+                *relational_update.tool_views,
+                *relational_upsert.tool_views,
                 *(local_files.tool_views if local_files is not None else ()),
             ),
         )
@@ -1322,6 +1484,8 @@ class EmbeddedAgent:
             data_view,
             learning_candidate_guard,
             relational_export_available=relational_export is not None,
+            transcript_loader=store.load,
+            upsert_readiness=postgresql_preview_backend.upsert_readiness,
             workspace_id=(
                 None if workspace_backend is None else workspace_backend.workspace_id
             ),
@@ -1399,7 +1563,8 @@ class EmbeddedAgent:
             *relational_query.executors,
             *(relational_export.executors if relational_export is not None else ()),
             *postgresql_preview.executors,
-            *postgresql_update.executors,
+            *relational_update.executors,
+            *relational_upsert.executors,
             *routine_precheck.executors,
             *(local_files.executors if local_files is not None else ()),
             *memory.executors,
@@ -1426,7 +1591,33 @@ class EmbeddedAgent:
             distribution_declaration_bundle,
             distribution_owner,
         )
+        model_contracts = _model_execution_contracts(
+            model, model_profile, model_route, model_call_policy
+        )
+
+        async def read_execution_contracts(
+            *,
+            agent_id: str,
+            source_ids: tuple[str, ...],
+            resource_ids: tuple[str, ...],
+            capability_ids: tuple[str, ...],
+            connector_binding_ids: tuple[str, ...],
+            model_route_ids: tuple[str, ...],
+        ) -> ExecutionContractBindings:
+            return await _current_execution_contracts(
+                store,
+                capabilities,
+                model_contracts,
+                agent_id=agent_id,
+                source_ids=source_ids,
+                resource_ids=resource_ids,
+                capability_ids=capability_ids,
+                connector_binding_ids=connector_binding_ids,
+                model_route_ids=model_route_ids,
+            )
+
         routine_owner = RoutineOwner(
+            execution_contract_reader=read_execution_contracts,
             agent_id=identity.id,
             store=store,
             catalog=data_view,
@@ -1489,17 +1680,28 @@ class EmbeddedAgent:
         )
         if artifact_domain is not None:
             artifact_domain.bind_capability_registry(capabilities)
+        data_domain.bind_capability_registry(capabilities)
         routine_owner.bind_capability_registry(capabilities)
+
+        async def resolve_run_sources(run: RunInput):
+            return await resolve_effective_source_scope(
+                run, data_view, files_only=run.id in files_only_run_ids
+            )
+
         capability_runtime = CapabilityRuntime(
             capabilities,
             domains,
+            effect_receipts=store,
+            execution_contract_reader=read_execution_contracts,
             approval_handler=approval_handler,
             mutation_lock=mutation_lock,
+            source_scope_resolver=resolve_run_sources,
             observer=observer,
             clock=clock,
             artifacts=artifact_store,
             limits=limits,
         )
+        routine_owner.bind_grant_preparer(capability_runtime.prepare_automation_grant)
         followup_wake = asyncio.Event()
         job_supervisor = JobSupervisor(
             agent_id=identity.id,
@@ -1521,11 +1723,14 @@ class EmbeddedAgent:
         resolved_tools = tools
         if model is not None and resolved_context is None:
             assert model_profile is not None
-            resolved_context = DataContextBuilder(
+            resolved_context = AgentContextBuilder(
                 data_view,
                 profile=model_profile,
+                routine_authoring_facts=routine_owner.authoring_facts,
+                effect_receipts=store,
                 memory=memory_store,
                 skills=skill_store,
+                scheduled_skill_bindings=skill_domain.scheduled_bindings,
                 semantics=store,
                 explicit_learning_requested=semantic_domain.explicit_learning_requested,
                 artifact_destinations=(
@@ -1553,6 +1758,7 @@ class EmbeddedAgent:
                 tools=_require_value(resolved_tools),
                 transcripts=transcripts,
                 limits=limits,
+                model_call_policy=model_call_policy,
                 clock=clock,
                 observer=observer,
                 stream_model_calls=(
@@ -1593,10 +1799,9 @@ class EmbeddedAgent:
                     )
                     if not conversation_exists:
                         raise ValueError("routine_destination_conversation_missing")
-                    prior_messages = _project_completed_history(
-                        conversation,
-                        older_history_exists=older_history_exists,
-                    )
+                    # An approved routine is self-contained. The conversation
+                    # owns its inbox destination, not its reasoning context.
+                    prior_messages: tuple[CanonicalMessage, ...] = ()
                     prepared = await loop.prepare(
                         run_input,
                         prior_messages=prior_messages,
@@ -1650,6 +1855,7 @@ class EmbeddedAgent:
             catalog_service=catalog_service,
             data_view=data_view,
             capability_runtime=capability_runtime,
+            approval_handler=approval_handler,
             job_owner=job_owner,
             routine_owner=routine_owner,
             routine_supervisor=routine_supervisor,
@@ -1657,23 +1863,24 @@ class EmbeddedAgent:
             data_profile_admission=data_profile_admission,
             followup_wake=followup_wake,
             followup_model_routes=_stage_c_model_routes(model, model_route),
+            execution_contract_reader=read_execution_contracts,
             data_profile_job_domain=data_profile_job_domain,
             learning_candidate_guard=learning_candidate_guard,
             semantic_domain=semantic_domain,
-            postgresql_update_backend=postgresql_preview_backend,
+            relational_update_backend=postgresql_preview_backend,
             memory_store=memory_store,
             skill_store=skill_store,
             candidate_reviewer=candidate_reviewer,
-            data_context_builder=(
+            context_builder=(
                 resolved_context
-                if isinstance(resolved_context, DataContextBuilder)
+                if isinstance(resolved_context, AgentContextBuilder)
                 else None
             ),
             files_only_run_ids=files_only_run_ids,
             artifact_store=artifact_store,
             artifact_delivery=artifact_delivery,
             candidate_acceptance_supported=(
-                isinstance(resolved_context, DataContextBuilder)
+                isinstance(resolved_context, AgentContextBuilder)
                 and resolved_tools is capability_runtime
             ),
             mutation_lock=mutation_lock,
@@ -1682,6 +1889,7 @@ class EmbeddedAgent:
             model_route=model_route,
             owned_model_provider=owned_model_provider,
             limits=limits,
+            model_call_policy=model_call_policy,
             secret_provider=secret_provider,
             keychain=keychain,
             owns_credential_session=owns_credential_session,
@@ -1715,7 +1923,11 @@ class EmbeddedAgent:
         """Run one provider-owned subscription login without persisting it."""
 
         self._require_open()
-        if provider != "codex":
+        definition = provider_definition(provider)
+        if (
+            definition is None
+            or definition.authentication is not AuthenticationMode.CODEX_SUBSCRIPTION
+        ):
             raise ValueError(
                 "integrated subscription login is available only for Codex"
             )
@@ -1742,14 +1954,16 @@ class EmbeddedAgent:
         """
 
         provider_name, model_name, endpoint, requires_credential = (
-            _admit_model_selection(
+            admit_model_selection(
                 provider,
                 model,
                 base_url,
             )
         )
+        definition = provider_definition(provider_name)
         requires_subscription_credential = (
-            provider_name in _SUBSCRIPTION_CREDENTIAL_PROVIDERS
+            definition is not None
+            and definition.authentication is AuthenticationMode.CODEX_SUBSCRIPTION
         )
         if requires_subscription_credential:
             if api_key is not None:
@@ -1809,7 +2023,11 @@ class EmbeddedAgent:
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
             )
-            replacement = AgentConfig(model_route=route, limits=self._limits)
+            replacement = AgentConfig(
+                model_route=route,
+                limits=self._limits,
+                model_call_policy=self._model_call_policy,
+            )
             committed = False
             try:
                 if reference is not None:
@@ -1825,6 +2043,7 @@ class EmbeddedAgent:
                     route,
                     secret_provider=self._secret_provider or self._keychain,
                     injected_provider=self._model_validator,
+                    call_policy=self._model_call_policy,
                 )
                 await _await_sync_completion(
                     lambda: _write_model_configuration(self.home, replacement)
@@ -1858,14 +2077,14 @@ class EmbeddedAgent:
         message: str,
         *,
         conversation_id: str | None = None,
-        source_id: str | None = None,
+        source_scope_ids: tuple[str, ...] = (),
         files_only: bool = False,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._run(
             message,
             conversation_id=conversation_id,
-            source_id=source_id,
+            source_scope_ids=source_scope_ids,
             files_only=files_only,
             job_executor_profile_id=job_executor_profile_id,
         )
@@ -1875,14 +2094,14 @@ class EmbeddedAgent:
         message: str,
         *,
         conversation_id: str | None = None,
-        source_id: str | None = None,
+        source_scope_ids: tuple[str, ...] = (),
     ) -> LoopExit:
         """Run one explicit user-authorized foreground learning action."""
 
         return await self._run(
             message,
             conversation_id=conversation_id,
-            source_id=source_id,
+            source_scope_ids=source_scope_ids,
             explicit_learning=True,
         )
 
@@ -1891,7 +2110,7 @@ class EmbeddedAgent:
         message: str,
         *,
         conversation_id: str | None = None,
-        source_id: str | None = None,
+        source_scope_ids: tuple[str, ...] = (),
         learning_candidate_id: str | None = None,
         learning_candidate_text: str | None = None,
         learning_candidate: LearningCandidate | None = None,
@@ -1901,14 +2120,14 @@ class EmbeddedAgent:
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
-        if source_id is not None and (
-            not isinstance(source_id, str) or not source_id.strip()
+        if not isinstance(source_scope_ids, tuple) or any(
+            not isinstance(item, str) or not item.strip() for item in source_scope_ids
         ):
-            raise ValueError("source_id must be a non-empty string or None")
+            raise ValueError("source_scope_ids must be a tuple of exact source IDs")
         if not isinstance(files_only, bool):
             raise TypeError("files_only must be bool")
-        if files_only and source_id is not None:
-            raise ValueError("files_only and source_id are mutually exclusive")
+        if files_only and source_scope_ids:
+            raise ValueError("files_only and source_scope_ids are mutually exclusive")
         if files_only and job_executor_profile_id is not None:
             raise ValueError(
                 "files_only and job_executor_profile_id are mutually exclusive"
@@ -1943,7 +2162,7 @@ class EmbeddedAgent:
                 loop,
                 message,
                 conversation_id=conversation_id,
-                source_id=source_id,
+                source_scope_ids=source_scope_ids,
                 files_only=files_only,
                 learning_candidate_id=learning_candidate_id,
                 learning_candidate_text=learning_candidate_text,
@@ -1958,7 +2177,7 @@ class EmbeddedAgent:
         message: str,
         *,
         conversation_id: str | None,
-        source_id: str | None,
+        source_scope_ids: tuple[str, ...],
         learning_candidate_id: str | None,
         learning_candidate_text: str | None,
         learning_candidate: LearningCandidate | None,
@@ -1971,10 +2190,10 @@ class EmbeddedAgent:
 
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
-        if source_id is not None and (
-            not isinstance(source_id, str) or not source_id.strip()
+        if not isinstance(source_scope_ids, tuple) or any(
+            not isinstance(item, str) or not item.strip() for item in source_scope_ids
         ):
-            raise ValueError("source_id must be a non-empty string or None")
+            raise ValueError("source_scope_ids must be a tuple of exact source IDs")
         if self._model_reopen_required:
             raise AgentNotConfiguredError(
                 "model configuration changed; close and reopen required"
@@ -1997,49 +2216,16 @@ class EmbeddedAgent:
             raise ValueError("unknown conversation for this agent")
         if not supplied_conversation and conversation_exists:
             raise ValueError("generated conversation id already exists")
-        conversation_source_id = (
-            await self._store.conversation_source_id(
-                self.identity.id,
-                resolved_conversation,
-            )
-            if supplied_conversation
-            else await self._store.load_active_source_id(self.identity.id)
-        )
-        active_sources = tuple(
-            source
+        active_ids = {
+            source.id
             for source in await self._store.list_sources(self.identity.id)
             if source.active
-        )
-        if conversation_source_id is None and len(active_sources) == 1:
-            conversation_source_id = active_sources[0].id
-        effective_source_id = (
-            None
-            if files_only
-            else (
-                source_id.strip() if source_id is not None else conversation_source_id
-            )
-        )
-        if not files_only and active_sources and effective_source_id is None:
-            raise SourceSelectionError(
-                "Multiple data sources are attached. Select one with /source "
-                "before asking a question."
-            )
-        if effective_source_id is not None and not any(
-            source.id == effective_source_id for source in active_sources
-        ):
-            raise SourceSelectionError(
-                "The selected data source is not active for this agent."
-            )
-        scoped_conversation = tuple(
-            item
-            for item in conversation
-            if item.transcript.run.source_id == effective_source_id
-        )
+        }
+        if not set(source_scope_ids) <= active_ids:
+            raise ValueError("A requested source is not active for this agent")
         prior_messages = _project_completed_history(
-            scoped_conversation,
-            older_history_exists=(
-                older_history_exists or len(scoped_conversation) < len(conversation)
-            ),
+            conversation,
+            older_history_exists=older_history_exists,
         )
         run_input = RunInput(
             id=run_id or self._id_factory("run"),
@@ -2047,8 +2233,16 @@ class EmbeddedAgent:
             message=message.strip(),
             created_at=self._clock(),
             conversation_id=resolved_conversation,
-            source_id=effective_source_id,
-            conversation_source_id=conversation_source_id,
+            source_scope_ids=source_scope_ids,
+            history_sensitivity=max(
+                (
+                    item.result.sensitivity
+                    for item in conversation
+                    if item.result is not None
+                ),
+                key=lambda item: item.routing_rank,
+                default=ModelSensitivity.PUBLIC,
+            ),
         )
         if job_executor_profile_id is not None:
             self._data_profile_job_domain.select_connected_executor(
@@ -2056,14 +2250,15 @@ class EmbeddedAgent:
                 job_executor_profile_id.strip(),
             )
         if learning_candidate_id is not None:
-            if self._data_context_builder is None:
+            if self._context_builder is None:
                 raise AgentHomeError(
-                    "learning candidate acceptance requires DataContextBuilder"
+                    "learning candidate acceptance requires AgentContextBuilder"
                 )
-            self._data_context_builder.select_learning_candidate(
+            self._context_builder.select_learning_candidate(
                 run_input.id,
                 learning_candidate_id,
                 cast(str, learning_candidate_text),
+                cast(LearningCandidate, learning_candidate).sensitivity,
             )
             self._learning_candidate_guard.select(
                 run_input.id,
@@ -2076,6 +2271,12 @@ class EmbeddedAgent:
                 raise AgentHomeError("files_only requires an admitted local workspace")
             self._files_only_run_ids.add(run_input.id)
         try:
+            run_input = replace(
+                run_input,
+                resolved_source_scope=await resolve_effective_source_scope(
+                    run_input, self._data_view, files_only=files_only
+                ),
+            )
             return await loop.run(
                 run_input,
                 prior_messages=prior_messages,
@@ -2084,8 +2285,8 @@ class EmbeddedAgent:
             if self._artifact_delivery is not None:
                 self._artifact_delivery.end_run(run_input.id)
             if learning_candidate_id is not None:
-                assert self._data_context_builder is not None
-                self._data_context_builder.clear_learning_candidate(run_input.id)
+                assert self._context_builder is not None
+                self._context_builder.clear_learning_candidate(run_input.id)
                 self._learning_candidate_guard.clear(run_input.id)
             if explicit_learning:
                 self._semantic_domain.clear_explicit_learning_run(run_input.id)
@@ -2101,7 +2302,7 @@ class EmbeddedAgent:
     def _start_followup_driver(self) -> None:
         if (
             self._loop is None
-            or self._data_context_builder is None
+            or self._context_builder is None
             or self._limits.max_estimated_cost_usd is None
             or not self._followup_model_routes
         ):
@@ -2175,8 +2376,22 @@ class EmbeddedAgent:
         jobs = await self._store.list_unbound_terminal_daita_jobs(self.identity.id)
         for job in jobs:
             try:
+                contracts = await self._execution_contract_reader(
+                    agent_id=self.identity.id,
+                    source_ids=job.source_ids,
+                    resource_ids=job.resource_ids,
+                    capability_ids=capability_ids,
+                    connector_binding_ids=(),
+                    model_route_ids=routes,
+                )
+                if dict(contracts.resource_revisions) != {
+                    item.resource_id: item.resource_revision
+                    for item in job.specification.resource_bindings
+                }:
+                    raise ValueError("followup_job_resource_contract_changed")
                 followup = create_terminal_job_followup(
                     job,
+                    contract_bindings=contracts,
                     followup_id=self._id_factory("followup"),
                     grant_id=self._id_factory("grant"),
                     scope_id=self._id_factory("scope"),
@@ -2251,35 +2466,14 @@ class EmbeddedAgent:
                 return
             try:
                 job = await self._revalidate_followup(followup)
-                _conversation_exists, conversation, older_history_exists = (
-                    await self._store.completed_conversation_tail(
-                        self.identity.id,
-                        followup.conversation_id,
-                    )
-                )
-                scoped_conversation = tuple(
-                    item
-                    for item in conversation
-                    if item.transcript.run.source_id
-                    in followup.execution_scope.allowed_source_ids
-                )
-                prior_messages = _project_completed_history(
-                    scoped_conversation,
-                    older_history_exists=(
-                        older_history_exists
-                        or len(scoped_conversation) < len(conversation)
-                    ),
-                )
+                prior_messages: tuple[CanonicalMessage, ...] = ()
                 run_input = RunInput(
                     id=followup.reserved_run_id,
                     agent_id=self.identity.id,
                     message=FOLLOWUP_INSTRUCTION,
                     created_at=self._clock(),
                     conversation_id=followup.conversation_id,
-                    source_id=(job.source_ids[0] if len(job.source_ids) == 1 else None),
-                    conversation_source_id=(
-                        job.source_ids[0] if len(job.source_ids) == 1 else None
-                    ),
+                    source_scope_ids=job.source_ids,
                     start=RunStartEnvelope(
                         origin=RunOrigin.JOB_EVENT,
                         instruction_authority=InstructionAuthority.CODE_OWNED,
@@ -2420,6 +2614,17 @@ class EmbeddedAgent:
             > followup.execution_scope.sensitivity_ceiling.routing_rank
         ):
             raise ValueError("followup_sensitivity_scope_changed")
+        scope = followup.execution_scope
+        contracts = await self._execution_contract_reader(
+            agent_id=self.identity.id,
+            source_ids=scope.allowed_source_ids,
+            resource_ids=scope.allowed_resource_ids,
+            capability_ids=scope.allowed_capability_ids,
+            connector_binding_ids=scope.allowed_connector_binding_ids,
+            model_route_ids=scope.eligible_model_routes,
+        )
+        if contracts != scope.contract_bindings:
+            raise ValueError("followup_execution_contract_changed")
         await self._data_profile_admission.revalidate_job(job)
         return job
 
@@ -2519,6 +2724,141 @@ class EmbeddedAgent:
         self._require_open()
         return await self._job_owner.list(statuses=statuses, limit=limit)
 
+    async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
+        """Read one exact bounded agent-owned observation and separate resolution."""
+        self._require_open()
+        validate_effect_receipt_id(receipt_id)
+        return await self._store.load_effect_receipt(self.identity.id, receipt_id)
+
+    async def list_effects(
+        self, *, unresolved_only: bool = False, limit: int = 20, offset: int = 0
+    ) -> tuple[EffectReceipt, ...]:
+        self._require_open()
+        return await self._store.list_effect_receipts(
+            self.identity.id,
+            unresolved_only=unresolved_only,
+            limit=limit,
+            offset=offset,
+        )
+
+    async def resolve_effect(
+        self,
+        receipt_id: str,
+        *,
+        expected_digest: str,
+        decision: EffectResolutionDecision,
+        note: str,
+        evidence_references: tuple[str, ...] = (),
+    ) -> EffectReceipt:
+        """Approve one exact human recovery decision; never retry an operation."""
+        async with self._run_lock:
+            self._require_open()
+            receipt = await self.inspect_effect(receipt_id)
+            if receipt is None or receipt.receipt_digest != expected_digest:
+                raise ValueError(
+                    "the exact owned receipt or expected observation digest is unavailable"
+                )
+            resolution = EffectResolution(
+                receipt_id=receipt_id,
+                receipt_digest=expected_digest,
+                decision=decision,
+                approving_principal_id=self.identity.id,
+                control_id=self._id_factory("effect-recovery"),
+                resolved_at=max(
+                    self._clock(), receipt.finished_at or receipt.started_at
+                ),
+                note=note,
+                evidence_references=evidence_references,
+            )
+            if receipt.resolution is not None:
+                prior = receipt.resolution
+                if (
+                    prior.decision is decision
+                    and prior.note == note
+                    and prior.evidence_references == resolution.evidence_references
+                ):
+                    return receipt
+                raise ValueError(
+                    "this receipt already has a different immutable recovery decision"
+                )
+            if receipt.outcome is not EffectOutcome.UNCERTAIN:
+                raise ValueError("only terminal uncertainty requires explicit recovery")
+            if self._approval_handler is None:
+                raise PermissionError(
+                    "effect recovery requires the foreground approval handler"
+                )
+            evidence = await self._effect_recovery_evidence(
+                resolution.evidence_references
+            )
+            request = ApprovalRequest(
+                run_id=resolution.control_id,
+                call_id=resolution.control_id,
+                tool_name="resolve_effect",
+                capability_id="control.resolve_effect",
+                arguments=FrozenJsonObject.from_mapping(
+                    {
+                        "receipt": receipt.material(),
+                        "receipt_digest": receipt.receipt_digest,
+                        "decision": decision.value,
+                        "user_note": note,
+                        "evidence_references": evidence,
+                        "consequence": (
+                            "Disable the producing routine without retrying the operation."
+                            if decision is EffectResolutionDecision.CLOSE_WITHOUT_RETRY
+                            else "Accept possible duplication in future authorized work; leave the producing routine paused until explicit resume or run-now."
+                        ),
+                        "observation_unchanged": True,
+                    }
+                ),
+                reason="Approve this exact recovery decision? The original external outcome remains uncertain; recovery grants no connector authority and performs no retry.",
+            )
+            if request.render_arguments_for_review() is None:
+                raise ValueError(
+                    "the exact recovery document exceeds the approval display bound"
+                )
+            if await self._approval_handler(request) is not ApprovalDecision.APPROVE:
+                raise PermissionError("the effect recovery decision was denied")
+            async with self._mutation_lock:
+                self._require_open()
+                current = await self.inspect_effect(receipt_id)
+                if (
+                    current != receipt
+                    or await self._effect_recovery_evidence(
+                        resolution.evidence_references
+                    )
+                    != evidence
+                ):
+                    raise ValueError(
+                        "recovery evidence changed while approval was pending"
+                    )
+                return await self._store.resolve_effect_receipt(
+                    self.identity.id, resolution
+                )
+
+    async def _effect_recovery_evidence(
+        self, references: tuple[str, ...]
+    ) -> tuple[dict[str, object], ...]:
+        evidence: list[dict[str, object]] = []
+        for reference in references:
+            if reference.startswith("effect-receipt:"):
+                receipt = await self.inspect_effect(reference)
+                if receipt is None or receipt.outcome is EffectOutcome.STARTED:
+                    raise ValueError(
+                        "recovery evidence requires exact owned terminal receipts"
+                    )
+                evidence.append(
+                    {
+                        "receipt_id": receipt.receipt_id,
+                        "receipt_digest": receipt.receipt_digest,
+                    }
+                )
+            else:
+                artifact = await self._artifact_store.find_ref(reference)
+                evidence.append(
+                    {"artifact_id": artifact.artifact_id, "sha256": artifact.sha256}
+                )
+        return tuple(evidence)
+
     async def inspect_job(self, job_id: str) -> JobInspection | None:
         self._require_open()
         return await self._job_owner.inspect(job_id)
@@ -2551,13 +2891,42 @@ class EmbeddedAgent:
             basis_run_id=basis_run_id,
         )
 
-    async def create_routine(self, proposal: ScheduledRoutine) -> ScheduledRoutine:
-        """Persist one previously inspected exact proposal."""
+    async def create_routine(
+        self,
+        proposal: ScheduledRoutine,
+        *,
+        confirmation_handler: ApprovalHandler | None = None,
+    ) -> ScheduledRoutine:
+        """Persist one exact proposal, presenting it to an explicit human confirmation handler."""
 
+        self._require_open()
+        if proposal.agent_id != self.identity.id:
+            raise ValueError("routine proposal belongs to another agent")
+        authority = await self._routine_owner.proposal_authority_snapshot(proposal)
+        if confirmation_handler is not None:
+            control_id = self._id_factory("routine-approval")
+            request = ApprovalRequest(
+                run_id=control_id,
+                call_id=control_id,
+                tool_name="routine_create",
+                capability_id="routines.create",
+                arguments=routine_approval_arguments(authority),
+                reason="Approve this exact saved assignment, its standing actions, and its schedule?",
+            )
+            if (
+                request.render_arguments_for_review() is None
+                or await confirmation_handler(request) is not ApprovalDecision.APPROVE
+            ):
+                raise PermissionError("the routine creation was not approved")
         async with self._mutation_lock:
             self._require_open()
-            if proposal.agent_id != self.identity.id:
-                raise ValueError("routine proposal belongs to another agent")
+            if (
+                await self._routine_owner.proposal_authority_snapshot(proposal)
+                != authority
+            ):
+                raise ValueError(
+                    "routine authority changed during approval; propose again"
+                )
             return await self._routine_owner.admit(proposal)
 
     async def list_routines(
@@ -2582,25 +2951,47 @@ class EmbeddedAgent:
         expected_revision: int,
         draft: ScheduledRoutineDraft,
         basis_run_id: str | None = None,
+        confirmation_handler: ApprovalHandler | None = None,
     ) -> ScheduledRoutine:
-        """Conditionally replace one routine with a newly authorized definition."""
+        """Prepare, review and conditionally replace one exact routine revision."""
 
+        self._require_open()
+        inspection = await self._routine_owner.inspect(routine_id)
+        if inspection is None or inspection.routine.revision != expected_revision:
+            raise RoutineError(
+                "routine_revision_changed",
+                "The routine changed or is no longer owned by this agent.",
+            )
+        proposal = await self._prepare_routine_revision(
+            inspection.routine, draft, basis_run_id=basis_run_id
+        )
+        authority = await self._routine_owner.proposal_authority_snapshot(proposal)
+        if confirmation_handler is not None:
+            control_id = self._id_factory("routine-approval")
+            request = ApprovalRequest(
+                run_id=control_id,
+                call_id=control_id,
+                tool_name="routine_update",
+                capability_id="routines.update",
+                arguments=routine_approval_arguments(authority),
+                reason="Replace this saved assignment with the exact proposed revision?",
+            )
+            if (
+                request.render_arguments_for_review() is None
+                or await confirmation_handler(request) is not ApprovalDecision.APPROVE
+            ):
+                raise PermissionError("the routine revision was not approved")
         async with self._mutation_lock:
             self._require_open()
-            inspection = await self._routine_owner.inspect(routine_id)
-            if inspection is None or inspection.routine.revision != expected_revision:
-                raise RoutineError(
-                    "routine_revision_changed",
-                    "The routine changed or is no longer owned by this agent.",
+            if (
+                await self._routine_owner.proposal_authority_snapshot(proposal)
+                != authority
+            ):
+                raise ValueError(
+                    "routine authority changed during approval; propose again"
                 )
-            proposal = await self._prepare_routine_revision(
-                inspection.routine,
-                draft,
-                basis_run_id=basis_run_id,
-            )
             return await self._routine_owner.revise(
-                proposal,
-                expected_revision=expected_revision,
+                proposal, expected_revision=expected_revision
             )
 
     async def pause_routine(
@@ -2776,34 +3167,6 @@ class EmbeddedAgent:
             self._require_open()
             return await self._require_artifact_delivery().reset_export_destination()
 
-    async def active_source(
-        self,
-        *,
-        conversation_id: str | None = None,
-    ) -> SourceRegistration | None:
-        """Return the persisted default or one conversation's sticky source."""
-
-        self._require_open()
-        if conversation_id is not None:
-            _validate_conversation_id(conversation_id)
-            source_id = await self._store.conversation_source_id(
-                self.identity.id,
-                conversation_id,
-            )
-        else:
-            source_id = await self._store.load_active_source_id(self.identity.id)
-        active_sources = tuple(
-            source
-            for source in await self._store.list_sources(self.identity.id)
-            if source.active
-        )
-        if source_id is None:
-            return active_sources[0] if len(active_sources) == 1 else None
-        return next(
-            (source for source in active_sources if source.id == source_id),
-            None,
-        )
-
     async def resolve_source(self, selector: str) -> SourceRegistration:
         """Resolve one exact ID, display name, or stable display-name alias."""
 
@@ -2815,38 +3178,25 @@ class EmbeddedAgent:
         )
         return _resolve_source_selector(selector, sources)
 
-    async def select_source(self, selector: str) -> SourceRegistration:
-        """Persist one active source as the default for subsequent conversations."""
-
-        async with self._run_lock:
-            async with self._mutation_lock:
-                self._require_open()
-                sources = tuple(
-                    source
-                    for source in await self._store.list_sources(self.identity.id)
-                    if source.active
-                )
-                selected = _resolve_source_selector(selector, sources)
-                return await self._store.set_active_source_id(
-                    self.identity.id,
-                    selected.id,
-                )
-
     async def read_memory(self) -> str:
         self._require_open()
         return await self._memory_store.read_memory()
 
-    async def set_memory(self, text: str) -> None:
+    async def set_memory(
+        self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    ) -> None:
         self._require_open()
-        await self._memory_store.set_memory(text)
+        await self._memory_store.set_memory(text, sensitivity=sensitivity)
 
     async def read_user_profile(self) -> str:
         self._require_open()
         return await self._memory_store.read_user_profile()
 
-    async def set_user_profile(self, text: str) -> None:
+    async def set_user_profile(
+        self, text: str, *, sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
+    ) -> None:
         self._require_open()
-        await self._memory_store.set_user_profile(text)
+        await self._memory_store.set_user_profile(text, sensitivity=sensitivity)
 
     async def review_learning_candidates(
         self,
@@ -2973,7 +3323,9 @@ class EmbeddedAgent:
                         "returning text. Otherwise do not mutate active knowledge."
                     ),
                     conversation_id=conversation_id,
-                    source_id=effective_source_id,
+                    source_scope_ids=(
+                        () if effective_source_id is None else (effective_source_id,)
+                    ),
                     learning_candidate_id=candidate.id,
                     learning_candidate_text=candidate_text,
                     learning_candidate=candidate,
@@ -3115,9 +3467,13 @@ class EmbeddedAgent:
         name: str,
         description: str,
         instructions: str,
+        *,
+        sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED,
     ) -> bool:
         self._require_open()
-        return await self._skill_store.save_skill(name, description, instructions)
+        return await self._skill_store.save_skill(
+            name, description, instructions, sensitivity=sensitivity
+        )
 
     async def delete_skill(self, name: str) -> bool:
         self._require_open()
@@ -3148,6 +3504,7 @@ class EmbeddedAgent:
         local_label: str | None = None,
         binding_id: str | None = None,
     ) -> MCPBindingStatus:
+        """Persist exact local MCP admission for the next immutable composition."""
         """Persist one exact binding; declarations activate only after reopen."""
 
         if not isinstance(maximum_outbound_sensitivity, ModelSensitivity):
@@ -3181,6 +3538,44 @@ class EmbeddedAgent:
                 )
                 await self._deactivate_mcp_binding(stored.binding_id)
                 return MCPBindingStatus(stored, None)
+
+    async def update_mcp_discovery(
+        self,
+        binding_id: str,
+        *,
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...] = (),
+    ) -> MCPServerBinding:
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                return await self._store.update_mcp_discovery(
+                    self.identity.id,
+                    binding_id,
+                    summary=summary,
+                    when_to_use=when_to_use,
+                    keywords=keywords,
+                )
+
+    async def update_source_discovery(
+        self,
+        source_id: str,
+        *,
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...] = (),
+    ) -> SourceRegistration:
+        async with self._run_lock:
+            async with self._mutation_lock:
+                self._require_open()
+                return await self._store.update_source_discovery(
+                    self.identity.id,
+                    source_id,
+                    summary=summary,
+                    when_to_use=when_to_use,
+                    keywords=keywords,
+                )
 
     async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
         """Return bounded non-secret status for all independently keyed bindings."""
@@ -3328,7 +3723,14 @@ class EmbeddedAgent:
         sync: CatalogSync | None = None
         try:
             if persisted_registration is not None:
-                if persisted_registration != opened_registration:
+                current_identity = replace(
+                    opened_registration,
+                    summary=persisted_registration.summary,
+                    when_to_use=persisted_registration.when_to_use,
+                    keywords=persisted_registration.keywords,
+                    presentation_sensitivity=persisted_registration.presentation_sensitivity,
+                )
+                if persisted_registration != current_identity:
                     raise ValueError(
                         "refreshed source registration disagrees with persisted identity"
                     )
@@ -3424,6 +3826,14 @@ class EmbeddedAgent:
                     registration = adapter.registration
                     if registration.adapter_id != current.adapter_id:
                         raise ValueError("source edit cannot change source type")
+                    if registration.id == current.id:
+                        registration = replace(
+                            registration,
+                            summary=current.summary,
+                            when_to_use=current.when_to_use,
+                            keywords=current.keywords,
+                            presentation_sensitivity=current.presentation_sensitivity,
+                        )
                     if registration.id != current.id:
                         existing = await self._store.load_source(
                             self.identity.id,
@@ -3694,7 +4104,7 @@ class EmbeddedAgent:
         source_id: str,
         read_mode: SourceReadMode,
         read_resource_ids: tuple[str, ...],
-        postgresql_update_scopes: Mapping[str, tuple[str, ...]],
+        relational_write_scopes: Mapping[str, Mapping[str, object]],
     ) -> SourcePermissionsPreview:
         """Build and retain one bounded in-process exact confirmation preview."""
 
@@ -3706,7 +4116,7 @@ class EmbeddedAgent:
                     inspection,
                     read_mode=read_mode,
                     read_resource_ids=read_resource_ids,
-                    postgresql_update_scopes=postgresql_update_scopes,
+                    relational_write_scopes=relational_write_scopes,
                 )
                 self._source_permission_previews[source_id] = preview
                 return preview
@@ -3743,14 +4153,18 @@ class EmbeddedAgent:
                     )
 
                 update_mapping = {
-                    scope.resource_id: scope.allowed_assignment_columns
-                    for scope in preview.after.postgresql_update_scopes
+                    scope.resource_id: {
+                        key: value
+                        for key, value in scope.constraints().items()
+                        if key != "resource_revision"
+                    }
+                    for scope in preview.after.relational_write_scopes
                 }
                 revalidated = await self._build_source_permissions_preview(
                     current,
                     read_mode=preview.after.read_scope.mode,
                     read_resource_ids=preview.after.read_scope.resource_ids,
-                    postgresql_update_scopes=update_mapping,
+                    relational_write_scopes=update_mapping,
                 )
                 if revalidated.after != preview.after:
                     raise ValueError(
@@ -3758,7 +4172,7 @@ class EmbeddedAgent:
                     )
                 await self._store.replace_source_permission_scopes(
                     preview.after.read_scope,
-                    preview.after.postgresql_update_scopes,
+                    preview.after.relational_write_scopes,
                 )
                 return await self._inspect_source_permissions_locked(source_id)
 
@@ -3780,7 +4194,7 @@ class EmbeddedAgent:
         )
         if read_scope is None:
             raise ValueError("active source is missing its read scope")
-        update_scopes = await self._store.list_postgresql_update_scopes(
+        update_scopes = await self._store.list_relational_write_scopes(
             self.identity.id,
             source_id,
         )
@@ -3806,26 +4220,79 @@ class EmbeddedAgent:
         )
         schemas_by_resource_id = {schema.resource_id: schema for schema in schemas}
         choices: list[SourcePermissionResource] = []
+        from ..domains.data.sql.relational_upsert import (
+            validate_relational_upsert_scope,
+        )
+
         for resource in resources:
             eligible_columns: tuple[str, ...] = ()
+            insert_columns: tuple[str, ...] = ()
+            upsert_keys: list[tuple[str, ...]] = []
             schema = schemas_by_resource_id.get(resource.id)
             if schema is not None and resource.kind is ResourceKind.TABLE:
                 eligible_columns = tuple(
                     column
                     for column in schema.columns
-                    if validate_postgresql_update_scope(
+                    if validate_relational_write_scope(
                         source_id,
                         resource.id,
                         (column,),
                         resources=(schema,),
                     ).valid
                 )
+                insert_columns = tuple(
+                    column
+                    for column in schema.columns
+                    if column not in schema.identity_columns
+                )
+                for keys in schema.conflict_keys:
+                    try:
+                        validate_relational_upsert_scope(
+                            schema,
+                            key_columns=keys,
+                            insert_columns=insert_columns,
+                            update_columns=tuple(
+                                column
+                                for column in schema.updatable_columns
+                                if column
+                                not in (
+                                    *keys,
+                                    *schema.primary_key_columns,
+                                    *schema.identity_columns,
+                                )
+                            ),
+                            generated_identity_columns=schema.identity_columns,
+                        )
+                    except CapabilityInputError:
+                        continue
+                    upsert_keys.append(keys)
             choices.append(
                 SourcePermissionResource(
                     resource_id=resource.id,
                     display_name=resource.native_identity,
                     resource_kind=resource.kind.value,
                     eligible_assignment_columns=eligible_columns,
+                    key_columns=() if schema is None else schema.primary_key_columns,
+                    upsert_conflict_keys=tuple(upsert_keys),
+                    eligible_insert_columns=insert_columns if upsert_keys else (),
+                    eligible_upsert_update_columns=(
+                        ()
+                        if schema is None or not upsert_keys
+                        else tuple(
+                            column
+                            for column in schema.updatable_columns
+                            if column
+                            not in (
+                                *schema.primary_key_columns,
+                                *schema.identity_columns,
+                            )
+                        )
+                    ),
+                    generated_identity_columns=(
+                        ()
+                        if schema is None or not upsert_keys
+                        else schema.identity_columns
+                    ),
                 )
             )
         return SourcePermissionsInspection(
@@ -3843,14 +4310,14 @@ class EmbeddedAgent:
         *,
         read_mode: SourceReadMode,
         read_resource_ids: tuple[str, ...],
-        postgresql_update_scopes: Mapping[str, tuple[str, ...]],
+        relational_write_scopes: Mapping[str, Mapping[str, object]],
     ) -> SourcePermissionsPreview:
         if not isinstance(read_mode, SourceReadMode):
             raise TypeError("read_mode must be SourceReadMode")
         if not isinstance(read_resource_ids, tuple):
             raise TypeError("read_resource_ids must be a tuple")
-        if not isinstance(postgresql_update_scopes, Mapping):
-            raise TypeError("postgresql_update_scopes must be a mapping")
+        if not isinstance(relational_write_scopes, Mapping):
+            raise TypeError("relational_write_scopes must be a mapping")
         current_resources = {
             resource.resource_id: resource for resource in inspection.resources
         }
@@ -3866,7 +4333,7 @@ class EmbeddedAgent:
                 raise ValueError(
                     "selected read resources are not current resources of this source"
                 )
-        if postgresql_update_scopes and inspection.adapter_id != "postgresql":
+        if relational_write_scopes and inspection.adapter_id != "postgresql":
             raise ValueError(
                 "PostgreSQL update scopes require an active PostgreSQL source"
             )
@@ -3888,50 +4355,93 @@ class EmbeddedAgent:
                 inspection.source_id,
             )
         }
-        update_scopes: list[PostgreSQLUpdateScope] = []
+        update_scopes: list[RelationalWriteScope] = []
         requested_update_ids: set[str] = set()
-        for resource_id, raw_columns in postgresql_update_scopes.items():
-            if not isinstance(resource_id, str) or not resource_id:
-                raise ValueError("update scope resource ids must be non-empty text")
-            if not isinstance(raw_columns, tuple):
-                raise TypeError("update scope columns must be tuples")
-            resource = current_resources.get(resource_id)
-            if resource is None or not resource.postgresql_update_eligible:
-                raise ValueError(
-                    "PostgreSQL update scope requires a current eligible table"
-                )
-            selected_columns = tuple(sorted(raw_columns))
-            if (
-                not selected_columns
-                or len(selected_columns) != len(set(selected_columns))
-                or not set(selected_columns)
-                <= set(resource.eligible_assignment_columns)
-            ):
-                raise ValueError(
-                    "update scope columns must be a non-empty eligible subset"
-                )
-            requested_update_ids.add(resource_id)
-            tabular = tabular_by_resource_id.get(resource_id)
-            if tabular is None or tabular.resource.kind is not ResourceKind.TABLE:
-                raise ValueError(
-                    "PostgreSQL update scope requires exact current table facts"
-                )
-            update_scopes.append(
-                PostgreSQLUpdateScope(
-                    agent_id=self.identity.id,
-                    source_id=inspection.source_id,
-                    resource_id=resource_id,
-                    allowed_assignment_columns=selected_columns,
-                    authorization_fingerprint=(
-                        postgresql_update_authorization_fingerprint(
-                            source=registration,
-                            resource=tabular.resource,
-                            facet=tabular.facet,
-                            allowed_assignment_columns=selected_columns,
-                        )
-                    ),
-                )
+        schemas = {
+            item.resource_id: item
+            for item in await self._data_view.resource_schemas(
+                self.identity.id, inspection.source_id
             )
+        }
+        from ..domains.data.sql.relational_upsert import (
+            validate_relational_upsert_scope,
+        )
+
+        for resource_id, constraints in relational_write_scopes.items():
+            if not isinstance(constraints, Mapping) or set(constraints) != {
+                "allowed_operations",
+                "allowed_insert_columns",
+                "allowed_update_columns",
+                "key_columns",
+                "generated_identity_columns",
+                "max_rows",
+            }:
+                raise ValueError(
+                    "write scopes require explicit operations, keys, insert/update columns, identities and row limit"
+                )
+            tabular = tabular_by_resource_id.get(resource_id)
+            schema = schemas.get(resource_id)
+            if (
+                tabular is None
+                or schema is None
+                or tabular.resource.kind is not ResourceKind.TABLE
+            ):
+                raise ValueError("write scope requires an exact current table")
+            scope = RelationalWriteScope(
+                agent_id=self.identity.id,
+                source_id=inspection.source_id,
+                resource_id=resource_id,
+                resource_revision=tabular.resource.current_revision,
+                allowed_operations=cast(
+                    tuple[str, ...], constraints["allowed_operations"]
+                ),
+                allowed_insert_columns=cast(
+                    tuple[str, ...], constraints["allowed_insert_columns"]
+                ),
+                allowed_update_columns=cast(
+                    tuple[str, ...], constraints["allowed_update_columns"]
+                ),
+                key_columns=cast(tuple[str, ...], constraints["key_columns"]),
+                generated_identity_columns=cast(
+                    tuple[str, ...], constraints["generated_identity_columns"]
+                ),
+                max_rows=cast(int, constraints["max_rows"]),
+                authorization_fingerprint="sha256:" + "0" * 64,
+            )
+            if "update" in scope.allowed_operations:
+                if (
+                    set(scope.key_columns) != set(schema.primary_key_columns)
+                    or not validate_relational_write_scope(
+                        inspection.source_id,
+                        resource_id,
+                        scope.allowed_update_columns,
+                        resources=(schema,),
+                    ).valid
+                ):
+                    raise ValueError(
+                        "update scope requires eligible columns and the exact primary key"
+                    )
+            if "upsert" in scope.allowed_operations:
+                validate_relational_upsert_scope(
+                    schema,
+                    key_columns=scope.key_columns,
+                    insert_columns=scope.allowed_insert_columns,
+                    update_columns=scope.allowed_update_columns,
+                    generated_identity_columns=scope.generated_identity_columns,
+                )
+                if scope.max_rows > 1000:
+                    raise ValueError("upsert scope cannot exceed 1000 rows")
+            scope = replace(
+                scope,
+                authorization_fingerprint=relational_write_authorization_fingerprint(
+                    source=registration,
+                    resource=tabular.resource,
+                    facet=tabular.facet,
+                    scope=scope,
+                ),
+            )
+            update_scopes.append(scope)
+            requested_update_ids.add(resource_id)
 
         automatic_read_additions: set[str] = set()
         if requested_read.mode is SourceReadMode.ALL:
@@ -3961,7 +4471,7 @@ class EmbeddedAgent:
         )
         dependent_revocations = tuple(
             scope.resource_id
-            for scope in inspection.state.postgresql_update_scopes
+            for scope in inspection.state.relational_write_scopes
             if scope.resource_id not in effective_read_ids
         )
 
@@ -3981,8 +4491,8 @@ class EmbeddedAgent:
                 if final_read_scope.mode is SourceReadMode.ALL
                 else len(final_read_scope.resource_ids)
             ),
-            postgresql_update_table_count=len(update_scopes),
-            postgresql_update_table_examples=tuple(
+            relational_write_table_count=len(update_scopes),
+            relational_write_table_examples=tuple(
                 names.get(scope.resource_id, scope.resource_id)
                 for scope in sorted(
                     update_scopes,
@@ -4011,7 +4521,7 @@ class EmbeddedAgent:
             "before": _source_permission_state_payload(inspection.state),
             "after": _source_permission_state_payload(after),
             "automatic_read_additions": tuple(sorted(automatic_read_additions)),
-            "dependent_update_revocations": tuple(sorted(dependent_revocations)),
+            "dependent_write_revocations": tuple(sorted(dependent_revocations)),
         }
         confirmation_fingerprint = (
             "sha256:"
@@ -4027,21 +4537,42 @@ class EmbeddedAgent:
             before=inspection.state,
             after=after,
             automatic_read_additions=tuple(automatic_read_additions),
-            dependent_update_revocations=dependent_revocations,
+            dependent_write_revocations=dependent_revocations,
             summary=summary,
             confirmation_fingerprint=confirmation_fingerprint,
         )
 
-    async def postgresql_update_readiness(
+    async def relational_upsert_readiness(
+        self, source_id: str, resource_id: str
+    ) -> FrozenJsonObject:
+        async with self._mutation_lock:
+            self._require_open()
+            permission = await self._data_view.load_relational_write_scope(
+                self.identity.id, source_id, resource_id
+            )
+            if permission is None:
+                raise ValueError("exact current upsert permission is required")
+            constraints = FrozenJsonObject.from_mapping(
+                {
+                    "source_id": source_id,
+                    "resource_id": resource_id,
+                    **permission.constraints(),
+                }
+            )
+            return await self._relational_update_backend.upsert_readiness(
+                self.identity.id, constraints
+            )
+
+    async def relational_update_readiness(
         self,
         source_id: str,
         resource_id: str,
         assignment_columns: tuple[str, ...],
-    ) -> PostgreSQLUpdateReadiness:
+    ) -> RelationalUpdateReadiness:
         """Inspect one exact PostgreSQL update scope without mutating state."""
 
         self._require_open()
-        return await self._postgresql_update_backend.postgresql_update_readiness(
+        return await self._relational_update_backend.relational_update_readiness(
             agent_id=self.identity.id,
             source_id=source_id,
             resource_id=resource_id,
@@ -4179,13 +4710,25 @@ class EmbeddedAgent:
             async with self._mutation_lock:
                 pass
         owned_model_provider = self._owned_model_provider
-        self._owned_model_provider = None
+        model_shutdown_deadline = (
+            asyncio.get_running_loop().time()
+            + self._model_call_policy.cleanup_timeout_seconds
+        )
+        reviewer_close = asyncio.create_task(
+            self._candidate_reviewer.close(deadline=model_shutdown_deadline)
+        )
         if owned_model_provider is not None:
             try:
-                await owned_model_provider.close()
+                await owned_model_provider.close(deadline=model_shutdown_deadline)
+                self._owned_model_provider = None
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+        try:
+            await reviewer_close
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         activated_bindings = tuple(self._mcp_activated_bindings.values())
         self._mcp_activated_bindings.clear()
         for activated in activated_bindings:
@@ -4201,7 +4744,6 @@ class EmbeddedAgent:
                 if first_error is None:
                     first_error = error
         for store in (
-            self._candidate_reviewer,
             self._memory_store,
             self._skill_store,
             *(
@@ -4251,13 +4793,13 @@ def _source_permission_state_payload(
             "mode": state.read_scope.mode.value,
             "resource_ids": state.read_scope.resource_ids,
         },
-        "postgresql_updates": tuple(
+        "relational_writes": tuple(
             {
                 "resource_id": scope.resource_id,
-                "allowed_assignment_columns": scope.allowed_assignment_columns,
+                **scope.constraints(),
                 "authorization_fingerprint": scope.authorization_fingerprint,
             }
-            for scope in state.postgresql_update_scopes
+            for scope in state.relational_write_scopes
         ),
     }
 
@@ -4333,10 +4875,12 @@ def _resolve_candidate_reviewer_profile(
         if profile is not None:
             raise ValueError("reviewer_profile requires reviewer_model")
         return None
-    if isinstance(model, ModelRouter):
-        raise ValueError(
-            "candidate reviewer requires one direct provider without fallback"
-        )
+    if isinstance(model, ModelRouter) and (
+        len(model.candidates) != 1
+        or model.retry_policy.max_attempts_per_candidate != 1
+        or model.retry_policy.max_total_attempts != 1
+    ):
+        raise ValueError("candidate reviewer requires one attempt without fallback")
     resolved = profile
     if resolved is None:
         candidate = getattr(model, "model_profile", None)
@@ -4376,7 +4920,9 @@ def _candidate_reviewer_from_route(
                 allowed_sensitivities=primary.allowed_sensitivities,
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
     return (
         create_model_route_provider(
@@ -4434,7 +4980,13 @@ def _resolve_configuration(
     model_profile: ModelProfile | None,
     limits: LoopLimits | None,
     secret_provider: SecretProvider | None,
-) -> tuple[ModelProvider | None, ModelProfile | None, ModelRoute | None, LoopLimits]:
+) -> tuple[
+    ModelProvider | None,
+    ModelProfile | None,
+    ModelRoute | None,
+    LoopLimits,
+    ModelCallPolicy,
+]:
     if config is not None and not isinstance(config, AgentConfig):
         raise TypeError("config must be AgentConfig or None")
     route = None if config is None else config.model_route
@@ -4452,7 +5004,13 @@ def _resolve_configuration(
         assert model_profile is not None
         if model.provider_id != model_profile.id:
             raise AgentNotConfiguredError("model and profile identities differ")
-    return model, model_profile, route, resolved_limits
+    return (
+        model,
+        model_profile,
+        route,
+        resolved_limits,
+        (ModelCallPolicy() if config is None else config.model_call_policy),
+    )
 
 
 def _resolve_credential_session(
@@ -4483,52 +5041,6 @@ def _configuration_was_injected(
     )
 
 
-def _admit_model_selection(
-    provider: str,
-    model: str,
-    base_url: str | None,
-) -> tuple[str, str, str | None, bool]:
-    if not isinstance(provider, str):
-        raise TypeError("provider must be a string")
-    provider_name = provider.strip().lower()
-    if _PROVIDER_NAME.fullmatch(provider_name) is None:
-        raise ValueError("provider must be a bounded lowercase identifier")
-    if not isinstance(model, str) or not model.strip():
-        raise ValueError("model identifier must be non-empty")
-    model_name = model.strip()
-    if any(
-        character.isspace() or ord(character) < 32 or ord(character) == 127
-        for character in model_name
-    ):
-        raise ValueError("model identifier cannot contain whitespace or controls")
-    endpoint: str | None = None
-    if base_url is not None:
-        if not isinstance(base_url, str) or not base_url.strip():
-            raise ValueError("base URL must be non-empty when provided")
-        endpoint = base_url.strip()
-        if (
-            len(endpoint) > 2_048
-            or any(
-                ord(character) < 32 or ord(character) == 127 for character in endpoint
-            )
-            or not endpoint.startswith(("http://", "https://"))
-        ):
-            raise ValueError("base URL must be a bounded HTTP or HTTPS URL")
-    if provider_name in _BUILTIN_PROVIDERS - {"ollama"} and endpoint is not None:
-        raise ValueError(f"{provider_name} uses its fixed endpoint")
-    if provider_name not in _BUILTIN_PROVIDERS and endpoint is None:
-        raise ValueError("custom providers require an explicit base URL")
-    provider_id = f"{provider_name}:{model_name}"
-    if len(provider_id) > 256:
-        raise ValueError("model identity exceeds its 256 character bound")
-    return (
-        provider_name,
-        model_name,
-        endpoint,
-        provider_name not in {"ollama", "claude-code", "grok-build"},
-    )
-
-
 def _model_profile(
     provider: str,
     model: str,
@@ -4546,17 +5058,26 @@ def _model_profile(
         raise ValueError(
             "unreviewed models require explicit context and output token limits"
         )
+    definition = provider_definition(provider)
     return ModelProfile(
         id=provider_id,
         context_window_tokens=context_window_tokens,
         max_output_tokens=max_output_tokens,
         supports_tools=True,
-        supports_parallel_tools=provider in _SUBSCRIPTION_PROVIDERS,
-        supports_structured_output=provider in _SUBSCRIPTION_PROVIDERS,
-        supports_streaming=(
-            provider in _BUILTIN_PROVIDERS and provider not in _SUBSCRIPTION_PROVIDERS
+        supports_parallel_tools=(
+            False if definition is None else definition.profile_supports_parallel_tools
         ),
-        supports_reasoning=provider in _SUBSCRIPTION_PROVIDERS,
+        supports_structured_output=(
+            False
+            if definition is None
+            else definition.profile_supports_structured_output
+        ),
+        supports_streaming=(
+            False if definition is None else definition.profile_supports_streaming
+        ),
+        supports_reasoning=(
+            False if definition is None else definition.profile_supports_reasoning
+        ),
     )
 
 
@@ -4771,6 +5292,7 @@ async def _validate_model_route(
     *,
     secret_provider: SecretProvider,
     injected_provider: ModelProvider | None,
+    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
 ) -> None:
     validation_candidates = tuple(
         replace(
@@ -4790,7 +5312,12 @@ async def _validate_model_route(
         )
         for candidate in route.candidates
     )
-    validation_route = ModelRoute(validation_candidates, route.retry_policy)
+    validation_route = ModelRoute(
+        validation_candidates,
+        RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
+    )
     owns_provider = injected_provider is None
     if owns_provider:
         provider = create_model_route_provider(
@@ -4819,24 +5346,43 @@ async def _validate_model_route(
             retry_policy=validation_route.retry_policy,
         )
     try:
-        await _require_validated_model_provider(provider)
+        await _require_validated_model_provider(
+            provider,
+            call_policy=call_policy,
+            deadline=asyncio.get_running_loop().time()
+            + call_policy.max_request_seconds,
+        )
     except BaseException:
         if owns_provider:
             assert isinstance(provider, ManagedModelProvider)
             try:
-                await provider.close()
-            except BaseException:
-                pass
+                await provider.close(
+                    deadline=asyncio.get_running_loop().time()
+                    + call_policy.cleanup_timeout_seconds
+                )
+            except BaseException:  # noqa: BLE001
+                # Retain the original validation failure.
+                pass  # Cleanup's once-only outcome stays on the provider owner.
         raise
     else:
         if owns_provider:
             assert isinstance(provider, ManagedModelProvider)
-            await provider.close()
+            await provider.close(
+                deadline=asyncio.get_running_loop().time()
+                + call_policy.cleanup_timeout_seconds
+            )
 
 
-async def _require_validated_model_provider(provider: ModelProvider) -> None:
+async def _require_validated_model_provider(
+    provider: ModelProvider,
+    *,
+    call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
+    deadline: float | None = None,
+) -> None:
     response = await provider.generate(
         ModelRequest(
+            call_policy=call_policy,
+            deadline=deadline,
             messages=(
                 CanonicalMessage(
                     role=MessageRole.USER,
@@ -4976,10 +5522,24 @@ def _write_model_configuration(home: Path, config: AgentConfig) -> None:
             pass
 
 
+def _encode_call_policy(policy: ModelCallPolicy) -> dict[str, object]:
+    from dataclasses import asdict
+
+    return asdict(policy)
+
+
+def _decode_call_policy(value: object) -> ModelCallPolicy:
+    from dataclasses import fields
+
+    values = _strict_mapping(value, {item.name for item in fields(ModelCallPolicy)})
+    return ModelCallPolicy(**cast(Mapping[str, float], values))
+
+
 def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
     route = config.model_route
     assert route is not None
     return {
+        "model_call_policy": _encode_call_policy(config.model_call_policy),
         "limits": {
             "max_estimated_cost_usd": (
                 None
@@ -5009,7 +5569,8 @@ def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
                 for candidate in route.candidates
             ],
             "retry_policy": {
-                "attempts": route.retry_policy.attempts,
+                "max_attempts_per_candidate": route.retry_policy.max_attempts_per_candidate,
+                "max_total_attempts": route.retry_policy.max_total_attempts,
                 "backoff_seconds": route.retry_policy.backoff_seconds,
             },
         },
@@ -5039,7 +5600,7 @@ def _encode_model_profile(profile: ModelProfile) -> dict[str, object]:
 
 
 def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
-    document = _strict_mapping(value, {"limits", "model_route"})
+    document = _strict_mapping(value, {"limits", "model_route", "model_call_policy"})
     route_value = _strict_mapping(
         document["model_route"],
         {"candidates", "retry_policy"},
@@ -5075,7 +5636,7 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         provider_name, separator, model_name = provider_id.partition(":")
         if not separator:
             raise ValueError("provider ID is incomplete")
-        _, _, admitted_url, requires_credential = _admit_model_selection(
+        _, _, admitted_url, requires_credential = admit_model_selection(
             provider_name,
             model_name,
             base_url,
@@ -5132,12 +5693,15 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         )
     raw_retry = _strict_mapping(
         route_value["retry_policy"],
-        {"attempts", "backoff_seconds"},
+        {"max_attempts_per_candidate", "max_total_attempts", "backoff_seconds"},
     )
     route = ModelRoute(
         tuple(candidates),
         RetryPolicy(
-            attempts=cast(int, raw_retry["attempts"]),
+            max_attempts_per_candidate=cast(
+                int, raw_retry["max_attempts_per_candidate"]
+            ),
+            max_total_attempts=cast(int, raw_retry["max_total_attempts"]),
             backoff_seconds=cast(float, raw_retry["backoff_seconds"]),
         ),
     )
@@ -5155,6 +5719,7 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         raise TypeError("estimated cost must be text or null")
     return AgentConfig(
         model_route=route,
+        model_call_policy=_decode_call_policy(document["model_call_policy"]),
         limits=LoopLimits(
             max_steps=cast(int, raw_limits["max_steps"]),
             max_total_tokens=cast(int, raw_limits["max_total_tokens"]),
@@ -5498,5 +6063,4 @@ __all__ = [
     "AgentNotFoundError",
     "EmbeddedAgent",
     "HostActiveError",
-    "SourceSelectionError",
 ]

@@ -32,7 +32,6 @@ class CatalogScreen(ModalScreen[None]):
         summary: Any,
         sources: tuple[Any, ...],
         resources: tuple[Any, ...],
-        current_source_id: str | None,
         notice: str = "",
         notice_warning: bool = False,
     ) -> None:
@@ -40,7 +39,6 @@ class CatalogScreen(ModalScreen[None]):
         self._summary = summary
         self._sources = sources
         self._resources = resources
-        self._current_source_id = current_source_id
         self._notice = notice
         self._notice_warning = notice_warning
 
@@ -60,9 +58,7 @@ class CatalogScreen(ModalScreen[None]):
                     classes="-warning" if self._notice_warning else "",
                     markup=False,
                 )
-            tree: Tree[str] = Tree("Sources", id="catalog-tree")
-            tree.show_root = False
-            yield tree
+            yield self._catalog_tree()
             yield Static(
                 "Click a source to expand/collapse  ·  ↑/↓ select  ·  Enter toggle",
                 id="catalog-help",
@@ -71,7 +67,13 @@ class CatalogScreen(ModalScreen[None]):
             yield Footer()
 
     def on_mount(self) -> None:
-        tree = self.query_one("#catalog-tree", Tree)
+        self.query_one("#catalog-tree", Tree).focus()
+
+    def _catalog_tree(self) -> Tree[str]:
+        # Publish the notice and its source/resource contents in one composition;
+        # another task can inspect the screen before its Mount message runs.
+        tree: Tree[str] = Tree("Sources", id="catalog-tree")
+        tree.show_root = False
         resources_by_source: dict[str, list[Any]] = defaultdict(list)
         for resource in self._resources:
             resources_by_source[resource.source_id].append(resource)
@@ -79,7 +81,6 @@ class CatalogScreen(ModalScreen[None]):
         ordered_sources = sorted(
             self._sources,
             key=lambda source: (
-                source.id != self._current_source_id,
                 source.display_name.casefold(),
                 source.id,
             ),
@@ -104,7 +105,7 @@ class CatalogScreen(ModalScreen[None]):
         tree.root.expand()
         if ordered_sources:
             tree.cursor_line = 0
-        tree.focus()
+        return tree
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -127,8 +128,6 @@ class CatalogScreen(ModalScreen[None]):
 
     def _source_label(self, source: Any, resource_count: int) -> Text:
         label = Text()
-        if source.id == self._current_source_id:
-            label.append("● ", style="#ACFD21")
         label.append(
             safe_display(source.display_name, fallback="source", maximum=512),
             style="bold",
@@ -136,8 +135,6 @@ class CatalogScreen(ModalScreen[None]):
         source_type = SOURCE_TYPE_LABELS.get(source.adapter_id, source.adapter_id)
         noun = "resource" if resource_count == 1 else "resources"
         label.append(f"  {source_type} · {resource_count} {noun}", style="dim")
-        if source.id == self._current_source_id:
-            label.append("  current", style="#ACFD21")
         return label
 
     @staticmethod

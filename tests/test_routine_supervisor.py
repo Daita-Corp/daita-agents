@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import cast
 
 import pytest
+from _capability_runtime_support import frozen_execution_bindings
 from _distribution_support import (
     inbox_distribution_plan,
     no_artifact_outcome_contract,
@@ -23,7 +24,14 @@ from daita.capability_runtime import (
     InternalCapabilityRequest,
 )
 from daita.distribution import DistributionOwner, OutcomeState
-from daita.llm.models import CanonicalMessage, MessageRole, ModelSensitivity, TextBlock
+from daita.llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    ModelSensitivity,
+    ModelUsage,
+    TextBlock,
+)
+from daita.llm.pricing import CostEstimate
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.routines.models import (
     IntervalSchedule,
@@ -88,8 +96,20 @@ def _routine(
     precheck: ResourceRevisionPrecheck | None = None,
     observation: ResourceRevisionObservation | None = None,
 ) -> ScheduledRoutine:
-    instruction = "Read the exact resource and report its current value."
+    instruction = (
+        "Report this exact structural catalog revision."
+        if precheck is not None
+        else "Read the exact resource and report its current value."
+    )
+    capability_ids = (
+        ("catalog.schema", "data.resource_revision_observation")
+        if precheck is not None
+        else ("data.query",)
+    )
     return ScheduledRoutine(
+        contract_bindings=frozen_execution_bindings(
+            capability_ids, ("resource-1",), ("mock",)
+        ),
         routine_id="routine-supervisor",
         agent_id="agent-1",
         conversation_id="conversation-1",
@@ -108,7 +128,7 @@ def _routine(
         allowed_source_ids=("source-1",),
         allowed_connector_binding_ids=(),
         allowed_resource_ids=("resource-1",),
-        allowed_capability_ids=("data.query",),
+        allowed_capability_ids=capability_ids,
         allowed_access_modes=frozenset({AccessMode.READ}),
         allowed_operational_effects=frozenset({OperationalEffect.NONE}),
         sensitivity_ceiling=ModelSensitivity.INTERNAL,
@@ -248,6 +268,7 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
             created_at=NOW,
             final_text="The current value is 42.",
             steps=1,
+            usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
         )
         await store.complete(
             result,
@@ -353,6 +374,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
             created_at=NOW,
             final_text="Capacity retry completed.",
             steps=1,
+            usage=ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0"))),
         )
         await store.complete(
             result,
@@ -505,6 +527,152 @@ async def test_unchanged_precheck_advances_with_zero_model_runs(tmp_path) -> Non
         deliveries = await store.list_deliveries("agent-1")
         assert len(deliveries) == 1
         assert deliveries[0].outcome.conclusion_state is OutcomeState.SKIPPED_NO_CHANGE
+    finally:
+        await supervisor.close()
+        await store.close()
+
+
+@pytest.mark.parametrize(
+    "change", ("values", "multiple_resources", "mcp", "wrong_observer")
+)
+def test_revision_precheck_rejects_assignments_it_cannot_observe(change):
+    precheck = ResourceRevisionPrecheck(
+        "data.resource_revision_observation",
+        "sha256:" + "3" * 64,
+        "source-1",
+        "resource-1",
+    )
+    routine = _routine(precheck=precheck)
+    with pytest.raises(ValueError, match="revision prechecks support only"):
+        if change == "values":
+            replace(
+                routine,
+                allowed_capability_ids=(
+                    "data.query",
+                    "data.resource_revision_observation",
+                ),
+                contract_bindings=frozen_execution_bindings(
+                    ("data.query", "data.resource_revision_observation"),
+                    ("resource-1",),
+                    ("mock",),
+                ),
+            )
+        elif change == "multiple_resources":
+            replace(
+                routine,
+                allowed_resource_ids=("resource-1", "resource-2"),
+                contract_bindings=frozen_execution_bindings(
+                    routine.allowed_capability_ids,
+                    ("resource-1", "resource-2"),
+                    ("mock",),
+                ),
+            )
+        elif change == "mcp":
+            replace(routine, allowed_connector_binding_ids=("binding-web",))
+        else:
+            replace(routine, precheck=replace(precheck, capability_id="catalog.schema"))
+
+
+@pytest.mark.parametrize(
+    "boundary", ["cumulative_attempts", "occurrence_attempts", "bound", "started"]
+)
+async def test_recovery_finishes_exhausted_or_unstarted_occurrence_without_replay(
+    tmp_path, boundary
+) -> None:
+    store = await SQLiteStateStore.open(tmp_path / "state.db")
+    await _seed_conversation(store)
+    routine = await store.admit_scheduled_routine(
+        replace(
+            _routine(),
+            cumulative_max_attempts=1 if boundary == "cumulative_attempts" else 10,
+        )
+    )
+    artifacts = await AgentHomeArtifactStore.open(
+        agent_id="agent-1", agent_home=tmp_path, references=store
+    )
+    now = NOW
+    executed = 0
+
+    async def execute(occurrence, run, observation):
+        nonlocal executed
+        executed += 1
+        assert boundary in {"bound", "started"}, "expired claims must not dispatch"
+        bound = await store.bind_routine_occurrence_run(
+            "agent-1",
+            occurrence.occurrence_id,
+            claim_token=occurrence.claim_token,
+            run_id=run.id,
+            execution_scope=run.execution_scope,
+            bound_at=now,
+        )
+        assert bound is not None
+        if boundary == "started":
+            await store.start(run)
+        raise RuntimeError("process lost after occurrence binding")
+
+    supervisor = RoutineSupervisor(
+        agent_id="agent-1",
+        store=store,
+        owner=cast(RoutineOwner, _Owner()),
+        runtime=cast(CapabilityRuntime, _UnusedRuntime()),
+        distribution=DistributionOwner(agent_id="agent-1", store=store),
+        artifacts=artifacts,
+        execute_run=execute,
+        clock=lambda: now,
+        id_factory=_ids(),
+    )
+    try:
+        claimed = await store.claim_due_routine_occurrence(
+            "agent-1",
+            routine.routine_id,
+            expected_revision=1,
+            expected_due_at=NOW,
+            claimed_at=NOW,
+            claim_token="first-claim",
+        )
+        assert claimed is not None
+        if boundary in {"bound", "started"}:
+            await supervisor._run_claimed(claimed)
+        elif boundary == "occurrence_attempts":
+            supervisor._execute_run = None
+            tokens = {claimed.claim_token}
+            for index in range(2):
+                now += timedelta(seconds=31)
+                await supervisor._recover()
+                recovered = await store.load_routine_occurrence(
+                    "agent-1", claimed.occurrence_id
+                )
+                assert recovered is not None and recovered.attempt_count == index + 2
+                assert recovered.claim_token not in tokens
+                tokens.add(recovered.claim_token)
+        now += timedelta(seconds=31)
+        await supervisor._recover()
+        current = await store.load_routine_occurrence("agent-1", claimed.occurrence_id)
+        assert current is not None
+        if boundary == "started":
+            # A live transcript is owned by the run lifecycle; its expired claim
+            # alone cannot authorize terminal failure or another run.
+            assert current.disposition is RoutineOccurrenceDisposition.RUNNING
+            assert not await store.list_deliveries("agent-1")
+        else:
+            assert current.disposition is RoutineOccurrenceDisposition.TERMINAL_FAILED
+            assert current.failure_code == (
+                "routine_run_not_started"
+                if boundary == "bound"
+                else "routine_attempt_limit_exceeded"
+            )
+            persisted = await store.load_scheduled_routine(
+                "agent-1", routine.routine_id
+            )
+            assert persisted is not None and persisted.active_occurrence_id is None
+            assert persisted.reserved_tokens == 0
+            assert persisted.attempt_count <= persisted.cumulative_max_attempts
+            assert current.attempt_count <= 3
+            await supervisor._recover()
+            deliveries = await store.list_deliveries("agent-1")
+            assert len(deliveries) == 1
+            assert deliveries[0].outcome.conclusion_state is OutcomeState.FAILED
+        assert executed == (1 if boundary in {"bound", "started"} else 0)
     finally:
         await supervisor.close()
         await store.close()

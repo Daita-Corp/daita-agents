@@ -14,6 +14,7 @@ from ...learning_candidates import (
     SemanticCandidateContent,
     SkillCandidateContent,
 )
+from ...llm.models import ModelSensitivity
 from ...semantics import SemanticKind
 from .common import (
     JsonValue,
@@ -274,6 +275,7 @@ def _encode_candidate(value: LearningCandidate) -> dict[str, JsonValue]:
                 )
             ),
             "candidate_identity_sha256": value.candidate_identity_sha256,
+            "sensitivity": enum_encode(value.sensitivity, "ModelSensitivity"),
         },
     )
 
@@ -299,9 +301,13 @@ def _decode_candidate(value: JsonValue) -> LearningCandidate:
             "updated_at",
             "rejection_reason",
             "candidate_identity_sha256",
+            "sensitivity",
         ),
     )
     return LearningCandidate(
+        sensitivity=enum_decode(
+            fields["sensitivity"], ModelSensitivity, "ModelSensitivity"
+        ),
         id=text(fields["id"], "learning candidate id"),
         agent_id=text(fields["agent_id"], "learning candidate agent_id"),
         target=enum_decode(

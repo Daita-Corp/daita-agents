@@ -7,9 +7,10 @@ import json
 import os
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 from _workspace_support import workspace_for
@@ -17,6 +18,11 @@ from _workspace_support import workspace_for
 from daita import Agent, JobStatus, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
+from daita.llm.errors import (
+    ModelProviderError,
+    interrupted_model_usage,
+    take_provider_attempt_diagnostic,
+)
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -24,6 +30,7 @@ from daita.llm.models import (
     ModelResponse,
     ModelStreamCompleted,
     ModelStreamEvent,
+    ModelUsage,
     TextBlock,
     ToolCall,
     ToolResultBlock,
@@ -114,6 +121,8 @@ class RecordingProvider:
         self._delegate = delegate
         self.requests: list[ModelRequest] = []
         self.responses: list[ModelResponse] = []
+        self.usages: list[ModelUsage] = []
+        self.timings: list[dict[str, object]] = []
 
     @property
     def provider_id(self) -> str:
@@ -126,22 +135,157 @@ class RecordingProvider:
         return provider_has_complete_pricing(self._delegate, request)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
+        take_provider_attempt_diagnostic()
+        index = len(self.requests)
         self.requests.append(request)
-        response = await self._delegate.generate(request)
-        self.responses.append(response)
-        return response
+        started = perf_counter()
+        response = None
+        failure = None
+        try:
+            response = await self._delegate.generate(request)
+            self.responses.append(response)
+            return response
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            self._record_timing(index, started, response, failure, None)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
         if not isinstance(self._delegate, StreamingModelProvider):
             raise TypeError("the live benchmark provider must support streaming")
+        take_provider_attempt_diagnostic()
+        index = len(self.requests)
         self.requests.append(request)
-        async with closing_stream(self._delegate.stream(request)) as events:
-            async for event in events:
-                if isinstance(event, ModelStreamCompleted):
-                    self.responses.append(event.response)
-                yield event
+        started = perf_counter()
+        response = None
+        failure: BaseException | None = None
+        first_event_seconds = None
+        try:
+            async with closing_stream(self._delegate.stream(request)) as events:
+                async for event in events:
+                    if first_event_seconds is None:
+                        first_event_seconds = perf_counter() - started
+                    if isinstance(event, ModelStreamCompleted):
+                        response = event.response
+                        self.responses.append(response)
+                    yield event
+        except GeneratorExit as error:
+            # Consumers close at the terminal event. That normal release is
+            # not a cancelled model attempt; early close still is.
+            if response is None:
+                failure = error
+            raise
+        except BaseException as error:
+            failure = error
+            raise
+        finally:
+            self._record_timing(index, started, response, failure, first_event_seconds)
 
-    async def close(self) -> None:
+    def _record_timing(
+        self,
+        index: int,
+        started: float,
+        response: ModelResponse | None,
+        failure: BaseException | None,
+        first_event_seconds: float | None,
+    ) -> None:
+        usage = (
+            response.usage
+            if response is not None
+            else (
+                failure.usage
+                if isinstance(failure, ModelProviderError)
+                else (
+                    interrupted_model_usage(failure)
+                    if isinstance(failure, (asyncio.CancelledError, TimeoutError))
+                    else None
+                )
+            )
+        )
+        if usage is not None:
+            self.usages.append(usage)
+        usage_reported = usage is not None and (
+            usage.total_tokens > 0 or usage.cost_estimate.status.value == "complete"
+        )
+        dimensions = (
+            response.provider_metadata.get("pricing_dimensions") if response else None
+        )
+        attempt = take_provider_attempt_diagnostic()
+        self.timings.append(
+            {
+                "request_index": index,
+                "provider_id": self.provider_id,
+                "attempt_diagnostic": None if attempt is None else attempt.to_dict(),
+                "seconds": perf_counter() - started,
+                "first_event_seconds": first_event_seconds,
+                "returned_response": response is not None,
+                "outcome": (
+                    "cancelled"
+                    if isinstance(failure, (asyncio.CancelledError, GeneratorExit))
+                    else (
+                        "failed"
+                        if failure is not None or response is None
+                        else "completed"
+                    )
+                ),
+                "failure_type": type(failure).__name__ if failure is not None else None,
+                "failure_code": (
+                    failure.error_code
+                    if isinstance(failure, ModelProviderError)
+                    else None
+                ),
+                "request_admission": (
+                    json.loads(
+                        canonical_json(response.provider_metadata["request_admission"])
+                    )
+                    if response is not None
+                    and "request_admission" in response.provider_metadata
+                    else None
+                ),
+                "admission_failure": (
+                    asdict(failure.diagnostic)
+                    if isinstance(failure, ModelProviderError)
+                    and failure.diagnostic is not None
+                    and failure.diagnostic.phase.value == "request_admission"
+                    else None
+                ),
+                "usage_complete": usage_reported
+                and (
+                    response is not None
+                    or (
+                        isinstance(failure, ModelProviderError)
+                        and failure.terminal_observed
+                    )
+                    or (
+                        usage is not None
+                        and usage.cost_estimate.status.value == "complete"
+                    )
+                ),
+                "input_tokens": (
+                    usage.input_tokens if usage_reported and usage is not None else None
+                ),
+                "output_tokens": (
+                    usage.output_tokens
+                    if usage_reported and usage is not None
+                    else None
+                ),
+                "known_estimated_cost_usd": (
+                    str(usage.cost_estimate.amount_usd)
+                    if usage is not None and usage.cost_estimate.amount_usd is not None
+                    else None
+                ),
+                "response_provider_id": response.provider_id if response else None,
+                "response_id": response.provider_response_id if response else None,
+                "response_model_id": (
+                    dimensions.get("response_model")
+                    if isinstance(dimensions, Mapping)
+                    else None
+                ),
+            }
+        )
+
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 
@@ -377,7 +521,7 @@ async def seed_completed_profile_agent(
     try:
         result = await agent.run(
             "Seed one deterministic completed profile job.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.COMPLETED
         jobs = await agent.list_jobs()
@@ -410,7 +554,7 @@ async def capture_run(
     start = len(fixture.provider.requests)
     result = await fixture.agent.run(
         message,
-        source_id=source_id,
+        source_scope_ids=(() if source_id is None else (source_id,)),
         conversation_id=conversation_id,
     )
     transcript = await fixture.agent.transcript(result.run_id)

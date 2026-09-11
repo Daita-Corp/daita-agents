@@ -108,7 +108,7 @@ class _RecordingProvider:
                     self.responses.append(event.response)
                 yield event
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 
@@ -316,7 +316,7 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
             "the local verification token. Separately inspect the connected schema "
             "and query customer counts by segment with its verification token. "
             "Report the exact totals, counts, and both tokens from tool results.",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         transcript = await agent.transcript(result.run_id)
     finally:

@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 
-from daita import ConversationRun, Transcript
+from daita import ConversationRun, EffectReceipt, LoopExit, LoopExitKind, Transcript
+from daita._json import FrozenJsonObject
 from daita.llm.models import MessageRole, ToolCall, ToolResultBlock
 
 from .models import ToolCardDetails, ToolCardState, ToolTablePreview, TranscriptBlock
@@ -50,6 +51,9 @@ CAPABILITY_LABELS = {
     "skill_view": "Read skill",
     "skill_save": "Save skill",
     "skill_delete": "Delete skill",
+    "routine_create": "Create routine",
+    "routine_update": "Update routine",
+    "routine_control": "Control routine",
 }
 _TOOL_ERROR_HEADINGS = {
     "postgresql_connect_failed": "Connection unavailable",
@@ -158,6 +162,9 @@ def project_tool_details(call: ToolCall, result: ToolResultBlock) -> ToolCardDet
         )
         error_heading = _TOOL_ERROR_HEADINGS.get(error_code, error_code)
         summary = one_logical_line(f"{error_heading} · {error_message}")
+        evidence = tool_outcome_summary(result)
+        if evidence is not None:
+            summary += " " + evidence
         return ToolCardDetails(
             summary=sanitize_terminal_text(
                 summary,
@@ -209,6 +216,7 @@ def project_tool_details(call: ToolCall, result: ToolResultBlock) -> ToolCardDet
             else None
         )
         summary = result_kind
+    summary = tool_outcome_summary(result) or summary
     if isinstance(code_value, str):
         summary = one_logical_line(code_value)
     elif result_text is not None and summary == "Tool result":
@@ -337,31 +345,6 @@ def tool_result_error_code(result: ToolResultBlock) -> str:
     return "tool_failed"
 
 
-def completed_tool_pairs(
-    transcript: Transcript,
-) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
-    calls: list[ToolCall] = []
-    call_ids: set[str] = set()
-    results: dict[str, ToolResultBlock] = {}
-    for message in transcript.messages:
-        if message.role is MessageRole.ASSISTANT:
-            for call in message.tool_calls:
-                if call.id in call_ids:
-                    raise ValueError("completed transcript repeats a tool call ID")
-                call_ids.add(call.id)
-                calls.append(call)
-        elif message.role is MessageRole.TOOL:
-            for block in message.content:
-                if not isinstance(block, ToolResultBlock):
-                    raise TypeError("tool transcript message contains non-tool content")
-                if block.call_id in results:
-                    raise ValueError("completed transcript repeats a tool result ID")
-                results[block.call_id] = block
-    if not set(results).issubset(call_ids):
-        raise ValueError("completed transcript contains an unmatched tool result")
-    return tuple((call, results.get(call.id)) for call in calls)
-
-
 def artifact_delivery_messages(
     pairs: tuple[tuple[ToolCall, ToolResultBlock | None], ...],
 ) -> tuple[str, ...]:
@@ -453,7 +436,7 @@ def project_transcript(
     tools_expanded: bool = False,
 ) -> tuple[TranscriptBlock, ...]:
     blocks: list[TranscriptBlock] = []
-    pairs = completed_tool_pairs(transcript)
+    pairs = transcript.tool_pairs
     tool_index = 0
     for message in transcript.messages:
         if message.role is MessageRole.USER:
@@ -508,10 +491,16 @@ def project_transcript(
                     capability_id=getattr(call, "name", None),
                     label=label,
                     state=(
-                        "failed" if result is not None and result.is_error else "done"
+                        "unknown"
+                        if result is None
+                        else "failed" if result.is_error else "done"
                     ),
                     details=(
-                        None if result is None else project_tool_details(call, result)
+                        ToolCardDetails(
+                            summary="No terminal result recorded; execution outcome is unknown."
+                        )
+                        if result is None
+                        else project_tool_details(call, result)
                     ),
                     expanded=tools_expanded,
                 )
@@ -537,7 +526,88 @@ def project_conversation(
                 tools_expanded=tools_expanded,
             )
         )
+        if run.result is not None and run.result.kind is not LoopExitKind.COMPLETED:
+            blocks.append(
+                TranscriptBlock(
+                    "notice",
+                    f"{run.result.run_id}:terminal",
+                    run_failure_notice(run.result, run.transcript),
+                )
+            )
     return tuple(blocks)
+
+
+def tool_outcome_summary(result: ToolResultBlock) -> str | None:
+    """Present code-owned receipt facts without returning arguments or full records."""
+    reference = result.output.get("effect_receipt")
+    if isinstance(reference, Mapping):
+        basis = reference.get("evidence_basis")
+        meaning = (
+            "server-reported invocation; downstream outcome unverified"
+            if basis == "server_reported"
+            else str(basis)
+        )
+        return sanitize_terminal_text(
+            f"Effect receipt {reference.get('receipt_id')}: {reference.get('outcome')} ({meaning}).",
+            maximum=768,
+            preserve_lines=False,
+            fallback="Effect evidence retained.",
+        )
+    data = result.output.get("data")
+    if (
+        not result.is_error
+        and result.output.get("kind") == "routine.receipt"
+        and result.capability_id
+        in {"routines.create", "routines.update", "routines.control"}
+        and result.output_sha256 is not None
+        and isinstance(data, Mapping)
+        and isinstance(data.get("routine"), Mapping)
+    ):
+        routine = data["routine"]
+        assert isinstance(routine, Mapping)
+        return sanitize_terminal_text(
+            f"Routine {data.get('action')} committed: {routine.get('routine_id')} "
+            f"(revision {routine.get('revision')}, {routine.get('state')}). "
+            "Scheduled execution is reported separately in the Inbox.",
+            maximum=1600,
+            preserve_lines=False,
+            fallback="Routine mutation recorded.",
+        )
+    return None
+
+
+def run_failure_notice(result: LoopExit, transcript: Transcript | None = None) -> str:
+    """Describe a stopped run without treating completed tools as rolled back."""
+    if result.reason == "timeout":
+        reason = "The model provider timed out after bounded retries."
+    elif result.reason == "wall_time_exhausted":
+        reason = "The run reached its overall time limit."
+    elif result.reason in {
+        "token_budget_insufficient",
+        "token_limit_reached",
+        "cost_limit_reached",
+    }:
+        reason = (
+            "The run stopped at its model budget limit before completing its answer."
+        )
+    else:
+        reason = f"{result.kind.value}: {result.reason}."
+    notice = (
+        reason + " Completed tool results remain recorded; completed actions were not "
+        "rolled back. Check their receipts before repeating the request. "
+    )
+    if transcript is not None:
+        for _call, outcome in transcript.tool_pairs:
+            if outcome is not None:
+                summary = tool_outcome_summary(outcome)
+                if summary is not None:
+                    notice += "\n" + summary
+    return sanitize_terminal_text(
+        notice,
+        maximum=MAX_RENDER_CHARACTERS,
+        preserve_lines=True,
+        fallback="Run stopped.",
+    )
 
 
 def format_status_label(
@@ -592,14 +662,262 @@ def approval_review_document(
             if reason is not None
             else ""
         )
-        + "Arguments:\n"
     )
-    document = header + arguments_text
+    document = (
+        header
+        + (
+            approval_summary(arguments_text, capability_id)
+            if capability_id
+            in {
+                "routines.create",
+                "routines.update",
+                "control.resolve_effect",
+                "data.update_rows",
+                "data.upsert_rows",
+            }
+            else ""
+        )
+        + "Exact validated details:\n"
+        + arguments_text
+    )
     if looks_secret_shaped(arguments_text):
         return document, False
     return document, True
 
 
 def looks_secret_shaped(value: str) -> bool:
-    folded = value.casefold()
-    return any(part in folded for part in SENSITIVE_KEY_PARTS)
+    # Inspect credential fields, not prose or legitimate budget/digest names.
+    # The exact JSON remains visible; this is a display guard, never authority.
+    def contains_secret(item: object) -> bool:
+        if isinstance(item, dict):
+            return any(
+                str(key).casefold()
+                in {
+                    "api_key",
+                    "authorization",
+                    "credential",
+                    "password",
+                    "private_key",
+                    "secret",
+                    "token",
+                    "access_token",
+                    "refresh_token",
+                }
+                or contains_secret(child)
+                for key, child in item.items()
+            )
+        if isinstance(item, list):
+            return any(contains_secret(child) for child in item)
+        return False
+
+    try:
+        return contains_secret(json.loads(value))
+    except ValueError:
+        return True
+
+
+def approval_summary(arguments_text: str, capability_id: str) -> str:
+    """Summarize only the frozen document handed to the approval handler."""
+    try:
+        document = json.loads(arguments_text)
+    except ValueError:
+        return ""
+    if not isinstance(document, dict):
+        return ""
+    if capability_id in {"data.update_rows", "data.upsert_rows"}:
+        arguments, target, preview = (
+            document.get("arguments"),
+            document.get("target"),
+            document.get("preview"),
+        )
+        if not all(isinstance(item, dict) for item in (arguments, target, preview)):
+            return ""
+        assert isinstance(arguments, dict)
+        assert isinstance(target, dict)
+        assert isinstance(preview, dict)
+        lines = [
+            f"Connection: {target.get('source_name')}",
+            f"Table: {target.get('name')}",
+            "Catalog aliases: " + json.dumps(target.get("aliases"), ensure_ascii=True),
+        ]
+        if capability_id == "data.update_rows":
+            lines.extend(
+                (
+                    "Select rows where: "
+                    + json.dumps(arguments.get("where"), ensure_ascii=True),
+                    "Set: "
+                    + json.dumps(arguments.get("assignments"), ensure_ascii=True),
+                    f"Preview: {preview.get('matched_rows')} matching row(s); expected {arguments.get('expected_affected_rows')}.",
+                    "Bounded samples of primary keys and before/after values: "
+                    + json.dumps(preview.get("samples"), ensure_ascii=True),
+                )
+            )
+        else:
+            lines.extend(
+                (
+                    "Match keys: "
+                    + json.dumps(arguments.get("key_columns"), ensure_ascii=True),
+                    "Insert columns: "
+                    + json.dumps(arguments.get("insert_columns"), ensure_ascii=True),
+                    "Update columns: "
+                    + json.dumps(arguments.get("update_columns"), ensure_ascii=True),
+                    f"Preview: {preview.get('inserted_count')} insert, {preview.get('updated_count')} update, {preview.get('unchanged_count')} unchanged; {preview.get('input_count')} input row(s).",
+                    "Bounded samples of keys and planned actions: "
+                    + json.dumps(preview.get("classifications"), ensure_ascii=True),
+                    "The complete supplied batch is in the exact details below. Omitted update values stay unchanged; explicit null clears an admitted nullable value.",
+                )
+            )
+        lines.append(
+            "Check that these are the intended entities and values. Samples are not a complete inventory or proof of business meaning. Approval permits this exact operation once; changed state is rechecked before execution."
+        )
+        return (
+            sanitize_terminal_text(
+                "\n".join(lines),
+                maximum=12000,
+                preserve_lines=True,
+                fallback="Native write review",
+            )
+            + "\n\n"
+        )
+    routine = document.get("proposal")
+    if isinstance(routine, dict):
+        schedule = routine.get("schedule", {})
+        if not isinstance(schedule, dict):
+            return ""
+        kind = schedule.get("kind")
+        when = (
+            f"Once at {schedule.get('exact_at')}"
+            if kind == "once"
+            else (
+                f"Every {schedule.get('interval_seconds')} seconds from {schedule.get('anchor_at')}"
+                if kind == "interval"
+                else f"Calendar {schedule.get('hour')}:{str(schedule.get('minute')).zfill(2)} "
+                f"in {schedule.get('timezone')}; {schedule.get('day_selector')}; "
+                f"weekdays {schedule.get('weekdays')}, month days {schedule.get('month_days')}, "
+                f"months {schedule.get('months')}; DST gap {schedule.get('nonexistent_time_policy')}, "
+                f"overlap {schedule.get('ambiguous_time_policy')}"
+            )
+        )
+        lines = [
+            f"Assignment: {routine.get('title')} · revision {routine.get('revision')}",
+            f"Instruction: {routine.get('authorized_instruction')}",
+            f"Schedule: {when}; missed slots: {routine.get('misfire_policy')}",
+            "Immediate occurrence: "
+            + (
+                "one, within the same limits"
+                if routine.get("run_immediately")
+                else "none"
+            ),
+            f"Per run: {routine.get('per_run_max_tokens')} tokens, ${routine.get('per_run_max_cost_usd')} estimated model cost.",
+            f"Total: {routine.get('cumulative_max_tokens')} tokens, ${routine.get('cumulative_max_cost_usd')}; "
+            f"{routine.get('cumulative_max_attempts')} attempts, {routine.get('cumulative_max_occurrences')} occurrences; "
+            f"expires {routine.get('expires_at')}.",
+            f"Sensitivity ceiling: {routine.get('sensitivity_ceiling')}; model routes: {routine.get('eligible_model_routes')}.",
+            "Connections, exact resources, operations, columns, keys, argument restrictions, call ceilings, "
+            "retained skills and required effects/artifacts are listed below.",
+            "Results go to the originating conversation inbox. Execution requires an open host and shares its run lock.",
+            "This revision grants no missing connector permissions. Uncertain actions pause work; actions are never automatically replayed.",
+            "Model-cost limits do not cap third-party service fees.",
+        ]
+        authority = document.get("authority", {})
+        if isinstance(authority, dict):
+            for resource in authority.get("resources", ()):
+                if isinstance(resource, dict):
+                    lines.append(
+                        f"Table: {resource.get('display_name', resource.get('resource_id'))} [{resource.get('sensitivity')}]."
+                    )
+            for binding in authority.get("bindings", ()):
+                if isinstance(binding, dict):
+                    lines.append(
+                        f"Connection: {binding.get('display_name', binding.get('binding_id'))}; outbound ceiling {binding.get('maximum_outbound_sensitivity')}."
+                    )
+        for grant in routine.get("capability_grants", ()):
+            if not isinstance(grant, dict):
+                continue
+            lines.append(
+                f"Action: {grant.get('capability_id')}; at most {grant.get('max_calls_per_occurrence')} call(s) per occurrence."
+            )
+            constraints = grant.get("constraints", {})
+            if not isinstance(constraints, dict):
+                continue
+            if "allowed_operations" in constraints:
+                lines.append(
+                    f"Native operations {constraints.get('allowed_operations')}; keys {constraints.get('key_columns')}; "
+                    f"insert {constraints.get('allowed_insert_columns')}; update {constraints.get('allowed_update_columns')}; "
+                    f"generated identities {constraints.get('generated_identity_columns')}; maximum rows {constraints.get('max_rows')}."
+                )
+            if "fixed_arguments" in constraints:
+                lines.append(
+                    "Fixed arguments: "
+                    + json.dumps(
+                        constraints["fixed_arguments"],
+                        ensure_ascii=True,
+                        sort_keys=True,
+                    )
+                    + "; variable scalar arguments: "
+                    + str(constraints.get("variable_argument_names"))
+                    + "."
+                )
+        outcome = routine.get("outcome_contract", {})
+        if isinstance(outcome, dict):
+            for effect in outcome.get("effect_requirements", ()):
+                if isinstance(effect, dict):
+                    minimum = effect.get("minimum_successful_calls")
+                    lines.append(
+                        f"Completion: {effect.get('capability_id')} requires {minimum} successful call(s) "
+                        f"with evidence {effect.get('accepted_evidence_bases')}. "
+                        + (
+                            "An approved no-action path may succeed."
+                            if minimum == 0
+                            else "No findings or a final answer alone cannot satisfy this action requirement."
+                        )
+                    )
+            for artifact in outcome.get("artifact_requirements", ()):
+                if isinstance(artifact, dict):
+                    lines.append(
+                        f"Artifact: {'required' if artifact.get('required') else 'optional'}; "
+                        f"formats {artifact.get('allowed_media_types')}; count {artifact.get('minimum_count')}–{artifact.get('maximum_count')}."
+                    )
+        lines.append(
+            "Server-reported evidence confirms invocation, not verified downstream delivery or business completion. Configured step and wall-time limits also apply."
+        )
+        return (
+            sanitize_terminal_text(
+                "\n".join(lines),
+                maximum=12000,
+                preserve_lines=True,
+                fallback="Assignment review",
+            )
+            + "\n\n"
+        )
+    if "receipt" in document and "decision" in document:
+        return (
+            "Recovery: " + str(document.get("consequence", document["decision"])) + "\n"
+            "The original observation stays unchanged. This records a human decision, performs no action, "
+            "and grants no connector permission.\n\n"
+        )
+    return ""
+
+
+def effect_receipt_mapping(receipt: EffectReceipt) -> dict[str, object]:
+    """Project evidence and the separate human decision without a storage codec."""
+    resolution = receipt.resolution
+    return FrozenJsonObject.from_mapping(
+        {
+            **receipt.material(),
+            "receipt_digest": receipt.receipt_digest,
+            "resolution": (
+                None
+                if resolution is None
+                else {
+                    "decision": resolution.decision.value,
+                    "note": resolution.note,
+                    "evidence_references": resolution.evidence_references,
+                    "approving_principal_id": resolution.approving_principal_id,
+                    "control_id": resolution.control_id,
+                    "resolved_at": resolution.resolved_at.isoformat(),
+                    "receipt_digest": resolution.receipt_digest,
+                }
+            ),
+        }
+    ).to_dict()

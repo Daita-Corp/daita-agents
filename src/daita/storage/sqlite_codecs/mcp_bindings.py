@@ -7,10 +7,14 @@ from ...adapters.mcp import (
     MCPAuthentication,
     MCPAuthenticationMode,
     MCPBindingState,
+    MCPCompletionSemantics,
     MCPServerBinding,
     MCPToolBinding,
 )
 from ...capabilities import (
+    AccessMode,
+    AutomationEligibility,
+    OperationalEffect,
     ToolboxId,
     ToolLoadMode,
     ToolPresentation,
@@ -57,6 +61,9 @@ def encode_mcp_binding(value: MCPServerBinding) -> str:
                 "server_name": value.server_name,
                 "server_version": value.server_version,
                 "local_label": value.local_label,
+                "summary": value.summary,
+                "when_to_use": value.when_to_use,
+                "keywords": list(value.keywords),
                 "maximum_outbound_sensitivity": (
                     value.maximum_outbound_sensitivity.value
                 ),
@@ -90,6 +97,9 @@ def decode_mcp_binding(
             "server_name",
             "server_version",
             "local_label",
+            "summary",
+            "when_to_use",
+            "keywords",
             "maximum_outbound_sensitivity",
             "tools",
             "state",
@@ -132,6 +142,12 @@ def decode_mcp_binding(
         server_name=text(fields["server_name"], "MCP server name"),
         server_version=text(fields["server_version"], "MCP server version"),
         local_label=text(fields["local_label"], "MCP local server label"),
+        summary=text(fields["summary"], "MCP binding summary"),
+        when_to_use=text(fields["when_to_use"], "MCP binding when_to_use"),
+        keywords=tuple(
+            text(item, "MCP binding keyword")
+            for item in sequence(fields["keywords"], "MCP binding keywords")
+        ),
         maximum_outbound_sensitivity=maximum_outbound,
         tools=tools,
         state=state,
@@ -167,6 +183,12 @@ def _encode_tool(value: MCPToolBinding):
             ),
             "output_schema_digest": value.output_schema_digest,
             "result_sensitivity": value.result_sensitivity.value,
+            "access_mode": value.access_mode.value,
+            "operational_effect": value.operational_effect.value,
+            "automation_eligibility": value.automation_eligibility.value,
+            "maximum_outbound_sensitivity": value.maximum_outbound_sensitivity.value,
+            "completion_semantics": value.completion_semantics.value,
+            "task_support": value.task_support,
         },
     )
 
@@ -192,6 +214,12 @@ def _decode_tool(value) -> MCPToolBinding:
             "output_schema",
             "output_schema_digest",
             "result_sensitivity",
+            "access_mode",
+            "operational_effect",
+            "automation_eligibility",
+            "maximum_outbound_sensitivity",
+            "completion_semantics",
+            "task_support",
         ),
     )
     input_schema = plain_decode(fields["input_schema"])
@@ -252,6 +280,20 @@ def _decode_tool(value) -> MCPToolBinding:
             fields["output_schema_digest"], "MCP output schema digest"
         ),
         result_sensitivity=sensitivity,
+        access_mode=AccessMode(text(fields["access_mode"], "MCP access mode")),
+        operational_effect=OperationalEffect(
+            text(fields["operational_effect"], "MCP effect")
+        ),
+        automation_eligibility=AutomationEligibility(
+            text(fields["automation_eligibility"], "MCP automation eligibility")
+        ),
+        maximum_outbound_sensitivity=ModelSensitivity(
+            text(fields["maximum_outbound_sensitivity"], "MCP tool outbound ceiling")
+        ),
+        completion_semantics=MCPCompletionSemantics(
+            text(fields["completion_semantics"], "MCP completion semantics")
+        ),
+        task_support=text(fields["task_support"], "MCP task support"),
     )
 
 

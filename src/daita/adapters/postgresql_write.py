@@ -1,4 +1,4 @@
-"""Preview and transactionally execute approved structured PostgreSQL updates."""
+"""Preview and transactionally execute admitted native PostgreSQL row writes."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from hashlib import sha256
-from typing import Any, Protocol
+from typing import Any, cast
 from uuid import UUID
 
 from .._json import (
@@ -21,36 +21,48 @@ from .._json import (
     freeze_json,
     thaw_json,
 )
-from ..capabilities import ToolExecution
+from ..capabilities import (
+    CapabilityInputError,
+    EffectEvidenceBasis,
+    EffectObservation,
+    EffectOutcome,
+    ToolExecution,
+)
 from ..domains.data.capabilities import (
-    PostgreSQLPreviewFingerprint,
-    PostgreSQLUpdatePreview,
-    PostgreSQLUpdatePreviewChecks,
-    PostgreSQLUpdateResult,
-    PostgreSQLUpdateSample,
+    RelationalPreviewFingerprint,
+    RelationalUpdatePreview,
+    RelationalUpdatePreviewChecks,
+    RelationalUpdateResult,
+    RelationalUpdateSample,
+    RelationalUpsertResult,
 )
 from ..domains.data.controller import (
-    POSTGRESQL_UPDATE_CAPABILITY_ID,
-    POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-    PostgreSQLUpdateCatalogReader,
+    RELATIONAL_UPDATE_CAPABILITY_ID,
+    RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
+    RelationalWriteCatalogReader,
 )
 from ..domains.data.sql import (
-    PostgreSQLUpdateCell,
-    PostgreSQLUpdateCommand,
-    PostgreSQLUpdateIntent,
-    ValidatedPostgreSQLUpdate,
-    render_postgresql_update_statement,
-    validate_postgresql_update_intent,
-    validate_postgresql_update_scope,
+    RelationalUpdateCell,
+    RelationalUpdateCommand,
+    RelationalUpdateIntent,
+    ResourceSchema,
+    ValidatedRelationalUpdate,
+    render_relational_update_statement,
+    validate_relational_update_intent,
+    validate_relational_write_scope,
+)
+from ..domains.data.sql.relational_update import _qualified_identity
+from ..domains.data.sql.relational_upsert import (
+    RelationalUpsertIntent,
+    ValidatedRelationalUpsert,
+    validate_relational_upsert_intent,
+    validate_relational_upsert_scope,
 )
 from ..errors import DaitaError
+from ..llm.models import ModelSensitivity
 from ..security import SecretProvider, default_secret_provider
-from ..storage.sqlite import (
-    DatabaseWriteOutcome,
-    DatabaseWriteReceipt,
-    DatabaseWriteReceiptConflictError,
-)
-from ..storage.sqlite_records import SourcePermissionStateError
+from ..storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
+from .models import SourceRegistration
 from .postgresql import (
     _DEFAULT_MAX_COLUMNS,
     _DEFAULT_MAX_INDEXES,
@@ -160,7 +172,7 @@ LIMIT 1
 """
 
 
-class PostgreSQLUpdatePreviewError(DaitaError):
+class RelationalUpdatePreviewError(DaitaError):
     """Stable preview failure that excludes driver and server diagnostics."""
 
     def __init__(self, code: str, message: str) -> None:
@@ -172,7 +184,7 @@ class PostgreSQLUpdatePreviewError(DaitaError):
         super().__init__(message, error_code=code)
 
 
-class PostgreSQLUpdateExecutionError(DaitaError):
+class RelationalUpdateExecutionError(DaitaError):
     """Stable write failure with bounded receipt/outcome details."""
 
     def __init__(
@@ -180,13 +192,22 @@ class PostgreSQLUpdateExecutionError(DaitaError):
         code: str,
         message: str,
         details: Mapping[str, object] | None = None,
+        *,
+        effect_observation: EffectObservation | None = None,
     ) -> None:
+        self.effect_observation = effect_observation
         self.details = FrozenJsonObject.from_mapping(details or {})
         super().__init__(message, error_code=code)
 
 
+class RelationalUpdateExecutionCancelled(asyncio.CancelledError):
+    def __init__(self, observation: EffectObservation) -> None:
+        self.effect_observation = observation
+        super().__init__("native update cancelled after bounded transaction cleanup")
+
+
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateReadiness:
+class RelationalUpdateReadiness:
     """Bounded, secret-free readiness facts for one exact update scope."""
 
     source_id: str
@@ -277,30 +298,15 @@ class PostgreSQLUpdateReadiness:
         }
 
 
-class DatabaseWriteReceiptStore(Protocol):
-    async def load_database_write_receipt_for_call(
-        self, agent_id: str, run_id: str, call_id: str
-    ) -> DatabaseWriteReceipt | None: ...
-
-    async def start_database_write_receipt(
-        self, receipt: DatabaseWriteReceipt
-    ) -> DatabaseWriteReceipt: ...
-
-    async def finish_database_write_receipt(
-        self, receipt: DatabaseWriteReceipt
-    ) -> DatabaseWriteReceipt: ...
-
-
-class PostgreSQLUpdatePreviewBackend:
-    """Validate, compile, and inspect one update plan without mutating."""
+class PostgreSQLWriteBackend:
+    """Own native update/upsert readiness, previews and bounded transactions."""
 
     def __init__(
         self,
         sources: SourceStore,
-        catalog: PostgreSQLUpdateCatalogReader,
+        catalog: RelationalWriteCatalogReader,
         secret_provider: SecretProvider | None = None,
         *,
-        receipt_store: DatabaseWriteReceiptStore | None = None,
         clock: Callable[[], datetime] | None = None,
         statement_timeout_seconds: float = 5.0,
         lock_timeout_seconds: float = 1.0,
@@ -310,7 +316,7 @@ class PostgreSQLUpdatePreviewBackend:
             raise TypeError("sources must implement SourceStore")
         for method_name in (
             "resource_schemas",
-            "postgresql_update_scope_issue",
+            "relational_write_scope_issue",
         ):
             if not callable(getattr(catalog, method_name, None)):
                 raise TypeError(f"catalog must provide {method_name}")
@@ -331,16 +337,6 @@ class PostgreSQLUpdatePreviewBackend:
         self._sources = sources
         self._catalog = catalog
         self._secret_provider = provider
-        if receipt_store is not None and not all(
-            callable(getattr(receipt_store, name, None))
-            for name in (
-                "load_database_write_receipt_for_call",
-                "start_database_write_receipt",
-                "finish_database_write_receipt",
-            )
-        ):
-            raise TypeError("receipt_store must provide the database receipt contract")
-        self._receipt_store = receipt_store
         self._clock = clock or (lambda: datetime.now(UTC))
         self._statement_timeout_seconds = float(statement_timeout_seconds)
         self._lock_timeout_seconds = float(lock_timeout_seconds)
@@ -354,9 +350,9 @@ class PostgreSQLUpdatePreviewBackend:
         resource_id: str,
         assignment_columns: tuple[str, ...],
         execution: bool,
-    ) -> None:
+    ) -> RelationalWriteScope:
         try:
-            issue = await self._catalog.postgresql_update_scope_issue(
+            issue = await self._catalog.relational_write_scope_issue(
                 agent_id,
                 source_id,
                 resource_id,
@@ -368,19 +364,27 @@ class PostgreSQLUpdatePreviewBackend:
                 "Stored source permission state is missing or invalid.",
             )
         if issue is None:
-            return
+            permission = await self._catalog.load_relational_write_scope(
+                agent_id, source_id, resource_id
+            )
+            if permission is not None and "update" in permission.allowed_operations:
+                return permission
+            issue = (
+                "resource_write_not_allowed",
+                "The exact current update permission is unavailable.",
+            )
         if execution:
-            raise PostgreSQLUpdateExecutionError(issue[0], issue[1])
-        raise PostgreSQLUpdatePreviewError(issue[0], issue[1])
+            raise RelationalUpdateExecutionError(issue[0], issue[1])
+        raise RelationalUpdatePreviewError(issue[0], issue[1])
 
-    async def postgresql_update_readiness(
+    async def relational_update_readiness(
         self,
         *,
         agent_id: str,
         source_id: str,
         resource_id: str,
         assignment_columns: tuple[str, ...],
-    ) -> PostgreSQLUpdateReadiness:
+    ) -> RelationalUpdateReadiness:
         """Inspect one exact resource/column scope without granting or mutating."""
 
         if not isinstance(agent_id, str) or not agent_id:
@@ -422,7 +426,7 @@ class PostgreSQLUpdatePreviewBackend:
                 remediation_categories=("attach_active_postgresql_source",),
             )
         try:
-            scope_issue = await self._catalog.postgresql_update_scope_issue(
+            scope_issue = await self._catalog.relational_write_scope_issue(
                 agent_id,
                 source_id,
                 resource_id,
@@ -450,7 +454,7 @@ class PostgreSQLUpdatePreviewBackend:
                     ),
                 ),
             )
-        validation = validate_postgresql_update_scope(
+        validation = validate_relational_write_scope(
             source_id,
             resource_id,
             assignment_columns,
@@ -561,12 +565,12 @@ class PostgreSQLUpdatePreviewBackend:
         self,
         *,
         agent_id: str,
-        intent: PostgreSQLUpdateIntent,
-    ) -> PostgreSQLUpdatePreview:
+        intent: RelationalUpdateIntent,
+    ) -> RelationalUpdatePreview:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("preview agent_id must be non-empty text")
-        if not isinstance(intent, PostgreSQLUpdateIntent):
-            raise TypeError("intent must be PostgreSQLUpdateIntent")
+        if not isinstance(intent, RelationalUpdateIntent):
+            raise TypeError("intent must be RelationalUpdateIntent")
         registration = await self._sources.load_source(agent_id, intent.source_id)
         if (
             registration is None
@@ -575,18 +579,18 @@ class PostgreSQLUpdatePreviewBackend:
             or not registration.active
             or registration.adapter_id != "postgresql"
         ):
-            raise PostgreSQLUpdatePreviewError(
+            raise RelationalUpdatePreviewError(
                 "write_source_not_available",
                 "The selected source is not an active PostgreSQL source owned by this agent.",
             )
-        await self._require_update_scope(
+        permission = await self._require_update_scope(
             agent_id=agent_id,
             source_id=intent.source_id,
             resource_id=intent.resource_id,
             assignment_columns=tuple(item.column for item in intent.assignments),
             execution=False,
         )
-        validation = validate_postgresql_update_intent(
+        validation = validate_relational_update_intent(
             intent,
             resources=await self._catalog.resource_schemas(
                 agent_id,
@@ -595,9 +599,9 @@ class PostgreSQLUpdatePreviewBackend:
         )
         if not validation.valid or validation.validated is None:
             issue = validation.issues[0]
-            raise PostgreSQLUpdatePreviewError(issue.code, issue.message)
+            raise RelationalUpdatePreviewError(issue.code, issue.message)
         validated = validation.validated
-        statement = render_postgresql_update_statement(validated)
+        statement = render_relational_update_statement(validated)
         bound_update_parameters = _bound_update_parameters(validated)
 
         connection = None
@@ -605,7 +609,7 @@ class PostgreSQLUpdatePreviewBackend:
         transaction_finished = False
         normalized_failure: tuple[str, str] | None = None
         stage = "connect"
-        result: PostgreSQLUpdatePreview | None = None
+        result: RelationalUpdatePreview | None = None
         try:
             connection = await _connect(registration, self._secret_provider)
             transaction = connection.transaction(
@@ -628,7 +632,7 @@ class PostgreSQLUpdatePreviewBackend:
                 max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
             )
             if structure.source_revision != validated.source_revision:
-                raise PostgreSQLUpdatePreviewError(
+                raise RelationalUpdatePreviewError(
                     "write_resource_not_writable",
                     "The live PostgreSQL structure differs from the current catalog.",
                 )
@@ -656,7 +660,13 @@ class PostgreSQLUpdatePreviewBackend:
                 _bound_where_parameters(validated),
                 validated,
             )
+            if scan.matched_rows > permission.max_rows:
+                raise RelationalUpdatePreviewError(
+                    "write_row_limit",
+                    "The exact update exceeds the admitted row ceiling.",
+                )
             result = _build_preview(
+                permission_fingerprint=permission.authorization_fingerprint,
                 agent_id=agent_id,
                 validated=validated,
                 statement_sha256=statement.statement_sha256,
@@ -670,7 +680,7 @@ class PostgreSQLUpdatePreviewBackend:
             raise
         except ImportError:
             raise
-        except PostgreSQLUpdatePreviewError:
+        except RelationalUpdatePreviewError:
             raise
         except PostgreSQLSourceError:
             normalized_failure = (
@@ -694,9 +704,9 @@ class PostgreSQLUpdatePreviewBackend:
                         timeout_seconds=self._cleanup_timeout_seconds,
                     )
         if normalized_failure is not None:
-            raise PostgreSQLUpdatePreviewError(*normalized_failure)
+            raise RelationalUpdatePreviewError(*normalized_failure)
         if result is None:
-            raise PostgreSQLUpdatePreviewError(
+            raise RelationalUpdatePreviewError(
                 "write_preview_failed",
                 "PostgreSQL could not complete the bounded read-only preview.",
             )
@@ -707,109 +717,87 @@ class PostgreSQLUpdatePreviewBackend:
         *,
         agent_id: str,
         execution: ToolExecution,
-        command: PostgreSQLUpdateCommand,
-    ) -> PostgreSQLUpdateResult:
+        command: RelationalUpdateCommand,
+    ) -> RelationalUpdateResult:
         """Execute one receipt-backed update and classify commit certainty."""
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("update agent_id must be non-empty text")
         if not isinstance(execution, ToolExecution):
             raise TypeError("execution must be ToolExecution")
-        if execution.capability_id != POSTGRESQL_UPDATE_CAPABILITY_ID:
+        if execution.capability_id != RELATIONAL_UPDATE_CAPABILITY_ID:
             raise ValueError("update execution capability identity is invalid")
-        if not isinstance(command, PostgreSQLUpdateCommand):
-            raise TypeError("command must be PostgreSQLUpdateCommand")
-        if self._receipt_store is None:
-            raise PostgreSQLUpdateExecutionError(
+        if not isinstance(command, RelationalUpdateCommand):
+            raise TypeError("command must be RelationalUpdateCommand")
+        if execution.effect_receipt_id is None:
+            raise RelationalUpdateExecutionError(
                 "write_receipt_unavailable",
-                "Durable database write receipts are unavailable.",
+                "Runtime receipt reservation is required before native execution.",
             )
 
-        intent = command.intent
-        registration = await self._sources.load_source(agent_id, intent.source_id)
-        if (
-            registration is None
-            or registration.agent_id != agent_id
-            or registration.id != intent.source_id
-            or not registration.active
-            or registration.adapter_id != "postgresql"
-        ):
-            raise PostgreSQLUpdateExecutionError(
-                "write_source_not_available",
-                "The selected source is not an active PostgreSQL source owned by this agent.",
-            )
-        await self._require_update_scope(
-            agent_id=agent_id,
-            source_id=intent.source_id,
-            resource_id=intent.resource_id,
-            assignment_columns=tuple(item.column for item in intent.assignments),
-            execution=True,
-        )
-        validation = validate_postgresql_update_intent(
-            intent,
-            resources=await self._catalog.resource_schemas(agent_id, intent.source_id),
-        )
-        if not validation.valid or validation.validated is None:
-            issue = validation.issues[0]
-            raise PostgreSQLUpdateExecutionError(issue.code, issue.message)
-        validated = validation.validated
-        statement = render_postgresql_update_statement(validated)
-        receipt = DatabaseWriteReceipt.start(
-            agent_id=agent_id,
-            run_id=execution.run_id,
-            call_id=execution.call_id,
-            capability_id=execution.capability_id,
-            source_id=validated.source_id,
-            resource_id=validated.resource_id,
-            intent_sha256=validated.intent_sha256,
-            preview_fingerprint=command.preview_fingerprint,
-            expected_affected_rows=command.expected_affected_rows,
-            started_at=self._clock(),
-        )
         try:
-            existing = await self._receipt_store.load_database_write_receipt_for_call(
-                agent_id,
-                execution.run_id,
-                execution.call_id,
+            intent = command.intent
+            registration = await self._sources.load_source(agent_id, intent.source_id)
+            if (
+                registration is None
+                or registration.agent_id != agent_id
+                or registration.id != intent.source_id
+                or not registration.active
+                or registration.adapter_id != "postgresql"
+            ):
+                raise RelationalUpdateExecutionError(
+                    "write_source_not_available",
+                    "The selected source is not an active PostgreSQL source owned by this agent.",
+                )
+            permission = await self._require_update_scope(
+                agent_id=agent_id,
+                source_id=intent.source_id,
+                resource_id=intent.resource_id,
+                assignment_columns=tuple(item.column for item in intent.assignments),
+                execution=True,
             )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            raise PostgreSQLUpdateExecutionError(
-                "write_receipt_unavailable",
-                "The durable receipt identity could not be checked.",
-            ) from None
-        if existing is not None:
-            _raise_duplicate_receipt(existing, receipt)
-        try:
-            await self._receipt_store.start_database_write_receipt(receipt)
-        except DatabaseWriteReceiptConflictError:
-            current = await self._receipt_store.load_database_write_receipt_for_call(
-                agent_id,
-                execution.run_id,
-                execution.call_id,
+            validation = validate_relational_update_intent(
+                intent,
+                resources=await self._catalog.resource_schemas(
+                    agent_id, intent.source_id
+                ),
             )
-            if current is not None:
-                _raise_duplicate_receipt(current, receipt)
-            raise PostgreSQLUpdateExecutionError(
-                "write_receipt_unavailable",
-                "The durable started receipt could not be established.",
+            if not validation.valid or validation.validated is None:
+                issue = validation.issues[0]
+                raise RelationalUpdateExecutionError(issue.code, issue.message)
+            validated = validation.validated
+            statement = render_relational_update_statement(validated)
+        except asyncio.CancelledError as error:
+            raise RelationalUpdateExecutionCancelled(
+                EffectObservation(
+                    EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+                )
+            ) from error
+        except (RelationalUpdateExecutionError, RelationalUpdatePreviewError) as error:
+            raise RelationalUpdateExecutionError(
+                error.error_code,
+                str(error),
+                effect_observation=EffectObservation(
+                    EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+                ),
             ) from None
-        except asyncio.CancelledError:
-            raise
         except Exception:
-            raise PostgreSQLUpdateExecutionError(
-                "write_receipt_unavailable",
-                "The durable started receipt could not be established.",
+            raise RelationalUpdateExecutionError(
+                "write_not_dispatched",
+                "Native update admission failed before write dispatch.",
+                effect_observation=EffectObservation(
+                    EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+                ),
             ) from None
 
         connection = None
         transaction = None
         transaction_finished = False
         commit_attempted = False
+        mutation_attempted = False
         target_set_sha256: str | None = None
         affected_rows: int | None = None
-        terminal_outcome = DatabaseWriteOutcome.NOT_COMMITTED
+        terminal_outcome = EffectOutcome.NOT_APPLIED
         terminal_code: str | None = "write_not_committed"
         cancelled: asyncio.CancelledError | None = None
         try:
@@ -837,7 +825,7 @@ class PostgreSQLUpdatePreviewBackend:
                 max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
             )
             if structure.source_revision != validated.source_revision:
-                raise PostgreSQLUpdateExecutionError(
+                raise RelationalUpdateExecutionError(
                     "write_state_changed",
                     "The live PostgreSQL structure changed after approval.",
                 )
@@ -862,6 +850,7 @@ class PostgreSQLUpdatePreviewBackend:
                 validated,
             )
             locked_preview = _build_preview(
+                permission_fingerprint=permission.authorization_fingerprint,
                 agent_id=agent_id,
                 validated=validated,
                 statement_sha256=statement.statement_sha256,
@@ -875,10 +864,22 @@ class PostgreSQLUpdatePreviewBackend:
                 or locked_preview.fingerprint.preview_fingerprint
                 != command.preview_fingerprint
             ):
-                raise PostgreSQLUpdateExecutionError(
+                raise RelationalUpdateExecutionError(
                     "write_state_changed",
                     "The exact target set or write guardrails changed after approval.",
                 )
+            current_permission = await self._require_update_scope(
+                agent_id=agent_id,
+                source_id=intent.source_id,
+                resource_id=intent.resource_id,
+                assignment_columns=tuple(item.column for item in intent.assignments),
+                execution=True,
+            )
+            if current_permission != permission:
+                raise RelationalUpdateExecutionError(
+                    "write_state_changed", "Native permission changed before mutation."
+                )
+            mutation_attempted = True
             status = await connection.execute(
                 statement.sql,
                 *_bound_update_parameters(validated),
@@ -886,28 +887,28 @@ class PostgreSQLUpdatePreviewBackend:
             )
             affected_rows = _affected_rows_from_status(status)
             if affected_rows != command.expected_affected_rows:
-                raise PostgreSQLUpdateExecutionError(
+                raise RelationalUpdateExecutionError(
                     "write_affected_rows_mismatch",
                     "PostgreSQL changed a different number of rows than the approved plan.",
                 )
             commit_attempted = True
             await transaction.commit()
             transaction_finished = True
-            terminal_outcome = DatabaseWriteOutcome.COMMITTED
+            terminal_outcome = EffectOutcome.SUCCEEDED
             terminal_code = None
         except asyncio.CancelledError as error:
             cancelled = error
             if commit_attempted:
-                terminal_outcome = DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                terminal_outcome = EffectOutcome.UNCERTAIN
                 terminal_code = "write_outcome_unknown"
             else:
-                terminal_outcome = DatabaseWriteOutcome.NOT_COMMITTED
+                terminal_outcome = EffectOutcome.NOT_APPLIED
                 terminal_code = "write_not_committed"
-        except (PostgreSQLUpdateExecutionError, PostgreSQLUpdatePreviewError) as error:
+        except (RelationalUpdateExecutionError, RelationalUpdatePreviewError) as error:
             terminal_outcome = (
-                DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                EffectOutcome.UNCERTAIN
                 if commit_attempted
-                else DatabaseWriteOutcome.NOT_COMMITTED
+                else EffectOutcome.NOT_APPLIED
             )
             terminal_code = (
                 "write_outcome_unknown" if commit_attempted else error.error_code
@@ -917,97 +918,88 @@ class PostgreSQLUpdatePreviewBackend:
                 getattr(error, "sqlstate", None), str
             )
             terminal_outcome = (
-                DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                EffectOutcome.UNCERTAIN
                 if commit_attempted and not commit_rejected
-                else DatabaseWriteOutcome.NOT_COMMITTED
+                else EffectOutcome.NOT_APPLIED
             )
             terminal_code = (
                 "write_outcome_unknown"
-                if terminal_outcome is DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                if terminal_outcome is EffectOutcome.UNCERTAIN
                 else _normalized_update_failure(error)
             )
         finally:
             try:
                 if transaction is not None and not transaction_finished:
-                    await _rollback_postgresql_transaction(
-                        transaction,
-                        connection,
-                        timeout_seconds=self._cleanup_timeout_seconds,
-                    )
+                    try:
+                        rolled_back = await _rollback_postgresql_transaction(
+                            transaction,
+                            connection,
+                            timeout_seconds=self._cleanup_timeout_seconds,
+                        )
+                    except asyncio.CancelledError as error:
+                        cancelled = cancelled or error
+                        rolled_back = False
+                    if not rolled_back and mutation_attempted:
+                        terminal_outcome, terminal_code = (
+                            EffectOutcome.UNCERTAIN,
+                            "write_outcome_unknown",
+                        )
             finally:
                 if connection is not None:
-                    await _close_postgresql_connection(
-                        connection,
-                        timeout_seconds=self._cleanup_timeout_seconds,
-                    )
+                    try:
+                        await _close_postgresql_connection(
+                            connection, timeout_seconds=self._cleanup_timeout_seconds
+                        )
+                    except asyncio.CancelledError as error:
+                        cancelled = cancelled or error
 
         completed_at = self._clock()
-        terminal = receipt.finish(
+        observation = EffectObservation(
             terminal_outcome,
-            completed_at=completed_at,
-            affected_rows=(
-                affected_rows
-                if terminal_outcome is DatabaseWriteOutcome.COMMITTED
-                else (
-                    0
-                    if terminal_outcome is DatabaseWriteOutcome.NOT_COMMITTED
-                    else None
-                )
-            ),
-            normalized_error_code=terminal_code,
-        )
-        try:
-            await self._receipt_store.finish_database_write_receipt(terminal)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            code = (
-                "write_outcome_unknown"
-                if terminal_outcome
-                in {
-                    DatabaseWriteOutcome.COMMITTED,
-                    DatabaseWriteOutcome.OUTCOME_UNKNOWN,
-                }
-                else "write_receipt_unavailable"
-            )
-            raise PostgreSQLUpdateExecutionError(
-                code,
-                "The terminal database write receipt could not be established.",
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+            FrozenJsonObject.from_mapping(
                 {
-                    "receipt_id": receipt.receipt_id,
-                    "outcome": (
-                        "outcome_unknown"
-                        if code == "write_outcome_unknown"
-                        else "not_committed"
+                    "source_id": validated.source_id,
+                    "resource_id": validated.resource_id,
+                    "intent_sha256": validated.intent_sha256,
+                    "preview_fingerprint": command.preview_fingerprint,
+                    "target_set_sha256": target_set_sha256,
+                    "expected_affected_rows": command.expected_affected_rows,
+                    "affected_rows": (
+                        affected_rows
+                        if terminal_outcome is EffectOutcome.SUCCEEDED
+                        else (
+                            0 if terminal_outcome is EffectOutcome.NOT_APPLIED else None
+                        )
                     ),
-                    "affected_rows": None if code == "write_outcome_unknown" else 0,
-                },
-            ) from None
+                    "normalized_error_code": terminal_code,
+                }
+            ),
+        )
         if cancelled is not None:
-            raise cancelled
-        if terminal_outcome is not DatabaseWriteOutcome.COMMITTED:
+            raise RelationalUpdateExecutionCancelled(observation) from cancelled
+        if terminal_outcome is not EffectOutcome.SUCCEEDED:
             assert terminal_code is not None
-            raise PostgreSQLUpdateExecutionError(
+            raise RelationalUpdateExecutionError(
                 terminal_code,
                 (
                     "PostgreSQL commit certainty was lost; do not retry automatically."
-                    if terminal_outcome is DatabaseWriteOutcome.OUTCOME_UNKNOWN
+                    if terminal_outcome is EffectOutcome.UNCERTAIN
                     else "PostgreSQL did not commit the approved update."
                 ),
                 {
-                    "receipt_id": receipt.receipt_id,
+                    "receipt_id": execution.effect_receipt_id,
                     "outcome": terminal_outcome.value,
                     "affected_rows": (
-                        0
-                        if terminal_outcome is DatabaseWriteOutcome.NOT_COMMITTED
-                        else None
+                        0 if terminal_outcome is EffectOutcome.NOT_APPLIED else None
                     ),
                 },
+                effect_observation=observation,
             )
         assert affected_rows is not None
         assert target_set_sha256 is not None
-        return PostgreSQLUpdateResult(
-            receipt_id=receipt.receipt_id,
+        return RelationalUpdateResult(
+            receipt_id=execution.effect_receipt_id,
             source_id=validated.source_id,
             resource_id=validated.resource_id,
             source_revision=validated.source_revision,
@@ -1017,6 +1009,709 @@ class PostgreSQLUpdatePreviewBackend:
             target_set_sha256=target_set_sha256,
             affected_rows=affected_rows,
             committed_at=completed_at.isoformat(),
+            effect_observation=observation,
+        )
+
+    async def _admit_upsert(
+        self,
+        agent_id: str,
+        intent: RelationalUpsertIntent,
+        request_sensitivity: ModelSensitivity | None = None,
+    ) -> tuple[SourceRegistration, ValidatedRelationalUpsert, RelationalWriteScope]:
+        registration = await self._sources.load_source(agent_id, intent.source_id)
+        if (
+            registration is None
+            or not registration.active
+            or registration.agent_id != agent_id
+            or registration.adapter_id != "postgresql"
+        ):
+            raise CapabilityInputError(
+                "write_source_not_available", "The exact native source is unavailable."
+            )
+        scope = await self._catalog.load_relational_write_scope(
+            agent_id, intent.source_id, intent.resource_id
+        )
+        if scope is None:
+            raise CapabilityInputError(
+                "resource_write_not_allowed",
+                "The exact native write permission is unavailable or stale.",
+            )
+        issue = await self._catalog.relational_write_scope_issue(
+            agent_id,
+            intent.source_id,
+            intent.resource_id,
+            intent.update_columns,
+            operation="upsert",
+            insert_columns=intent.insert_columns,
+            key_columns=intent.key_columns,
+            row_count=len(intent.rows),
+        )
+        if issue is not None:
+            raise CapabilityInputError(*issue)
+        resource = next(
+            (
+                item
+                for item in await self._catalog.resource_schemas(
+                    agent_id, intent.source_id
+                )
+                if item.resource_id == intent.resource_id
+            ),
+            None,
+        )
+        if resource is None:
+            raise CapabilityInputError(
+                "write_resource_not_writable", "The exact table is no longer cataloged."
+            )
+        if request_sensitivity is not None:
+            try:
+                target_sensitivity = ModelSensitivity(resource.sensitivity_class)
+            except ValueError:
+                raise CapabilityInputError(
+                    "write_sensitivity_denied", "Target classification is unknown."
+                ) from None
+            if request_sensitivity.routing_rank > target_sensitivity.routing_rank:
+                raise CapabilityInputError(
+                    "write_sensitivity_denied",
+                    "The request exceeds the target's current admitted classification.",
+                )
+        validated = validate_relational_upsert_intent(
+            intent,
+            resource=resource,
+            generated_identity_columns=scope.generated_identity_columns,
+            max_rows=scope.max_rows,
+        )
+        return registration, validated, scope
+
+    async def upsert_readiness(
+        self, agent_id: str, constraints: FrozenJsonObject
+    ) -> FrozenJsonObject:
+        source_id, resource_id = str(constraints["source_id"]), str(
+            constraints["resource_id"]
+        )
+        registration = await self._sources.load_source(agent_id, source_id)
+        permission = await self._catalog.load_relational_write_scope(
+            agent_id, source_id, resource_id
+        )
+        if (
+            registration is None
+            or permission is None
+            or "upsert" not in permission.allowed_operations
+        ):
+            raise CapabilityInputError(
+                "resource_write_not_allowed",
+                "Explicit current upsert permission is required.",
+            )
+        resource = next(
+            (
+                item
+                for item in await self._catalog.resource_schemas(agent_id, source_id)
+                if item.resource_id == resource_id
+            ),
+            None,
+        )
+        if resource is None:
+            raise CapabilityInputError(
+                "write_resource_not_writable", "The exact table is no longer admitted."
+            )
+        inserts = cast(tuple[str, ...], constraints["allowed_insert_columns"])
+        updates = cast(tuple[str, ...], constraints["allowed_update_columns"])
+        validate_relational_upsert_scope(
+            resource,
+            key_columns=cast(tuple[str, ...], constraints["key_columns"]),
+            insert_columns=inserts,
+            update_columns=updates,
+            generated_identity_columns=cast(
+                tuple[str, ...], constraints["generated_identity_columns"]
+            ),
+        )
+        connection = transaction = None
+        finished = False
+        try:
+            connection = await _connect(registration, self._secret_provider)
+            transaction = connection.transaction(
+                isolation="repeatable_read", readonly=True
+            )
+            await transaction.start()
+            await _configure_write_transaction(
+                connection,
+                statement_timeout_seconds=self._statement_timeout_seconds,
+                lock_timeout_seconds=self._lock_timeout_seconds,
+            )
+            await self._inspect_upsert_target(
+                connection, registration, resource, inserts, updates
+            )
+            if (
+                await self._catalog.load_relational_write_scope(
+                    agent_id, source_id, resource_id
+                )
+                != permission
+            ):
+                raise CapabilityInputError(
+                    "write_state_changed",
+                    "Upsert admission changed during readiness inspection.",
+                )
+            await transaction.commit()
+            finished = True
+            return FrozenJsonObject.from_mapping(
+                {
+                    "source_id": source_id,
+                    "resource_id": resource_id,
+                    "resource_revision": resource.revision,
+                    "ready_for_preview": True,
+                    "proves_execution": False,
+                    "lock_mode": "EXCLUSIVE",
+                    "statement_timeout_seconds": self._statement_timeout_seconds,
+                    "lock_timeout_seconds": self._lock_timeout_seconds,
+                    "identity_sequence_gaps_possible": bool(
+                        permission.generated_identity_columns
+                    ),
+                }
+            )
+        except (CapabilityInputError, asyncio.CancelledError, ImportError):
+            raise
+        except Exception as error:
+            raise CapabilityInputError(
+                _normalized_failure("inspect", error)[0],
+                "The bounded native upsert readiness inspection failed.",
+            ) from None
+        finally:
+            try:
+                if transaction is not None and not finished:
+                    await _rollback_postgresql_transaction(
+                        transaction,
+                        connection,
+                        timeout_seconds=self._cleanup_timeout_seconds,
+                    )
+            finally:
+                if connection is not None:
+                    await _close_postgresql_connection(
+                        connection, timeout_seconds=self._cleanup_timeout_seconds
+                    )
+
+    async def _inspect_upsert_target(
+        self,
+        connection: Any,
+        registration: SourceRegistration,
+        resource: ResourceSchema,
+        insert_columns: tuple[str, ...],
+        update_columns: tuple[str, ...],
+    ) -> tuple[Any, dict[str, object]]:
+        structure = await _load_structure(
+            connection,
+            registration,
+            max_resources=_DEFAULT_MAX_RESOURCES,
+            max_columns=_DEFAULT_MAX_COLUMNS,
+            max_indexes=_DEFAULT_MAX_INDEXES,
+            max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
+        )
+        if structure.source_revision != resource.source_revision:
+            raise CapabilityInputError(
+                "write_state_changed",
+                "The live structure differs from the admitted preview structure.",
+            )
+        schema, table_name = _qualified_identity(resource)
+        table = next(
+            (
+                table
+                for table in structure.tables
+                if table.schema == schema and table.name == table_name
+            ),
+            None,
+        )
+        if table is None:
+            raise CapabilityInputError(
+                "write_state_changed", "The exact target table disappeared."
+            )
+        raw = await connection.fetchrow(
+            _UPSERT_GUARDRAILS_SQL,
+            schema,
+            table_name,
+            list(update_columns),
+            list(insert_columns),
+            timeout=self._statement_timeout_seconds,
+        )
+        guardrails = _admitted_guardrails(raw)
+        insert_facts = {
+            name: _record_value(raw, name)
+            for name in (
+                "can_insert_columns",
+                "can_lock_table",
+                "unsupported_insert_features",
+            )
+        }
+        if (
+            insert_facts["can_insert_columns"] is not True
+            or insert_facts["can_lock_table"] is not True
+            or insert_facts["unsupported_insert_features"] is not False
+        ):
+            raise CapabilityInputError(
+                "upsert_guardrail_rejected",
+                "The insert branch or exclusive-lock permission has unsupported target features or privileges.",
+            )
+        guardrails.update(insert_facts)
+        return table, guardrails
+
+    async def _upsert_preview_on_connection(
+        self,
+        connection: Any,
+        registration: SourceRegistration,
+        validated: ValidatedRelationalUpsert,
+        scope: RelationalWriteScope,
+    ) -> tuple[FrozenJsonObject, tuple[str, ...]]:
+        resource, intent = validated.resource, validated.intent
+        table, guardrails = await self._inspect_upsert_target(
+            connection,
+            registration,
+            resource,
+            intent.insert_columns,
+            intent.update_columns,
+        )
+        schema, table_name = _qualified_identity(resource)
+        relation = _identifier(schema) + "." + _identifier(table_name)
+        types = {column: name for column, _, name in resource.column_type_provenance}
+        existing_rows: list[object] = []
+        classifications: list[dict[str, object]] = []
+        actions: list[str] = []
+        for row in validated.rows:
+            parameters = tuple(
+                _upsert_bound_value(row[column], types[column])
+                for column in intent.key_columns
+            )
+            where = " AND ".join(
+                f"{_identifier(column)} = ${index}"
+                for index, column in enumerate(intent.key_columns, 1)
+            )
+            compared = tuple(intent.update_columns)
+            values = tuple(
+                _upsert_bound_value(row[column], types[column]) for column in compared
+            )
+            changed = " OR ".join(
+                f"{_identifier(column)} IS DISTINCT FROM ${index}"
+                for index, column in enumerate(compared, len(parameters) + 1)
+            )
+            columns = tuple(dict.fromkeys((*intent.key_columns, *compared)))
+            row_size = (
+                "pg_catalog.pg_column_size(ROW("
+                + ", ".join(_identifier(column) for column in columns)
+                + "))"
+            )
+            selected = ", ".join(
+                f"CASE WHEN {row_size} <= {_PREVIEW_VALUE_BYTES} THEN {_identifier(column)} ELSE NULL END AS {_identifier(column)}"
+                for column in columns
+            )
+            records = await connection.fetch(
+                f"/* daita:postgresql.upsert_target */ SELECT {selected}, xmin::pg_catalog.text AS __daita_xmin, "
+                f"({changed}) AS __daita_changed, ({row_size} <= {_PREVIEW_VALUE_BYTES}) AS __daita_bounded "
+                f"FROM ONLY {relation} WHERE {where} LIMIT 2",
+                *parameters,
+                *values,
+                timeout=self._statement_timeout_seconds,
+            )
+            if len(records) > 1:
+                raise CapabilityInputError(
+                    "upsert_key_unsupported",
+                    "The conflict key matched more than one row.",
+                )
+            before: dict[str, object] | None = None
+            if records:
+                record = records[0]
+                if _record_value(record, "__daita_bounded") is not True:
+                    raise CapabilityInputError(
+                        "write_preview_too_large",
+                        "Existing values exceed the bounded preview.",
+                    )
+                before = {
+                    column: _preview_json_value_for_type(
+                        _record_value(record, column), types[column]
+                    )
+                    for column in columns
+                }
+                before["__daita_xmin"] = _bounded_row_version_fact(
+                    record, "__daita_xmin"
+                )
+                changed_value = _record_value(record, "__daita_changed")
+                if type(changed_value) is not bool:
+                    raise CapabilityInputError(
+                        "write_preview_failed",
+                        "Database change classification is unavailable.",
+                    )
+                action = "update" if changed_value else "unchanged"
+            else:
+                action = "insert"
+            existing_rows.append(before)
+            actions.append(action)
+            classifications.append(
+                {
+                    "key": {column: row[column] for column in intent.key_columns},
+                    "action": action,
+                }
+            )
+        target_digest = _sha256_json(
+            {"existing": existing_rows, "classifications": classifications}
+        )
+        fingerprint = _sha256_json(
+            {
+                "agent_id": registration.agent_id,
+                "intent_sha256": validated.intent_sha256,
+                "target_set_sha256": target_digest,
+                "resource_revision": resource.revision,
+                "permission_fingerprint": scope.authorization_fingerprint,
+                "structure": table.payload(),
+                "guardrails": guardrails,
+            }
+        )
+        preview = FrozenJsonObject.from_mapping(
+            {
+                "source_id": intent.source_id,
+                "resource_id": intent.resource_id,
+                "resource_revision": resource.revision,
+                "intent_sha256": validated.intent_sha256,
+                "preview_fingerprint": fingerprint,
+                "target_set_sha256": target_digest,
+                "permission_fingerprint": scope.authorization_fingerprint,
+                "input_count": len(validated.rows),
+                "inserted_count": actions.count("insert"),
+                "updated_count": actions.count("update"),
+                "unchanged_count": actions.count("unchanged"),
+                "classifications": classifications,
+                "evidence_call_ids": intent.evidence_call_ids,
+                "authorship": "model_derived",
+                "identity_sequence_gaps_possible": bool(
+                    scope.generated_identity_columns
+                ),
+            }
+        )
+        if len(canonical_json(preview).encode("utf-8")) > 256 * 1024:
+            raise CapabilityInputError(
+                "write_preview_too_large", "The exact preview exceeds its output bound."
+            )
+        return preview, tuple(actions)
+
+    async def preview_upsert(
+        self, *, agent_id: str, intent: RelationalUpsertIntent
+    ) -> FrozenJsonObject:
+        registration, validated, scope = await self._admit_upsert(agent_id, intent)
+        connection = transaction = None
+        finished = False
+        try:
+            connection = await _connect(registration, self._secret_provider)
+            transaction = connection.transaction(
+                isolation="repeatable_read", readonly=True
+            )
+            await transaction.start()
+            await _configure_write_transaction(
+                connection,
+                statement_timeout_seconds=self._statement_timeout_seconds,
+                lock_timeout_seconds=self._lock_timeout_seconds,
+            )
+            preview, _ = await self._upsert_preview_on_connection(
+                connection, registration, validated, scope
+            )
+            # Revocation or a changed approval while waiting for I/O invalidates this preview.
+            _, current, current_scope = await self._admit_upsert(agent_id, intent)
+            if (
+                current_scope != scope
+                or current.resource.revision != validated.resource.revision
+            ):
+                raise CapabilityInputError(
+                    "write_state_changed", "Native admission changed during preview."
+                )
+            await transaction.commit()
+            finished = True
+            return preview
+        except (CapabilityInputError, asyncio.CancelledError, ImportError):
+            raise
+        except Exception as error:
+            raise CapabilityInputError(
+                _normalized_failure("inspect", error)[0],
+                "The bounded native upsert preview failed.",
+            ) from None
+        finally:
+            try:
+                if transaction is not None and not finished:
+                    await _rollback_postgresql_transaction(
+                        transaction,
+                        connection,
+                        timeout_seconds=self._cleanup_timeout_seconds,
+                    )
+            finally:
+                if connection is not None:
+                    await _close_postgresql_connection(
+                        connection, timeout_seconds=self._cleanup_timeout_seconds
+                    )
+
+    async def execute_upsert(
+        self,
+        *,
+        agent_id: str,
+        execution: ToolExecution,
+        intent: RelationalUpsertIntent,
+        preview_fingerprint: str,
+    ) -> RelationalUpsertResult:
+        if (
+            execution.capability_id != "data.upsert_rows"
+            or execution.effect_receipt_id is None
+        ):
+            raise ValueError(
+                "upsert requires the exact runtime-reserved native execution"
+            )
+        connection = transaction = None
+        committed = commit_attempted = mutation_attempted = False
+        cancelled: asyncio.CancelledError | None = None
+        code: str | None = "write_not_committed"
+        outcome = EffectOutcome.NOT_APPLIED
+        preview: FrozenJsonObject | None = None
+        validated: ValidatedRelationalUpsert | None = None
+        scope: RelationalWriteScope | None = None
+        inserted = updated = unchanged = 0
+        generated: list[dict[str, object]] = []
+        try:
+            registration, validated, scope = await self._admit_upsert(
+                agent_id, intent, execution.request_sensitivity
+            )
+            connection = await _connect(registration, self._secret_provider)
+            # READ COMMITTED ensures setup queries cannot establish a stale pre-lock snapshot.
+            transaction = connection.transaction(isolation="read_committed")
+            await transaction.start()
+            await _configure_write_transaction(
+                connection,
+                statement_timeout_seconds=self._statement_timeout_seconds,
+                lock_timeout_seconds=self._lock_timeout_seconds,
+            )
+            schema, table = _qualified_identity(validated.resource)
+            relation = _identifier(schema) + "." + _identifier(table)
+            try:
+                await connection.execute(
+                    f"LOCK TABLE ONLY {relation} IN EXCLUSIVE MODE",
+                    timeout=self._lock_timeout_seconds,
+                )
+            except TimeoutError:
+                raise CapabilityInputError(
+                    "write_lock_timeout",
+                    "The table lock deadline elapsed before mutation.",
+                ) from None
+            preview, actions = await self._upsert_preview_on_connection(
+                connection, registration, validated, scope
+            )
+            if preview["preview_fingerprint"] != preview_fingerprint:
+                raise CapabilityInputError(
+                    "write_state_changed",
+                    "Existence, values, structure or permission changed after the exact preview.",
+                )
+            _, current, current_scope = await self._admit_upsert(
+                agent_id, intent, execution.request_sensitivity
+            )
+            if (
+                current_scope != scope
+                or current.resource.revision != validated.resource.revision
+            ):
+                raise CapabilityInputError(
+                    "write_state_changed", "Native permission changed before mutation."
+                )
+            types = {
+                column: name
+                for column, _, name in validated.resource.column_type_provenance
+            }
+            for row, action in zip(validated.rows, actions, strict=True):
+                if action == "unchanged":
+                    unchanged += 1
+                    continue
+                mutation_attempted = True
+                if action == "insert":
+                    columns = intent.insert_columns
+                    returning = (
+                        ", ".join(
+                            _identifier(column)
+                            for column in scope.generated_identity_columns
+                        )
+                        or "1 AS __daita_inserted"
+                    )
+                    records = await connection.fetch(
+                        f"INSERT INTO {relation} ("
+                        + ", ".join(_identifier(column) for column in columns)
+                        + ") VALUES ("
+                        + ", ".join(f"${index}" for index in range(1, len(columns) + 1))
+                        + f") RETURNING {returning}",
+                        *(
+                            _upsert_bound_value(row[column], types[column])
+                            for column in columns
+                        ),
+                        timeout=self._statement_timeout_seconds,
+                    )
+                    if len(records) != 1:
+                        raise CapabilityInputError(
+                            "write_affected_rows_mismatch",
+                            "The insertion count differs from the exact preview.",
+                        )
+                    inserted += 1
+                    if scope.generated_identity_columns:
+                        identity_values: dict[str, object] = {}
+                        for column in scope.generated_identity_columns:
+                            value = _record_value(records[0], column)
+                            bits = {"int2": 16, "int4": 32, "int8": 64}[types[column]]
+                            if (
+                                not isinstance(value, int)
+                                or isinstance(value, bool)
+                                or not -(2 ** (bits - 1)) <= value < 2 ** (bits - 1)
+                            ):
+                                raise CapabilityInputError(
+                                    "upsert_identity_invalid",
+                                    "The database returned an invalid generated identity.",
+                                )
+                            identity_values[column] = value
+                        generated.append(
+                            {
+                                "key": {
+                                    column: row[column] for column in intent.key_columns
+                                },
+                                "values": identity_values,
+                            }
+                        )
+                else:
+                    columns = (*intent.update_columns, *intent.key_columns)
+                    assignments = ", ".join(
+                        f"{_identifier(column)} = ${index}"
+                        for index, column in enumerate(intent.update_columns, 1)
+                    )
+                    where = " AND ".join(
+                        f"{_identifier(column)} = ${index}"
+                        for index, column in enumerate(
+                            intent.key_columns, len(intent.update_columns) + 1
+                        )
+                    )
+                    status = await connection.execute(
+                        f"UPDATE ONLY {relation} SET {assignments} WHERE {where}",
+                        *(
+                            _upsert_bound_value(row[column], types[column])
+                            for column in columns
+                        ),
+                        timeout=self._statement_timeout_seconds,
+                    )
+                    if _affected_rows_from_status(status) != 1:
+                        raise CapabilityInputError(
+                            "write_affected_rows_mismatch",
+                            "The update count differs from the exact preview.",
+                        )
+                    updated += 1
+            if (inserted, updated, unchanged) != (
+                preview["inserted_count"],
+                preview["updated_count"],
+                preview["unchanged_count"],
+            ) or inserted + updated + unchanged != len(validated.rows):
+                raise CapabilityInputError(
+                    "write_affected_rows_mismatch",
+                    "Batch counts do not sum to the exact input count.",
+                )
+            commit_attempted = True
+            await transaction.commit()
+            committed = True
+            outcome, code = EffectOutcome.SUCCEEDED, None
+        except asyncio.CancelledError as error:
+            cancelled = error
+            outcome = (
+                EffectOutcome.UNCERTAIN
+                if commit_attempted
+                else EffectOutcome.NOT_APPLIED
+            )
+            code = (
+                "write_outcome_unknown" if commit_attempted else "write_not_committed"
+            )
+        except Exception as error:
+            rejected_commit = commit_attempted and isinstance(
+                getattr(error, "sqlstate", None), str
+            )
+            outcome = (
+                EffectOutcome.UNCERTAIN
+                if commit_attempted and not rejected_commit
+                else EffectOutcome.NOT_APPLIED
+            )
+            code = (
+                "write_outcome_unknown"
+                if outcome is EffectOutcome.UNCERTAIN
+                else (
+                    error.code
+                    if isinstance(error, CapabilityInputError)
+                    else _normalized_update_failure(error)
+                )
+            )
+        finally:
+            try:
+                if transaction is not None and not committed:
+                    try:
+                        rolled_back = await _rollback_postgresql_transaction(
+                            transaction,
+                            connection,
+                            timeout_seconds=self._cleanup_timeout_seconds,
+                        )
+                    except asyncio.CancelledError as error:
+                        cancelled = cancelled or error
+                        rolled_back = False
+                    if not rolled_back and mutation_attempted:
+                        outcome, code = EffectOutcome.UNCERTAIN, "write_outcome_unknown"
+            finally:
+                if connection is not None:
+                    try:
+                        await _close_postgresql_connection(
+                            connection, timeout_seconds=self._cleanup_timeout_seconds
+                        )
+                    except asyncio.CancelledError as error:
+                        cancelled = cancelled or error
+
+        if validated is None or scope is None:
+            observation = EffectObservation(
+                EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+            )
+        else:
+            observation = EffectObservation(
+                outcome,
+                EffectEvidenceBasis.ADAPTER_VERIFIED,
+                FrozenJsonObject.from_mapping(
+                    {
+                        "source_id": intent.source_id,
+                        "resource_id": intent.resource_id,
+                        "intent_sha256": validated.intent_sha256,
+                        "preview_fingerprint": preview_fingerprint,
+                        "target_set_sha256": (
+                            None if preview is None else preview["target_set_sha256"]
+                        ),
+                        "input_count": len(intent.rows),
+                        "inserted_count": (
+                            inserted
+                            if committed
+                            else (0 if outcome is EffectOutcome.NOT_APPLIED else None)
+                        ),
+                        "updated_count": (
+                            updated
+                            if committed
+                            else (0 if outcome is EffectOutcome.NOT_APPLIED else None)
+                        ),
+                        "unchanged_count": unchanged if committed else None,
+                        "normalized_error_code": code,
+                        "identity_sequence_gaps_possible": bool(
+                            scope.generated_identity_columns
+                        ),
+                    }
+                ),
+            )
+        if cancelled is not None:
+            raise RelationalUpdateExecutionCancelled(observation) from cancelled
+        if not committed:
+            raise RelationalUpdateExecutionError(
+                code or "write_not_committed",
+                "The batch did not produce a verified commit; inspect its transaction evidence. Identity sequence allocations may leave gaps.",
+                effect_observation=observation,
+            )
+        assert preview is not None
+        return RelationalUpsertResult(
+            FrozenJsonObject.from_mapping(
+                {
+                    **preview.to_dict(),
+                    "receipt_id": execution.effect_receipt_id,
+                    "committed_at": self._clock().isoformat(),
+                    "generated_identities": generated,
+                }
+            ),
+            observation,
         )
 
 
@@ -1051,11 +1746,11 @@ async def _configure_write_transaction(
 class _TargetScan:
     matched_rows: int
     target_set_sha256: str
-    samples: tuple[PostgreSQLUpdateSample, ...]
+    samples: tuple[RelationalUpdateSample, ...]
 
 
 def _target_select_sql(
-    validated: ValidatedPostgreSQLUpdate,
+    validated: ValidatedRelationalUpdate,
     where_sql: str,
     *,
     for_update: bool = False,
@@ -1105,7 +1800,7 @@ async def _scan_target_rows(
     connection: object,
     sql: str,
     parameters: tuple[object, ...],
-    validated: ValidatedPostgreSQLUpdate,
+    validated: ValidatedRelationalUpdate,
 ) -> _TargetScan:
     cursor_factory = getattr(connection, "cursor")(sql, *parameters)
     cursor = (
@@ -1113,12 +1808,12 @@ async def _scan_target_rows(
     )
     digest = sha256()
     matched_rows = 0
-    samples: list[PostgreSQLUpdateSample] = []
+    samples: list[RelationalUpdateSample] = []
 
     async def accept(row: object) -> None:
         nonlocal matched_rows
         primary_key = tuple(
-            PostgreSQLUpdateCell(
+            RelationalUpdateCell(
                 column,
                 _preview_json_value_for_type(
                     _record_value(row, f"__daita_primary_key_{index}"),
@@ -1132,7 +1827,7 @@ async def _scan_target_rows(
         )
         before = (
             tuple(
-                PostgreSQLUpdateCell(
+                RelationalUpdateCell(
                     cell.column,
                     _preview_json_value_for_type(
                         _record_value(row, f"__daita_before_{index}"),
@@ -1164,7 +1859,7 @@ async def _scan_target_rows(
         if len(samples) >= 5 or not within_preview_limit:
             return
         samples.append(
-            PostgreSQLUpdateSample(
+            RelationalUpdateSample(
                 primary_key=primary_key,
                 before=before,
                 after=validated.assignments,
@@ -1178,14 +1873,14 @@ async def _scan_target_rows(
     else:
         fetch = getattr(cursor, "fetch", None)
         if not callable(fetch):
-            raise PostgreSQLUpdatePreviewError(
+            raise RelationalUpdatePreviewError(
                 "write_preview_failed",
                 "PostgreSQL did not provide a streaming target cursor.",
             )
         while True:
             batch = fetch(256)
             if not inspect.isawaitable(batch):
-                raise PostgreSQLUpdatePreviewError(
+                raise RelationalUpdatePreviewError(
                     "write_preview_failed",
                     "PostgreSQL did not provide an asynchronous target cursor.",
                 )
@@ -1206,64 +1901,22 @@ async def _scan_target_rows(
 
 def _affected_rows_from_status(value: object) -> int:
     if not isinstance(value, str):
-        raise PostgreSQLUpdateExecutionError(
+        raise RelationalUpdateExecutionError(
             "write_affected_rows_mismatch",
             "PostgreSQL returned an invalid update status.",
         )
     prefix, separator, count = value.rpartition(" ")
     if separator != " " or prefix != "UPDATE" or not count.isdecimal():
-        raise PostgreSQLUpdateExecutionError(
+        raise RelationalUpdateExecutionError(
             "write_affected_rows_mismatch",
             "PostgreSQL returned an invalid update status.",
         )
     return int(count)
 
 
-def _raise_duplicate_receipt(
-    existing: DatabaseWriteReceipt,
-    proposed: DatabaseWriteReceipt,
-) -> None:
-    same_identity = (
-        existing.agent_id == proposed.agent_id
-        and existing.run_id == proposed.run_id
-        and existing.call_id == proposed.call_id
-        and existing.capability_id == proposed.capability_id
-        and existing.source_id == proposed.source_id
-        and existing.resource_id == proposed.resource_id
-        and existing.intent_sha256 == proposed.intent_sha256
-        and existing.preview_fingerprint == proposed.preview_fingerprint
-        and existing.expected_affected_rows == proposed.expected_affected_rows
-    )
-    if not same_identity:
-        raise PostgreSQLUpdateExecutionError(
-            "write_receipt_integrity_error",
-            "The run and call identity conflicts with a different database write intent.",
-        )
-    outcome = (
-        "outcome_unknown"
-        if existing.outcome is DatabaseWriteOutcome.STARTED
-        else existing.outcome.value
-    )
-    raise PostgreSQLUpdateExecutionError(
-        (
-            "write_outcome_unknown"
-            if outcome == "outcome_unknown"
-            else "write_execution_duplicate"
-        ),
-        "This exact run and call identity already has a durable write receipt; it was not executed again.",
-        {
-            "receipt_id": existing.receipt_id,
-            "outcome": outcome,
-            "affected_rows": (
-                existing.affected_rows
-                if outcome == "committed"
-                else 0 if outcome == "not_committed" else None
-            ),
-        },
-    )
-
-
 def _normalized_update_failure(error: BaseException) -> str:
+    if isinstance(error, TimeoutError):
+        return "write_statement_timeout"
     sqlstate = getattr(error, "sqlstate", None)
     if isinstance(sqlstate, str) and sqlstate.startswith("23"):
         return "write_constraint_violation"
@@ -1278,7 +1931,7 @@ def _normalized_update_failure(error: BaseException) -> str:
 
 def _exact_live_table(
     structure: PostgreSQLStructure,
-    validated: ValidatedPostgreSQLUpdate,
+    validated: ValidatedRelationalUpdate,
 ) -> Any:
     table = next(
         (
@@ -1290,7 +1943,7 @@ def _exact_live_table(
         None,
     )
     if table is None or table.kind.value != "table":
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_resource_not_writable",
             "The exact cataloged PostgreSQL base table is no longer current.",
         )
@@ -1301,7 +1954,7 @@ def _admitted_guardrails(value: object) -> dict[str, object]:
     facts = _guardrail_facts(value)
     rejection_codes, _remediation = _readiness_rejections(facts)
     if rejection_codes:
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_guardrail_rejected",
             "The PostgreSQL relation, role, or privileges do not satisfy preview guardrails.",
         )
@@ -1310,7 +1963,7 @@ def _admitted_guardrails(value: object) -> dict[str, object]:
 
 def _guardrail_facts(value: object) -> dict[str, object]:
     if value is None:
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_resource_not_writable",
             "The exact PostgreSQL relation is no longer available.",
         )
@@ -1346,7 +1999,7 @@ def _guardrail_facts(value: object) -> dict[str, object]:
         or len(relation_kind) > 8
         or any(not isinstance(facts[name], bool) for name in boolean_names)
     ):
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_guardrail_rejected",
             "PostgreSQL returned invalid bounded write-readiness facts.",
         )
@@ -1479,7 +2132,7 @@ def _readiness_result(
     relation: Mapping[str, object] | None = None,
     rejection_codes: tuple[str, ...],
     remediation_categories: tuple[str, ...],
-) -> PostgreSQLUpdateReadiness:
+) -> RelationalUpdateReadiness:
     role_attributes: dict[str, object] = {}
     privileges: dict[str, object] = {}
     relation_facts: dict[str, object] = {}
@@ -1524,7 +2177,7 @@ def _readiness_result(
         if unknown:
             raise ValueError("readiness relation override is invalid")
         relation_facts.update(relation)
-    return PostgreSQLUpdateReadiness(
+    return RelationalUpdateReadiness(
         source_id=source_id,
         resource_id=resource_id,
         assignment_columns=assignment_columns,
@@ -1566,15 +2219,17 @@ def _distinct_labels(values: tuple[str, ...]) -> tuple[str, ...]:
 def _build_preview(
     *,
     agent_id: str,
-    validated: ValidatedPostgreSQLUpdate,
+    permission_fingerprint: str,
+    validated: ValidatedRelationalUpdate,
     statement_sha256: str,
     live_structure_sha256: str,
     guardrails: Mapping[str, object],
     scan: _TargetScan,
-) -> PostgreSQLUpdatePreview:
+) -> RelationalUpdatePreview:
     fingerprint_payload = {
+        "permission_fingerprint": permission_fingerprint,
         "agent_id": agent_id,
-        "capability_id": POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
+        "capability_id": RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
         "source_id": validated.source_id,
         "resource_id": validated.resource_id,
         "source_revision": validated.source_revision,
@@ -1597,7 +2252,7 @@ def _build_preview(
         warnings.append("target_not_found")
     if len(scan.samples) < min(scan.matched_rows, 5):
         warnings.append("oversized_sample_values_omitted")
-    return PostgreSQLUpdatePreview(
+    return RelationalUpdatePreview(
         source_id=validated.source_id,
         resource_id=validated.resource_id,
         resource_name=validated.resource_name,
@@ -1607,19 +2262,19 @@ def _build_preview(
         assignments=validated.assignments,
         matched_rows=scan.matched_rows,
         samples=scan.samples,
-        fingerprint=PostgreSQLPreviewFingerprint(
+        fingerprint=RelationalPreviewFingerprint(
             intent_sha256=validated.intent_sha256,
             target_set_sha256=scan.target_set_sha256,
             statement_sha256=statement_sha256,
             preview_fingerprint=_sha256_json(fingerprint_payload),
         ),
-        checks=PostgreSQLUpdatePreviewChecks(),
+        checks=RelationalUpdatePreviewChecks(),
         warnings=tuple(warnings),
     )
 
 
 def _bound_update_parameters(
-    validated: ValidatedPostgreSQLUpdate,
+    validated: ValidatedRelationalUpdate,
 ) -> tuple[object, ...]:
     return (
         *tuple(_bound_value(cell, validated) for cell in validated.assignments),
@@ -1628,7 +2283,7 @@ def _bound_update_parameters(
 
 
 def _bound_where_parameters(
-    validated: ValidatedPostgreSQLUpdate,
+    validated: ValidatedRelationalUpdate,
 ) -> tuple[object, ...]:
     parameters: list[object] = []
     for predicate in validated.where:
@@ -1642,7 +2297,7 @@ def _bound_where_parameters(
         assert isinstance(values, tuple)
         parameters.extend(
             _bound_value(
-                PostgreSQLUpdateCell(predicate.column, value),
+                RelationalUpdateCell(predicate.column, value),
                 validated,
             )
             for value in values
@@ -1651,15 +2306,15 @@ def _bound_where_parameters(
 
 
 def _bound_value(
-    cell: PostgreSQLUpdateCell,
-    validated: ValidatedPostgreSQLUpdate,
+    cell: RelationalUpdateCell,
+    validated: ValidatedRelationalUpdate,
 ) -> object:
     value = thaw_json(cell.value)
     if value is None:
         return None
     namespace, type_name = validated.type_for(cell.column)
     if namespace != "pg_catalog":
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_assignment_invalid",
             "The proposed value lacks admitted PostgreSQL type provenance.",
         )
@@ -1667,7 +2322,7 @@ def _bound_value(
         return Decimal(str(value))
     if type_name in {"float4", "float8"}:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
-            raise PostgreSQLUpdatePreviewError(
+            raise RelationalUpdatePreviewError(
                 "write_assignment_invalid",
                 "The proposed value is incompatible with its PostgreSQL float type.",
             )
@@ -1692,13 +2347,13 @@ def _preview_json_value(value: object) -> FrozenJsonValue:
     if isinstance(value, float):
         if math.isfinite(value):
             return value
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_preview_failed",
             "PostgreSQL returned an unsupported preview value.",
         )
     if isinstance(value, Decimal):
         if not value.is_finite():
-            raise PostgreSQLUpdatePreviewError(
+            raise RelationalUpdatePreviewError(
                 "write_preview_failed",
                 "PostgreSQL returned an unsupported preview value.",
             )
@@ -1707,7 +2362,7 @@ def _preview_json_value(value: object) -> FrozenJsonValue:
         return value.isoformat() if isinstance(value, (datetime, date)) else str(value)
     if isinstance(value, Mapping):
         if any(not isinstance(key, str) for key in value):
-            raise PostgreSQLUpdatePreviewError(
+            raise RelationalUpdatePreviewError(
                 "write_preview_failed",
                 "PostgreSQL returned an unsupported preview value.",
             )
@@ -1720,7 +2375,7 @@ def _preview_json_value(value: object) -> FrozenJsonValue:
         )
     if isinstance(value, (tuple, list)):
         return tuple(_preview_json_value(item) for item in value)
-    raise PostgreSQLUpdatePreviewError(
+    raise RelationalUpdatePreviewError(
         "write_preview_failed",
         "PostgreSQL returned an unsupported preview value.",
     )
@@ -1734,7 +2389,7 @@ def _preview_json_value_for_type(
         try:
             return freeze_json(json.loads(value))
         except (TypeError, ValueError):
-            raise PostgreSQLUpdatePreviewError(
+            raise RelationalUpdatePreviewError(
                 "write_preview_failed",
                 "PostgreSQL returned an invalid JSON preview value.",
             ) from None
@@ -1749,7 +2404,7 @@ def _record_value(record: object, name: str) -> object:
         getter = getattr(record, "get", None)
         value = getter(name, missing) if callable(getter) else missing
     if value is missing:
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_guardrail_rejected",
             "PostgreSQL returned incomplete bounded preview facts.",
         )
@@ -1760,7 +2415,7 @@ def _bounded_row_version_fact(record: object, name: str) -> str:
     value = _record_value(record, name)
     rendered = str(value)
     if not rendered or len(rendered) > 128:
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_guardrail_rejected",
             "PostgreSQL returned an invalid row-version fact.",
         )
@@ -1769,7 +2424,7 @@ def _bounded_row_version_fact(record: object, name: str) -> str:
 
 def _identifier(value: str) -> str:
     if not isinstance(value, str) or not value or "\x00" in value or len(value) > 256:
-        raise PostgreSQLUpdatePreviewError(
+        raise RelationalUpdatePreviewError(
             "write_resource_not_writable",
             "The cataloged PostgreSQL identifier is invalid.",
         )
@@ -1809,9 +2464,47 @@ def _normalized_failure(stage: str, error: BaseException) -> tuple[str, str]:
 
 
 __all__ = [
-    "DatabaseWriteReceiptStore",
-    "PostgreSQLUpdateExecutionError",
-    "PostgreSQLUpdatePreviewBackend",
-    "PostgreSQLUpdatePreviewError",
-    "PostgreSQLUpdateReadiness",
+    "RelationalUpdateExecutionError",
+    "PostgreSQLWriteBackend",
+    "RelationalUpdatePreviewError",
+    "RelationalUpdateReadiness",
 ]
+
+
+_UPSERT_GUARDRAILS_SQL = _WRITE_GUARDRAILS_SQL.replace(
+    " AS can_update_columns",
+    """ AS can_update_columns,
+    pg_catalog.has_table_privilege(current_user, relation.oid, 'UPDATE') AS can_lock_table,
+    NOT EXISTS (SELECT 1 FROM pg_catalog.unnest($4::pg_catalog.text[]) AS requested(column_name)
+        WHERE NOT pg_catalog.has_column_privilege(current_user, relation.oid, requested.column_name, 'INSERT')) AS can_insert_columns,
+    (EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS con WHERE con.conrelid = relation.oid
+                 AND (con.contype IN ('c', 'x', 'f') OR con.condeferrable))
+     OR EXISTS (SELECT 1 FROM pg_catalog.pg_constraint AS con
+          WHERE con.confrelid = relation.oid AND con.contype = 'f')
+     OR EXISTS (SELECT 1 FROM pg_catalog.pg_index AS idx
+          JOIN pg_catalog.pg_class AS ic ON ic.oid = idx.indexrelid
+          JOIN pg_catalog.pg_am AS am ON am.oid = ic.relam
+          CROSS JOIN LATERAL pg_catalog.unnest(idx.indclass) AS cls(oid)
+          JOIN pg_catalog.pg_opclass AS opc ON opc.oid = cls.oid
+          JOIN pg_catalog.pg_namespace AS ns ON ns.oid = opc.opcnamespace
+          WHERE idx.indrelid = relation.oid AND (idx.indexprs IS NOT NULL OR idx.indpred IS NOT NULL
+            OR NOT idx.indisvalid OR NOT idx.indisready OR NOT idx.indimmediate
+            OR am.amname <> 'btree' OR NOT opc.opcdefault OR ns.nspname <> 'pg_catalog')))
+        AS unsupported_insert_features""",
+)
+
+
+def _upsert_bound_value(value: object, type_name: str) -> object:
+    if value is None:
+        return None
+    if type_name == "numeric":
+        return Decimal(str(value))
+    if type_name in {"float4", "float8"}:
+        return float(str(value))
+    if type_name == "uuid":
+        return UUID(str(value))
+    if type_name == "date":
+        return date.fromisoformat(str(value))
+    if type_name in {"timestamp", "timestamptz"}:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return value

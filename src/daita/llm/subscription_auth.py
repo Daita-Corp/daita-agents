@@ -290,12 +290,36 @@ async def _post_json(url: str, body: Mapping[str, object]) -> _HttpResult:
 
 async def _post_form(url: str, body: Mapping[str, str]) -> _HttpResult:
     encoded = urlencode(dict(body)).encode("ascii")
-    return await asyncio.to_thread(
-        _post_sync,
-        url,
-        body=encoded,
-        content_type="application/x-www-form-urlencoded",
-    )
+    import httpx
+
+    try:
+        async with (
+            httpx.AsyncClient(
+                timeout=_REQUEST_TIMEOUT_SECONDS, follow_redirects=False
+            ) as client,
+            client.stream(
+                "POST",
+                url,
+                content=encoded,
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "daita",
+                    "originator": "daita",
+                },
+            ) as response,
+        ):
+            limit = _MAX_RESPONSE_BYTES if response.is_success else _MAX_ERROR_BYTES
+            data = bytearray()
+            async for chunk in response.aiter_bytes():
+                data.extend(chunk)
+                if len(data) > limit:
+                    raise ValueError("HTTP response body exceeded its bound")
+            return _HttpResult(status=response.status_code, body=bytes(data))
+    except httpx.HTTPError:
+        raise ModelProviderError(
+            ProviderErrorCode.PROVIDER_UNAVAILABLE,
+            "Daita could not reach OpenAI's subscription login service",
+        ) from None
 
 
 def _positive_seconds(value: object, default: float) -> float:

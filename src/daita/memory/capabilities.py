@@ -9,6 +9,7 @@ from .._json import FrozenJsonObject
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
+    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -85,7 +86,9 @@ class MemorySetExecutor:
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         target, content = _replacement_arguments(request)
-        await self._store.replace_from_tool(target, content)
+        await self._store.replace_from_tool(
+            target, content, sensitivity=request.request_sensitivity
+        )
         return ToolOutput(
             kind=MEMORY_SET_OUTPUT_KIND,
             data={"target": target, "replaced": True},
@@ -216,6 +219,18 @@ class MemoryCapabilityDomain:
         self._learning.validate_effect(run.id, call)
         return arguments
 
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
+
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -236,13 +251,12 @@ class MemoryCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
-        del request_sensitivity
         self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         return replace(
             output,
-            sensitivity=ModelSensitivity.INTERNAL,
+            sensitivity=request_sensitivity,
             sensitivity_provenance={
                 "authority": "memory_domain",
                 "capability_id": capability.id,

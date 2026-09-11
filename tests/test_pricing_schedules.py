@@ -34,12 +34,12 @@ from daita.llm.pricing import (
     validate_pricing_schedules,
 )
 from daita.llm.providers.anthropic import AnthropicProvider
-from daita.llm.providers.gemini import (
+from daita.llm.providers.gemini.adapter import (
     GeminiProvider,
     _decode_usage as decode_gemini_usage,
 )
 from daita.llm.providers.grok import GrokProvider
-from daita.llm.providers.openai import (
+from daita.llm.providers.openai.adapter import (
     OpenAIProvider,
     _billable_quantities as openai_billable_quantities,
     _decode_usage as decode_openai_usage,
@@ -782,7 +782,7 @@ def test_xai_provider_reported_ticks_take_precedence_over_token_rates():
     assert usage.cost_estimate.amount_usd == Decimal("0.00001585")
     assert usage.cost_estimate.basis is CostBasis.PROVIDER_REPORTED
     assert usage.cost_estimate.rate_schedule_id is None
-    assert provider.has_complete_pricing(_request()) is True
+    assert provider.has_complete_pricing(_request()) is False
     with pytest.raises(ValueError):
         provider._decode_usage(  # noqa: SLF001 - focused adapter contract
             {

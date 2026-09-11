@@ -12,15 +12,18 @@ from hashlib import sha256
 
 from .._json import FrozenJsonObject, canonical_json
 from ..artifacts.models import ArtifactDeliveryReceipt, ArtifactRef
-from ..capabilities import ExecutionScope
+from ..capabilities import RESERVED_TOOL_NAMES, ExecutionScope
 from ..llm.errors import ProviderFailureDiagnostic
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
+    ModelSensitivity,
     ModelUsage,
     TextBlock,
+    ToolCall,
     ToolResultBlock,
 )
+from ..scope import EffectiveSourceScope
 
 _MIN_TOOL_RESULT_BYTES = 128
 _MIN_TOOL_RESULT_DEPTH = 3
@@ -193,24 +196,35 @@ class RunInput:
     message: str
     created_at: datetime
     conversation_id: str | None = None
-    source_id: str | None = None
-    conversation_source_id: str | None = None
+    source_scope_ids: tuple[str, ...] = ()
     start: RunStartEnvelope | None = None
+    history_sensitivity: ModelSensitivity = ModelSensitivity.PUBLIC
+    resolved_source_scope: EffectiveSourceScope | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.id, "run id")
         _required_text(self.agent_id, "run agent_id")
         _required_text(self.message, "run message")
         _aware(self.created_at, "run created_at")
+        if not isinstance(self.history_sensitivity, ModelSensitivity):
+            raise TypeError("run history_sensitivity must be ModelSensitivity")
         if self.conversation_id is not None:
             _required_text(self.conversation_id, "run conversation_id")
-        if self.source_id is not None:
-            _required_text(self.source_id, "run source_id")
-        if self.conversation_source_id is not None:
-            _required_text(
-                self.conversation_source_id,
-                "run conversation_source_id",
-            )
+        if (
+            not isinstance(self.source_scope_ids, tuple)
+            or len(self.source_scope_ids) > 256
+        ):
+            raise TypeError("run source_scope_ids must be a bounded tuple")
+        for source_id in self.source_scope_ids:
+            _required_text(source_id, "run source scope id")
+            if len(source_id) > 2_048:
+                raise ValueError("run source scope identity exceeds its bound")
+        if len(set(self.source_scope_ids)) != len(self.source_scope_ids):
+            raise ValueError("run source scope cannot contain duplicates")
+        if self.resolved_source_scope is not None and not isinstance(
+            self.resolved_source_scope, EffectiveSourceScope
+        ):
+            raise TypeError("run resolved_source_scope must be EffectiveSourceScope")
         start = self.start or RunStartEnvelope.user(self.message)
         if not isinstance(start, RunStartEnvelope):
             raise TypeError("run start must be RunStartEnvelope or None")
@@ -224,11 +238,10 @@ class RunInput:
         if start.execution_scope is not None:
             if start.execution_scope.agent_id != self.agent_id:
                 raise ValueError("run execution scope belongs to another agent")
-            if (
-                self.source_id is not None
-                and self.source_id not in start.execution_scope.allowed_source_ids
+            if not set(self.source_scope_ids) <= set(
+                start.execution_scope.allowed_source_ids
             ):
-                raise ValueError("run source is outside its execution scope")
+                raise ValueError("run source filter is outside its execution scope")
         object.__setattr__(self, "start", start)
 
     @property
@@ -263,7 +276,7 @@ class LoopLimits:
     max_toolbox_manifest_tokens: int = 2_000
     max_pinned_tools: int = 32
     max_pinned_tool_definition_bytes: int = 96 * 1_024
-    max_loaded_tools: int = 16
+    max_loaded_tools: int = 15
     max_loaded_tool_definition_bytes: int = 96 * 1_024
     max_step_tools: int = 50
     max_step_tool_definition_bytes: int = 128 * 1_024
@@ -327,7 +340,10 @@ class LoopLimits:
                 raise ValueError(f"{field_name} must be a positive integer")
         if self.max_toolbox_manifest_entries > 6:
             raise ValueError("max_toolbox_manifest_entries cannot exceed 6")
-        if self.max_pinned_tools + self.max_loaded_tools + 2 > self.max_step_tools:
+        if (
+            self.max_pinned_tools + self.max_loaded_tools + len(RESERVED_TOOL_NAMES)
+            > self.max_step_tools
+        ):
             raise ValueError(
                 "pinned, loaded, and toolbox controls cannot exceed max_step_tools"
             )
@@ -407,11 +423,14 @@ class LoopExit:
     provider_failure: ProviderFailureDiagnostic | None = None
     artifacts: tuple[ArtifactRef, ...] = ()
     artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...] = ()
+    sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
 
     def __post_init__(self) -> None:
         _required_text(self.run_id, "loop-exit run_id")
         _required_text(self.conversation_id, "loop-exit conversation_id")
         _required_text(self.reason, "loop-exit reason")
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("loop-exit sensitivity must be ModelSensitivity")
         if not isinstance(self.kind, LoopExitKind):
             raise TypeError("loop-exit kind must be LoopExitKind")
         _aware(self.created_at, "loop-exit created_at")
@@ -478,6 +497,31 @@ class Transcript:
         if any(not isinstance(message, CanonicalMessage) for message in messages):
             raise TypeError("transcript messages must be CanonicalMessage records")
         object.__setattr__(self, "messages", messages)
+
+    @property
+    def tool_pairs(self) -> tuple[tuple[ToolCall, ToolResultBlock | None], ...]:
+        """Ordered evidence, including unanswered calls in interrupted runs.
+
+        This is a projection of the exact transcript, not a second persisted
+        outcome. Tool success never implies that the enclosing run completed.
+        """
+        calls: list[ToolCall] = []
+        call_ids: set[str] = set()
+        results: dict[str, ToolResultBlock] = {}
+        for message in self.messages:
+            for call in message.tool_calls:
+                if call.id in call_ids:
+                    raise ValueError("transcript repeats a tool call ID")
+                call_ids.add(call.id)
+                calls.append(call)
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    if block.call_id not in call_ids:
+                        raise ValueError("transcript contains an unmatched tool result")
+                    if block.call_id in results:
+                        raise ValueError("transcript repeats a tool result ID")
+                    results[block.call_id] = block
+        return tuple((call, results.get(call.id)) for call in calls)
 
 
 def validate_completed_transcript(

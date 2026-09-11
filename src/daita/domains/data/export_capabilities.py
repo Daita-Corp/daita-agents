@@ -70,6 +70,7 @@ from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
     AutomationEligibility,
+    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -89,6 +90,7 @@ from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
 from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
 from ...loop.models import RunInput, RunOrigin, Transcript
+from ...scope import SourceScopeCatalog, resolve_effective_source_scope
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID
@@ -561,6 +563,15 @@ class ArtifactListExecutor:
         selected = tuple(reversed(refs[-MAX_MODEL_ARTIFACT_LIST_ITEMS:]))
         return ToolOutput(
             kind=ARTIFACT_LIST_OUTPUT_KIND,
+            sensitivity=ModelSensitivity(
+                _resolved_sensitivity(
+                    tuple(ref.sensitivity for ref in selected) or (Sensitivity.PUBLIC,)
+                ).value
+            ),
+            sensitivity_provenance={
+                "authority": "committed_artifact_metadata",
+                "conversation_id": conversation_id,
+            },
             data={
                 "artifacts": tuple(_model_artifact_summary(ref) for ref in selected),
                 "returned_count": len(selected),
@@ -589,6 +600,13 @@ class ArtifactReadExecutor:
             rows = data.rows[:MAX_MODEL_ARTIFACT_XLSX_ROWS]
             return ToolOutput(
                 kind=ARTIFACT_READ_OUTPUT_KIND,
+                sensitivity=ModelSensitivity(
+                    _resolved_sensitivity((payload.ref.sensitivity,)).value
+                ),
+                sensitivity_provenance={
+                    "authority": "committed_artifact",
+                    "artifact_id": payload.ref.artifact_id,
+                },
                 data={
                     "artifact": summary,
                     "representation": "xlsx_data",
@@ -623,6 +641,13 @@ class ArtifactReadExecutor:
             preview = preview_bytes.decode("utf-8")
         return ToolOutput(
             kind=ARTIFACT_READ_OUTPUT_KIND,
+            sensitivity=ModelSensitivity(
+                _resolved_sensitivity((payload.ref.sensitivity,)).value
+            ),
+            sensitivity_provenance={
+                "authority": "committed_artifact",
+                "artifact_id": payload.ref.artifact_id,
+            },
             data={
                 "artifact": summary,
                 "representation": "utf8_text",
@@ -1012,7 +1037,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=DOCUMENT_CREATE_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/markdown", "text/plain"}),
             allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
@@ -1175,7 +1200,7 @@ def artifact_capability_declarations(
             "additionalProperties": False,
         },
         executor_id=RESULT_SNAPSHOT_EXECUTOR_ID,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({RESULT_SNAPSHOT_MEDIA_TYPE}),
             allowed_authorships=frozenset({ArtifactAuthorship.VALIDATED_TOOL_RESULT}),
@@ -1668,7 +1693,7 @@ LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS = frozenset({ARTIFACT_EDIT_TEXT_CAPABILITY_ID
 LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS = frozenset({ARTIFACT_EDIT_TEXT_EXECUTOR_ID})
 
 
-class ArtifactDomainCatalog(Protocol):
+class ArtifactDomainCatalog(SourceScopeCatalog, Protocol):
     async def resource_schemas(
         self,
         agent_id: str,
@@ -1891,17 +1916,17 @@ class ArtifactCapabilityDomain:
             return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
+        scope = await resolve_effective_source_scope(run, self._catalog)
         supplied_source_id = arguments.get("source_id")
         if (
-            run.source_id is not None
-            and supplied_source_id is not None
-            and supplied_source_id != run.source_id
+            supplied_source_id is not None
+            and supplied_source_id not in scope.source_ids
         ):
             raise CapabilityInputError(
                 "source_scope_violation",
                 "This run can only access the source selected by the user.",
                 {
-                    "selected_source_id": run.source_id,
+                    "allowed_source_ids": tuple(sorted(scope.source_ids)),
                     "requested_source_id": supplied_source_id,
                 },
             )
@@ -2165,7 +2190,7 @@ class ArtifactCapabilityDomain:
         result_data = evidence.data
         assert block.sensitivity is not None
         output_provenance = result_data.get("provenance")
-        if output_kind == "mcp.read.result" and (
+        if output_kind == "mcp.tool.result" and (
             not isinstance(output_provenance, Mapping)
             or output_provenance.get("output_schema_digest") == "none"
             or not isinstance(result_data.get("structured"), Mapping)
@@ -2230,6 +2255,18 @@ class ArtifactCapabilityDomain:
         )
         return FrozenJsonObject.from_mapping(prepared)
 
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
+
     async def side_effect_plan(
         self,
         run: RunInput,
@@ -2270,7 +2307,6 @@ class ArtifactCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
-        del request_sensitivity
         if output.artifact is not None:
             self._validate_artifact_summary(capability, output)
             bound_artifact = await self._bind_provenance(
@@ -2280,14 +2316,24 @@ class ArtifactCapabilityDomain:
                 arguments,
                 output.artifact,
             )
-            output = replace(
-                output,
-                artifact=bound_artifact,
-            )
-            if capability.id == ARTIFACT_CREATE_TABULAR_CAPABILITY_ID or (
-                capability.id == DOCUMENT_CREATE_CAPABILITY_ID
-                and bound_artifact.provenance.evidence_call_ids
+            if (
+                bound_artifact.provenance.authorship
+                is ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
             ):
+                bound_artifact = replace(
+                    bound_artifact,
+                    sensitivity=_resolved_sensitivity(
+                        (
+                            bound_artifact.sensitivity,
+                            Sensitivity(request_sensitivity.value),
+                        )
+                    ),
+                )
+            output = replace(output, artifact=bound_artifact)
+            if bound_artifact.provenance.authorship in {
+                ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS,
+                ArtifactAuthorship.EXACT_SOURCE_DATA,
+            }:
                 artifact_sensitivity = ModelSensitivity(
                     bound_artifact.sensitivity.value
                 )
@@ -2307,9 +2353,7 @@ class ArtifactCapabilityDomain:
                 elif (
                     output.sensitivity.routing_rank < artifact_sensitivity.routing_rank
                 ):
-                    raise ToolOutputValidationError(
-                        "artifact result sensitivity is lower than its committed draft"
-                    )
+                    output = replace(output, sensitivity=artifact_sensitivity)
         if capability.operational_effect is not OperationalEffect.NONE and not (
             capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
             and output.data.get("outcome") == "failed"
@@ -2317,34 +2361,14 @@ class ArtifactCapabilityDomain:
             self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
-        source_id = arguments.get("source_id")
-        source_ids = (
-            (source_id,)
-            if isinstance(source_id, str)
-            else (() if run.source_id is None else (run.source_id,))
-        )
-        sensitivity = await self._catalog.admitted_model_sensitivity(
-            run.agent_id,
-            source_ids,
-        )
-        if sensitivity is None:
-            raise CapabilityInputError(
-                "result_classification_unavailable",
-                "The current admitted result scope cannot be classified safely.",
-                {"capability_id": capability.id},
-            )
-        readable = await self._catalog.readable_resource_ids(
-            run.agent_id,
-            source_ids,
-        )
+        # Remaining outputs describe local management state and reflect the
+        # current request. An empty machine ceiling cannot query ambient sources.
         return replace(
             output,
-            sensitivity=sensitivity,
+            sensitivity=request_sensitivity,
             sensitivity_provenance={
-                "authority": "artifact_domain_current_scope",
+                "authority": "artifact_domain_request_context",
                 "capability_id": capability.id,
-                "source_ids": source_ids,
-                "resource_ids": tuple(sorted(readable)),
             },
         )
 
@@ -2806,7 +2830,7 @@ def _tabular_export_capability() -> Capability:
         },
         executor_id=DATA_EXPORT_TABULAR_EXECUTOR_ID,
         access_mode=AccessMode.READ,
-        automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+        automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/csv", XLSX_MEDIA_TYPE}),
             allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),

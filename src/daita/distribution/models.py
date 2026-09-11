@@ -15,6 +15,7 @@ from ..artifacts.models import (
     ArtifactRef,
     artifact_provenance_to_mapping,
 )
+from ..capabilities import MAX_EXECUTION_SCOPE_IDENTITIES, EffectEvidenceBasis
 from ..llm.models import ModelSensitivity
 
 MAX_OUTCOME_ARTIFACT_REQUIREMENTS = 4
@@ -210,6 +211,32 @@ class ArtifactRequirement:
 
 
 @dataclass(frozen=True, slots=True)
+class EffectRequirement:
+    """An objective invocation requirement, with explicitly accepted evidence."""
+
+    capability_id: str
+    minimum_successful_calls: int
+    accepted_evidence_bases: frozenset[EffectEvidenceBasis]
+
+    def __post_init__(self) -> None:
+        _text(self.capability_id, "effect requirement capability_id")
+        if (
+            type(self.minimum_successful_calls) is not int
+            or not 0 <= self.minimum_successful_calls <= 256
+        ):
+            raise ValueError("effect minimum successful calls is outside its bound")
+        bases = frozenset(self.accepted_evidence_bases)
+        if not bases or not bases <= {
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+            EffectEvidenceBasis.SERVER_REPORTED,
+        }:
+            raise ValueError(
+                "effect requirement must accept a supported success evidence basis"
+            )
+        object.__setattr__(self, "accepted_evidence_bases", bases)
+
+
+@dataclass(frozen=True, slots=True)
 class OutcomeContract:
     """One exact ceiling for validating a completed unattended conclusion."""
 
@@ -219,6 +246,7 @@ class OutcomeContract:
     maximum_effective_sensitivity: ModelSensitivity
     require_current_run_provenance: bool
     require_exact_source_bindings: bool
+    effect_requirements: tuple[EffectRequirement, ...] = ()
 
     def __post_init__(self) -> None:
         if self.require_terminal_conclusion is not True:
@@ -253,6 +281,22 @@ class OutcomeContract:
             raise ValueError("outcome contract requires current-run provenance")
         if not isinstance(self.require_exact_source_bindings, bool):
             raise TypeError("exact-source-binding requirement must be a boolean")
+        effects = tuple(self.effect_requirements)
+        if len(effects) > MAX_EXECUTION_SCOPE_IDENTITIES or any(
+            not isinstance(item, EffectRequirement) for item in effects
+        ):
+            raise ValueError(
+                "outcome effect requirements are invalid or exceed their bound"
+            )
+        if len({item.capability_id for item in effects}) != len(effects):
+            raise ValueError(
+                "outcome permits only one requirement per effectful capability"
+            )
+        object.__setattr__(
+            self,
+            "effect_requirements",
+            tuple(sorted(effects, key=lambda item: item.capability_id)),
+        )
         object.__setattr__(self, "artifact_requirements", requirements)
 
     @property
@@ -462,6 +506,7 @@ def validate_outcome_artifact_references(
     *,
     contract: OutcomeContract,
     resulting_run_id: str,
+    require_minimum_counts: bool = True,
 ) -> tuple[OutcomeArtifactReference, ...]:
     """Validate one exact committed artifact set against its frozen contract."""
 
@@ -473,6 +518,8 @@ def validate_outcome_artifact_references(
         not isinstance(item, OutcomeArtifactReference) for item in material
     ):
         raise ValueError("outcome artifact references exceed their bound")
+    if len({item.artifact_id for item in material}) != len(material):
+        raise ValueError("outcome artifact references cannot duplicate")
     if any(item.producing_run_id != resulting_run_id for item in material):
         raise ValueError("outcome artifact provenance belongs to another run")
     if sum(item.byte_size for item in material) > contract.maximum_total_artifact_bytes:
@@ -513,7 +560,8 @@ def validate_outcome_artifact_references(
     matched_ids: set[str] = set()
     for requirement in requirements:
         matched = tuple(item for item in material if matches(item, requirement))
-        if not requirement.minimum_count <= len(matched) <= requirement.maximum_count:
+        minimum = requirement.minimum_count if require_minimum_counts else 0
+        if not minimum <= len(matched) <= requirement.maximum_count:
             raise ValueError("outcome artifact requirement count is not satisfied")
         if sum(item.byte_size for item in matched) > requirement.maximum_total_bytes:
             raise ValueError("outcome artifact requirement byte ceiling is exceeded")
@@ -543,8 +591,23 @@ class OutcomeReference:
     provenance_digest: str
     failure_code: str | None
     observed_at: datetime
+    effect_receipt_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        receipts = tuple(self.effect_receipt_ids)
+        if (
+            len(receipts) > MAX_EXECUTION_SCOPE_IDENTITIES
+            or len(set(receipts)) != len(receipts)
+            or any(
+                not isinstance(item, str)
+                or re.fullmatch(r"effect-receipt:sha256:[0-9a-f]{64}", item) is None
+                for item in receipts
+            )
+        ):
+            raise ValueError(
+                "outcome effect receipt references are invalid or exceed their bound"
+            )
+        object.__setattr__(self, "effect_receipt_ids", receipts)
         if not isinstance(self.conclusion_kind, OutcomeConclusionKind):
             raise TypeError("outcome conclusion kind is invalid")
         if not isinstance(self.conclusion_state, OutcomeState):
@@ -877,6 +940,16 @@ def _outcome_contract_mapping(value: OutcomeContract) -> dict[str, object]:
         "maximum_effective_sensitivity": value.maximum_effective_sensitivity.value,
         "require_current_run_provenance": value.require_current_run_provenance,
         "require_exact_source_bindings": value.require_exact_source_bindings,
+        "effect_requirements": [
+            {
+                "capability_id": item.capability_id,
+                "minimum_successful_calls": item.minimum_successful_calls,
+                "accepted_evidence_bases": sorted(
+                    basis.value for basis in item.accepted_evidence_bases
+                ),
+            }
+            for item in value.effect_requirements
+        ],
     }
 
 
@@ -1015,6 +1088,7 @@ def delivery_inspection_projection(value: DeliveryInspection) -> dict[str, objec
             "conclusion_preview": outcome.conclusion_preview,
             "conclusion_preview_truncated": outcome.conclusion_preview_truncated,
             "resulting_run_id": outcome.resulting_run_id,
+            "effect_receipt_ids": outcome.effect_receipt_ids,
             "artifact_references": [
                 _outcome_artifact_reference_mapping(item)
                 for item in outcome.artifact_references

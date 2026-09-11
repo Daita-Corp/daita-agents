@@ -299,7 +299,7 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
             agent_id=agent.id,
             message="Review the selected candidate and apply its eligible write.",
             created_at=now,
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         runtime = agent._embedded._capability_runtime
         guard = agent._embedded._learning_candidate_guard
@@ -359,11 +359,11 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
         )[0]
         first_evidence = await agent.run(
             "Remember the first-source invoice definition.",
-            source_id=first_source.id,
+            source_scope_ids=(first_source.id,),
         )
         second_evidence = await agent.run(
             "Remember the second-source invoice definition.",
-            source_id=second_source.id,
+            source_scope_ids=(second_source.id,),
         )
 
         async def save_annotation(
@@ -506,7 +506,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
 
         result = await agent.learn(
             "Review, replace, and delete semantic definitions.",
-            source_id=first_source.id,
+            source_scope_ids=(first_source.id,),
         )
         transcript = await agent.transcript(result.run_id)
         results = {
@@ -546,7 +546,7 @@ async def test_semantic_tools_cannot_cross_the_selected_source_boundary(tmp_path
 
 
 class _TranscriptContext:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         del run
         return messages[:-1], tool_context.initial_provider_definitions
 
@@ -557,14 +557,16 @@ class _TranscriptContext:
         *,
         step,
         tool_context,
-        final=False,
         previous_request_input_tokens=None,
+        remaining_tokens=None,
+        request_input_growth_tokens=None,
+        remaining_steps=None,
     ):
         del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
-            tools=() if final else tools,
+            tools=tools,
         )
 
 

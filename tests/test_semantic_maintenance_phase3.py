@@ -641,7 +641,7 @@ async def test_identically_named_resources_remain_isolated_by_selected_source(
         assert first_resource.name == second_resource.name == "invoices"
         seed = await agent.run(
             "Teach the first invoice meaning.",
-            source_id=first_source.id,
+            source_scope_ids=(first_source.id,),
         )
         seed_transcript = await agent.transcript(seed.run_id)
         await agent.save_semantic_annotation(
@@ -675,7 +675,7 @@ async def test_identically_named_resources_remain_isolated_by_selected_source(
 
         await agent.run(
             "What does invoices.amount mean?",
-            source_id=second_source.id,
+            source_scope_ids=(second_source.id,),
         )
         prompt = _request_text(provider, 1)
         assert "FIRST_SOURCE_ONLY_SENTINEL" not in prompt

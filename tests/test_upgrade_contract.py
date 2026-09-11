@@ -372,7 +372,7 @@ def test_preproduction_tree_has_no_unreleased_compatibility_history() -> None:
         "20260810_database_write_receipts",
         "20260811_postgresql_write_admission",
         "20260812_scoped_source_permissions",
-        "20260814_generalized_postgresql_updates",
+        "20260814_generalized_relational_updates",
         "20260819_mcp_server_bindings",
     ):
         assert obsolete not in text

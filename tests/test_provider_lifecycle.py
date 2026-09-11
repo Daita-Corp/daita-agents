@@ -196,7 +196,8 @@ async def test_real_sdk_response_stream_released_before_provider_shutdown(
             ModelRoute(
                 (ModelRouteCandidate(provider_id=profile.id, profile=profile),),
                 retry_policy=RetryPolicy(
-                    attempts=2 if layer == "router" else 1, backoff_seconds=0
+                    max_attempts_per_candidate=2 if layer == "router" else 1,
+                    backoff_seconds=0,
                 ),
             )
         )
@@ -284,7 +285,10 @@ async def _blocking_provider(monkeypatch, kind: str):
         route = _route()
         if kind == "router":
             route = replace(
-                route, retry_policy=RetryPolicy(attempts=2, backoff_seconds=0)
+                route,
+                retry_policy=RetryPolicy(
+                    max_attempts_per_candidate=2, backoff_seconds=0
+                ),
             )
         provider = create_model_route_provider(route)
         await provider.generate(_request())
@@ -326,7 +330,7 @@ async def test_close_failure_is_not_reported_as_success_on_later_calls(
     client.error = RuntimeError("offline cleanup failure")
     client.release.set()
     for _ in range(2):
-        with pytest.raises(RuntimeError, match="offline cleanup failure"):
+        with pytest.raises(ModelProviderError, match="cleanup_failed"):
             await provider.close()
     assert client.close_calls == 1
 
@@ -452,7 +456,7 @@ class _ManagedProvider:
     async def generate(self, request: ModelRequest) -> ModelResponse:
         return self.response
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         self.close_calls += 1
 
 
@@ -462,7 +466,9 @@ def _route() -> ModelRoute:
     profile = replace(reviewed, supports_streaming=False)
     return ModelRoute(
         (ModelRouteCandidate(provider_id=profile.id, profile=profile),),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
 
 
@@ -517,6 +523,10 @@ async def test_configured_openai_route_closes_the_real_sdk_http_client(
     sdk_clients: list[openai.AsyncOpenAI] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/input_tokens"):
+            return httpx.Response(
+                200, json={"object": "response.input_tokens", "input_tokens": 10}
+            )
         return httpx.Response(
             200,
             request=request,

@@ -138,6 +138,7 @@ class RoutineSupervisor:
             return
 
     async def _claim_one_due(self) -> None:
+        now = self._clock()
         routines = await self._store.list_scheduled_routines(
             self._agent_id,
             states=frozenset({RoutineState.ACTIVE}),
@@ -152,6 +153,8 @@ class RoutineSupervisor:
             if (
                 occurrence is not None
                 and occurrence.reserved_run_id is None
+                and occurrence.lease_expires_at is not None
+                and occurrence.lease_expires_at > now
                 and occurrence.disposition
                 in {
                     RoutineOccurrenceDisposition.CLAIMED,
@@ -161,7 +164,6 @@ class RoutineSupervisor:
             ):
                 self._launch(occurrence)
                 return
-        now = self._clock()
         due = sorted(
             (
                 routine
@@ -260,6 +262,7 @@ class RoutineSupervisor:
                         result.artifacts,
                         contract=routine.outcome_contract,
                         resulting_run_id=run_id,
+                        require_minimum_counts=False,
                     )
                 )
             except (ArtifactError, TypeError, ValueError):
@@ -339,12 +342,11 @@ class RoutineSupervisor:
         )
 
     async def _recover(self) -> None:
+        recovered_at = self._clock()
         recovered = await self._store.recover_stale_routine_occurrences(
             self._agent_id,
-            recovered_at=self._clock(),
-            claim_token_factory=lambda occurrence_id: (
-                f"routine-recovery-{sha256(occurrence_id.encode('utf-8')).hexdigest()[:32]}"
-            ),
+            recovered_at=recovered_at,
+            claim_token_factory=lambda occurrence_id: self._id_factory("routine-claim"),
         )
         for occurrence in recovered:
             try:
@@ -364,9 +366,26 @@ class RoutineSupervisor:
                         artifact_references=artifact_references,
                         outcome_contract_failure_code=(outcome_contract_failure_code),
                     )
+                elif occurrence.reserved_run_id is not None:
+                    await self._store.finalize_routine_occurrence(
+                        self._agent_id,
+                        occurrence.occurrence_id,
+                        delivery_id=self._id_factory("delivery"),
+                        finalized_at=self._clock(),
+                        failure_code="routine_run_not_started",
+                    )
                 elif (
-                    occurrence.reserved_run_id is None and self._execute_run is not None
+                    occurrence.lease_expires_at is None
+                    or occurrence.lease_expires_at <= recovered_at
                 ):
+                    await self._store.finalize_routine_occurrence(
+                        self._agent_id,
+                        occurrence.occurrence_id,
+                        delivery_id=self._id_factory("delivery"),
+                        finalized_at=self._clock(),
+                        failure_code="routine_attempt_limit_exceeded",
+                    )
+                elif self._execute_run is not None:
                     self._launch(occurrence)
                     break
             except Exception:
@@ -391,6 +410,7 @@ class RoutineSupervisor:
                 result.artifacts,
                 contract=routine.outcome_contract,
                 resulting_run_id=occurrence.terminal_run_id,
+                require_minimum_counts=False,
             )
         except (ArtifactError, TypeError, ValueError):
             return (), "outcome_artifact_contract_failed"
@@ -402,6 +422,8 @@ def _execution_scope(
     occurrence: RoutineOccurrence,
 ) -> ExecutionScope:
     return ExecutionScope(
+        contract_bindings=routine.contract_bindings,
+        capability_grants=routine.capability_grants,
         scope_id=f"scope:{occurrence.occurrence_id}",
         revision=1,
         agent_id=routine.agent_id,
@@ -464,11 +486,7 @@ def _run_input(
         message=routine.authorized_instruction,
         created_at=occurrence.claimed_at or occurrence.created_at,
         conversation_id=routine.conversation_id,
-        source_id=(
-            routine.allowed_source_ids[0]
-            if len(routine.allowed_source_ids) == 1
-            else None
-        ),
+        source_scope_ids=routine.allowed_source_ids,
         start=RunStartEnvelope(
             origin=RunOrigin.SCHEDULED_ROUTINE,
             instruction_authority=InstructionAuthority.FOREGROUND_AUTHORIZED,

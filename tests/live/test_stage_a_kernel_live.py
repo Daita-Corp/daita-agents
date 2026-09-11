@@ -31,6 +31,7 @@ from daita.llm.models import (
     ModelStreamCompleted,
     ModelStreamEvent,
     ModelUsage,
+    TextBlock,
     ToolCall,
     ToolResultBlock,
 )
@@ -114,7 +115,7 @@ class _RecordingProvider:
                     self.responses.append(event.response)
                 yield event
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 
@@ -267,7 +268,7 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
         )
         try:
             source = await agent.attach(SQLiteSource(database, name="Stage A probe"))
-            result = await agent.run(_PROBE_PROMPT, source_id=source.id)
+            result = await agent.run(_PROBE_PROMPT, source_scope_ids=(source.id,))
             transcript = await agent.transcript(result.run_id)
         finally:
             await agent.close()
@@ -299,10 +300,20 @@ async def test_live_tool_round_trip_has_stable_context_and_durable_completion(
             request.sensitivity is ModelSensitivity.INTERNAL
             for request in provider.requests
         )
-        assert all(
-            request.messages[0] == provider.requests[0].messages[0]
+        systems = [
+            "".join(
+                block.text
+                for block in request.messages[0].content
+                if isinstance(block, TextBlock)
+            )
             for request in provider.requests
-        )
+        ]
+        frozen_core = systems[0].split("\n\nRemaining cumulative run allowance:", 1)[0]
+        for request, system in zip(provider.requests, systems, strict=True):
+            assert system.startswith(
+                frozen_core
+                + f"\n\nRemaining cumulative run allowance: {request.max_total_tokens} tokens."
+            )
         assert all(
             tuple(tool.name for tool in request.tools)
             == tuple(tool.name for tool in provider.requests[0].tools)
@@ -415,7 +426,9 @@ async def test_live_fallback_provider_stays_sticky_through_tool_completion(
                     allowed_sensitivities=frozenset(ModelSensitivity),
                 ),
             ),
-            retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+            retry_policy=RetryPolicy(
+                max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+            ),
         )
         database = tmp_path / "stage-a-fallback.sqlite"
         _database(database)
@@ -430,7 +443,7 @@ async def test_live_fallback_provider_stays_sticky_through_tool_completion(
         )
         try:
             source = await agent.attach(SQLiteSource(database, name="Fallback probe"))
-            result = await agent.run(_PROBE_PROMPT, source_id=source.id)
+            result = await agent.run(_PROBE_PROMPT, source_scope_ids=(source.id,))
             transcript = await agent.transcript(result.run_id)
         finally:
             await agent.close()

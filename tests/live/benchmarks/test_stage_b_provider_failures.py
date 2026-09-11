@@ -9,6 +9,7 @@ cancel, or corrupt the independently admitted job.
 from __future__ import annotations
 
 import sqlite3
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,8 @@ from _workspace_support import workspace_for
 
 from daita import Agent, JobStatus
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
-from daita.llm.models import ModelStreamCompleted, ModelTextDelta
+from daita.llm.models import ModelStreamCompleted, ModelTextDelta, ModelUsage
+from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider, MockStreamingModelProvider
 from daita.llm.routing import (
     ModelProviderRegistration,
@@ -104,31 +106,44 @@ async def _assert_one_independent_success(agent: Agent, run_id: str) -> str:
     return job_id
 
 
+@pytest.mark.parametrize("known_zero_usage", [False, True])
 async def test_transient_retry_after_start_receipt_does_not_reexecute_job_start(
     tmp_path: Path,
+    known_zero_usage: bool,
 ) -> None:
     home = await create_probe_home(tmp_path, "provider-transient-retry")
     scripted = MockModelProvider(
         (
             toolbox_load_response("start_data_profile"),
             start_profile_response(home.resource_ids[TARGET_PROFILE_TABLE]),
-            ModelProviderError(ProviderErrorCode.TIMEOUT),
+            ModelProviderError(
+                ProviderErrorCode.TIMEOUT,
+                usage=ModelUsage(
+                    cost_estimate=(
+                        CostEstimate.complete(Decimal("0"))
+                        if known_zero_usage
+                        else CostEstimate.unavailable()
+                    ),
+                ),
+            ),
             stop_response("The independently admitted job is still running."),
         ),
         provider_id="mock:stage-b-transient",
     )
     router = ModelRouter(
         (_registration(scripted),),
-        retry_policy=RetryPolicy(attempts=2, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
     agent = await _open(home, router, router.model_profile)
     try:
         result = await agent.run(
             "Start one profile and survive a later provider retry.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
-        assert result.kind is LoopExitKind.COMPLETED
-        assert len(scripted.requests) == 4
+        assert result.kind is (
+            LoopExitKind.COMPLETED if known_zero_usage else LoopExitKind.FAILED
+        )
+        assert len(scripted.requests) == (4 if known_zero_usage else 3)
         transcript = await agent.transcript(result.run_id)
         assert logical_names(transcript).count("start_data_profile") == 1
         await _assert_one_independent_success(agent, result.run_id)
@@ -150,13 +165,13 @@ async def test_permanent_provider_failure_after_receipt_leaves_one_durable_job(
     )
     router = ModelRouter(
         (_registration(scripted),),
-        retry_policy=RetryPolicy(attempts=5, backoff_seconds=0),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=5, backoff_seconds=0),
     )
     agent = await _open(home, router, router.model_profile)
     try:
         result = await agent.run(
             "Start one profile before the provider becomes permanently invalid.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.FAILED
         assert result.reason == ProviderErrorCode.INVALID_REQUEST.value
@@ -192,7 +207,7 @@ async def test_visible_stream_failure_after_receipt_never_persists_partial_text(
     try:
         result = await agent.run(
             "Start one profile before a visible stream interruption.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.FAILED
         assert result.reason == ProviderErrorCode.PROVIDER_UNAVAILABLE.value
@@ -225,7 +240,7 @@ async def test_malformed_terminal_stream_after_receipt_preserves_job_truth(
     try:
         result = await agent.run(
             "Start one profile before a malformed terminal model stream.",
-            source_id=home.source_id,
+            source_scope_ids=(home.source_id,),
         )
         assert result.kind is LoopExitKind.FAILED
         assert result.reason == ProviderErrorCode.MALFORMED_RESPONSE.value

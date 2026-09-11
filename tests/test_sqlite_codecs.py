@@ -8,6 +8,7 @@ from typing import TypeVar
 
 import pytest
 
+from daita._json import FrozenJsonObject
 from daita.adapters.models import SourceRegistration
 from daita.artifacts.models import (
     ArtifactAuthorship,
@@ -19,6 +20,7 @@ from daita.artifacts.models import (
     ArtifactRef,
     ArtifactTextChangeSummary,
 )
+from daita.capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
 from daita.catalog.models import (
     CatalogSync,
     CatalogSyncStatus,
@@ -54,7 +56,6 @@ from daita.semantics import (
     SemanticKind,
     SemanticSubject,
 )
-from daita.storage.sqlite import DatabaseWriteOutcome, DatabaseWriteReceipt
 from daita.storage.sqlite_codecs import (
     decode_catalog_snapshot,
     decode_catalog_sync,
@@ -63,8 +64,8 @@ from daita.storage.sqlite_codecs import (
     decode_learning_candidate,
     decode_loop_exit,
     decode_message,
-    decode_postgresql_update_scope,
     decode_receipt,
+    decode_relational_write_scope,
     decode_review_stamps,
     decode_run_input,
     decode_semantic_annotation,
@@ -77,8 +78,8 @@ from daita.storage.sqlite_codecs import (
     encode_learning_candidate,
     encode_loop_exit,
     encode_message,
-    encode_postgresql_update_scope,
     encode_receipt,
+    encode_relational_write_scope,
     encode_review_stamps,
     encode_run_input,
     encode_semantic_annotation,
@@ -86,9 +87,11 @@ from daita.storage.sqlite_codecs import (
     encode_source_read_scope,
 )
 from daita.storage.sqlite_records import (
-    PostgreSQLUpdateScope,
+    EffectReceipt,
+    RelationalWriteScope,
     SourceReadMode,
     SourceReadScope,
+    effect_receipt_id,
 )
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -153,23 +156,33 @@ def test_source_codec_rejects_adapters_outside_the_current_state_shape(
         encode_source(unsupported)
 
 
-def _receipt() -> DatabaseWriteReceipt:
-    return DatabaseWriteReceipt.start(
+def _receipt() -> EffectReceipt:
+    key = "sha256:" + "3" * 64
+    return EffectReceipt(
+        receipt_id=effect_receipt_id(
+            agent_id="agent-codec",
+            run_id="run-codec",
+            call_id="call-codec",
+            operation_key=key,
+        ),
+        receipt_kind="data.update_rows",
         agent_id="agent-codec",
         run_id="run-codec",
         call_id="call-codec",
-        capability_id="data.postgresql.update",
-        source_id="source:sha256:" + "1" * 64,
-        resource_id="catalog-resource:sha256:" + "2" * 64,
-        intent_sha256="sha256:" + "3" * 64,
-        preview_fingerprint="sha256:" + "4" * 64,
-        expected_affected_rows=3,
+        capability_id="data.update_rows",
+        domain_owner_id="data",
+        capability_contract_digest=key,
+        operation_key=key,
+        argument_fingerprint=key,
+        sensitivity=ModelSensitivity.INTERNAL,
         started_at=NOW,
     ).finish(
-        DatabaseWriteOutcome.COMMITTED,
-        completed_at=NOW + timedelta(seconds=1),
-        affected_rows=3,
-        normalized_error_code=None,
+        EffectObservation(
+            EffectOutcome.SUCCEEDED,
+            EffectEvidenceBasis.ADAPTER_VERIFIED,
+            FrozenJsonObject.from_mapping({"affected_rows": 3}),
+        ),
+        finished_at=NOW + timedelta(seconds=1),
     )
 
 
@@ -306,8 +319,7 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         "Question?",
         NOW,
         conversation_id="conversation-codec",
-        source_id="source-codec",
-        conversation_source_id="source-codec",
+        source_scope_ids=("source-codec",),
     )
     message = CanonicalMessage(MessageRole.USER, content=(TextBlock("Question?"),))
     result = _loop_exit()
@@ -359,16 +371,22 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
     )
     assert encode_source_read_scope(read_scope) == encoded_read_scope
 
-    update_scope = PostgreSQLUpdateScope(
+    update_scope = RelationalWriteScope(
         agent_id=read_scope.agent_id,
         source_id=read_scope.source_id,
         resource_id="catalog-resource:sha256:" + "2" * 64,
-        allowed_assignment_columns=("status", "amount"),
+        allowed_update_columns=("status", "amount"),
+        resource_revision="sha256:" + "5" * 64,
+        allowed_operations=("update",),
+        allowed_insert_columns=(),
+        key_columns=("id",),
+        generated_identity_columns=(),
+        max_rows=10000,
         authorization_fingerprint="sha256:" + "4" * 64,
     )
-    encoded_update_scope = encode_postgresql_update_scope(update_scope)
+    encoded_update_scope = encode_relational_write_scope(update_scope)
     assert (
-        decode_postgresql_update_scope(
+        decode_relational_write_scope(
             encoded_update_scope,
             agent_id=update_scope.agent_id,
             source_id=update_scope.source_id,
@@ -377,7 +395,7 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         )
         == update_scope
     )
-    assert encode_postgresql_update_scope(update_scope) == encoded_update_scope
+    assert encode_relational_write_scope(update_scope) == encoded_update_scope
 
 
 def test_bound_edit_provenance_and_exact_outcome_receipt_round_trip_in_codec_v1() -> (
@@ -473,6 +491,31 @@ def test_failed_loop_exit_round_trips_bounded_provider_diagnostic() -> None:
     _assert_round_trip(value, encode_loop_exit, decode_loop_exit)
 
 
+def test_counted_admission_failure_preserves_native_count_and_allowance():
+    value = LoopExit(
+        run_id="run-counted-admission",
+        conversation_id="conversation-counted-admission",
+        provider_id="openai:fixture-model",
+        kind=LoopExitKind.FAILED,
+        reason="token_budget_insufficient",
+        created_at=NOW,
+        provider_failure=ProviderFailureDiagnostic(
+            phase=ProviderFailurePhase.REQUEST_ADMISSION,
+            code="token_budget_insufficient",
+            input_tokens=8100,
+            remaining_tokens=7583,
+            maximum_output_tokens=2048,
+        ),
+    )
+    _assert_round_trip(value, encode_loop_exit, decode_loop_exit)
+    with pytest.raises(ValueError, match="admission phase"):
+        ProviderFailureDiagnostic(
+            phase=ProviderFailurePhase.RESPONSE_DECODE,
+            code="invalid",
+            input_tokens=8100,
+        )
+
+
 def test_classified_tool_result_provenance_round_trips_without_entering_output() -> (
     None
 ):
@@ -528,7 +571,7 @@ def test_source_permission_codecs_reject_unknown_versions_and_noncanonical_sets(
 def test_current_record_shape_rejects_missing_fields() -> None:
     run = RunInput("run-codec", "agent-codec", "Question?", NOW)
     payload = json.loads(encode_run_input(run))
-    del payload["fields"]["conversation_source_id"]
+    del payload["fields"]["source_scope_ids"]
     with pytest.raises(ValueError, match="missing fields"):
         decode_run_input(json.dumps(payload))
 

@@ -32,11 +32,15 @@ from daita import (
 from daita._json import FrozenJsonObject, canonical_json
 from daita.adapters.mcp import (
     MCP_MAX_ACTIVE_TOOLS_PER_AGENT,
+    MCPCompletionSemantics,
     MCPServerBinding,
     MCPToolBinding,
     StreamableHTTPMCPClientFactory,
 )
 from daita.capabilities import (
+    AccessMode,
+    AutomationEligibility,
+    OperationalEffect,
     ToolboxId,
     ToolLoadMode,
     ToolPresentation,
@@ -214,7 +218,7 @@ def _mcp_limit_binding(
         replace(
             template_tool,
             capability_id=(
-                "mcp.read:sha256:"
+                "mcp.tool:sha256:"
                 + sha256(
                     f"{resolved_binding_id}\x00{index}".encode("utf-8")
                 ).hexdigest()
@@ -641,6 +645,12 @@ async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_p
                     output_schema=None,
                     output_schema_digest=None,
                     result_sensitivity=ModelSensitivity.INTERNAL,
+                    access_mode=AccessMode.READ,
+                    operational_effect=OperationalEffect.NONE,
+                    automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+                    maximum_outbound_sensitivity=ModelSensitivity.RESTRICTED,
+                    completion_semantics=MCPCompletionSemantics.DIRECT_RESULT,
+                    task_support="forbidden",
                 )
             )
         return encode_mcp_binding(replace(status.binding, tools=tuple(tools)))
@@ -1454,7 +1464,7 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
     )
     high = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
-        maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
+        maximum_outbound_sensitivity=ModelSensitivity.CONFIDENTIAL,
         selections=(
             MCPToolSelection(
                 remote_name="lookup",
@@ -1517,12 +1527,14 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         )
         assert len(provider.requests) == 5
         assert tuple(request.sensitivity for request in provider.logical_requests) == (
-            ModelSensitivity.INTERNAL,
+            ModelSensitivity.CONFIDENTIAL,
             ModelSensitivity.CONFIDENTIAL,
             ModelSensitivity.CONFIDENTIAL,
         )
         assert blocks[0].sensitivity is ModelSensitivity.CONFIDENTIAL
-        assert blocks[0].sensitivity_provenance["run_sensitivity_floor"] == "internal"
+        assert (
+            blocks[0].sensitivity_provenance["run_sensitivity_floor"] == "confidential"
+        )
         assert _error_code(blocks[1]) == "mcp_outbound_sensitivity_exceeded"
         assert alpha.calls == [("lookup", {"query": "x"})]
     finally:

@@ -19,6 +19,7 @@ from ..catalog.models import (
     SourceCatalogSnapshot,
     catalog_resource_id,
 )
+from ..llm.models import ModelSensitivity
 
 _SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -97,14 +98,29 @@ class SourceRegistration:
     configuration: Mapping[str, object]
     attached_at: datetime
     detached_at: datetime | None = None
+    summary: str = ""
+    when_to_use: str = ""
+    keywords: tuple[str, ...] = ()
+    presentation_sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
 
     def __post_init__(self) -> None:
+        from ..capabilities import validate_discovery_hints
+
         if not isinstance(self.id, str) or _SOURCE_ID.fullmatch(self.id) is None:
             raise ValueError("source id must be a canonical source sha256 id")
         _text(self.agent_id, "source agent_id")
         _text(self.adapter_id, "source adapter_id", maximum=128)
         _text(self.native_identity, "source native_identity", maximum=2_048)
         _text(self.display_name, "source display_name")
+        if not isinstance(self.presentation_sensitivity, ModelSensitivity):
+            raise TypeError("source presentation sensitivity must be ModelSensitivity")
+        object.__setattr__(
+            self,
+            "keywords",
+            validate_discovery_hints(
+                self.summary, self.when_to_use, self.keywords, allow_empty=True
+            ),
+        )
         _aware(self.attached_at, "source attached_at")
         if self.detached_at is not None:
             _aware(self.detached_at, "source detached_at")
@@ -133,6 +149,7 @@ class SourceRegistration:
         display_name: str,
         configuration: Mapping[str, object],
         attached_at: datetime,
+        presentation_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
     ) -> SourceRegistration:
         return cls(
             id=source_registration_id(agent_id, adapter_id, native_identity),
@@ -142,6 +159,7 @@ class SourceRegistration:
             display_name=display_name,
             configuration=configuration,
             attached_at=attached_at,
+            presentation_sensitivity=presentation_sensitivity,
         )
 
     @property

@@ -6,6 +6,7 @@ from .adapters import (
     MCPAuthenticationMode,
     MCPBindingState,
     MCPBindingStatus,
+    MCPCompletionSemantics,
     MCPError,
     MCPInspectedTool,
     MCPServerBinding,
@@ -15,7 +16,7 @@ from .adapters import (
     PostgreSQLSource,
     SQLiteSource,
 )
-from .adapters.postgresql_write import PostgreSQLUpdateReadiness
+from .adapters.postgresql_write import RelationalUpdateReadiness
 from .agent import Agent
 from .artifacts import (
     ArtifactDeliveryReceipt,
@@ -29,6 +30,8 @@ from .capabilities import (
     ApprovalDecision,
     ApprovalHandler,
     ApprovalRequest,
+    EffectEvidenceBasis,
+    EffectOutcome,
     ToolboxDefinition,
     ToolboxId,
     ToolLoadMode,
@@ -47,6 +50,7 @@ from .distribution import (
     DistributionDestination,
     DistributionPlan,
     DistributionTargetBinding,
+    EffectRequirement,
     InboxView,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
@@ -99,6 +103,7 @@ from .routines import (
     NonexistentTimePolicy,
     OnceSchedule,
     ReportingMode,
+    RequestedCapabilityGrant,
     ResourceRevisionPrecheck,
     RoutineState,
     ScheduledRoutine,
@@ -120,11 +125,23 @@ from .semantics import (
     SemanticValidationError,
 )
 from .skills import Skill, SkillSummary
+from .storage.sqlite_records import RelationalWriteScope
 from .workspace import LocalWorkspace
 
 __version__ = "1.0.1"
 
+from .storage.sqlite_records import (
+    EffectReceipt,
+    EffectResolution,
+    EffectResolutionDecision,
+)
+
 __all__ = [
+    "EffectReceipt",
+    "EffectResolution",
+    "EffectResolutionDecision",
+    "EffectOutcome",
+    "EffectEvidenceBasis",
     "Agent",
     "AgentConfig",
     "AgentEvent",
@@ -190,6 +207,7 @@ __all__ = [
     "MCPServerInspection",
     "MCPToolBinding",
     "MCPToolSelection",
+    "MCPCompletionSemantics",
     "MisfirePolicy",
     "ModelRoute",
     "ModelRouteCandidate",
@@ -198,10 +216,11 @@ __all__ = [
     "OutcomeConclusionKind",
     "OutcomeArtifactReference",
     "OutcomeContract",
+    "EffectRequirement",
     "OutcomeReference",
     "OutcomeState",
     "PostgreSQLSource",
-    "PostgreSQLUpdateReadiness",
+    "RelationalUpdateReadiness",
     "RetryPolicy",
     "ResidentReady",
     "ReportingMode",
@@ -224,6 +243,8 @@ __all__ = [
     "SkillCandidateContent",
     "SkillSummary",
     "ScheduledRoutineDraft",
+    "RequestedCapabilityGrant",
+    "RelationalWriteScope",
     "ScheduledRoutineInspection",
     "ScheduledRoutineSummary",
     "ScheduledRoutine",

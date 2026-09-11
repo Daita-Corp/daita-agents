@@ -847,8 +847,8 @@ def _approval_request(arguments: dict[str, object]) -> ApprovalRequest:
     return ApprovalRequest(
         run_id="run-1",
         call_id="call-1",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping(arguments),
         reason="update one row",
     )
@@ -869,10 +869,10 @@ def test_cli_approval_displays_the_exact_canonical_review_document():
     assert decision is ApprovalDecision.APPROVE
     assert stdout.getvalue() == (
         "Approval required\n\n"
-        "Tool:       data_update_postgresql\n"
-        "Capability: data.postgresql.update\n"
-        "Change:     update one row\n"
-        "Arguments:\n"
+        "Tool: data_update_rows\n"
+        "Capability: data.update_rows\n"
+        "Change: update one row\n"
+        "Exact validated details:\n"
         f"{rendered}\n"
     )
     assert "Montr\\u00e9al" in stdout.getvalue()
@@ -892,7 +892,7 @@ def test_cli_approval_denies_unreviewable_arguments_without_prompting():
         decision = asyncio.run(cli._prompt_for_exact_approval(request))
 
     assert decision is ApprovalDecision.DENY
-    assert stdout.getvalue() == ""
+    assert "Approval unavailable" in stdout.getvalue()
     prompt.assert_not_called()
 
 
@@ -964,7 +964,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "create",
         "attach",
         "sources",
-        "postgresql-update-readiness",
+        "relational-update-readiness",
         "detach",
         "conversations",
         "export-location",
@@ -976,6 +976,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "mcp",
         "skills",
         "routines",
+        "effects",
         "inbox",
     }
     assert _surface(commands["detach"]) == (
@@ -986,7 +987,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         ("name",),
         frozenset({"-h", "--help", "--yes"}),
     )
-    assert _surface(commands["postgresql-update-readiness"])[0] == (
+    assert _surface(commands["relational-update-readiness"])[0] == (
         "name",
         "source_id",
         "resource_id",
@@ -1628,3 +1629,72 @@ def test_cli_4_shell_mutations_delegate_through_public_agent_methods_only():
         "Public instructions",
     )
     assert fake.close.await_count == 2
+
+
+def test_cli_stopped_run_retains_committed_routine_without_dumping_contract():
+    from daita.llm.models import CanonicalMessage, ToolResultBlock
+    from daita.loop.models import LoopExit, LoopExitKind, RunInput, Transcript
+
+    run = RunInput(
+        id="run-stopped",
+        agent_id="agent",
+        conversation_id="conversation",
+        message="create routine",
+        created_at=datetime.now(UTC),
+    )
+    result = LoopExit(
+        run_id=run.id,
+        conversation_id="conversation",
+        kind=LoopExitKind.FAILED,
+        reason="token_budget_insufficient",
+        created_at=run.created_at,
+    )
+    receipt = ToolResultBlock(
+        call_id="call-create",
+        capability_id="routines.create",
+        executor_id="routines.create.executor",
+        output_sha256="sha256:" + "a" * 64,
+        output={
+            "kind": "routine.receipt",
+            "data": {
+                "action": "create",
+                "routine": {
+                    "routine_id": "routine-committed",
+                    "revision": 1,
+                    "state": "active",
+                },
+            },
+        },
+    )
+    transcript = Transcript(
+        run,
+        (
+            run.start_message(),
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=(
+                    ToolCall(
+                        "call-create",
+                        "routine_create",
+                        {"authorized_instruction": "PRIVATE INSTRUCTION"},
+                    ),
+                ),
+            ),
+            CanonicalMessage(role=MessageRole.TOOL, content=(receipt,)),
+        ),
+    )
+    agent = AsyncMock()
+    agent.run.return_value = result
+    agent.transcript.return_value = transcript
+    args = cli.build_parser().parse_args(["run", "runner", "create routine"])
+    with patch.object(Agent, "open", new=AsyncMock(return_value=agent)):
+        record = asyncio.run(cli._execute(args))
+    assert isinstance(record, dict)
+    assert record["status"] == "failed" and record["text"] is None
+    assert (
+        "routine-committed" in record["notice"]
+        and "not rolled back" in record["notice"]
+    )
+    assert record["tool_results"][0]["is_error"] is False
+    assert "create committed" in record["tool_results"][0]["summary"]
+    assert "PRIVATE INSTRUCTION" not in json.dumps(record)

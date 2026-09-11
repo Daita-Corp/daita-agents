@@ -16,6 +16,7 @@ from ._json import FrozenJsonObject, canonical_json
 from .capabilities import (
     AccessMode,
     AutomationEligibility,
+    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -35,6 +36,7 @@ from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
 from .domains.learning import LearningCandidateGuard
 from .llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
 from .loop.models import RunInput, Transcript
+from .scope import resolve_effective_source_scope
 from .storage.sqlite_records import SourcePermissionStateError
 
 SEMANTIC_MAX_ANNOTATIONS = 256
@@ -306,9 +308,12 @@ class SemanticAnnotation:
     confirmed_at: datetime
     confirmed_by: str = _CONFIRMED_BY
     supersedes_id: str | None = None
+    sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
 
     def __post_init__(self) -> None:
         _identifier(self.id, "semantic annotation id")
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("semantic sensitivity must be ModelSensitivity")
         _identifier(self.agent_id, "semantic annotation agent_id")
         if not isinstance(self.subject, SemanticSubject):
             raise TypeError("semantic annotation subject must be SemanticSubject")
@@ -497,6 +502,7 @@ def semantic_annotation_to_mapping(
         "created_at": annotation.created_at.isoformat(),
         "confirmed_at": annotation.confirmed_at.isoformat(),
         "confirmed_by": annotation.confirmed_by,
+        "sensitivity": annotation.sensitivity.value,
     }
 
 
@@ -566,6 +572,7 @@ def semantic_annotation_from_mapping(
             created_at=datetime.fromisoformat(_mapping_text(value, "created_at")),
             confirmed_at=datetime.fromisoformat(_mapping_text(value, "confirmed_at")),
             confirmed_by=_mapping_text(value, "confirmed_by"),
+            sensitivity=ModelSensitivity(_mapping_text(value, "sensitivity")),
         )
     except (KeyError, TypeError, ValueError) as error:
         if isinstance(error, SemanticValidationError):
@@ -1091,6 +1098,14 @@ class SemanticListExecutor:
             if (source_id is None or source_id in item.subject.source_ids)
             and (resource_id is None or resource_id in item.subject.resource_ids)
             and (kind is None or item.kind is kind)
+            and (
+                request.source_scope is None
+                or (
+                    set(item.subject.source_ids) <= request.source_scope.source_ids
+                    and set(item.subject.resource_ids)
+                    <= request.source_scope.resource_ids
+                )
+            )
         )[:limit]
         return ToolOutput(
             kind=SEMANTIC_LIST_OUTPUT_KIND,
@@ -1129,6 +1144,8 @@ class SemanticViewExecutor:
             raise SemanticNotFoundError(annotation_id)
         return ToolOutput(
             kind=SEMANTIC_VIEW_OUTPUT_KIND,
+            sensitivity=annotation.sensitivity,
+            sensitivity_provenance={"authority": "semantic_owner", "id": annotation.id},
             data={
                 "annotation": semantic_annotation_to_mapping(annotation),
                 "current_sha256": semantic_annotation_sha256(annotation),
@@ -1198,6 +1215,7 @@ class SemanticSaveExecutor:
             agent_id=self._agent_id,
             created_at=created_at,
             confirmed_at=transcript.run.created_at,
+            sensitivity=request.request_sensitivity,
         )
         expected_sha256 = request.arguments.get("expected_sha256")
         if expected_sha256 is not None and not isinstance(expected_sha256, str):
@@ -1243,6 +1261,7 @@ def _annotation_from_tool_arguments(
     agent_id: str,
     created_at: datetime,
     confirmed_at: datetime,
+    sensitivity: ModelSensitivity,
 ) -> SemanticAnnotation:
     raw_subject = arguments["subject"]
     raw_evidence = arguments["evidence"]
@@ -1264,6 +1283,7 @@ def _annotation_from_tool_arguments(
         "created_at": created_at.isoformat(),
         "confirmed_at": confirmed_at.isoformat(),
         "confirmed_by": _CONFIRMED_BY,
+        "sensitivity": sensitivity.value,
         **(
             {"supersedes_id": arguments["supersedes_id"]}
             if "supersedes_id" in arguments
@@ -1658,9 +1678,16 @@ class SemanticCapabilityDomain:
     async def project(self, run: RunInput) -> tuple[str, ...]:
         if run.id in self._files_only_run_ids:
             return ()
-        facts = await self._catalog.source_routing_facts(
-            run.agent_id,
-            (() if run.source_id is None else (run.source_id,)),
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        run = replace(run, resolved_source_scope=scope)
+        facts = (
+            ()
+            if not scope.source_ids
+            else await self._catalog.source_routing_facts(
+                run.agent_id, tuple(sorted(scope.source_ids))
+            )
         )
         if not facts:
             return ()
@@ -1719,19 +1746,23 @@ class SemanticCapabilityDomain:
         del request_sensitivity
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
-        if (
-            run.source_id is not None
-            and capability.id == SEMANTIC_LIST_CAPABILITY_ID
-            and arguments.get("source_id") is None
-        ):
-            scoped = arguments.to_dict()
-            scoped["source_id"] = run.source_id
-            arguments = FrozenJsonObject.from_mapping(scoped)
         await self._validate_source_scope(run, capability, arguments)
         await self._validate_read_scope(run, capability, arguments)
         if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
             arguments = await self._bind_current_evidence(run, arguments)
         return arguments
+
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
 
     async def side_effect_plan(
         self,
@@ -1761,7 +1792,6 @@ class SemanticCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> ToolOutput:
-        del request_sensitivity
         if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
             output = await self._decorate_view(run, arguments, output)
         elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
@@ -1770,15 +1800,19 @@ class SemanticCapabilityDomain:
             self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
         source_id = arguments.get("source_id")
         source_ids = (
             (source_id,)
             if isinstance(source_id, str)
-            else (() if run.source_id is None else (run.source_id,))
+            else tuple(sorted(scope.source_ids))
         )
-        sensitivity = await self._catalog.admitted_model_sensitivity(
-            run.agent_id,
-            source_ids,
+        sensitivity = (
+            await self._catalog.admitted_model_sensitivity(run.agent_id, source_ids)
+            if source_ids
+            else ModelSensitivity.PUBLIC
         )
         if sensitivity is None:
             raise CapabilityInputError(
@@ -1786,13 +1820,12 @@ class SemanticCapabilityDomain:
                 "The current admitted result scope cannot be classified safely.",
                 {"capability_id": capability.id},
             )
-        readable = await self._catalog.readable_resource_ids(
-            run.agent_id,
-            source_ids,
-        )
+        readable = scope.resource_ids
         return replace(
             output,
-            sensitivity=sensitivity,
+            sensitivity=max(
+                sensitivity, request_sensitivity, key=lambda item: item.routing_rank
+            ),
             sensitivity_provenance={
                 "authority": "semantic_current_resource_scope",
                 "capability_id": capability.id,
@@ -1970,6 +2003,9 @@ class SemanticCapabilityDomain:
         arguments: Mapping[str, object],
         output: ToolOutput,
     ) -> ToolOutput:
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
         source_id = arguments.get("source_id")
         resource_id = arguments.get("resource_id")
         kind = arguments.get("kind")
@@ -1982,6 +2018,8 @@ class SemanticCapabilityDomain:
             view
             for view in await self._current_views(run.agent_id)
             if view.state is SemanticAnnotationState.ACTIVE
+            and set(view.annotation.subject.source_ids) <= scope.source_ids
+            and set(view.annotation.subject.resource_ids) <= scope.resource_ids
             and (source_id is None or source_id in view.annotation.subject.source_ids)
             and (
                 resource_id is None
@@ -2003,6 +2041,17 @@ class SemanticCapabilityDomain:
         return replace(
             output,
             data={"annotations": annotations, "count": len(annotations)},
+            sensitivity=max(
+                (
+                    ModelSensitivity.PUBLIC,
+                    *(view.annotation.sensitivity for view in active),
+                ),
+                key=lambda item: item.routing_rank,
+            ),
+            sensitivity_provenance={
+                "authority": "semantic_owner",
+                "source_ids": tuple(sorted(scope.source_ids)),
+            },
         )
 
     async def _current_views(
@@ -2200,16 +2249,17 @@ class SemanticCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> None:
-        selected_source_id = run.source_id
-        if selected_source_id is None:
-            return
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        selected_source_ids = scope.source_ids
         supplied = arguments.get("source_id")
-        if supplied is not None and supplied != selected_source_id:
+        if supplied is not None and supplied not in selected_source_ids:
             raise CapabilityInputError(
                 "source_scope_violation",
-                "This run can only access the source selected by the user.",
+                "This run can only access the effective source scope.",
                 {
-                    "selected_source_id": selected_source_id,
+                    "allowed_source_ids": tuple(sorted(selected_source_ids)),
                     "requested_source_id": supplied,
                 },
             )
@@ -2218,11 +2268,14 @@ class SemanticCapabilityDomain:
             source_ids = (
                 subject.get("source_ids") if isinstance(subject, Mapping) else None
             )
-            if source_ids != (selected_source_id,):
+            if (
+                not isinstance(source_ids, tuple)
+                or not set(source_ids) <= selected_source_ids
+            ):
                 raise CapabilityInputError(
                     "source_scope_violation",
-                    "A semantic write must stay within the source selected by the user.",
-                    {"selected_source_id": selected_source_id},
+                    "A semantic write must stay within the effective source scope.",
+                    {"allowed_source_ids": tuple(sorted(selected_source_ids))},
                 )
         referenced: tuple[object, ...] = ()
         if capability.id in {
@@ -2241,16 +2294,16 @@ class SemanticCapabilityDomain:
         }
         for annotation_id in ids:
             annotation = current.get(annotation_id)
-            if annotation is not None and annotation.subject.source_ids != (
-                selected_source_id,
+            if (
+                annotation is not None
+                and not set(annotation.subject.source_ids) <= selected_source_ids
             ):
                 raise CapabilityInputError(
                     "source_scope_violation",
-                    "This run can only access semantic annotations from the source "
-                    "selected by the user.",
+                    "This run can only access semantic annotations from the effective source scope.",
                     {
                         "annotation_id": annotation_id,
-                        "selected_source_id": selected_source_id,
+                        "allowed_source_ids": tuple(sorted(selected_source_ids)),
                     },
                 )
 
@@ -2267,7 +2320,11 @@ class SemanticCapabilityDomain:
             run.agent_id,
             run.message[:4_000],
             limit=CATALOG_CONTEXT_DEFAULT_LIMIT,
-            source_ids=(() if run.source_id is None else (run.source_id,)),
+            source_ids=(
+                tuple(sorted(run.resolved_source_scope.source_ids))
+                if run.resolved_source_scope is not None
+                else run.source_scope_ids
+            ),
         )
         resources = catalog.get("resources")
         if not isinstance(resources, tuple):

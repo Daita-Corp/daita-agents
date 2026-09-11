@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from hashlib import sha256
 from typing import Protocol, cast
@@ -18,9 +18,12 @@ from ...artifacts.models import (
 )
 from ...capabilities import (
     AccessMode,
+    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
+    CapabilityGrant,
     CapabilityInputError,
+    CapabilityRegistry,
     OperationalEffect,
     ToolExecution,
     ToolOutput,
@@ -34,9 +37,10 @@ from ...catalog.capabilities import (
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
 from ...catalog.models import Sensitivity
-from ...llm.models import ModelSensitivity, ToolCall
-from ...loop.models import RunInput, RunOrigin
-from ...storage.sqlite_records import SourcePermissionStateError
+from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
+from ...loop.models import RunInput, RunOrigin, Transcript
+from ...scope import resolve_effective_source_scope
+from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .file_capabilities import (
     LOCAL_FILE_CAPABILITY_IDS,
@@ -46,23 +50,28 @@ from .file_capabilities import (
 from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
 from .sql import (
     DuckDBReadValidationError,
-    PostgreSQLUpdateCommand,
-    PostgreSQLUpdateIntent,
+    RelationalUpdateCommand,
+    RelationalUpdateIntent,
     ResourceSchema,
     validate_duckdb_read,
     validate_postgresql_read,
-    validate_postgresql_update_intent,
+    validate_relational_update_intent,
     validate_sqlite_read,
+)
+from .sql.relational_upsert import (
+    RelationalUpsertIntent,
+    validate_relational_upsert_intent,
+    validate_relational_upsert_scope,
 )
 
 DATA_DOMAIN_OWNER_ID = "data"
 DATA_QUERY_CAPABILITY_ID = "data.query"
 DATA_QUERY_EVIDENCE_KIND = "data.query_result"
 DATA_EXPORT_TABULAR_CAPABILITY_ID = "data.export_tabular"
-POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID = "data.postgresql.update_impact"
-POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.postgresql.update_impact"
-POSTGRESQL_UPDATE_CAPABILITY_ID = "data.postgresql.update"
-POSTGRESQL_UPDATE_EVIDENCE_KIND = "data.postgresql.update_result"
+RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID = "data.preview_update_rows"
+RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND = "data.preview_update_rows"
+RELATIONAL_UPDATE_CAPABILITY_ID = "data.update_rows"
+RELATIONAL_UPDATE_EVIDENCE_KIND = "data.update_rows_result"
 
 _CATALOG_CAPABILITIES = frozenset(
     {
@@ -77,23 +86,44 @@ _RELATIONAL_READ_CAPABILITIES = frozenset(
     {DATA_QUERY_CAPABILITY_ID, DATA_EXPORT_TABULAR_CAPABILITY_ID}
 )
 _UPDATE_CAPABILITIES = frozenset(
-    {POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID, POSTGRESQL_UPDATE_CAPABILITY_ID}
+    {RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID, RELATIONAL_UPDATE_CAPABILITY_ID}
 )
+_UPSERT_CAPABILITIES = frozenset({"data.preview_upsert_rows", "data.upsert_rows"})
+_NATIVE_WRITE_CAPABILITIES = frozenset(
+    {RELATIONAL_UPDATE_CAPABILITY_ID, "data.upsert_rows"}
+)
+
+
+def native_preview_capability(capability_id: str) -> str:
+    """The two native operations own their exact current-run preview prerequisite."""
+    if capability_id == RELATIONAL_UPDATE_CAPABILITY_ID:
+        return RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID
+    if capability_id == "data.upsert_rows":
+        return "data.preview_upsert_rows"
+    raise ValueError("not a native write capability")
+
+
 _RESOURCE_ARGUMENT_CAPABILITIES = frozenset(
     {
+        *_UPSERT_CAPABILITIES,
         CATALOG_INSPECT_CAPABILITY_ID,
         RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID,
-        POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-        POSTGRESQL_UPDATE_CAPABILITY_ID,
+        RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
+        RELATIONAL_UPDATE_CAPABILITY_ID,
     }
 )
 _RESOURCE_LIST_ARGUMENT_CAPABILITIES = _RELATIONAL_READ_CAPABILITIES
 _RELATIONAL_ADAPTER_IDS = frozenset({"sqlite", "postgresql"})
+_RESOURCE_READ_DENIED_MESSAGE = (
+    "The requested resource is not available for reading in this run. Copy exact "
+    "current catalog IDs without shortening them; do not guess or substitute another resource."
+)
 _ADAPTER_CAPABILITIES = {
     "postgresql": frozenset(
         {
-            POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID,
-            POSTGRESQL_UPDATE_CAPABILITY_ID,
+            *_UPSERT_CAPABILITIES,
+            RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID,
+            RELATIONAL_UPDATE_CAPABILITY_ID,
         }
     ),
 }
@@ -120,18 +150,30 @@ class ReadScopedCatalogReader(CatalogSchemaReader, Protocol):
     ) -> frozenset[str]: ...
 
 
-class PostgreSQLUpdateCatalogReader(CatalogSchemaReader, Protocol):
-    async def postgresql_update_scope_issue(
+class RelationalWriteCatalogReader(CatalogSchemaReader, Protocol):
+    async def relational_write_scope_issue(
         self,
         agent_id: str,
         source_id: str,
         resource_id: str,
         assignment_columns: tuple[str, ...],
+        *,
+        operation: str = "update",
+        insert_columns: tuple[str, ...] = (),
+        key_columns: tuple[str, ...] = (),
+        row_count: int | None = None,
     ) -> tuple[str, str] | None: ...
+
+    async def load_relational_write_scope(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> RelationalWriteScope | None: ...
 
 
 class DataDomainCatalog(
-    ReadScopedCatalogReader, PostgreSQLUpdateCatalogReader, Protocol
+    ReadScopedCatalogReader, RelationalWriteCatalogReader, Protocol
 ):
     async def source_routing_facts(
         self,
@@ -139,10 +181,12 @@ class DataDomainCatalog(
         source_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]: ...
 
-    async def postgresql_update_applicable_source_ids(
+    async def relational_write_applicable_source_ids(
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
+        *,
+        operation: str = "update",
     ) -> frozenset[str]: ...
 
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None: ...
@@ -179,6 +223,10 @@ class DataCapabilityDomain:
         learning: LearningCandidateGuard,
         *,
         relational_export_available: bool = True,
+        transcript_loader: Callable[[str], Awaitable[Transcript]] | None = None,
+        upsert_readiness: (
+            Callable[[str, FrozenJsonObject], Awaitable[FrozenJsonObject]] | None
+        ) = None,
         workspace_id: str | None = None,
         workspace_sensitivity: ModelSensitivity | None = None,
         files_only_run_ids: set[str] | None = None,
@@ -223,6 +271,9 @@ class DataCapabilityDomain:
                 raise TypeError(f"data catalog must provide {method_name}")
         if not isinstance(learning, LearningCandidateGuard):
             raise TypeError("learning must be LearningCandidateGuard")
+        self._upsert_readiness = upsert_readiness
+        self._transcript_loader = transcript_loader
+        self._registry: CapabilityRegistry | None = None
         self._declarations = declarations
         self._catalog = catalog
         self._learning = learning
@@ -234,28 +285,44 @@ class DataCapabilityDomain:
         self._views = {item.name: item for item in declarations.tool_views}
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
+    def bind_capability_registry(self, registry: CapabilityRegistry) -> None:
+        if self._registry is not None:
+            raise ValueError("data registry is already bound")
+        self._registry = registry
+
     @property
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
         files_only = run.id in self._files_only_run_ids
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=files_only
+        )
+        run = replace(run, resolved_source_scope=scope)
         facts: tuple[Mapping[str, object], ...]
         update_source_ids: frozenset[str]
-        if files_only:
+        if not scope.source_ids:
             facts = ()
             update_source_ids = frozenset()
         else:
             facts = await self._catalog.source_routing_facts(
                 run.agent_id,
-                (() if run.source_id is None else (run.source_id,)),
+                tuple(sorted(scope.source_ids)),
             )
             update_source_ids = (
-                await self._catalog.postgresql_update_applicable_source_ids(
+                await self._catalog.relational_write_applicable_source_ids(
                     run.agent_id,
-                    (() if run.source_id is None else (run.source_id,)),
+                    tuple(sorted(scope.source_ids)),
                 )
             )
+        upsert_source_ids = (
+            await self._catalog.relational_write_applicable_source_ids(
+                run.agent_id, tuple(sorted(scope.source_ids)), operation="upsert"
+            )
+            if scope.source_ids
+            else frozenset()
+        )
         active_adapter_ids: set[str] = set()
         for fact in facts:
             adapter_id = fact.get("adapter_id")
@@ -295,6 +362,8 @@ class DataCapabilityDomain:
                 continue
             if capability.id in _UPDATE_CAPABILITIES and not update_source_ids:
                 continue
+            if capability.id in _UPSERT_CAPABILITIES and not upsert_source_ids:
+                continue
             names.append(name)
         return tuple(names)
 
@@ -314,7 +383,10 @@ class DataCapabilityDomain:
         *,
         request_sensitivity: ModelSensitivity,
     ) -> FrozenJsonObject:
-        del request_sensitivity
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        run = replace(run, resolved_source_scope=scope)
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
             if (
                 self._workspace_id is None
@@ -360,12 +432,11 @@ class DataCapabilityDomain:
             return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
-        arguments = self._apply_source_scope(run, capability, arguments)
         await self._validate_source_scope(run, capability, arguments)
         self._validate_execution_resource_scope(run, capability, arguments)
         await self._validate_resource_read_scope(run, capability, arguments)
         if capability.access_mode is AccessMode.WRITE and (
-            capability.id != POSTGRESQL_UPDATE_CAPABILITY_ID
+            capability.id not in _NATIVE_WRITE_CAPABILITIES
             or capability.operational_effect is not OperationalEffect.MUTATE_DATA
         ):
             raise CapabilityInputError(
@@ -404,13 +475,223 @@ class DataCapabilityDomain:
                 )
         if capability.id in _RELATIONAL_READ_CAPABILITIES:
             arguments = await self._validate_sql(run, arguments)
+        if capability.id in _UPDATE_CAPABILITIES | _UPSERT_CAPABILITIES:
+            await self._validate_target_sensitivity(
+                run.agent_id, arguments, request_sensitivity
+            )
+        if capability.id in _UPSERT_CAPABILITIES:
+            try:
+                intent = RelationalUpsertIntent.from_mapping(arguments)
+            except ValueError:
+                raise CapabilityInputError(
+                    "upsert_invalid_batch",
+                    "Upsert requires uniform scalar rows with explicit columns, "
+                    "at most 1,000 rows, and a batch within 64 KiB and the exact "
+                    "approval display bound. Reduce the batch or correct its shape; "
+                    "no write was dispatched.",
+                ) from None
+            permission = await self._catalog.load_relational_write_scope(
+                run.agent_id, intent.source_id, intent.resource_id
+            )
+            if permission is None:
+                raise CapabilityInputError(
+                    "resource_write_not_allowed",
+                    "The exact write permission is unavailable or stale.",
+                )
+            issue = await self._catalog.relational_write_scope_issue(
+                run.agent_id,
+                intent.source_id,
+                intent.resource_id,
+                intent.update_columns,
+                operation="upsert",
+                insert_columns=intent.insert_columns,
+                key_columns=intent.key_columns,
+                row_count=len(intent.rows),
+            )
+            if issue is not None:
+                raise CapabilityInputError(*issue)
+            resource = next(
+                item
+                for item in await self._catalog.resource_schemas(
+                    run.agent_id, intent.source_id
+                )
+                if item.resource_id == intent.resource_id
+            )
+            validate_relational_upsert_intent(
+                intent,
+                resource=resource,
+                generated_identity_columns=permission.generated_identity_columns,
+                max_rows=permission.max_rows,
+            )
+            await self._authenticate_native_lineage(
+                run,
+                call,
+                arguments,
+                capability,
+                intent.evidence_call_ids,
+                execution=capability.id == "data.upsert_rows",
+            )
+            self._check_native_grant(run, capability, arguments, permission)
         if capability.id in _UPDATE_CAPABILITIES:
-            await self._validate_postgresql_update_call(
+            await self._validate_relational_update_call(
                 run,
                 arguments,
-                execution=capability.id == POSTGRESQL_UPDATE_CAPABILITY_ID,
+                execution=capability.id == RELATIONAL_UPDATE_CAPABILITY_ID,
             )
+            if capability.id == RELATIONAL_UPDATE_CAPABILITY_ID:
+                await self._authenticate_native_lineage(
+                    run, call, arguments, capability, (), execution=True
+                )
+                permission = await self._catalog.load_relational_write_scope(
+                    run.agent_id,
+                    cast(str, arguments["source_id"]),
+                    cast(str, arguments["resource_id"]),
+                )
+                if permission is None:
+                    raise CapabilityInputError(
+                        "resource_write_not_allowed",
+                        "The current write permission is unavailable.",
+                    )
+                if cast(int, arguments["expected_affected_rows"]) > permission.max_rows:
+                    raise CapabilityInputError(
+                        "write_row_limit",
+                        "The exact update exceeds its permission row ceiling.",
+                    )
+                self._check_native_grant(run, capability, arguments, permission)
         return arguments
+
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        if (
+            capability.id not in _NATIVE_WRITE_CAPABILITIES
+            or max_calls_per_occurrence != 1
+        ):
+            raise CapabilityInputError(
+                "automation_grant_unsupported",
+                "Native writes permit exactly one invocation per occurrence.",
+            )
+        if len(set(proposal.allowed_capability_ids) & _NATIVE_WRITE_CAPABILITIES) != 1:
+            raise CapabilityInputError(
+                "automation_grant_unsupported",
+                "A routine may admit only one native write capability.",
+            )
+        required_preview = native_preview_capability(capability.id)
+        if required_preview not in proposal.allowed_capability_ids:
+            raise CapabilityInputError(
+                "automation_grant_preview_required",
+                f"Include {required_preview} in the proposed scope. A corrected proposal "
+                "requires foreground review; execution still needs its own successful current-run preview.",
+            )
+        source_id, resource_id = cast(str, constraints["source_id"]), cast(
+            str, constraints["resource_id"]
+        )
+        if (
+            source_id not in proposal.allowed_source_ids
+            or resource_id not in proposal.allowed_resource_ids
+        ):
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "Native grant target is outside the proposed scope.",
+            )
+        permission = await self._catalog.load_relational_write_scope(
+            proposal.agent_id, source_id, resource_id
+        )
+        if permission is None:
+            raise CapabilityInputError(
+                "resource_write_not_allowed",
+                "An exact current native permission is required.",
+            )
+        operation = (
+            "update" if capability.id == RELATIONAL_UPDATE_CAPABILITY_ID else "upsert"
+        )
+        if (
+            operation not in permission.allowed_operations
+            or constraints["resource_revision"] != permission.resource_revision
+        ):
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "The operation or structural revision is not currently authorized.",
+            )
+        normalized = constraints.to_dict()
+        for name in (
+            "key_columns",
+            "allowed_insert_columns",
+            "allowed_update_columns",
+            "generated_identity_columns",
+        ):
+            values = cast(tuple[str, ...], constraints[name])
+            if not set(values) <= set(getattr(permission, name)):
+                raise CapabilityInputError(
+                    "automation_grant_scope_invalid",
+                    "Grant columns exceed current native permission.",
+                )
+            normalized[name] = tuple(sorted(values))
+        if set(cast(tuple[str, ...], constraints["key_columns"])) != set(
+            permission.key_columns
+        ):
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "Native grants require the exact admitted key.",
+            )
+        if (
+            cast(int, constraints["max_rows"]) > permission.max_rows
+            or not constraints["allowed_update_columns"]
+        ):
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "Grant row or column ceilings are invalid.",
+            )
+        if operation == "update" and (
+            constraints["allowed_insert_columns"]
+            or constraints["generated_identity_columns"]
+        ):
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "Update grants cannot authorize insertion or identity generation.",
+            )
+        await self._validate_target_sensitivity(
+            proposal.agent_id, constraints, proposal.sensitivity_ceiling
+        )
+        if operation == "upsert":
+            resource = next(
+                item
+                for item in await self._catalog.resource_schemas(
+                    proposal.agent_id, source_id
+                )
+                if item.resource_id == resource_id
+            )
+            validate_relational_upsert_scope(
+                resource,
+                key_columns=cast(tuple[str, ...], constraints["key_columns"]),
+                insert_columns=cast(
+                    tuple[str, ...], constraints["allowed_insert_columns"]
+                ),
+                update_columns=cast(
+                    tuple[str, ...], constraints["allowed_update_columns"]
+                ),
+                generated_identity_columns=cast(
+                    tuple[str, ...], constraints["generated_identity_columns"]
+                ),
+            )
+            if cast(int, constraints["max_rows"]) > 1000:
+                raise CapabilityInputError(
+                    "automation_grant_scope_invalid",
+                    "Upsert permits at most 1000 rows.",
+                )
+            if self._upsert_readiness is None:
+                raise CapabilityInputError(
+                    "automation_grant_unsupported",
+                    "Native upsert readiness is unavailable.",
+                )
+            await self._upsert_readiness(
+                proposal.agent_id, FrozenJsonObject.from_mapping(normalized)
+            )
+        return FrozenJsonObject.from_mapping(normalized)
 
     async def side_effect_plan(
         self,
@@ -421,11 +702,95 @@ class DataCapabilityDomain:
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
         if (
-            capability.id not in _UPDATE_CAPABILITIES
+            capability.id not in _NATIVE_WRITE_CAPABILITIES
             or capability.operational_effect is not OperationalEffect.MUTATE_DATA
         ):
             raise ValueError("data domain received an unsupported side effect")
-        return SideEffectPlan(recheck_after_approval=False)
+        grant = (
+            None
+            if run.execution_scope is None
+            else next(
+                (
+                    item
+                    for item in run.execution_scope.capability_grants
+                    if item.capability_id == capability.id
+                ),
+                None,
+            )
+        )
+        approval_arguments = None
+        if run.execution_scope is None:
+            source_id = cast(str, execution.arguments["source_id"])
+            resource_id = cast(str, execution.arguments["resource_id"])
+            resource = next(
+                (
+                    item
+                    for item in await self._catalog.resource_schemas(
+                        run.agent_id, source_id
+                    )
+                    if item.resource_id == resource_id
+                ),
+                None,
+            )
+            source = next(
+                (
+                    item
+                    for item in await self._catalog.source_routing_facts(
+                        run.agent_id, (source_id,)
+                    )
+                    if item["source_id"] == source_id
+                ),
+                None,
+            )
+            if (
+                resource is None
+                or source is None
+                or resource.revision != fingerprint["resource_revision"]
+            ):
+                raise CapabilityInputError(
+                    "write_state_changed",
+                    "The exact review target is no longer current.",
+                )
+            approval_arguments = FrozenJsonObject.from_mapping(
+                {
+                    "arguments": execution.arguments,
+                    "target": {
+                        "source_id": source_id,
+                        "resource_id": resource_id,
+                        "name": resource.name,
+                        "aliases": resource.aliases,
+                        "source_name": source["display_name"],
+                        "revision": resource.revision,
+                    },
+                    "preview": fingerprint["review"],
+                }
+            )
+        approval_reason = (
+            "Review the exact batch. Execution briefly holds an EXCLUSIVE table lock; ordinary reads may continue."
+            if capability.id == "data.upsert_rows"
+            else "Review the exact selected rows and assignments. Execution locks matching rows and rejects a changed preview."
+        )
+        if (
+            capability.id == "data.upsert_rows"
+            and cast(Mapping[str, object], fingerprint["review"])[
+                "identity_sequence_gaps_possible"
+            ]
+        ):
+            approval_reason += " Identity sequence gaps can remain after rollback."
+        return SideEffectPlan(
+            approval_required=run.execution_scope is None,
+            capability_grant_digest=None if grant is None else grant.grant_digest,
+            approval_reason=approval_reason,
+            approval_arguments=approval_arguments,
+            recheck_after_approval=True,
+            effect_intent=FrozenJsonObject.from_mapping(
+                {
+                    "source_id": execution.arguments["source_id"],
+                    "resource_id": execution.arguments["resource_id"],
+                    "intent_sha256": fingerprint["intent_sha256"],
+                }
+            ),
+        )
 
     async def finalize_output(
         self,
@@ -511,6 +876,8 @@ class DataCapabilityDomain:
             )
         except SourcePermissionStateError as error:
             raise _incomplete_export(draft, "permission_state_invalid") from error
+        if run.resolved_source_scope is not None:
+            readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
@@ -580,28 +947,29 @@ class DataCapabilityDomain:
         error: BaseException,
     ) -> CapabilityFailure | None:
         del call
+        from ...adapters.postgresql_write import (
+            RelationalUpdateExecutionCancelled,
+            RelationalUpdateExecutionError,
+        )
+
+        if isinstance(error, RelationalUpdateExecutionError):
+            return CapabilityFailure(
+                error.error_code,
+                str(error),
+                error.details,
+                effect_observation=error.effect_observation,
+            )
+        if isinstance(error, RelationalUpdateExecutionCancelled):
+            return CapabilityFailure(
+                "write_interrupted",
+                "The native update was interrupted; see its transaction evidence.",
+                effect_observation=error.effect_observation,
+            )
         if isinstance(error, LocalWorkspaceError):
             return CapabilityFailure(error.code, error.message, error.details)
         if isinstance(error, LocalFileQueryError):
             return CapabilityFailure(error.code, error.message, error.details)
         return None
-
-    def _apply_source_scope(
-        self,
-        run: RunInput,
-        capability: Capability,
-        arguments: FrozenJsonObject,
-    ) -> FrozenJsonObject:
-        if (
-            run.source_id is None
-            or capability.id
-            not in {CATALOG_SEARCH_CAPABILITY_ID, CATALOG_SCHEMA_CAPABILITY_ID}
-            or arguments.get("source_id") is not None
-        ):
-            return arguments
-        scoped = arguments.to_dict()
-        scoped["source_id"] = run.source_id
-        return FrozenJsonObject.from_mapping(scoped)
 
     async def _validate_source_scope(
         self,
@@ -609,16 +977,20 @@ class DataCapabilityDomain:
         capability: Capability,
         arguments: Mapping[str, object],
     ) -> None:
-        selected_source_id = run.source_id
-        if selected_source_id is None:
-            return
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        selected_source_ids = scope.source_ids
         supplied_source_id = arguments.get("source_id")
-        if supplied_source_id is not None and supplied_source_id != selected_source_id:
+        if (
+            supplied_source_id is not None
+            and supplied_source_id not in selected_source_ids
+        ):
             raise CapabilityInputError(
                 "source_scope_violation",
-                "This run can only access the source selected by the user.",
+                "The requested source is outside this run's effective scope.",
                 {
-                    "selected_source_id": selected_source_id,
+                    "allowed_source_ids": tuple(sorted(selected_source_ids)),
                     "requested_source_id": supplied_source_id,
                 },
             )
@@ -645,14 +1017,10 @@ class DataCapabilityDomain:
                 run.agent_id,
                 resource_id,
             )
-            if identity is None or identity[0] != selected_source_id:
+            if identity is None or identity[0] not in selected_source_ids:
                 raise CapabilityInputError(
-                    "source_scope_violation",
-                    "This run can only access resources from the selected source.",
-                    {
-                        "resource_id": resource_id,
-                        "selected_source_id": selected_source_id,
-                    },
+                    "resource_read_not_allowed",
+                    _RESOURCE_READ_DENIED_MESSAGE,
                 )
 
     async def _validate_resource_read_scope(
@@ -692,12 +1060,14 @@ class DataCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
+        if run.resolved_source_scope is not None:
+            readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         if any(resource_id not in readable for resource_id in requested):
             raise CapabilityInputError(
                 "resource_read_not_allowed",
-                "The requested resource is not available for reading.",
+                _RESOURCE_READ_DENIED_MESSAGE,
             )
 
     async def _validate_sql(
@@ -744,7 +1114,7 @@ class DataCapabilityDomain:
             if identity is None:
                 raise CapabilityInputError(
                     "resource_read_not_allowed",
-                    "The requested resource is not available for reading.",
+                    _RESOURCE_READ_DENIED_MESSAGE,
                 )
             if identity[0] != source_id:
                 raise CapabilityInputError(
@@ -763,6 +1133,8 @@ class DataCapabilityDomain:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from error
+        if run.resolved_source_scope is not None:
+            readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         validator = (
@@ -796,7 +1168,7 @@ class DataCapabilityDomain:
         }:
             raise CapabilityInputError(
                 "resource_read_not_allowed",
-                "One or more requested resources are not available for reading.",
+                _RESOURCE_READ_DENIED_MESSAGE,
             )
         raise CapabilityInputError(
             "sql_validation_failed",
@@ -855,7 +1227,7 @@ class DataCapabilityDomain:
                 "The requested resource is outside this run's immutable scope.",
             )
 
-    async def _validate_postgresql_update_call(
+    async def _validate_relational_update_call(
         self,
         run: RunInput,
         arguments: Mapping[str, object],
@@ -880,9 +1252,9 @@ class DataCapabilityDomain:
             )
         try:
             intent = (
-                PostgreSQLUpdateCommand.from_mapping(arguments).intent
+                RelationalUpdateCommand.from_mapping(arguments).intent
                 if execution
-                else PostgreSQLUpdateIntent.from_mapping(arguments)
+                else RelationalUpdateIntent.from_mapping(arguments)
             )
         except (TypeError, ValueError) as error:
             raise CapabilityInputError(
@@ -890,7 +1262,7 @@ class DataCapabilityDomain:
                 "The PostgreSQL update intent is malformed.",
             ) from error
         try:
-            issue = await self._catalog.postgresql_update_scope_issue(
+            issue = await self._catalog.relational_write_scope_issue(
                 run.agent_id,
                 source_id,
                 intent.resource_id,
@@ -903,7 +1275,7 @@ class DataCapabilityDomain:
             ) from error
         if issue is not None:
             raise CapabilityInputError(issue[0], issue[1])
-        validation = validate_postgresql_update_intent(
+        validation = validate_relational_update_intent(
             intent,
             resources=await self._catalog.resource_schemas(
                 run.agent_id,
@@ -917,6 +1289,286 @@ class DataCapabilityDomain:
                 first.message,
                 {"source_id": source_id, "resource_id": intent.resource_id},
             )
+
+    async def _validate_target_sensitivity(
+        self,
+        agent_id: str,
+        arguments: Mapping[str, object],
+        sensitivity: ModelSensitivity,
+    ) -> None:
+        resource = next(
+            (
+                item
+                for item in await self._catalog.resource_schemas(
+                    agent_id, cast(str, arguments["source_id"])
+                )
+                if item.resource_id == arguments["resource_id"]
+            ),
+            None,
+        )
+        try:
+            target = ModelSensitivity(
+                "unknown" if resource is None else resource.sensitivity_class
+            )
+        except ValueError:
+            raise CapabilityInputError(
+                "write_sensitivity_denied", "Target classification is unknown."
+            ) from None
+        if sensitivity.routing_rank > target.routing_rank:
+            raise CapabilityInputError(
+                "write_sensitivity_denied",
+                "The request exceeds the target's current admitted classification.",
+            )
+
+    def _check_native_grant(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        permission: RelationalWriteScope,
+    ) -> CapabilityGrant | None:
+        if run.execution_scope is None:
+            return None
+        capability_id = (
+            "data.upsert_rows"
+            if capability.id in _UPSERT_CAPABILITIES
+            else RELATIONAL_UPDATE_CAPABILITY_ID
+        )
+        grant = next(
+            (
+                item
+                for item in run.execution_scope.capability_grants
+                if item.capability_id == capability_id
+            ),
+            None,
+        )
+        if grant is None or grant.max_calls_per_occurrence != 1:
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "An exact once-per-occurrence native grant is required.",
+            )
+        c = grant.constraints
+        if (
+            c["source_id"] != arguments["source_id"]
+            or c["resource_id"] != arguments["resource_id"]
+            or c["resource_revision"] != permission.resource_revision
+        ):
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "The native target differs from its frozen grant.",
+            )
+        if capability_id == "data.upsert_rows":
+            intent = RelationalUpsertIntent.from_mapping(arguments)
+            updates, inserts, keys, count = (
+                intent.update_columns,
+                intent.insert_columns,
+                intent.key_columns,
+                len(intent.rows),
+            )
+        else:
+            update = RelationalUpdateIntent.from_mapping(
+                {
+                    key: arguments[key]
+                    for key in ("source_id", "resource_id", "where", "assignments")
+                }
+            )
+            updates, inserts, keys, count = (
+                tuple(item.column for item in update.assignments),
+                (),
+                permission.key_columns,
+                cast(int, arguments.get("expected_affected_rows", 0)),
+            )
+        if (
+            not set(updates) <= set(cast(tuple[str, ...], c["allowed_update_columns"]))
+            or not set(inserts)
+            <= set(cast(tuple[str, ...], c["allowed_insert_columns"]))
+            or set(keys) != set(cast(tuple[str, ...], c["key_columns"]))
+            or set(permission.generated_identity_columns)
+            != set(cast(tuple[str, ...], c["generated_identity_columns"]))
+            or count > cast(int, c["max_rows"])
+        ):
+            raise CapabilityInputError(
+                "automation_grant_scope_invalid",
+                "The batch exceeds its exact native grant.",
+            )
+        return grant
+
+    async def _authenticate_native_lineage(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        arguments: Mapping[str, object],
+        capability: Capability,
+        evidence_ids: tuple[str, ...],
+        *,
+        execution: bool,
+    ) -> None:
+        if not execution and not evidence_ids:
+            return
+        if self._transcript_loader is None or self._registry is None:
+            raise CapabilityInputError(
+                "write_preview_not_authenticated",
+                "Current-run native lineage is unavailable.",
+            )
+        transcript = await self._transcript_loader(run.id)
+        if transcript.run.agent_id != run.agent_id or transcript.run.id != run.id:
+            raise CapabilityInputError(
+                "write_preview_not_authenticated",
+                "The preview belongs to another run or agent.",
+            )
+        current_calls = [
+            (index, candidate)
+            for index, message in enumerate(transcript.messages)
+            for candidate in message.tool_calls
+            if candidate.id == call.id
+        ]
+        if len(current_calls) != 1 or current_calls[0][1] != call:
+            raise CapabilityInputError(
+                "write_preview_not_authenticated",
+                "The native call does not match its persisted current-run identity.",
+            )
+        current_index = current_calls[0][0]
+        calls = {
+            candidate.id: candidate
+            for message in transcript.messages[:current_index]
+            for candidate in message.tool_calls
+        }
+        results: list[ToolResultBlock] = []
+        for result_index, message in enumerate(transcript.messages[:current_index]):
+            for block in message.content:
+                if (
+                    not isinstance(block, ToolResultBlock)
+                    or block.is_error
+                    or block.call_id not in calls
+                    or block.capability_id is None
+                ):
+                    continue
+                producers = [
+                    (index, candidate)
+                    for index, item in enumerate(transcript.messages)
+                    for candidate in item.tool_calls
+                    if candidate.id == block.call_id
+                ]
+                result_count = sum(
+                    1
+                    for item in transcript.messages
+                    for other in item.content
+                    if isinstance(other, ToolResultBlock)
+                    and other.call_id == block.call_id
+                )
+                if (
+                    len(producers) != 1
+                    or result_count != 1
+                    or not producers[0][0] < result_index < current_index
+                ):
+                    continue
+                if (
+                    block.output_sha256
+                    != "sha256:"
+                    + sha256(canonical_json(block.output).encode("utf-8")).hexdigest()
+                    or block.sensitivity is None
+                ):
+                    continue
+                try:
+                    _, result_capability = self._registry.resolve_tool(
+                        calls[block.call_id].name
+                    )
+                    if (
+                        result_capability.id != block.capability_id
+                        or result_capability.executor_id != block.executor_id
+                        or result_capability.operational_effect
+                        is not OperationalEffect.NONE
+                    ):
+                        continue
+                    self._registry.validate_arguments(
+                        result_capability.id, calls[block.call_id].arguments
+                    )
+                    result_data = block.output.get("data")
+                    if not isinstance(result_data, Mapping):
+                        continue
+                    self._registry.validate_output(
+                        result_capability.id,
+                        ToolOutput(
+                            kind=cast(str, block.output["kind"]), data=result_data
+                        ),
+                    )
+                    source_id = result_data.get("source_id")
+                    revisions = result_data.get("resource_revisions", ())
+                    if (
+                        isinstance(source_id, str)
+                        and isinstance(revisions, tuple)
+                        and revisions
+                    ):
+                        schemas = {
+                            item.resource_id: item.revision
+                            for item in await self._catalog.resource_schemas(
+                                run.agent_id, source_id
+                            )
+                        }
+                        if any(
+                            not isinstance(item, Mapping)
+                            or schemas.get(cast(str, item.get("resource_id")))
+                            != item.get("revision")
+                            for item in revisions
+                        ):
+                            continue
+                except (KeyError, TypeError, ValueError):
+                    continue
+                results.append(block)
+        if (
+            evidence_ids
+            and tuple(
+                block.call_id for block in results if block.call_id in evidence_ids
+            )
+            != evidence_ids
+        ):
+            raise CapabilityInputError(
+                "write_evidence_invalid",
+                "Evidence must identify ordered successful authenticated current-run results.",
+            )
+        if not execution:
+            return
+        expected = native_preview_capability(capability.id)
+        for result in results:
+            data = result.output.get("data")
+            if (
+                result.capability_id != expected
+                or not isinstance(data, Mapping)
+                or data.get("preview_fingerprint") != arguments["preview_fingerprint"]
+            ):
+                continue
+            original = calls[result.call_id].arguments
+            if expected == "data.preview_upsert_rows":
+                current = RelationalUpsertIntent.from_mapping(arguments)
+                previewed = RelationalUpsertIntent.from_mapping(original)
+                # Typed validation and adapter preflight authenticate semantic equality; compare all requested values here.
+                a, b = current.to_payload(), previewed.to_payload()
+                a["rows"] = tuple(sorted(current.rows, key=canonical_json))
+                b["rows"] = tuple(sorted(previewed.rows, key=canonical_json))
+                if canonical_json(a) == canonical_json(b):
+                    return
+            else:
+                current_update = RelationalUpdateCommand.from_mapping(arguments).intent
+                original_update = RelationalUpdateIntent.from_mapping(original)
+                resources = await self._catalog.resource_schemas(
+                    run.agent_id, current_update.source_id
+                )
+                a_update = validate_relational_update_intent(
+                    current_update, resources=resources
+                ).validated
+                b_update = validate_relational_update_intent(
+                    original_update, resources=resources
+                ).validated
+                if (
+                    a_update is not None
+                    and b_update is not None
+                    and a_update.intent_sha256 == b_update.intent_sha256
+                ):
+                    return
+        raise CapabilityInputError(
+            "write_preview_not_authenticated",
+            "The write requires its exact successful current-run preview and matching intent.",
+        )
 
     async def _classify(
         self,
@@ -961,11 +1613,15 @@ class DataCapabilityDomain:
                     "physical_revisions": tuple(physical_revisions),
                 },
             )
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        run = replace(run, resolved_source_scope=scope)
         source_id = call.arguments.get("source_id")
         source_ids = (
             (source_id,)
             if isinstance(source_id, str)
-            else (() if run.source_id is None else (run.source_id,))
+            else tuple(sorted(scope.source_ids))
         )
         sensitivity = await self._catalog.admitted_model_sensitivity(
             run.agent_id,
@@ -981,6 +1637,8 @@ class DataCapabilityDomain:
             run.agent_id,
             source_ids,
         )
+        if run.resolved_source_scope is not None:
+            readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
         return replace(
@@ -1032,10 +1690,10 @@ __all__ = [
     "DATA_QUERY_CAPABILITY_ID",
     "DATA_QUERY_EVIDENCE_KIND",
     "DATA_EXPORT_TABULAR_CAPABILITY_ID",
-    "POSTGRESQL_UPDATE_CAPABILITY_ID",
-    "POSTGRESQL_UPDATE_EVIDENCE_KIND",
-    "POSTGRESQL_UPDATE_PREVIEW_CAPABILITY_ID",
-    "POSTGRESQL_UPDATE_PREVIEW_EVIDENCE_KIND",
-    "PostgreSQLUpdateCatalogReader",
+    "RELATIONAL_UPDATE_CAPABILITY_ID",
+    "RELATIONAL_UPDATE_EVIDENCE_KIND",
+    "RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID",
+    "RELATIONAL_UPDATE_PREVIEW_EVIDENCE_KIND",
+    "RelationalWriteCatalogReader",
     "ReadScopedCatalogReader",
 ]

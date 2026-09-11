@@ -102,6 +102,13 @@ filesystem, shell, browser, or database.
   Daita invokes that client without copying the credential.
 - **Allowance:** setup validation and normal requests consume a small amount of
   the connected subscription allowance.
+- **Token limits:** these subscription interfaces do not expose complete request
+  token counting. Daita stops progression using reported usage after each response,
+  before executing tools or accepting completion. CLI output limits are advisory;
+  the Codex subscription endpoint does not support the API output-token cap.
+  One in-flight request can therefore exceed the remaining token allowance.
+  Daita does not estimate billed tokens from serialized request bytes or use an
+  API credential as a fallback counter.
 - **Dollar estimates:** subscription usage is not treated as zero-cost API
   usage. Daita records token usage when the provider reports it, but marks the
   dollar estimate unavailable. A run that requires a complete dollar estimate
@@ -149,3 +156,26 @@ custom providers, API keys, instructions, permissions, hooks, plugins,
 marketplaces, MCP servers, skills, and other active configuration layers, then
 run `grok login` and retry. Daita rejects these layers instead of attempting to
 reinterpret their precedence.
+
+## Request lifetime
+
+All model routes use `AgentConfig.model_call_policy` (`daita.llm.ModelCallPolicy`).
+The defaults allow 180 seconds per logical model call, 120 per attempt, and
+5 seconds for once-only cleanup. These ceilings also intersect the remaining
+run wall time. Codex counts recognized text, argument and reasoning deltas as
+progress, with 60 seconds to first progress and 30 seconds between progress.
+The CLI subscriptions expose opaque output: Daita reports progress as
+unobservable and uses the fixed attempt deadline, not console activity.
+
+Command startup, protocol checks and inference consume the same attempt.
+Cancellation terminates the process group and bounds reaping by the shared
+cleanup deadline. If native work remains unresolved, its provider is unavailable
+for replacement calls; late output is discarded. Known terminal usage is retained
+when cleanup fails, and no successful completion or automatic replay follows an
+uncertain shutdown. Caller-injected SDK clients remain caller-owned.
+
+The serialized policy replaces provider-specific constructor timeout settings.
+Changing it changes the model execution contract, so previously authorized
+routines and follow-ups must pass exact contract revalidation. See the
+[implementation plan](MODEL_CALL_RELIABILITY_IMPLEMENTATION_PLAN_2026-09-10.md)
+for field limits, retry ceilings and qualification requirements.

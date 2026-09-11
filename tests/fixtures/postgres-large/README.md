@@ -31,6 +31,18 @@ update testing. It can catalog and select `support.tickets`, and its
 only PostgreSQL mutation privilege is column-scoped `UPDATE (priority)` on
 that table. The production-shape `daita_large_reader` remains read-only.
 
+The automated write release tests use `daita_large_write_tester` and the isolated
+`write_acceptance.companies` and `write_acceptance.cells` tables. This does not add
+tables or permissions to the reader or change the original update canary. The
+company table's integer identity and two unique text keys exercise generated IDs,
+conflict-key matching, and independent server
+constraint failures. The narrow integer `cells` table reaches the 1,000-row ceiling
+without exceeding the byte or exact approval bounds. The role has SELECT,
+table-level UPDATE (needed for the EXCLUSIVE lock), column-scoped INSERT, and
+identity-sequence USAGE. It has no
+DELETE, TRUNCATE, DDL, administrative, or role-management privilege. Daita's own
+permission scope further restricts each admitted operation and column.
+
 Two deliberate PostgreSQL boundary cases are present:
 
 - `catalog.unsupported_type_probe` uses a custom enum. Daita currently omits
@@ -106,8 +118,8 @@ Schema: support
 SSL mode: disable
 ```
 
-Through `/source permissions`, select PostgreSQL update access,
-`support.tickets`, Advanced column selection, and only `priority`. The
+Through `/source permissions`, select `support.tickets`, choose update access,
+and admit only `priority` as an update column. The
 deterministic fresh-fixture canary is `ticket_id = 42`, whose initial priority
 is `medium`. Use it to verify that a single-row selection goes through the same
 preview and `[Y] Approve once` flow as a bulk selection.
@@ -135,6 +147,100 @@ DAITA_LARGE_POSTGRES_PASSWORD=daita_large_fixture_password \
 DAITA_LARGE_POSTGRES_WRITER_PASSWORD=daita_large_writer_fixture_password \
 .venv/bin/python -m pytest tests/test_postgres_large_fixture.py -v
 ```
+
+## Native write release checks
+
+These opt-in tests use the real public Agent API, catalog discovery, permission
+preview/apply, SQL validation, asyncpg, PostgreSQL transactions, and persisted
+effect receipts. The model is scripted: no LLM credentials, paid model requests,
+MCP calls, or live external services beyond this local fixture are needed.
+
+The suite covers:
+
+- Mixed insert/update/unchanged batches, exact counts and generated identities;
+  unchanged repeats; omitted values versus explicit nulls.
+- Approval denial, stale row values and structure, revoked database privileges,
+  and Daita permission revocation retained after reopen.
+- Duplicate/null keys, explicit identity assignments, row and byte ceilings,
+  and update permission that cannot authorize upsert.
+- A real second-insert unique violation rolling back the entire batch; a
+  deliberately corrupted driver row count rolling back a real update.
+- Real lock timeout and a concurrent insertion while the upsert waits for its
+  EXCLUSIVE lock. The authoritative scan must see the committed competitor.
+- Driver cancellation after mutation and after commit; foreground cancellation
+  that drains an already-started write and retains its verified commit; lost
+  commit confirmation;
+  persisted uncertainty, blocked subsequent writes, and both exact human recovery
+  decisions performing no action and granting no permission.
+- Narrow batch sizes 1, 100 and 1,000, with actual row counts and elapsed-time
+  samples in JUnit properties. These are bounded canary measurements, not a throughput or
+  p95 latency certification. A wide 1,000-row batch is separately required to fail
+  before I/O with an actionable size/shape error; the row ceiling cannot bypass
+  byte or approval display bounds.
+
+First start a **fresh disposable fixture built from the current `init.sql`** using
+the command above. Existing containers do not rerun initialization SQL. Recreate
+only this fixture when its disposable data is no longer needed; the tests never
+start, stop or recreate Docker, or delete an existing agent home.
+
+Run serially from the repository root:
+
+```bash
+DAITA_RUN_POSTGRES_WRITE_RELEASE=1 \
+.venv/bin/python -m pytest tests/test_postgresql_write_release.py -v \
+  -o junit_family=xunit1 --junitxml=/private/tmp/daita-postgresql-write-release.xml
+```
+
+The harness is fixed to `127.0.0.1`, database `daita_large_fixture`, and the
+dedicated roles. `DAITA_LARGE_POSTGRES_PORT` selects the fixture port (default
+55433). Password overrides are `DAITA_LARGE_POSTGRES_ADMIN_PASSWORD` and
+`DAITA_LARGE_POSTGRES_WRITE_TESTER_PASSWORD`; defaults match `init.sql` and Compose.
+Do not point this harness at customer data.
+
+The fixture administrator verifies the ready marker and holds an advisory lock
+before resetting only the two `write_acceptance` canary tables. A concurrent suite
+fails instead of sharing canary data. Administrator access is used for seed/readback,
+controlled privilege/structure changes, and cleanup; Daita always connects as the
+restricted tester. Teardown restores canary privileges, removes the test-added
+column, empties the canary tables, and checks that write connections were closed.
+The original large workload and `support.tickets` are preserved.
+
+Commit-loss cases inject a disconnect immediately before sending COMMIT, or hide
+confirmation after a real successful COMMIT. Cancellation and count corruption
+also use explicitly labeled driver-boundary hooks; catalog truth, transactions,
+SQL results in ordinary cases, and receipts remain production-owned. These tests
+do not claim to exercise actual dropped network packets, a PostgreSQL server
+crash, managed-host failover, TLS/pooler behavior, or every PostgreSQL version.
+Run those checks separately for the intended deployment where applicable.
+
+Without database authorization, validate the test harness offline:
+
+```bash
+.venv/bin/python -m pytest tests/test_postgresql_write_release_harness.py \
+  tests/test_postgresql_write_fixture_contract.py -v
+.venv/bin/python -m pytest tests/test_postgresql_write_release.py --collect-only
+```
+
+Release evidence requires a passing authorized database run and review of its
+assertions, timings, and remaining deployment-specific limits. Collection and
+offline harness checks alone do not establish release readiness.
+
+## Live LLM decisions with this fixture
+
+The separate [live model acceptance suite](../../../docs/LIVE_LLM_ACCEPTANCE.md)
+uses actual API generation and the production router with these same canaries.
+It covers model-driven discovery, writes, refusals, failure interpretation,
+recovery and immediate/weekly routine authoring. It requires its own paid-run
+authorization and environment credential; the default twelve cases admit at most
+seventeen bounded agent runs and $2.55 estimated cost per model/repetition.
+The explicit `user_flow` profile uses ordinary requests and prose answers,
+with thirteen cases, at most nineteen runs and $9.50 estimated per
+model/repetition. It uses the production 100,000-token, 24-request, 300-second
+outer limits with a $0.50 estimated per-run ceiling; the strict profile remains
+unchanged. Exact execution assertions and separate answer review are required.
+Independent owner-seeded recovery and scheduled cases are labeled separately
+from model-authored end-to-end cases. Database-only results above
+do not substitute for a passing live model run.
 
 ## Stop and discard it
 

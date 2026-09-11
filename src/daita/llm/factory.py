@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import cast
+from decimal import Decimal
 
 from ..security import (
     KeychainStore,
@@ -13,9 +12,22 @@ from ..security import (
     SecretResolutionError,
     default_secret_provider,
 )
-from ._lifecycle import await_cleanup, closing_stream
-from .errors import ModelProviderError, ProviderErrorCode
-from .models import ModelRequest, ModelResponse, ModelStreamEvent
+from ._lifecycle import (
+    AttemptLifecycle,
+    NativeOwner,
+    await_cleanup,
+    closing_stream,
+    materialize_request,
+    shutdown_deadline,
+)
+from .errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    before_generation,
+    with_cancelled_model_usage,
+)
+from .models import ModelRequest, ModelResponse, ModelStreamEvent, ModelUsage
+from .pricing import CostEstimate
 from .protocols import (
     ManagedModelProvider,
     ModelProvider,
@@ -23,16 +35,11 @@ from .protocols import (
     provider_has_complete_pricing,
     provider_supports_request_policy,
 )
-from .providers import (
-    AnthropicProvider,
-    ClaudeCodeSubscriptionProvider,
-    CodexSubscriptionProvider,
-    GeminiProvider,
-    GrokBuildSubscriptionProvider,
-    GrokProvider,
-    OllamaProvider,
-    OpenAICompatibleProvider,
-    OpenAIProvider,
+from .provider_definitions import (
+    AuthenticationMode,
+    ProviderConstruction,
+    provider_definition,
+    split_provider_model_id,
 )
 from .routing import (
     ModelProviderRegistration,
@@ -40,8 +47,6 @@ from .routing import (
     ModelRouteCandidate,
     ModelRouter,
 )
-
-_PROVIDER = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 
 
 def create_llm_provider(
@@ -53,66 +58,34 @@ def create_llm_provider(
     base_url: str | None = None,
     max_output_tokens: int = 1_024,
 ) -> ManagedModelProvider:
-    provider_name, separator, model = model_id.partition(":")
-    if not separator or not _PROVIDER.fullmatch(provider_name) or not model:
-        raise ValueError("model_id must use provider:model form")
-    if not isinstance(max_output_tokens, int) or max_output_tokens < 1:
+    provider_name, model = split_provider_model_id(model_id)
+    if (
+        not isinstance(max_output_tokens, int)
+        or isinstance(max_output_tokens, bool)
+        or max_output_tokens < 1
+    ):
         raise ValueError("max_output_tokens must be positive")
-    if provider_name != "codex" and subscription_credential is not None:
+    values = ProviderConstruction(
+        model=model,
+        api_key=api_key,
+        subscription_credential=subscription_credential,
+        credential_updater=credential_updater,
+        base_url=base_url,
+        max_output_tokens=max_output_tokens,
+    )
+    definition = provider_definition(provider_name)
+    if definition is not None:
+        return definition.construct(values)
+    if subscription_credential is not None:
         raise ValueError(
             "subscription_credential is only accepted by subscription providers"
         )
-    if provider_name != "codex" and credential_updater is not None:
+    if credential_updater is not None:
         raise ValueError("credential_updater is only accepted by Codex")
-    if provider_name == "openai":
-        _fixed_endpoint(provider_name, base_url)
-        return OpenAIProvider(
-            model, api_key=api_key, max_output_tokens=max_output_tokens
-        )
-    if provider_name == "anthropic":
-        _fixed_endpoint(provider_name, base_url)
-        return AnthropicProvider(model, api_key=api_key, max_tokens=max_output_tokens)
-    if provider_name == "codex":
-        _fixed_endpoint(provider_name, base_url)
-        if api_key is not None:
-            raise ValueError("codex does not accept an API key")
-        if subscription_credential is None:
-            raise ValueError("codex requires a Daita subscription login")
-        return CodexSubscriptionProvider(
-            model,
-            credential=subscription_credential,
-            credential_updater=credential_updater,
-            max_output_tokens=max_output_tokens,
-        )
-    if provider_name == "claude-code":
-        _subscription_auth_only(provider_name, api_key, base_url)
-        return ClaudeCodeSubscriptionProvider(
-            model,
-            max_output_tokens=max_output_tokens,
-        )
-    if provider_name == "grok-build":
-        _subscription_auth_only(provider_name, api_key, base_url)
-        return GrokBuildSubscriptionProvider(
-            model,
-            max_output_tokens=max_output_tokens,
-        )
-    if provider_name == "gemini":
-        _fixed_endpoint(provider_name, base_url)
-        return GeminiProvider(
-            model, api_key=api_key, max_output_tokens=max_output_tokens
-        )
-    if provider_name == "grok":
-        _fixed_endpoint(provider_name, base_url)
-        return GrokProvider(model, api_key=api_key, max_tokens=max_output_tokens)
-    if provider_name == "ollama":
-        return OllamaProvider(
-            model,
-            base_url=base_url or "http://127.0.0.1:11434/v1",
-            api_key=api_key or "ollama",
-            max_tokens=max_output_tokens,
-        )
     if base_url is None:
         raise ValueError("custom providers require base_url")
+    from .providers.openai_compatible import OpenAICompatibleProvider
+
     return OpenAICompatibleProvider(
         model,
         provider=provider_name,
@@ -122,27 +95,13 @@ def create_llm_provider(
     )
 
 
-def _fixed_endpoint(provider: str, base_url: str | None) -> None:
-    if base_url is not None:
-        raise ValueError(f"{provider} uses its fixed endpoint")
-
-
-def _subscription_auth_only(
-    provider: str,
-    api_key: str | None,
-    base_url: str | None,
-) -> None:
-    _fixed_endpoint(provider, base_url)
-    if api_key is not None:
-        raise ValueError(f"{provider} uses the official client's subscription login")
-
-
 class _LazyProvider:
     def __init__(self, candidate: ModelRouteCandidate, secrets: SecretProvider) -> None:
         self._candidate = candidate
         self._secrets = secrets
         self._provider: ModelProvider | None = None
         self._close_task: asyncio.Task[None] | None = None
+        self._native_owner = NativeOwner()
 
     @property
     def provider_id(self) -> str:
@@ -154,25 +113,20 @@ class _LazyProvider:
         if self._provider is not None:
             return provider_supports_request_policy(self._provider, request)
         provider_name = self.provider_id.partition(":")[0]
+        definition = provider_definition(provider_name)
         return (
-            request.allow_parallel_tool_calls is None
-            or self._candidate.base_url is not None
-            or provider_name
-            in {
-                "openai",
-                "grok",
-                "ollama",
-                "codex",
-                "claude-code",
-                "grok-build",
-            }
+            True if definition is None else definition.supports_request_policy(request)
         )
 
     def has_complete_pricing(self, request: ModelRequest) -> bool:
         if self._provider is not None:
             return provider_has_complete_pricing(self._provider, request)
         provider_name = self.provider_id.partition(":")[0]
-        if provider_name == "codex":
+        definition = provider_definition(provider_name)
+        if (
+            definition is not None
+            and definition.authentication is AuthenticationMode.CODEX_SUBSCRIPTION
+        ):
             return False
         provider = create_llm_provider(
             self._candidate.provider_id,
@@ -182,10 +136,12 @@ class _LazyProvider:
         return provider_has_complete_pricing(provider, request)
 
     async def generate(self, request: ModelRequest) -> ModelResponse:
+        request = materialize_request(request)
         provider = await self._resolve(request)
         return await provider.generate(request)
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        request = materialize_request(request)
         provider = await self._resolve(request)
         if not self._candidate.profile.supports_streaming or not isinstance(
             provider, StreamingModelProvider
@@ -200,6 +156,35 @@ class _LazyProvider:
                 yield event
 
     async def _resolve(self, request: ModelRequest) -> ModelProvider:
+        attempt = AttemptLifecycle(self._native_owner, request)
+        try:
+            async with attempt:
+                return await self._resolve_before_generation(attempt.request, attempt)
+        except TimeoutError:
+            raise before_generation(
+                ModelProviderError(
+                    ProviderErrorCode.TIMEOUT,
+                    "The model request deadline expired during provider resolution.",
+                    provider_id=self.provider_id,
+                ),
+                code="provider_resolution_timeout",
+            ) from None
+        except asyncio.CancelledError as error:
+            attempt.finish(error)
+            raise with_cancelled_model_usage(
+                error,
+                ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0))),
+            ) from None
+        except ModelProviderError as error:
+            attempt.finish(error)
+            raise before_generation(error, code="provider_resolution_failed") from None
+
+    async def _resolve_before_generation(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelProvider:
+        request.remaining_after(
+            ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+        )
         if self._close_task is not None:
             raise ModelProviderError(
                 ProviderErrorCode.PROVIDER_UNAVAILABLE,
@@ -214,11 +199,12 @@ class _LazyProvider:
         if self._provider is None:
             reference = self._candidate.secret_reference
             provider_name = self.provider_id.partition(":")[0]
+            definition = provider_definition(provider_name)
             try:
                 credential = (
                     None
                     if reference is None
-                    else await self._secrets.resolve(reference)
+                    else await attempt.run_native(self._secrets.resolve(reference))
                 )
             except SecretResolutionError as error:
                 raise ModelProviderError(
@@ -226,8 +212,14 @@ class _LazyProvider:
                     "The configured provider credential could not be resolved.",
                     provider_id=self.provider_id,
                 ) from None
+            attempt.check_execution()
+            self._native_owner.require_available()
             credential_updater: Callable[[str], Awaitable[None]] | None = None
-            if provider_name == "codex" and reference is not None:
+            if (
+                definition is not None
+                and definition.authentication is AuthenticationMode.CODEX_SUBSCRIPTION
+                and reference is not None
+            ):
 
                 async def update_credential(value: str) -> None:
                     if not isinstance(self._secrets, KeychainStore):
@@ -250,9 +242,19 @@ class _LazyProvider:
             if self._provider is None:
                 self._provider = create_llm_provider(
                     self._candidate.provider_id,
-                    api_key=(credential if provider_name != "codex" else None),
+                    api_key=(
+                        None
+                        if definition is not None
+                        and definition.authentication
+                        is AuthenticationMode.CODEX_SUBSCRIPTION
+                        else credential
+                    ),
                     subscription_credential=(
-                        credential if provider_name == "codex" else None
+                        credential
+                        if definition is not None
+                        and definition.authentication
+                        is AuthenticationMode.CODEX_SUBSCRIPTION
+                        else None
                     ),
                     credential_updater=credential_updater,
                     base_url=self._candidate.base_url,
@@ -260,18 +262,21 @@ class _LazyProvider:
                 )
         return self._provider
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Join once-only cleanup without activating unused delegates."""
 
+        deadline = shutdown_deadline(deadline)
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._finish_close())
-        await await_cleanup(self._close_task)
+            self._close_task = asyncio.create_task(self._finish_close(deadline))
+        await await_cleanup(
+            self._close_task, deadline=deadline, owner=self._native_owner
+        )
 
-    async def _finish_close(self) -> None:
+    async def _finish_close(self, deadline: float) -> None:
         provider = self._provider
         if provider is not None:
             assert isinstance(provider, ManagedModelProvider)
-            await provider.close()
+            await provider.close(deadline=deadline)
         self._provider = None
 
 
@@ -302,8 +307,6 @@ def create_model_route_provider(
         )
         for candidate in route.candidates
     )
-    if len(registrations) == 1 and route.retry_policy.attempts == 1:
-        return cast(ManagedModelProvider, registrations[0].provider)
     return ModelRouter(registrations, retry_policy=route.retry_policy)
 
 

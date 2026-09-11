@@ -21,11 +21,11 @@ from ...catalog.service import CatalogService
 from ...llm.models import ModelSensitivity
 from ...semantics import SemanticResourceFact
 from ...storage.sqlite_records import (
-    PostgreSQLUpdateScope,
+    RelationalWriteScope,
     SourcePermissionStateError,
     SourceReadMode,
     SourceReadScope,
-    postgresql_update_authorization_fingerprint,
+    relational_write_authorization_fingerprint,
 )
 from .sql import ResourceSchema
 
@@ -39,11 +39,11 @@ if TYPE_CHECKING:
             source_id: str,
         ) -> SourceReadScope | None: ...
 
-        async def list_postgresql_update_scopes(
+        async def list_relational_write_scopes(
             self,
             agent_id: str,
             source_id: str,
-        ) -> tuple[PostgreSQLUpdateScope, ...]: ...
+        ) -> tuple[RelationalWriteScope, ...]: ...
 
 
 class CatalogDataView:
@@ -65,7 +65,7 @@ class CatalogDataView:
             raise TypeError("sources must provide source registration reads")
         for method_name in (
             "load_source_read_scope",
-            "list_postgresql_update_scopes",
+            "list_relational_write_scopes",
         ):
             if not callable(getattr(sources, method_name, None)):
                 raise TypeError(f"sources must provide {method_name}")
@@ -82,11 +82,32 @@ class CatalogDataView:
 
         selected_source_ids = frozenset(source_ids)
         registrations = await self._sources.list_sources(agent_id)
+        readable_sources: set[str] = set()
+        for registration in registrations:
+            if registration.agent_id != agent_id or not registration.active:
+                continue
+            if selected_source_ids and registration.id not in selected_source_ids:
+                continue
+            scope = await self._sources.load_source_read_scope(
+                agent_id, registration.id
+            )
+            if scope is None:
+                raise SourcePermissionStateError(
+                    "active source is missing its read scope"
+                )
+            self._require_owned_read_scope(registration.id, agent_id, scope)
+            if scope.mode is not SourceReadMode.NONE:
+                readable_sources.add(registration.id)
         return tuple(
             FrozenJsonObject.from_mapping(
                 {
                     "source_id": registration.id,
                     "adapter_id": registration.adapter_id,
+                    "display_name": registration.display_name,
+                    "summary": registration.summary,
+                    "when_to_use": registration.when_to_use,
+                    "keywords": registration.keywords,
+                    "presentation_sensitivity": registration.presentation_sensitivity.value,
                 }
             )
             for registration in sorted(
@@ -95,6 +116,7 @@ class CatalogDataView:
             )
             if registration.agent_id == agent_id
             and registration.active
+            and registration.id in readable_sources
             and (not selected_source_ids or registration.id in selected_source_ids)
         )
 
@@ -120,6 +142,13 @@ class CatalogDataView:
         except SourcePermissionStateError:
             return None
         sensitivities: list[ModelSensitivity] = []
+        sensitivities.extend(
+            registration.presentation_sensitivity
+            for registration in await self._sources.list_sources(agent_id)
+            if registration.agent_id == agent_id
+            and registration.active
+            and (not source_ids or registration.id in source_ids)
+        )
         for resource in resources:
             if resource.sensitivity is Sensitivity.UNKNOWN:
                 return None
@@ -199,21 +228,35 @@ class CatalogDataView:
                 "active source read scope ownership is invalid"
             )
 
-    async def search(self, request: CatalogSearchRequest) -> CatalogSearchResult:
+    async def search(
+        self,
+        request: CatalogSearchRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> CatalogSearchResult:
         readable = await self.readable_resource_ids(
             request.agent_id,
             request.source_ids,
         )
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         return await self._service.search(
             request,
             readable_resource_ids=readable,
         )
 
-    async def schema_slice(self, request: CatalogSchemaRequest) -> FrozenJsonObject:
+    async def schema_slice(
+        self,
+        request: CatalogSchemaRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> FrozenJsonObject:
         readable = await self.readable_resource_ids(
             request.agent_id,
             (() if request.source_id is None else (request.source_id,)),
         )
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         return await self._service.schema_slice(
             request,
             readable_resource_ids=readable,
@@ -223,8 +266,12 @@ class CatalogDataView:
         self,
         agent_id: str,
         resource_id: str,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
         readable = await self.readable_resource_ids(agent_id)
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         return await self._service.inspect_resource(
             agent_id,
             resource_id,
@@ -234,8 +281,12 @@ class CatalogDataView:
     async def traverse(
         self,
         request: CatalogTraversalRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject:
         readable = await self.readable_resource_ids(request.agent_id)
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
         return await self._service.traverse(
             request,
             readable_resource_ids=readable,
@@ -319,6 +370,20 @@ class CatalogDataView:
                     column_declared_types=column_declared_types,
                     column_nullability=column_nullability,
                     column_type_provenance=column_type_provenance,
+                    conflict_keys=tuple(
+                        index.columns
+                        for index in tabular.indexes
+                        if index.unique
+                        and index.predicate is None
+                        and index.write_conflict_supported
+                    ),
+                    column_defaults=tuple(
+                        (column.name, column.default_expression)
+                        for column in tabular.columns
+                    ),
+                    column_collations=tuple(
+                        (column.name, column.collation) for column in tabular.columns
+                    ),
                     identity_columns=tuple(identity_column_names),
                     generated_columns=tuple(generated_column_names),
                     updatable_columns=tuple(updatable_column_names),
@@ -485,12 +550,17 @@ class CatalogDataView:
             readable_resource_ids=readable,
         )
 
-    async def postgresql_update_scope_issue(
+    async def relational_write_scope_issue(
         self,
         agent_id: str,
         source_id: str,
         resource_id: str,
         assignment_columns: tuple[str, ...],
+        *,
+        operation: str = "update",
+        insert_columns: tuple[str, ...] = (),
+        key_columns: tuple[str, ...] = (),
+        row_count: int | None = None,
     ) -> tuple[str, str] | None:
         """Validate one exact current update authorization without source I/O."""
 
@@ -526,7 +596,7 @@ class CatalogDataView:
                 "resource_update_not_allowed",
                 "The requested resource is not authorized for PostgreSQL updates.",
             )
-        scopes = await self._sources.list_postgresql_update_scopes(
+        scopes = await self._sources.list_relational_write_scopes(
             agent_id,
             source_id,
         )
@@ -540,25 +610,45 @@ class CatalogDataView:
                 "The requested resource is not authorized for PostgreSQL updates.",
             )
         if (
-            not isinstance(scope, PostgreSQLUpdateScope)
+            not isinstance(scope, RelationalWriteScope)
             or scope.agent_id != agent_id
             or scope.source_id != source_id
         ):
             raise SourcePermissionStateError(
                 "stored PostgreSQL update scope ownership is invalid"
             )
+        if operation not in scope.allowed_operations:
+            return (
+                "resource_write_not_allowed",
+                "This relational operation is not explicitly authorized.",
+            )
+        if key_columns and set(key_columns) != set(scope.key_columns):
+            return (
+                "write_key_not_allowed",
+                "The requested conflict key differs from the exact permission.",
+            )
+        if not set(insert_columns) <= set(scope.allowed_insert_columns):
+            return (
+                "insert_column_not_allowed",
+                "One or more insertion columns are not authorized.",
+            )
+        if row_count is not None and row_count > scope.max_rows:
+            return (
+                "write_row_limit",
+                "The exact batch exceeds the admitted row ceiling.",
+            )
         requested_columns = frozenset(assignment_columns)
-        if not requested_columns <= frozenset(scope.allowed_assignment_columns):
+        if not requested_columns <= frozenset(scope.allowed_update_columns):
             return (
                 "update_column_not_allowed",
                 "One or more assignment columns are not authorized for this table.",
             )
         try:
-            expected = postgresql_update_authorization_fingerprint(
+            expected = relational_write_authorization_fingerprint(
                 source=registration,
                 resource=current.resource,
                 facet=current.facet,
-                allowed_assignment_columns=scope.allowed_assignment_columns,
+                scope=scope,
             )
         except (TypeError, ValueError):
             expected = None
@@ -569,10 +659,33 @@ class CatalogDataView:
             )
         return None
 
-    async def postgresql_update_applicable_source_ids(
+    async def load_relational_write_scope(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+    ) -> RelationalWriteScope | None:
+        scopes = await self._sources.list_relational_write_scopes(agent_id, source_id)
+        scope = next((item for item in scopes if item.resource_id == resource_id), None)
+        if scope is None:
+            return None
+        issue = await self.relational_write_scope_issue(
+            agent_id,
+            source_id,
+            resource_id,
+            scope.allowed_update_columns,
+            operation=scope.allowed_operations[0],
+        )
+        if issue is not None:
+            return None
+        return scope
+
+    async def relational_write_applicable_source_ids(
         self,
         agent_id: str,
         source_ids: tuple[str, ...] = (),
+        *,
+        operation: str = "update",
     ) -> frozenset[str]:
         selected = frozenset(source_ids)
         applicable: set[str] = set()
@@ -584,15 +697,16 @@ class CatalogDataView:
                 or (selected and registration.id not in selected)
             ):
                 continue
-            for scope in await self._sources.list_postgresql_update_scopes(
+            for scope in await self._sources.list_relational_write_scopes(
                 agent_id,
                 registration.id,
             ):
-                issue = await self.postgresql_update_scope_issue(
+                issue = await self.relational_write_scope_issue(
                     agent_id,
                     registration.id,
                     scope.resource_id,
-                    scope.allowed_assignment_columns,
+                    scope.allowed_update_columns,
+                    operation=operation,
                 )
                 if issue is None:
                     applicable.add(registration.id)

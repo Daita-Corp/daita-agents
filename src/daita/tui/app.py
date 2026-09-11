@@ -47,6 +47,7 @@ from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
+from .screens.effects import EffectsScreen
 from .screens.inbox import InboxScreen
 from .screens.jobs import JobsScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
@@ -59,6 +60,7 @@ from .screens.permissions import PermissionsScreen
 from .screens.routines import RoutinesScreen
 from .screens.selection import SelectionScreen
 from .screens.source_edit import SourceEditScreen
+from .widgets.approval import ApprovalPanel
 from .widgets.composer import (
     ComposerExitRequested,
     ComposerLimitReached,
@@ -96,20 +98,6 @@ DAITA_THEME = Theme(
 )
 
 _CREATE_NEW_AGENT_SELECTION = "daita:create-new-agent"
-
-
-def _run_failure_notice(result: LoopExit) -> str:
-    if result.reason == "timeout":
-        return (
-            "The model provider timed out after bounded retries. Daita stopped "
-            "waiting; any completed tool results remain available above."
-        )
-    if result.reason == "wall_time_exhausted":
-        return (
-            "The run reached its overall time limit and was stopped. Any completed "
-            "tool results remain available above."
-        )
-    return f"{result.kind.value}: {result.reason}"
 
 
 class DaitaApp(App[int]):
@@ -161,6 +149,8 @@ class DaitaApp(App[int]):
         self._start_bootstrap = start_bootstrap
         self._startup_error: Exception | None = None
         self._active_job_count = 0
+        self._routine_count = 0
+        self._foreground_state = "ready"
         self._inbox_item_count = 0
         self._autonomous_run_ids: set[str] = set()
         self._known_inbox_ids: set[str] | None = None
@@ -210,6 +200,9 @@ class DaitaApp(App[int]):
             return
         self._shutting_down = True
         self._observer.close()
+        for screen in self.screen_stack:
+            for panel in screen.query(ApprovalPanel):
+                panel.action_cancel()
         pending = self._modal_future
         if pending is not None and not pending.done():
             pending.set_result(None)
@@ -231,6 +224,11 @@ class DaitaApp(App[int]):
             raise asyncio.CancelledError
         if self.size.height < 15:
             raise RuntimeError("terminal is too small to review this change")
+        if isinstance(self.screen, EffectsScreen):
+            decision = await self.screen.request_approval(request)
+            if decision is None:
+                raise asyncio.CancelledError
+            return decision
         screen = self.chat()
         if screen is None:
             raise RuntimeError("chat view is unavailable for approval review")
@@ -325,32 +323,13 @@ class DaitaApp(App[int]):
             f"Files: {workspace.root.name} ({workspace.sensitivity.value})"
         )
         if not sources:
-            source_status = "Run source: none connected (a source is optional)"
+            source_status = "Sources: none connected (sources are optional)"
         else:
-            active_source = await self.controller.active_source()
-            if len(sources) > 1 and active_source is None:
-                source_status = "Run source: Files only or choose with @"
-            else:
-                selected = active_source or next(iter(sources))
-                source_status = f"Run source: {selected.display_name}"
+            source_status = f"Sources: {len(sources)} admitted"
             if (await self.controller.catalog_summary()).is_empty:
                 setup_guidance.append("catalog has 0 resources · use /source edit")
         status = "  ·  ".join((workspace_status, source_status, *setup_guidance))
         chat.show_notice(status)
-
-    async def _pick_source(self) -> None:
-        sources = await self.controller.list_sources()
-        options = tuple(
-            PickerOption(source.id, source.display_name, source.adapter_id)
-            for source in sources
-            if source.active
-        )
-        selected = await self._await_modal(
-            SelectionScreen(title="Choose the active source", options=options)
-        )
-        if selected is None:
-            return
-        await self.controller.select_source(selected[0])
 
     async def _show_chat(self) -> None:
         self.invalidate_completion_cache()
@@ -362,6 +341,7 @@ class DaitaApp(App[int]):
 
     def _reset_background_status(self) -> None:
         self._active_job_count = 0
+        self._routine_count = 0
         self._inbox_item_count = 0
         self._autonomous_run_ids.clear()
         self._known_inbox_ids = None
@@ -381,6 +361,12 @@ class DaitaApp(App[int]):
         async with self._background_refresh_lock:
             jobs = None
             inbox = None
+            try:
+                self._routine_count = len(await self.controller.list_routines())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
             try:
                 jobs = await self.controller.list_jobs()
             except asyncio.CancelledError:
@@ -484,8 +470,11 @@ class DaitaApp(App[int]):
         return None
 
     async def _refresh_status(
-        self, *, running: bool = False, state: str = "ready"
+        self, *, running: bool | None = None, state: str = "ready"
     ) -> None:
+        if running is not None:
+            self._foreground_state = state if running else "ready"
+        running = self._foreground_state != "ready"
         screen = self.chat()
         if screen is None or self.controller.agent is None:
             return
@@ -498,12 +487,21 @@ class DaitaApp(App[int]):
             agent=self.controller.require_agent().name,
             model=self.controller.model_label(),
             source=await self.controller.source_summary(),
-            state=state if running else "ready",
+            state=(
+                "queued behind background"
+                if running and self._autonomous_run_ids
+                else (
+                    self._foreground_state
+                    if running
+                    else "background running" if self._autonomous_run_ids else "ready"
+                )
+            ),
             context_used=self._context_input_tokens,
             context_total=(
                 profile.context_window_tokens if profile is not None else None
             ),
             active_jobs=self._active_job_count,
+            saved_routines=self._routine_count,
             active_reports=len(self._autonomous_run_ids),
             inbox_items=self._inbox_item_count,
             too_small=too_small,
@@ -650,11 +648,6 @@ class DaitaApp(App[int]):
         payload: dict[str, Any],
         message: str = "",
     ) -> None:
-        if screen_name == "source_picker":
-            await self._pick_source()
-            await self._refresh_status()
-            await self._show_home_guidance()
-            return
         if screen_name == "source_setup":
             await self._await_modal(SourceSetupScreen())
             await self._refresh_status()
@@ -715,6 +708,17 @@ class DaitaApp(App[int]):
             await self._await_modal(RoutinesScreen())
             await self.refresh_background_status(notify_new=False)
             return
+        if screen_name == "effects":
+            await self._await_modal(
+                EffectsScreen(
+                    receipt_id=(
+                        str(payload["receipt_id"])
+                        if isinstance(payload.get("receipt_id"), str)
+                        else None
+                    )
+                )
+            )
+            return
         if screen_name == "inbox":
             await self._await_modal(InboxScreen())
             await self.refresh_background_status(notify_new=False)
@@ -736,13 +740,11 @@ class DaitaApp(App[int]):
                 for source_resources in resource_groups
                 for resource in source_resources
             )
-            current = await self.controller.active_source()
             await self._await_modal(
                 CatalogScreen(
                     summary=await self.controller.catalog_summary(),
                     sources=sources,
                     resources=resources,
-                    current_source_id=None if current is None else current.id,
                     notice=message,
                     notice_warning=bool(payload.get("catalog_notice_warning", False)),
                 )
@@ -1064,7 +1066,7 @@ class DaitaApp(App[int]):
             result = await agent.run(
                 message,
                 conversation_id=self.controller.conversation_id,
-                source_id=source_id,
+                source_scope_ids=(() if source_id is None else (source_id,)),
                 files_only=files_only,
             )
             await self._settle_result(result)
@@ -1073,6 +1075,7 @@ class DaitaApp(App[int]):
             if screen is not None:
                 screen.remove_block(self._partial_identity)
                 screen.clear_activity()
+                await self._replace_conversation_transcript()
                 screen.show_notice("Run cancelled.")
             raise
         except Exception as error:
@@ -1094,7 +1097,7 @@ class DaitaApp(App[int]):
             if chat is not None:
                 chat.clear_activity()
                 chat.set_submitting(False)
-            await self._refresh_status()
+            await self._refresh_status(running=False)
 
     def _on_run_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -1115,9 +1118,7 @@ class DaitaApp(App[int]):
             self._pending_user_identity = None
         self._partial_text = ""
         await self._replace_conversation_transcript()
-        if result.kind is not LoopExitKind.COMPLETED:
-            screen.show_notice(_run_failure_notice(result))
-        elif result.final_text:
+        if result.kind is LoopExitKind.COMPLETED and result.final_text:
             # Canonical assistant text is already in the transcript.
             pass
         for notice in await self.controller.artifact_notices(result):

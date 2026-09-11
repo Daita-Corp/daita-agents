@@ -84,8 +84,16 @@ async def test_fresh_agent_is_empty_and_public_writes_survive_reopen(tmp_path):
         assert reopened.home == home
         assert await reopened.read_memory() == memory
         assert await reopened.read_user_profile() == profile
-        assert (home / "MEMORY.md").read_bytes() == memory.encode("utf-8")
-        assert (home / "USER.md").read_bytes() == profile.encode("utf-8")
+        assert (
+            home / "MEMORY.md"
+        ).read_bytes() == b"<!-- daita-sensitivity: restricted -->\n" + memory.encode(
+            "utf-8"
+        )
+        assert (
+            home / "USER.md"
+        ).read_bytes() == b"<!-- daita-sensitivity: restricted -->\n" + profile.encode(
+            "utf-8"
+        )
     finally:
         await reopened.close()
 
@@ -250,7 +258,7 @@ async def test_failed_atomic_replacement_preserves_prior_valid_document(
         with pytest.raises(MemoryPathError, match="cannot replace"):
             await agent.set_memory("new content")
         assert (agent.home / "MEMORY.md").read_text(encoding="utf-8") == (
-            "prior valid content"
+            "<!-- daita-sensitivity: restricted -->\nprior valid content"
         )
         assert not tuple(agent.home.glob(".MEMORY.md.*.tmp"))
     finally:
@@ -394,13 +402,13 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
         assert tables == {
             "autonomous_followups",
             "deliveries",
-            "database_write_receipts",
+            "effect_receipts",
             "learning_candidates",
             "job_runs",
             "mcp_server_bindings",
             "messages",
             "metadata",
-            "postgresql_update_scopes",
+            "relational_write_scopes",
             "routine_occurrences",
             "runs",
             "semantic_annotations",

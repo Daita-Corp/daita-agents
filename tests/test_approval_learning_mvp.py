@@ -365,9 +365,9 @@ async def test_approval_executes_the_exact_frozen_invocation_once(
         tool_executions.append(request)
         return await original_execute(request)
 
-    async def counted(target, content):
+    async def counted(target, content, *, sensitivity):
         executions.append((target, content))
-        await original(target, content)
+        await original(target, content, sensitivity=sensitivity)
 
     monkeypatch.setattr(executor, "execute", capture_execution)
     monkeypatch.setattr(store, "replace_from_tool", counted)
@@ -648,10 +648,10 @@ async def test_read_groups_are_parallel_and_side_effects_are_ordered_barriers(
             actions.append(f"read-done:{name}")
             return value
 
-        async def controlled_replace(target, content):
+        async def controlled_replace(target, content, *, sensitivity):
             assert {"read-done:first", "read-done:second"} <= set(actions)
             actions.append("write-start")
-            await original_replace(target, content)
+            await original_replace(target, content, sensitivity=sensitivity)
             actions.append("write-done")
             write_done.set()
 
@@ -694,13 +694,13 @@ async def test_two_approved_replacements_are_sequential_and_keep_result_order(
     maximum_active = 0
     executions: list[str] = []
 
-    async def controlled(target, content):
+    async def controlled(target, content, *, sensitivity):
         nonlocal active, maximum_active
         active += 1
         maximum_active = max(maximum_active, active)
         executions.append(content)
         await asyncio.sleep(0)
-        await original(target, content)
+        await original(target, content, sensitivity=sensitivity)
         active -= 1
 
     monkeypatch.setattr(store, "replace_from_tool", controlled)
@@ -941,10 +941,22 @@ async def test_explicit_correction_is_one_approved_foreground_memory_write(tmp_p
         assert approvals[0].arguments["content"] == content
         assert len(provider.logical_requests) == 2
         assert content not in _system_text(provider.logical_requests[1])
+        first, second = provider.logical_requests
         assert (
-            provider.logical_requests[0].messages[0]
-            == provider.logical_requests[1].messages[0]
+            first.sensitivity_provenance["static_context_sha256"]
+            == second.sensitivity_provenance["static_context_sha256"]
         )
+        assert first.tools == second.tools
+        assert (
+            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(first)}."
+            in _system_text(first)
+        )
+        assert (
+            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(second)}."
+            in _system_text(second)
+        )
+        transcript = await agent.transcript(result.run_id)
+        assert second.messages[1:] == transcript.messages[:-1]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"target": "memory", "replaced": True}
@@ -992,10 +1004,22 @@ async def test_explicit_reusable_workflow_is_one_approved_foreground_skill(tmp_p
         assert "- monthly-revenue: Calculate monthly revenue consistently.\n" not in (
             _system_text(provider.logical_requests[1])
         )
+        first, second = provider.logical_requests
         assert (
-            provider.logical_requests[0].messages[0]
-            == provider.logical_requests[1].messages[0]
+            first.sensitivity_provenance["static_context_sha256"]
+            == second.sensitivity_provenance["static_context_sha256"]
         )
+        assert first.tools == second.tools
+        assert (
+            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(first)}."
+            in _system_text(first)
+        )
+        assert (
+            f"Remaining model requests including this one: {EAGER_LIMITS.max_steps - provider.requests.index(second)}."
+            in _system_text(second)
+        )
+        transcript = await agent.transcript(result.run_id)
+        assert second.messages[1:] == transcript.messages[:-1]
         tool_result = _tool_results(provider)[0]
         assert tool_result.output["data"] == FrozenJsonObject.from_mapping(
             {"name": "monthly-revenue", "changed": True}
@@ -1529,7 +1553,15 @@ async def test_approved_identical_save_reports_unchanged_without_replacement(tmp
             "description": "Same description.",
             "instructions": "Same instructions.",
         }
-        assert await agent.save_skill(**arguments) is True
+        assert (
+            await agent.save_skill(
+                arguments["name"],
+                arguments["description"],
+                arguments["instructions"],
+                sensitivity=ModelSensitivity.INTERNAL,
+            )
+            is True
+        )
         expected_sha256 = await _skill_digest(agent, "target")
         path = agent.home / "skills" / "target" / "SKILL.md"
         before = path.stat()
@@ -1648,12 +1680,14 @@ async def test_model_skill_write_uses_shared_lock_and_side_effect_barrier(
     original_delete = store.delete_from_tool
     actions: list[str] = []
 
-    async def observed_save(name, description, instructions):
+    async def observed_save(name, description, instructions, *, sensitivity):
         assert runtime._mutation_lock is agent._embedded._mutation_lock
         assert runtime._mutation_lock is store._mutation_lock
         assert runtime._mutation_lock.locked()
         actions.append("save")
-        return await original_save(name, description, instructions)
+        return await original_save(
+            name, description, instructions, sensitivity=sensitivity
+        )
 
     async def observed_delete(name):
         assert runtime._mutation_lock.locked()

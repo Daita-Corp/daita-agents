@@ -91,7 +91,8 @@ class WelcomeView(Static):
                     ),
                     Text(),
                     Text(
-                        "Ask about workspace files; a source is optional", style="bold"
+                        "Ask across connections or files; sources are optional",
+                        style="bold",
                     ),
                     Text(
                         "Type / for commands  ·  /files for workspace  ·  @ for sources",
@@ -160,7 +161,7 @@ class WelcomeView(Static):
             content.append("\nStarting your workspace…", style="dim")
         else:
             content.append(
-                "\nAsk about workspace files; a source is optional", style="bold"
+                "\nAsk across connections or files; sources are optional", style="bold"
             )
             content.append(
                 "\nType / for commands  ·  /files for workspace", style="dim"

@@ -16,6 +16,7 @@ from daita._json import FrozenJsonObject
 from daita.capabilities import (
     Capability,
     CapabilityInputError,
+    CapabilityRegistry,
     ToolExecution,
     ToolOutput,
     ToolView,
@@ -23,6 +24,34 @@ from daita.capabilities import (
 from daita.capability_runtime import CapabilityRuntime
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import LoopLimits, RunInput, ToolBatchOutcome
+
+
+@pytest.mark.parametrize("field", ["notification", "table", "document"])
+@pytest.mark.parametrize("unexpected", [False, True])
+def test_nested_argument_errors_retain_object_path(field, unexpected):
+    from dataclasses import replace
+
+    capability, view = _declaration()
+    nested = {
+        "type": "object",
+        "properties": {"target": {"type": "string"}},
+        "required": ["target"],
+        "additionalProperties": False,
+    }
+    capability = replace(
+        capability, input_schema={"type": "object", "properties": {field: nested}}
+    )
+    domain = StaticTestDomain((capability,), (view,))
+    registry = CapabilityRegistry(
+        declarations=(domain.declarations,), executors=(_CountingExecutor(),)
+    )
+    value = {"target": "chosen", "invented": "value"} if unexpected else {}
+    with pytest.raises(CapabilityInputError) as failure:
+        registry.validate_arguments(capability.id, {field: value})
+    assert failure.value.details["path"] == f"arguments.{field}"
+    assert failure.value.details["names"] == (
+        ("invented",) if unexpected else ("target",)
+    )
 
 
 class _CountingExecutor:

@@ -18,6 +18,7 @@ from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
     AutomationEligibility,
+    AutomationScopeProposal,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -46,6 +47,7 @@ from ...jobs.models import (
 from ...jobs.owner import JobError, JobOwner
 from ...llm.models import ModelSensitivity, ToolCall
 from ...loop.models import RunInput
+from ...scope import resolve_effective_source_scope
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .capabilities import SqlReadBackend, SqlReadResult
@@ -374,14 +376,16 @@ class StartDataProfileExecutor:
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         specification = await self._admission.build_specification(request.arguments)
-        source_id = request.arguments.get("_source_id")
         run = RunInput(
             id=request.run_id,
             agent_id=self._owner.agent_id,
             message="Start the exact admitted data profile job.",
             created_at=self._clock(),
             conversation_id=request.conversation_id,
-            source_id=source_id if isinstance(source_id, str) else None,
+            source_scope_ids=tuple(
+                sorted({item.source_id for item in specification.resource_bindings})
+            ),
+            resolved_source_scope=request.source_scope,
         )
         job = await self._owner.admit(
             run=run,
@@ -599,9 +603,15 @@ class DataProfileCapabilityDomain:
     async def project(self, run: RunInput) -> tuple[str, ...]:
         if run.id in self._files_only_run_ids:
             return ()
-        facts = await self._catalog.source_routing_facts(
-            run.agent_id,
-            (() if run.source_id is None else (run.source_id,)),
+        scope = await resolve_effective_source_scope(
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
+        )
+        facts = (
+            ()
+            if not scope.resource_ids
+            else await self._catalog.source_routing_facts(
+                run.agent_id, tuple(sorted(scope.source_ids))
+            )
         )
         if not facts:
             return ()
@@ -644,23 +654,37 @@ class DataProfileCapabilityDomain:
                 float(deadline_seconds),
                 MAX_JOB_WALL_TIME_SECONDS,
             )
-            if run.source_id is not None:
-                prepared["_source_id"] = run.source_id
             selected = self._selected_profiles.get(run.id)
             if selected is not None:
                 prepared["_connected_profile_id"] = selected
             specification = await self._admission.build_specification(prepared)
-            if run.source_id is not None and any(
-                item.source_id != run.source_id
+            scope = await resolve_effective_source_scope(
+                run, self._catalog, files_only=run.id in self._files_only_run_ids
+            )
+            if any(
+                item.source_id not in scope.source_ids
+                or item.resource_id not in scope.resource_ids
                 for item in specification.resource_bindings
             ):
                 raise CapabilityInputError(
                     "source_scope_violation",
-                    "This run can only profile resources from the selected source.",
+                    "This run can only profile resources in its effective scope.",
                 )
             return FrozenJsonObject.from_mapping(prepared)
         await self._admission.validate_internal(arguments)
         return arguments
+
+    async def prepare_automation_grant(
+        self,
+        capability: Capability,
+        constraints: FrozenJsonObject,
+        max_calls_per_occurrence: int,
+        proposal: AutomationScopeProposal,
+    ) -> FrozenJsonObject:
+        raise CapabilityInputError(
+            "automation_grant_unsupported",
+            "This domain does not admit unattended external effects.",
+        )
 
     async def side_effect_plan(
         self,

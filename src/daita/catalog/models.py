@@ -294,6 +294,7 @@ class TabularColumn:
     default_expression: str | None = None
     native_type_namespace: str | None = None
     native_type_name: str | None = None
+    collation: str | None = None
     identity: bool = False
     generated: bool = False
     updatable: bool = False
@@ -325,6 +326,7 @@ class TabularColumn:
             raise ValueError(
                 "column native type namespace and name must be provided together"
             )
+        _optional_text(self.collation, "column collation", maximum=256)
         for value, name in (
             (self.identity, "column identity"),
             (self.generated, "column generated"),
@@ -335,6 +337,7 @@ class TabularColumn:
 
     def to_payload(self) -> dict[str, object]:
         return {
+            "collation": self.collation,
             "default_expression": self.default_expression,
             "name": self.name,
             "native_type": self.native_type,
@@ -356,6 +359,7 @@ class TabularColumn:
             payload,
             frozenset(
                 {
+                    "collation",
                     "default_expression",
                     "generated",
                     "identity",
@@ -377,6 +381,7 @@ class TabularColumn:
             ordinal=cast(int, value["ordinal"]),
             nullable=cast(bool, value["nullable"]),
             primary_key_ordinal=cast(int | None, value["primary_key_ordinal"]),
+            collation=cast(str | None, value["collation"]),
             default_expression=cast(str | None, value["default_expression"]),
             native_type_namespace=cast(
                 str | None,
@@ -396,6 +401,7 @@ class TabularIndex:
     columns: tuple[str, ...]
     unique: bool
     predicate: str | None = None
+    write_conflict_supported: bool = False
 
     def __post_init__(self) -> None:
         _required_text(self.name, "index name", maximum=256)
@@ -406,6 +412,8 @@ class TabularIndex:
             maximum_items=64,
             allow_empty=False,
         )
+        if not isinstance(self.write_conflict_supported, bool):
+            raise TypeError("index write_conflict_supported must be boolean")
         if not isinstance(self.unique, bool):
             raise TypeError("index unique must be a boolean")
         _optional_text(self.predicate, "index predicate", maximum=4_096)
@@ -418,6 +426,7 @@ class TabularIndex:
             "name": self.name,
             "predicate": self.predicate,
             "unique": self.unique,
+            "write_conflict_supported": self.write_conflict_supported,
         }
 
     @classmethod
@@ -426,7 +435,16 @@ class TabularIndex:
 
         value = _exact_payload_fields(
             payload,
-            frozenset({"columns", "kind", "name", "predicate", "unique"}),
+            frozenset(
+                {
+                    "columns",
+                    "kind",
+                    "name",
+                    "predicate",
+                    "unique",
+                    "write_conflict_supported",
+                }
+            ),
             "tabular index payload",
         )
         raw_columns = value["columns"]
@@ -437,6 +455,7 @@ class TabularIndex:
             kind=cast(str, value["kind"]),
             columns=cast(tuple[str, ...], raw_columns),
             unique=cast(bool, value["unique"]),
+            write_conflict_supported=cast(bool, value["write_conflict_supported"]),
             predicate=cast(str | None, value["predicate"]),
         )
 
@@ -1260,9 +1279,13 @@ class CatalogSearchRequest:
     source_ids: tuple[str, ...] = ()
     resource_kinds: tuple[ResourceKind, ...] = ()
     limit: int = CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT
+    cursor: str | None = None
+    run_id: str | None = None
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "catalog search agent_id")
+        _optional_text(self.cursor, "catalog search cursor", maximum=80)
+        _optional_text(self.run_id, "catalog search run_id", maximum=256)
         if not isinstance(self.query, str):
             raise TypeError("catalog search query must be a string")
         if not self.query.strip():
@@ -1347,6 +1370,9 @@ class CatalogSearchResult:
     total_matches: int
     returned_count: int
     truncated: bool
+    total_candidates: int
+    position: int = 0
+    next_cursor: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.request, CatalogSearchRequest):
@@ -1356,16 +1382,29 @@ class CatalogSearchResult:
         hits = _record_tuple(self.hits, CatalogSearchHit, "catalog search hits")
         _non_negative_int(self.total_matches, "catalog search total_matches")
         _non_negative_int(self.returned_count, "catalog search returned_count")
+        _non_negative_int(self.total_candidates, "catalog search total_candidates")
+        _non_negative_int(self.position, "catalog search position")
+        _optional_text(self.next_cursor, "catalog search next cursor", maximum=80)
         if not isinstance(self.truncated, bool):
             raise TypeError("catalog search truncated must be a boolean")
         if len(hits) > self.request.limit:
             raise ValueError("catalog search result exceeds request limit")
-        if self.total_matches < len(hits):
-            raise ValueError("catalog search total_matches cannot be below hit count")
+        if self.total_candidates < max(self.total_matches, self.position + len(hits)):
+            raise ValueError(
+                "catalog candidate count cannot be below matches or page bounds"
+            )
         if self.returned_count != len(hits):
             raise ValueError("catalog search returned_count disagrees with hit count")
-        if self.truncated != (self.total_matches > self.returned_count):
-            raise ValueError("catalog search truncated disagrees with total_matches")
+        if self.truncated != (
+            self.total_candidates > self.position + self.returned_count
+        ):
+            raise ValueError(
+                "catalog search truncated disagrees with remaining candidates"
+            )
+        if self.truncated != (self.next_cursor is not None):
+            raise ValueError(
+                "catalog search continuation must cover remaining candidates"
+            )
         resource_ids = [hit.resource_id for hit in hits]
         if len(resource_ids) != len(set(resource_ids)):
             raise ValueError("catalog search hits cannot repeat a resource")

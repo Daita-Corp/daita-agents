@@ -11,7 +11,12 @@ from enum import Enum
 from hashlib import sha256
 
 from ._json import FrozenJsonObject, canonical_json
-from .capabilities import AccessMode, ExecutionScope, OperationalEffect
+from .capabilities import (
+    AccessMode,
+    ExecutionContractBindings,
+    ExecutionScope,
+    OperationalEffect,
+)
 from .distribution.models import (
     CONVERSATION_INBOX_DESTINATION_REVISION,
     ConversationInboxTarget,
@@ -449,9 +454,11 @@ class AutonomousFollowup:
             ):
                 raise ValueError(f"{token_name} must be non-negative")
         if (
-            self.charged_cost_usd + self.reserved_cost_usd
+            self.reserved_cost_usd
+            and self.charged_cost_usd + self.reserved_cost_usd
             > self.grant.cumulative_max_cost_usd
-            or self.charged_tokens + self.reserved_tokens
+            or self.reserved_tokens
+            and self.charged_tokens + self.reserved_tokens
             > self.grant.cumulative_max_tokens
         ):
             raise ValueError("follow-up budget exceeds its cumulative ceiling")
@@ -676,6 +683,7 @@ def create_terminal_job_followup(
     allowed_capability_ids: tuple[str, ...],
     eligible_model_routes: tuple[str, ...],
     limits: LoopLimits,
+    contract_bindings: ExecutionContractBindings,
 ) -> AutonomousFollowup:
     """Create the sole code-authored follow-up grant for a terminal Daita job."""
 
@@ -756,6 +764,7 @@ def create_terminal_job_followup(
         expires_at=expires_at,
     )
     scope = ExecutionScope(
+        contract_bindings=contract_bindings,
         scope_id=scope_id,
         revision=1,
         agent_id=job.agent_id,

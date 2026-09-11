@@ -289,6 +289,7 @@ async def test_mcp_result_can_feed_tabular_and_document_artifacts_with_inherited
     )
     status = await agent.attach_mcp_server(
         endpoint=alpha.endpoint,
+        maximum_outbound_sensitivity=ModelSensitivity.CONFIDENTIAL,
         selections=(
             MCPToolSelection(
                 remote_name="lookup",

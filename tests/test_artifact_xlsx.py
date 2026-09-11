@@ -605,7 +605,7 @@ async def test_sqlite_public_xlsx_creation_delivery_restart_and_redelivery(
         assert secret.encode() not in (agent.home / "state.db").read_bytes()
         first_request = "\n".join(
             block.text
-            for message in provider.requests[0].messages
+            for message in provider.logical_requests[0].messages
             for block in message.content
             if isinstance(block, TextBlock)
         )

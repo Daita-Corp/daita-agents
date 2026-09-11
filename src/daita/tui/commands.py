@@ -19,10 +19,9 @@ SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
 SLASH_COMMAND_COMPLETIONS = (
     ("/model", "/model", "Choose or validate the active model"),
     ("/sources", "/sources", "List registered data sources"),
-    ("/source", "/source", "Choose the active query source"),
-    ("/source use ", "/source use <name>", "Use a source for new conversations"),
+    ("/source", "/source", "Browse admitted sources"),
     ("/source add", "/source add", "Add a data source"),
-    ("/source edit", "/source edit", "Edit the active source connection"),
+    ("/source edit", "/source edit", "Edit an admitted source connection"),
     ("/source refresh ", "/source refresh <id>", "Refresh a source catalog"),
     (
         "/source detach ",
@@ -32,18 +31,24 @@ SLASH_COMMAND_COMPLETIONS = (
     (
         "/source permissions",
         "/source permissions",
-        "Configure read and PostgreSQL update access",
+        "Configure read and PostgreSQL update/upsert access",
     ),
     ("/jobs", "/jobs", "Manage durable jobs"),
     ("/jobs inspect ", "/jobs inspect <id>", "Inspect one durable job"),
     ("/jobs results ", "/jobs results <id>", "Read one completed job result"),
     ("/jobs cancel ", "/jobs cancel <id>", "Cancel one queued or running job"),
+    ("/effects", "/effects", "Inspect action receipts and record human recovery"),
+    (
+        "/effects inspect ",
+        "/effects inspect <receipt-id>",
+        "Review exact action evidence and recovery",
+    ),
     ("/inbox", "/inbox", "Inspect and acknowledge completed background reports"),
-    ("/routines", "/routines", "Inspect and control scheduled read routines"),
+    ("/routines", "/routines", "Inspect and control saved assignments"),
     (
         "/routines create ",
         "/routines create <self-contained instruction>",
-        "Propose and approve a scheduled read routine",
+        "Propose and approve a saved assignment",
     ),
     (
         "/routines promote ",
@@ -55,7 +60,7 @@ SLASH_COMMAND_COMPLETIONS = (
         "/routines update <routine-id> <instruction>",
         "Revise one scheduled routine through exact inspection and approval",
     ),
-    ("/mcp", "/mcp", "Manage remote MCP read tools"),
+    ("/mcp", "/mcp", "Manage admitted remote MCP tools and actions"),
     ("/mcp add", "/mcp add", "Guided MCP server setup"),
     ("/mcp inspect ", "/mcp inspect <endpoint>", "Inspect one no-auth endpoint"),
     (
@@ -109,7 +114,10 @@ BUILTIN_SLASH_COMMAND_ROOTS = frozenset(
 BUILTIN_SLASH_COMMANDS = BUILTIN_SLASH_COMMAND_ROOTS
 HELP_TEXT = (
     "Type / to browse commands and their descriptions.\n"
-    'Use @"source name" <question> to ask another source directly.\n'
+    "Ask across admitted connections without selecting a source.\n"
+    'Use @"source name" <question> to narrow one request.\n'
+    "Saved assignments: /routines · action evidence/recovery: /effects · results: /inbox\n"
+    "Execution requires an open host; stop this TUI before starting daita host --agent <name>.\n"
     "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit\n"
     "Wheel or Page Up/Page Down review · Ctrl-Home start · Ctrl-End latest\n"
     "Ctrl-O show/hide tool results · Ctrl-C copy selection or cancel the run\n"

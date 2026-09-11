@@ -1,9 +1,9 @@
-# Remote MCP read connectivity
+# Remote MCP tools and external actions
 
 Daita can admit independently configured remote Model Context Protocol (MCP)
-servers as read-only tools in the existing direct model/tool loop. The feature
+servers as locally admitted reads or external actions in the existing direct model/tool loop. The feature
 is deliberately narrow and server neutral: a binding records one exact HTTPS
-endpoint, one negotiated server identity, an explicit read-tool allowlist, and
+endpoint, one negotiated server identity, explicit local tool permissions, and
 canonical schema digests. A server's names, descriptions, annotations, and
 results are untrusted data and never create authorization.
 
@@ -44,7 +44,8 @@ results are untrusted data and never create authorization.
 
 Stdio, OAuth, dynamic client registration, sampling, roots, prompts,
 resources, subscriptions, server-initiated requests, binary content, arbitrary
-schema dialects, and remote writes are not supported. There is no automatic
+schema dialects, shell/infrastructure/arbitrary execution and asynchronous
+completion are not supported. There is no automatic
 server or tool discovery at model request time and no server-specific default.
 
 ## Inspect and attach
@@ -65,10 +66,11 @@ for tool in inspection.tools:
     print(tool.remote_name, tool.supported, tool.unsupported_reason)
 ```
 
-Attach only exact tools that an operator has independently established are
-read only. The local server label, alias, description, summary, use guidance,
-keywords, exposure, and priority are trusted admission data; a remote server
-name or description is not copied into the trusted search corpus.
+Attach only exact tools whose access, effects and completion behavior an operator
+has independently verified. Ordinary selections default to read access with no
+operational effect. Local labels and discovery hints remain untrusted presentation;
+they never change execution authority. Remote annotations cannot establish
+read-only behavior, action permission or replay safety.
 
 ```python
 status = await agent.attach_mcp_server(
@@ -136,10 +138,11 @@ Choose **Add server** (or run `/mcp add`) for the guided no-auth path:
 
 1. enter and inspect one Streamable HTTP endpoint;
 2. review supported and unsupported tools with exact schema-rejection reasons;
-3. multi-select only tools independently verified to be read only;
-4. review Daita-generated provider-safe aliases, code-owned descriptions, and
-   the default `internal` result sensitivity;
-5. confirm the read-only attestation; and
+3. select exact tools; default selections admit reads only;
+4. use **Configure selected tool permissions** to review each alias, description,
+   access mode, operational effect, unattended eligibility, result/outbound
+   sensitivity and known completion semantics; choose the server outbound ceiling;
+5. confirm those exact local permissions; and
 6. optionally perform a controlled agent-runtime restart to activate the new
    immutable registry.
 
@@ -150,8 +153,9 @@ the operator to copy a binding ID. `/mcp status`, `/mcp inspect`, `/mcp attach`,
 `/mcp refresh`, and `/mcp revoke` remain available as power-user commands.
 If activation was deferred, the manager exposes **Restart now** while any
 current binding revision is absent from the open runtime.
-Use the CLI or Python API when a bearer-secret reference or non-default
-sensitivity is needed.
+Use the CLI or Python API for bearer-secret references. The CLI `--tool` and
+text `/mcp attach` commands retain explicit read-only admission. Action admission
+is available through the Python API and the guided TUI permission controls.
 
 Inspection and attachment report the bounded code-owned reason when a schema
 is unsupported, such as an unsupported dialect or `$ref`; a generic rejection
@@ -185,3 +189,117 @@ binding and revision, exact remote tool identity, schema digests, call
 identity, observation time, and sensitivity classification. The shared
 capability-runtime result bound applies to successes and to every typed or
 unexpected error before anything is appended to the transcript.
+
+## Explicit external actions
+
+An action has separately admitted data access and operational effects. For example,
+a notification uses `AccessMode.NONE` with `OperationalEffect.EXTERNAL_ACTION`.
+Remote data mutations use `AccessMode.WRITE` and `OperationalEffect.MUTATE_DATA`.
+Only these effect families are supported; calling an arbitrary execution tool an
+external action does not make it supported.
+
+```python
+from daita import MCPToolSelection
+from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
+from daita.llm.models import ModelSensitivity
+
+selection = MCPToolSelection(
+    remote_name="notify",
+    local_alias="notify",
+    description="Send a notification through the reviewed service.",
+    access_mode=AccessMode.NONE,
+    operational_effect=OperationalEffect.EXTERNAL_ACTION,
+    automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+    result_sensitivity=ModelSensitivity.INTERNAL,
+    maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
+)
+status = await agent.attach_mcp_server(
+    endpoint="https://mcp.example.com/mcp",
+    selections=(selection,),
+    maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
+)
+```
+
+Action selections default to `INTERACTIVE_ONLY` when eligibility is omitted.
+Setting `AUTOMATION_DIRECT` permits a routine proposal; it grants no standing
+authority by itself. Each foreground invocation still requires exact per-call
+approval through the ordinary runtime. The public typed admission API is a local
+operator control and must not be delegated to model-written content.
+
+Both tool and binding outbound ceilings apply to the **full model request
+classification**, including retained history, research and connector metadata.
+A restricted request cannot call an internal-only action. Adjust local admission
+only when the actual service may receive that classification.
+
+Every action uses the same `mcp.tool_call` grant constraints:
+
+```python
+constraints = {
+    "binding_id": status.binding.binding_id,
+    "binding_revision": status.binding.revision,
+    "remote_tool_name": "notify",
+    "fixed_arguments": {"destination": "reviewed-room"},
+    "variable_argument_names": ["content"],
+}
+```
+
+The enclosing `RequestedCapabilityGrant` supplies the exact capability ID and
+`max_calls_per_occurrence` (1–256, further bounded by the run). The constraints
+kind is `mcp.tool_call`; it is assigned by the domain policy, not sent to the server.
+Approval shows the fixed values and variable names. Every fixed value must be
+present and match exactly; extra names are rejected. The complete call must pass
+the admitted input schema. This release permits only declared scalar variables
+(string, integer, number or boolean). Fix an entire nested object or array to
+restrict recipients or targets inside it. Variable arbitrary JSON cannot enforce
+nested restrictions. Credentials belong in binding-owned secret references, never
+in grants or tool arguments.
+
+## Invocation evidence and uncertainty
+
+Preflight reloads current admission and checks identity, schemas, arguments and
+authority without invoking the action. The runtime rechecks after approval and
+atomically reserves an effect receipt and call allowance before dispatch. The
+existing executor sends exactly one `tools/call`. Canonically equivalent arguments
+within the same run/occurrence cannot dispatch again, even with a new model call ID.
+Reservations remain consumed after failures. Advertised idempotency never enables
+replay, connector substitution or a second attempt to obtain a cleaner response.
+
+A valid normal response, including plain text with **no output schema**, establishes
+`SUCCEEDED / SERVER_REPORTED`: successful invocation only. It does not verify a
+downstream business result. Text such as “success” has no special evidentiary meaning.
+When an output schema is admitted, structured results must satisfy it. All ordinary
+content, provenance, sensitivity and result-size checks precede success finalization.
+The shared receipt kind `mcp.tool_call` records bounded identity/revision, argument
+fingerprints and response/error classification; it omits credentials and private
+argument/result bodies.
+
+Lost responses, `isError=true` (which may follow partial application), malformed or
+oversized output, timeout and cancellation after possible dispatch yield uncertainty.
+Positive local non-dispatch can establish `NOT_APPLIED / LOCAL_NOT_DISPATCHED`.
+Missing/invalid observations use runtime uncertainty. Failed receipt persistence
+leaves a blocking reservation; reopening recovers it as uncertain.
+
+Tools known to require asynchronous completion cannot enter an unattended proposal.
+`MCPCompletionSemantics.ASYNCHRONOUS_ONLY` records a locally known limitation and
+cannot execute through this release. Protocol `execution.taskSupport="required"`
+also prevents direct execution; optional task support uses ordinary direct calls.
+An unexpected protocol `CreateTaskResult` becomes uncertain server-reported
+acceptance with a bounded task handle. Daita never polls or retrieves task results.
+These distinctions follow the [MCP task protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks).
+
+Required actions need authenticated successful receipts and validated tool results.
+MCP invocation evidence cannot satisfy an `ADAPTER_VERIFIED` requirement. Optional
+no-action paths are explicit; uncertainty still prevents successful completion.
+Research and valid partial artifacts remain available when a required action fails.
+
+Unresolved effects block potentially duplicating work across restart, future slots,
+run-now, resume, changed arguments, revision and new effectful clones. Exact human
+recovery records a receipt-linked decision without invoking anything. See
+[effect receipts and recovery](EFFECT_RECEIPTS.md) and
+[scheduled assignments](SCHEDULED_ROUTINES.md). This implementation and its
+deterministic fake-I/O acceptance are not production release approval.
+
+The [offline assignment and recovery walkthrough](../examples/03_offline_assignments_and_recovery.py)
+uses the production MCP client with an in-memory HTTP transport. It demonstrates
+research, artifacts, a fixed-destination standing action, response loss and human
+recovery without a live service. Live model and service validation remains opt-in.

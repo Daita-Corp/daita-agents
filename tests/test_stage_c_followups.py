@@ -43,10 +43,11 @@ from daita.autonomy import (
     create_terminal_job_followup,
     terminal_job_event_payload,
 )
-from daita.capabilities import AccessMode, OperationalEffect
+from daita.capabilities import AccessMode, ExecutionContractBindings, OperationalEffect
 from daita.distribution.models import MAX_OUTCOME_CONCLUSION_PREVIEW_BYTES
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
-from daita.jobs.models import MAX_JOB_RESOURCE_BINDINGS
+from daita.hosting.embedded import _model_execution_contracts
+from daita.jobs.models import MAX_JOB_RESOURCE_BINDINGS, JobRun
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import (
     FinishReason,
@@ -254,8 +255,32 @@ async def _delivery_job_id(agent: Agent, delivery: InboxView) -> str:
     )
 
 
+def _followup_contracts(
+    agent: Agent,
+    job: JobRun,
+    capability_ids: tuple[str, ...],
+) -> ExecutionContractBindings:
+    embedded = agent._embedded
+    return ExecutionContractBindings(
+        capability_contracts={
+            key: embedded._capabilities.contract_digest(key) for key in capability_ids
+        },
+        resource_revisions={
+            item.resource_id: item.resource_revision
+            for item in job.specification.resource_bindings
+        },
+        model_routes=_model_execution_contracts(
+            MockModelProvider((), complete_pricing=True),
+            embedded.model_profile,
+            embedded.model_route,
+        ),
+    )
+
+
+@pytest.mark.parametrize("accounting", ["complete", "overrun", "unknown"])
 async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
     tmp_path: Path,
+    accounting: str,
 ) -> None:
     database = tmp_path / "source.sqlite"
     _database(database)
@@ -277,6 +302,25 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
         id_factory=ids,
         workspace=workspace_for(tmp_path),
     )
+    conclusion = _stop("The durable profile completed and its result is available.")
+    if accounting == "overrun":
+        conclusion = replace(
+            conclusion,
+            usage=ModelUsage(
+                input_tokens=20_000,
+                cost_estimate=CostEstimate.complete(Decimal("0.08")),
+            ),
+        )
+    elif accounting == "unknown":
+        conclusion = replace(
+            conclusion,
+            usage=ModelUsage(
+                input_tokens=100,
+                cost_estimate=CostEstimate.partial(
+                    Decimal("0.002"), code="unpriced_attempt"
+                ),
+            ),
+        )
     provider.replace_script(
         (
             _start_profile(resource.id),
@@ -285,7 +329,7 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
                 "job-stage-c-1",
                 resource_id_for_disallowed_calls=resource.id,
             ),
-            _stop("The durable profile completed and its result is available."),
+            conclusion,
         )
     )
     try:
@@ -298,9 +342,20 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
         delivery = items[0]
         assert delivery.state is DeliveryState.AVAILABLE
         assert await _delivery_job_id(agent, delivery) == job_id
-        assert delivery.conclusion_preview == (
-            "The durable profile completed and its result is available."
-        )
+        if accounting == "complete":
+            assert delivery.conclusion_preview == conclusion.text
+        else:
+            assert delivery.failure_code is not None
+            assert delivery.failure_code.startswith("followup_run_")
+        followup = (await agent._embedded._store.list_autonomous_followups(agent.id))[0]
+        if accounting == "overrun":
+            assert followup.charged_tokens == 20_000 + USAGE.total_tokens
+            assert followup.charged_cost_usd == Decimal("0.081")
+        elif accounting == "unknown":
+            assert followup.charged_tokens == followup.grant.per_run_max_tokens
+            assert followup.charged_cost_usd == followup.grant.per_run_max_cost_usd
+        assert followup.reserved_tokens == 0
+        assert followup.reserved_cost_usd == 0
         assert delivery.conclusion_preview_truncated is False
         followup_run_id = delivery.resulting_run_id
         assert followup_run_id is not None
@@ -323,7 +378,7 @@ async def test_terminal_daita_job_runs_one_scoped_machine_followup_and_inbox(
                 "job_cancel",
                 "memory_set",
                 "skill_create",
-                "postgresql_update",
+                "relational_update",
             }
             for tool in provider.logical_requests[2].tools
         )
@@ -385,7 +440,7 @@ async def test_failed_terminal_job_delivers_grounded_no_result_report(
 
     monkeypatch.setattr(executor, "execute", fail_execution)
     try:
-        await agent.run("profile and fail", source_id=source.id)
+        await agent.run("profile and fail", source_scope_ids=(source.id,))
         job_id = _job_id(seed)
         terminal = await _terminal(agent, job_id)
         assert terminal.summary.status is JobStatus.FAILED
@@ -465,7 +520,7 @@ async def test_injected_router_fallback_is_scoped_sticky_and_delivers_once(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile before fallback", source_id=source.id)
+        await agent.run("profile before fallback", source_scope_ids=(source.id,))
         job_id = _job_id(seed)
         terminal = await _terminal(agent, job_id)
         assert terminal.summary.status is JobStatus.SUCCEEDED
@@ -505,7 +560,9 @@ async def test_injected_router_fallback_is_scoped_sticky_and_delivers_once(
                 allowed_sensitivities=frozenset(ModelSensitivity),
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
+        ),
     )
     agent = await Agent.open(
         "stage-c-router-fallback",
@@ -576,6 +633,9 @@ async def test_store_deduplicates_exact_event_and_rejects_conflicts(
     try:
         followup = create_terminal_job_followup(
             job,
+            contract_bindings=_followup_contracts(
+                agent, job, ("jobs.inspect", "jobs.read_results")
+            ),
             followup_id="followup-one",
             grant_id="grant-one",
             scope_id="scope-one",
@@ -835,6 +895,9 @@ async def test_host_loss_before_run_creation_recovers_stale_claim(
     try:
         followup = create_terminal_job_followup(
             job,
+            contract_bindings=_followup_contracts(
+                agent, job, ("jobs.inspect", "jobs.read_results")
+            ),
             followup_id="followup-host-loss",
             grant_id="grant-host-loss",
             scope_id="scope-host-loss",
@@ -1211,6 +1274,7 @@ async def test_delivery_is_blocked_when_destination_sensitivity_is_too_low(
     try:
         followup = create_terminal_job_followup(
             job,
+            contract_bindings=_followup_contracts(agent, job, ALLOWED_CAPABILITIES),
             followup_id="followup-sensitive",
             grant_id="grant-sensitive",
             scope_id="scope-sensitive",
@@ -1393,7 +1457,7 @@ async def test_cleared_origin_conversation_does_not_revoke_followup(
         await agent.close()
 
 
-async def test_followup_history_excludes_other_conversation_sources(
+async def test_followup_is_self_contained_with_only_its_classified_source_advice(
     tmp_path: Path,
 ) -> None:
     first_database = tmp_path / "first.sqlite"
@@ -1432,7 +1496,7 @@ async def test_followup_history_excludes_other_conversation_sources(
     try:
         first_result = await agent.run(
             "remember the other source",
-            source_id=second.id,
+            source_scope_ids=(second.id,),
         )
         created_at = (await agent.transcript(first_result.run_id)).run.created_at
         for annotation_id, source_id, resource, statement in (
@@ -1477,12 +1541,13 @@ async def test_followup_history_excludes_other_conversation_sources(
                     created_at=created_at,
                     confirmed_at=created_at,
                     confirmed_by="local-user",
+                    sensitivity=ModelSensitivity.INTERNAL,
                 ),
             )
         await agent.run(
             "profile the first source",
             conversation_id=first_result.conversation_id,
-            source_id=first.id,
+            source_scope_ids=(first.id,),
         )
         job_id = _job_id_from_request(provider, 2)
         await _terminal(agent, job_id)
@@ -1583,6 +1648,9 @@ async def test_terminal_event_uses_bounded_result_preview_and_exact_digest(
         assert maximum_bindings[0].source_id not in canonical_json(maximum_payload)
         create_terminal_job_followup(
             maximum_job,
+            contract_bindings=_followup_contracts(
+                agent, maximum_job, ("jobs.inspect", "jobs.read_results")
+            ),
             followup_id="followup-maximum-event",
             grant_id="grant-maximum-event",
             scope_id="scope-maximum-event",
@@ -1593,6 +1661,9 @@ async def test_terminal_event_uses_bounded_result_preview_and_exact_digest(
         )
         followup = create_terminal_job_followup(
             job,
+            contract_bindings=_followup_contracts(
+                agent, job, ("jobs.inspect", "jobs.read_results")
+            ),
             followup_id="followup-expiring-bind",
             grant_id="grant-expiring-bind",
             scope_id="scope-expiring-bind",

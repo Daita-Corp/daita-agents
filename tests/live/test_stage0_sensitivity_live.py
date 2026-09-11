@@ -85,7 +85,7 @@ class _RecordingProvider:
             async for event in events:
                 yield event
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 
@@ -121,7 +121,9 @@ def _route(
                 allowed_sensitivities=allowed_sensitivities,
             ),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=1, backoff_seconds=0
+        ),
     )
 
 
@@ -193,7 +195,7 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
             eligible_exit = await eligible.run(
                 "This is a live routing check. Reply with exactly LIVE_STAGE0_OK. "
                 "Do not call tools and do not inspect the attached data.",
-                source_id=source.id,
+                source_scope_ids=(source.id,),
             )
         finally:
             await eligible.close()
@@ -231,7 +233,7 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
             )
             blocked_exit = await ineligible.run(
                 "Reply with LIVE_STAGE0_MUST_NOT_REACH_PROVIDER.",
-                source_id=blocked_source.id,
+                source_scope_ids=(blocked_source.id,),
             )
         finally:
             await ineligible.close()

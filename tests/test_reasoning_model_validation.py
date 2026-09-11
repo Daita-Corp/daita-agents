@@ -54,7 +54,7 @@ async def test_model_validation_reserves_output_for_reasoning(
     )
     route = ModelRoute(
         (ModelRouteCandidate(provider_id=profile.id, profile=profile),),
-        RetryPolicy(attempts=1),
+        RetryPolicy(max_attempts_per_candidate=1, max_total_attempts=1),
     )
     provider = MockModelProvider(
         (
@@ -175,3 +175,86 @@ def test_compatible_reasoning_only_incomplete_response_is_an_output_limit():
         provider._decode_response(response)
 
     assert caught.value.code is ProviderErrorCode.OUTPUT_LIMIT
+
+
+@pytest.mark.parametrize("injected", [True, False])
+@pytest.mark.parametrize("fails", [False, True])
+async def test_validation_keeps_original_deadline_and_one_attempt(
+    monkeypatch, injected, fails
+):
+    import asyncio
+
+    from daita.llm.errors import before_generation
+    from daita.llm.models import ModelCallPolicy
+    from daita.llm.routing import ModelRouter
+
+    policy = ModelCallPolicy(
+        max_request_seconds=2,
+        max_attempt_seconds=1,
+        first_progress_timeout_seconds=1,
+        progress_idle_timeout_seconds=1,
+    )
+    profile = ModelProfile(
+        id="openai:validation-test",
+        context_window_tokens=4096,
+        max_output_tokens=128,
+        supports_tools=True,
+    )
+    route = ModelRoute((ModelRouteCandidate(provider_id=profile.id, profile=profile),))
+    response = ModelResponse(
+        finish_reason=FinishReason.TOOL_CALLS,
+        tool_calls=(
+            ToolCall(id="validation", name="daita_validate_tool_support", arguments={}),
+        ),
+    )
+    failure = before_generation(
+        ModelProviderError(ProviderErrorCode.PROVIDER_UNAVAILABLE),
+        code="test_transient_setup",
+    )
+    provider = MockModelProvider(
+        [failure if fails else response, response], provider_id=profile.id
+    )
+    monkeypatch.setattr(
+        "daita.llm.factory.create_llm_provider", lambda *a, **kw: provider
+    )
+    original = embedded._require_validated_model_provider
+    observed = {}
+
+    async def delayed_validation(model, *, call_policy, deadline):
+        observed["deadline"] = deadline
+        assert isinstance(model, ModelRouter)
+        assert model.retry_policy.max_attempts_per_candidate == 1
+        assert model.retry_policy.max_total_attempts == 1
+        await asyncio.sleep(0.02)
+        await original(model, call_policy=call_policy, deadline=deadline)
+
+    monkeypatch.setattr(
+        embedded, "_require_validated_model_provider", delayed_validation
+    )
+    start = asyncio.get_running_loop().time()
+    try:
+        if fails:
+            with pytest.raises(ModelProviderError) as caught:
+                await embedded._validate_model_route(
+                    route,
+                    secret_provider=EmptySecretProvider(),
+                    injected_provider=provider if injected else None,
+                    call_policy=policy,
+                )
+            assert caught.value.code is ProviderErrorCode.PROVIDER_UNAVAILABLE
+        else:
+            await embedded._validate_model_route(
+                route,
+                secret_provider=EmptySecretProvider(),
+                injected_provider=provider if injected else None,
+                call_policy=policy,
+            )
+        assert len(provider.requests) == 1
+        request = provider.requests[0]
+        assert request.deadline is not None and request.attempt_deadline is not None
+        assert request.call_policy == policy
+        assert request.deadline == observed["deadline"]
+        assert request.deadline >= start + policy.max_request_seconds
+        assert request.attempt_deadline <= request.deadline
+    finally:
+        await provider.close()

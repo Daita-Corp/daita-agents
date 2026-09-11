@@ -59,8 +59,14 @@ RECEIPT_TABLE = (
     ("id", "TEXT", 1, None, 2),
     ("run_id", "TEXT", 1, None, 0),
     ("call_id", "TEXT", 1, None, 0),
+    ("operation_key", "TEXT", 1, None, 0),
+    ("routine_id", "TEXT", 0, None, 0),
+    ("occurrence_id", "TEXT", 0, None, 0),
+    ("grant_digest", "TEXT", 0, None, 0),
+    ("unresolved", "INTEGER", 1, None, 0),
     ("data", "TEXT", 1, None, 0),
 )
+
 JOURNAL_TABLE = (
     ("ordinal", "INTEGER", 1, None, 0),
     ("migration_id", "TEXT", 1, None, 1),
@@ -71,7 +77,7 @@ READ_SCOPE_TABLE = (
     ("source_id", "TEXT", 1, None, 2),
     ("data", "TEXT", 1, None, 0),
 )
-UPDATE_SCOPE_TABLE = (
+RELATIONAL_WRITE_SCOPE_TABLE = (
     ("agent_id", "TEXT", 1, None, 1),
     ("source_id", "TEXT", 1, None, 2),
     ("resource_id", "TEXT", 1, None, 3),
@@ -130,10 +136,10 @@ ROUTINE_OCCURRENCE_TABLE = (
 
 CURRENT_TABLES = {
     **CORE_TABLES,
-    "database_write_receipts": RECEIPT_TABLE,
+    "effect_receipts": RECEIPT_TABLE,
     "state_migrations": JOURNAL_TABLE,
     "source_read_scopes": READ_SCOPE_TABLE,
-    "postgresql_update_scopes": UPDATE_SCOPE_TABLE,
+    "relational_write_scopes": RELATIONAL_WRITE_SCOPE_TABLE,
     "mcp_server_bindings": MCP_BINDING_TABLE,
     "job_runs": JOB_RUN_TABLE,
     "autonomous_followups": AUTONOMOUS_FOLLOWUP_TABLE,
@@ -166,6 +172,16 @@ ROUTINE_OCCURRENCE_FOREIGN_KEYS = (
     ),
 )
 NAMED_INDEXES = {
+    "effect_receipts_unresolved": (
+        "effect_receipts",
+        False,
+        ("agent_id", "unresolved", "routine_id", "run_id"),
+    ),
+    "effect_receipts_grant_reservations": (
+        "effect_receipts",
+        False,
+        ("agent_id", "occurrence_id", "grant_digest"),
+    ),
     "runs_conversation_turn": (
         "runs",
         True,
@@ -188,7 +204,9 @@ NAMED_INDEXES = {
     ),
 }
 UNIQUE_CONSTRAINTS = {
-    "database_write_receipts": frozenset({("agent_id", "run_id", "call_id")}),
+    "effect_receipts": frozenset(
+        {("agent_id", "run_id", "call_id"), ("agent_id", "operation_key")}
+    ),
     "state_migrations": frozenset({("ordinal",)}),
     "autonomous_followups": frozenset(
         {("agent_id", "event_id"), ("agent_id", "job_id")}
@@ -268,15 +286,23 @@ CREATE UNIQUE INDEX runs_conversation_turn
 """
 
 RECEIPT_TABLE_SQL = """
-CREATE TABLE database_write_receipts (
+CREATE TABLE effect_receipts (
     agent_id TEXT NOT NULL,
     id TEXT NOT NULL,
     run_id TEXT NOT NULL,
     call_id TEXT NOT NULL,
+    operation_key TEXT NOT NULL,
+    routine_id TEXT,
+    occurrence_id TEXT,
+    grant_digest TEXT,
+    unresolved INTEGER NOT NULL,
     data TEXT NOT NULL,
     PRIMARY KEY(agent_id, id),
-    UNIQUE(agent_id, run_id, call_id)
-)
+    UNIQUE(agent_id, run_id, call_id),
+    UNIQUE(agent_id, operation_key)
+);
+CREATE INDEX effect_receipts_unresolved ON effect_receipts(agent_id, unresolved, routine_id, run_id);
+CREATE INDEX effect_receipts_grant_reservations ON effect_receipts(agent_id, occurrence_id, grant_digest)
 """
 
 JOURNAL_TABLE_SQL = """
@@ -299,8 +325,8 @@ CREATE TABLE source_read_scopes (
 )
 """
 
-POSTGRESQL_UPDATE_SCOPE_TABLE_SQL = """
-CREATE TABLE postgresql_update_scopes (
+RELATIONAL_WRITE_SCOPE_TABLE_SQL = """
+CREATE TABLE relational_write_scopes (
     agent_id TEXT NOT NULL,
     source_id TEXT NOT NULL,
     resource_id TEXT NOT NULL,
@@ -446,8 +472,8 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
             else {}
         ),
         **(
-            {"postgresql_update_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
-            if "postgresql_update_scopes" in definitions
+            {"relational_write_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
+            if "relational_write_scopes" in definitions
             else {}
         ),
         **(
@@ -489,7 +515,11 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
             for row in connection.execute(f"PRAGMA index_list({table})")
             if not str(row[1]).startswith("sqlite_autoindex")
         }
-        if indexes != {name: expected_unique}:
+        if indexes != {
+            index_name: definition[1]
+            for index_name, definition in NAMED_INDEXES.items()
+            if definition[0] == table
+        }:
             raise ValueError(f"state index is invalid: {name}")
         columns = tuple(
             row[2] for row in connection.execute(f"PRAGMA index_info({name})")

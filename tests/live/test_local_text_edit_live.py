@@ -9,6 +9,7 @@ remain deterministic contracts in ``tests/test_local_text_edit.py``.
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
@@ -24,6 +25,7 @@ from daita import (
     LoopLimits,
     create_llm_provider,
 )
+from daita._json import canonical_json
 from daita.artifacts.models import ArtifactDeliveryMode, ArtifactDeliveryOutcome
 from daita.llm.models import ModelProfile, ModelSensitivity, ToolCall, ToolResultBlock
 from daita.llm.profiles import reviewed_model_profile
@@ -33,6 +35,8 @@ from daita.loop.models import (
     Transcript,
     validate_completed_transcript,
 )
+from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
+from live.benchmarks._support import RecordingProvider
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_LOCAL_TEXT_EDIT"
 _MODEL_ID = "DAITA_LOCAL_TEXT_EDIT_LIVE_MODEL_ID"
@@ -119,10 +123,14 @@ def _live_model() -> tuple[ModelProfile, ManagedModelProvider]:
 
 
 def _limits() -> LoopLimits:
+    profile = os.environ.get("DAITA_LOCAL_TEXT_EDIT_LIVE_PROFILE", "strict")
+    if profile not in {"strict", "user_flow"}:
+        raise ValueError("local text edit profile must be strict or user_flow")
+    user_flow = profile == "user_flow"
     return LoopLimits(
-        max_steps=14,
-        max_total_tokens=30_000,
-        max_wall_time_seconds=120,
+        max_steps=24 if user_flow else 14,
+        max_total_tokens=100_000 if user_flow else 30_000,
+        max_wall_time_seconds=300 if user_flow else 120,
         max_estimated_cost_usd=_cost_limit(),
     )
 
@@ -154,7 +162,8 @@ async def test_live_model_reads_edits_approves_and_replaces_exact_bound_file(
 ) -> None:
     """Exercise the complete public Phase 3 model-led edit workflow."""
 
-    profile, provider = _live_model()
+    profile, raw_provider = _live_model()
+    provider = RecordingProvider(raw_provider)
     state_root = tmp_path / "live-local-text-edit-state"
     workspace = workspace_for(state_root)
     target = workspace.root / _RELATIVE_PATH
@@ -180,6 +189,8 @@ async def test_live_model_reads_edits_approves_and_replaces_exact_bound_file(
         approval_handler=approve,
         limits=_limits(),
     )
+    result = None
+    transcript = None
     try:
         result = await agent.run(_PROMPT)
         transcript = await agent.transcript(result.run_id)
@@ -188,7 +199,65 @@ async def test_live_model_reads_edits_approves_and_replaces_exact_bound_file(
             await agent.close()
         finally:
             await provider.close()
+            report_dir = os.environ.get("DAITA_LOCAL_TEXT_EDIT_REPORT_DIR")
+            if report_dir:
+                report = {
+                    "status": "captured_for_separate_assertions_and_answer_review",
+                    "evaluation_profile": os.environ.get(
+                        "DAITA_LOCAL_TEXT_EDIT_LIVE_PROFILE", "strict"
+                    ),
+                    "limits": {
+                        "max_steps": _limits().max_steps,
+                        "max_tokens": _limits().max_total_tokens,
+                        "max_seconds": _limits().max_wall_time_seconds,
+                        "max_estimated_cost_usd": str(_limits().max_estimated_cost_usd),
+                    },
+                    "prompt": _PROMPT,
+                    "result": (
+                        None if result is None else json.loads(encode_loop_exit(result))
+                    ),
+                    "messages": (
+                        []
+                        if transcript is None
+                        else [
+                            json.loads(encode_message(message))
+                            for message in transcript.messages
+                        ]
+                    ),
+                    "physical_attempts": provider.timings,
+                    "requests": [
+                        {
+                            "messages": [
+                                json.loads(encode_message(message))
+                                for message in request.messages
+                            ],
+                            "tools": [
+                                {
+                                    "name": tool.name,
+                                    "input_schema": json.loads(
+                                        canonical_json(tool.input_schema)
+                                    ),
+                                }
+                                for tool in request.tools
+                            ],
+                            "max_total_tokens": request.max_total_tokens,
+                            "max_estimated_cost_usd": str(
+                                request.max_estimated_cost_usd
+                            ),
+                        }
+                        for request in provider.requests
+                    ],
+                    "approvals": [request.arguments.to_dict() for request in approvals],
+                    "content_at_approval": content_at_approval,
+                    "final_file_content": target.read_text(encoding="utf-8"),
+                }
+                directory = Path(report_dir)
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "local-file-contract.json").write_text(
+                    json.dumps(report, indent=2) + "\n"
+                )
 
+    assert result is not None and transcript is not None
     assert result.kind is LoopExitKind.COMPLETED, (
         result.reason,
         result.usage.cost_estimate.code,

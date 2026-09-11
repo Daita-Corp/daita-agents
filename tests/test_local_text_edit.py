@@ -137,6 +137,71 @@ def _profile(provider: _EditWorkflowProvider) -> ModelProfile:
     )
 
 
+@pytest.mark.parametrize("profile", ["strict", "user_flow"])
+async def test_live_text_edit_report_captures_real_offline_workflow(
+    tmp_path, monkeypatch, profile
+):
+    """Exercise the live harness's new recorder without a provider credential."""
+    import json
+    from dataclasses import replace
+
+    from live import test_local_text_edit_live as live_case
+
+    from daita.llm.models import ModelUsage
+    from daita.llm.pricing import CostEstimate
+
+    class RecordedEdit(_EditWorkflowProvider):
+        def has_complete_pricing(self, request):
+            return True
+
+        async def close(self, *, deadline: float | None = None):
+            pass
+
+        async def generate(self, request):
+            result = await super().generate(request)
+            if result.text == "done":
+                result = replace(
+                    result,
+                    text=f"Saved {live_case._RELATIVE_PATH}: timeout 45, marker {live_case._MARKER}.",
+                )
+            return replace(
+                result,
+                usage=ModelUsage(
+                    input_tokens=5,
+                    output_tokens=3,
+                    cost_estimate=CostEstimate.complete(Decimal(0)),
+                ),
+            )
+
+    provider = RecordedEdit(
+        (
+            {
+                "old_text": "timeout_seconds: 30",
+                "new_text": "timeout_seconds: 45",
+                "expected_occurrences": 1,
+            },
+        ),
+        target_path=live_case._RELATIVE_PATH,
+    )
+    monkeypatch.setattr(
+        live_case, "_live_model", lambda: (_profile(provider), provider)
+    )
+    monkeypatch.setenv("DAITA_LOCAL_TEXT_EDIT_REPORT_DIR", str(tmp_path / "reports"))
+    monkeypatch.setenv("DAITA_LOCAL_TEXT_EDIT_LIVE_PROFILE", profile)
+    await live_case.test_live_model_reads_edits_approves_and_replaces_exact_bound_file(
+        tmp_path
+    )
+    report = json.loads((tmp_path / "reports/local-file-contract.json").read_text())
+    assert len(report["approvals"]) == 1
+    assert report["final_file_content"] == live_case._EXPECTED_CONTENT
+    assert report["requests"] and report["physical_attempts"]
+    assert report["result"] is not None
+    assert report["evaluation_profile"] == profile
+    assert report["limits"]["max_tokens"] == (
+        100000 if profile == "user_flow" else 30000
+    )
+
+
 def _call(call_id: str, name: str, arguments: Mapping[str, object]) -> ModelResponse:
     return ModelResponse(
         finish_reason=FinishReason.TOOL_CALLS,
@@ -1043,6 +1108,23 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
     )
     agent, _workspace = await _agent(tmp_path, provider)
     embedded = agent._embedded
+    import sqlite3
+
+    from daita import SQLiteSource
+
+    database = tmp_path / "scope.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE allowed (value INTEGER)")
+    source = await agent.attach(SQLiteSource(database))
+    resource = (await agent.list_catalog_resources(source_id=source.id))[0]
+    contracts = await embedded._execution_contract_reader(
+        agent_id=agent.id,
+        source_ids=(source.id,),
+        resource_ids=(resource.id,),
+        capability_ids=("artifact.edit_text", "artifact.save_local"),
+        connector_binding_ids=(),
+        model_route_ids=(provider.provider_id,),
+    )
 
     async def unexpected_workspace_io(*_args: object, **_kwargs: object) -> object:
         raise AssertionError("machine forged call reached workspace I/O")
@@ -1058,6 +1140,7 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
     monkeypatch.setattr(AgentHomeArtifactStore, "find_ref", unexpected_artifact_io)
     instruction = "Process one bounded job event."
     scope = ExecutionScope(
+        contract_bindings=contracts,
         scope_id="scope-local-edit-negative",
         revision=1,
         agent_id=agent.id,
@@ -1065,8 +1148,8 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
         grant_id="grant-local-edit-negative",
         job_id="job-local-edit-negative",
         job_revision=1,
-        allowed_source_ids=("source-none",),
-        allowed_resource_ids=("resource-none",),
+        allowed_source_ids=(source.id,),
+        allowed_resource_ids=(resource.id,),
         allowed_capability_ids=("artifact.edit_text", "artifact.save_local"),
         allowed_access_modes=frozenset({AccessMode.NONE, AccessMode.READ}),
         allowed_operational_effects=frozenset(

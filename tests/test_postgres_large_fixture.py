@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from _relational_write_support import update_constraints
 from _workspace_support import workspace_for
 
 from daita import Agent, ApprovalDecision, ApprovalRequest
@@ -132,8 +133,8 @@ class _BulkUpdateProvider:
                         name="toolbox_load",
                         arguments={
                             "tool_names": [
-                                "data_preview_postgresql_update",
-                                "data_update_postgresql",
+                                "data_preview_update_rows",
+                                "data_update_rows",
                             ]
                         },
                     ),
@@ -148,7 +149,7 @@ class _BulkUpdateProvider:
                 tool_calls=(
                     ToolCall(
                         id="bulk-preview",
-                        name="data_preview_postgresql_update",
+                        name="data_preview_update_rows",
                         arguments=self._plan(),
                     ),
                 ),
@@ -170,7 +171,7 @@ class _BulkUpdateProvider:
                 tool_calls=(
                     ToolCall(
                         id="bulk-update",
-                        name="data_update_postgresql",
+                        name="data_update_rows",
                         arguments={
                             **self._plan(),
                             "preview_fingerprint": preview_fingerprint,
@@ -510,7 +511,11 @@ async def test_terminal_write_permissions_use_large_support_tickets(
             source_id=source.id,
             read_mode=inspection.state.read_scope.mode,
             read_resource_ids=inspection.state.read_scope.resource_ids,
-            postgresql_update_scopes={tickets.resource_id: ("priority",)},
+            relational_write_scopes={
+                tickets.resource_id: update_constraints(
+                    ("priority",), key_columns=tickets.key_columns
+                )
+            },
         )
         await agent.apply_source_permissions(
             source_id=source.id,
@@ -518,11 +523,11 @@ async def test_terminal_write_permissions_use_large_support_tickets(
         )
 
         after = await agent.inspect_source_permissions(source.id)
-        assert len(after.state.postgresql_update_scopes) == 1
-        scope = after.state.postgresql_update_scopes[0]
+        assert len(after.state.relational_write_scopes) == 1
+        scope = after.state.relational_write_scopes[0]
         assert scope.resource_id == tickets.resource_id
-        assert scope.allowed_assignment_columns == ("priority",)
-        readiness = await agent.postgresql_update_readiness(
+        assert scope.allowed_update_columns == ("priority",)
+        readiness = await agent.relational_update_readiness(
             source.id,
             tickets.resource_id,
             ("priority",),
@@ -590,7 +595,11 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
             source_id=source.id,
             read_mode="all",
             read_resource_ids=(),
-            postgresql_update_scopes={tickets.resource_id: ("priority",)},
+            relational_write_scopes={
+                tickets.resource_id: update_constraints(
+                    ("priority",), key_columns=tickets.key_columns
+                )
+            },
         )
         await agent.apply_source_permissions(
             source_id=source.id,
@@ -620,7 +629,7 @@ async def test_bulk_update_uses_exact_preview_approval_commit_and_readback(
         assert restored.final_text.startswith("Committed and verified ")
 
         assert len(approvals) == 2
-        assert all(item.tool_name == "data_update_postgresql" for item in approvals)
+        assert all(item.tool_name == "data_update_rows" for item in approvals)
         for request in approvals:
             expected_rows = request.arguments["expected_affected_rows"]
             preview_fingerprint = request.arguments["preview_fingerprint"]

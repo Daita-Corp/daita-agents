@@ -133,7 +133,7 @@ _FORBIDDEN_TOOL_NAMES = frozenset(
         "routine_inspect",
         "routine_list",
         "routine_update",
-        "data_update_postgresql",
+        "data_update_rows",
     }
 )
 
@@ -186,7 +186,7 @@ class _RecordingProvider:
                     self.responses.append(event.response)
                 yield event
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         await self._delegate.close()
 
 
@@ -338,7 +338,7 @@ async def _seed_home(
         resource = next(item for item in resources if item.name == resource_name)
         origin = await agent.run(
             "Establish the foreground conversation for one scheduled read report.",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         assert origin.kind is LoopExitKind.COMPLETED
         assert origin.conversation_id

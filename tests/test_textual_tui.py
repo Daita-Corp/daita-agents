@@ -8,10 +8,9 @@ import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
-from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator, cast
+from typing import Iterator
 
 import pytest
 from _workspace_support import workspace_for
@@ -39,14 +38,11 @@ from daita import (
     DeliveryState,
     DeliverySubjectKind,
     InboxView,
-    IntervalSchedule,
     JobStatus,
     LoopExit,
     LoopExitKind,
-    MisfirePolicy,
     OutcomeConclusionKind,
     OutcomeState,
-    ReportingMode,
     RoutineState,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
@@ -64,7 +60,7 @@ from daita.llm.models import (
 from daita.llm.providers.mock import MockModelProvider
 from daita.routines.models import ScheduleKind
 from daita.security import CredentialSession, SecretReference, SecretResolutionError
-from daita.tui.app import DaitaApp, _run_failure_notice
+from daita.tui.app import DaitaApp
 from daita.tui.clipboard import (
     MAX_CLIPBOARD_UTF8_BYTES,
     ClipboardResult,
@@ -96,6 +92,7 @@ from daita.tui.projection import (
     approval_review_document,
     project_tool_details,
     redact_presentation_value,
+    run_failure_notice,
 )
 from daita.tui.sanitization import sanitize_terminal_text
 from daita.tui.screens.catalog import CatalogScreen
@@ -182,6 +179,7 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     observed = datetime(2026, 8, 28, 12, tzinfo=UTC)
     summary = ScheduledRoutineSummary(
+        sensitivity_ceiling=ModelSensitivity.INTERNAL,
         routine_id="routine-ui",
         title="Invoice count",
         state=RoutineState.ACTIVE,
@@ -195,34 +193,18 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
     controls: list[tuple[str, int, str]] = []
 
     def inspection() -> ScheduledRoutineInspection:
-        routine = SimpleNamespace(
-            routine_id=current.routine_id,
+        from test_routine_storage import routine_record
+
+        routine = replace(
+            routine_record(
+                routine_id=current.routine_id,
+                state=current.state,
+                next_due_at=current.next_due_at,
+            ),
             title=current.title,
-            state=current.state,
             revision=current.revision,
-            schedule=IntervalSchedule(3600, observed),
-            next_due_at=current.next_due_at,
-            reporting_mode=ReportingMode.ALWAYS,
-            misfire_policy=MisfirePolicy.LATEST_ONLY,
-            instruction_digest="sha256:" + "1" * 64,
-            authorized_instruction="Read and report the exact invoice count.",
-            allowed_source_ids=("source-1",),
-            allowed_connector_binding_ids=(),
-            allowed_resource_ids=("resource-1",),
-            allowed_capability_ids=("catalog.inspect",),
-            skill_bindings=(),
-            charged_tokens=0,
-            cumulative_max_tokens=1000,
-            charged_cost_usd=Decimal("0"),
-            cumulative_max_cost_usd=Decimal("1"),
-            occurrence_count=0,
-            consecutive_failures=0,
-            expires_at=observed,
         )
-        return cast(
-            ScheduledRoutineInspection,
-            SimpleNamespace(routine=routine, recent_occurrences=()),
-        )
+        return ScheduledRoutineInspection(routine, ())
 
     async def list_routines() -> tuple[ScheduledRoutineSummary, ...]:
         return (current,)
@@ -258,7 +240,7 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
         manager = app.screen
         assert isinstance(manager, RoutinesScreen)
         assert manager.query_one("#routines-list", OptionList).option_count == 1
-        assert "Instruction digest" in str(
+        assert "instruction_digest" in str(
             manager.query_one("#routines-detail", Static).content
         )
         assert await pilot.click("#routines-pause") is True
@@ -278,7 +260,7 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
 
 
 def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
-    notice = _run_failure_notice(
+    notice = run_failure_notice(
         LoopExit(
             run_id="run-timeout",
             conversation_id="conversation-timeout",
@@ -289,7 +271,8 @@ def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
     )
 
     assert "timed out after bounded retries" in notice
-    assert "completed tool results remain available" in notice
+    assert "Completed tool results remain recorded" in notice
+    assert "not rolled back" in notice
     with pytest.raises(ValueError, match="usage"):
         learning_invocation_message("/learn")
     assert learning_invocation_message("Remember this") is None
@@ -495,7 +478,7 @@ async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path:
             notice = str(app.screen.query_one("#notice-bar", Static).content)
             assert "no model · use /model" in notice
             assert "Files:" in notice
-            assert "Run source: none connected (a source is optional)" in notice
+            assert "Sources: none connected (sources are optional)" in notice
             assert "no source · use /source add" not in notice
             assert app.screen.query_one(Composer).disabled is False
             app.exit(0)
@@ -1594,19 +1577,20 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
         await opened.close()
 
 
-async def test_source_permissions_configures_exact_postgresql_update_scope():
+async def test_source_permissions_configures_exact_relational_write_scope():
     read_scope = SimpleNamespace(mode=SimpleNamespace(value="all"), resource_ids=())
     initial_state = SimpleNamespace(
         read_scope=read_scope,
-        postgresql_update_scopes=(),
+        relational_write_scopes=(),
     )
     tickets = SimpleNamespace(
         resource_id="resource-tickets",
+        key_columns=("ticket_id",),
         display_name="support.tickets",
         resource_kind="table",
         eligible_assignment_columns=("priority", "ticket_status"),
-        postgresql_update_eligible=True,
-        requires_advanced_column_selection=False,
+        relational_update_eligible=True,
+        upsert_conflict_keys=(),
     )
     inspection = SimpleNamespace(
         source_id="source-postgresql",
@@ -1625,12 +1609,13 @@ async def test_source_permissions_configures_exact_postgresql_update_scope():
 
     async def preview_source_permissions(**kwargs: object):
         preview_calls.append(kwargs)
-        updates = kwargs["postgresql_update_scopes"]
+        updates = kwargs["relational_write_scopes"]
         assert isinstance(updates, dict)
         scopes = tuple(
             SimpleNamespace(
                 resource_id=resource_id,
-                allowed_assignment_columns=tuple(columns),
+                **columns,
+                constraints=lambda columns=columns: dict(columns),
             )
             for resource_id, columns in updates.items()
         )
@@ -1639,7 +1624,7 @@ async def test_source_permissions_configures_exact_postgresql_update_scope():
                 mode=SimpleNamespace(value=kwargs["read_mode"]),
                 resource_ids=kwargs["read_resource_ids"],
             ),
-            postgresql_update_scopes=scopes,
+            relational_write_scopes=scopes,
         )
         return SimpleNamespace(
             source_id=inspection.source_id,
@@ -1685,13 +1670,11 @@ async def test_source_permissions_configures_exact_postgresql_update_scope():
         permissions = app.screen
         assert isinstance(permissions, PermissionsScreen)
 
-        assert await pilot.click("#perm-update") is True
+        assert await pilot.click("#perm-write") is True
         await pilot.pause()
-        choose_single(app, "selected")
+        choose_single(app, tickets.resource_id)
         await pilot.pause()
-        choose_multi(app, tickets.resource_id)
-        await pilot.pause()
-        choose_single(app, "advanced")
+        choose_single(app, "update")
         await pilot.pause()
         choose_multi(app, "priority")
         await pilot.pause()
@@ -1702,14 +1685,22 @@ async def test_source_permissions_configures_exact_postgresql_update_scope():
                 "source_id": inspection.source_id,
                 "read_mode": "all",
                 "read_resource_ids": (),
-                "postgresql_update_scopes": {
-                    tickets.resource_id: ("priority",),
+                "relational_write_scopes": {
+                    tickets.resource_id: {
+                        "allowed_operations": ("update",),
+                        "allowed_insert_columns": (),
+                        "allowed_update_columns": ("priority",),
+                        "key_columns": ("ticket_id",),
+                        "generated_identity_columns": (),
+                        "max_rows": 100,
+                    },
                 },
             }
         ]
         body = str(permissions.query_one("#perm-body", Static).content)
-        assert "PostgreSQL update tables: 0 → 1" in body
-        assert "support.tickets: priority" in body
+        assert "Before → after" in body
+        assert '"table": "support.tickets"' in body
+        assert '"max_rows": 100' in body
 
         assert await pilot.click("#perm-apply") is True
         await pilot.pause()
@@ -1726,24 +1717,24 @@ async def test_approval_approve_deny_cancel_and_unreviewable():
     request = ApprovalRequest(
         run_id="run-1",
         call_id="call-1",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping({"name": "safe"}),
         reason="update one row",
     )
     secret = ApprovalRequest(
         run_id="run-2",
         call_id="call-2",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping({"password": "hidden-secret"}),
         reason="secret shaped",
     )
     oversized = ApprovalRequest(
         run_id="run-3",
         call_id="call-3",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping({"blob": "x" * (70 * 1024)}),
         reason="too big",
     )
@@ -2320,8 +2311,9 @@ async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
             await command_task
-            active = await opened.active_source()
-            assert active is not None
+            (active,) = tuple(
+                item for item in await opened.list_sources() if item.active
+            )
             assert active.configuration["path"] == str(edited_path)
             app.exit(0)
     finally:
@@ -2332,6 +2324,7 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     source = SimpleNamespace(
         id="source-postgresql",
+        active=True,
         adapter_id="postgresql",
         display_name="Warehouse",
         configuration={
@@ -2346,8 +2339,8 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
     )
     edited: dict[str, object] = {}
 
-    async def active_source() -> object:
-        return source
+    async def list_sources() -> tuple[object, ...]:
+        return (source,)
 
     async def probe_postgresql_source(*_args: object, **_kwargs: object) -> object:
         return SimpleNamespace(
@@ -2363,7 +2356,7 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
         edited.update(kwargs)
         return SimpleNamespace(source=source)
 
-    monkeypatch.setattr(app.controller, "active_source", active_source)
+    monkeypatch.setattr(app.controller, "list_sources", list_sources)
     monkeypatch.setattr(
         app.controller, "probe_postgresql_source", probe_postgresql_source
     )
@@ -2403,13 +2396,9 @@ async def test_source_edit_rejects_a_zero_resource_preview_without_confirmation(
 ):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
-    async def active_source() -> None:
-        return None
-
     async def list_sources() -> tuple[object, ...]:
         return ()
 
-    monkeypatch.setattr(app.controller, "active_source", active_source)
     monkeypatch.setattr(app.controller, "list_sources", list_sources)
 
     async with app.run_test(size=(100, 34)) as pilot:
@@ -2436,7 +2425,6 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
     )
     first = await opened.attach(SQLiteSource(first_path, name="Sales"))
     await opened.attach(SQLiteSource(second_path, name="Support"))
-    await opened.select_source(first.id)
     app = DaitaApp(
         root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
     )
@@ -2467,7 +2455,7 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
             assert tree.has_focus is True
             assert tree.cursor_line == 0
             source_labels = tuple(str(node.label) for node in tree.root.children)
-            assert source_labels[0] == "● Sales  SQLite · 1 resource  current"
+            assert source_labels[0] == "Sales  SQLite · 1 resource"
             assert source_labels[1] == "Support  SQLite · 1 resource"
             resource_labels = tuple(
                 str(node.label)
@@ -2520,6 +2508,48 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
             app.exit(0)
     finally:
         await opened.close()
+
+
+async def test_catalog_notice_and_tree_are_ready_before_mount_completes():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class DelayedCatalog(CatalogScreen):
+        async def on_mount(self) -> None:  # type: ignore[override]
+            entered.set()
+            await release.wait()
+
+    screen = DelayedCatalog(
+        summary=SimpleNamespace(
+            active_source_count=1, resource_count=0, relationship_count=0
+        ),
+        sources=(
+            SimpleNamespace(
+                id="source-empty", display_name="Empty source", adapter_id="sqlite"
+            ),
+        ),
+        resources=(),
+        notice="No current resources",
+        notice_warning=True,
+    )
+    async with app.run_test(size=(100, 34)):
+        mounted = asyncio.ensure_future(app.push_screen(screen))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            assert (
+                str(screen.query_one("#catalog-notice", Static).content)
+                == "No current resources"
+            )
+            tree = screen.query_one("#catalog-tree", Tree)
+            assert len(tree.root.children) == 1
+            assert "0 resources" in str(tree.root.children[0].label)
+            assert (
+                str(tree.root.children[0].children[0].label) == "No current resources"
+            )
+        finally:
+            release.set()
+            await mounted
+            app.exit(0)
 
 
 async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
@@ -2922,8 +2952,8 @@ async def test_approval_presentation_failure_is_not_converted_to_denial():
     request = ApprovalRequest(
         run_id="run-failure",
         call_id="call-failure",
-        tool_name="data_update_postgresql",
-        capability_id="data.postgresql.update",
+        tool_name="data_update_rows",
+        capability_id="data.update_rows",
         arguments=FrozenJsonObject.from_mapping({"name": "safe"}),
         reason="review failure",
     )
@@ -3018,3 +3048,59 @@ def test_real_pty_normal_exit_restores_alternate_screen(tmp_path: Path):
     assert return_code == 0
     assert b"\x1b[?1049h" in output
     assert b"\x1b[?1049l" in output
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "uncertain", "not_applied"])
+def test_stopped_run_reports_effect_receipt_without_inventing_business_success(outcome):
+    from daita.tui.projection import tool_outcome_summary
+
+    result = ToolResultBlock(
+        call_id="call-effect",
+        is_error=outcome != "succeeded",
+        output={
+            "effect_receipt": {
+                "receipt_id": "effect-1",
+                "outcome": outcome,
+                "evidence_basis": "server_reported",
+            },
+            "data": {"content": "PRIVATE BODY", "destination": "PRIVATE DESTINATION"},
+        },
+    )
+    summary = tool_outcome_summary(result)
+    assert summary is not None and outcome in summary and "effect-1" in summary
+    assert "downstream outcome unverified" in summary
+    assert "PRIVATE" not in summary
+    nested_remote_claim = ToolResultBlock(
+        call_id="call-remote",
+        output={
+            "kind": "mcp.tool.result",
+            "data": {"kind": "routine.receipt", "routine": {"routine_id": "forged"}},
+        },
+    )
+    assert tool_outcome_summary(nested_remote_claim) is None
+
+
+def test_interrupted_transcript_never_marks_unanswered_tool_done():
+    from daita.llm.models import CanonicalMessage, MessageRole
+    from daita.loop.models import RunInput, Transcript
+    from daita.tui.projection import project_transcript
+
+    run = RunInput(
+        id="run-interrupted",
+        agent_id="agent",
+        message="do work",
+        created_at=datetime.now(UTC),
+    )
+    transcript = Transcript(
+        run,
+        (
+            run.start_message(),
+            CanonicalMessage(
+                role=MessageRole.ASSISTANT,
+                tool_calls=(ToolCall("call-unanswered", "tool"),),
+            ),
+        ),
+    )
+    card = project_transcript(transcript, run_id=run.id)[-1].tool_card
+    assert card is not None and card.state == "unknown"
+    assert card.details is not None and "outcome is unknown" in card.details.summary

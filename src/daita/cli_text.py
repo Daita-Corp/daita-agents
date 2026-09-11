@@ -20,7 +20,7 @@ from daita.learning_candidates import (
 )
 from daita.semantics import SemanticAnnotationState, SemanticAnnotationView
 
-from .tui.projection import artifact_delivery_messages, completed_tool_pairs
+from .tui.projection import artifact_delivery_messages
 from .tui.sanitization import MAX_DISPLAY_CHARACTERS, render_model_answer, safe_display
 
 _render_model_answer = render_model_answer
@@ -61,7 +61,7 @@ async def _write_artifact_outcomes(
         )
     try:
         transcript = await agent.transcript(result.run_id)
-        for message in artifact_delivery_messages(completed_tool_pairs(transcript)):
+        for message in artifact_delivery_messages(transcript.tool_pairs):
             print(message, file=output_stream)
     except Exception:
         return

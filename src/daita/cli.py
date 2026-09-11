@@ -26,6 +26,8 @@ from . import (
     ArtifactError,
     CalendarDaySelector,
     CalendarSchedule,
+    EffectReceipt,
+    EffectResolutionDecision,
     IntervalSchedule,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
@@ -43,9 +45,7 @@ from . import (
     ResidentReady,
     ResourceRevisionPrecheck,
     RoutineState,
-    ScheduledRoutine,
     ScheduledRoutineDraft,
-    ScheduledRoutineInspection,
     SQLiteSource,
     __version__,
     create_llm_provider,
@@ -65,9 +65,7 @@ from .distribution import (
     OutcomeContract,
     delivery_inspection_projection,
     distribution_destination_projection,
-    distribution_plan_projection,
     inbox_view_projection,
-    outcome_contract_projection,
 )
 from .errors import StateCompatibilityError
 from .learning_candidates import (
@@ -80,11 +78,13 @@ from .llm import (
 )
 from .llm.profiles import reviewed_model_profile
 from .llm.protocols import ManagedModelProvider
+from .routines.capabilities import routine_inspection_projection, routine_projection
 from .security import SecretReference
 from .terminal import run_terminal_application
 from .tui.models import (
     validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
 )
+from .tui.projection import run_failure_notice, tool_outcome_summary
 from .workspace import paths_overlap
 
 _CANDIDATE_REVIEW_COST_LIMIT_ENV = "DAITA_CANDIDATE_REVIEW_MAX_COST_USD"
@@ -244,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     sources = commands.add_parser("sources", help="list attached sources")
     sources.add_argument("name")
 
-    mcp = commands.add_parser("mcp", help="manage admitted remote MCP read tools")
+    mcp = commands.add_parser("mcp", help="manage admitted remote MCP tools")
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
     mcp_inspect = mcp_commands.add_parser(
         "inspect",
@@ -286,7 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_revoke.add_argument("--yes", action="store_true")
 
     readiness = commands.add_parser(
-        "postgresql-update-readiness",
+        "relational-update-readiness",
         help="inspect one resource and assignment-column update scope",
     )
     readiness.add_argument("name")
@@ -465,9 +465,36 @@ def build_parser() -> argparse.ArgumentParser:
     skill_delete.add_argument("name")
     skill_delete.add_argument("skill_name")
 
+    effects = commands.add_parser(
+        "effects",
+        help="inspect action receipts and record human recovery without replay",
+    )
+    effect_commands = effects.add_subparsers(dest="effects_command", required=True)
+    effect_list = effect_commands.add_parser("list")
+    effect_list.add_argument("name")
+    effect_list.add_argument("--unresolved", action="store_true")
+    effect_list.add_argument("--limit", type=int, default=20)
+    effect_list.add_argument("--offset", type=int, default=0)
+    effect_inspect = effect_commands.add_parser("inspect")
+    effect_inspect.add_argument("name")
+    effect_inspect.add_argument("receipt_id")
+    effect_resolve = effect_commands.add_parser(
+        "resolve", help="review one exact human decision; performs no action"
+    )
+    effect_resolve.add_argument("name")
+    effect_resolve.add_argument("receipt_id")
+    effect_resolve.add_argument("--expected-digest", required=True)
+    effect_resolve.add_argument(
+        "--decision",
+        required=True,
+        choices=tuple(item.value for item in EffectResolutionDecision),
+    )
+    effect_resolve.add_argument("--note", required=True)
+    effect_resolve.add_argument("--evidence", action="append", default=[])
+
     routines = commands.add_parser(
         "routines",
-        help="inspect and manage scheduled read routines",
+        help="inspect and manage saved assignments (execution requires an open host)",
     )
     routine_commands = routines.add_subparsers(
         dest="routines_command",
@@ -804,16 +831,20 @@ async def _edit_skill(agent: Agent, name: str) -> bool:
 async def _prompt_for_exact_approval(
     request: ApprovalRequest,
 ) -> ApprovalDecision:
-    rendered_arguments = request.render_arguments_for_review()
-    if rendered_arguments is None:
+    from .tui.projection import approval_review_document
+
+    document, reviewable = approval_review_document(
+        tool_name=request.tool_name,
+        capability_id=request.capability_id,
+        arguments_text=request.render_arguments_for_review(),
+        reason=request.reason,
+    )
+    if not reviewable or document is None:
+        print("Approval unavailable: exact details cannot be safely reviewed.")
         return ApprovalDecision.DENY
     print("Approval required")
     print()
-    print(f"Tool:       {request.tool_name}")
-    print(f"Capability: {request.capability_id}")
-    print(f"Change:     {request.reason}")
-    print("Arguments:")
-    print(rendered_arguments)
+    print(document)
     while True:
         try:
             answer = input("Approve this exact change once? [y/n]")
@@ -1104,88 +1135,6 @@ def _routine_datetime(value: str) -> datetime:
         raise ValueError("routine datetime must be ISO 8601") from error
 
 
-def _routine_mapping(routine: ScheduledRoutine) -> dict[str, object]:
-    schedule: dict[str, object]
-    if isinstance(routine.schedule, OnceSchedule):
-        schedule = {"kind": "once", "exact_at": routine.schedule.exact_at.isoformat()}
-    elif isinstance(routine.schedule, IntervalSchedule):
-        schedule = {
-            "kind": "interval",
-            "interval_seconds": routine.schedule.interval_seconds,
-            "anchor_at": routine.schedule.anchor_at.isoformat(),
-        }
-    else:
-        schedule = {
-            "kind": "calendar",
-            "timezone": routine.schedule.timezone,
-            "hour": routine.schedule.hour,
-            "minute": routine.schedule.minute,
-            "day_selector": routine.schedule.day_selector.value,
-            "weekdays": routine.schedule.weekdays,
-            "month_days": routine.schedule.month_days,
-            "months": routine.schedule.months,
-            "nonexistent_time_policy": routine.schedule.nonexistent_time_policy.value,
-            "ambiguous_time_policy": routine.schedule.ambiguous_time_policy.value,
-        }
-    return {
-        "routine_id": routine.routine_id,
-        "title": routine.title,
-        "state": routine.state.value,
-        "revision": routine.revision,
-        "authorized_instruction": routine.authorized_instruction,
-        "instruction_digest": routine.instruction_digest,
-        "schedule": schedule,
-        "misfire_policy": routine.misfire_policy.value,
-        "reporting_mode": routine.reporting_mode.value,
-        "allowed_source_ids": routine.allowed_source_ids,
-        "allowed_connector_binding_ids": routine.allowed_connector_binding_ids,
-        "allowed_resource_ids": routine.allowed_resource_ids,
-        "allowed_capability_ids": routine.allowed_capability_ids,
-        "skill_bindings": tuple(
-            {
-                "name": item.skill_name,
-                "revision": item.skill_revision,
-                "content_digest": item.content_digest,
-            }
-            for item in routine.skill_bindings
-        ),
-        "next_due_at": (
-            None if routine.next_due_at is None else routine.next_due_at.isoformat()
-        ),
-        "expires_at": routine.expires_at.isoformat(),
-        "occurrence_count": routine.occurrence_count,
-        "attempt_count": routine.attempt_count,
-        "consecutive_failures": routine.consecutive_failures,
-        "charged_tokens": routine.charged_tokens,
-        "charged_cost_usd": str(routine.charged_cost_usd),
-        "last_occurrence_id": routine.last_occurrence_id,
-        "outcome_contract": outcome_contract_projection(routine.outcome_contract),
-        "distribution_plan": distribution_plan_projection(routine.distribution_plan),
-        "last_delivery_ids": routine.last_delivery_ids,
-    }
-
-
-def _routine_inspection_mapping(
-    inspection: ScheduledRoutineInspection,
-) -> dict[str, object]:
-    return {
-        "routine": _routine_mapping(inspection.routine),
-        "recent_occurrences": tuple(
-            {
-                "occurrence_id": item.occurrence_id,
-                "slot_key": item.slot_key,
-                "scheduled_for": item.scheduled_for.isoformat(),
-                "disposition": item.disposition.value,
-                "reserved_run_id": item.reserved_run_id,
-                "terminal_run_id": item.terminal_run_id,
-                "delivery_ids": item.delivery_ids,
-                "failure_code": item.failure_code,
-            }
-            for item in inspection.recent_occurrences
-        ),
-    }
-
-
 async def _execute(args: argparse.Namespace) -> object:
     if args.command == "delete":
         if not args.yes:
@@ -1286,6 +1235,7 @@ async def _execute(args: argparse.Namespace) -> object:
                     conversation_id=args.conversation_id,
                 )
             )
+            transcript = await run_agent.transcript(result.run_id)
             return {
                 "run_id": result.run_id,
                 "conversation_id": result.conversation_id,
@@ -1293,6 +1243,22 @@ async def _execute(args: argparse.Namespace) -> object:
                 "reason": result.reason,
                 "text": result.final_text,
                 "steps": result.steps,
+                "notice": (
+                    None
+                    if result.kind.value == "completed"
+                    else run_failure_notice(result, transcript)
+                ),
+                "tool_results": tuple(
+                    {
+                        "call_id": call.id,
+                        "tool_name": call.name,
+                        "is_error": None if outcome is None else outcome.is_error,
+                        "summary": (
+                            None if outcome is None else tool_outcome_summary(outcome)
+                        ),
+                    }
+                    for call, outcome in transcript.tool_pairs
+                ),
                 "artifacts": tuple(
                     artifact_ref_to_mapping(item) for item in result.artifacts
                 ),
@@ -1364,8 +1330,39 @@ async def _execute(args: argparse.Namespace) -> object:
             }
         finally:
             await _close_cli_resources(agent=accept_agent, provider=provider)
-    agent = await Agent.open(args.name, workspace=workspace, root=args.root)
+    agent = await Agent.open(
+        args.name,
+        workspace=workspace,
+        root=args.root,
+        approval_handler=_prompt_for_exact_approval,
+    )
     try:
+        if args.command == "effects":
+            from .tui.projection import effect_receipt_mapping
+
+            if args.effects_command == "list":
+                return [
+                    effect_receipt_mapping(item)
+                    for item in await agent.list_effects(
+                        unresolved_only=args.unresolved,
+                        limit=args.limit,
+                        offset=args.offset,
+                    )
+                ]
+            effect: EffectReceipt | None
+            if args.effects_command == "resolve":
+                effect = await agent.resolve_effect(
+                    args.receipt_id,
+                    expected_digest=args.expected_digest,
+                    decision=EffectResolutionDecision(args.decision),
+                    note=args.note,
+                    evidence_references=tuple(args.evidence),
+                )
+            else:
+                effect = await agent.inspect_effect(args.receipt_id)
+                if effect is None:
+                    raise ValueError("effect receipt not found")
+            return effect_receipt_mapping(effect)
         if args.command == "artifacts":
             receipt = await agent.save_artifact(
                 args.artifact_id,
@@ -1436,8 +1433,8 @@ async def _execute(args: argparse.Namespace) -> object:
             if not args.yes:
                 raise ValueError("mcp revoke requires --yes")
             return _mcp_status_mapping(await agent.revoke_mcp_server(args.binding_id))
-        if args.command == "postgresql-update-readiness":
-            readiness_result = await agent.postgresql_update_readiness(
+        if args.command == "relational-update-readiness":
+            readiness_result = await agent.relational_update_readiness(
                 args.source_id,
                 args.resource_id,
                 tuple(args.assignment_columns),
@@ -1574,6 +1571,12 @@ async def _execute(args: argparse.Namespace) -> object:
                 raise ValueError("delivery not found")
             return inbox_view_projection(acknowledged)
         if args.command == "routines":
+            print(
+                "Host open for this command only. Saved assignments progress while a host is open; "
+                "this command closes its host on exit. For continued execution, run "
+                "daita host --agent <name>. Stop that host before reopening the same agent in the TUI.",
+                file=sys.stderr,
+            )
             if args.routines_command == "list":
                 states = frozenset(RoutineState(item) for item in (args.state or ()))
                 return [
@@ -1597,7 +1600,7 @@ async def _execute(args: argparse.Namespace) -> object:
                 routine_inspection = await agent.inspect_routine(args.routine_id)
                 if routine_inspection is None:
                     raise ValueError("routine not found")
-                return _routine_inspection_mapping(routine_inspection)
+                return routine_inspection_projection(routine_inspection)
             if args.routines_command in {"create", "promote"}:
                 draft = _routine_draft_from_file(args.spec)
                 proposal = (
@@ -1608,14 +1611,19 @@ async def _execute(args: argparse.Namespace) -> object:
                     if args.routines_command == "promote"
                     else await agent.propose_routine(draft)
                 )
-                return _routine_mapping(await agent.create_routine(proposal))
+                return routine_projection(
+                    await agent.create_routine(
+                        proposal, confirmation_handler=_prompt_for_exact_approval
+                    )
+                )
             if args.routines_command == "update":
-                return _routine_mapping(
+                return routine_projection(
                     await agent.update_routine(
                         args.routine_id,
                         expected_revision=args.expected_revision,
                         draft=_routine_draft_from_file(args.spec),
                         basis_run_id=args.basis_run_id,
+                        confirmation_handler=_prompt_for_exact_approval,
                     )
                 )
             control = {
@@ -1624,7 +1632,7 @@ async def _execute(args: argparse.Namespace) -> object:
                 "run-now": agent.run_routine_now,
                 "disable": agent.disable_routine,
             }[args.routines_command]
-            return _routine_mapping(
+            return routine_projection(
                 await control(
                     args.routine_id,
                     expected_revision=args.expected_revision,

@@ -53,6 +53,7 @@ def construct_logical_delivery(
     provenance_digest: str,
     failure_code: str | None,
     observed_at: datetime,
+    effect_receipt_ids: tuple[str, ...] = (),
 ) -> Delivery:
     """Construct one immutable logical delivery for any admitted producer."""
 
@@ -69,7 +70,22 @@ def construct_logical_delivery(
         and visibility_state is DeliveryState.AVAILABLE
         else ""
     )
+    if (
+        conclusion_state is OutcomeState.FAILED
+        and visibility_state is DeliveryState.AVAILABLE
+        and subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE
+    ):
+        # Failed model prose may claim completion. Publish bounded code-owned
+        # facts and preserve the actual evidence for inspection instead.
+        visible_preview = (
+            f"Assignment did not meet its completion requirements ({failure_code}). "
+            f"Recorded effect invocations: {len(effect_receipt_ids)}. "
+            f"Validated artifacts: {len(artifact_references)}. "
+            "Inspect the recorded evidence before deciding on future work."
+        )
+        conclusion_preview_truncated = False
     outcome = OutcomeReference(
+        effect_receipt_ids=effect_receipt_ids,
         conclusion_kind=conclusion_kind,
         conclusion_state=conclusion_state,
         conclusion_id=conclusion_id,
@@ -272,6 +288,7 @@ class DistributionOwner:
         *,
         contract: OutcomeContract,
         resulting_run_id: str,
+        require_minimum_counts: bool = True,
     ) -> tuple[OutcomeArtifactReference, ...]:
         """Resolve bytes once and validate the exact frozen artifact contract."""
 
@@ -283,6 +300,7 @@ class DistributionOwner:
             projected.append(outcome_artifact_reference(ref))
         return validate_outcome_artifact_references(
             tuple(projected),
+            require_minimum_counts=require_minimum_counts,
             contract=contract,
             resulting_run_id=resulting_run_id,
         )

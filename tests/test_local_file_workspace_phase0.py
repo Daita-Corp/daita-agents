@@ -148,7 +148,7 @@ async def test_files_only_omits_all_source_tools_with_multiple_sources(
 
         for method_name in (
             "source_routing_facts",
-            "postgresql_update_applicable_source_ids",
+            "relational_write_applicable_source_ids",
             "admitted_model_sensitivity",
             "catalog_context",
             "semantic_resource_facts",
@@ -328,7 +328,7 @@ async def test_files_only_cannot_be_combined_with_a_selected_source(
     agent = await Agent.create("exclusive", workspace=workspace, root=tmp_path)
     try:
         with pytest.raises(ValueError, match="mutually exclusive"):
-            await agent.run("invalid", source_id="source-1", files_only=True)
+            await agent.run("invalid", source_scope_ids=("source-1",), files_only=True)
     finally:
         await agent.close()
 

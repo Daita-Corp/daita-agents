@@ -181,7 +181,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             message="Teach this resource definition.",
             created_at=NOW,
             conversation_id="projection-conversation",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         semantic_domain.select_explicit_learning_run(projection_run.id)
         catalog = await runtime.prepare_run(projection_run)
@@ -233,7 +233,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
                 message="Which invoice has the largest value?",
                 created_at=NOW,
                 conversation_id="ordinary-conversation",
-                source_id=source.id,
+                source_scope_ids=(source.id,),
             )
         )
         assert not {
@@ -249,7 +249,7 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
                 message="Remember the definition while answering this semantic query.",
                 created_at=NOW,
                 conversation_id="incidental-conversation",
-                source_id=source.id,
+                source_scope_ids=(source.id,),
             )
         )
         assert not {
@@ -506,7 +506,7 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
             message="forget the definition",
             created_at=NOW,
             conversation_id="delete-approved-conversation",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         runtime = agent._embedded._capability_runtime
         semantic_domain = agent._embedded._semantic_domain
@@ -724,7 +724,7 @@ async def test_natural_language_and_learn_route_to_semantics_without_new_command
         )
         prompt = "\n".join(
             block.text
-            for message in provider.requests[0].messages
+            for message in provider.logical_requests[0].messages
             for block in message.content
             if isinstance(block, TextBlock)
         )

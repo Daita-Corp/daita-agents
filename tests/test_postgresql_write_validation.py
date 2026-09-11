@@ -6,12 +6,12 @@ import pytest
 
 from daita.capabilities import render_approval_arguments
 from daita.domains.data.sql import (
-    PostgreSQLUpdateCommand,
-    PostgreSQLUpdateIntent,
+    RelationalUpdateCommand,
+    RelationalUpdateIntent,
     ResourceSchema,
-    render_postgresql_update_statement,
-    validate_postgresql_update_intent,
-    validate_postgresql_update_scope,
+    render_relational_update_statement,
+    validate_relational_update_intent,
+    validate_relational_write_scope,
 )
 
 SOURCE_ID = "source:sha256:" + "1" * 64
@@ -55,8 +55,8 @@ def _intent(
         {"column": "status", "operator": "eq", "value": "open"},
     ),
     assignments: tuple[dict[str, object], ...] = ({"column": "priority", "value": 4},),
-) -> PostgreSQLUpdateIntent:
-    return PostgreSQLUpdateIntent.from_mapping(
+) -> RelationalUpdateIntent:
+    return RelationalUpdateIntent.from_mapping(
         {
             "source_id": SOURCE_ID,
             "resource_id": RESOURCE_ID,
@@ -81,13 +81,13 @@ def _resource_with_payload(type_name: str) -> ResourceSchema:
 
 
 def test_one_contract_validates_single_and_bulk_target_selections():
-    single = validate_postgresql_update_intent(
+    single = validate_relational_update_intent(
         _intent(
             where=({"column": "id", "operator": "eq", "value": 7},),
         ),
         resources=(_resource(),),
     )
-    bulk = validate_postgresql_update_intent(
+    bulk = validate_relational_update_intent(
         _intent(
             where=(
                 {"column": "status", "operator": "eq", "value": "open"},
@@ -106,7 +106,7 @@ def test_one_contract_validates_single_and_bulk_target_selections():
 
 
 def test_composite_primary_keys_are_supported_for_target_fingerprinting():
-    result = validate_postgresql_update_intent(
+    result = validate_relational_update_intent(
         _intent(
             where=(
                 {"column": "tenant_id", "operator": "eq", "value": 9},
@@ -121,7 +121,7 @@ def test_composite_primary_keys_are_supported_for_target_fingerprinting():
 
 
 def test_renderer_uses_only_parameterized_catalog_scoped_sql():
-    result = validate_postgresql_update_intent(
+    result = validate_relational_update_intent(
         _intent(
             where=(
                 {"column": "status", "operator": "in", "value": ["open", "new"]},
@@ -135,7 +135,7 @@ def test_renderer_uses_only_parameterized_catalog_scoped_sql():
         resources=(_resource(),),
     )
     assert result.validated is not None
-    statement = render_postgresql_update_statement(result.validated)
+    statement = render_relational_update_statement(result.validated)
     assert statement.sql == (
         'UPDATE ONLY "support"."tickets" SET "priority" = $1, "assignee" = $2 '
         'WHERE ("status" IN ($3, $4)) AND ("assignee" IS NULL)'
@@ -148,7 +148,7 @@ def test_renderer_uses_only_parameterized_catalog_scoped_sql():
 
 
 def test_execution_command_freezes_expected_impact_without_a_row_limit():
-    command = PostgreSQLUpdateCommand.from_mapping(
+    command = RelationalUpdateCommand.from_mapping(
         {
             **_intent().to_payload(),
             "preview_fingerprint": "sha256:" + "4" * 64,
@@ -159,7 +159,7 @@ def test_execution_command_freezes_expected_impact_without_a_row_limit():
 
 
 def test_scope_is_cardinality_independent_and_supports_composite_keys():
-    result = validate_postgresql_update_scope(
+    result = validate_relational_write_scope(
         SOURCE_ID,
         RESOURCE_ID,
         ("priority", "status"),
@@ -178,7 +178,7 @@ def test_invalid_filters_and_assignments_fail_closed():
         _intent(assignments=({"column": "id", "value": 4},)),
     )
     codes = tuple(
-        validate_postgresql_update_intent(item, resources=(_resource(),)).issue_codes[0]
+        validate_relational_update_intent(item, resources=(_resource(),)).issue_codes[0]
         for item in cases
     )
     assert codes == (
@@ -194,7 +194,7 @@ def test_json_equality_and_set_filters_fail_before_postgresql_io(operator: str):
     value: object = (
         [{"state": "open"}] if operator in {"in", "not_in"} else {"state": "open"}
     )
-    result = validate_postgresql_update_intent(
+    result = validate_relational_update_intent(
         _intent(where=({"column": "payload", "operator": operator, "value": value},)),
         resources=(_resource_with_payload("json"),),
     )
@@ -207,7 +207,7 @@ def test_jsonb_equality_and_set_filters_remain_supported(operator: str):
     value: object = (
         [{"state": "open"}] if operator in {"in", "not_in"} else {"state": "open"}
     )
-    result = validate_postgresql_update_intent(
+    result = validate_relational_update_intent(
         _intent(where=({"column": "payload", "operator": operator, "value": value},)),
         resources=(_resource_with_payload("jsonb"),),
     )
@@ -217,7 +217,7 @@ def test_jsonb_equality_and_set_filters_remain_supported(operator: str):
 
 @pytest.mark.parametrize("type_name", ("json", "jsonb"))
 def test_json_null_filters_remain_supported(type_name: str):
-    result = validate_postgresql_update_intent(
+    result = validate_relational_update_intent(
         _intent(where=({"column": "payload", "operator": "is_null", "value": None},)),
         resources=(_resource_with_payload(type_name),),
     )
@@ -235,12 +235,12 @@ def test_every_accepted_update_intent_has_a_reviewable_exact_command():
             },
         )
     )
-    accepted_result = validate_postgresql_update_intent(
+    accepted_result = validate_relational_update_intent(
         accepted,
         resources=(_resource(),),
     )
     assert accepted_result.valid
-    command = PostgreSQLUpdateCommand(
+    command = RelationalUpdateCommand(
         accepted,
         preview_fingerprint="sha256:" + "4" * 64,
         expected_affected_rows=9_223_372_036_854_775_807,
@@ -256,7 +256,7 @@ def test_every_accepted_update_intent_has_a_reviewable_exact_command():
             },
         )
     )
-    rejected = validate_postgresql_update_intent(
+    rejected = validate_relational_update_intent(
         unreviewable,
         resources=(_resource(),),
     )
@@ -264,10 +264,10 @@ def test_every_accepted_update_intent_has_a_reviewable_exact_command():
 
 
 def test_update_requires_a_primary_key_but_not_a_primary_key_filter():
-    missing_key = validate_postgresql_update_intent(
+    missing_key = validate_relational_update_intent(
         _intent(), resources=(_resource(primary_key=()),)
     )
     assert missing_key.issue_codes == ("write_primary_key_required",)
 
-    bulk = validate_postgresql_update_intent(_intent(), resources=(_resource(),))
+    bulk = validate_relational_update_intent(_intent(), resources=(_resource(),))
     assert bulk.valid

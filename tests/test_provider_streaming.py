@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
+from dataclasses import replace
 from typing import Any, cast
 
 import pytest
 
 from daita.llm.errors import (
     ModelProviderError,
+    ProviderAttempt,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
@@ -294,6 +296,116 @@ async def test_native_streams_release_resources_on_every_exit(monkeypatch, kind,
     assert opened[0].closed
 
 
+@pytest.mark.parametrize("kind", ["openai", "anthropic", "gemini"])
+@pytest.mark.parametrize("fault", ["cleanup", "diagnostic", "both"])
+async def test_attempt_completion_survives_cleanup_and_diagnostic_faults(
+    monkeypatch, kind, fault
+):
+    from live.benchmarks._support import RecordingProvider
+
+    from daita.llm._lifecycle import closing_stream
+
+    if fault in {"cleanup", "both"}:
+
+        async def fail_close(self):
+            self.closed = True
+            raise RuntimeError("private cleanup details must not escape")
+
+        monkeypatch.setattr(_NativeStream, "close", fail_close)
+        monkeypatch.setattr(_NativeStream, "aclose", fail_close)
+    if fault in {"diagnostic", "both"}:
+
+        def fail_snapshot(self):
+            raise ValueError("diagnostic extraction failed")
+
+        monkeypatch.setattr(ProviderAttempt, "snapshot", fail_snapshot)
+    provider: Any
+    if kind == "openai":
+        terminal = _openai_text_response("Done.")
+        terminal["usage"] = {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+        provider = OpenAIResponsesProvider(
+            "test-model",
+            client=cast(
+                Any,
+                _OpenAIClient(({"type": "response.completed", "response": terminal},)),
+            ),
+        )
+    elif kind == "anthropic":
+        start = _anthropic_message_start()
+        cast(dict[str, object], start["message"])["usage"] = {
+            "input_tokens": 3,
+            "output_tokens": 0,
+        }
+        provider = AnthropicMessagesProvider(
+            "test-model",
+            client=cast(
+                Any,
+                _AnthropicClient(
+                    (
+                        start,
+                        {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {"type": "text", "text": "Done."},
+                        },
+                        {"type": "content_block_stop", "index": 0},
+                        {
+                            "type": "message_delta",
+                            "delta": {"stop_reason": "end_turn"},
+                            "usage": {"output_tokens": 2},
+                        },
+                        {"type": "message_stop"},
+                    )
+                ),
+            ),
+        )
+    else:
+        provider = GeminiProvider(
+            "test-model",
+            client=cast(
+                Any,
+                _GeminiClient(
+                    (
+                        {
+                            "candidates": [
+                                {
+                                    "finish_reason": "STOP",
+                                    "content": {"parts": [{"text": "Done."}]},
+                                }
+                            ],
+                            "usage_metadata": {
+                                "prompt_token_count": 3,
+                                "candidates_token_count": 2,
+                                "total_token_count": 5,
+                            },
+                        },
+                    )
+                ),
+            ),
+        )
+    recorder = RecordingProvider(provider)
+    events = []
+    try:
+        async with closing_stream(recorder.stream(_request())) as stream:
+            async for event in stream:
+                events.append(event)
+    except ModelProviderError:
+        assert fault in {"cleanup", "both"}
+    completed = [event for event in events if isinstance(event, ModelStreamCompleted)]
+    assert len(completed) == (0 if fault in {"cleanup", "both"} else 1)
+    if completed:
+        assert completed[0].response.usage.total_tokens == 5
+    assert len(recorder.timings) == 1
+    assert recorder.timings[0]["usage_complete"] is True
+    observation = cast(Mapping[str, object], recorder.timings[0]["attempt_diagnostic"])
+    if fault == "cleanup":
+        assert observation["terminal_observed"] is True
+        assert observation["cleanup_failure"] == "cleanup_failed"
+        assert observation["cleanup_finished_seconds"] is not None
+    else:
+        assert observation == {"measurement_availability": "unavailable"}
+
+
 async def test_openai_native_stream_ignores_empty_deltas_and_uses_terminal_response():
     client = _OpenAIClient(
         (
@@ -394,7 +506,9 @@ async def test_openai_native_stream_still_rejects_non_text_delta():
 
     assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
     assert caught.value.provider_id == "openai:test-model"
-    assert caught.value.diagnostic == ProviderFailureDiagnostic(
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.attempt is not None
+    assert replace(caught.value.diagnostic, attempt=None) == ProviderFailureDiagnostic(
         phase=ProviderFailurePhase.STREAM_EVENT,
         code="event_decode_failed",
         event_type="response.output_text.delta",
@@ -533,7 +647,9 @@ async def test_openai_malformed_terminal_retains_only_bounded_structure():
         await _events(provider, _request())
 
     assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
-    assert caught.value.diagnostic == ProviderFailureDiagnostic(
+    assert caught.value.diagnostic is not None
+    assert caught.value.diagnostic.attempt is not None
+    assert replace(caught.value.diagnostic, attempt=None) == ProviderFailureDiagnostic(
         phase=ProviderFailurePhase.STREAM_TERMINAL,
         code="terminal_content_missing",
         event_type="response.completed",
@@ -951,7 +1067,10 @@ async def test_native_streams_require_canonical_terminal_completion(
 
     assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
     assert caught.value.provider_id == provider_id
-    assert caught.value.diagnostic == ProviderFailureDiagnostic(
+    assert caught.value.diagnostic is not None
+    if provider_id.split(":")[0] in {"openai", "anthropic", "gemini"}:
+        assert caught.value.diagnostic.attempt is not None
+    assert replace(caught.value.diagnostic, attempt=None) == ProviderFailureDiagnostic(
         phase=ProviderFailurePhase.STREAM_TERMINAL,
         code="terminal_completion_missing",
     )
@@ -974,3 +1093,377 @@ def test_every_builtin_provider_constructs_a_lazy_streaming_adapter(
     provider = create_llm_provider(model_id, base_url=base_url)
 
     assert callable(getattr(provider, "stream", None))
+
+
+def test_attempt_observation_bounds_and_unsafe_correlation_are_inert():
+    from daita._json import canonical_json
+    from daita.llm.errors import take_provider_attempt_diagnostic
+
+    attempt = ProviderAttempt(
+        ModelRequest(
+            messages=(
+                CanonicalMessage(
+                    MessageRole.USER, content=(TextBlock("private prompt"),)
+                ),
+            )
+        ),
+        headers_supported=True,
+    )
+    attempt.headers("generation", 200, "a" * 257)
+    assert attempt.snapshot()["generation_request_id_digest"] is None
+    attempt.headers("generation", 200, "key=secret&credential=value")
+    for index in range(64):
+        attempt.native(f"event_{index}", "private response body / invalid id")
+    attempt.native("event_0")
+    attempt.finish(None)
+    snapshot = take_provider_attempt_diagnostic()
+    assert snapshot is not None
+    counts = snapshot["native_event_counts"]
+    assert isinstance(counts, Mapping) and len(counts) == 16
+    assert counts["event_0"] == 2 and snapshot["native_event_overflow"] == 48
+    encoded = canonical_json(snapshot)
+    assert len(encoded.encode()) <= 8192
+    assert "secret" not in encoded and "private" not in encoded
+    assert take_provider_attempt_diagnostic() is None
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("stop", ["deadline", "cancel"])
+@pytest.mark.parametrize("progress", ["silent", "arguments"])
+async def test_actual_sdk_silent_stream_stops_without_tool_dispatch(
+    routed, stop, progress
+):
+    """Contain the captured partial-argument symptom; this is not a causal repair."""
+    import json
+    from decimal import Decimal
+
+    import httpx
+    from live.benchmarks._support import RecordingProvider
+    from test_loop import NOW, ScriptedTools, TranscriptContext
+    from test_provider_token_counting import count_response, is_count, provider_at
+    from test_routing import registration
+
+    from daita.llm.routing import ModelRouter, RetryPolicy
+    from daita.loop import AgentLoop, InMemoryTranscriptStore, LoopLimits, RunInput
+
+    paths = []
+    released = []
+    blocked = asyncio.Event()
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            if progress == "arguments":
+                events = [
+                    {
+                        "type": "response.created",
+                        "response": {"id": "resp_offline", "status": "in_progress"},
+                    },
+                    {
+                        "type": "response.output_item.added",
+                        "output_index": 0,
+                        "item": {
+                            "type": "function_call",
+                            "id": "fc_offline",
+                            "call_id": "call_offline",
+                            "name": "lookup",
+                            "arguments": "",
+                        },
+                    },
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": 0,
+                        "item_id": "fc_offline",
+                        "delta": "{",
+                    },
+                ]
+                for event in events:
+                    yield ("data: " + json.dumps(event) + "\n\n").encode()
+            blocked.set()
+            await asyncio.Event().wait()
+
+        async def aclose(self):
+            released.append(True)
+
+    async def respond(request):
+        paths.append(request.url.path)
+        if is_count(request.url.path):
+            await asyncio.sleep(0.05)  # Counting consumes the same absolute deadline.
+            return httpx.Response(200, json=count_response("openai", 500))
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=Body()
+        )
+
+    async with provider_at("openai", respond) as adapter:
+        recorder = RecordingProvider(adapter)
+        entry = registration(recorder, streaming=True)
+        router = ModelRouter(
+            (replace(entry, profile=replace(entry.profile, supports_tools=True)),),
+            retry_policy=RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
+        )
+        store = InMemoryTranscriptStore()
+        runtime = ScriptedTools({})
+        loop = AgentLoop(
+            model=router if routed else recorder,
+            context_builder=TranscriptContext(),
+            tools=runtime,
+            transcripts=store,
+            clock=lambda: NOW,
+            stream_model_calls=True,
+            limits=LoopLimits(
+                max_wall_time_seconds=1.5,
+                max_total_tokens=2000,
+                max_estimated_cost_usd=Decimal("0.05"),
+            ),
+        )
+        run = RunInput(
+            id="silent-sdk",
+            agent_id="agent-1",
+            message="Read the value.",
+            created_at=NOW,
+        )
+        started = asyncio.get_running_loop().time()
+        task = asyncio.create_task(loop.run(run))
+        try:
+            async with asyncio.timeout(3):
+                await blocked.wait()
+                if stop == "cancel":
+                    task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                else:
+                    await task
+            result = await store.result(run.id)
+            assert result is not None and result.kind.value == (
+                "interrupted" if stop == "cancel" else "failed"
+            )
+            assert result.final_text is None
+            assert result.usage.cost_estimate.status.value != "complete"
+            assert not runtime.calls
+            transcript = await store.load(run.id)
+            assert (
+                not transcript.tool_pairs
+            )  # Partial arguments are never an executable call.
+            assert len(recorder.requests) == 1 and not recorder.responses
+            assert len(paths) == 2 and is_count(paths[0]) and not is_count(paths[1])
+            request = recorder.requests[0]
+            assert request.deadline is not None
+            assert started <= request.deadline - 1.5 <= started + 0.1
+            timing = recorder.timings[0]
+            assert timing["usage_complete"] is False
+            diagnostic = timing["attempt_diagnostic"]
+            assert isinstance(diagnostic, Mapping)
+            assert diagnostic["count_state"] == "succeeded"
+            assert diagnostic["counted_input_tokens"] == 500
+            assert diagnostic["generation_http_status"] == 200
+            assert diagnostic["terminal_observed"] is False
+            assert diagnostic["cleanup_finished_seconds"] is not None
+            assert (diagnostic["first_native_event_seconds"] is not None) is (
+                progress == "arguments"
+            )
+            assert diagnostic["transport_error_kind"] is None
+            assert released == [True]
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await router.close()
+
+
+async def test_gemini_repeated_cumulative_function_snapshots_emit_one_final_call(
+    monkeypatch,
+):
+    from daita.llm._lifecycle import AttemptLifecycle
+
+    progress = []
+    original = AttemptLifecycle.progress
+
+    def record(self, fragment):
+        progress.append(fragment)
+        original(self, fragment)
+
+    monkeypatch.setattr(AttemptLifecycle, "progress", record)
+
+    def snapshot(value):
+        return {
+            "response_id": "response-1",
+            "candidates": [
+                {
+                    "content": {
+                        "parts": [
+                            {
+                                "function_call": {
+                                    "id": "native-1",
+                                    "name": "lookup",
+                                    "args": {"value": value},
+                                }
+                            }
+                        ]
+                    }
+                }
+            ],
+        }
+
+    provider = GeminiProvider(
+        "test-model",
+        client=cast(
+            Any,
+            _GeminiClient(
+                (
+                    snapshot("a"),
+                    snapshot("a"),
+                    snapshot("ab"),
+                    snapshot("ab"),
+                    {
+                        "response_id": "response-1",
+                        "candidates": [{"finish_reason": "STOP", "content": None}],
+                    },
+                )
+            ),
+        ),
+    )
+    events = await _events(provider, _request())
+    calls = [event for event in events if isinstance(event, ModelToolCallDelta)]
+    assert len(calls) == 1
+    assert calls[0].arguments_delta == '{"value":"ab"}'
+    terminal = cast(ModelStreamCompleted, events[-1])
+    assert dict(terminal.response.tool_calls[0].arguments) == {"value": "ab"}
+    assert progress == ['{"value":"a"}', '{"value":"ab"}']
+
+
+@pytest.mark.parametrize(
+    "bad_event",
+    [
+        {"type": "response.output_text.delta", "sequence_number": 1, "delta": "late"},
+        {"type": "response.in_progress", "response": {"id": "changed"}},
+    ],
+)
+async def test_openai_validates_native_identity_and_sequence_before_progress(bad_event):
+    provider = OpenAIResponsesProvider(
+        "test-model",
+        client=cast(
+            Any,
+            _OpenAIClient(
+                (
+                    {
+                        "type": "response.created",
+                        "sequence_number": 1,
+                        "response": {"id": "original"},
+                    },
+                    bad_event,
+                )
+            ),
+        ),
+    )
+    with pytest.raises(ModelProviderError) as caught:
+        await _events(provider, _request())
+    assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert (
+        caught.value.diagnostic is not None
+        and caught.value.diagnostic.attempt is not None
+    )
+    assert caught.value.diagnostic.attempt["first_substantive_progress_seconds"] is None
+
+
+@pytest.mark.parametrize("family", ["openai", "anthropic", "gemini", "custom"])
+@pytest.mark.parametrize("substantive", [False, True])
+async def test_reasoning_progress_requires_recognized_nonempty_native_content(
+    family, substantive
+):
+    provider: Any
+    marker = "observable-reasoning-fragment" if substantive else ""
+    if family == "openai":
+        provider = OpenAIResponsesProvider(
+            "test-model",
+            client=cast(
+                Any,
+                _OpenAIClient(
+                    (
+                        {
+                            "type": "response.reasoning_summary_text.delta",
+                            "delta": marker,
+                        },
+                    )
+                ),
+            ),
+        )
+    elif family == "anthropic":
+        provider = AnthropicMessagesProvider(
+            "test-model",
+            client=cast(
+                Any,
+                _AnthropicClient(
+                    (
+                        {
+                            "type": "message_start",
+                            "message": {
+                                "id": "r",
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [],
+                                "stop_reason": None,
+                            },
+                        },
+                        {
+                            "type": "content_block_start",
+                            "index": 0,
+                            "content_block": {
+                                "type": "thinking",
+                                "thinking": "",
+                                "signature": "",
+                            },
+                        },
+                        {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "thinking_delta", "thinking": marker},
+                        },
+                    )
+                ),
+            ),
+        )
+    elif family == "gemini":
+        provider = GeminiProvider(
+            "test-model",
+            client=cast(
+                Any,
+                _GeminiClient(
+                    (
+                        {
+                            "candidates": [
+                                {
+                                    "content": {
+                                        "parts": [{"thought": True, "text": marker}]
+                                    }
+                                }
+                            ]
+                        },
+                    )
+                ),
+            ),
+        )
+    else:
+        provider = _compatible_provider(
+            "custom",
+            (
+                {
+                    "id": "r",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"reasoning_content": marker},
+                            "finish_reason": None,
+                        }
+                    ],
+                },
+            ),
+        )
+    with pytest.raises(ModelProviderError) as caught:
+        await _events(provider, _request())
+    assert (
+        caught.value.diagnostic is not None
+        and caught.value.diagnostic.attempt is not None
+    )
+    diagnostic = caught.value.diagnostic.attempt
+    assert (diagnostic["first_substantive_progress_seconds"] is not None) == substantive
+    assert "observable-reasoning-fragment" not in str(diagnostic.to_dict())
+    assert diagnostic["canonical_emitted"] is False

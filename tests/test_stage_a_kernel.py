@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
@@ -27,7 +28,7 @@ from daita.capabilities import (
 )
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.capabilities import CATALOG_SEARCH_CAPABILITY_ID
-from daita.domains.data.context import DataContextBuilder, _estimate_input_tokens
+from daita.context import AgentContextBuilder, _estimate_input_tokens
 from daita.domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
 from daita.llm.errors import ContextEvidencePressureExceeded
 from daita.llm.models import (
@@ -69,7 +70,7 @@ def _error(result: ToolResultBlock) -> Mapping[str, object]:
 
 
 class _Context:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         del run
         return messages[:-1], tool_context.initial_provider_definitions
 
@@ -80,14 +81,16 @@ class _Context:
         *,
         step,
         tool_context,
-        final=False,
         previous_request_input_tokens=None,
+        remaining_tokens=None,
+        request_input_growth_tokens=None,
+        remaining_steps=None,
     ):
         del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
-            tools=() if final else tools,
+            tools=tools,
         )
 
 
@@ -114,6 +117,12 @@ class _RuntimeCatalog:
 
 
 class _SnapshotCatalog:
+    async def source_routing_facts(self, agent_id, source_ids=()):
+        return ({"source_id": "source-snapshot", "adapter_id": "sqlite"},)
+
+    async def readable_resource_ids(self, agent_id, source_ids=()):
+        return frozenset(("resource-snapshot",))
+
     def __init__(self) -> None:
         self.context_reads = 0
         self.sensitivity_reads = 0
@@ -616,14 +625,14 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         max_output_tokens=2_000,
         supports_tools=True,
     )
-    builder = DataContextBuilder(catalog, profile=profile)
+    builder = AgentContextBuilder(catalog, profile=profile)
     run = RunInput(
         id="run-context-snapshot",
         agent_id="agent-stage-a",
         message="question",
         created_at=NOW,
         conversation_id="conversation-stage-a-context",
-        source_id="source-stage-a",
+        source_scope_ids=("source-snapshot",),
     )
     user = CanonicalMessage(role=MessageRole.USER, content=(TextBlock("question"),))
     tool = ToolDefinition(
@@ -687,7 +696,7 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         second.sensitivity_provenance["initial_sensitivity_provenance"],
     )
     assert initial_provenance["authority"] == "run_context_snapshot"
-    assert initial_provenance["source_ids"] == ("source-stage-a",)
+    assert initial_provenance["source_ids"] == ("source-snapshot",)
     assert initial_provenance["static_context_sha256"] == (
         snapshot.static_context_sha256
     )
@@ -696,21 +705,53 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         second.sensitivity_provenance["classified_results"],
     )
     assert classified_results[0]["call_id"] == "classified"
-    final = builder.project(
-        snapshot,
-        current,
-        step=3,
-        tool_context=step_projection,
-        final=True,
-    )
-    assert final.tools == ()
-    assert final.messages[0] == snapshot.final_static_messages[0]
-    assert "execution step limit has been reached" in repr(final.messages[0])
     assert "execution step limit has been reached" not in repr(first.messages[0])
+    assert "execution step limit has been reached" not in repr(second.messages[0])
+    assert not hasattr(snapshot, "final_static_messages")
+
+
+async def test_optional_context_uses_run_allowance_without_rejecting_mandatory_input():
+    catalog = _SnapshotCatalog()
+    profile = ModelProfile(
+        id="mock:large-window",
+        context_window_tokens=1_050_000,
+        max_output_tokens=128_000,
+        supports_tools=True,
+    )
+    builder = AgentContextBuilder(catalog, profile=profile)
+    run = replace(_run("run-context-budget"), source_scope_ids=("source-snapshot",))
+    user = run.start_message()
+    projection = ContextToolProjectionAdapter(())
+    tools = await projection.prepare_run(run)
+    wide = await builder.prepare(run, (user,), tools, max_total_tokens=100_000)
+    narrow = await builder.prepare(run, (user,), tools, max_total_tokens=1_000)
+    wide_request = builder.project(
+        wide, (user,), step=1, tool_context=projection.project(tools, (user,))
+    )
+    narrow_request = builder.project(
+        narrow,
+        (user,),
+        step=1,
+        tool_context=projection.project(tools, (user,)),
+        remaining_tokens=1,
+    )
+    assert '"returned_count":1' in repr(wide_request.messages[0])
+    assert '"returned_count":0' in repr(narrow_request.messages[0])
+    assert "Remaining cumulative run allowance: 1 tokens" in repr(
+        narrow_request.messages[0]
+    )
+    assert narrow_request.messages[-1] == user
+    assert wide.initial_sensitivity == narrow.initial_sensitivity
+    assert (
+        wide.initial_sensitivity_provenance["source_ids"]
+        == narrow.initial_sensitivity_provenance["source_ids"]
+    )
+    # Context shaping cannot replace provider counting with a byte-based refusal.
+    assert narrow_request.max_total_tokens is None
 
 
 async def test_context_owns_durable_job_handoff_guidance() -> None:
-    builder = DataContextBuilder(
+    builder = AgentContextBuilder(
         _SnapshotCatalog(),
         profile=ModelProfile(
             id="mock:durable-handoff-context",
@@ -725,7 +766,7 @@ async def test_context_owns_durable_job_handoff_guidance() -> None:
         message="Profile the current table in the background.",
         created_at=NOW,
         conversation_id="conversation-durable-handoff-context",
-        source_id="source-stage-a",
+        source_scope_ids=("source-snapshot",),
     )
     user = run.start_message()
     start_tool = ToolDefinition(
@@ -753,7 +794,7 @@ async def test_context_owns_durable_job_handoff_guidance() -> None:
 
 
 async def test_context_owner_rejects_cumulative_evidence_pressure_explicitly():
-    builder = DataContextBuilder(
+    builder = AgentContextBuilder(
         _SnapshotCatalog(),
         profile=ModelProfile(
             id="mock:stage-a-pressure",
@@ -834,7 +875,9 @@ async def test_successful_fallback_provider_is_sticky_for_run():
 
     router = ModelRouter(
         (registration(first), registration(second)),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
+        ),
     )
     route = router.begin_run(ModelSensitivity.INTERNAL)
     request = ModelRequest(
@@ -889,7 +932,9 @@ async def test_selected_route_rejects_raised_sensitivity_without_new_fallback():
             ),
             registration(later, ModelSensitivity),
         ),
-        retry_policy=RetryPolicy(attempts=1, backoff_seconds=0),
+        retry_policy=RetryPolicy(
+            max_attempts_per_candidate=1, max_total_attempts=2, backoff_seconds=0
+        ),
     )
     route = router.begin_run(ModelSensitivity.INTERNAL)
     internal = ModelRequest(
@@ -933,7 +978,7 @@ async def test_tool_call_response_bound_rejects_batch_before_execution():
     assert result.reason == "tool_calls_per_response_exceeded"
     assert tuple(
         message.role for message in (await store.load(result.run_id)).messages
-    ) == (MessageRole.USER,)
+    ) == (MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL, MessageRole.TOOL)
 
 
 async def test_tool_call_run_bound_counts_across_responses():

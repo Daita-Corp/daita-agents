@@ -3,17 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import random
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from decimal import Decimal
+from typing import cast
 
+from ..errors import ErrorRetryability
 from ..security import SecretReference
-from ._lifecycle import await_cleanup, closing_stream
+from ._lifecycle import (
+    NativeOwner,
+    await_cleanup,
+    closing_stream,
+    materialize_request,
+    shutdown_deadline,
+)
 from .errors import (
     ModelProviderError,
     ProviderErrorCode,
     ProviderFailureDiagnostic,
     ProviderFailurePhase,
+    before_generation,
+    interrupted_model_usage,
+    with_cancelled_model_usage,
 )
 from .models import (
     ModelProfile,
@@ -24,7 +36,7 @@ from .models import (
     ModelStreamEvent,
     ModelUsage,
 )
-from .pricing import aggregate_cost_estimates
+from .pricing import CostEstimateStatus, aggregate_cost_estimates
 from .protocols import (
     ManagedModelProvider,
     ModelProvider,
@@ -33,27 +45,25 @@ from .protocols import (
     provider_supports_request_policy,
 )
 
-_TRANSIENT = frozenset(
-    {
-        ProviderErrorCode.RATE_LIMIT_ERROR,
-        ProviderErrorCode.PROVIDER_UNAVAILABLE,
-        ProviderErrorCode.TIMEOUT,
-    }
-)
-
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
-    attempts: int = 2
+    max_attempts_per_candidate: int = 2
+    max_total_attempts: int = 3
     backoff_seconds: float = 0.25
 
     def __post_init__(self) -> None:
         if (
-            not isinstance(self.attempts, int)
-            or isinstance(self.attempts, bool)
-            or not 1 <= self.attempts <= 5
+            not isinstance(self.max_attempts_per_candidate, int)
+            or isinstance(self.max_attempts_per_candidate, bool)
+            or not 1 <= self.max_attempts_per_candidate <= 5
         ):
             raise ValueError("retry attempts must be from 1 through 5")
+        if (
+            type(self.max_total_attempts) is not int
+            or not 1 <= self.max_total_attempts <= 25
+        ):
+            raise ValueError("total attempts must be from 1 through 25")
         if (
             not isinstance(self.backoff_seconds, (int, float))
             or isinstance(self.backoff_seconds, bool)
@@ -205,6 +215,7 @@ class ModelRouter:
         self._retry_policy = retry_policy
         self._sleep = sleep
         self._close_task: asyncio.Task[None] | None = None
+        self._native_owner = NativeOwner()
 
     @property
     def provider_id(self) -> str:
@@ -232,33 +243,41 @@ class ModelRouter:
             self._retry_policy,
         ).model_profile
 
-    async def close(self) -> None:
+    async def close(self, *, deadline: float | None = None) -> None:
         """Join once-only cleanup without activating unused delegates."""
 
+        deadline = shutdown_deadline(deadline)
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._finish_close())
-        await await_cleanup(self._close_task)
+            self._close_task = asyncio.create_task(self._finish_close(deadline))
+        await await_cleanup(
+            self._close_task, deadline=deadline, owner=self._native_owner
+        )
 
-    async def _finish_close(self) -> None:
-        first_error: BaseException | None = None
-        for registration in reversed(self._candidates):
-            if not registration.close_with_router:
-                continue
-            provider = registration.provider
-            assert isinstance(provider, ManagedModelProvider)
-            try:
-                await provider.close()
-            except BaseException as error:
-                if first_error is None:
-                    first_error = error
-        if first_error is not None:
-            raise first_error
+    async def _finish_close(self, deadline: float) -> None:
+        # Ask every owner to close before waiting on any slow one.
+        closures = [
+            asyncio.create_task(
+                cast(ManagedModelProvider, registration.provider).close(
+                    deadline=deadline
+                )
+            )
+            for registration in reversed(self._candidates)
+            if registration.close_with_router
+        ]
+        results = await asyncio.gather(*closures, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     def _require_open(self) -> None:
+        self._native_owner.require_available()
         if self._close_task is not None:
-            raise ModelProviderError(
-                ProviderErrorCode.PROVIDER_UNAVAILABLE,
-                "model router is closed",
+            raise before_generation(
+                ModelProviderError(
+                    ProviderErrorCode.PROVIDER_UNAVAILABLE,
+                    "model router is closed",
+                ),
+                code="router_closed",
             )
 
     def supports_request_policy(self, request: ModelRequest) -> bool:
@@ -321,50 +340,73 @@ class ModelRouter:
         route: RunRoute | None,
     ) -> ModelResponse:
         self._require_open()
+        request = materialize_request(request, attempt=False)
+        total_attempts = 0
         last_error: ModelProviderError | None = None
         attempt_usage: list[ModelUsage] = []
+        in_flight = False
         candidates = self._candidates if route is None else self._run_candidates(route)
-        for registration in candidates:
-            if not _eligible(registration, request):
-                continue
-            for attempt in range(self._retry_policy.attempts):
-                try:
-                    response = await registration.provider.generate(request)
-                except asyncio.CancelledError:
-                    raise
-                except ModelProviderError as error:
-                    last_error = error
-                    attempt_usage.append(error.usage)
-                    if error.code not in _TRANSIENT:
-                        break
-                    if attempt + 1 < self._retry_policy.attempts:
-                        delay = (
-                            error.retry_after_seconds
-                            if error.retry_after_seconds is not None
-                            else self._retry_policy.backoff_seconds * (2**attempt)
-                        )
-                        if delay:
-                            await self._sleep(delay)
-                else:
-                    attempt_usage.append(response.usage)
-                    if route is not None:
-                        route.selected_provider_id = registration.provider.provider_id
-                    return replace(
-                        response,
-                        usage=_aggregate_usage(attempt_usage),
+        try:
+            for registration in candidates:
+                if not _eligible(registration, request):
+                    continue
+                for attempt in range(self._retry_policy.max_attempts_per_candidate):
+                    attempt_request = self._admit_attempt(
+                        request, attempt_usage, total_attempts, last_error
                     )
-        if last_error is not None:
+                    total_attempts += 1
+                    in_flight = True
+                    try:
+                        response = await registration.provider.generate(attempt_request)
+                    except ModelProviderError as error:
+                        if error.provider_id is None:
+                            error.provider_id = registration.provider.provider_id
+                        in_flight = False
+                        last_error = error
+                        _number_attempt(error, attempt + 1, total_attempts)
+                        attempt_usage.append(error.usage)
+                        _require_recoverable_usage(request, error, attempt_usage)
+                        if not await self._wait_for_retry(
+                            request, error, attempt, attempt_usage, total_attempts
+                        ):
+                            break
+                    else:
+                        in_flight = False
+                        attempt_usage.append(response.usage)
+                        if route is not None:
+                            route.selected_provider_id = (
+                                registration.provider.provider_id
+                            )
+                        return _number_response(
+                            replace(response, usage=_aggregate_usage(attempt_usage)),
+                            attempt + 1,
+                            total_attempts,
+                        )
+        except asyncio.CancelledError as error:
+            raise with_cancelled_model_usage(
+                error,
+                _interruption_usage(error, attempt_usage, in_flight),
+            ) from None
+        except TimeoutError as error:
             raise ModelProviderError(
-                last_error.code,
-                str(last_error),
-                provider_id=last_error.provider_id,
-                retry_after_seconds=last_error.retry_after_seconds,
-                usage=_aggregate_usage(attempt_usage),
-                diagnostic=last_error.diagnostic,
-            )
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=_interruption_usage(error, attempt_usage, in_flight),
+            ) from None
+        except ModelProviderError:
+            raise
+        except Exception as error:
+            raise ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "The model provider boundary failed.",
+                usage=_interruption_usage(error, attempt_usage, in_flight),
+            ) from None
+        if last_error is not None:
+            raise _aggregate_failure(last_error, attempt_usage)
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,
             "no configured provider can handle this request",
+            usage=_aggregate_usage(attempt_usage),
         )
 
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
@@ -388,55 +430,59 @@ class ModelRouter:
         request: ModelRequest,
         route: RunRoute | None,
     ) -> AsyncIterator[ModelStreamEvent]:
-        """Route one canonical stream without retrying after visible progress."""
-
+        """Keep completion and all visible progress terminal for retry purposes."""
         self._require_open()
+        request = materialize_request(request, attempt=False)
+        total_attempts = 0
         last_error: ModelProviderError | None = None
         attempt_usage: list[ModelUsage] = []
+        in_flight = False
         candidates = self._candidates if route is None else self._run_candidates(route)
-        for registration in candidates:
-            if not _eligible(registration, request):
-                continue
-            if not registration.profile.supports_streaming or not isinstance(
-                registration.provider, StreamingModelProvider
-            ):
-                continue
-            for attempt in range(self._retry_policy.attempts):
-                emitted = False
-                try:
+        try:
+            for registration in candidates:
+                if not _eligible(registration, request):
+                    continue
+                if not registration.profile.supports_streaming or not isinstance(
+                    registration.provider, StreamingModelProvider
+                ):
+                    continue
+                for attempt in range(self._retry_policy.max_attempts_per_candidate):
+                    attempt_request = self._admit_attempt(
+                        request, attempt_usage, total_attempts, last_error
+                    )
+                    total_attempts += 1
+                    emitted = False
                     completed = False
-                    async with closing_stream(
-                        registration.provider.stream(request)
-                    ) as events:
-                        async for event in events:
-                            if completed:
-                                raise ModelProviderError(
-                                    ProviderErrorCode.MALFORMED_RESPONSE,
-                                    "provider stream continued after completion",
-                                    provider_id=registration.provider.provider_id,
-                                    diagnostic=ProviderFailureDiagnostic(
-                                        phase=ProviderFailurePhase.STREAM_TERMINAL,
-                                        code="stream_continued_after_completion",
-                                    ),
-                                )
-                            if isinstance(event, ModelStreamCompleted):
-                                completed = True
-                                attempt_usage.append(event.response.usage)
-                                if route is not None:
-                                    route.selected_provider_id = (
-                                        registration.provider.provider_id
-                                    )
-                                yield ModelStreamCompleted(
-                                    replace(
+                    in_flight = True
+                    try:
+                        async with closing_stream(
+                            registration.provider.stream(attempt_request)
+                        ) as events:
+                            async for event in events:
+                                # A completion is visible progress too. Close the
+                                # request on its first terminal event, without
+                                # reading or retrying any subsequent generation.
+                                emitted = True
+                                if isinstance(event, ModelStreamCompleted):
+                                    completed = True
+                                    in_flight = False
+                                    attempt_usage.append(event.response.usage)
+                                    terminal = replace(
                                         event.response,
                                         usage=_aggregate_usage(attempt_usage),
                                     )
-                                )
-                                return
-                            else:
-                                emitted = True
+                                    break
                                 yield event
-                    if not completed:
+                        if completed:
+                            if route is not None:
+                                route.selected_provider_id = (
+                                    registration.provider.provider_id
+                                )
+                            request.remaining_after(_aggregate_usage(()))
+                            yield ModelStreamCompleted(
+                                _number_response(terminal, attempt + 1, total_attempts)
+                            )
+                            return
                         raise ModelProviderError(
                             ProviderErrorCode.MALFORMED_RESPONSE,
                             "provider stream ended without a canonical completion",
@@ -446,44 +492,89 @@ class ModelRouter:
                                 code="canonical_completion_missing",
                             ),
                         )
-                    return
-                except asyncio.CancelledError:
-                    raise
-                except ModelProviderError as error:
-                    last_error = error
-                    attempt_usage.append(error.usage)
-                    if emitted:
-                        raise ModelProviderError(
-                            error.code,
-                            str(error),
-                            provider_id=error.provider_id,
-                            retry_after_seconds=error.retry_after_seconds,
-                            usage=_aggregate_usage(attempt_usage),
-                            diagnostic=error.diagnostic,
-                        ) from None
-                    if error.code not in _TRANSIENT:
-                        break
-                    if attempt + 1 < self._retry_policy.attempts:
-                        delay = (
-                            error.retry_after_seconds
-                            if error.retry_after_seconds is not None
-                            else self._retry_policy.backoff_seconds * (2**attempt)
+                    except ModelProviderError as error:
+                        in_flight = False
+                        last_error = error
+                        # Cleanup after completion is not another model attempt.
+                        if not completed:
+                            if error.provider_id is None:
+                                error.provider_id = registration.provider.provider_id
+                            _number_attempt(error, attempt + 1, total_attempts)
+                            attempt_usage.append(error.usage)
+                        _require_recoverable_usage(
+                            request, error, attempt_usage, terminal=emitted
                         )
-                        if delay:
-                            await self._sleep(delay)
-        if last_error is not None:
+                        if not await self._wait_for_retry(
+                            request, error, attempt, attempt_usage, total_attempts
+                        ):
+                            break
+        except asyncio.CancelledError as error:
+            raise with_cancelled_model_usage(
+                error,
+                _interruption_usage(error, attempt_usage, in_flight),
+            ) from None
+        except TimeoutError as error:
             raise ModelProviderError(
-                last_error.code,
-                str(last_error),
-                provider_id=last_error.provider_id,
-                retry_after_seconds=last_error.retry_after_seconds,
-                usage=_aggregate_usage(attempt_usage),
-                diagnostic=last_error.diagnostic,
-            )
+                ProviderErrorCode.TIMEOUT,
+                "The model request deadline expired.",
+                usage=_interruption_usage(error, attempt_usage, in_flight),
+            ) from None
+        except ModelProviderError:
+            raise
+        except Exception as error:
+            raise ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "The model provider stream failed.",
+                usage=_interruption_usage(error, attempt_usage, in_flight),
+            ) from None
+        if last_error is not None:
+            raise _aggregate_failure(last_error, attempt_usage)
         raise ModelProviderError(
             ProviderErrorCode.INVALID_REQUEST,
             "no configured provider can stream this request",
+            usage=_aggregate_usage(attempt_usage),
         )
+
+    def _admit_attempt(self, request, usage, total_attempts, last_error):
+        if total_attempts >= self._retry_policy.max_total_attempts:
+            assert last_error is not None
+            raise _aggregate_failure(last_error, usage)
+        narrowed = request.remaining_after(_aggregate_usage(usage))
+        return materialize_request(narrowed)
+
+    async def _wait_for_retry(
+        self,
+        request: ModelRequest,
+        error: ModelProviderError,
+        attempt: int,
+        usage: list[ModelUsage],
+        total_attempts: int,
+    ) -> bool:
+        """One retry/backoff policy for both delivery modes, within existing limits."""
+        if (
+            error.retryability is not ErrorRetryability.TRANSIENT
+            or attempt + 1 >= self._retry_policy.max_attempts_per_candidate
+            or total_attempts >= self._retry_policy.max_total_attempts
+        ):
+            return False
+        request.remaining_after(_aggregate_usage(usage))
+        delay = error.retry_after_seconds
+        if delay is None:
+            delay = min(
+                30.0, self._retry_policy.backoff_seconds * (2**attempt)
+            ) * random.uniform(0.75, 1.0)
+        # Never shorten a server's minimum wait. A request cannot spend unlimited
+        # time waiting or begin a retry with an already exhausted deadline.
+        if delay > 60 or (
+            request.deadline is not None
+            and asyncio.get_running_loop().time() + delay >= request.deadline
+        ):
+            raise _aggregate_failure(error, usage)
+        if delay:
+            async with asyncio.timeout_at(request.deadline):
+                await self._sleep(delay)
+        request.remaining_after(_aggregate_usage(usage))
+        return True
 
     def _run_candidates(
         self,
@@ -532,8 +623,92 @@ def autonomous_request_is_admissible(
     )
 
 
+def _require_recoverable_usage(
+    request: ModelRequest,
+    error: ModelProviderError,
+    usage: list[ModelUsage],
+    *,
+    terminal: bool = False,
+) -> None:
+    if (
+        terminal
+        or error.terminal_observed
+        or error.canonical_emitted
+        or error.cleanup_unresolved
+        or error.code
+        in {
+            ProviderErrorCode.CLEANUP_TIMEOUT,
+            ProviderErrorCode.CLEANUP_FAILED,
+            ProviderErrorCode.OWNER_UNAVAILABLE,
+        }
+    ) or (
+        (
+            request.max_total_tokens is not None
+            or request.max_estimated_cost_usd is not None
+        )
+        and error.usage.cost_estimate.status is not CostEstimateStatus.COMPLETE
+    ):
+        raise _aggregate_failure(error, usage) from None
+
+
+def _number_attempt(error: ModelProviderError, candidate: int, total: int) -> None:
+    from .._json import FrozenJsonObject
+
+    diagnostic = error.diagnostic or ProviderFailureDiagnostic(
+        phase=ProviderFailurePhase.PROVIDER_BOUNDARY, code=error.code.value
+    )
+    material = {} if diagnostic.attempt is None else diagnostic.attempt.to_dict()
+    material.update(candidate_attempt_number=candidate, total_attempt_number=total)
+    error.diagnostic = replace(
+        diagnostic, attempt=FrozenJsonObject.from_mapping(material)
+    )
+
+
+def _number_response(
+    response: ModelResponse, candidate: int, total: int
+) -> ModelResponse:
+    from collections.abc import Mapping
+
+    metadata = dict(response.provider_metadata)
+    existing = metadata.get("attempt_diagnostic")
+    diagnostic = dict(existing) if isinstance(existing, Mapping) else {}
+    diagnostic.update(candidate_attempt_number=candidate, total_attempt_number=total)
+    metadata["attempt_diagnostic"] = diagnostic
+    return replace(response, provider_metadata=metadata)
+
+
+def _interruption_usage(
+    error: BaseException,
+    usage: list[ModelUsage],
+    in_flight: bool,
+) -> ModelUsage:
+    return _aggregate_usage(
+        [*usage, interrupted_model_usage(error)] if in_flight else usage
+    )
+
+
+def _aggregate_failure(
+    error: ModelProviderError, usage: Iterable[ModelUsage]
+) -> ModelProviderError:
+    return ModelProviderError(
+        error.code,
+        str(error),
+        provider_id=error.provider_id,
+        retry_after_seconds=error.retry_after_seconds,
+        usage=_aggregate_usage(usage),
+        diagnostic=error.diagnostic,
+        terminal_observed=error.terminal_observed,
+        cleanup_unresolved=error.cleanup_unresolved,
+        canonical_emitted=error.canonical_emitted,
+    )
+
+
 def _aggregate_usage(items: Iterable[ModelUsage]) -> ModelUsage:
     usage = tuple(items)
+    if not usage:
+        from .pricing import CostEstimate
+
+        return ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
     return ModelUsage(
         input_tokens=sum(item.input_tokens for item in usage),
         output_tokens=sum(item.output_tokens for item in usage),

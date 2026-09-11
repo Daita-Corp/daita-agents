@@ -303,7 +303,7 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         "semantic-acceptance",
         root=tmp_path,
         model=provider,
-        model_profile=_profile(provider),
+        model_profile=replace(_profile(provider), context_window_tokens=64_000),
         limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),
@@ -370,7 +370,9 @@ async def test_foreground_teaching_learn_supersession_reopen_and_skill_invocatio
         "semantic-acceptance",
         root=tmp_path,
         model=reopened_provider,
-        model_profile=_profile(reopened_provider),
+        model_profile=replace(
+            _profile(reopened_provider), context_window_tokens=64_000
+        ),
         id_factory=_ids("reopen"),
         clock=lambda: NOW,
         workspace=workspace_for(tmp_path),
@@ -491,7 +493,7 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
             message="inspect current semantics",
             created_at=NOW,
             conversation_id="semantic-read-conversation",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         semantic_domain.select_explicit_learning_run(read_run.id)
         listed = (

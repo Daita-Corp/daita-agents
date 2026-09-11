@@ -18,6 +18,8 @@ from daita import (
     ConversationRun,
     DeliveryInspection,
     DistributionDestination,
+    EffectReceipt,
+    EffectResolutionDecision,
     InboxView,
     JobInspection,
     JobResultView,
@@ -43,13 +45,13 @@ from daita.agent import (
     AgentModelConfigurationError,
     AgentNameError,
     SourceRefreshError,
-    SourceSelectionError,
 )
 from daita.learning_candidates import (
     learning_candidate_content_from_mapping,
     learning_candidate_content_to_mapping,
 )
 from daita.llm import ModelSensitivity
+from daita.llm.provider_definitions import SUBSCRIPTION_CLIENTS
 from daita.observation import AgentObserver
 from daita.security import (
     CredentialSession,
@@ -72,7 +74,7 @@ from .models import (
     UserInputError,
     parse_candidate_review_cost_limit,
 )
-from .projection import artifact_delivery_messages, completed_tool_pairs
+from .projection import artifact_delivery_messages
 from .sanitization import MAX_DISPLAY_CHARACTERS, render_model_answer, safe_display
 
 VALIDATION_ERRORS = {
@@ -108,11 +110,6 @@ SUBSCRIPTION_VALIDATION_ERRORS = {
     "output_limit": (
         "The model exhausted its validation output budget before proposing the tool."
     ),
-}
-SUBSCRIPTION_CLIENTS = {
-    "codex": ("ChatGPT", "sign in through Daita"),
-    "claude-code": ("Claude Code", "claude auth login"),
-    "grok-build": ("Grok Build", "grok login"),
 }
 MODEL_SETUP_ERRORS = {
     "secret_provider_unavailable": (
@@ -339,9 +336,6 @@ class PresentationController:
 
     async def source_summary(self) -> str:
         agent = self.require_agent()
-        active = await agent.active_source(conversation_id=self.conversation_id)
-        if active is not None:
-            return safe_display(active.display_name, fallback="source")
         sources = tuple(
             source for source in await agent.list_sources() if source.active
         )
@@ -489,11 +483,6 @@ class PresentationController:
 
     async def attach_postgresql(self, **kwargs: Any) -> Any:
         return await self.require_agent().attach_postgresql(**kwargs)
-
-    async def active_source(self) -> Any:
-        return await self.require_agent().active_source(
-            conversation_id=self.conversation_id
-        )
 
     def source_edit_defaults(self, source: Any) -> dict[str, Any]:
         """Return safe editable connection fields from one public registration."""
@@ -658,6 +647,33 @@ class PresentationController:
     async def list_routines(self) -> tuple[ScheduledRoutineSummary, ...]:
         return await self.require_agent().list_routines(limit=50)
 
+    async def list_effects(
+        self, *, unresolved_only: bool = False, limit: int = 20, offset: int = 0
+    ) -> tuple[EffectReceipt, ...]:
+        return await self.require_agent().list_effects(
+            unresolved_only=unresolved_only, limit=limit, offset=offset
+        )
+
+    async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
+        return await self.require_agent().inspect_effect(receipt_id)
+
+    async def resolve_effect(
+        self,
+        receipt_id: str,
+        *,
+        expected_digest: str,
+        decision: EffectResolutionDecision,
+        note: str,
+        evidence_references: tuple[str, ...] = (),
+    ) -> EffectReceipt:
+        return await self.require_agent().resolve_effect(
+            receipt_id,
+            expected_digest=expected_digest,
+            decision=decision,
+            note=note,
+            evidence_references=evidence_references,
+        )
+
     async def inspect_routine(
         self, routine_id: str
     ) -> ScheduledRoutineInspection | None:
@@ -682,16 +698,10 @@ class PresentationController:
             raise ValueError("unknown routine control action") from None
         return await operation(routine_id, expected_revision=expected_revision)
 
-    async def select_source(self, selector: str) -> Any:
-        try:
-            return await self.require_agent().select_source(selector)
-        except SourceSelectionError as error:
-            raise UserInputError(str(error)) from error
-
     async def resolve_source(self, selector: str) -> Any:
         try:
             return await self.require_agent().resolve_source(selector)
-        except SourceSelectionError as error:
+        except ValueError as error:
             raise UserInputError(str(error)) from error
 
     async def refresh_source(self, source_id: str) -> Any:
@@ -802,6 +812,19 @@ class PresentationController:
             return await self._jobs_command(parts)
         if name == "/routines":
             return await self._routines_command(parts, command)
+        if name == "/effects":
+            if len(parts) == 1 or (len(parts) == 3 and parts[1] == "inspect"):
+                return CommandOutcome(
+                    "screen",
+                    screen="effects",
+                    conversation_id=conversation_id,
+                    payload={} if len(parts) == 1 else {"receipt_id": parts[2]},
+                )
+            return CommandOutcome(
+                "notice",
+                "Usage: /effects | /effects inspect <receipt-id>",
+                conversation_id=conversation_id,
+            )
         if name == "/inbox":
             if len(parts) == 1:
                 return CommandOutcome(
@@ -867,14 +890,10 @@ class PresentationController:
                 screen="confirm_delete_agent",
                 payload={"name": self.require_agent().name},
             )
-        if name == "/source" and (len(parts) == 1 or parts[1:] == ["use"]):
+        if name == "/source" and len(parts) == 1:
             return CommandOutcome(
-                "screen",
-                screen="source_picker",
-                conversation_id=conversation_id,
+                "screen", screen="catalog", conversation_id=conversation_id
             )
-        if name == "/source" and len(parts) >= 3 and parts[1] == "use":
-            return await self._use_source(" ".join(parts[2:]))
         if name == "/source" and parts[1:] == ["add"]:
             return CommandOutcome(
                 "screen",
@@ -950,7 +969,7 @@ class PresentationController:
         if name == "/source":
             return CommandOutcome(
                 "notice",
-                "Usage: /source | /source use <name> | /source add | /source edit | "
+                "Usage: /source | /source add | /source edit | "
                 "/source refresh <source-id> | /source detach <source> | "
                 "/source permissions",
             )
@@ -978,7 +997,7 @@ class PresentationController:
             return CommandOutcome(
                 "run",
                 run_message=(
-                    "Create a scheduled read routine for this self-contained "
+                    "Create a saved assignment for this self-contained "
                     "instruction, eliciting any missing schedule or scope details and "
                     "using the routine management tools: " + instruction
                 ),
@@ -991,7 +1010,7 @@ class PresentationController:
                 run_message=(
                     "Promote completed run "
                     + parts[2]
-                    + " into a scheduled read routine with this self-contained "
+                    + " into a saved assignment with this self-contained "
                     "instruction, using exact promotion evidence: " + instruction
                 ),
                 conversation_id=conversation_id,
@@ -1001,7 +1020,7 @@ class PresentationController:
             return CommandOutcome(
                 "run",
                 run_message=(
-                    "Inspect and update scheduled read routine "
+                    "Inspect and update saved assignment "
                     + parts[2]
                     + " using its exact current revision and the routine management "
                     "tools. The replacement self-contained instruction is: "
@@ -1208,11 +1227,14 @@ class PresentationController:
         self,
         endpoint: str,
         selections: tuple[MCPToolSelection, ...],
+        *,
+        maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
     ) -> MCPBindingStatus:
         try:
             return await self.require_agent().attach_mcp_server(
                 endpoint=endpoint,
                 selections=selections,
+                maximum_outbound_sensitivity=maximum_outbound_sensitivity,
             )
         except MCPAdmissionError as error:
             reason = error.details.get("reason")
@@ -1237,19 +1259,6 @@ class PresentationController:
             + safe_display(status.binding.binding_id, fallback="binding")
             + " revoked."
         )
-
-    async def _use_source(self, selector: str) -> CommandOutcome:
-        prior = await self.require_agent().active_source(
-            conversation_id=self.conversation_id
-        )
-        selected = await self.select_source(selector)
-        conversation_id = self.conversation_id
-        message = f"Source  {safe_display(selected.display_name, fallback='source')}"
-        if (prior is None or prior.id != selected.id) and conversation_id is not None:
-            self.conversation_id = None
-            conversation_id = None
-            message += "\nStarted a new conversation to keep source context isolated."
-        return CommandOutcome("notice", message, conversation_id=conversation_id)
 
     async def clear_conversations(self) -> CommandOutcome:
         cleared = await self.require_agent().clear_conversations()
@@ -1583,7 +1592,7 @@ class PresentationController:
                 )
         try:
             transcript = await self.require_agent().transcript(result.run_id)
-            notices.extend(artifact_delivery_messages(completed_tool_pairs(transcript)))
+            notices.extend(artifact_delivery_messages(transcript.tool_pairs))
         except Exception:
             pass
         return tuple(notices)
@@ -1640,7 +1649,9 @@ class PresentationController:
         return (
             f"Agent      {safe_display(agent.name, fallback='agent')}\n"
             f"Model      {safe_display(self.model_label(), fallback='model')}\n"
-            f"Source     {source}\n"
+            f"Sources    {source}\n"
+            "Host       open in this TUI; background reasoning shares the run lock.\n"
+            "Handoff    exit this TUI, then start daita host --agent <name>. No progress while all hosts are closed.\n"
             f"Workspace  {safe_display(str(self.workspace.root), fallback='admitted')} "
             f"[{self.workspace.sensitivity.value}]\n"
             "Conversation  " + safe_display(self.conversation_id, fallback="new")

@@ -14,6 +14,7 @@ git clone https://github.com/Daita-Corp/daita-agents.git
 cd daita-agents
 python3.11 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pre_commit install
 ```
 
 ## Report a problem
@@ -44,11 +45,11 @@ catalog, scheduler, state store, or writer.
    validation performed.
 
 Use type hints on public functions and docstrings on public classes and
-methods. Format Python with Black.
+methods. Use pre-commit to sort imports with Ruff and format Python with Black.
 
 ```bash
+.venv/bin/python -m pre_commit run --all-files
 .venv/bin/python -m pytest tests/ -m "not requires_llm and not requires_db"
-.venv/bin/python -m black --check src tests
 .venv/bin/python -m mypy src/daita tests
 ```
 

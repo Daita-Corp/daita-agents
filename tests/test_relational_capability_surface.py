@@ -31,9 +31,10 @@ from daita.domains.data import (
     SQLiteReadResult,
     data_export_tabular_capability_declarations,
     data_query_capability_declarations,
-    postgresql_update_capability_declarations,
-    postgresql_update_preview_capability_declarations,
     project_result_rows,
+    relational_update_capability_declarations,
+    relational_update_preview_capability_declarations,
+    relational_upsert_capability_declarations,
     resource_revision_observation_declarations,
 )
 from daita.domains.data.routine_precheck import ResourceRevisionCatalog
@@ -148,8 +149,12 @@ class _Catalog:
             fact for fact in facts if not source_ids or fact["source_id"] in source_ids
         )
 
-    async def postgresql_update_applicable_source_ids(
-        self, agent_id: str, source_ids: tuple[str, ...] = ()
+    async def relational_write_applicable_source_ids(
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+        *,
+        operation: str = "update",
     ) -> frozenset[str]:
         del agent_id, source_ids
         return frozenset()
@@ -182,7 +187,11 @@ class _Catalog:
         )
 
     async def readable_resource_ids(
-        self, agent_id: str, source_ids: tuple[str, ...] = ()
+        self,
+        agent_id: str,
+        source_ids: tuple[str, ...] = (),
+        *,
+        operation: str = "update",
     ) -> frozenset[str]:
         del agent_id
         return frozenset(
@@ -208,8 +217,9 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> No
     )
     query_bundle = data_query_capability_declarations()
     export_bundle = data_export_tabular_capability_declarations()
-    preview_bundle = postgresql_update_preview_capability_declarations()
-    update_bundle = postgresql_update_capability_declarations()
+    preview_bundle = relational_update_preview_capability_declarations()
+    update_bundle = relational_update_capability_declarations()
+    upsert_bundle = relational_upsert_capability_declarations()
     revision_bundle = resource_revision_observation_declarations(
         agent_id="agent-relational",
         catalog=cast(ResourceRevisionCatalog, catalog),
@@ -221,6 +231,7 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> No
         *export_bundle.capabilities,
         *preview_bundle.capabilities,
         *update_bundle.capabilities,
+        *upsert_bundle.capabilities,
         *revision_bundle.capabilities,
     )
     domain = DataCapabilityDomain(
@@ -234,6 +245,7 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> No
                 *export_bundle.tool_views,
                 *preview_bundle.tool_views,
                 *update_bundle.tool_views,
+                *upsert_bundle.tool_views,
             ),
         ),
         cast(DataDomainCatalog, catalog),

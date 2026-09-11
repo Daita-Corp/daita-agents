@@ -48,7 +48,7 @@ NOW = datetime(2026, 7, 21, tzinfo=UTC)
 
 
 class TranscriptContext:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         del run
         return messages[:-1], tool_context.initial_provider_definitions
 
@@ -59,19 +59,21 @@ class TranscriptContext:
         *,
         step,
         tool_context,
-        final=False,
         previous_request_input_tokens=None,
+        remaining_tokens=None,
+        request_input_growth_tokens=None,
+        remaining_steps=None,
     ):
         del step, previous_request_input_tokens, tool_context
         static, tools = snapshot
         return ModelRequest(
             messages=(*static, *messages),
-            tools=() if final else tools,
+            tools=tools,
         )
 
 
 class OverflowContext:
-    async def prepare(self, run, messages, tool_context):
+    async def prepare(self, run, messages, tool_context, *, max_total_tokens=None):
         del run, messages, tool_context
         raise ContextWindowExceeded
 
@@ -653,7 +655,7 @@ async def test_outer_step_limit_emits_one_completion():
 
     result = await loop.run(_run("run-step-limit"))
 
-    assert result.kind is LoopExitKind.COMPLETED
+    assert result.kind is LoopExitKind.FAILED
     assert result.reason == "step_limit_reached"
     assert _kinds(events).count(AgentEventKind.RUN_COMPLETED) == 1
 

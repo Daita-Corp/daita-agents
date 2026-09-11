@@ -430,7 +430,8 @@ async def test_job_lifecycle_executors_are_agent_scoped_and_origin_is_provenance
     try:
         listed = await JobListExecutor(owner).execute(
             ToolExecution(
-                **request,
+                run_id=request["run_id"],
+                conversation_id=request["conversation_id"],
                 call_id="list",
                 capability_id="jobs.list",
                 arguments={"statuses": (JobStatus.QUEUED.value,)},
@@ -447,7 +448,8 @@ async def test_job_lifecycle_executors_are_agent_scoped_and_origin_is_provenance
 
         inspected = await JobInspectExecutor(owner).execute(
             ToolExecution(
-                **request,
+                run_id=request["run_id"],
+                conversation_id=request["conversation_id"],
                 call_id="inspect",
                 capability_id="jobs.inspect",
                 arguments={"job_id": job.job_id},
@@ -461,7 +463,8 @@ async def test_job_lifecycle_executors_are_agent_scoped_and_origin_is_provenance
 
         cancelled = await JobCancelExecutor(owner).execute(
             ToolExecution(
-                **request,
+                run_id=request["run_id"],
+                conversation_id=request["conversation_id"],
                 call_id="cancel",
                 capability_id="jobs.cancel",
                 arguments={"job_id": job.job_id},
@@ -478,7 +481,8 @@ async def test_job_lifecycle_executors_are_agent_scoped_and_origin_is_provenance
         ):
             await JobInspectExecutor(foreign_owner).execute(
                 ToolExecution(
-                    **request,
+                    run_id=request["run_id"],
+                    conversation_id=request["conversation_id"],
                     call_id="foreign-inspect",
                     capability_id="jobs.inspect",
                     arguments={"job_id": job.job_id},
@@ -516,13 +520,16 @@ async def test_job_context_is_agent_scoped_and_result_first(tmp_path: Path) -> N
             in system.text
         )
         assert "even when the numbers happen to match" in system.text
-        assert "Use job_inspect only" in system.text
+        assert (
+            "For requested lifecycle details, call job_inspect when needed"
+            in system.text
+        )
         search = next(
             item for item in provider.requests[0].tools if item.name == "toolbox_search"
         )
         properties = search.input_schema["properties"]
         assert isinstance(properties, Mapping)
-        assert set(properties) == {"query", "limit"}
+        assert set(properties) == {"query", "limit", "cursor"}
     finally:
         await agent.close()
 
@@ -545,7 +552,10 @@ async def test_daita_data_profile_runs_after_originating_interaction_and_reopens
         workspace=workspace_for(tmp_path),
     )
     try:
-        exit = await agent.run("Profile the customer data.", source_id=source_id)
+        exit = await agent.run(
+            "Profile the customer data.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
+        )
         assert exit.final_text == "Job accepted."
         job_id = _job_id(provider)
         inspection = await _terminal(agent, job_id)
@@ -603,7 +613,7 @@ async def test_explicit_external_selection_reconciles_a_lost_start_response(
     try:
         await agent.run(
             "Use the selected connected executor.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
             job_executor_profile_id=profile.profile_id,
         )
         job_id = _job_id(provider)
@@ -644,7 +654,7 @@ async def test_external_cancel_intent_is_durable_before_lost_response(
     try:
         await agent.run(
             "Start then cancel the selected connected job.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
             job_executor_profile_id=profile.profile_id,
         )
         job_id = _job_id(provider)
@@ -708,7 +718,7 @@ async def test_invalid_external_selection_fails_before_admission_or_io(
     try:
         await agent.run(
             "Try only the explicitly selected connected executor.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
             job_executor_profile_id=selection,
         )
         results = tuple(
@@ -747,7 +757,7 @@ async def test_external_result_bound_fails_closed_without_daita_fallback(
     try:
         await agent.run(
             "Use the selected executor and enforce the result bound.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
             job_executor_profile_id=profile.profile_id,
         )
         job_id = _job_id(provider)
@@ -779,7 +789,7 @@ async def test_external_binding_drift_is_rejected_before_external_io(
     try:
         await agent.run(
             "Use the exact selected executor only.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
             job_executor_profile_id=profile.profile_id,
         )
         inspection = await _terminal(agent, _job_id(provider))
@@ -812,7 +822,7 @@ async def test_external_cancel_intent_precedes_fresh_profile_revalidation(
     try:
         await agent.run(
             "Start the selected executor and then cancel it.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
             job_executor_profile_id=profile.profile_id,
         )
         job_id = _job_id(provider)
@@ -855,7 +865,7 @@ async def test_reopen_past_deadline_reconciles_authoritative_external_success(
     )
     await agent.run(
         "Start external work that must be reconciled after host loss.",
-        source_id=source_id,
+        source_scope_ids=(() if source_id is None else (source_id,)),
         job_executor_profile_id=profile.profile_id,
     )
     job_id = _job_id(provider)
@@ -898,7 +908,10 @@ async def test_public_and_model_job_result_reads_are_side_effect_free(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("Profile the source.", source_id=source_id)
+        await agent.run(
+            "Profile the source.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
+        )
         job_id = _job_id(provider)
         await _terminal(agent, job_id)
         before = await agent._embedded._store.load_job(agent.id, job_id)
@@ -962,9 +975,15 @@ async def test_same_source_jobs_run_concurrently_and_cancelling_one_isolates_its
 
     monkeypatch.setattr(executor, "execute", controlled_execute)
     try:
-        await agent.run("Start the first profile.", source_id=source_id)
+        await agent.run(
+            "Start the first profile.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
+        )
         first_id = _job_id_at(provider, 1)
-        await agent.run("Start an independent sibling profile.", source_id=source_id)
+        await agent.run(
+            "Start an independent sibling profile.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
+        )
         second_id = _job_id_at(provider, 3)
         await asyncio.wait_for(both_started.wait(), timeout=2)
         assert started == {first_id, second_id}
@@ -1018,7 +1037,10 @@ async def test_host_reopen_fences_and_safely_restarts_an_interrupted_daita_job(
     monkeypatch.setattr(executor, "execute", interrupted_execute)
     closed = False
     try:
-        await agent.run("Start a profile before host close.", source_id=source_id)
+        await agent.run(
+            "Start a profile before host close.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
+        )
         job_id = _job_id(provider)
         await asyncio.wait_for(entered.wait(), timeout=2)
         running = await agent.inspect_job(job_id)
@@ -1117,7 +1139,10 @@ async def test_revoked_read_scope_is_rechecked_before_internal_executor_io(
 
     monkeypatch.setattr(executor, "execute", counted_execute)
     try:
-        await agent.run("Queue a profile before scope revocation.", source_id=source_id)
+        await agent.run(
+            "Queue a profile before scope revocation.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
+        )
         job_id = _job_id(provider)
         queued = await agent.inspect_job(job_id)
         assert queued is not None and queued.summary.status is JobStatus.QUEUED
@@ -1166,7 +1191,7 @@ async def test_external_start_revalidates_current_scope_after_persisting_intent(
     try:
         await agent.run(
             "Queue selected external work before scope revocation.",
-            source_id=source_id,
+            source_scope_ids=(() if source_id is None else (source_id,)),
             job_executor_profile_id=profile.profile_id,
         )
         job_id = _job_id(provider)
@@ -1229,7 +1254,8 @@ async def test_published_artifact_wins_a_cancellation_completion_race(
     monkeypatch.setattr(store, "finalize_job_attempt", gated_finalize)
     try:
         await agent.run(
-            "Start a profile and retain any known result.", source_id=source_id
+            "Start a profile and retain any known result.",
+            source_scope_ids=(() if source_id is None else (source_id,)),
         )
         job_id = _job_id(provider)
         await asyncio.wait_for(finalize_entered.wait(), timeout=2)

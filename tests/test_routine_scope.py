@@ -5,10 +5,12 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
+from typing import Any, cast
 
 import pytest
 from _capability_runtime_support import (
     StaticTestDomain,
+    frozen_execution_bindings,
     presentation_metadata,
     static_registry,
 )
@@ -18,6 +20,7 @@ from daita.capabilities import (
     AccessMode,
     AutomationEligibility,
     Capability,
+    CapabilityRegistry,
     ExecutionScope,
     OperationalEffect,
     ToolExecution,
@@ -34,6 +37,7 @@ from daita.loop.models import (
     RunOrigin,
     RunStartEnvelope,
 )
+from daita.scope import resolve_effective_source_scope
 from daita.storage.sqlite_codecs.execution_scope import (
     decode_execution_scope,
     encode_execution_scope,
@@ -68,8 +72,13 @@ def _capability(
     )
 
 
-def _scheduled_scope(capability_ids: tuple[str, ...]) -> ExecutionScope:
+def _scheduled_scope(
+    capability_ids: tuple[str, ...], registry: CapabilityRegistry | None = None
+) -> ExecutionScope:
     return ExecutionScope(
+        contract_bindings=frozen_execution_bindings(
+            capability_ids, (), ("mock:routine",), registry=registry
+        ),
         scope_id="scope-routine-1",
         revision=1,
         agent_id="agent-1",
@@ -117,6 +126,20 @@ def _scheduled_run(scope: ExecutionScope) -> RunInput:
     )
 
 
+async def test_empty_machine_source_ceiling_never_queries_all_current_sources():
+    class ForbiddenCatalog:
+        async def source_routing_facts(self, agent_id, source_ids=()):
+            raise AssertionError("an empty machine ceiling cannot enumerate sources")
+
+        async def readable_resource_ids(self, agent_id, source_ids=()):
+            raise AssertionError("an empty machine ceiling cannot enumerate resources")
+
+    run = _scheduled_run(_scheduled_scope(("catalog.search",)))
+    scope = await resolve_effective_source_scope(run, ForbiddenCatalog())
+    assert scope.source_ids == frozenset()
+    assert scope.resource_ids == frozenset()
+
+
 def test_automation_eligibility_is_fail_closed_and_part_of_contract_identity() -> None:
     default = Capability(
         id="test.default",
@@ -128,13 +151,13 @@ def test_automation_eligibility_is_fail_closed_and_part_of_contract_identity() -
     )
     scheduled = _capability(
         "test.scheduled",
-        AutomationEligibility.SCHEDULED_DIRECT,
+        AutomationEligibility.AUTOMATION_DIRECT,
     )
     assert default.automation_eligibility is AutomationEligibility.INTERACTIVE_ONLY
     assert capability_contract_digest(default, domain_owner_id="test") != (
         capability_contract_digest(scheduled, domain_owner_id="test")
     )
-    with pytest.raises(ValueError, match="must be effect-free"):
+    with pytest.raises(ValueError, match="require a receipt policy"):
         Capability(
             id="test.invalid",
             description="Invalid scheduled mutation.",
@@ -143,7 +166,7 @@ def test_automation_eligibility_is_fail_closed_and_part_of_contract_identity() -
             output_schema={"type": "object", "properties": {}},
             executor_id="test.invalid.executor",
             operational_effect=OperationalEffect.MUTATE_DATA,
-            automation_eligibility=AutomationEligibility.SCHEDULED_DIRECT,
+            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         )
 
 
@@ -160,6 +183,9 @@ def test_mcp_only_scheduled_scope_round_trips_with_exact_identity() -> None:
 def test_nonroutine_scope_cannot_use_mcp_only_relaxation() -> None:
     with pytest.raises(ValueError, match="non-routine execution scope"):
         ExecutionScope(
+            contract_bindings=frozen_execution_bindings(
+                ("test.scheduled",), (), ("mock:routine",)
+            ),
             scope_id="scope-followup",
             revision=1,
             agent_id="agent-1",
@@ -183,18 +209,18 @@ def test_nonroutine_scope_cannot_use_mcp_only_relaxation() -> None:
         )
 
 
-async def test_scheduled_catalog_projects_only_explicit_scheduled_direct_tools() -> (
+async def test_scheduled_catalog_projects_only_explicit_automation_direct_tools() -> (
     None
 ):
     scheduled = _capability(
         "test.scheduled",
-        AutomationEligibility.SCHEDULED_DIRECT,
+        AutomationEligibility.AUTOMATION_DIRECT,
     )
     interactive = _capability(
         "test.interactive",
         AutomationEligibility.INTERACTIVE_ONLY,
     )
-    outside = _capability("test.outside", AutomationEligibility.SCHEDULED_DIRECT)
+    outside = _capability("test.outside", AutomationEligibility.AUTOMATION_DIRECT)
     views = tuple(
         ToolView(
             name=f"tool_{item.id.split('.')[-1]}",
@@ -208,14 +234,23 @@ async def test_scheduled_catalog_projects_only_explicit_scheduled_direct_tools()
         _Executor(item.executor_id) for item in (scheduled, interactive, outside)
     )
     domain = StaticTestDomain((scheduled, interactive, outside), views)
-    runtime = CapabilityRuntime(static_registry(domain, executors), (domain,))
+    registry = static_registry(domain, executors)
+
+    async def read_contracts(**kwargs):
+        return frozen_execution_bindings(
+            kwargs["capability_ids"], (), ("mock:routine",), registry=registry
+        )
+
+    runtime = CapabilityRuntime(
+        registry, (domain,), execution_contract_reader=read_contracts
+    )
 
     catalog = await runtime.prepare_run(
-        _scheduled_run(_scheduled_scope((scheduled.id, interactive.id)))
+        _scheduled_run(_scheduled_scope((scheduled.id, interactive.id), registry))
     )
 
     assert tuple(item.capability.id for item in catalog.entries) == (scheduled.id,)
-    run = _scheduled_run(_scheduled_scope((scheduled.id, interactive.id)))
+    run = _scheduled_run(_scheduled_scope((scheduled.id, interactive.id), registry))
     result = await runtime.execute_all(
         run,
         (
@@ -281,3 +316,152 @@ def test_scheduled_origin_rejects_code_owned_instruction_authority() -> None:
             payload_digest="sha256:" + sha256(b"{}").hexdigest(),
             execution_scope=_scheduled_scope(("test.scheduled",)),
         )
+
+
+@pytest.mark.parametrize(
+    "changed_family",
+    ("capability_contracts", "resource_revisions", "model_routes", "tool_origins"),
+)
+@pytest.mark.parametrize(
+    "machine_origin", [RunOrigin.SCHEDULED_ROUTINE, RunOrigin.JOB_EVENT]
+)
+async def test_machine_calls_revalidate_retained_contracts_after_preparation(
+    changed_family: str,
+    machine_origin: RunOrigin,
+) -> None:
+    from daita.capabilities import CapabilityInputError, ExecutionContractBindings
+    from daita.hosting.embedded import _model_execution_contracts
+    from daita.llm import ModelCallPolicy
+    from daita.llm.providers.mock import MockModelProvider
+
+    model = MockModelProvider((), provider_id="mock:routine")
+    policy = ModelCallPolicy()
+
+    capability = _capability("test.scheduled", AutomationEligibility.AUTOMATION_DIRECT)
+    origin = "sha256:" + "d" * 64
+    view = ToolView(
+        name="read_exact",
+        capability_id=capability.id,
+        description=capability.description,
+        origin_revision_digest=origin,
+        presentation=presentation_metadata(load_mode=ToolLoadMode.PINNED),
+    )
+    calls: list[str] = []
+
+    class CountingExecutor(_Executor):
+        async def execute(self, request: ToolExecution) -> ToolOutput:
+            calls.append(request.call_id)
+            return await super().execute(request)
+
+    executor = CountingExecutor(capability.executor_id)
+    domain = StaticTestDomain((capability,), (view,))
+    registry = static_registry(domain, (executor,))
+    bindings = ExecutionContractBindings(
+        capability_contracts={capability.id: registry.contract_digest(capability.id)},
+        tool_origins={capability.id: origin},
+        resource_revisions={"resource-1": "sha256:" + "e" * 64},
+        model_routes=_model_execution_contracts(
+            model, model.model_profile, None, policy
+        ),
+    )
+    current = bindings
+
+    async def read_contracts(**_kwargs):
+        return current
+
+    runtime = CapabilityRuntime(
+        registry, (domain,), execution_contract_reader=read_contracts
+    )
+    scope = replace(
+        _scheduled_scope((capability.id,), registry),
+        allowed_source_ids=("source-1",),
+        allowed_resource_ids=("resource-1",),
+        contract_bindings=bindings,
+    )
+    run = _scheduled_run(scope)
+    if machine_origin is RunOrigin.JOB_EVENT:
+        scope = replace(
+            scope,
+            routine_id=None,
+            routine_revision=None,
+            occurrence_id=None,
+            job_id="job-1",
+            job_revision=1,
+            allowed_connector_binding_ids=(),
+        )
+        assert run.start is not None
+        run = replace(
+            run,
+            start=replace(
+                run.start,
+                origin=machine_origin,
+                instruction_authority=InstructionAuthority.CODE_OWNED,
+                execution_scope=scope,
+            ),
+        )
+    messages = (run.start_message(),)
+    catalog = await runtime.prepare_run(run)
+    projection = runtime.project(catalog, messages)
+    first = await runtime.execute_all(
+        run,
+        (ToolCall("before", view.name, {}),),
+        projection=projection,
+        messages=messages,
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
+    assert not first[0].is_error
+    values = dict(getattr(bindings, changed_family))
+    if changed_family == "model_routes":
+        values = _model_execution_contracts(
+            model, model.model_profile, None, replace(policy, cleanup_timeout_seconds=6)
+        )
+    else:
+        values[next(iter(values))] = "sha256:" + "0" * 64
+    current = replace(bindings, **{changed_family: values})
+    blocked = await runtime.execute_all(
+        run,
+        (ToolCall("after", view.name, {}),),
+        projection=projection,
+        messages=messages,
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
+    assert blocked[0].is_error
+    error = blocked[0].output["error"]
+    assert isinstance(error, Mapping)
+    assert error["code"] in {
+        "execution_contract_changed",
+        "execution_contract_unavailable",
+    }
+    assert calls == ["before"]
+    assert scope.contract_bindings == bindings
+    with pytest.raises(CapabilityInputError):
+        await runtime.prepare_run(run)
+
+
+def test_scope_codec_rejects_missing_extra_and_malformed_execution_bindings() -> None:
+    import copy
+
+    encoded = cast(
+        dict[str, Any], encode_execution_scope(_scheduled_scope(("test.scheduled",)))
+    )
+    binding_fields = encoded["fields"]["contract_bindings"]["fields"]
+    for family in (
+        "capability_contracts",
+        "resource_revisions",
+        "model_routes",
+        "tool_origins",
+    ):
+        altered = copy.deepcopy(encoded)
+        altered["fields"]["contract_bindings"]["fields"][family]["extra"] = (
+            "sha256:" + "1" * 64
+        )
+        with pytest.raises(ValueError):
+            decode_execution_scope(altered)
+    for invalid in ({}, {"test.scheduled": "not-a-digest"}):
+        altered = copy.deepcopy(encoded)
+        altered["fields"]["contract_bindings"]["fields"][
+            "capability_contracts"
+        ] = invalid
+        with pytest.raises(ValueError):
+            decode_execution_scope(altered)
+    assert binding_fields["tool_origins"] == {}

@@ -3,14 +3,19 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import stat
 import sys
+from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 from _workspace_support import workspace_for
 
-import daita.llm.providers.subscription_cli as subscription_cli
+import daita.llm.providers.subscription_cli.envelope as subscription_envelope
+import daita.llm.providers.subscription_cli.grok as subscription_grok
+import daita.llm.providers.subscription_cli.process as subscription_process
 from daita import Agent
 from daita.llm.errors import (
     ModelProviderError,
@@ -22,8 +27,10 @@ from daita.llm.models import (
     CanonicalMessage,
     FinishReason,
     MessageRole,
+    ModelCallPolicy,
     ModelRequest,
     ModelResponse,
+    ModelUsage,
     TextBlock,
     ToolCall,
     ToolDefinition,
@@ -80,7 +87,7 @@ def _tool_envelope() -> dict[str, object]:
 
 def _grok_help() -> bytes:
     return " ".join(
-        (*sorted(subscription_cli._GROK_REQUIRED_HELP_TOKENS), "streaming-json")
+        (*sorted(subscription_grok._GROK_REQUIRED_HELP_TOKENS), "streaming-json")
     ).encode()
 
 
@@ -123,12 +130,14 @@ def _grok_inspection(cwd: Path, **overrides: object) -> bytes:
 
 
 def _grok_setup_result(
-    command: subscription_cli._Command,
-) -> subscription_cli._CompletedCommand | None:
+    command: subscription_process._Command,
+) -> subscription_process._CompletedCommand | None:
     if command.arguments[-1] == "--help":
-        return subscription_cli._CompletedCommand(0, _grok_help(), b"")
+        return subscription_process._CompletedCommand(0, _grok_help(), b"")
     if command.arguments[1:] == ("inspect", "--json"):
-        return subscription_cli._CompletedCommand(0, _grok_inspection(command.cwd), b"")
+        return subscription_process._CompletedCommand(
+            0, _grok_inspection(command.cwd), b""
+        )
     return None
 
 
@@ -208,7 +217,7 @@ async def test_grok_build_uses_prompt_file_oauth_and_no_native_capabilities(
     monkeypatch.setenv("GROK_CLI_CHAT_PROXY_BASE_URL", "https://custom.invalid")
     monkeypatch.setenv("GROK_AUTH_PROVIDER_COMMAND", "print-secret")
     monkeypatch.setenv("DATABASE_URL", "postgresql://secret")
-    commands: list[subscription_cli._Command] = []
+    commands: list[subscription_process._Command] = []
     prompt_mode: int | None = None
     prompt_content = b""
 
@@ -222,7 +231,7 @@ async def test_grok_build_uses_prompt_file_oauth_and_no_native_capabilities(
         )
         prompt_content = prompt_path.read_bytes()
         prompt_mode = stat.S_IMODE(prompt_path.stat().st_mode)
-        return subscription_cli._CompletedCommand(0, _grok_output(), b"")
+        return subscription_process._CompletedCommand(0, _grok_output(), b"")
 
     provider = GrokBuildSubscriptionProvider("grok-4.5", runner=run)
     response = await provider.generate(_request())
@@ -246,7 +255,7 @@ async def test_grok_build_uses_prompt_file_oauth_and_no_native_capabilities(
     assert command.stdin == b""
     assert prompt_mode == 0o600
     assert b"DAITA REQUEST DOCUMENT" in prompt_content
-    assert subscription_cli._CONTROL_PROMPT.encode() not in prompt_content
+    assert subscription_envelope._CONTROL_PROMPT.encode() not in prompt_content
     assert all("Inspect the admitted source" not in item for item in command.arguments)
     for flag in (
         "--disable-web-search",
@@ -267,7 +276,7 @@ async def test_grok_build_uses_prompt_file_oauth_and_no_native_capabilities(
     assert command.arguments[command.arguments.index("--max-turns") + 1] == "1"
     assert json.loads(
         command.arguments[command.arguments.index("--json-schema") + 1]
-    ) == subscription_cli._response_envelope_schema(_request())
+    ) == subscription_envelope._response_envelope_schema(_request())
     assert (
         command.arguments[command.arguments.index("--output-format") + 1]
         == "streaming-json"
@@ -326,14 +335,14 @@ async def test_grok_build_uses_prompt_file_oauth_and_no_native_capabilities(
 async def test_grok_rejects_unsafe_configuration_before_inference(
     unsafe_inspection,
 ):
-    commands: list[subscription_cli._Command] = []
+    commands: list[subscription_process._Command] = []
 
     async def run(command):
         commands.append(command)
         if command.arguments[-1] == "--help":
-            return subscription_cli._CompletedCommand(0, _grok_help(), b"")
+            return subscription_process._CompletedCommand(0, _grok_help(), b"")
         if command.arguments[1:] == ("inspect", "--json"):
-            return subscription_cli._CompletedCommand(
+            return subscription_process._CompletedCommand(
                 0, _grok_inspection(command.cwd, **unsafe_inspection), b""
             )
         raise AssertionError("inference must not start after unsafe inspection")
@@ -356,7 +365,7 @@ async def test_grok_rechecks_configuration_before_every_inference():
     async def run(command):
         nonlocal inferences, inspections
         if command.arguments[-1] == "--help":
-            return subscription_cli._CompletedCommand(0, _grok_help(), b"")
+            return subscription_process._CompletedCommand(0, _grok_help(), b"")
         if command.arguments[1:] == ("inspect", "--json"):
             inspections += 1
             overrides = (
@@ -373,11 +382,11 @@ async def test_grok_rechecks_configuration_before_every_inference():
                     }
                 }
             )
-            return subscription_cli._CompletedCommand(
+            return subscription_process._CompletedCommand(
                 0, _grok_inspection(command.cwd, **overrides), b""
             )
         inferences += 1
-        return subscription_cli._CompletedCommand(0, _grok_output(), b"")
+        return subscription_process._CompletedCommand(0, _grok_output(), b"")
 
     provider = GrokBuildSubscriptionProvider("grok-4.5", runner=run)
     await provider.generate(_request())
@@ -410,14 +419,14 @@ async def test_grok_uses_native_schema_and_terminal_structured_output():
         ),
         response_schema=schema,
     )
-    inference: subscription_cli._Command | None = None
+    inference: subscription_process._Command | None = None
 
     async def run(command):
         nonlocal inference
         if (setup := _grok_setup_result(command)) is not None:
             return setup
         inference = command
-        return subscription_cli._CompletedCommand(
+        return subscription_process._CompletedCommand(
             0,
             _grok_output({"answer": "grounded"}),
             b"",
@@ -452,7 +461,7 @@ async def test_grok_rejects_native_tools_and_failed_structured_output(output, co
     async def run(command):
         if (setup := _grok_setup_result(command)) is not None:
             return setup
-        return subscription_cli._CompletedCommand(0, output, b"")
+        return subscription_process._CompletedCommand(0, output, b"")
 
     provider = GrokBuildSubscriptionProvider("grok-4.5", runner=run)
     with pytest.raises(ModelProviderError) as caught:
@@ -470,7 +479,7 @@ async def test_subscription_client_rejects_terminal_control_output():
     async def run(command):
         if (setup := _grok_setup_result(command)) is not None:
             return setup
-        return subscription_cli._CompletedCommand(
+        return subscription_process._CompletedCommand(
             0,
             _grok_output(
                 {"kind": "message", "text": "unsafe\u001b[2J", "tool_calls": []}
@@ -493,12 +502,12 @@ async def test_subscription_client_rejects_terminal_control_output():
 
 def test_subscription_json_and_response_bounds_fail_closed():
     nested: object = "leaf"
-    for _ in range(subscription_cli._MAX_JSON_DEPTH + 1):
+    for _ in range(subscription_envelope._MAX_JSON_DEPTH + 1):
         nested = [nested]
     with pytest.raises(ValueError, match="depth bound"):
-        subscription_cli._strict_json(json.dumps(nested))
+        subscription_envelope._strict_json(json.dumps(nested))
     with pytest.raises(ValueError, match="terminal controls"):
-        subscription_cli._strict_json('{"value":"\\u001b[2J"}')
+        subscription_envelope._strict_json('{"value":"\\u001b[2J"}')
 
     request = ModelRequest(
         messages=(
@@ -509,16 +518,16 @@ def test_subscription_json_and_response_bounds_fail_closed():
         )
     )
     with pytest.raises(ValueError, match="safety bound"):
-        subscription_cli._decode_model_output(
+        subscription_envelope._decode_model_output(
             {
                 "kind": "message",
-                "text": "x" * (subscription_cli._MAX_RESPONSE_TEXT_CHARACTERS + 1),
+                "text": "x" * (subscription_envelope._MAX_RESPONSE_TEXT_CHARACTERS + 1),
                 "tool_calls": [],
             },
             request=request,
             provider_id="grok-build:test",
             provider_response_id=None,
-            usage=subscription_cli.ModelUsage(),
+            usage=ModelUsage(),
             id_factory=lambda prefix: prefix,
             transport="test",
         )
@@ -560,7 +569,7 @@ async def test_grok_rejects_native_events_and_unconfirmed_custom_models(output):
     async def run(command):
         if (setup := _grok_setup_result(command)) is not None:
             return setup
-        return subscription_cli._CompletedCommand(0, output, b"")
+        return subscription_process._CompletedCommand(0, output, b"")
 
     provider = GrokBuildSubscriptionProvider("grok-4.5", runner=run)
     with pytest.raises(ModelProviderError) as caught:
@@ -581,7 +590,7 @@ async def test_subscription_client_failures_are_normalized(provider, stderr, cod
     async def run(command):
         if (setup := _grok_setup_result(command)) is not None:
             return setup
-        return subscription_cli._CompletedCommand(1, b"", stderr)
+        return subscription_process._CompletedCommand(1, b"", stderr)
 
     client = GrokBuildSubscriptionProvider("grok-4.5", runner=run)
     with pytest.raises(ModelProviderError) as caught:
@@ -593,10 +602,10 @@ async def test_subscription_client_failures_are_normalized(provider, stderr, cod
 
 async def test_missing_and_incompatible_clients_are_actionable():
     async def missing(command):
-        raise subscription_cli._ExecutableUnavailable(command.arguments[0])
+        raise subscription_process._ExecutableUnavailable(command.arguments[0])
 
     async def old_grok(command):
-        return subscription_cli._CompletedCommand(0, b"--output-format", b"")
+        return subscription_process._CompletedCommand(0, b"--output-format", b"")
 
     for client in (GrokBuildSubscriptionProvider("grok-4.5", runner=missing),):
         with pytest.raises(ModelProviderError) as caught:
@@ -620,11 +629,23 @@ async def test_grok_subscription_total_attempt_timeout_is_normalized():
     provider = GrokBuildSubscriptionProvider(
         "grok-4.5",
         runner=hang,
-        timeout_seconds=0.01,
     )
 
     with pytest.raises(ModelProviderError) as caught:
-        await asyncio.wait_for(provider.generate(_request()), timeout=0.25)
+        await asyncio.wait_for(
+            provider.generate(
+                replace(
+                    _request(),
+                    call_policy=ModelCallPolicy(
+                        max_attempt_seconds=0.01,
+                        first_progress_timeout_seconds=0.01,
+                        progress_idle_timeout_seconds=0.01,
+                        cleanup_timeout_seconds=0.1,
+                    ),
+                )
+            ),
+            timeout=0.5,
+        )
 
     assert caught.value.code is ProviderErrorCode.TIMEOUT
     assert caught.value.provider_id == "grok-build:grok-4.5"
@@ -660,29 +681,29 @@ async def test_command_timeout_and_cancellation_terminate_subprocess_trees(tmp_p
         "time.sleep(60)"
     )
     timeout_pid_path = tmp_path / "timeout.pid"
-    timeout_command = subscription_cli._Command(
+    timeout_command = subscription_process._Command(
         arguments=(sys.executable, "-c", script, str(timeout_pid_path)),
         stdin=b"",
         cwd=tmp_path,
         environment={"PATH": os.environ.get("PATH", "")},
-        timeout_seconds=0.2,
+        deadline=asyncio.get_running_loop().time() + 0.2,
     )
 
     with pytest.raises(ModelProviderError) as caught:
-        await subscription_cli._run_command(timeout_command)
+        await subscription_process._run_command(timeout_command)
     timeout_child = await _wait_for_file(timeout_pid_path)
     await _wait_for_process_exit(timeout_child)
     assert caught.value.code is ProviderErrorCode.TIMEOUT
 
     cancel_pid_path = tmp_path / "cancel.pid"
-    cancel_command = subscription_cli._Command(
+    cancel_command = subscription_process._Command(
         arguments=(sys.executable, "-c", script, str(cancel_pid_path)),
         stdin=b"",
         cwd=tmp_path,
         environment={"PATH": os.environ.get("PATH", "")},
-        timeout_seconds=60,
+        deadline=asyncio.get_running_loop().time() + 60,
     )
-    task = asyncio.create_task(subscription_cli._run_command(cancel_command))
+    task = asyncio.create_task(subscription_process._run_command(cancel_command))
     cancel_child = await _wait_for_file(cancel_pid_path)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -698,16 +719,16 @@ async def test_command_timeout_terminates_descendants_after_leader_exit(tmp_path
         "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
         "pathlib.Path(sys.argv[1]).write_text(str(p.pid))"
     )
-    command = subscription_cli._Command(
+    command = subscription_process._Command(
         arguments=(sys.executable, "-c", script, str(child_pid_path)),
         stdin=b"",
         cwd=tmp_path,
         environment={"PATH": os.environ.get("PATH", "")},
-        timeout_seconds=0.2,
+        deadline=asyncio.get_running_loop().time() + 0.2,
     )
 
     with pytest.raises(ModelProviderError) as caught:
-        await subscription_cli._run_command(command)
+        await subscription_process._run_command(command)
     child = await _wait_for_file(child_pid_path)
     await _wait_for_process_exit(child)
     assert caught.value.code is ProviderErrorCode.TIMEOUT
@@ -720,19 +741,19 @@ async def test_command_output_limit_terminates_subprocess_tree(tmp_path):
         "import pathlib,subprocess,sys,time;"
         "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
         "pathlib.Path(sys.argv[1]).write_text(str(p.pid));"
-        f"sys.stdout.buffer.write(b'x'*{subscription_cli._MAX_STDOUT_BYTES + 1});"
+        f"sys.stdout.buffer.write(b'x'*{subscription_process._MAX_STDOUT_BYTES + 1});"
         "sys.stdout.buffer.flush();time.sleep(60)"
     )
-    command = subscription_cli._Command(
+    command = subscription_process._Command(
         arguments=(sys.executable, "-c", script, str(child_pid_path)),
         stdin=b"",
         cwd=tmp_path,
         environment={"PATH": os.environ.get("PATH", "")},
-        timeout_seconds=5,
+        deadline=asyncio.get_running_loop().time() + 5,
     )
 
     with pytest.raises(ModelProviderError) as caught:
-        await subscription_cli._run_command(command)
+        await subscription_process._run_command(command)
     child = await _wait_for_file(child_pid_path)
     await _wait_for_process_exit(child)
     assert caught.value.code is ProviderErrorCode.OUTPUT_LIMIT
@@ -794,3 +815,140 @@ async def test_subscription_route_persists_without_credentials(
         assert reopened.model_route.candidates[0].provider_id == provider_id
     finally:
         await reopened.close()
+
+
+async def test_unreaped_process_returns_bounded_failure_and_retains_waiter(monkeypatch):
+    from types import SimpleNamespace
+
+    from daita.llm._lifecycle import NativeOwner, await_cleanup
+
+    release = asyncio.Event()
+    signals = []
+    owner = NativeOwner()
+
+    async def wait():
+        await release.wait()
+        return 0
+
+    process = SimpleNamespace(pid=987654321, wait=wait)
+    monkeypatch.setattr(subscription_process.os, "name", "posix")
+    monkeypatch.setattr(
+        subscription_process.os, "killpg", lambda pid, sig: signals.append((pid, sig))
+    )
+    monkeypatch.setattr(
+        subscription_process, "_process_group_exists", lambda pid: False
+    )
+    start = asyncio.get_running_loop().time()
+    task = asyncio.create_task(
+        subscription_process._stop_process(
+            cast(asyncio.subprocess.Process, process),
+            deadline=start + 0.04,
+            owner=owner,
+        )
+    )
+    try:
+        with pytest.raises(ModelProviderError) as caught:
+            await await_cleanup(task, deadline=start + 0.05, owner=owner)
+        assert caught.value.code is ProviderErrorCode.CLEANUP_TIMEOUT
+        assert asyncio.get_running_loop().time() - start < 0.2
+        assert owner.poisoned
+        assert any(not task.done() for task in owner.tasks)
+        assert signals == [(987654321, signal.SIGTERM)]
+    finally:
+        pending = tuple(owner.tasks)
+        release.set()
+        await asyncio.gather(task, *pending, return_exceptions=True)
+
+
+async def test_late_process_start_is_owned_and_terminated_without_returning_output(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from daita.llm._lifecycle import NativeOwner
+
+    release = asyncio.Event()
+    stopped = []
+    owner = NativeOwner()
+
+    async def spawn(*args, **kwargs):
+        await release.wait()
+        return SimpleNamespace(pid=123456789)
+
+    async def stop(process, *, deadline, owner):
+        stopped.append(process.pid)
+
+    monkeypatch.setattr(subscription_process.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(subscription_process, "_stop_process", stop)
+    start = asyncio.get_running_loop().time()
+    command = subscription_process._Command(
+        (sys.executable,),
+        b"",
+        tmp_path,
+        {"PATH": os.environ.get("PATH", "")},
+        start + 0.04,
+        cleanup_timeout_seconds=0.04,
+        native_owner=owner,
+    )
+    try:
+        with pytest.raises(ModelProviderError) as caught:
+            await subscription_process._run_command(command)
+        assert caught.value.code is ProviderErrorCode.TIMEOUT
+        assert owner.poisoned and stopped == []
+        assert asyncio.get_running_loop().time() - start < 0.2
+    finally:
+        pending = tuple(owner.tasks)
+        release.set()
+        await asyncio.gather(*pending, return_exceptions=True)
+    assert stopped == [123456789]
+
+
+async def test_command_cancellation_survives_failed_process_cleanup(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from daita.llm._lifecycle import NativeOwner
+
+    started = asyncio.Event()
+    owner = NativeOwner()
+
+    async def drain():
+        started.set()
+        await asyncio.Event().wait()
+
+    async def read(size):
+        await asyncio.Event().wait()
+
+    async def spawn(*args, **kwargs):
+        return SimpleNamespace(
+            stdin=SimpleNamespace(
+                write=lambda data: None, drain=drain, close=lambda: None
+            ),
+            stdout=SimpleNamespace(read=read),
+            stderr=SimpleNamespace(read=read),
+        )
+
+    async def stop(process, *, deadline, owner):
+        raise ModelProviderError(ProviderErrorCode.CLEANUP_TIMEOUT)
+
+    monkeypatch.setattr(subscription_process.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(subscription_process, "_stop_process", stop)
+    command = subscription_process._Command(
+        (sys.executable,),
+        b"",
+        tmp_path,
+        {},
+        asyncio.get_running_loop().time() + 1,
+        cleanup_timeout_seconds=0.05,
+        native_owner=owner,
+    )
+    task = asyncio.create_task(subscription_process._run_command(command))
+    try:
+        await started.wait()
+        task.cancel("user cancelled")
+        with pytest.raises(asyncio.CancelledError, match="user cancelled"):
+            await task
+        assert owner.poisoned
+    finally:
+        await asyncio.gather(task, *tuple(owner.tasks), return_exceptions=True)

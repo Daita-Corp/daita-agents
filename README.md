@@ -15,6 +15,7 @@ context does not have to be explained again.
 [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) ·
 [Remote MCP](docs/MCP_CONNECTIVITY.md) ·
 [Scheduled routines](docs/SCHEDULED_ROUTINES.md) ·
+[Action receipts and recovery](docs/EFFECT_RECEIPTS.md) ·
 [Examples](examples/README.md)
 
 ```text
@@ -69,7 +70,16 @@ Summarize the CSV files in this workspace.
 Run `daita` again for a returning launch. Daita reopens the only agent or shows
 a picker when several exist. Use `daita --agent atlas` to select one directly.
 Inside the terminal, `/help` lists commands and controls, `/` opens the command
-palette, and `@` selects a source for one question.
+palette, and `@` narrows one question to a source. Ordinary questions can discover
+and compare all admitted connections without a selection. `/routines` shows saved
+assignments and occurrence evidence, `/inbox` shows results, and `/effects` opens
+action receipts and human recovery. `/source permissions` guides exact PostgreSQL
+update/upsert authoring.
+
+Saved assignments execute while the TUI or `daita host --agent atlas` keeps the
+agent open. Exit the current host before opening another; no work progresses
+while all hosts are closed. Routine approval grants no missing connector
+permission, and recovering an uncertain action performs no retry.
 
 ## Read-first by design
 
@@ -81,15 +91,17 @@ change the execution policy.
 - SQL is validated against the current catalog before source I/O.
 - Workspace reads reject traversal, symlinks, secret-like paths, and special
   files.
-- Remote MCP tools require an explicitly admitted read-only binding and are
-  revalidated at call time.
-- The only supported source-data mutation is an explicitly enabled structured
-  PostgreSQL update with an exact target preview, once-only approval,
-  transactional drift detection, and an immutable receipt.
+- Remote MCP tools require explicit local access/effect admission and are
+  revalidated at call time. Admitted actions use exact per-call approval or a
+  frozen routine grant, one dispatch and durable invocation receipts.
+- Native source-data mutations are explicitly enabled structured updates and
+  upserts, initially backed by PostgreSQL. Exact current-run previews, explicit
+  operation/column/row permissions, transactional drift checks, and runtime-owned
+  receipts govern each call. A routine permits one native write invocation per occurrence.
 
 Learn more in [Local workspaces](docs/LOCAL_WORKSPACES.md),
-[Remote MCP read connectivity](docs/MCP_CONNECTIVITY.md), and
-[PostgreSQL updates](docs/POSTGRESQL_UPDATES.md).
+[Remote MCP tools and actions](docs/MCP_CONNECTIVITY.md), and
+[Relational writes](docs/RELATIONAL_WRITES.md).
 
 ## How it works
 
@@ -101,13 +113,39 @@ user message -> model -> tool calls -> ordered tool results -> model -> answer
 
 The current transcript is the loop state. Tool failures are returned to the
 model like ordinary results so it can correct a call on the next step. Steps,
-wall time, tokens, and estimated cost are bounded.
+wall time, tokens, and estimated cost bound progression. Exhaustion ends the run
+with retained evidence and an explicit failure; it never starts an extra model
+request to write a closing answer. Requests carry the remaining allowance, and
+OpenAI, Anthropic, and Gemini API adapters count the prepared input through their
+provider's counting endpoint before narrowing output limits. Counting shares the
+run deadline and does not generate a response. Routes without complete request
+counting retain usage-based stopping and supported output caps; they cannot admit
+an estimated-cost ceiling. Actual returned usage is retained even when it exceeds
+an allowance. An in-flight generation timeout can leave usage unknown; estimated
+ceilings are not a billing guarantee.
+
+Configured model routes own bounded retries, with SDK retries disabled. Credential
+resolution, counting, generation, and backoff share one run deadline; counting also
+has a 15-second phase cap. Temporary pre-generation failures can retry with known
+zero usage. Unknown generation consumption prevents budgeted retry or fallback.
+Stream progress and completion stop retry eligibility, and model retries never
+replay completed tool actions. Injecting a provider directly retains that provider's
+own behavior rather than implicitly adding a router.
+
+Each request includes procedure guidance for its currently loaded tools. Optional
+discovery and prior conversation context are fitted to the run allowance as well
+as the model window, while current-run messages remain exact. Admission diagnostics
+retain native input counts separately from actual returned usage.
 
 Agent identity, source registrations, catalog snapshots, transcripts, jobs,
 routines, and results are stored in one SQLite database inside the agent home.
 Memory and skills are bounded advisory Markdown—not source truth, evidence, or
 authorization. Durable jobs and scheduled routines use the same catalog,
 capability runtime, and execution loop as foreground questions.
+
+Questions can span admitted sources without selecting one first. See
+[context and source scope](docs/CONTEXT_AND_SCOPE.md) for exact caller filters,
+retained sensitivity, and the self-contained context used by scheduled work.
 
 For the full implementation boundaries, see the
 [repository architecture guide](AGENTS.md).
@@ -119,13 +157,14 @@ For the full implementation boundaries, see the
 | Exact exports and evidence-bound derived files | [Artifacts](docs/ARTIFACTS.md) |
 | Workspace selection, file reads, queries, and edits | [Local workspaces](docs/LOCAL_WORKSPACES.md) |
 | Codex, Claude Code, and Grok Build subscriptions | [Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
-| Read-only remote tools | [Remote MCP connectivity](docs/MCP_CONNECTIVITY.md) |
+| Remote reads and admitted actions | [Remote MCP connectivity](docs/MCP_CONNECTIVITY.md) |
 | Schedules, outcomes, inboxes, and resident hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |
-| Scoped PostgreSQL updates and receipts | [PostgreSQL updates](docs/POSTGRESQL_UPDATES.md) |
+| Scoped relational writes and receipts | [Relational writes](docs/RELATIONAL_WRITES.md) |
 | State compatibility and automatic upgrades | [Local state compatibility](docs/LOCAL_STATE_UPGRADES.md) |
 | Managed installer release status | [Managed installer](docs/MANAGED_INSTALLER_RELEASE.md) |
 | Public Python API walkthroughs | [Offline examples](examples/README.md) |
 | Development and architecture contracts | [Repository guide](AGENTS.md) |
+| Model provider implementation | [Provider implementation guide](docs/MODEL_PROVIDERS.md) |
 | Contribution workflow | [Contributing](CONTRIBUTING.md) |
 | Private vulnerability reporting | [Security policy](SECURITY.md) |
 

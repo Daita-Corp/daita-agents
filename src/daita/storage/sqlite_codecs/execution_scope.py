@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from ...capabilities import AccessMode, ExecutionScope, OperationalEffect
+from ..._json import FrozenJsonObject
+from ...capabilities import (
+    AccessMode,
+    CapabilityGrant,
+    ExecutionContractBindings,
+    ExecutionScope,
+    OperationalEffect,
+)
 from ...llm.models import ModelSensitivity
 from .common import (
     decimal_decode,
@@ -48,6 +55,12 @@ def encode_execution_scope(value: ExecutionScope):
             "per_run_max_cost_usd": decimal_encode(value.per_run_max_cost_usd),
             "per_run_max_tokens": value.per_run_max_tokens,
             "distribution_plan_digest": value.distribution_plan_digest,
+            "contract_bindings": encode_execution_contract_bindings(
+                value.contract_bindings
+            ),
+            "capability_grants": [
+                encode_capability_grant(grant) for grant in value.capability_grants
+            ],
         },
     )
 
@@ -78,6 +91,8 @@ def decode_execution_scope(value) -> ExecutionScope:
             "per_run_max_cost_usd",
             "per_run_max_tokens",
             "distribution_plan_digest",
+            "contract_bindings",
+            "capability_grants",
         ),
     )
     try:
@@ -101,6 +116,13 @@ def decode_execution_scope(value) -> ExecutionScope:
     except ValueError:
         raise ValueError("stored execution scope enum is invalid") from None
     return ExecutionScope(
+        contract_bindings=decode_execution_contract_bindings(
+            fields["contract_bindings"]
+        ),
+        capability_grants=tuple(
+            decode_capability_grant(item)
+            for item in sequence(fields["capability_grants"], "scope capability grants")
+        ),
         scope_id=text(fields["scope_id"], "execution scope id"),
         revision=integer(fields["revision"], "execution scope revision"),
         agent_id=text(fields["agent_id"], "execution scope agent id"),
@@ -168,6 +190,83 @@ def decode_execution_scope(value) -> ExecutionScope:
             "execution scope distribution plan digest",
         ),
     )
+
+
+def encode_execution_contract_bindings(value: ExecutionContractBindings):
+    return record(
+        "ExecutionContractBindings",
+        {key: plain_encode(item) for key, item in value.material().items()},
+    )
+
+
+def decode_execution_contract_bindings(value) -> ExecutionContractBindings:
+    fields = record_fields(
+        value,
+        "ExecutionContractBindings",
+        (
+            "capability_contracts",
+            "tool_origins",
+            "resource_revisions",
+            "model_routes",
+        ),
+    )
+    maps: dict[str, dict[str, str]] = {}
+    for name, raw in fields.items():
+        if not isinstance(raw, dict):
+            raise ValueError(
+                "execution contract bindings must contain fixed-shape maps"
+            )
+        maps[name] = {
+            text(key, "binding identity"): text(digest, "binding digest")
+            for key, digest in raw.items()
+        }
+    return ExecutionContractBindings(**maps)
+
+
+def encode_capability_grant(value: CapabilityGrant):
+    return record(
+        "CapabilityGrant",
+        {
+            **{key: plain_encode(item) for key, item in value.material().items()},
+            "grant_digest": value.grant_digest,
+        },
+    )
+
+
+def decode_capability_grant(value) -> CapabilityGrant:
+    fields = record_fields(
+        value,
+        "CapabilityGrant",
+        (
+            "grant_id",
+            "domain_owner_id",
+            "capability_id",
+            "capability_contract_digest",
+            "constraints_kind",
+            "constraints",
+            "max_calls_per_occurrence",
+            "grant_digest",
+        ),
+    )
+    constraints = fields["constraints"]
+    if not isinstance(constraints, dict):
+        raise ValueError("grant constraints must be an object")
+    grant = CapabilityGrant(
+        grant_id=text(fields["grant_id"], "grant id"),
+        domain_owner_id=text(fields["domain_owner_id"], "grant owner"),
+        capability_id=text(fields["capability_id"], "grant capability"),
+        capability_contract_digest=text(
+            fields["capability_contract_digest"], "grant contract"
+        ),
+        constraints_kind=text(fields["constraints_kind"], "grant constraints kind"),
+        constraints=FrozenJsonObject.from_mapping(constraints),
+        max_calls_per_occurrence=integer(
+            fields["max_calls_per_occurrence"], "grant call ceiling"
+        ),
+    )
+    if fields["grant_digest"] != grant.grant_digest:
+        raise ValueError("grant digest does not match its authority")
+    return grant
 
 
 __all__ = ["decode_execution_scope", "encode_execution_scope"]

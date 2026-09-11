@@ -164,7 +164,7 @@ def test_phase1_has_one_toolbox_catalog_and_no_legacy_discovery_path():
 def test_stage_m1_keeps_loop_context_and_composition_owners_exact():
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     loop = (PACKAGE / "loop" / "driver.py").read_text(encoding="utf-8")
-    assert _class_owners("DataContextBuilder") == {"domains/data/context.py"}
+    assert _class_owners("AgentContextBuilder") == {"context.py"}
     assert _class_owners("ToolRuntime") == {"loop/driver.py"}
     assert "tools: ToolRuntime" in loop
     assert "_capability_runtime" in embedded
@@ -291,6 +291,19 @@ def test_stage_m2_is_server_neutral_lazy_and_uses_existing_runtime_owners():
     assert _class_owners("MCPCapabilityDomain") == {"domains/mcp.py"}
     assert "CapabilityRuntime(" not in adapter
     assert "CapabilityRuntime(" not in domain
+    assert _class_owners("MCPToolExecutor") == {"domains/mcp.py"}
+    for receipt_operation in ("start_effect_receipt", "finish_effect_receipt"):
+        assert receipt_operation not in domain
+        assert receipt_operation not in adapter
+    for action_extension in (
+        "tasks/get",
+        "tasks/result",
+        "idempotency_endpoint",
+        "preview_endpoint",
+    ):
+        assert action_extension not in adapter
+    assert "MCP_GRANT_POLICY" in domain
+    assert "MCP_RECEIPT_POLICY" in domain
     assert "activate_mcp_domain" in embedded
     assert "mcp_domain" in embedded
     assert "mcp_server_bindings" in (
@@ -410,7 +423,7 @@ async def test_stage_m1_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["file_search"] == "data"
         assert resolved["file_read"] == "data"
         assert resolved["file_query"] == "data"
-        assert resolved["data_update_postgresql"] == "data"
+        assert resolved["data_update_rows"] == "data"
         assert resolved["memory_set"] == "memory"
         assert resolved["skill_view"] == "skills"
         assert resolved["semantic_list"] == "semantics"
@@ -447,6 +460,11 @@ def test_model_suggestions_remain_terminal_only_presentation_metadata():
 
 def test_public_surface_is_focused():
     assert set(daita.__all__) == {
+        "EffectReceipt",
+        "EffectResolution",
+        "EffectResolutionDecision",
+        "EffectOutcome",
+        "EffectEvidenceBasis",
         "Agent",
         "AgentConfig",
         "AgentEvent",
@@ -506,6 +524,7 @@ def test_public_surface_is_focused():
         "MCPAuthenticationMode",
         "MCPBindingState",
         "MCPBindingStatus",
+        "MCPCompletionSemantics",
         "MCPError",
         "MCPInspectedTool",
         "MCPServerBinding",
@@ -520,10 +539,12 @@ def test_public_surface_is_focused():
         "OutcomeConclusionKind",
         "OutcomeArtifactReference",
         "OutcomeContract",
+        "EffectRequirement",
         "OutcomeReference",
         "OutcomeState",
         "PostgreSQLSource",
-        "PostgreSQLUpdateReadiness",
+        "RelationalUpdateReadiness",
+        "RelationalWriteScope",
         "RetryPolicy",
         "ReportingMode",
         "ResidentReady",
@@ -546,6 +567,7 @@ def test_public_surface_is_focused():
         "SkillCandidateContent",
         "SkillSummary",
         "ScheduledRoutineDraft",
+        "RequestedCapabilityGrant",
         "ScheduledRoutineInspection",
         "ScheduledRoutineSummary",
         "ScheduledRoutine",
@@ -759,7 +781,7 @@ def test_survivor_docs_and_examples_describe_only_the_mvp():
     for required in (
         "bounded projection of completed runs",
         "Data capabilities are reads except",
-        "structured PostgreSQL update",
+        "native relational update/upsert",
         "foreground-authorized content",
         "Approval is once-only, in-process",
         "does not create durable events, telemetry",
@@ -929,7 +951,7 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
     skill_capabilities = (PACKAGE / "skills" / "capabilities.py").read_text(
         encoding="utf-8"
     )
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     assert "class SkillCapabilityDomain" in skill_capabilities
     assert "SKILL_VIEW_CAPABILITY_ID" in skill_capabilities
     assert "SKILL_SAVE_CAPABILITY_ID" in skill_capabilities
@@ -941,7 +963,7 @@ def test_stage_six_skills_extend_the_slim_progressive_owner_with_two_writes():
 def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
 
@@ -985,7 +1007,7 @@ def test_phase_two_semantics_extend_existing_storage_context_and_runtime_owners(
 
 def test_phase_three_is_read_time_maintenance_and_caller_owned_evaluation_only():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
@@ -1059,7 +1081,8 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
         assert effect_tools == {
             "artifact_save_local",
             "artifact_set_export_location",
-            "data_update_postgresql",
+            "data_update_rows",
+            "data_upsert_rows",
             "job_cancel",
             "memory_set",
             "routine_control",
@@ -1075,7 +1098,7 @@ async def test_every_composed_builtin_effect_uses_preflight_and_one_runtime_bran
         await agent.close()
 
 
-async def test_database_write_phase_three_registers_only_the_postgresql_update_slice(
+async def test_database_write_phase_three_registers_only_the_relational_update_slice(
     tmp_path,
 ):
     agent = await daita.Agent.create(
@@ -1088,10 +1111,10 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         capability_ids = {
             registry.resolve_tool(name)[1].id for name in registry.tool_names
         }
-        preview_tool = "data_preview_postgresql_update"
-        preview_capability = "data.postgresql.update_impact"
-        update_tool = "data_update_postgresql"
-        update_capability = "data.postgresql.update"
+        preview_tool = "data_preview_update_rows"
+        preview_capability = "data.preview_update_rows"
+        update_tool = "data_update_rows"
+        update_capability = "data.update_rows"
         forbidden_tools = {
             "data_preview_sqlite_update",
             "data_update_sqlite",
@@ -1124,13 +1147,15 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
         for dormant_name in forbidden_tools | forbidden_capabilities:
             assert f'"{dormant_name}"' not in package_text
             assert f"'{dormant_name}'" not in package_text
-        assert "class PostgreSQLUpdateExecutor" in package_text
+        assert "class RelationalUpdateExecutor" in package_text
         write_backend = (PACKAGE / "adapters" / "postgresql_write.py").read_text(
             encoding="utf-8"
         )
-        assert "start_database_write_receipt" in write_backend
-        assert "finish_database_write_receipt" in write_backend
-        assert "database_write_receipts" not in write_backend
+        assert "start_effect_receipt" in runtime
+        assert "start_effect_receipt" not in write_backend
+        assert "finish_effect_receipt" in runtime
+        assert "finish_effect_receipt" not in write_backend
+        assert "effect_receipts" not in write_backend
         assert "SideEffectExecutor" not in write_backend
         assert "approval_handler" not in write_backend
         assert "_execute_side_effect" in runtime
@@ -1159,9 +1184,7 @@ async def test_database_write_phase_three_registers_only_the_postgresql_update_s
                 PACKAGE / "hosting" / "embedded.py", "EmbeddedAgent"
             )
             assert method not in controller
-            assert method not in (
-                PACKAGE / "domains" / "data" / "context.py"
-            ).read_text(encoding="utf-8")
+            assert method not in (PACKAGE / "context.py").read_text(encoding="utf-8")
     finally:
         await agent.close()
 
@@ -1174,27 +1197,27 @@ def test_database_write_phase_four_control_plane_keeps_current_owners():
     )
     backend_methods = _class_methods(
         PACKAGE / "adapters" / "postgresql_write.py",
-        "PostgreSQLUpdatePreviewBackend",
+        "PostgreSQLWriteBackend",
     )
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
     )
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
     terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
     tui_commands = (PACKAGE / "tui" / "commands.py").read_text(encoding="utf-8")
     tui_controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
 
-    assert "postgresql_update_readiness" in agent_methods
-    assert "postgresql_update_readiness" in embedded_methods
-    assert "postgresql_update_readiness" in backend_methods
-    assert _class_owners("PostgreSQLUpdateReadiness") == {
+    assert "relational_update_readiness" in agent_methods
+    assert "relational_update_readiness" in embedded_methods
+    assert "relational_update_readiness" in backend_methods
+    assert _class_owners("RelationalUpdateReadiness") == {
         "adapters/postgresql_write.py"
     }
-    assert "postgresql_update_readiness" not in controller
-    assert "postgresql_update_readiness" not in context
-    assert ".postgresql_update_readiness(" in cli
-    assert ".postgresql_update_readiness(" not in terminal
+    assert "relational_update_readiness" not in controller
+    assert "relational_update_readiness" not in context
+    assert ".relational_update_readiness(" in cli
+    assert ".relational_update_readiness(" not in terminal
     assert "inspect_source_permissions" in tui_controller
     assert "preview_source_permissions" in tui_controller
     assert "apply_source_permissions" in tui_controller
@@ -1257,7 +1280,7 @@ def test_artifact_continuity_replaces_prompt_routing_and_history_refs_once():
     controller = (PACKAGE / "domains" / "data" / "controller.py").read_text(
         encoding="utf-8"
     )
-    context = (PACKAGE / "domains" / "data" / "context.py").read_text(encoding="utf-8")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     exports = (PACKAGE / "domains" / "data" / "export_capabilities.py").read_text(
         encoding="utf-8"
     )
@@ -1666,10 +1689,16 @@ def test_streaming_keeps_partial_state_disposable_and_provider_neutral():
 def test_native_stream_grammars_end_inside_provider_adapters():
     provider_root = PACKAGE / "llm" / "providers"
     owners = {
-        "response.output_text.delta": provider_root / "openai.py",
-        "content_block_delta": provider_root / "anthropic.py",
-        "generate_content_stream": provider_root / "gemini.py",
-        "stream_options": provider_root / "openai_compatible.py",
+        "response.output_text.delta": (provider_root / "openai" / "stream.py",),
+        "content_block_delta": (provider_root / "anthropic" / "stream.py",),
+        "generate_content_stream": (
+            provider_root / "gemini" / "adapter.py",
+            provider_root / "gemini" / "stream.py",
+        ),
+        "stream_options": (
+            provider_root / "openai_compatible" / "adapter.py",
+            provider_root / "openai_compatible" / "stream.py",
+        ),
     }
     generic_runtime = "\n".join(
         (
@@ -1680,14 +1709,109 @@ def test_native_stream_grammars_end_inside_provider_adapters():
         )
     )
 
-    for native_marker, owner in owners.items():
-        assert native_marker in owner.read_text(encoding="utf-8")
+    for native_marker, owner_paths in owners.items():
+        owner_text = "\n".join(
+            owner.read_text(encoding="utf-8") for owner in owner_paths
+        )
+        assert native_marker in owner_text
         assert native_marker not in generic_runtime
 
     for specialization in ("grok.py", "ollama.py"):
         text = (provider_root / specialization).read_text(encoding="utf-8")
         assert "OpenAICompatibleProvider" in text
         assert "async def stream(" not in text
+
+
+def test_substantial_provider_families_are_cohesive_packages():
+    provider_root = PACKAGE / "llm" / "providers"
+    expected = {
+        "openai": {"__init__.py", "adapter.py", "messages.py", "stream.py"},
+        "anthropic": {
+            "__init__.py",
+            "adapter.py",
+            "messages.py",
+            "stream.py",
+            "usage.py",
+        },
+        "gemini": {"__init__.py", "adapter.py", "messages.py", "stream.py"},
+        "openai_compatible": {
+            "__init__.py",
+            "adapter.py",
+            "messages.py",
+            "stream.py",
+        },
+        "subscription_cli": {
+            "__init__.py",
+            "claude.py",
+            "envelope.py",
+            "grok.py",
+            "process.py",
+        },
+    }
+    for family, filenames in expected.items():
+        path = provider_root / family
+        assert {item.name for item in path.iterdir() if item.is_file()} == filenames
+
+    superseded = {
+        "openai.py",
+        "anthropic.py",
+        "gemini.py",
+        "openai_compatible.py",
+        "subscription_cli.py",
+    }
+    assert not superseded & {
+        item.name for item in provider_root.iterdir() if item.is_file()
+    }
+
+
+def test_provider_definitions_are_the_only_generic_provider_catalog():
+    definitions = (PACKAGE / "llm" / "provider_definitions.py").read_text(
+        encoding="utf-8"
+    )
+    factory = (PACKAGE / "llm" / "factory.py").read_text(encoding="utf-8")
+    embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
+    tui_models = (PACKAGE / "tui" / "models.py").read_text(encoding="utf-8")
+    onboarding = (PACKAGE / "tui" / "screens" / "onboarding.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert _class_owners("ProviderDefinition") == {"llm/provider_definitions.py"}
+    assert "PROVIDER_DEFINITIONS" in definitions
+    assert "provider_definition(" in factory
+    assert "provider_definition(" in embedded
+    assert "PROVIDER_PRESENTATION" in tui_models
+    assert "provider_definition(" in onboarding
+    for obsolete in (
+        "_BUILTIN_PROVIDERS",
+        "_SUBSCRIPTION_PROVIDERS",
+        "_SUBSCRIPTION_CREDENTIAL_PROVIDERS",
+        "_fixed_endpoint",
+        "_subscription_auth_only",
+    ):
+        assert obsolete not in factory + embedded + tui_models + onboarding
+    for provider in (
+        "openai",
+        "anthropic",
+        "gemini",
+        "grok",
+        "ollama",
+        "codex",
+        "claude-code",
+        "grok-build",
+    ):
+        assert f'provider_name == "{provider}"' not in factory
+
+
+def test_subscription_process_and_envelope_have_single_owners():
+    process_owner = "llm/providers/subscription_cli/process.py"
+    assert _class_owners("_Command") == {process_owner}
+    assert _class_owners("_CompletedCommand") == {process_owner}
+    assert _class_owners("_SubscriptionExecution") == {process_owner}
+    facade = (
+        PACKAGE / "llm" / "providers" / "subscription_cli" / "__init__.py"
+    ).read_text(encoding="utf-8")
+    assert "create_subprocess_exec" not in facade
+    assert "_decode_model_output" not in facade
 
 
 def test_schema_multi_selector_has_no_data_runtime_or_persisted_state_owner():
@@ -1896,7 +2020,10 @@ def test_pricing_semantics_have_one_provider_neutral_owner():
     models = (PACKAGE / "llm" / "models.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop").lower()
     pricing = (PACKAGE / "llm" / "pricing.py").read_text(encoding="utf-8").lower()
-    assert "estimated_cost_usd" not in models
+    # Requests carry an allowance; returned usage still has one CostEstimate.
+    for node in ast.walk(ast.parse(models)):
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assert node.target.id != "estimated_cost_usd"
     assert "cost_per_million" not in models
     for provider in ("openai", "anthropic", "gemini", "grok", "ollama"):
         assert provider not in loop
@@ -2002,7 +2129,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
         }
 
         assert tables == {
-            "database_write_receipts",
+            "effect_receipts",
             "learning_candidates",
             "job_runs",
             "autonomous_followups",
@@ -2010,7 +2137,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "mcp_server_bindings",
             "messages",
             "metadata",
-            "postgresql_update_scopes",
+            "relational_write_scopes",
             "runs",
             "routine_occurrences",
             "scheduled_routines",
@@ -2022,11 +2149,16 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "syncs",
         }
         assert columns == {
-            "database_write_receipts": (
+            "effect_receipts": (
                 "agent_id",
                 "id",
                 "run_id",
                 "call_id",
+                "operation_key",
+                "routine_id",
+                "occurrence_id",
+                "grant_digest",
+                "unresolved",
                 "data",
             ),
             "learning_candidates": ("agent_id", "id", "data"),
@@ -2054,7 +2186,7 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "messages": ("run_id", "position", "data"),
             "metadata": ("key", "data"),
             "mcp_server_bindings": ("agent_id", "binding_id", "data"),
-            "postgresql_update_scopes": (
+            "relational_write_scopes": (
                 "agent_id",
                 "source_id",
                 "resource_id",
@@ -2096,6 +2228,8 @@ async def test_sqlite_table_set_and_conversation_grouping_are_minimal(tmp_path):
             "syncs": ("agent_id", "id", "source_id", "data"),
         }
         assert named_indexes == {
+            "effect_receipts_unresolved": "effect_receipts",
+            "effect_receipts_grant_reservations": "effect_receipts",
             "deliveries_conversation_history": "deliveries",
             "routine_occurrences_stale": "routine_occurrences",
             "runs_conversation_turn": "runs",
@@ -2285,9 +2419,7 @@ def test_artifact_delivery_uses_no_bash_shell_subprocess_or_unrestricted_file_to
 
 def test_artifact_payloads_and_destination_grants_never_enter_sqlite_messages_or_model_requests():
     sqlite_text = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
-    context_text = (PACKAGE / "domains" / "data" / "context.py").read_text(
-        encoding="utf-8"
-    )
+    context_text = (PACKAGE / "context.py").read_text(encoding="utf-8")
     assert "ArtifactPayload" not in sqlite_text
     assert "ArtifactDraft" not in sqlite_text
     assert "_DestinationGrant" not in sqlite_text
@@ -2327,3 +2459,112 @@ def test_phase_three_xlsx_dependencies_are_scoped_and_integrations_remain_lazy()
     assert "xlsxwriter" not in top_level_imports
     assert "ExactXlsxRenderer" not in _python_text(PACKAGE / "loop")
     assert "ArtifactRendererRegistry" not in artifact_text
+
+
+def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
+    from dataclasses import fields
+
+    from daita.capabilities import AutomationEligibility
+    from daita.domains.data.capabilities import (
+        relational_update_capability_declarations,
+        relational_update_preview_capability_declarations,
+        relational_upsert_capability_declarations,
+    )
+
+    declarations = (
+        relational_update_preview_capability_declarations(),
+        relational_update_capability_declarations(),
+        relational_upsert_capability_declarations(),
+    )
+    assert {view.name for bundle in declarations for view in bundle.tool_views} == {
+        "data_preview_update_rows",
+        "data_update_rows",
+        "data_preview_upsert_rows",
+        "data_upsert_rows",
+    }
+    for bundle in declarations:
+        assert bundle.domain_owner_id == "data"
+        for capability in bundle.capabilities:
+            assert "postgresql" not in capability.id
+            assert (
+                capability.automation_eligibility
+                is AutomationEligibility.AUTOMATION_DIRECT
+            )
+            if capability.access_mode is AccessMode.WRITE:
+                assert capability.operational_effect is OperationalEffect.MUTATE_DATA
+                assert capability.automation_grant_policy is not None
+                assert (
+                    capability.automation_grant_policy.constraints_kind
+                    == "data.relational_write"
+                )
+                assert capability.effect_receipt_policy is not None
+            else:
+                assert capability.operational_effect is OperationalEffect.NONE
+    assert {field.name for field in fields(daita.RelationalWriteScope)} == {
+        "agent_id",
+        "source_id",
+        "resource_id",
+        "resource_revision",
+        "allowed_operations",
+        "allowed_insert_columns",
+        "allowed_update_columns",
+        "key_columns",
+        "generated_identity_columns",
+        "max_rows",
+        "authorization_fingerprint",
+    }
+    assert not hasattr(daita, "PostgreSQLUpdateScope")
+    assert not (PACKAGE / "domains/data/sql/postgresql_update.py").exists()
+
+
+def test_product_recovery_and_permissions_keep_existing_execution_and_state_owners():
+    for relative in (
+        "tui/screens/effects.py",
+        "tui/screens/permissions.py",
+        "tui/screens/routines.py",
+    ):
+        tree = ast.parse((PACKAGE / relative).read_text(encoding="utf-8"))
+        imports = {
+            node.module or ""
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+        }
+        assert not any(
+            module.startswith(
+                (
+                    "daita.storage",
+                    "daita.adapters",
+                    "daita.loop.driver",
+                    "daita.capability_runtime",
+                )
+            )
+            for module in imports
+        )
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        assert calls.isdisjoint(
+            {
+                "execute",
+                "execute_internal",
+                "reserve_effect_receipt",
+                "resolve_effect_receipt",
+                "connect",
+            }
+        )
+    controller = (PACKAGE / "tui/controller.py").read_text(encoding="utf-8")
+    for name in (
+        "inspect_effect",
+        "list_effects",
+        "resolve_effect",
+        "preview_source_permissions",
+        "apply_source_permissions",
+    ):
+        assert f"self.require_agent().{name}(" in controller
+    assert _class_owners("ApprovalPanel") == {"tui/widgets/approval.py"}
+    assert _class_owners("EffectResolution") == {"storage/sqlite_records.py"}
+    cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
+    assert "routine_inspection_projection" in cli
+    assert "def _routine_mapping" not in cli

@@ -126,6 +126,82 @@ def _review_response(run_id: str, *, text: str) -> ModelResponse:
     )
 
 
+@pytest.mark.parametrize("fails", [False, True])
+async def test_reviewer_preserves_original_deadline_and_one_call(
+    tmp_path, monkeypatch, fails
+):
+    from dataclasses import replace
+
+    from daita.config import AgentConfig
+    from daita.llm.errors import (
+        ModelProviderError,
+        ProviderErrorCode,
+        before_generation,
+    )
+    from daita.llm.models import ModelCallPolicy, ModelSensitivity
+    from daita.llm.providers.mock import MockModelProvider as DirectMock
+    from daita.llm.routing import ModelProviderRegistration, ModelRouter, RetryPolicy
+
+    policy = ModelCallPolicy(read_timeout_seconds=45)
+    response = _response('{"candidates": []}')
+    failure = before_generation(
+        ModelProviderError(ProviderErrorCode.PROVIDER_UNAVAILABLE),
+        code="test_transient_setup",
+    )
+    direct = DirectMock([failure if fails else response, response])
+    reviewer = ModelRouter(
+        (
+            ModelProviderRegistration(
+                provider=direct,
+                profile=replace(direct.model_profile, supports_structured_output=True),
+                allowed_sensitivities=frozenset(ModelSensitivity),
+            ),
+        ),
+        retry_policy=RetryPolicy(max_attempts_per_candidate=1, max_total_attempts=1),
+    )
+    foreground = MockModelProvider([_response("Remembered for this conversation.")])
+    agent = await Agent.create(
+        "review-deadline",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        model=foreground,
+        model_profile=foreground.model_profile,
+        config=AgentConfig(model_call_policy=policy),
+        reviewer_model=reviewer,
+        id_factory=_ids(),
+    )
+    original = OneShotCandidateReviewer._review_once
+    observed = {}
+
+    async def delayed_review(self, started, progress, **kwargs):
+        observed["started"] = started
+        await asyncio.sleep(0.02)
+        return await original(self, started, progress, **kwargs)
+
+    monkeypatch.setattr(OneShotCandidateReviewer, "_review_once", delayed_review)
+    try:
+        await agent.run("Remember that booked revenue excludes completed refunds.")
+        result = await agent.review_learning_candidates()
+        assert result.status is (
+            LearningReviewStatus.PROVIDER_FAILED
+            if fails
+            else LearningReviewStatus.COMPLETED
+        )
+        assert result.model_calls == 1
+        assert len(direct.requests) == 1
+        request = direct.requests[0]
+        assert request.deadline is not None and request.attempt_deadline is not None
+        assert request.call_policy == policy
+        assert (
+            request.deadline
+            == observed["started"] + LEARNING_REVIEW_MAX_WALL_TIME_SECONDS
+        )
+        assert request.attempt_deadline <= request.deadline
+    finally:
+        await agent.close()
+        await reviewer.close()
+
+
 def _sqlite_file(path):
     with sqlite3.connect(path) as connection:
         connection.execute("CREATE TABLE invoices(id INTEGER PRIMARY KEY, amount REAL)")
@@ -784,7 +860,7 @@ async def test_source_scoped_candidate_cannot_be_accepted_through_another_source
         source_b = await agent.attach_sqlite(second_path, name="second")
         await agent.run(
             "Run and retain a reusable monthly invoice procedure.",
-            source_id=source_a.id,
+            source_scope_ids=(source_a.id,),
         )
         reviewer.replace_script(
             (
@@ -1247,7 +1323,7 @@ async def test_reviewer_redacts_secret_values_inside_bounded_tool_results(tmp_pa
         )
         run = await agent.run(
             "Inspect the credential record without retaining its value.",
-            source_id=source.id,
+            source_scope_ids=(source.id,),
         )
         transcript = await agent.transcript(run.run_id)
         tool_result = transcript.messages[2].content[0]

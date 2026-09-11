@@ -34,6 +34,7 @@ from .mcp import (
     MCPServerInspection,
     MCPToolBinding,
     MCPToolSelection,
+    MCPCompletionSemantics,
     MCP_SUPPORTED_PROTOCOL_VERSIONS,
 )
 from .sqlite import SQLiteResourceAdapter, SQLiteSource, SQLiteSourceError
@@ -64,6 +65,7 @@ __all__ = [
     "MCPServerInspection",
     "MCPToolBinding",
     "MCPToolSelection",
+    "MCPCompletionSemantics",
     "MCP_SUPPORTED_PROTOCOL_VERSIONS",
     "ResourceAdapter",
     "ResourceAdapterError",

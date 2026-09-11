@@ -3,28 +3,30 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 
-from .._json import canonical_json
+from .._json import FrozenJsonObject, canonical_json
 from ..adapters.models import SourceRegistration
-from ..catalog.models import CatalogFacet, CatalogResource, FacetKind, ResourceKind
+from ..capabilities import EffectEvidenceBasis, EffectObservation, EffectOutcome
+from ..catalog.models import (
+    CatalogFacet,
+    CatalogResource,
+    FacetKind,
+    ResourceKind,
+    TabularFacet,
+)
+from ..llm.models import ModelSensitivity
 
-_DATABASE_WRITE_RECEIPT_ID = re.compile(r"database-write-receipt:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
-_DATABASE_WRITE_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}\Z")
 _SOURCE_PERMISSION_HASH = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_SOURCE_ID = re.compile(r"source:sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_RESOURCE_ID = re.compile(r"catalog-resource:sha256:[0-9a-f]{64}\Z")
 _SOURCE_PERMISSION_MAX_RESOURCE_IDS = 10_000
 _SOURCE_PERMISSION_MAX_CATALOG_COLUMNS = 512
 _SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS = _SOURCE_PERMISSION_MAX_CATALOG_COLUMNS
-_SOURCE_PERMISSION_ADVANCED_COLUMN_THRESHOLD = 32
 _SOURCE_PERMISSION_MAX_SUMMARY_EXAMPLES = 5
 
 
@@ -108,45 +110,94 @@ class SourceReadScope:
 
 
 @dataclass(frozen=True, slots=True)
-class PostgreSQLUpdateScope:
-    """One exact table and assignment-column PostgreSQL authorization."""
+class RelationalWriteScope:
+    """Exact operation, structure, column and row authority for one resource."""
 
     agent_id: str
     source_id: str
     resource_id: str
-    allowed_assignment_columns: tuple[str, ...]
+    resource_revision: str
+    allowed_operations: tuple[str, ...]
+    allowed_insert_columns: tuple[str, ...]
+    allowed_update_columns: tuple[str, ...]
+    key_columns: tuple[str, ...]
+    generated_identity_columns: tuple[str, ...]
+    max_rows: int
     authorization_fingerprint: str
 
     def __post_init__(self) -> None:
-        _permission_text(self.agent_id, "update scope agent_id")
-        if (
-            not isinstance(self.source_id, str)
-            or _SOURCE_PERMISSION_SOURCE_ID.fullmatch(self.source_id) is None
+        _permission_text(self.agent_id, "write scope agent_id")
+        for value, pattern, name in (
+            (self.source_id, _SOURCE_PERMISSION_SOURCE_ID, "source_id"),
+            (self.resource_id, _SOURCE_PERMISSION_RESOURCE_ID, "resource_id"),
+            (self.resource_revision, _SOURCE_PERMISSION_HASH, "resource_revision"),
+            (
+                self.authorization_fingerprint,
+                _SOURCE_PERMISSION_HASH,
+                "authorization_fingerprint",
+            ),
         ):
-            raise ValueError("update scope source_id must be a canonical source id")
-        if (
-            not isinstance(self.resource_id, str)
-            or _SOURCE_PERMISSION_RESOURCE_ID.fullmatch(self.resource_id) is None
+            if not isinstance(value, str) or pattern.fullmatch(value) is None:
+                raise ValueError(f"write scope {name} must be canonical")
+        for name in (
+            "allowed_operations",
+            "allowed_insert_columns",
+            "allowed_update_columns",
+            "key_columns",
+            "generated_identity_columns",
+        ):
+            values = _canonical_permission_texts(
+                getattr(self, name),
+                name,
+                maximum_items=_SOURCE_PERMISSION_MAX_CATALOG_COLUMNS,
+                maximum_characters=256,
+            )
+            object.__setattr__(self, name, values)
+        operations = set(self.allowed_operations)
+        if not operations or not operations <= {"update", "upsert"}:
+            raise ValueError(
+                "write scope requires explicit update and/or upsert operations"
+            )
+        if not self.key_columns or not self.allowed_update_columns:
+            raise ValueError("write scope requires exact keys and update columns")
+        if set(self.key_columns) & set(self.allowed_update_columns):
+            raise ValueError("write scope cannot authorize changing conflict keys")
+        if "upsert" not in operations and (
+            self.allowed_insert_columns or self.generated_identity_columns
         ):
             raise ValueError(
-                "update scope resource_id must be a canonical catalog resource id"
+                "update permission cannot authorize insertion or identity generation"
             )
-        columns = _canonical_permission_texts(
-            self.allowed_assignment_columns,
-            "update scope allowed_assignment_columns",
-            maximum_items=_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS,
-            maximum_characters=256,
-        )
-        if not columns:
-            raise ValueError("update scope allowed_assignment_columns cannot be empty")
-        if (
-            not isinstance(self.authorization_fingerprint, str)
-            or _SOURCE_PERMISSION_HASH.fullmatch(self.authorization_fingerprint) is None
+        if "upsert" in operations and not set(self.key_columns) <= set(
+            self.allowed_insert_columns
+        ):
+            raise ValueError("upsert permission must admit every explicit conflict key")
+        if set(self.generated_identity_columns) & (
+            set(self.allowed_insert_columns)
+            | set(self.allowed_update_columns)
+            | set(self.key_columns)
         ):
             raise ValueError(
-                "update scope authorization_fingerprint must be a sha256 hash"
+                "generated identities must be omitted and outside conflict keys"
             )
-        object.__setattr__(self, "allowed_assignment_columns", columns)
+        if (
+            not isinstance(self.max_rows, int)
+            or isinstance(self.max_rows, bool)
+            or not 1 <= self.max_rows <= 10_000
+        ):
+            raise ValueError("write scope max_rows must be between 1 and 10000")
+
+    def constraints(self) -> dict[str, object]:
+        """Canonical authority shared by permission review, codecs and grants."""
+        return {
+            "resource_revision": self.resource_revision,
+            "allowed_operations": self.allowed_operations,
+            "allowed_insert_columns": self.allowed_insert_columns,
+            "allowed_update_columns": self.allowed_update_columns,
+            "key_columns": self.key_columns,
+            "generated_identity_columns": self.generated_identity_columns,
+            "max_rows": self.max_rows,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +208,11 @@ class SourcePermissionResource:
     display_name: str
     resource_kind: str
     eligible_assignment_columns: tuple[str, ...] = ()
+    key_columns: tuple[str, ...] = ()
+    upsert_conflict_keys: tuple[tuple[str, ...], ...] = ()
+    eligible_insert_columns: tuple[str, ...] = ()
+    eligible_upsert_update_columns: tuple[str, ...] = ()
+    generated_identity_columns: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (
@@ -177,32 +233,69 @@ class SourcePermissionResource:
             maximum_characters=256,
         )
         object.__setattr__(self, "eligible_assignment_columns", columns)
-
-    @property
-    def postgresql_update_eligible(self) -> bool:
-        return bool(self.eligible_assignment_columns)
-
-    @property
-    def requires_advanced_column_selection(self) -> bool:
-        return len(self.eligible_assignment_columns) > (
-            _SOURCE_PERMISSION_ADVANCED_COLUMN_THRESHOLD
+        for name in (
+            "eligible_insert_columns",
+            "eligible_upsert_update_columns",
+            "generated_identity_columns",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                _canonical_permission_texts(
+                    getattr(self, name),
+                    name,
+                    maximum_items=512,
+                    maximum_characters=256,
+                ),
+            )
+        if (
+            not isinstance(self.upsert_conflict_keys, tuple)
+            or len(self.upsert_conflict_keys) > 512
+        ):
+            raise ValueError("upsert conflict keys must be bounded")
+        object.__setattr__(
+            self,
+            "upsert_conflict_keys",
+            tuple(
+                _canonical_permission_texts(
+                    key,
+                    "upsert conflict key",
+                    maximum_items=512,
+                    maximum_characters=256,
+                )
+                for key in self.upsert_conflict_keys
+            ),
         )
+        object.__setattr__(
+            self,
+            "key_columns",
+            _canonical_permission_texts(
+                self.key_columns,
+                "key columns",
+                maximum_items=512,
+                maximum_characters=256,
+            ),
+        )
+
+    @property
+    def relational_update_eligible(self) -> bool:
+        return bool(self.eligible_assignment_columns)
 
 
 @dataclass(frozen=True, slots=True)
 class SourcePermissionState:
-    """One exact read/update-scope state returned by the control plane."""
+    """One exact read/write-scope state returned by the control plane."""
 
     read_scope: SourceReadScope
-    postgresql_update_scopes: tuple[PostgreSQLUpdateScope, ...]
+    relational_write_scopes: tuple[RelationalWriteScope, ...]
 
     def __post_init__(self) -> None:
         if not isinstance(self.read_scope, SourceReadScope):
             raise TypeError("permission state read_scope must be SourceReadScope")
-        scopes = tuple(self.postgresql_update_scopes)
-        if any(not isinstance(scope, PostgreSQLUpdateScope) for scope in scopes):
+        scopes = tuple(self.relational_write_scopes)
+        if any(not isinstance(scope, RelationalWriteScope) for scope in scopes):
             raise TypeError(
-                "permission state update scopes must be PostgreSQLUpdateScope records"
+                "permission state update scopes must be RelationalWriteScope records"
             )
         if len({scope.resource_id for scope in scopes}) != len(scopes):
             raise ValueError("permission state update scopes cannot repeat resources")
@@ -214,7 +307,7 @@ class SourcePermissionState:
             raise ValueError("permission state scopes must share one owner")
         object.__setattr__(
             self,
-            "postgresql_update_scopes",
+            "relational_write_scopes",
             tuple(sorted(scopes, key=lambda scope: scope.resource_id)),
         )
 
@@ -226,8 +319,8 @@ class SourcePermissionSummary:
     source_display_name: str
     read_mode: SourceReadMode
     selected_read_resource_count: int
-    postgresql_update_table_count: int
-    postgresql_update_table_examples: tuple[str, ...]
+    relational_write_table_count: int
+    relational_write_table_examples: tuple[str, ...]
     automatic_read_addition_examples: tuple[str, ...]
     dependent_update_revocation_examples: tuple[str, ...]
     postgresql_privilege_status: str = "unknown"
@@ -239,12 +332,12 @@ class SourcePermissionSummary:
             raise TypeError("permission summary read_mode must be SourceReadMode")
         for value, name in (
             (self.selected_read_resource_count, "selected read resource count"),
-            (self.postgresql_update_table_count, "update table count"),
+            (self.relational_write_table_count, "update table count"),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"permission summary {name} must be non-negative")
         for values, name in (
-            (self.postgresql_update_table_examples, "update table examples"),
+            (self.relational_write_table_examples, "update table examples"),
             (self.automatic_read_addition_examples, "automatic read examples"),
             (
                 self.dependent_update_revocation_examples,
@@ -260,7 +353,7 @@ class SourcePermissionSummary:
             object.__setattr__(
                 self,
                 {
-                    "update table examples": "postgresql_update_table_examples",
+                    "update table examples": "relational_write_table_examples",
                     "automatic read examples": "automatic_read_addition_examples",
                     "dependent revocation examples": (
                         "dependent_update_revocation_examples"
@@ -346,7 +439,7 @@ class SourcePermissionsPreview:
     before: SourcePermissionState
     after: SourcePermissionState
     automatic_read_additions: tuple[str, ...]
-    dependent_update_revocations: tuple[str, ...]
+    dependent_write_revocations: tuple[str, ...]
     summary: SourcePermissionSummary
     confirmation_fingerprint: str
 
@@ -368,7 +461,7 @@ class SourcePermissionsPreview:
                 raise ValueError(f"permission preview {name} belongs elsewhere")
         for values, name in (
             (self.automatic_read_additions, "automatic read additions"),
-            (self.dependent_update_revocations, "dependent update revocations"),
+            (self.dependent_write_revocations, "dependent update revocations"),
         ):
             normalized = _canonical_permission_texts(
                 values,
@@ -386,7 +479,7 @@ class SourcePermissionsPreview:
                 (
                     "automatic_read_additions"
                     if name == "automatic read additions"
-                    else "dependent_update_revocations"
+                    else "dependent_write_revocations"
                 ),
                 normalized,
             )
@@ -403,21 +496,14 @@ class SourcePermissionsPreview:
             )
 
 
-def postgresql_update_authorization_fingerprint(
+def relational_write_authorization_fingerprint(
     *,
     source: SourceRegistration,
     resource: CatalogResource,
     facet: CatalogFacet,
-    allowed_assignment_columns: Iterable[str],
+    scope: RelationalWriteScope,
 ) -> str:
-    """Bind only durable facts that determine one update authorization's meaning."""
-
-    if not isinstance(source, SourceRegistration):
-        raise TypeError("authorization source must be a SourceRegistration")
-    if not isinstance(resource, CatalogResource):
-        raise TypeError("authorization resource must be a CatalogResource")
-    if not isinstance(facet, CatalogFacet):
-        raise TypeError("authorization facet must be a CatalogFacet")
+    """Bind exact current structural and permission facts, excluding freshness."""
     if (
         source.adapter_id != "postgresql"
         or not source.active
@@ -426,345 +512,358 @@ def postgresql_update_authorization_fingerprint(
         or resource.kind is not ResourceKind.TABLE
         or facet.resource_id != resource.id
         or facet.kind is not FacetKind.TABULAR
+        or scope.agent_id != source.agent_id
+        or scope.source_id != source.id
+        or scope.resource_id != resource.id
+        or scope.resource_revision != resource.current_revision
     ):
         raise ValueError(
-            "authorization requires one current table from an active PostgreSQL source"
+            "write authorization requires exact current owned table structure"
         )
-    allowed = _canonical_permission_texts(
-        allowed_assignment_columns,
-        "authorization allowed_assignment_columns",
-        maximum_items=_SOURCE_PERMISSION_MAX_ASSIGNMENT_COLUMNS,
-        maximum_characters=256,
-    )
-    if not allowed:
-        raise ValueError("authorization allowed_assignment_columns cannot be empty")
-    raw_columns = facet.payload.get("columns")
-    if not isinstance(raw_columns, tuple):
-        raise ValueError("authorization requires exact tabular column facts")
-    columns: dict[str, Mapping[str, object]] = {}
-    for raw_column in raw_columns:
-        if not isinstance(raw_column, Mapping):
-            raise ValueError("authorization tabular column facts are invalid")
-        name = raw_column.get("name")
-        if not isinstance(name, str) or name in columns:
-            raise ValueError("authorization tabular column identity is invalid")
-        columns[name] = raw_column
-
-    primary_key_columns: list[tuple[int, str]] = []
-    for name, column in columns.items():
-        ordinal = column.get("primary_key_ordinal")
-        if ordinal is None:
-            continue
-        if not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 1:
-            raise ValueError("authorization primary-key structure is invalid")
-        primary_key_columns.append((ordinal, name))
-    primary_key_columns.sort()
-    if [ordinal for ordinal, _ in primary_key_columns] != list(
-        range(1, len(primary_key_columns) + 1)
-    ):
-        raise ValueError("authorization primary-key structure is invalid")
-
-    allowed_facts: list[dict[str, object]] = []
-    primary_names = {name for _, name in primary_key_columns}
-    for name in allowed:
-        selected_column = columns.get(name)
-        if selected_column is None:
-            raise ValueError("authorization references an unknown assignment column")
-        native_type = selected_column.get("native_type")
-        namespace = selected_column.get("native_type_namespace")
-        native_name = selected_column.get("native_type_name")
-        updatable = selected_column.get("updatable")
-        identity = selected_column.get("identity")
-        generated = selected_column.get("generated")
-        if (
-            not isinstance(native_type, str)
-            or not isinstance(updatable, bool)
-            or not isinstance(identity, bool)
-            or not isinstance(generated, bool)
-            or (namespace is None) is not (native_name is None)
-            or (namespace is not None and not isinstance(namespace, str))
-            or (native_name is not None and not isinstance(native_name, str))
-        ):
-            raise ValueError("authorization assignment-column facts are invalid")
-        if name in primary_names or not updatable or identity or generated:
-            raise ValueError("authorization assignment column is not eligible")
-        allowed_facts.append(
-            {
-                "generated": generated,
-                "identity": identity,
-                "name": name,
-                "native_type": native_type,
-                "native_type_name": native_name,
-                "native_type_namespace": namespace,
-                "updatable": updatable,
-            }
-        )
-
-    material = {
-        "adapter_id": source.adapter_id,
-        "allowed_assignment_columns": allowed_facts,
-        "primary_key": tuple(
-            {"name": name, "ordinal": ordinal} for ordinal, name in primary_key_columns
-        ),
-        "resource_id": resource.id,
-        "resource_kind": resource.kind.value,
-        "source_id": source.id,
+    tabular = TabularFacet.from_payload(facet.payload)
+    columns = {column.name: column for column in tabular.columns}
+    primary = {
+        column.name
+        for column in tabular.columns
+        if column.primary_key_ordinal is not None
     }
-    return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
+    for name in scope.allowed_update_columns:
+        column = columns.get(name)
+        if (
+            column is None
+            or not column.updatable
+            or column.identity
+            or column.generated
+            or name in primary
+        ):
+            raise ValueError("authorization update column is not eligible")
+    if not set(scope.allowed_insert_columns) <= set(columns) or not set(
+        scope.key_columns
+    ) <= set(columns):
+        raise ValueError("authorization column is not eligible")
+    if any(not columns[name].identity for name in scope.generated_identity_columns):
+        raise ValueError("authorization generated identity is not eligible")
+    if "update" in scope.allowed_operations and set(scope.key_columns) != primary:
+        raise ValueError("update authority requires the exact primary key")
+    if "upsert" in scope.allowed_operations:
+        if set(scope.key_columns) not in [
+            set(index.columns)
+            for index in tabular.indexes
+            if index.unique
+            and index.predicate is None
+            and index.write_conflict_supported
+        ]:
+            raise ValueError("upsert authority requires a supported conflict key")
+        if any(
+            columns[name].identity or columns[name].generated
+            for name in scope.allowed_insert_columns
+        ):
+            raise ValueError("explicit generated columns are not eligible")
+    return (
+        "sha256:"
+        + sha256(
+            canonical_json(
+                {
+                    "agent_id": source.agent_id,
+                    "adapter_id": source.adapter_id,
+                    "source_id": source.id,
+                    "resource_id": resource.id,
+                    "structure": tabular.structural_payload(),
+                    "authority": scope.constraints(),
+                }
+            ).encode("utf-8")
+        ).hexdigest()
+    )
 
 
-class DatabaseWriteOutcome(str, Enum):
-    STARTED = "started"
-    COMMITTED = "committed"
-    NOT_COMMITTED = "not_committed"
-    OUTCOME_UNKNOWN = "outcome_unknown"
+class EffectReceiptConflictError(RuntimeError):
+    """A reserved operation or immutable terminal observation conflicts."""
 
 
-class DatabaseWriteReceiptConflictError(RuntimeError):
-    """The durable receipt identity or immutable terminal state conflicts."""
+class EffectUnresolvedError(RuntimeError):
+    """External work is blocked by durable unresolved evidence."""
+
+    def __init__(self, receipt_ids: tuple[str, ...], omitted_count: int) -> None:
+        self.receipt_ids = receipt_ids
+        self.omitted_count = omitted_count
+        super().__init__(
+            "Unresolved external effects require explicit foreground recovery."
+        )
 
 
-def database_write_text(value: str, name: str, *, maximum: int = 512) -> str:
+def effect_receipt_text(value: str, name: str, *, maximum: int = 512) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError(f"{name} must be non-empty text without surrounding space")
-    if len(value) > maximum:
-        raise ValueError(f"{name} exceeds {maximum} characters")
+    if len(value) > maximum or any(character in "\r\n\x00" for character in value):
+        raise ValueError(f"{name} must be bounded single-line text")
     return value
 
 
-def database_write_aware(value: datetime, name: str) -> datetime:
-    if (
-        not isinstance(value, datetime)
-        or value.tzinfo is None
-        or value.utcoffset() is None
-    ):
+def effect_receipt_aware(value: datetime, name: str) -> datetime:
+    if not isinstance(value, datetime) or value.utcoffset() is None:
         raise ValueError(f"{name} must be timezone-aware")
     return value
 
 
-def database_write_receipt_id(
-    *,
-    agent_id: str,
-    run_id: str,
-    call_id: str,
-    capability_id: str,
-    intent_sha256: str,
+def effect_receipt_id(
+    *, agent_id: str, run_id: str, call_id: str, operation_key: str
 ) -> str:
-    identity = {
-        "agent_id": database_write_text(agent_id, "receipt agent_id"),
-        "call_id": database_write_text(call_id, "receipt call_id"),
-        "capability_id": database_write_text(
-            capability_id, "receipt capability_id", maximum=128
-        ),
-        "intent_sha256": intent_sha256,
-        "run_id": database_write_text(run_id, "receipt run_id"),
+    material = {
+        "agent_id": effect_receipt_text(agent_id, "receipt agent_id"),
+        "run_id": effect_receipt_text(run_id, "receipt run_id"),
+        "call_id": effect_receipt_text(call_id, "receipt call_id"),
+        "operation_key": operation_key,
     }
     if (
-        not isinstance(intent_sha256, str)
-        or _DATABASE_WRITE_HASH.fullmatch(intent_sha256) is None
+        not isinstance(operation_key, str)
+        or _SOURCE_PERMISSION_HASH.fullmatch(operation_key) is None
     ):
-        raise ValueError("receipt intent_sha256 must be a sha256 hash")
-    digest = sha256(canonical_json(identity).encode("utf-8")).hexdigest()
-    return f"database-write-receipt:sha256:{digest}"
+        raise ValueError("receipt operation key must be a sha256 digest")
+    return (
+        "effect-receipt:sha256:"
+        + sha256(canonical_json(material).encode("utf-8")).hexdigest()
+    )
 
 
-def validate_database_write_receipt_id(value: str) -> str:
+def validate_effect_receipt_id(value: str) -> str:
     if (
         not isinstance(value, str)
-        or _DATABASE_WRITE_RECEIPT_ID.fullmatch(value) is None
+        or re.fullmatch(r"effect-receipt:sha256:[0-9a-f]{64}", value) is None
     ):
-        raise ValueError("receipt_id must be a canonical database-write receipt id")
+        raise ValueError("receipt_id must be a canonical effect receipt id")
     return value
 
 
+class EffectResolutionDecision(str, Enum):
+    CLOSE_WITHOUT_RETRY = "close_without_retry"
+    ALLOW_FUTURE_WORK = "allow_future_work"
+
+
 @dataclass(frozen=True, slots=True)
-class DatabaseWriteReceipt:
-    """Bounded durable metadata for one exact external database-write attempt."""
+class EffectResolution:
+    """One human decision retained separately from the original observation."""
 
     receipt_id: str
+    receipt_digest: str
+    decision: EffectResolutionDecision
+    approving_principal_id: str
+    control_id: str
+    resolved_at: datetime
+    note: str
+    evidence_references: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        validate_effect_receipt_id(self.receipt_id)
+        if (
+            not isinstance(self.receipt_digest, str)
+            or _SOURCE_PERMISSION_HASH.fullmatch(self.receipt_digest) is None
+        ):
+            raise ValueError("resolution receipt digest is invalid")
+        if not isinstance(self.decision, EffectResolutionDecision):
+            raise TypeError("resolution decision is invalid")
+        effect_receipt_text(self.approving_principal_id, "resolution principal")
+        effect_receipt_text(self.control_id, "resolution control identity")
+        effect_receipt_aware(self.resolved_at, "resolution time")
+        if (
+            not isinstance(self.note, str)
+            or not self.note.strip()
+            or "\x00" in self.note
+            or len(self.note.encode("utf-8")) > 4096
+        ):
+            raise ValueError("resolution requires a bounded non-empty user note")
+        references = _canonical_permission_texts(
+            self.evidence_references,
+            "resolution evidence references",
+            maximum_items=16,
+            maximum_characters=512,
+        )
+        object.__setattr__(self, "evidence_references", references)
+
+
+@dataclass(frozen=True, slots=True)
+class EffectReceipt:
+    """One runtime-reserved external operation and its immutable observation."""
+
+    receipt_id: str
+    receipt_kind: str
     agent_id: str
     run_id: str
     call_id: str
     capability_id: str
-    source_id: str
-    resource_id: str
-    intent_sha256: str
-    preview_fingerprint: str
-    expected_affected_rows: int
-    outcome: DatabaseWriteOutcome
-    affected_rows: int | None
-    normalized_error_code: str | None
+    domain_owner_id: str
+    capability_contract_digest: str
+    operation_key: str
+    argument_fingerprint: str
+    sensitivity: ModelSensitivity
     started_at: datetime
-    completed_at: datetime | None
+    routine_id: str | None = None
+    routine_revision: int | None = None
+    occurrence_id: str | None = None
+    capability_grant_digest: str | None = None
+    outcome: EffectOutcome = EffectOutcome.STARTED
+    evidence_basis: EffectEvidenceBasis = EffectEvidenceBasis.UNKNOWN
+    payload: FrozenJsonObject | None = None
+    finished_at: datetime | None = None
+    resolution: EffectResolution | None = None
 
     def __post_init__(self) -> None:
-        validate_database_write_receipt_id(self.receipt_id)
-        database_write_text(self.agent_id, "receipt agent_id")
-        database_write_text(self.run_id, "receipt run_id")
-        database_write_text(self.call_id, "receipt call_id")
-        database_write_text(self.capability_id, "receipt capability_id", maximum=128)
-        if (
-            not isinstance(self.source_id, str)
-            or _DATABASE_WRITE_SOURCE_ID.fullmatch(self.source_id) is None
+        validate_effect_receipt_id(self.receipt_id)
+        for name in (
+            "receipt_kind",
+            "agent_id",
+            "run_id",
+            "call_id",
+            "capability_id",
+            "domain_owner_id",
         ):
-            raise ValueError("receipt source_id must be a canonical source id")
-        if (
-            not isinstance(self.resource_id, str)
-            or _DATABASE_WRITE_RESOURCE_ID.fullmatch(self.resource_id) is None
+            effect_receipt_text(getattr(self, name), f"receipt {name}")
+        for name in (
+            "capability_contract_digest",
+            "operation_key",
+            "argument_fingerprint",
         ):
-            raise ValueError("receipt resource_id must be a canonical resource id")
-        for value, name in (
-            (self.intent_sha256, "intent_sha256"),
-            (self.preview_fingerprint, "preview_fingerprint"),
-        ):
+            value = getattr(self, name)
             if (
                 not isinstance(value, str)
-                or _DATABASE_WRITE_HASH.fullmatch(value) is None
+                or _SOURCE_PERMISSION_HASH.fullmatch(value) is None
             ):
-                raise ValueError(f"receipt {name} must be a sha256 hash")
-        if not isinstance(self.outcome, DatabaseWriteOutcome):
-            raise TypeError("receipt outcome must be a DatabaseWriteOutcome")
-        if (
-            not isinstance(self.expected_affected_rows, int)
-            or isinstance(self.expected_affected_rows, bool)
-            or self.expected_affected_rows < 1
+                raise ValueError(f"receipt {name} must be a sha256 digest")
+        routine_fields = (
+            self.routine_id,
+            self.routine_revision,
+            self.occurrence_id,
+            self.capability_grant_digest,
+        )
+        if any(item is not None for item in routine_fields):
+            if any(item is None for item in routine_fields):
+                raise ValueError("receipt routine fields must be present together")
+            effect_receipt_text(self.routine_id or "", "receipt routine_id")
+            effect_receipt_text(self.occurrence_id or "", "receipt occurrence_id")
+            if type(self.routine_revision) is not int or self.routine_revision < 1:
+                raise ValueError("receipt routine revision must be positive")
+            if (
+                not isinstance(self.capability_grant_digest, str)
+                or _SOURCE_PERMISSION_HASH.fullmatch(self.capability_grant_digest)
+                is None
+            ):
+                raise ValueError("receipt grant digest is invalid")
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("receipt sensitivity must be classified")
+        effect_receipt_aware(self.started_at, "receipt start time")
+        if not isinstance(self.outcome, EffectOutcome) or not isinstance(
+            self.evidence_basis, EffectEvidenceBasis
         ):
-            raise ValueError("receipt expected_affected_rows must be positive")
-        database_write_aware(self.started_at, "receipt started_at")
-        if self.completed_at is not None:
-            database_write_aware(self.completed_at, "receipt completed_at")
-            if self.completed_at < self.started_at:
-                raise ValueError("receipt cannot complete before it starts")
-        expected_id = database_write_receipt_id(
+            raise TypeError("receipt observation classification is invalid")
+        if self.receipt_id != effect_receipt_id(
             agent_id=self.agent_id,
             run_id=self.run_id,
             call_id=self.call_id,
-            capability_id=self.capability_id,
-            intent_sha256=self.intent_sha256,
-        )
-        if self.receipt_id != expected_id:
-            raise ValueError("receipt_id does not match its execution identity")
-        if self.normalized_error_code is not None and (
-            not isinstance(self.normalized_error_code, str)
-            or _DATABASE_WRITE_ERROR_CODE.fullmatch(self.normalized_error_code) is None
+            operation_key=self.operation_key,
         ):
-            raise ValueError("receipt normalized_error_code is invalid")
-        if self.affected_rows is not None and (
-            not isinstance(self.affected_rows, int)
-            or isinstance(self.affected_rows, bool)
-        ):
-            raise TypeError("receipt affected_rows must be an integer or None")
-        if self.outcome is DatabaseWriteOutcome.STARTED:
-            if any(
-                value is not None
-                for value in (
-                    self.affected_rows,
-                    self.normalized_error_code,
-                    self.completed_at,
-                )
-            ):
-                raise ValueError("started receipt cannot contain terminal fields")
-        elif self.outcome is DatabaseWriteOutcome.COMMITTED:
+            raise ValueError("receipt ID does not match its execution identity")
+        if self.outcome is EffectOutcome.STARTED:
             if (
-                self.affected_rows != self.expected_affected_rows
-                or self.normalized_error_code is not None
-                or self.completed_at is None
+                self.finished_at is not None
+                or self.payload is not None
+                or self.evidence_basis is not EffectEvidenceBasis.UNKNOWN
             ):
-                raise ValueError(
-                    "committed receipt must record the expected affected rows"
-                )
-        elif self.outcome is DatabaseWriteOutcome.NOT_COMMITTED:
-            if (
-                self.affected_rows != 0
-                or self.normalized_error_code is None
-                or self.completed_at is None
-            ):
-                raise ValueError(
-                    "not_committed receipt must record zero rows and an error code"
-                )
-        elif (
-            self.affected_rows is not None
-            or self.normalized_error_code != "write_outcome_unknown"
-            or self.completed_at is None
-        ):
-            raise ValueError(
-                "outcome_unknown receipt must omit affected rows and use its stable code"
+                raise ValueError("started receipt cannot contain terminal evidence")
+        else:
+            if self.finished_at is None:
+                raise ValueError("terminal receipt requires a finish time")
+            effect_receipt_aware(self.finished_at, "receipt finish time")
+            if self.finished_at < self.started_at:
+                raise ValueError("receipt cannot finish before it starts")
+            observation = EffectObservation(
+                self.outcome, self.evidence_basis, self.payload
             )
+            object.__setattr__(self, "payload", observation.payload)
+        if self.resolution is not None:
+            if (
+                not isinstance(self.resolution, EffectResolution)
+                or self.outcome is not EffectOutcome.UNCERTAIN
+            ):
+                raise ValueError("only uncertain receipts can carry a human resolution")
+            if (
+                self.resolution.receipt_id != self.receipt_id
+                or self.resolution.receipt_digest != self.receipt_digest
+            ):
+                raise ValueError("resolution does not bind this exact observation")
+            if (
+                self.finished_at is None
+                or self.resolution.resolved_at < self.finished_at
+            ):
+                raise ValueError("resolution cannot precede its terminal observation")
 
-    @classmethod
-    def start(
-        cls,
-        *,
-        agent_id: str,
-        run_id: str,
-        call_id: str,
-        capability_id: str,
-        source_id: str,
-        resource_id: str,
-        intent_sha256: str,
-        preview_fingerprint: str,
-        expected_affected_rows: int,
-        started_at: datetime,
-    ) -> DatabaseWriteReceipt:
-        return cls(
-            receipt_id=database_write_receipt_id(
-                agent_id=agent_id,
-                run_id=run_id,
-                call_id=call_id,
-                capability_id=capability_id,
-                intent_sha256=intent_sha256,
+    def material(self) -> dict[str, object]:
+        return {
+            "receipt_id": self.receipt_id,
+            "receipt_kind": self.receipt_kind,
+            "agent_id": self.agent_id,
+            "run_id": self.run_id,
+            "call_id": self.call_id,
+            "capability_id": self.capability_id,
+            "domain_owner_id": self.domain_owner_id,
+            "capability_contract_digest": self.capability_contract_digest,
+            "routine_id": self.routine_id,
+            "routine_revision": self.routine_revision,
+            "occurrence_id": self.occurrence_id,
+            "capability_grant_digest": self.capability_grant_digest,
+            "operation_key": self.operation_key,
+            "argument_fingerprint": self.argument_fingerprint,
+            "outcome": self.outcome.value,
+            "evidence_basis": self.evidence_basis.value,
+            "sensitivity": self.sensitivity.value,
+            "payload": self.payload,
+            "started_at": self.started_at.isoformat(),
+            "finished_at": (
+                None if self.finished_at is None else self.finished_at.isoformat()
             ),
-            agent_id=agent_id,
-            run_id=run_id,
-            call_id=call_id,
-            capability_id=capability_id,
-            source_id=source_id,
-            resource_id=resource_id,
-            intent_sha256=intent_sha256,
-            preview_fingerprint=preview_fingerprint,
-            expected_affected_rows=expected_affected_rows,
-            outcome=DatabaseWriteOutcome.STARTED,
-            affected_rows=None,
-            normalized_error_code=None,
-            started_at=started_at,
-            completed_at=None,
+        }
+
+    @property
+    def receipt_digest(self) -> str:
+        return (
+            "sha256:"
+            + sha256(canonical_json(self.material()).encode("utf-8")).hexdigest()
         )
+
+    @property
+    def unresolved(self) -> bool:
+        return self.resolution is None and self.outcome in {
+            EffectOutcome.STARTED,
+            EffectOutcome.UNCERTAIN,
+        }
 
     def finish(
-        self,
-        outcome: DatabaseWriteOutcome,
-        *,
-        completed_at: datetime,
-        affected_rows: int | None,
-        normalized_error_code: str | None,
-    ) -> DatabaseWriteReceipt:
-        if self.outcome is not DatabaseWriteOutcome.STARTED:
-            raise ValueError("only a started receipt can reach a terminal outcome")
-        if outcome is DatabaseWriteOutcome.STARTED:
-            raise ValueError("receipt terminal outcome cannot be started")
+        self, observation: EffectObservation, *, finished_at: datetime
+    ) -> EffectReceipt:
+        if self.outcome is not EffectOutcome.STARTED:
+            raise ValueError("only a started receipt can reach a terminal observation")
         return replace(
             self,
-            outcome=outcome,
-            affected_rows=affected_rows,
-            normalized_error_code=normalized_error_code,
-            completed_at=completed_at,
+            outcome=observation.outcome,
+            evidence_basis=observation.evidence_basis,
+            payload=observation.payload,
+            finished_at=finished_at,
         )
 
-    def as_started(self) -> DatabaseWriteReceipt:
+    def as_started(self) -> EffectReceipt:
         return replace(
             self,
-            outcome=DatabaseWriteOutcome.STARTED,
-            affected_rows=None,
-            normalized_error_code=None,
-            completed_at=None,
+            outcome=EffectOutcome.STARTED,
+            evidence_basis=EffectEvidenceBasis.UNKNOWN,
+            payload=None,
+            finished_at=None,
+            resolution=None,
         )
 
 
 __all__ = [
-    "DatabaseWriteOutcome",
-    "DatabaseWriteReceipt",
-    "DatabaseWriteReceiptConflictError",
-    "PostgreSQLUpdateScope",
+    "EffectOutcome",
+    "EffectReceipt",
+    "EffectReceiptConflictError",
+    "RelationalWriteScope",
     "SourcePermissionResource",
     "SourcePermissionState",
     "SourcePermissionStateError",
@@ -773,9 +872,9 @@ __all__ = [
     "SourcePermissionsPreview",
     "SourceReadMode",
     "SourceReadScope",
-    "database_write_aware",
-    "database_write_receipt_id",
-    "database_write_text",
-    "postgresql_update_authorization_fingerprint",
-    "validate_database_write_receipt_id",
+    "effect_receipt_aware",
+    "effect_receipt_id",
+    "effect_receipt_text",
+    "relational_write_authorization_fingerprint",
+    "validate_effect_receipt_id",
 ]

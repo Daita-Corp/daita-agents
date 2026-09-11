@@ -23,7 +23,8 @@ explain intent, but they do not define current behavior.
 ## Product architecture
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
-explicitly enabled PostgreSQL update capability. It uses one direct loop:
+explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL,
+and locally admitted MCP external actions. It uses one direct loop:
 
 ```text
 user message -> model -> zero or more tool calls -> ordered tool results
@@ -39,9 +40,18 @@ Outer step, wall-time, token, and estimated-cost limits bound the loop. Every
 requested tool call receives exactly one result in call order, including when
 independent reads execute concurrently or another call fails.
 
+Budget exhaustion is terminal failure, with exact usage and partial evidence
+retained. There is no post-limit model request or separate final-context path.
+Returned usage is checked before tool dispatch and before accepting completion.
+Canonical requests carry the remaining allowance; adapters own provider-native
+input counting, reviewed price admission, and supported wire output controls.
+Actual consumption is never clipped to an authorization or reservation ceiling.
+Unknown machine-run usage consumes at least its reservation; it is never recorded
+as measured zero. Exhausted cumulative budgets prevent subsequent reservation.
+
 Daita supports catalog-backed SQLite and PostgreSQL reads, bounded access to
 one admitted local workspace, and explicitly admitted server-neutral remote
-MCP read tools. SQL is validated against the current catalog before source
+MCP reads and external actions. SQL is validated against the current catalog before source
 I/O. Workspace reads are descriptor-contained and revision-bound. MCP calls
 revalidate the exact binding revision, remote identity, and schemas.
 
@@ -61,7 +71,9 @@ src/daita/
   capabilities.py             # declarations, registry, schema validation
   capability_runtime.py       # common model-to-execution boundary
   domains/                    # statically composed capability domains
-  domains/data/               # data context, validation, SQL, files, artifacts
+  context.py                  # bounded classified framework request construction
+  scope.py                    # effective source/resource scope intersection
+  domains/data/               # data validation, SQL, files, artifacts
   catalog/                    # normalized source and resource truth
   adapters/                   # source admission, discovery, and bounded I/O
   artifacts/                  # artifact records, renderers, storage, delivery
@@ -78,6 +90,7 @@ src/daita/
   config.py                   # immutable runtime and model configuration
   workspace.py                # runtime-only local workspace admission
   cli.py                      # CLI over the public embedded API
+  tui/                        # source-free navigation, approvals and human controls
 tests/                        # deterministic and opt-in live tests
 examples/                     # offline examples
 docs/                         # user-facing guides
@@ -120,11 +133,42 @@ It depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
 validation, source I/O, policy, and feature lifecycle state stay outside the
 loop.
 
-`daita.domains.data.context.DataContextBuilder` creates each model request from
+`daita.context.AgentContextBuilder` creates each model request from
 the current transcript, current catalog, projected tool definitions, and model
 profile. It keeps complete tool exchanges together and labels catalog, tool,
 file, memory, skill, and data content as untrusted. Untrusted content cannot
 become an instruction or grant authority.
+
+Preparation freezes core instructions, admitted metadata, prior continuity, and
+safe artifact destinations. Each step adds code-owned procedure guidance only for
+its authenticated callable tool projection and reports the remaining run allowance.
+Optional discovery and prior continuity are fitted against the configured input
+window, with a separate conservative footprint allowance derived from the effective
+cumulative run limit. Fixed instructions, current input, and pinned schemas form
+the mandatory baseline; they do not consume the optional-addition allowance. This
+presentation target cannot truncate the exact current
+transcript, lower sensitivity, grant authority, or replace provider token admission.
+The same projection reports remaining steps and an advisory two-request budget
+forecast using measured input growth and output allowances. Forecasts cannot reserve
+credit, alter hard admission, or guarantee completion with unknown future results.
+
+Foreground `RunInput.source_scope_ids=()` admits all currently readable sources
+as candidates at preparation; a nonempty tuple narrows them to exact caller IDs.
+One explicit effective scope freezes source and resource candidates for that run.
+Revocation narrows it; later attachment or permission expansion cannot widen it.
+An empty machine ceiling or resolved scope means no sources. Files-only excludes
+both catalog and MCP tools. There is no active source, conversation source, or
+implicit source argument injection.
+
+Completed-run sensitivity is a conservative floor retained with conversation
+continuity, including compressed assistant answers after source detach. Requests
+also include the classifications of rendered connector metadata, memory, skills,
+semantics, and current results. Model-written advisory content inherits the full
+request classification. Local advisory imports default to restricted; explicit
+local classification uses typed owner APIs or the owned Markdown sensitivity
+label. These labels affect information handling, never execution authority.
+Scheduled reasoning starts from its approved self-contained instruction and
+exact retained skills, without unrelated conversation history or mutable memory.
 
 The catalog is authoritative for current source and resource identity,
 schemas, facets, relationships, and freshness. A current validated tool result
@@ -138,7 +182,13 @@ routine identity, allowed sources, resources, connector bindings,
 capabilities, access modes, operational effects, sensitivity ceiling, model
 routes, per-run budgets, and distribution-plan digest. Scheduled instructions
 are foreground-authorized content; job-event instructions are code-owned.
-Untrusted payloads and model text cannot enlarge the scope.
+Untrusted payloads and model text cannot enlarge the scope. `contract_bindings`
+retains exact capability, MCP-origin, resource-structure and model-configuration
+digests. The composition supplies one bound current-contract reader to routine
+admission, runtime checks and code-owned follow-up construction; it cannot execute
+work. Revalidation compares retained references, never accepts replacement current
+contracts implicitly. Local hints and refresh timestamps are presentation/freshness
+facts, not execution authority.
 
 ## Capabilities and execution
 
@@ -147,13 +197,38 @@ executor, and domain identities. It projects tool schemas and validates model
 arguments and executor output. A tool is a model-facing view of a capability,
 not another execution path.
 
-`toolbox_search` accepts only a natural-language `query` and optional bounded
-`limit` over the run's applicable catalog. Toolbox grouping, access modes, and
+`toolbox_search` accepts a natural-language `query`, optional bounded
+`limit`, and an opaque continuation `cursor` over the run's applicable catalog.
+Catalog and toolbox search rank lexical matches first and include labeled
+unmatched fallbacks; bounded pages retain access to every scoped candidate.
+The framework context includes an ephemeral bounded connector directory built
+from current catalog, MCP binding, and skill metadata, alongside one compact toolbox
+manifest. The manifest derives prepared-candidate access modes and operational effects
+from immutable capability metadata; compact group summaries do not imply missing
+connector permissions. Local discovery
+hints are untrusted presentation and never change execution authority.
+Toolbox grouping, access modes, and
 operational effects are metadata, not model-selected search filters. Improve
 discovery vocabulary in existing `ToolPresentation` records without changing
 capability execution contracts. `toolbox_load` accepts exact on-demand names
-directly; search is unnecessary when those names are known. Neither control
-grants authority or bypasses current admission and approval checks.
+directly; search is unnecessary when those names are known. `toolbox_inspect`
+reads an exact prepared contract without changing the callable set or executing
+a capability. These controls grant no authority and bypass no admission checks.
+Search includes the existing domain-owned automation contract for grant-requiring
+tools so scheduling can inspect constraints without activating execution schemas.
+Its `requires_automation_grant` flag refers to scheduled execution. Search,
+load receipts and exact inspection share one registered contract projection,
+with exact revision digests. Load retains compact incomplete references and grant
+metadata; explicit inspection supplies input/output schemas. Inspected contracts
+remain in the ordinary transcript after callable-set replacement. Foreground actions
+use ordinary approval at invocation.
+Byte pressure omits whole contracts with `automation_contract_omitted` before
+removing candidates. Load receipts omit their remaining grant metadata as a whole
+when byte/depth bounds require it, preserving exact inspection references. `toolbox_inspect` retrieves a complete
+contract or explicitly partial path/page/string fragments bound to its digest.
+Inspection intersects frozen candidates with current local domain applicability;
+it never refreshes remote state or replaces execution-time validation. The default
+50-tool surface reserves 32 pinned, 15 on-demand and three control slots.
 
 `daita.capability_runtime.CapabilityRuntime` is the sole production boundary
 between model tool calls and execution. For each call it:
@@ -185,6 +260,32 @@ and applies the ordinary validation, execution, artifact, sensitivity,
 provenance, result-bound, and observation rules. It is not a recursive model
 call or a second runtime.
 
+External native data effects and admitted external actions declare an
+`EffectReceiptPolicy`. Automation proposals also require an
+`AutomationGrantPolicy`; the runtime validates both requested and domain-normalized
+constraints. Effect-free and local management capabilities cannot use these
+external-effect policies. Unattended effects require concrete native/MCP admission
+and exact standing grants. Generic routine authority and outcome conformance alone
+do not enable them; implementation acceptance is not production release approval.
+
+The runtime reserves a unique operation and call identity in SQLite before
+external dispatch, validates the resulting observation and ordinary output, and
+persists terminal evidence before returning an authenticated receipt reference.
+Reservations are never automatically refunded or replayed. Native commit evidence
+is adapter-verified; server invocation evidence is server-reported. Unusable
+server output, missing evidence, and ambiguous failures become uncertain. Startup
+recovers leftover started receipts before effects are admitted.
+
+Unresolved receipts block new foreground external effects and their originating
+routine. `Agent.inspect_effect`, bounded `Agent.list_effects`, and the human-only
+`Agent.resolve_effect` expose evidence and exact foreground-approved recovery.
+One immutable resolution is retained separately from the original observation;
+resolution performs no retry and grants no connector permission.
+Foreground context reads this same durable blocking check at preparation and
+retains bounded receipt IDs/counts as internal operational metadata, without
+receipt payloads. Current row values do not resolve prior operation uncertainty.
+The frozen context informs reporting; execution still rechecks the store.
+
 Do not call source clients or executors directly from `AgentLoop`, `Agent`, a
 tool view, or model-authored text. Do not infer access, effects, or automation
 eligibility from a tool name when capability metadata defines them.
@@ -207,15 +308,30 @@ SQL validation belongs in `daita.domains.data.sql`; connector guardrails still
 apply during execution. Do not duplicate either mechanism in a generic policy
 layer.
 
-Data capabilities are reads except for the explicitly enabled structured
-PostgreSQL update. The update uses one plan for single-row and bulk selections
-with resource-scoped readiness, current admission rechecks, an exact target-set
-preview and fingerprint, once-only approval, transactional drift detection,
-exact affected-count validation, and an immutable receipt. Arbitrary SQL,
-inserts, deletes, DDL, and every other external data write are unsupported.
-Adding another data mutation requires an explicit design for validation,
-authorization, transactionality, idempotency, uncertain outcomes, and
-recovery; approval alone is insufficient.
+Data capabilities are reads except for explicitly admitted `data_update_rows` and
+`data_upsert_rows`, initially backed by PostgreSQL. Their read-only counterparts are
+`data_preview_update_rows` and `data_preview_upsert_rows`. Execution requires an
+authenticated current-run preview and matching intent. Update retains its exact
+selection, target-count, drift, rollback and receipt safeguards.
+
+`RelationalWriteScope` binds exact structural revision, explicit update/upsert
+operations, keys, insert/update columns, admitted identity generation and row limits.
+Update permission never implies insertion authority. Upsert uses one bounded uniform
+scalar batch, supported non-null unique-key equality, explicit omitted/null semantics,
+and narrowly admitted identity generation. Its transaction acquires EXCLUSIVE on the
+exact table before the authoritative scan, rebuilds the preview, rejects drift,
+inserts missing rows, updates changed rows, skips unchanged rows, and verifies exact
+counts summing to the input count. Mismatches roll back the entire batch. Sequence
+allocations may leave gaps after rollback; receipts describe table-row effects.
+
+The data domain normalizes native standing grants and permits at most one native
+write capability per routine, with one invocation per occurrence and exact ceilings.
+An unchanged batch consumes its reservation and produces verified zero-mutation
+evidence. Full request sensitivity must fit the current target classification.
+Research lineage remains model-derived claims, distinct from transaction facts.
+Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
+insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
+Native implementation acceptance is not production release approval.
 
 ## Workspace files and artifacts
 
@@ -248,11 +364,12 @@ relational resource revisions where present. The artifact remains explicitly
 derived analysis rather than exact or complete source data. Exact complete
 relational export remains the separate `data_export_tabular` capability.
 
-## Remote MCP reads
+## Remote MCP tools and actions
 
 Remote MCP support uses one bounded server-neutral Streamable HTTP client.
 Every binding records an exact endpoint, negotiated identity, admitted
-read-only tool allowlist, schema digests, sensitivity ceiling, and secret
+tool allowlist, schema digests, local access/effect/eligibility and completion
+admission, sensitivity ceilings, and secret
 reference. Agent open reconstructs immutable declarations without network I/O.
 The first exact call initializes the client and rechecks the binding revision,
 remote identity, schemas, and authentication.
@@ -262,6 +379,22 @@ from annotations, names, descriptions, or schemas. Revocation is binding-local
 and takes effect immediately. A stale, changed, revoked, unavailable, or
 authentication-failed binding yields one bounded tool error without switching
 servers or retrying the remote call.
+
+MCP selections default to reads; explicit action selections default to interactive
+approval. Locally admitted unattended actions use the shared `mcp.tool_call` grant:
+exact binding/revision/tool, fixed top-level JSON values and bounded distinct scalar
+variable names. Fix nested values in full; arbitrary variable JSON cannot enforce
+nested recipient or target restrictions. Tool and binding outbound ceilings apply
+to the full request classification. No remote annotation grants authority.
+
+The existing MCP executor preflights without dispatch, then sends exactly one
+`tools/call` after the runtime's reservation. Valid plain-text results without an
+output schema establish server-reported invocation evidence only. Partial errors,
+unusable output, response loss or explicit task acceptance produce uncertainty;
+positive local non-dispatch can establish non-application. Known asynchronous-only
+completion cannot execute or enter an unattended proposal. No task polling, custom
+remote receipts, status/idempotency extension, per-server action adapter or replay
+exists. Current MCP output/capability identities are `mcp.tool.result` / `mcp.tool`.
 
 ## Durable jobs and follow-ups
 
@@ -297,6 +430,12 @@ data, expand scope, or create another continuation.
 
 ## Scheduled routines and deliveries
 
+Routine mutation tools return compact identity/revision/state, schedule and reservation
+receipts; full contracts remain in inspection and enforcement. Stopped model runs
+retain completed tool evidence and do not roll back committed routines. Terminal
+notices and CLI summaries project that evidence without creating another durable
+outcome or synthesizing a model answer.
+
 `ScheduledRoutine` and `RoutineOccurrence` are the only scheduled-work records.
 `RoutineOwner` admits exact foreground-authorized, self-contained instructions
 and implements bounded create, list, inspect, update, pause, resume, run-now,
@@ -312,8 +451,9 @@ resource, MCP binding, capability, model-route, sensitivity, outcome,
 distribution, budget, expiry, and optional retained skill-content contracts.
 Raw prompt text never determines whether a time slot is due.
 
-Scheduled execution permits only statically declared `scheduled_direct`
-capabilities with `OperationalEffect.NONE` and read/none data access. It can
+Scheduled execution permits statically declared `automation_direct` capabilities.
+Native effects additionally require exact data-owned grants and runtime receipts;
+effect-free operations retain read/none access. It can
 create only these artifacts:
 
 - `artifact.create_document`;
@@ -324,8 +464,10 @@ create only these artifacts:
 an exact earlier successful result in the same run. It performs no source I/O
 or format projection.
 
-Scheduled runs cannot update data, start or cancel jobs, manage routines, call
-remote write tools, publish local files, deliver externally, run shell
+Scheduled runs can perform one explicitly granted native update/upsert and admitted
+MCP actions within their exact per-occurrence grants. They
+cannot start or cancel jobs, manage routines, call
+unadmitted remote actions, publish local files, deliver through external distribution destinations, run shell
 commands, or submit workflows or execution graphs. An exact resource-revision
 precheck may complete an unchanged occurrence without a model call.
 
@@ -387,8 +529,8 @@ changes use immutable migration IDs/checksums and owner-local migration files.
 Migrations validate a verified copy under the agent-home writer boundary and
 replace the active database only after complete target validation.
 
-Source read authority exists only in `source_read_scopes`. PostgreSQL update
-authority exists only in `postgresql_update_scopes`. Connection JSON never
+Source read authority exists only in `source_read_scopes`. Native relational write
+authority exists only in `relational_write_scopes`. Connection JSON never
 owns either permission. Reconstruction fails closed, refresh preserves exact
 scopes, and detach revokes both scope families atomically.
 
@@ -404,6 +546,56 @@ payloads end inside provider adapters. `daita.llm.routing` handles retry and
 fallback decisions from normalized failures; `AgentLoop` does not retry a
 whole run or inspect provider-specific failures.
 
+`daita.llm.provider_definitions` is the sole static source for built-in provider
+identity, display metadata, authentication and endpoint modes, lazy construction,
+request-policy facts, and unreviewed-profile capability defaults. The factory,
+embedded host, and TUI derive their views from those definitions; do not add a
+parallel provider list or vendor dispatch branch. Reviewed model limits and
+prices remain in `profiles.py` and `pricing.py`.
+
+One immutable `ModelCallPolicy` in `AgentConfig` and `ModelRequest` governs
+configured and conforming injected providers, both delivery modes, foreground,
+routines, follow-ups, validation and candidate review. Defaults are 180 seconds
+per logical request, 120 per attempt, 60 to first substantive progress, 30 idle,
+15 counting, 5 connect, 120 read, 30 write, 5 pool and 5 cleanup. Every logical
+request intersects its caller/run deadline before setup; retries retain that
+logical deadline and receive a fresh, narrower attempt deadline. Counting has
+its own phase cap (`call_policy.input_count_timeout_seconds`, at most 60).
+Monotonic deadlines are runtime-only; policy durations and both retry ceilings
+are serialized and included in frozen machine model-contract digests.
+Counting transport failures retain their canonical cause and proven zero generation
+usage; invalid count data and unsupported counting remain permanent admission
+failures. External cancellation remains cancellation.
+
+Bounded OpenAI, Anthropic, and Gemini API requests use provider-owned input
+counting over the prepared generation input, including tools and retained
+provider content. Count and generation calls share the run deadline and SDK
+ownership. Token counts are admission estimates; returned usage is incurred
+consumption. Byte bounds must not substitute for billed-token counts. Routes
+without complete counting retain usage-based progression and supported output
+caps, and cannot admit estimated-cost ceilings. A failed count never submits
+generation. Preserve known zero usage when counting is cancelled while retaining
+normal cancellation/deadline behavior; dispatched generation can remain unmeasured.
+
+The router owns model retries. API SDK retries are disabled on owned clients and
+on borrowed-client request views without changing or closing the caller's client.
+Every retried attempt receives the remaining logical-request allowance. Unknown
+failed-attempt consumption stops budgeted routing; it cannot fund a retry or
+fallback. A provider-reported charge alone does not establish advance price
+coverage. Subscription output bounds remain advisory where the external surface
+does not support a wire limit; returned usage still controls loop progression.
+
+Retry accounting covers active attempts, backoff, cancellation, and stream cleanup.
+Visible stream progress, including terminal completion, closes retry/fallback
+eligibility. Completed usage remains authoritative during shutdown. Valid HTTP
+retry delays are honored without shortening; waits exceeding 60 seconds or the
+remaining deadline stop recovery. Local exponential backoff uses bounded jitter.
+`RetryPolicy` defaults to `max_attempts_per_candidate=2` and
+`max_total_attempts=3`. Both limits are one for one-shot validation/review.
+Every configured route uses `ModelRouter`, including a one-candidate route.
+Injected providers retain caller ownership and must honor the canonical policy;
+they do not gain an implicit router. Tests exercise both compositions.
+
 Provider lifecycle follows explicit ownership. Providers constructed from an
 agent's persisted model route are closed by `EmbeddedAgent` after runs and
 supervisors drain. Providers injected by a caller remain caller-owned and may
@@ -412,8 +604,16 @@ created; injected SDK clients remain borrowed. Temporary validation and
 candidate-review providers are closed by the component that creates them.
 
 Owners stop new work and drain active calls before closing a provider. Close
-callers join one cancellation-safe cleanup task; repeated calls observe the
-same completion or failure without retrying SDK cleanup. Adapters scope
+callers share one absolute cleanup deadline and a retained once-only outcome;
+repeated calls cannot retry native cleanup or renew grace. Native SDK scopes
+enter, iterate and exit in one owned task. A bounded supervisor retains native
+work that fails to retire, poisons its owner, discards late output and rejects
+replacement work. Only native I/O, never tools or persistence, can remain there.
+Transport bytes, decoded activity, substantive progress, canonical emission and
+terminal completion are separate facts. Empty introductions, snapshots without
+growth and keepalives do not reset progress. Opaque nonstreaming/CLI calls report
+progress as unobservable and obey fixed deadlines. Terminal usage survives
+cleanup failure; successful completion is published only after native release. Adapters scope
 request-stream cleanup to completion, failure, cancellation, or early exit.
 Canonical stream wrappers finalize in the iteration context and propagate
 closure to their delegate; releasing a request stream never closes a borrowed
@@ -422,13 +622,32 @@ tests rather than assuming that closing a public SDK generator releases it.
 
 To add a provider:
 
-1. implement `ManagedModelProvider` under `src/daita/llm/providers/` with an
-   idempotent `close()` method;
-2. keep native wire models and translation inside that adapter;
-3. import the SDK lazily and provide normalized pipx repair guidance;
-4. register construction in `src/daita/llm/factory.py`;
-5. add the bounded SDK version to default production dependencies; and
-6. add focused translation, error, and routing tests.
+1. implement `ManagedModelProvider` under `src/daita/llm/providers/`, delegating
+   common attempt and once-only close behavior to `llm._lifecycle`; use a
+   provider-named package with `adapter.py`, `messages.py`, and `stream.py` when
+   the protocol has substantial translation or stream grammar, while a small
+   specialization of an existing adapter remains one module;
+2. keep client ownership and native calls in the package's orchestration
+   adapter, message translation in its message module, and substantial stream
+   grammar in its decoder; the package `__init__.py` exports only the supported
+   provider classes so the public provider import stays stable;
+3. reuse `providers._fields` for identical native-field validation and import a
+   new SDK only at client construction, with normalized pipx repair guidance;
+4. add one immutable `ProviderDefinition`, including its explicit lazy
+   construction callable, in `llm/provider_definitions.py`; factory, host, and
+   TUI provider choices require no provider-specific edit;
+5. add a bounded SDK dependency only when the protocol needs one; and
+6. add focused definition, lazy-import, translation, lifecycle, accounting,
+   routing, and architecture tests.
+
+Unknown configured names continue through the explicit OpenAI-compatible path
+and require a base URL; they never inherit built-in authentication, endpoint, or
+profile privileges. Subscription subprocess mechanics live in
+`providers.subscription_cli.process`, the canonical envelope in
+`providers.subscription_cli.envelope`, and vendor flags, inspection, and
+decoding in the package's Claude or Grok adapters. Preserve dispatch-time
+revalidation even when it uses the same definition fact as lazy route preflight:
+those checks protect different boundaries.
 
 Do not add provider branches to `AgentLoop`.
 
@@ -560,7 +779,7 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/loop/models.py` | run, transcript, limits, and exit records |
 | `src/daita/capabilities.py` | declarations and registry |
 | `src/daita/capability_runtime.py` | common execution mechanics |
-| `src/daita/domains/data/context.py` | model-request construction |
+| `src/daita/context.py` | model-request construction |
 | `src/daita/domains/data/sql/` | catalog-scoped SQL validation |
 | `src/daita/domains/mcp.py` | MCP projection and call-time rechecks |
 | `src/daita/jobs/` | durable job records and supervision |
@@ -573,3 +792,33 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/storage/sqlite_migrations/` | checksummed migration engine |
 | `src/daita/llm/routing.py` | normalized provider routing |
 | `tests/test_architecture.py` | architecture and public-surface checks |
+
+## Product control surfaces
+
+CLI and TUI routine inspection reuse the routine domain's current projections.
+Approval summaries derive only from the exact validated request and retain its
+complete bounded details. An explicit `confirmation_handler` reviews direct routine
+create/update controls before mutation; typed Python callers without that callback
+remain the authorizing owner. CLI create/update supplies this callback. Approval cannot grant missing connector permission.
+
+Native approval documents contain the exact execution `arguments`, catalog-backed
+`target`, and bounded `preview` review facts. The data domain reuses its existing
+preflight preview; rendering performs no I/O. Execution arguments and intent digests
+remain separate from review labels and samples. The runtime still approves and
+rechecks one exact plan before reserving an effect. A positive count alone does not
+prove the selected business entity; there is no second target authorization record.
+
+Model-authored routine creation requires an explicit `run_immediately` boolean.
+Model-authored updates accept omission or false and reject true; typed owner defaults
+remain false. Immediate creation and later run-now use the existing owner/supervisor.
+
+The source permission editor authors one exact table scope through existing
+preview/apply APIs. Catalog-backed column/key choices are presentation, not a
+second validator or proof of live database readiness. Apply confirms the complete
+before/after state, including required read additions; it performs no source write.
+
+Receipt list, inspect and human recovery controls call the existing Agent APIs.
+Recovery never calls the model or an external executor. The original observation
+and separate immutable resolution stay owned by SQLite. Product host status must
+distinguish saved assignments, queued/running occurrences and the lifetime of the
+currently open TUI or headless command; no host means no execution progress.

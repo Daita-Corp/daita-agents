@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import TypeVar
 from uuid import uuid4
 
+from ..llm.models import ModelSensitivity
+
 SKILL_MAX_COUNT = 32
 SKILL_DESCRIPTION_MAX_CHARACTERS = 240
 SKILL_INSTRUCTIONS_MAX_CHARACTERS = 12_000
@@ -50,10 +52,13 @@ class SkillNotFoundError(SkillStoreError, LookupError):
 class SkillSummary:
     name: str
     description: str
+    sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
 
     def __post_init__(self) -> None:
         validate_skill_name(self.name)
         _validate_description(self.description)
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("skill sensitivity must be ModelSensitivity")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,16 +66,19 @@ class Skill:
     name: str
     description: str
     instructions: str
+    sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
 
     def __post_init__(self) -> None:
         validate_skill_name(self.name)
         _validate_description(self.description)
         _validate_instructions(self.instructions)
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("skill sensitivity must be ModelSensitivity")
         _render_skill(self)
 
     @property
     def summary(self) -> SkillSummary:
-        return SkillSummary(self.name, self.description)
+        return SkillSummary(self.name, self.description, self.sensitivity)
 
 
 class SkillStore:
@@ -141,8 +149,10 @@ class SkillStore:
         name: str,
         description: str,
         instructions: str,
+        *,
+        sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED,
     ) -> bool:
-        skill = Skill(name, description, instructions)
+        skill = Skill(name, description, instructions, sensitivity)
         rendered = _render_skill(skill)
         return await self._run_locked(lambda: self._save_sync(skill, rendered))
 
@@ -155,10 +165,12 @@ class SkillStore:
         name: str,
         description: str,
         instructions: str,
+        *,
+        sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED,
     ) -> tuple[bool, str, str, str]:
         """Validate one save and fingerprint its document and complete index."""
 
-        skill = Skill(name, description, instructions)
+        skill = Skill(name, description, instructions, sensitivity)
         self._require_open()
         _selected, exists, digest, state_digest, index_digest = await asyncio.to_thread(
             self._inspect_sync,
@@ -186,12 +198,14 @@ class SkillStore:
         name: str,
         description: str,
         instructions: str,
+        *,
+        sensitivity: ModelSensitivity,
     ) -> bool:
         """Save after runtime authorization while the shared lock is held."""
 
         if not self._mutation_lock.locked():
             raise SkillStoreError("tool save requires the mutation lock")
-        skill = Skill(name, description, instructions)
+        skill = Skill(name, description, instructions, sensitivity)
         rendered = _render_skill(skill)
         self._require_open()
         return await asyncio.to_thread(self._save_sync, skill, rendered)
@@ -724,6 +738,7 @@ def _validate_instructions(instructions: str) -> None:
 
 def _render_skill(skill: Skill) -> bytes:
     text = (
+        f"<!-- daita-sensitivity: {skill.sensitivity.value} -->\n"
         f"# {skill.name}\n\n{skill.description}\n\n"
         f"## Instructions\n\n{skill.instructions}\n"
     )
@@ -759,6 +774,16 @@ def _parse_skill(data: bytes, expected_name: str) -> Skill:
         text = data.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
         raise SkillValidationError("SKILL.md is not strict UTF-8") from error
+    sensitivity = ModelSensitivity.RESTRICTED
+    labeled = text.startswith("<!-- daita-sensitivity: ")
+    if labeled:
+        label, separator, text = text.partition("\n")
+        try:
+            if not separator or not label.endswith(" -->"):
+                raise ValueError
+            sensitivity = ModelSensitivity(label[len("<!-- daita-sensitivity: ") : -4])
+        except ValueError as error:
+            raise SkillValidationError("skill sensitivity label is invalid") from error
     prefix = f"# {expected_name}\n\n"
     marker = "\n\n## Instructions\n\n"
     if not text.startswith(prefix) or not text.endswith("\n"):
@@ -767,8 +792,11 @@ def _parse_skill(data: bytes, expected_name: str) -> Skill:
     if remainder.count(marker) != 1:
         raise SkillValidationError("SKILL.md must contain one reserved heading")
     description, instructions = remainder.split(marker)
-    skill = Skill(expected_name, description, instructions)
-    if _render_skill(skill) != data:
+    skill = Skill(expected_name, description, instructions, sensitivity)
+    rendered = _render_skill(skill)
+    if not labeled:
+        rendered = rendered.split(b"\n", 1)[1]
+    if rendered != data:
         raise SkillValidationError("SKILL.md is not rendered exactly")
     return skill
 

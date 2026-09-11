@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ...artifacts.models import ArtifactAuthorship
+from ...capabilities import EffectEvidenceBasis
 from ...distribution.models import (
     ArtifactRequirement,
     ConversationInboxTarget,
@@ -10,6 +11,7 @@ from ...distribution.models import (
     DeliveryState,
     DeliverySubjectKind,
     DistributionPlan,
+    EffectRequirement,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
     OutcomeContract,
@@ -26,6 +28,7 @@ from .common import (
     optional_datetime_decode,
     optional_datetime_encode,
     optional_text,
+    plain_encode,
     record,
     record_fields,
     sequence,
@@ -131,6 +134,21 @@ def encode_outcome_contract(value: OutcomeContract):
             ),
             "require_current_run_provenance": value.require_current_run_provenance,
             "require_exact_source_bindings": value.require_exact_source_bindings,
+            "effect_requirements": [
+                record(
+                    "EffectRequirement",
+                    {
+                        "capability_id": item.capability_id,
+                        "minimum_successful_calls": item.minimum_successful_calls,
+                        "accepted_evidence_bases": plain_encode(
+                            sorted(
+                                basis.value for basis in item.accepted_evidence_bases
+                            )
+                        ),
+                    },
+                )
+                for item in value.effect_requirements
+            ],
         },
     )
 
@@ -146,6 +164,7 @@ def decode_outcome_contract(value) -> OutcomeContract:
             "maximum_effective_sensitivity",
             "require_current_run_provenance",
             "require_exact_source_bindings",
+            "effect_requirements",
         ),
     )
     try:
@@ -157,7 +176,29 @@ def decode_outcome_contract(value) -> OutcomeContract:
         )
     except ValueError:
         raise ValueError("stored outcome contract sensitivity is invalid") from None
+    effects = []
+    for raw in sequence(fields["effect_requirements"], "effect requirements"):
+        effect = record_fields(
+            raw,
+            "EffectRequirement",
+            ("capability_id", "minimum_successful_calls", "accepted_evidence_bases"),
+        )
+        effects.append(
+            EffectRequirement(
+                capability_id=text(effect["capability_id"], "effect capability"),
+                minimum_successful_calls=integer(
+                    effect["minimum_successful_calls"], "effect minimum calls"
+                ),
+                accepted_evidence_bases=frozenset(
+                    EffectEvidenceBasis(text(item, "effect evidence basis"))
+                    for item in sequence(
+                        effect["accepted_evidence_bases"], "effect evidence bases"
+                    )
+                ),
+            )
+        )
     return OutcomeContract(
+        effect_requirements=tuple(effects),
         require_terminal_conclusion=_boolean(
             fields["require_terminal_conclusion"],
             "outcome require_terminal_conclusion",
@@ -280,6 +321,7 @@ def encode_outcome_reference(value: OutcomeReference):
             "conclusion_preview": value.conclusion_preview,
             "conclusion_preview_truncated": value.conclusion_preview_truncated,
             "resulting_run_id": value.resulting_run_id,
+            "effect_receipt_ids": list(value.effect_receipt_ids),
             "artifact_references": [
                 _encode_outcome_artifact_reference(item)
                 for item in value.artifact_references
@@ -304,6 +346,7 @@ def decode_outcome_reference(value) -> OutcomeReference:
             "conclusion_preview",
             "conclusion_preview_truncated",
             "resulting_run_id",
+            "effect_receipt_ids",
             "artifact_references",
             "effective_sensitivity",
             "provenance_digest",
@@ -322,6 +365,12 @@ def decode_outcome_reference(value) -> OutcomeReference:
     except ValueError:
         raise ValueError("stored outcome reference enum is invalid") from None
     return OutcomeReference(
+        effect_receipt_ids=tuple(
+            text(item, "outcome effect receipt ID")
+            for item in sequence(
+                fields["effect_receipt_ids"], "outcome effect receipt IDs"
+            )
+        ),
         conclusion_kind=kind,
         conclusion_state=state,
         conclusion_id=text(fields["conclusion_id"], "outcome conclusion id"),

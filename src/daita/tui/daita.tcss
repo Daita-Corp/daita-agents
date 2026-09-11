@@ -773,3 +773,60 @@ Select {
     color: $foreground;
     background: $error;
 }
+
+EffectsScreen {
+    align: center middle;
+}
+#effects-manager {
+    width: 96%;
+    height: 96%;
+    background: $panel;
+    padding: 1 2;
+}
+#effects-list {
+    height: 5;
+}
+#effects-detail-scroll {
+    height: 1fr;
+    min-height: 3;
+}
+.effects-actions {
+    height: auto;
+}
+#effects-error {
+    height: auto;
+    color: $text-muted;
+}
+
+RoutinesScreen {
+    align: center middle;
+}
+#routines-manager {
+    width: 96%;
+    height: 96%;
+    padding: 1 2;
+    background: $panel;
+}
+#routines-list {
+    height: 7;
+}
+#routines-detail-scroll {
+    height: 1fr;
+    min-height: 3;
+}
+#routines-help, #routines-error, #routines-summary, #routines-actions {
+    height: auto;
+}
+
+.permission-actions {
+    height: auto;
+}
+
+EffectsScreen #approval-inline {
+    height: 1fr;
+    max-height: 100%;
+}
+EffectsScreen #approval-inline-document {
+    height: 1fr;
+    max-height: 100%;
+}

@@ -175,6 +175,69 @@ async def test_model_configuration_round_trips_without_persisting_the_key(tmp_pa
         await reopened.close()
 
 
+async def test_nondefault_call_policy_survives_reopen_and_model_replacement(tmp_path):
+    from dataclasses import asdict
+
+    from daita.config import AgentConfig
+    from daita.llm.models import ModelCallPolicy
+
+    policy = ModelCallPolicy(
+        max_request_seconds=150,
+        max_attempt_seconds=100,
+        first_progress_timeout_seconds=50,
+        progress_idle_timeout_seconds=25,
+        input_count_timeout_seconds=12,
+        connect_timeout_seconds=4,
+        read_timeout_seconds=95,
+        write_timeout_seconds=24,
+        pool_timeout_seconds=3,
+        cleanup_timeout_seconds=4,
+    )
+    keychain = _FakeKeychain()
+    first_validator = _provider("openai:first-model")
+    agent = await Agent.create(
+        "atlas",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        config=AgentConfig(model_call_policy=policy),
+        keychain=keychain,
+        model_validator=first_validator,
+    )
+    try:
+        # configure_model is the public persistence boundary. Creation-time
+        # injected configuration alone is intentionally runtime-only.
+        await agent.configure_model(
+            provider="openai",
+            model="first-model",
+            api_key="secret-value",
+            context_window_tokens=8192,
+            max_output_tokens=1024,
+        )
+        assert len(first_validator.requests) == 1
+        assert first_validator.requests[0].call_policy == policy
+    finally:
+        await agent.close()
+    config_path = tmp_path / "agents" / "atlas" / "config.json"
+    assert json.loads(config_path.read_text())["model_call_policy"] == asdict(policy)
+    for model_name in ("replacement-model",):
+        validator = _provider(f"openai:{model_name}")
+        route = await _configure(tmp_path, keychain, validator, model=model_name)
+        assert len(validator.requests) == 1
+        assert validator.requests[0].call_policy == policy
+        document = json.loads(config_path.read_text())
+        assert document["model_call_policy"] == asdict(policy)
+        reopened = await Agent.open(
+            "atlas",
+            root=tmp_path,
+            keychain=keychain,
+            workspace=workspace_for(tmp_path),
+        )
+        try:
+            assert reopened.model_route == route
+        finally:
+            await reopened.close()
+
+
 async def test_explicit_model_injection_precedes_persisted_config_without_rewrite(
     tmp_path,
 ):
@@ -278,7 +341,7 @@ async def test_incomplete_or_terminal_unsafe_route_fails_closed(tmp_path, mutati
         await Agent.open("atlas", root=tmp_path, workspace=workspace_for(tmp_path))
 
 
-async def test_validation_requires_one_exact_tool_call_and_uses_route_retries(tmp_path):
+async def test_validation_requires_one_exact_tool_call_without_retries(tmp_path):
     await _create_unconfigured(tmp_path)
     keychain = _FakeKeychain()
     provider = MockModelProvider(
@@ -289,17 +352,12 @@ async def test_validation_requires_one_exact_tool_call_and_uses_route_retries(tm
         provider_id="anthropic:claude-test",
     )
 
-    route = await _configure(
-        tmp_path,
-        keychain,
-        provider,
-        provider_name="anthropic",
-        model="claude-test",
-    )
-
-    assert route.retry_policy == RetryPolicy()
-    assert provider.provider_id == "anthropic:claude-test"
-    assert len(provider.requests) == 2
+    with pytest.raises(ModelProviderError) as error:
+        await _configure(
+            tmp_path, keychain, provider, provider_name="anthropic", model="claude-test"
+        )
+    assert error.value.code is ProviderErrorCode.TIMEOUT
+    assert len(provider.requests) == 1
     request = provider.requests[0]
     assert tuple(tool.name for tool in request.tools) == (
         "daita_validate_tool_support",
@@ -814,7 +872,7 @@ async def test_missing_configured_credential_is_normalized_as_authentication():
                 secret_reference=SecretReference.keychain("missing-key"),
             ),
         ),
-        RetryPolicy(attempts=1),
+        RetryPolicy(max_attempts_per_candidate=1, max_total_attempts=1),
     )
     provider = create_model_route_provider(
         route,
@@ -856,7 +914,7 @@ def test_lazy_model_route_exposes_pricing_without_resolving_credential():
                 secret_reference=SecretReference.keychain("hidden-reference"),
             ),
         ),
-        RetryPolicy(attempts=3, backoff_seconds=0),
+        RetryPolicy(max_attempts_per_candidate=3, backoff_seconds=0),
     )
     secrets = _CountingSecrets()
     provider = create_model_route_provider(route, secret_provider=secrets)
@@ -921,7 +979,7 @@ async def test_secret_failures_keep_distinct_routing_classification(
                 secret_reference=SecretReference.keychain("hidden-reference"),
             ),
         ),
-        RetryPolicy(attempts=2, backoff_seconds=0),
+        RetryPolicy(max_attempts_per_candidate=2, backoff_seconds=0),
     )
     provider = create_model_route_provider(route, secret_provider=secrets)
     request = ModelRequest(

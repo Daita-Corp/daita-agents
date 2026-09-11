@@ -41,7 +41,12 @@ from ..autonomy import (
     assess_followup_conclusion,
     terminal_job_event_payload,
 )
-from ..capabilities import ExecutionScope
+from ..capabilities import (
+    CapabilityGrant,
+    EffectEvidenceBasis,
+    EffectObservation,
+    ExecutionScope,
+)
 from ..catalog.models import (
     CatalogFacet,
     CatalogRelationship,
@@ -108,6 +113,7 @@ from ..learning_candidates import (
 from ..llm.models import (
     CanonicalMessage,
     MessageRole,
+    ModelSensitivity,
     ToolResultBlock,
 )
 from ..llm.pricing import CostEstimateStatus
@@ -157,15 +163,14 @@ from .sqlite_codecs import (
     decode_catalog_snapshot,
     decode_catalog_sync,
     decode_delivery,
-    decode_identifier,
     decode_identity,
     decode_job_run,
     decode_learning_candidate,
     decode_loop_exit,
     decode_mcp_binding,
     decode_message,
-    decode_postgresql_update_scope,
     decode_receipt,
+    decode_relational_write_scope,
     decode_review_stamps,
     decode_routine_occurrence,
     decode_run_input,
@@ -177,15 +182,14 @@ from .sqlite_codecs import (
     encode_catalog_snapshot,
     encode_catalog_sync,
     encode_delivery,
-    encode_identifier,
     encode_identity,
     encode_job_run,
     encode_learning_candidate,
     encode_loop_exit,
     encode_mcp_binding,
     encode_message,
-    encode_postgresql_update_scope,
     encode_receipt,
+    encode_relational_write_scope,
     encode_review_stamps,
     encode_routine_occurrence,
     encode_run_input,
@@ -204,18 +208,21 @@ from .sqlite_migrations import (
     upgrade_journaled,
 )
 from .sqlite_records import (
-    DatabaseWriteOutcome,
-    DatabaseWriteReceipt,
-    DatabaseWriteReceiptConflictError,
-    PostgreSQLUpdateScope,
+    EffectOutcome,
+    EffectReceipt,
+    EffectReceiptConflictError,
+    EffectResolution,
+    EffectResolutionDecision,
+    EffectUnresolvedError,
+    RelationalWriteScope,
     SourcePermissionStateError,
     SourceReadMode,
     SourceReadScope,
-    database_write_aware as _database_write_aware,
-    database_write_receipt_id,
-    database_write_text as _database_write_text,
-    postgresql_update_authorization_fingerprint,
-    validate_database_write_receipt_id,
+    effect_receipt_aware as _effect_receipt_aware,
+    effect_receipt_id,
+    effect_receipt_text as _effect_receipt_text,
+    relational_write_authorization_fingerprint,
+    validate_effect_receipt_id,
 )
 from .sqlite_schema import (
     CURRENT_TABLES,
@@ -225,7 +232,6 @@ from .sqlite_schema import (
 )
 
 _CATALOG_SNAPSHOT_SOURCE_FILTER_BATCH = 64
-_ACTIVE_SOURCE_KEY_PREFIX = "active_source:"
 _LEARNING_REVIEW_STAMPS_KEY_PREFIX = "learning_review_stamps:"
 _T = TypeVar("_T")
 
@@ -236,10 +242,6 @@ def _active_mcp_tool_count(bindings: Iterable[MCPServerBinding]) -> int:
         for binding in bindings
         if binding.state is MCPBindingState.ACTIVE
     )
-
-
-def _active_source_key(agent_id: str) -> str:
-    return f"{_ACTIVE_SOURCE_KEY_PREFIX}{agent_id}"
 
 
 def _learning_review_stamps_key(agent_id: str) -> str:
@@ -628,7 +630,7 @@ def _source_state_row(
 ) -> tuple[object, ...] | None:
     return connection.execute(
         """SELECT s.agent_id, s.id, s.data, r.data,
-                  (SELECT COUNT(*) FROM postgresql_update_scopes AS u
+                  (SELECT COUNT(*) FROM relational_write_scopes AS u
                    WHERE u.agent_id = s.agent_id AND u.source_id = s.id)
            FROM sources AS s
            LEFT JOIN source_read_scopes AS r
@@ -714,8 +716,11 @@ class SQLiteStateStore:
 
     current_revision = CURRENT_REVISION
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, *, clock: Callable[[], datetime] | None = None
+    ) -> None:
         self.path = path
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._decoded_catalog_snapshots: dict[
             tuple[str, str, str], SourceCatalogSnapshot
         ] = {}
@@ -736,7 +741,7 @@ class SQLiteStateStore:
 
         def admit() -> None:
             if _initialize(resolved, upgrade_gate=upgrade_gate):
-                _recover_started_database_write_receipts(resolved, resolved_clock)
+                _recover_started_effect_receipts(resolved, resolved_clock)
 
         worker = asyncio.create_task(asyncio.to_thread(admit))
         cancelled = False
@@ -749,7 +754,7 @@ class SQLiteStateStore:
         worker.result()
         if cancelled:
             raise asyncio.CancelledError
-        return cls(resolved)
+        return cls(resolved, clock=resolved_clock)
 
     async def close(self) -> None:
         async with self._decoded_catalog_snapshot_lock:
@@ -948,6 +953,87 @@ class SQLiteStateStore:
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
+    async def update_mcp_discovery(
+        self,
+        agent_id: str,
+        binding_id: str,
+        *,
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...],
+    ) -> MCPServerBinding:
+        """Replace local hints without changing any execution admission or revision."""
+
+        def write(connection: sqlite3.Connection) -> MCPServerBinding:
+            row = connection.execute(
+                "SELECT data FROM mcp_server_bindings WHERE agent_id = ? AND binding_id = ?",
+                (agent_id, binding_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("MCP binding does not exist")
+            current = decode_mcp_binding(
+                row[0], agent_id=agent_id, binding_id=binding_id
+            )
+            updated = replace(
+                current, summary=summary, when_to_use=when_to_use, keywords=keywords
+            )
+            encoded = encode_mcp_binding(updated)
+            if len(encoded.encode("utf-8")) > MCP_MAX_BINDING_CANONICAL_BYTES:
+                raise ValueError("MCP binding exceeds its byte bound")
+            others = connection.execute(
+                "SELECT data FROM mcp_server_bindings WHERE agent_id = ? AND binding_id <> ?",
+                (agent_id, binding_id),
+            )
+            if (
+                len(encoded.encode("utf-8"))
+                + sum(len(item[0].encode("utf-8")) for item in others)
+                > MCP_MAX_AGENT_CATALOG_BYTES
+            ):
+                raise ValueError("MCP agent catalog exceeds its byte bound")
+            connection.execute(
+                "UPDATE mcp_server_bindings SET data = ? WHERE agent_id = ? AND binding_id = ?",
+                (encoded, agent_id, binding_id),
+            )
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def update_source_discovery(
+        self,
+        agent_id: str,
+        source_id: str,
+        *,
+        summary: str,
+        when_to_use: str,
+        keywords: tuple[str, ...],
+    ) -> SourceRegistration:
+        """Replace local discovery hints while retaining source identity and scopes."""
+
+        def write(connection: sqlite3.Connection) -> SourceRegistration:
+            row = _source_state_row(connection, agent_id, source_id)
+            if row is None:
+                raise ValueError("source does not exist")
+            current = _decode_source_state(
+                connection,
+                row_agent_id=row[0],
+                row_source_id=row[1],
+                source_data=row[2],
+                read_scope_data=row[3],
+                update_scope_count=row[4],
+            )
+            if not current.active:
+                raise ValueError("source is not active")
+            updated = replace(
+                current, summary=summary, when_to_use=when_to_use, keywords=keywords
+            )
+            connection.execute(
+                "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
+                (encode_source(updated), agent_id, source_id),
+            )
+            return updated
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
     async def admit_scheduled_routine(
         self,
         routine: ScheduledRoutine,
@@ -987,6 +1073,8 @@ class SQLiteStateStore:
         encoded = encode_scheduled_routine(normalized)
 
         def write(connection: sqlite3.Connection) -> ScheduledRoutine:
+            if normalized.capability_grants:
+                _require_effects_unblocked(connection, normalized.agent_id)
             row = connection.execute(
                 "SELECT 1 FROM scheduled_routines "
                 "WHERE agent_id = ? AND routine_id = ?",
@@ -1024,6 +1112,38 @@ class SQLiteStateStore:
                     encoded,
                 ),
             )
+            if normalized.run_immediately:
+                if normalized.state is not RoutineState.ACTIVE:
+                    raise ValueError("routine_immediate_requires_active_creation")
+                claimed_at = self._clock()
+                if claimed_at >= normalized.expires_at:
+                    raise ValueError("routine_expired")
+                following = next_slot(
+                    normalized.schedule,
+                    after=claimed_at,
+                    expires_at=normalized.expires_at,
+                )
+                immediate = replace(normalized, next_due_at=following)
+                _replace_routine_row(connection, encoded, immediate)
+                immediate_encoded = encode_scheduled_routine(immediate)
+                creation_identity = f"create:{normalized.routine_id}"
+                self._claim_routine_slot_in_transaction(
+                    connection,
+                    immediate,
+                    immediate_encoded,
+                    slot_kind=RoutineSlotKind.MANUAL,
+                    slot_key=manual_slot_key(
+                        normalized.routine_id, normalized.revision, creation_identity
+                    ),
+                    scheduled_for=claimed_at,
+                    claimed_at=claimed_at,
+                    claim_token=creation_identity,
+                )
+                claimed = _load_routine_row(
+                    connection, normalized.agent_id, normalized.routine_id
+                )
+                assert claimed is not None
+                return claimed[0]
             return normalized
 
         return await _run_cancellation_safe_transaction(self.path, write)
@@ -1137,6 +1257,38 @@ class SQLiteStateStore:
             if loaded is None:
                 return None
             current, encoded = loaded
+            if routine.capability_grants:
+                _require_effects_unblocked(
+                    connection, routine.agent_id, routine_id=routine.routine_id
+                )
+                if (
+                    routine.capability_grants != current.capability_grants
+                    or routine.contract_bindings != current.contract_bindings
+                    or routine.allowed_source_ids != current.allowed_source_ids
+                    or routine.allowed_resource_ids != current.allowed_resource_ids
+                    or routine.allowed_connector_binding_ids
+                    != current.allowed_connector_binding_ids
+                    or routine.allowed_capability_ids != current.allowed_capability_ids
+                    or routine.sensitivity_ceiling != current.sensitivity_ceiling
+                    or routine.instruction_digest != current.instruction_digest
+                    or routine.schedule != current.schedule
+                    or routine.misfire_policy != current.misfire_policy
+                    or routine.skill_bindings != current.skill_bindings
+                    or routine.eligible_model_routes != current.eligible_model_routes
+                    or routine.outcome_contract != current.outcome_contract
+                    or routine.distribution_plan != current.distribution_plan
+                    or routine.expires_at > current.expires_at
+                    or routine.per_run_max_tokens > current.per_run_max_tokens
+                    or routine.per_run_max_cost_usd > current.per_run_max_cost_usd
+                    or routine.cumulative_max_tokens > current.cumulative_max_tokens
+                    or routine.cumulative_max_cost_usd > current.cumulative_max_cost_usd
+                    or routine.cumulative_max_attempts > current.cumulative_max_attempts
+                    or routine.cumulative_max_occurrences
+                    > current.cumulative_max_occurrences
+                    or routine.maximum_consecutive_failures
+                    > current.maximum_consecutive_failures
+                ):
+                    _require_effects_unblocked(connection, routine.agent_id)
             if current.revision != expected_revision:
                 return None
             if current.active_occurrence_id is not None:
@@ -1199,6 +1351,12 @@ class SQLiteStateStore:
             if current.active_occurrence_id is not None:
                 raise ValueError("routine_has_active_occurrence")
             if state is RoutineState.ACTIVE:
+                if current.model_budget_exhausted:
+                    raise ValueError("routine_model_budget_exhausted")
+                if current.capability_grants:
+                    _require_effects_unblocked(
+                        connection, agent_id, routine_id=routine_id
+                    )
                 due = next_slot(
                     current.schedule,
                     after=transitioned_at,
@@ -1374,6 +1532,8 @@ class SQLiteStateStore:
             if loaded is None:
                 return None
             current, encoded = loaded
+            if current.capability_grants:
+                _require_effects_unblocked(connection, agent_id, routine_id=routine_id)
             if (
                 current.revision != expected_revision
                 or current.state is not RoutineState.ACTIVE
@@ -1406,21 +1566,16 @@ class SQLiteStateStore:
         claimed_at: datetime,
         claim_token: str,
     ) -> RoutineOccurrence:
+        if current.capability_grants:
+            _require_effects_unblocked(
+                connection, current.agent_id, routine_id=current.routine_id
+            )
         if (
             current.attempt_count >= current.cumulative_max_attempts
             or current.occurrence_count >= current.cumulative_max_occurrences
         ):
             raise ValueError("routine_occurrence_budget_exhausted")
-        if (
-            current.reserved_tokens
-            + current.charged_tokens
-            + current.per_run_max_tokens
-            > current.cumulative_max_tokens
-            or current.reserved_cost_usd
-            + current.charged_cost_usd
-            + current.per_run_max_cost_usd
-            > current.cumulative_max_cost_usd
-        ):
+        if current.model_budget_exhausted:
             raise ValueError("routine_model_budget_exhausted")
         identity = routine_occurrence_id(current.routine_id, slot_key)
         occurrence = RoutineOccurrence(
@@ -1491,12 +1646,20 @@ class SQLiteStateStore:
                 return None
             current, encoded = loaded
             if current.reserved_run_id is not None:
-                return current if current.reserved_run_id == run_id else None
+                return (
+                    current
+                    if (
+                        current.reserved_run_id == run_id
+                        and current.claim_token == claim_token
+                        and current.execution_scope == execution_scope
+                    )
+                    else None
+                )
             if (
                 current.disposition is not RoutineOccurrenceDisposition.CLAIMED
                 or current.claim_token != claim_token
                 or current.lease_expires_at is None
-                or current.lease_expires_at < bound_at
+                or current.lease_expires_at <= bound_at
                 or execution_scope.agent_id != current.agent_id
                 or execution_scope.routine_id != current.routine_id
                 or execution_scope.routine_revision != current.routine_revision
@@ -1505,6 +1668,38 @@ class SQLiteStateStore:
                 return None
             routine = _load_routine_row(connection, agent_id, current.routine_id)
             if routine is None or routine[0].active_occurrence_id != occurrence_id:
+                return None
+            if (
+                routine[0].revision != execution_scope.routine_revision
+                or routine[0].state is not RoutineState.ACTIVE
+                or bound_at >= routine[0].expires_at
+                or execution_scope.scope_id != f"scope:{occurrence_id}"
+                or execution_scope.revision != 1
+                or execution_scope.principal_id != routine[0].owner_principal_id
+                or execution_scope.grant_id
+                != f"routine:{current.routine_id}:revision:{current.routine_revision}"
+                or routine[0].contract_bindings != execution_scope.contract_bindings
+                or routine[0].capability_grants != execution_scope.capability_grants
+                or routine[0].allowed_source_ids != execution_scope.allowed_source_ids
+                or routine[0].allowed_connector_binding_ids
+                != execution_scope.allowed_connector_binding_ids
+                or routine[0].allowed_resource_ids
+                != execution_scope.allowed_resource_ids
+                or routine[0].allowed_capability_ids
+                != execution_scope.allowed_capability_ids
+                or routine[0].allowed_access_modes
+                != execution_scope.allowed_access_modes
+                or routine[0].allowed_operational_effects
+                != execution_scope.allowed_operational_effects
+                or routine[0].sensitivity_ceiling != execution_scope.sensitivity_ceiling
+                or routine[0].eligible_model_routes
+                != execution_scope.eligible_model_routes
+                or routine[0].per_run_max_tokens != execution_scope.per_run_max_tokens
+                or routine[0].per_run_max_cost_usd
+                != execution_scope.per_run_max_cost_usd
+                or routine[0].distribution_plan.plan_digest
+                != execution_scope.distribution_plan_digest
+            ):
                 return None
             precheck = routine[0].precheck
             if (precheck is None) != (precheck_observation is None):
@@ -1643,6 +1838,16 @@ class SQLiteStateStore:
                 skipped_no_change_observation is not None or failure_code is not None
             )
             if pre_run_outcome:
+                bound_without_transcript = (
+                    failure_code == "routine_run_not_started"
+                    and current.disposition is RoutineOccurrenceDisposition.RUNNING
+                    and current.reserved_run_id is not None
+                    and connection.execute(
+                        "SELECT 1 FROM runs WHERE id = ? AND agent_id = ?",
+                        (current.reserved_run_id, agent_id),
+                    ).fetchone()
+                    is None
+                )
                 expected_disposition = (
                     RoutineOccurrenceDisposition.SKIPPED_NO_CHANGE
                     if skipped_no_change_observation is not None
@@ -1650,7 +1855,7 @@ class SQLiteStateStore:
                 )
                 if current.disposition is expected_disposition:
                     return current, None
-                if (
+                if not bound_without_transcript and (
                     current.disposition
                     not in {
                         RoutineOccurrenceDisposition.CLAIMED,
@@ -1675,6 +1880,8 @@ class SQLiteStateStore:
             report_preview: str | None = None
             report_truncated = False
             validated_artifact_references: tuple[OutcomeArtifactReference, ...] = ()
+            effect_receipt_ids: tuple[str, ...] = ()
+            uncertain_effect = False
             if pre_run_outcome:
                 occurrence_observation = skipped_no_change_observation
                 successful = occurrence_observation is not None
@@ -1744,6 +1951,110 @@ class SQLiteStateStore:
                     and isinstance(result.final_text, str)
                     and bool(result.final_text.strip())
                 )
+                receipt_rows = connection.execute(
+                    "SELECT data FROM effect_receipts WHERE agent_id = ? AND run_id = ? ORDER BY id LIMIT 257",
+                    (agent_id, current.reserved_run_id),
+                ).fetchall()
+                if len(receipt_rows) > 256:
+                    raise ValueError(
+                        "routine effect receipt references exceed their bound"
+                    )
+                receipts = tuple(decode_receipt(row[0]) for row in receipt_rows)
+                effect_receipt_ids = tuple(receipt.receipt_id for receipt in receipts)
+                grants = {
+                    grant.capability_id: grant for grant in routine.capability_grants
+                }
+                successful_calls: dict[str, int] = {}
+                result_blocks: dict[str, list[ToolResultBlock]] = {}
+                for exchange in transcript.messages:
+                    if exchange.role is MessageRole.TOOL:
+                        for tool_result in exchange.content:
+                            if isinstance(tool_result, ToolResultBlock):
+                                result_blocks.setdefault(
+                                    tool_result.call_id, []
+                                ).append(tool_result)
+                for receipt in receipts:
+                    if receipt.sensitivity.routing_rank > sensitivity.routing_rank:
+                        sensitivity = receipt.sensitivity
+                    if receipt.outcome in {
+                        EffectOutcome.STARTED,
+                        EffectOutcome.UNCERTAIN,
+                    }:
+                        uncertain_effect = True
+                    grant = grants.get(receipt.capability_id)
+                    if (
+                        receipt.routine_id != current.routine_id
+                        or receipt.routine_revision != current.routine_revision
+                        or receipt.occurrence_id != current.occurrence_id
+                        or grant is None
+                        or receipt.capability_grant_digest != grant.grant_digest
+                        or receipt.capability_contract_digest
+                        != grant.capability_contract_digest
+                        or receipt.domain_owner_id != grant.domain_owner_id
+                    ):
+                        contract_failure_code = "outcome_effect_binding_invalid"
+                        continue
+                    if receipt.outcome in {
+                        EffectOutcome.STARTED,
+                        EffectOutcome.UNCERTAIN,
+                    }:
+                        uncertain_effect = True
+                        contract_failure_code = "outcome_effect_uncertain"
+                        continue
+                    if receipt.outcome is not EffectOutcome.SUCCEEDED:
+                        continue
+                    results = result_blocks.get(receipt.call_id, [])
+                    expected_reference = {
+                        "receipt_id": receipt.receipt_id,
+                        "receipt_digest": receipt.receipt_digest,
+                        "outcome": receipt.outcome.value,
+                        "evidence_basis": receipt.evidence_basis.value,
+                    }
+                    if (
+                        len(results) != 1
+                        or results[0].is_error
+                        or results[0].capability_id != receipt.capability_id
+                        or results[0].output.get("effect_receipt")
+                        != FrozenJsonObject.from_mapping(expected_reference)
+                        or results[0].output_sha256
+                        != "sha256:"
+                        + sha256(
+                            canonical_json(results[0].output).encode("utf-8")
+                        ).hexdigest()
+                    ):
+                        contract_failure_code = "outcome_effect_result_invalid"
+                        continue
+                    requirement = next(
+                        (
+                            item
+                            for item in routine.outcome_contract.effect_requirements
+                            if item.capability_id == receipt.capability_id
+                        ),
+                        None,
+                    )
+                    if (
+                        requirement is None
+                        or receipt.evidence_basis
+                        not in requirement.accepted_evidence_bases
+                    ):
+                        contract_failure_code = "outcome_effect_evidence_unsupported"
+                        continue
+                    successful_calls[receipt.capability_id] = (
+                        successful_calls.get(receipt.capability_id, 0) + 1
+                    )
+                if any(
+                    successful_calls.get(item.capability_id, 0)
+                    < item.minimum_successful_calls
+                    for item in routine.outcome_contract.effect_requirements
+                ):
+                    contract_failure_code = (
+                        contract_failure_code
+                        or "outcome_effect_requirement_unsatisfied"
+                    )
+                if uncertain_effect:
+                    contract_failure_code = "outcome_effect_uncertain"
+                if contract_failure_code is not None:
+                    successful = False
                 for message in transcript.messages:
                     for block in message.content:
                         if (
@@ -1760,47 +2071,84 @@ class SQLiteStateStore:
                     successful = False
                     contract_failure_code = "outcome_sensitivity_contract_failed"
                 estimate = result.usage.cost_estimate
-                charged_cost = (
-                    estimate.amount_usd
-                    if estimate.status is CostEstimateStatus.COMPLETE
-                    and estimate.amount_usd is not None
-                    and estimate.amount_usd <= current.reserved_cost_usd
-                    else current.reserved_cost_usd
-                )
-                charged_tokens = min(result.usage.total_tokens, current.reserved_tokens)
-                if successful:
-                    contract_failure = contract_failure_code
+                charged_tokens = result.usage.total_tokens
+                charged_cost = estimate.amount_usd or Decimal("0")
+                if (
+                    estimate.status is not CostEstimateStatus.COMPLETE
+                    and estimate.code != "no_model_attempts"
+                ):
+                    # Unknown consumption retains the reservation as a conservative
+                    # charge, without discarding a larger known partial amount.
+                    charged_cost = max(charged_cost, current.reserved_cost_usd)
+                    charged_tokens = max(charged_tokens, current.reserved_tokens)
+                    if successful:
+                        contract_failure_code = (
+                            contract_failure_code or "routine_run_usage_incomplete"
+                        )
+                    successful = False
+                if (
+                    result.usage.total_tokens > current.reserved_tokens
+                    or charged_cost > current.reserved_cost_usd
+                ):
+                    contract_failure_code = (
+                        contract_failure_code or "routine_run_budget_exceeded"
+                    )
+                    successful = False
+                # Authenticate committed partial artifacts even when a different
+                # required action failed. Minimum counts decide completion only.
+                try:
+                    expected_artifact_references = tuple(
+                        sorted(
+                            (
+                                outcome_artifact_reference(ref)
+                                for ref in result.artifacts
+                            ),
+                            key=lambda item: item.artifact_id,
+                        )
+                    )
+                    validated_artifact_references = (
+                        validate_outcome_artifact_references(
+                            artifact_references,
+                            contract=routine.outcome_contract,
+                            resulting_run_id=current.reserved_run_id,
+                            require_minimum_counts=False,
+                        )
+                    )
+                    if validated_artifact_references != expected_artifact_references:
+                        raise ValueError("validated artifact references differ")
+                except (TypeError, ValueError):
+                    contract_failure_code = (
+                        contract_failure_code or "outcome_artifact_contract_failed"
+                    )
+                    validated_artifact_references = ()
+                    successful = False
+                else:
                     try:
-                        expected_artifact_references = tuple(
-                            sorted(
-                                (
-                                    outcome_artifact_reference(ref)
-                                    for ref in result.artifacts
-                                ),
-                                key=lambda item: item.artifact_id,
-                            )
+                        validate_outcome_artifact_references(
+                            validated_artifact_references,
+                            contract=routine.outcome_contract,
+                            resulting_run_id=current.reserved_run_id,
                         )
-                        validated_artifact_references = (
-                            validate_outcome_artifact_references(
-                                artifact_references,
-                                contract=routine.outcome_contract,
-                                resulting_run_id=current.reserved_run_id,
-                            )
-                        )
-                        if (
-                            validated_artifact_references
-                            != expected_artifact_references
-                        ):
-                            raise ValueError("validated artifact references differ")
                     except (TypeError, ValueError):
-                        contract_failure = "outcome_artifact_contract_failed"
-                        validated_artifact_references = ()
-                    if contract_failure is not None:
+                        contract_failure_code = (
+                            contract_failure_code or "outcome_artifact_contract_failed"
+                        )
                         successful = False
-                        contract_failure_code = contract_failure
                 if result.final_text is not None:
                     report_digest, report_preview, report_truncated = (
                         conclusion_preview_projection(result.final_text)
+                    )
+                if (
+                    successful
+                    and routine.outcome_contract.effect_requirements
+                    and not receipts
+                ):
+                    report_digest, report_preview, report_truncated = (
+                        conclusion_preview_projection(
+                            "No external action was taken in this occurrence. "
+                            "The approved optional action path was used.\n\n"
+                            + (result.final_text or "")
+                        )
                     )
                 resulting_run_id = current.reserved_run_id
                 terminal_failure_code = (
@@ -1816,6 +2164,13 @@ class SQLiteStateStore:
                 outcome = "completed" if successful else "failed"
                 reason = "completed" if successful else terminal_failure_code
 
+            accounted_routine = replace(
+                routine,
+                reserved_tokens=routine.reserved_tokens - current.reserved_tokens,
+                reserved_cost_usd=routine.reserved_cost_usd - current.reserved_cost_usd,
+                charged_tokens=routine.charged_tokens + charged_tokens,
+                charged_cost_usd=routine.charged_cost_usd + charged_cost,
+            )
             if current.slot_kind is RoutineSlotKind.MANUAL:
                 following = routine.next_due_at
             else:
@@ -1846,6 +2201,24 @@ class SQLiteStateStore:
                 following = None
             else:
                 next_state = RoutineState.ACTIVE
+            if (
+                next_state is RoutineState.ACTIVE
+                and accounted_routine.model_budget_exhausted
+            ):
+                next_state = RoutineState.NEEDS_ATTENTION
+                following = None
+            if uncertain_effect:
+                next_state = RoutineState.PAUSED
+                following = None
+            if routine.state in {
+                RoutineState.PAUSED,
+                RoutineState.DISABLED,
+                RoutineState.EXPIRED,
+            }:
+                # A foreground stop/recovery decision survives delayed producer
+                # finalization; that finalizer cannot reactivate the assignment.
+                next_state = routine.state
+                following = None
             escalation = not successful and next_state is RoutineState.NEEDS_ATTENTION
 
             payload = {
@@ -1858,6 +2231,7 @@ class SQLiteStateStore:
                 "occurrence_id": current.occurrence_id,
                 "scheduled_for": current.scheduled_for.isoformat(),
                 "run_id": resulting_run_id,
+                "effect_receipt_ids": effect_receipt_ids,
                 "outcome": outcome,
                 "reason": reason,
                 "escalation": escalation,
@@ -1893,13 +2267,15 @@ class SQLiteStateStore:
                     else (OutcomeState.SUCCEEDED if successful else OutcomeState.FAILED)
                 ),
                 conclusion_id=resulting_run_id or occurrence_id,
-                conclusion_digest=report_digest or conclusion_digest,
+                conclusion_digest=(
+                    report_digest if successful and report_digest else conclusion_digest
+                ),
                 conclusion_preview=report_preview or "",
                 conclusion_preview_truncated=report_truncated,
                 resulting_run_id=resulting_run_id,
                 artifact_references=(
                     validated_artifact_references
-                    if resulting_run_id is not None and successful
+                    if resulting_run_id is not None
                     else ()
                 ),
                 effective_sensitivity=sensitivity,
@@ -1914,6 +2290,7 @@ class SQLiteStateStore:
                 ),
                 failure_code=terminal_failure_code,
                 observed_at=finalized_at,
+                effect_receipt_ids=effect_receipt_ids,
             )
             _insert_delivery(connection, delivery)
 
@@ -1926,6 +2303,7 @@ class SQLiteStateStore:
                 charged_cost_usd=charged_cost,
                 conclusion_digest=conclusion_digest,
                 delivery_ids=(delivery.delivery_id,),
+                effect_receipt_ids=effect_receipt_ids,
                 failure_code=terminal_failure_code,
                 lease_expires_at=None,
                 disposition=disposition,
@@ -1935,13 +2313,7 @@ class SQLiteStateStore:
             if successful and occurrence_observation is not None:
                 acknowledged_observation = occurrence_observation
             completed_routine = replace(
-                routine,
-                reserved_tokens=routine.reserved_tokens - current.reserved_tokens,
-                reserved_cost_usd=(
-                    routine.reserved_cost_usd - current.reserved_cost_usd
-                ),
-                charged_tokens=routine.charged_tokens + charged_tokens,
-                charged_cost_usd=routine.charged_cost_usd + charged_cost,
+                accounted_routine,
                 consecutive_failures=failures,
                 last_acknowledged_precheck_observation=acknowledged_observation,
                 active_occurrence_id=None,
@@ -2036,9 +2408,11 @@ class SQLiteStateStore:
                         )
                         recovered.append(updated)
                         continue
-                    if run_row is not None:
-                        continue
-                if current.attempt_count >= MAX_ROUTINE_ATTEMPTS:
+                    # A reserved ID is never rebound, including a crash before
+                    # the loop created its transcript. The ordinary finalizer
+                    # rechecks that absence and records a no-model failure.
+                    if run_row is None:
+                        recovered.append(current)
                     continue
                 routine_loaded = _load_routine_row(
                     connection,
@@ -2049,6 +2423,14 @@ class SQLiteStateStore:
                     continue
                 routine, routine_data = routine_loaded
                 if routine.active_occurrence_id != current.occurrence_id:
+                    continue
+                if (
+                    current.attempt_count >= MAX_ROUTINE_ATTEMPTS
+                    or routine.attempt_count >= routine.cumulative_max_attempts
+                ):
+                    # Return the expired claim for atomic failure/delivery,
+                    # without consuming another attempt or renewing its lease.
+                    recovered.append(current)
                     continue
                 token = claim_token_factory(current.occurrence_id)
                 updated = replace(
@@ -2854,14 +3236,27 @@ class SQLiteStateStore:
                 successful = False
                 conclusion_failure_code = "outcome_sensitivity_contract_failed"
             estimate = result.usage.cost_estimate
-            charged_cost = (
-                estimate.amount_usd
-                if estimate.status is CostEstimateStatus.COMPLETE
-                and estimate.amount_usd is not None
-                and estimate.amount_usd <= current.reserved_cost_usd
-                else current.reserved_cost_usd
-            )
-            charged_tokens = min(result.usage.total_tokens, current.reserved_tokens)
+            charged_cost = estimate.amount_usd or Decimal("0")
+            charged_tokens = result.usage.total_tokens
+            if (
+                estimate.status is not CostEstimateStatus.COMPLETE
+                and estimate.code != "no_model_attempts"
+            ):
+                charged_cost = max(charged_cost, current.reserved_cost_usd)
+                charged_tokens = max(charged_tokens, current.reserved_tokens)
+                if successful:
+                    conclusion_failure_code = (
+                        conclusion_failure_code or "followup_run_usage_incomplete"
+                    )
+                successful = False
+            if (
+                result.usage.total_tokens > current.reserved_tokens
+                or charged_cost > current.reserved_cost_usd
+            ):
+                conclusion_failure_code = (
+                    conclusion_failure_code or "followup_run_budget_exceeded"
+                )
+                successful = False
             report_digest: str | None = None
             report_preview: str | None = None
             report_truncated = False
@@ -3546,7 +3941,7 @@ class SQLiteStateStore:
                 rows = connection.execute(
                     """SELECT s.agent_id, s.id, s.data, r.data,
                               (SELECT COUNT(*)
-                               FROM postgresql_update_scopes AS u
+                               FROM relational_write_scopes AS u
                                WHERE u.agent_id = s.agent_id
                                  AND u.source_id = s.id)
                        FROM sources AS s
@@ -3599,12 +3994,12 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
-    async def list_postgresql_update_scopes(
+    async def list_relational_write_scopes(
         self,
         agent_id: str,
         source_id: str,
-    ) -> tuple[PostgreSQLUpdateScope, ...]:
-        def read() -> tuple[PostgreSQLUpdateScope, ...]:
+    ) -> tuple[RelationalWriteScope, ...]:
+        def read() -> tuple[RelationalWriteScope, ...]:
             with _connect(self.path) as connection:
                 source_row = _source_state_row(connection, agent_id, source_id)
                 if source_row is None:
@@ -3627,14 +4022,14 @@ class SQLiteStateStore:
                     return ()
                 rows = connection.execute(
                     """SELECT resource_id, authorization_fingerprint, data
-                       FROM postgresql_update_scopes
+                       FROM relational_write_scopes
                        WHERE agent_id = ? AND source_id = ?
                        ORDER BY resource_id""",
                     (agent_id, source_id),
                 ).fetchall()
                 try:
                     return tuple(
-                        decode_postgresql_update_scope(
+                        decode_relational_write_scope(
                             data,
                             agent_id=agent_id,
                             source_id=source_id,
@@ -3653,16 +4048,16 @@ class SQLiteStateStore:
     async def replace_source_permission_scopes(
         self,
         read_scope: SourceReadScope,
-        update_scopes: tuple[PostgreSQLUpdateScope, ...],
+        update_scopes: tuple[RelationalWriteScope, ...],
     ) -> SourceRegistration:
         """Atomically replace only the two narrow scope families for one source."""
 
         if not isinstance(read_scope, SourceReadScope):
             raise TypeError("read_scope must be a SourceReadScope")
         if not isinstance(update_scopes, tuple) or any(
-            not isinstance(scope, PostgreSQLUpdateScope) for scope in update_scopes
+            not isinstance(scope, RelationalWriteScope) for scope in update_scopes
         ):
-            raise TypeError("update_scopes must be a tuple of PostgreSQLUpdateScope")
+            raise TypeError("update_scopes must be a tuple of RelationalWriteScope")
         if len({scope.resource_id for scope in update_scopes}) != len(update_scopes):
             raise ValueError("update_scopes cannot contain duplicate resources")
         gate = _CatalogCommitGate()
@@ -3735,11 +4130,11 @@ class SQLiteStateStore:
                         raise ValueError(
                             "PostgreSQL update scope requires a current table resource"
                         )
-                    expected = postgresql_update_authorization_fingerprint(
+                    expected = relational_write_authorization_fingerprint(
                         source=registration,
                         resource=resource,
                         facet=facet,
-                        allowed_assignment_columns=scope.allowed_assignment_columns,
+                        scope=scope,
                     )
                     if scope.authorization_fingerprint != expected:
                         raise ValueError(
@@ -3758,13 +4153,13 @@ class SQLiteStateStore:
                     ),
                 )
                 connection.execute(
-                    """DELETE FROM postgresql_update_scopes
+                    """DELETE FROM relational_write_scopes
                        WHERE agent_id = ? AND source_id = ?""",
                     (read_scope.agent_id, read_scope.source_id),
                 )
                 for scope in sorted(update_scopes, key=lambda item: item.resource_id):
                     connection.execute(
-                        """INSERT INTO postgresql_update_scopes(
+                        """INSERT INTO relational_write_scopes(
                                agent_id, source_id, resource_id,
                                authorization_fingerprint, data
                            ) VALUES (?, ?, ?, ?, ?)""",
@@ -3773,7 +4168,7 @@ class SQLiteStateStore:
                             scope.source_id,
                             scope.resource_id,
                             scope.authorization_fingerprint,
-                            encode_postgresql_update_scope(scope),
+                            encode_relational_write_scope(scope),
                         ),
                     )
                 connection.commit()
@@ -3806,18 +4201,18 @@ class SQLiteStateStore:
             )
         return updated
 
-    async def load_database_write_receipt(
+    async def load_effect_receipt(
         self,
         agent_id: str,
         receipt_id: str,
-    ) -> DatabaseWriteReceipt | None:
-        _database_write_text(agent_id, "receipt agent_id")
-        validate_database_write_receipt_id(receipt_id)
+    ) -> EffectReceipt | None:
+        _effect_receipt_text(agent_id, "receipt agent_id")
+        validate_effect_receipt_id(receipt_id)
 
-        def read() -> DatabaseWriteReceipt | None:
+        def read() -> EffectReceipt | None:
             with _connect(self.path) as connection:
                 row = connection.execute(
-                    """SELECT data FROM database_write_receipts
+                    """SELECT data FROM effect_receipts
                        WHERE agent_id = ? AND id = ?""",
                     (agent_id, receipt_id),
                 ).fetchone()
@@ -3825,20 +4220,20 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
-    async def load_database_write_receipt_for_call(
+    async def load_effect_receipt_for_call(
         self,
         agent_id: str,
         run_id: str,
         call_id: str,
-    ) -> DatabaseWriteReceipt | None:
-        _database_write_text(agent_id, "receipt agent_id")
-        _database_write_text(run_id, "receipt run_id")
-        _database_write_text(call_id, "receipt call_id")
+    ) -> EffectReceipt | None:
+        _effect_receipt_text(agent_id, "receipt agent_id")
+        _effect_receipt_text(run_id, "receipt run_id")
+        _effect_receipt_text(call_id, "receipt call_id")
 
-        def read() -> DatabaseWriteReceipt | None:
+        def read() -> EffectReceipt | None:
             with _connect(self.path) as connection:
                 row = connection.execute(
-                    """SELECT data FROM database_write_receipts
+                    """SELECT data FROM effect_receipts
                        WHERE agent_id = ? AND run_id = ? AND call_id = ?""",
                     (agent_id, run_id, call_id),
                 ).fetchone()
@@ -3846,180 +4241,327 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
-    async def start_database_write_receipt(
-        self,
-        receipt: DatabaseWriteReceipt,
-    ) -> DatabaseWriteReceipt:
-        if not isinstance(receipt, DatabaseWriteReceipt):
-            raise TypeError("receipt must be a DatabaseWriteReceipt")
-        if receipt.outcome is not DatabaseWriteOutcome.STARTED:
-            raise ValueError(
-                "database write execution must begin with a started receipt"
-            )
+    async def load_effect_receipt_for_operation(
+        self, agent_id: str, operation_key: str
+    ) -> EffectReceipt | None:
+        _effect_receipt_text(agent_id, "receipt agent")
+        if (
+            not isinstance(operation_key, str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", operation_key) is None
+        ):
+            raise ValueError("effect operation key is invalid")
 
-        def write() -> DatabaseWriteReceipt:
-            with _connect(self.path) as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                current = connection.execute(
-                    """SELECT data FROM database_write_receipts
-                       WHERE agent_id = ?
-                         AND (id = ? OR (run_id = ? AND call_id = ?))""",
-                    (
-                        receipt.agent_id,
-                        receipt.receipt_id,
-                        receipt.run_id,
-                        receipt.call_id,
-                    ),
-                ).fetchone()
-                if current is not None:
-                    raise DatabaseWriteReceiptConflictError(
-                        "execution identity already has a receipt"
-                    )
-                connection.execute(
-                    """INSERT INTO database_write_receipts(
-                           agent_id, id, run_id, call_id, data
-                       ) VALUES (?, ?, ?, ?, ?)""",
-                    (
-                        receipt.agent_id,
-                        receipt.receipt_id,
-                        receipt.run_id,
-                        receipt.call_id,
-                        encode_receipt(receipt),
-                    ),
-                )
-                return receipt
-
-        worker = asyncio.create_task(asyncio.to_thread(write))
-        cancelled = False
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                cancelled = True
-        result = worker.result()
-        if cancelled:
-            raise asyncio.CancelledError
-        return result
-
-    async def finish_database_write_receipt(
-        self,
-        receipt: DatabaseWriteReceipt,
-    ) -> DatabaseWriteReceipt:
-        if not isinstance(receipt, DatabaseWriteReceipt):
-            raise TypeError("receipt must be a DatabaseWriteReceipt")
-        if receipt.outcome is DatabaseWriteOutcome.STARTED:
-            raise ValueError(
-                "finish requires a terminal receipt, not a started receipt"
-            )
-
-        def write() -> DatabaseWriteReceipt:
-            with _connect(self.path) as connection:
-                connection.execute("BEGIN IMMEDIATE")
+        def read() -> EffectReceipt | None:
+            with _connect_read_only(self.path) as connection:
                 row = connection.execute(
-                    """SELECT data FROM database_write_receipts
-                       WHERE agent_id = ?
-                         AND (id = ? OR (run_id = ? AND call_id = ?))""",
-                    (
-                        receipt.agent_id,
-                        receipt.receipt_id,
-                        receipt.run_id,
-                        receipt.call_id,
-                    ),
+                    "SELECT data FROM effect_receipts WHERE agent_id = ? AND operation_key = ?",
+                    (agent_id, operation_key),
                 ).fetchone()
-                if row is None:
-                    raise DatabaseWriteReceiptConflictError(
-                        "started receipt does not exist"
-                    )
-                current = decode_receipt(row[0])
-                if current.outcome is not DatabaseWriteOutcome.STARTED:
-                    if current == receipt:
-                        return current
-                    raise DatabaseWriteReceiptConflictError(
-                        "terminal receipt is immutable"
-                    )
-                if current != receipt.as_started():
-                    raise DatabaseWriteReceiptConflictError(
-                        "terminal receipt does not match its started identity"
-                    )
-                connection.execute(
-                    """UPDATE database_write_receipts SET data = ?
-                       WHERE agent_id = ? AND id = ?""",
-                    (encode_receipt(receipt), receipt.agent_id, receipt.receipt_id),
-                )
-                return receipt
-
-        worker = asyncio.create_task(asyncio.to_thread(write))
-        cancelled = False
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                cancelled = True
-        result = worker.result()
-        if cancelled:
-            raise asyncio.CancelledError
-        return result
-
-    async def load_active_source_id(self, agent_id: str) -> str | None:
-        def read() -> str | None:
-            with _connect(self.path) as connection:
-                row = connection.execute(
-                    "SELECT data FROM metadata WHERE key = ?",
-                    (_active_source_key(agent_id),),
-                ).fetchone()
-            if row is None:
-                return None
-            source_id = decode_identifier(row[0])
-            if not source_id:
-                raise ValueError("stored active source id is invalid")
-            return source_id
+                return None if row is None else decode_receipt(row[0])
 
         return await asyncio.to_thread(read)
 
-    async def set_active_source_id(
+    async def list_effect_receipts(
         self,
         agent_id: str,
-        source_id: str,
-    ) -> SourceRegistration:
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("agent_id must be a non-empty string")
-        if not isinstance(source_id, str) or not source_id:
-            raise ValueError("source_id must be a non-empty string")
+        *,
+        run_id: str | None = None,
+        routine_id: str | None = None,
+        unresolved_only: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[EffectReceipt, ...]:
+        _effect_receipt_text(agent_id, "receipt agent")
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 50
+            or type(offset) is not int
+            or offset < 0
+        ):
+            raise ValueError("receipt inspection page is outside its bound")
+        for value in (run_id, routine_id):
+            if value is not None:
+                _effect_receipt_text(value, "receipt inspection identity")
+        if not isinstance(unresolved_only, bool):
+            raise TypeError("unresolved_only must be boolean")
 
-        def write() -> SourceRegistration:
-            with _connect(self.path) as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                row = _source_state_row(connection, agent_id, source_id)
-                if row is None:
-                    raise ValueError("unknown active source for this agent")
-                registration = _decode_source_state(
+        def read() -> tuple[EffectReceipt, ...]:
+            with _connect_read_only(self.path) as connection:
+                rows = connection.execute(
+                    "SELECT data FROM effect_receipts WHERE agent_id = ? AND (? IS NULL OR run_id = ?) AND (? IS NULL OR routine_id = ?) AND (? = 0 OR unresolved = 1) ORDER BY id LIMIT ? OFFSET ?",
+                    (
+                        agent_id,
+                        run_id,
+                        run_id,
+                        routine_id,
+                        routine_id,
+                        int(unresolved_only),
+                        limit,
+                        offset,
+                    ),
+                )
+                return tuple(decode_receipt(row[0]) for row in rows)
+
+        return await asyncio.to_thread(read)
+
+    async def require_effects_unblocked(
+        self, agent_id: str, *, run_id: str | None = None, routine_id: str | None = None
+    ) -> None:
+        def read() -> None:
+            with _connect_read_only(self.path) as connection:
+                _require_effects_unblocked(
+                    connection, agent_id, run_id=run_id, routine_id=routine_id
+                )
+
+        await asyncio.to_thread(read)
+
+    async def start_effect_receipt(
+        self,
+        receipt: EffectReceipt,
+        *,
+        grant: CapabilityGrant | None = None,
+        max_receipts_per_run: int = 64,
+    ) -> EffectReceipt:
+        if (
+            not isinstance(receipt, EffectReceipt)
+            or receipt.outcome is not EffectOutcome.STARTED
+        ):
+            raise ValueError("external execution must begin with a started receipt")
+        if (
+            type(max_receipts_per_run) is not int
+            or not 1 <= max_receipts_per_run <= 256
+        ):
+            raise ValueError("receipt reservation requires a positive run call bound")
+
+        def write(connection: sqlite3.Connection) -> EffectReceipt:
+            identity = connection.execute(
+                "SELECT data FROM metadata WHERE key = 'identity'"
+            ).fetchone()
+            run_row = connection.execute(
+                "SELECT input, result FROM runs WHERE agent_id = ? AND id = ?",
+                (receipt.agent_id, receipt.run_id),
+            ).fetchone()
+            if (
+                identity is None
+                or decode_identity(identity[0]).id != receipt.agent_id
+                or run_row is None
+                or run_row[1] is not None
+            ):
+                raise EffectReceiptConflictError(
+                    "receipt requires its current owned nonterminal run"
+                )
+            run = decode_run_input(run_row[0])
+            _require_effects_unblocked(
+                connection,
+                receipt.agent_id,
+                run_id=receipt.run_id,
+                routine_id=receipt.routine_id,
+            )
+            existing = connection.execute(
+                "SELECT id FROM effect_receipts WHERE agent_id = ? AND (id = ? OR (run_id = ? AND call_id = ?) OR operation_key = ?)",
+                (
+                    receipt.agent_id,
+                    receipt.receipt_id,
+                    receipt.run_id,
+                    receipt.call_id,
+                    receipt.operation_key,
+                ),
+            ).fetchone()
+            if existing is not None:
+                raise EffectReceiptConflictError(
+                    "execution or operation identity already has a receipt"
+                )
+            reserved_count = connection.execute(
+                "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND run_id = ?",
+                (receipt.agent_id, receipt.run_id),
+            ).fetchone()[0]
+            if reserved_count >= max_receipts_per_run:
+                raise EffectReceiptConflictError(
+                    "the run receipt reservation bound is exhausted"
+                )
+            scope = run.start.execution_scope if run.start is not None else None
+            if receipt.routine_id is None:
+                if grant is not None or scope is not None:
+                    raise EffectReceiptConflictError(
+                        "foreground receipt cannot carry machine authorization"
+                    )
+            else:
+                if (
+                    not isinstance(grant, CapabilityGrant)
+                    or scope is None
+                    or grant not in scope.capability_grants
+                ):
+                    raise EffectReceiptConflictError(
+                        "receipt lacks its exact frozen scope grant"
+                    )
+                if (
+                    grant.capability_id != receipt.capability_id
+                    or grant.domain_owner_id != receipt.domain_owner_id
+                    or grant.capability_contract_digest
+                    != receipt.capability_contract_digest
+                    or grant.grant_digest != receipt.capability_grant_digest
+                    or scope.routine_id != receipt.routine_id
+                    or scope.routine_revision != receipt.routine_revision
+                    or scope.occurrence_id != receipt.occurrence_id
+                ):
+                    raise EffectReceiptConflictError(
+                        "receipt does not match its scope authorization"
+                    )
+                occurrence = _load_routine_occurrence_row(
+                    connection, receipt.agent_id, receipt.occurrence_id or ""
+                )
+                routine = _load_routine_row(
+                    connection, receipt.agent_id, receipt.routine_id
+                )
+                if (
+                    occurrence is None
+                    or routine is None
+                    or (
+                        occurrence[0].execution_scope != scope
+                        or occurrence[0].reserved_run_id != receipt.run_id
+                        or occurrence[0].routine_revision != receipt.routine_revision
+                        or occurrence[0].disposition
+                        is not RoutineOccurrenceDisposition.RUNNING
+                        or occurrence[0].claim_token is None
+                        # The lease fences unbound claims. Once bound, the
+                        # immutable run/scope and nonterminal run row fence
+                        # dispatch; model reasoning may outlast the claim lease.
+                        or routine[0].revision != receipt.routine_revision
+                        or routine[0].active_occurrence_id != receipt.occurrence_id
+                        or routine[0].state is not RoutineState.ACTIVE
+                        or self._clock() >= routine[0].expires_at
+                        or grant not in routine[0].capability_grants
+                        or routine[0].contract_bindings != scope.contract_bindings
+                    )
+                ):
+                    raise EffectReceiptConflictError(
+                        "receipt occurrence claim is no longer current"
+                    )
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND occurrence_id = ? AND grant_digest = ?",
+                    (receipt.agent_id, receipt.occurrence_id, grant.grant_digest),
+                ).fetchone()[0]
+                if count >= grant.max_calls_per_occurrence:
+                    raise EffectReceiptConflictError(
+                        "the grant invocation ceiling is exhausted"
+                    )
+            connection.execute(
+                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                (
+                    receipt.agent_id,
+                    receipt.receipt_id,
+                    receipt.run_id,
+                    receipt.call_id,
+                    receipt.operation_key,
+                    receipt.routine_id,
+                    receipt.occurrence_id,
+                    receipt.capability_grant_digest,
+                    encode_receipt(receipt),
+                ),
+            )
+            return receipt
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt:
+        if (
+            not isinstance(receipt, EffectReceipt)
+            or receipt.outcome is EffectOutcome.STARTED
+            or receipt.resolution is not None
+        ):
+            raise ValueError(
+                "finish requires one terminal observation without human resolution"
+            )
+
+        def write(connection: sqlite3.Connection) -> EffectReceipt:
+            row = connection.execute(
+                "SELECT data FROM effect_receipts WHERE agent_id = ? AND id = ?",
+                (receipt.agent_id, receipt.receipt_id),
+            ).fetchone()
+            if row is None:
+                raise EffectReceiptConflictError("started receipt does not exist")
+            current = decode_receipt(row[0])
+            if current.outcome is not EffectOutcome.STARTED:
+                if replace(current, resolution=None) == receipt:
+                    return current
+                raise EffectReceiptConflictError("terminal receipt is immutable")
+            if current != receipt.as_started():
+                raise EffectReceiptConflictError(
+                    "terminal receipt does not match its started identity"
+                )
+            connection.execute(
+                "UPDATE effect_receipts SET data = ?, unresolved = ? WHERE agent_id = ? AND id = ?",
+                (
+                    encode_receipt(receipt),
+                    int(receipt.unresolved),
+                    receipt.agent_id,
+                    receipt.receipt_id,
+                ),
+            )
+            if receipt.unresolved:
+                _pause_effect_routine(
+                    connection, receipt, receipt.finished_at or self._clock()
+                )
+            return receipt
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def resolve_effect_receipt(
+        self, agent_id: str, resolution: EffectResolution
+    ) -> EffectReceipt:
+        if not isinstance(resolution, EffectResolution):
+            raise TypeError("effect recovery requires an exact human resolution")
+
+        def write(connection: sqlite3.Connection) -> EffectReceipt:
+            row = connection.execute(
+                "SELECT data FROM effect_receipts WHERE agent_id = ? AND id = ?",
+                (agent_id, resolution.receipt_id),
+            ).fetchone()
+            if row is None:
+                raise EffectReceiptConflictError(
+                    "the exact owned receipt is unavailable"
+                )
+            receipt = decode_receipt(row[0])
+            if receipt.receipt_digest != resolution.receipt_digest:
+                raise EffectReceiptConflictError(
+                    "the receipt observation changed before recovery"
+                )
+            if receipt.resolution is not None:
+                if receipt.resolution == resolution:
+                    return receipt
+                raise EffectReceiptConflictError(
+                    "an existing human resolution is immutable"
+                )
+            if receipt.outcome is not EffectOutcome.UNCERTAIN:
+                raise EffectReceiptConflictError(
+                    "only terminal uncertainty requires recovery"
+                )
+            resolved = replace(receipt, resolution=resolution)
+            connection.execute(
+                "UPDATE effect_receipts SET data = ?, unresolved = 0 WHERE agent_id = ? AND id = ?",
+                (encode_receipt(resolved), agent_id, receipt.receipt_id),
+            )
+            if receipt.routine_id is not None:
+                loaded = _load_routine_row(connection, agent_id, receipt.routine_id)
+                if loaded is None:
+                    raise EffectReceiptConflictError(
+                        "the producing routine is unavailable"
+                    )
+                routine, data = loaded
+                state = (
+                    RoutineState.DISABLED
+                    if resolution.decision
+                    is EffectResolutionDecision.CLOSE_WITHOUT_RETRY
+                    else RoutineState.PAUSED
+                )
+                _replace_routine_row(
                     connection,
-                    row_agent_id=row[0],
-                    row_source_id=row[1],
-                    source_data=row[2],
-                    read_scope_data=row[3],
-                    update_scope_count=row[4],
+                    data,
+                    replace(routine, state=state, updated_at=resolution.resolved_at),
                 )
-                if not registration.active:
-                    raise ValueError("unknown active source for this agent")
-                connection.execute(
-                    """INSERT INTO metadata(key, data) VALUES (?, ?)
-                       ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
-                    (_active_source_key(agent_id), encode_identifier(source_id)),
-                )
-                return registration
+            return resolved
 
-        worker = asyncio.create_task(asyncio.to_thread(write))
-        cancelled = False
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                cancelled = True
-        registration = worker.result()
-        if cancelled:
-            raise asyncio.CancelledError
-        return registration
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
@@ -4051,38 +4593,10 @@ class SQLiteStateStore:
                     (agent_id, source_id),
                 )
                 connection.execute(
-                    """DELETE FROM postgresql_update_scopes
+                    """DELETE FROM relational_write_scopes
                        WHERE agent_id = ? AND source_id = ?""",
                     (agent_id, source_id),
                 )
-                selection = connection.execute(
-                    "SELECT data FROM metadata WHERE key = ?",
-                    (_active_source_key(agent_id),),
-                ).fetchone()
-                selected_id = (
-                    None if selection is None else decode_identifier(selection[0])
-                )
-                if selected_id == source_id:
-                    connection.execute(
-                        "DELETE FROM metadata WHERE key = ?",
-                        (_active_source_key(agent_id),),
-                    )
-                    remaining: list[SourceRegistration] = []
-                    for (data,) in connection.execute(
-                        "SELECT data FROM sources WHERE agent_id = ? ORDER BY id",
-                        (agent_id,),
-                    ).fetchall():
-                        candidate = decode_source(data)
-                        if candidate.active:
-                            remaining.append(candidate)
-                    if len(remaining) == 1:
-                        connection.execute(
-                            "INSERT INTO metadata(key, data) VALUES (?, ?)",
-                            (
-                                _active_source_key(agent_id),
-                                encode_identifier(remaining[0].id),
-                            ),
-                        )
                 connection.commit()
                 return detached
             except BaseException:
@@ -4224,18 +4738,6 @@ class SQLiteStateStore:
                                     encode_source_read_scope(attach_scope),
                                 ),
                             )
-                    selection = connection.execute(
-                        "SELECT 1 FROM metadata WHERE key = ?",
-                        (_active_source_key(stored_registration.agent_id),),
-                    ).fetchone()
-                    if selection is None:
-                        connection.execute(
-                            "INSERT INTO metadata(key, data) VALUES (?, ?)",
-                            (
-                                _active_source_key(stored_registration.agent_id),
-                                encode_identifier(stored_registration.id),
-                            ),
-                        )
                 connection.execute(
                     """INSERT INTO syncs(agent_id, id, source_id, data)
                        VALUES (?, ?, ?, ?)
@@ -4416,7 +4918,7 @@ class SQLiteStateStore:
                         (registration.agent_id, source_id),
                     )
                     connection.execute(
-                        """DELETE FROM postgresql_update_scopes
+                        """DELETE FROM relational_write_scopes
                            WHERE agent_id = ? AND source_id = ?""",
                         (registration.agent_id, source_id),
                     )
@@ -4427,14 +4929,6 @@ class SQLiteStateStore:
                         read_scope.agent_id,
                         read_scope.source_id,
                         encode_source_read_scope(read_scope),
-                    ),
-                )
-                connection.execute(
-                    """INSERT INTO metadata(key, data) VALUES (?, ?)
-                       ON CONFLICT(key) DO UPDATE SET data = excluded.data""",
-                    (
-                        _active_source_key(registration.agent_id),
-                        encode_identifier(registration.id),
                     ),
                 )
                 connection.execute(
@@ -5424,22 +5918,65 @@ class SQLiteStateStore:
         def write() -> tuple[LoopExit, ...]:
             with _connect(self.path) as connection:
                 rows = connection.execute(
-                    """SELECT id, conversation_id
+                    """SELECT id, conversation_id, input
                        FROM runs
                        WHERE agent_id = ? AND result IS NULL
                        ORDER BY conversation_id, turn_index""",
                     (agent_id,),
                 ).fetchall()
                 recovered: list[LoopExit] = []
-                for run_id, conversation_id in rows:
+                for run_id, conversation_id, run_data in rows:
+                    run = decode_run_input(run_data)
                     messages = connection.execute(
                         "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
                         (run_id,),
                     ).fetchall()
+                    decoded = tuple(decode_message(row[0]) for row in messages)
                     steps = sum(
-                        decode_message(row[0]).role is MessageRole.ASSISTANT
-                        for row in messages
+                        message.role is MessageRole.ASSISTANT for message in decoded
                     )
+                    refs: dict[str, ArtifactRef] = {}
+                    sensitivity = max(
+                        run.history_sensitivity,
+                        # Machine content is bounded by its approved ceiling.
+                        # An interrupted foreground request has no persisted
+                        # request classification, so unknown content stays private.
+                        (
+                            run.execution_scope.sensitivity_ceiling
+                            if run.execution_scope is not None
+                            else ModelSensitivity.RESTRICTED
+                        ),
+                        key=lambda item: item.routing_rank,
+                    )
+                    for message in decoded:
+                        if message.role is not MessageRole.TOOL:
+                            continue
+                        for block in message.content:
+                            if not isinstance(block, ToolResultBlock):
+                                continue
+                            if block.sensitivity is not None:
+                                sensitivity = max(
+                                    sensitivity,
+                                    block.sensitivity,
+                                    key=lambda item: item.routing_rank,
+                                )
+                            value = block.output.get("artifact")
+                            if block.is_error or not isinstance(value, Mapping):
+                                continue
+                            ref = artifact_ref_from_mapping(value)
+                            if (
+                                ref.run_id != run_id
+                                or ref.conversation_id != conversation_id
+                                or ref.call_id != block.call_id
+                                or (
+                                    ref.artifact_id in refs
+                                    and refs[ref.artifact_id] != ref
+                                )
+                            ):
+                                raise RuntimeError(
+                                    "recovered artifact identity does not match its run"
+                                )
+                            refs[ref.artifact_id] = ref
                     result = LoopExit(
                         run_id=run_id,
                         conversation_id=conversation_id,
@@ -5447,6 +5984,8 @@ class SQLiteStateStore:
                         reason="previous_process_terminated",
                         steps=steps,
                         created_at=created_at,
+                        sensitivity=sensitivity,
+                        artifacts=tuple(refs.values()),
                     )
                     cursor = connection.execute(
                         "UPDATE runs SET result = ? WHERE id = ? AND result IS NULL",
@@ -5886,29 +6425,6 @@ class SQLiteStateStore:
                 "conversation-clear transaction stopped without cancellation"
             )
         return cleared
-
-    async def conversation_source_id(
-        self,
-        agent_id: str,
-        conversation_id: str,
-    ) -> str | None:
-        """Return the sticky source captured by the first run in a conversation."""
-
-        def read() -> str | None:
-            with _connect(self.path) as connection:
-                row = connection.execute(
-                    """SELECT input FROM runs
-                       WHERE agent_id = ? AND conversation_id = ?
-                       ORDER BY turn_index
-                       LIMIT 1""",
-                    (agent_id, conversation_id),
-                ).fetchone()
-            if row is None:
-                return None
-            run = decode_run_input(row[0])
-            return run.conversation_source_id or run.source_id
-
-        return await asyncio.to_thread(read)
 
     async def completed_conversation_tail(
         self,
@@ -6408,15 +6924,11 @@ def _validate_current_mcp_binding_bounds(connection: sqlite3.Connection) -> None
 def _validate_current_records(connection: sqlite3.Connection) -> None:
     _validate_current_mcp_binding_bounds(connection)
     identity: AgentIdentity | None = None
-    active_sources: dict[str, str] = {}
     for key, data in connection.execute("SELECT key, data FROM metadata"):
         if key == "identity":
             if identity is not None:
                 raise ValueError("state contains duplicate agent identity")
             identity = decode_identity(data)
-        elif isinstance(key, str) and key.startswith(_ACTIVE_SOURCE_KEY_PREFIX):
-            agent_id = key.removeprefix(_ACTIVE_SOURCE_KEY_PREFIX)
-            active_sources[agent_id] = decode_identifier(data)
         elif isinstance(key, str) and key.startswith(
             _LEARNING_REVIEW_STAMPS_KEY_PREFIX
         ):
@@ -6454,11 +6966,6 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
         sources[(agent_id, source_id)] = registration
     if identity is not None and any(agent_id != identity.id for agent_id, _ in sources):
         raise ValueError("stored source belongs to another agent")
-    for agent_id, source_id in active_sources.items():
-        active_registration = sources.get((agent_id, source_id))
-        if active_registration is None or not active_registration.active:
-            raise ValueError("stored active source selection is invalid")
-
     read_scopes: dict[tuple[str, str], SourceReadScope] = {}
     for agent_id, source_id, data in connection.execute(
         "SELECT agent_id, source_id, data FROM source_read_scopes"
@@ -6483,7 +6990,7 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
     for agent_id, source_id, resource_id, fingerprint, data in connection.execute(
         """SELECT agent_id, source_id, resource_id,
                   authorization_fingerprint, data
-           FROM postgresql_update_scopes"""
+           FROM relational_write_scopes"""
     ):
         scope_registration = sources.get((agent_id, source_id))
         if (
@@ -6492,7 +6999,7 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
             or not scope_registration.active
         ):
             raise ValueError("stored PostgreSQL update scope is foreign")
-        decode_postgresql_update_scope(
+        decode_relational_write_scope(
             data,
             agent_id=agent_id,
             source_id=source_id,
@@ -6576,9 +7083,20 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
     ):
         raise ValueError("stored transcript message positions are not contiguous")
 
-    for agent_id, receipt_id, run_id, call_id, data in connection.execute(
-        """SELECT agent_id, id, run_id, call_id, data
-           FROM database_write_receipts"""
+    for (
+        agent_id,
+        receipt_id,
+        run_id,
+        call_id,
+        operation_key,
+        routine_id,
+        occurrence_id,
+        grant_digest,
+        unresolved,
+        data,
+    ) in connection.execute(
+        """SELECT agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, data
+           FROM effect_receipts"""
     ):
         receipt = decode_receipt(data)
         if (
@@ -6586,10 +7104,17 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
             or receipt.receipt_id != receipt_id
             or receipt.run_id != run_id
             or receipt.call_id != call_id
+            or receipt.operation_key != operation_key
+            or receipt.routine_id != routine_id
+            or receipt.occurrence_id != occurrence_id
+            or receipt.capability_grant_digest != grant_digest
+            or int(receipt.unresolved) != unresolved
         ):
-            raise ValueError("stored database write receipt ownership is invalid")
+            raise ValueError(
+                "stored effect receipt identity or indexed state is invalid"
+            )
         if identity is not None and receipt.agent_id != identity.id:
-            raise ValueError("stored database write receipt belongs to another agent")
+            raise ValueError("stored effect receipt belongs to another agent")
 
     for agent_id, annotation_id, data in connection.execute(
         "SELECT agent_id, id, data FROM semantic_annotations"
@@ -7043,36 +7568,72 @@ def _damaged_state_error(
     )
 
 
-def _recover_started_database_write_receipts(
+def _require_effects_unblocked(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    run_id: str | None = None,
+    routine_id: str | None = None,
+) -> None:
+    _effect_receipt_text(agent_id, "effect agent")
+    rows = connection.execute(
+        "SELECT id, COUNT(*) OVER() FROM effect_receipts WHERE agent_id = ? AND unresolved = 1 AND (? IS NULL OR routine_id = ? OR run_id = ?) ORDER BY id LIMIT 20",
+        (agent_id, routine_id, routine_id, run_id),
+    ).fetchall()
+    if rows:
+        raise EffectUnresolvedError(
+            tuple(row[0] for row in rows), int(rows[0][1]) - len(rows)
+        )
+
+
+def _pause_effect_routine(
+    connection: sqlite3.Connection, receipt: EffectReceipt, changed_at: datetime
+) -> None:
+    if receipt.routine_id is None:
+        return
+    loaded = _load_routine_row(connection, receipt.agent_id, receipt.routine_id)
+    if loaded is None:
+        raise EffectReceiptConflictError("the producing routine is unavailable")
+    routine, encoded = loaded
+    _replace_routine_row(
+        connection,
+        encoded,
+        replace(
+            routine,
+            state=RoutineState.PAUSED,
+            updated_at=max(changed_at, routine.updated_at),
+        ),
+    )
+
+
+def _recover_started_effect_receipts(
     path: Path,
     clock: Callable[[], datetime],
 ) -> None:
     try:
         with _connect_read_only(path) as connection:
             rows = tuple(
-                connection.execute(
-                    "SELECT agent_id, id, data FROM database_write_receipts"
-                )
+                connection.execute("SELECT agent_id, id, data FROM effect_receipts")
             )
         started = tuple(
             (agent_id, receipt_id, receipt)
             for agent_id, receipt_id, data in rows
-            if (receipt := decode_receipt(data)).outcome is DatabaseWriteOutcome.STARTED
+            if (receipt := decode_receipt(data)).outcome is EffectOutcome.STARTED
         )
         if not started:
             return
-        completed_at = _database_write_aware(clock(), "receipt recovery completed_at")
+        completed_at = _effect_receipt_aware(clock(), "receipt recovery completed_at")
         with _connect(path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             for agent_id, receipt_id, receipt in started:
                 recovered = receipt.finish(
-                    DatabaseWriteOutcome.OUTCOME_UNKNOWN,
-                    completed_at=completed_at,
-                    affected_rows=None,
-                    normalized_error_code="write_outcome_unknown",
+                    EffectObservation(
+                        EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN
+                    ),
+                    finished_at=completed_at,
                 )
                 result = connection.execute(
-                    """UPDATE database_write_receipts SET data = ?
+                    """UPDATE effect_receipts SET data = ?
                        WHERE agent_id = ? AND id = ? AND data = ?""",
                     (
                         encode_receipt(recovered),
@@ -7082,9 +7643,8 @@ def _recover_started_database_write_receipts(
                     ),
                 )
                 if result.rowcount != 1:
-                    raise RuntimeError(
-                        "database write receipt changed during startup recovery"
-                    )
+                    raise RuntimeError("effect receipt changed during startup recovery")
+                _pause_effect_routine(connection, recovered, completed_at)
     except RuntimeError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -7113,16 +7673,16 @@ def _commit_catalog_transaction(connection: sqlite3.Connection) -> None:
 
 
 __all__ = [
-    "DatabaseWriteOutcome",
-    "DatabaseWriteReceipt",
-    "DatabaseWriteReceiptConflictError",
-    "PostgreSQLUpdateScope",
+    "EffectOutcome",
+    "EffectReceipt",
+    "EffectReceiptConflictError",
+    "RelationalWriteScope",
     "SQLiteStateStore",
     "SourcePermissionStateError",
     "SourceReadMode",
     "SourceReadScope",
     "StateCompatibilityCode",
     "StateCompatibilityError",
-    "database_write_receipt_id",
-    "postgresql_update_authorization_fingerprint",
+    "effect_receipt_id",
+    "relational_write_authorization_fingerprint",
 ]

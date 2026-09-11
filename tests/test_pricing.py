@@ -19,22 +19,22 @@ from daita.llm.pricing import (
     aggregate_cost_estimates,
     format_cost_estimate,
 )
-from daita.llm.providers.anthropic import (
-    AnthropicProvider,
+from daita.llm.providers.anthropic import AnthropicProvider
+from daita.llm.providers.anthropic.usage import (
     _decode_usage as decode_anthropic_usage,
 )
-from daita.llm.providers.gemini import (
+from daita.llm.providers.gemini.adapter import (
     GeminiProvider,
     _decode_usage as decode_gemini_usage,
 )
 from daita.llm.providers.grok import GrokProvider
 from daita.llm.providers.mock import MockModelProvider
 from daita.llm.providers.ollama import OllamaProvider
-from daita.llm.providers.openai import (
+from daita.llm.providers.openai.adapter import (
     OpenAIProvider,
     _decode_usage as decode_openai_usage,
 )
-from daita.llm.providers.openai_compatible import (
+from daita.llm.providers.openai_compatible.adapter import (
     OpenAICompatibleProvider,
     _decode_usage as decode_compatible_usage,
 )
@@ -186,7 +186,7 @@ def test_unknown_pricing_identities_fail_closed_while_xai_reports_exact_cost():
     assert all(
         provider.has_complete_pricing(request) is False for provider in providers
     )
-    assert GrokProvider("test-model").has_complete_pricing(request) is True
+    assert GrokProvider("test-model").has_complete_pricing(request) is False
 
     decoded = (
         decode_openai_usage({"input_tokens": 1, "output_tokens": 2}),

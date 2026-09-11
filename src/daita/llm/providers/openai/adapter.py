@@ -1,0 +1,954 @@
+"""Translate canonical requests and streaming responses for OpenAI Responses."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
+from datetime import UTC, datetime
+from decimal import Decimal
+from hashlib import sha256
+from typing import Protocol, cast
+from uuid import uuid4
+
+from ...._installation import repair_guidance
+from ...._json import FrozenJsonObject
+from ..._lifecycle import (
+    AttemptLifecycle,
+    CloseCoordinator,
+    NativeOwner,
+    closing_stream,
+    execute_generate_attempt,
+    execute_stream_attempt,
+    native_events,
+    transport_timeout,
+)
+from ...errors import (
+    ModelProviderError,
+    ProviderErrorCode,
+    ProviderFailureDiagnostic,
+    ProviderFailurePhase,
+    before_generation,
+    retry_after_from_headers,
+    token_count_error,
+    with_cancelled_model_usage,
+)
+from ...models import (
+    FinishReason,
+    ModelRequest,
+    ModelResponse,
+    ModelStreamEvent,
+    ModelUsage,
+    ToolCall,
+)
+from ...pricing import (
+    BillableQuantity,
+    CostEstimate,
+    PricingSchedule,
+    bound_request_output,
+    calculate_cost_estimate,
+    has_complete_pricing_coverage,
+    load_bundled_pricing_schedules,
+    validate_pricing_schedules,
+    with_request_admission,
+)
+from ...provider_definitions import supports_builtin_request_policy
+from .._fields import (
+    MISSING as _MISSING,
+    field as _field,
+    nonnegative_int as _nonnegative_int,
+    optional_text as _optional_text,
+    required_text as _required_text,
+    safe_structural_token as _safe_structural_token,
+)
+from .messages import _response_input
+
+
+class _ResponsesResource(Protocol):
+    async def create(self, **kwargs: object) -> object: ...
+
+
+class _InputTokensResource(Protocol):
+    async def count(self, **kwargs: object) -> object: ...
+
+
+class _OpenAIClient(Protocol):
+    @property
+    def responses(self) -> _ResponsesResource: ...
+
+    async def close(self) -> None: ...
+
+
+class _OpenAIResponseDecodeFailure(ValueError):
+    """Carry one bounded structural checkpoint across the provider boundary."""
+
+    __slots__ = ("diagnostic_code",)
+
+    def __init__(self, diagnostic_code: str) -> None:
+        super().__init__(diagnostic_code)
+        self.diagnostic_code = diagnostic_code
+
+
+class _ResponseOutputOverride:
+    """Retain terminal response metadata while supplying streamed output items."""
+
+    __slots__ = ("_response", "output")
+
+    def __init__(self, response: object, output: tuple[object, ...]) -> None:
+        self._response = response
+        self.output = output
+
+    def __getattr__(self, name: str) -> object:
+        if isinstance(self._response, Mapping) and name in self._response:
+            return self._response[name]
+        return getattr(self._response, name)
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}-{uuid4().hex}"
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+class OpenAIResponsesProvider:
+    """Translate canonical requests to the OpenAI Responses API only."""
+
+    def __init__(
+        self,
+        model: str,
+        *,
+        api_key: str | None = None,
+        max_output_tokens: int | None = None,
+        client: _OpenAIClient | None = None,
+        id_factory: Callable[[str], str] | None = None,
+        service_tier: str = "default",
+        region: str = "global",
+        pricing_schedules: Iterable[PricingSchedule] | None = None,
+        clock: Callable[[], datetime] = _utc_now,
+    ) -> None:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model must be a non-empty string")
+        if api_key is not None and (
+            not isinstance(api_key, str) or not api_key.strip()
+        ):
+            raise ValueError("api_key must be a non-empty string when provided")
+        if max_output_tokens is not None and (
+            not isinstance(max_output_tokens, int)
+            or isinstance(max_output_tokens, bool)
+            or max_output_tokens < 1
+        ):
+            raise ValueError("max_output_tokens must be a positive integer")
+        if service_tier != "default":
+            raise ValueError("only the default OpenAI service tier is admitted")
+        if region != "global":
+            raise ValueError("only the global OpenAI endpoint is admitted")
+        if not callable(clock):
+            raise TypeError("clock must be callable")
+        self.model = model.strip()
+        self._api_key = api_key
+        self._max_output_tokens = max_output_tokens
+        self._client = client
+        self._owns_client = client is None
+        self._native_owner = NativeOwner()
+        self._close = CloseCoordinator(self._native_owner)
+        self._id_factory = _new_id if id_factory is None else id_factory
+        self._service_tier = service_tier
+        self._region = region
+        self._pricing_schedules = (
+            load_bundled_pricing_schedules()
+            if pricing_schedules is None
+            else validate_pricing_schedules(pricing_schedules)
+        )
+        self._clock = clock
+
+    @property
+    def provider_id(self) -> str:
+        return f"openai:{self.model}"
+
+    def supports_request_policy(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return supports_builtin_request_policy(
+            self.provider_id.partition(":")[0], request
+        )
+
+    def has_complete_pricing(self, request: ModelRequest) -> bool:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        return has_complete_pricing_coverage(
+            self._pricing_schedules,
+            provider="openai",
+            model=self.model,
+            endpoint="responses",
+            requested_at=self._clock(),
+            qualifiers={
+                "service_tier": self._service_tier,
+                "region": self._region,
+            },
+            required_metrics=(
+                "input_uncached_tokens",
+                "input_cache_read_tokens",
+                "input_cache_write_tokens",
+                "output_tokens",
+            ),
+            usage_range_metric="request_input_tokens",
+        )
+
+    @property
+    def client(self) -> _OpenAIClient:
+        if self._close.started:
+            raise RuntimeError("OpenAI provider is closed")
+        if self._client is None:
+            try:
+                from openai import AsyncOpenAI
+            except ImportError as error:
+                raise ImportError(
+                    "Daita's OpenAI runtime dependency is unavailable. "
+                    f"{repair_guidance()}"
+                ) from error
+            self._client = cast(
+                _OpenAIClient, AsyncOpenAI(api_key=self._api_key, max_retries=0)
+            )
+        if not self._owns_client:
+            # Use a request view; do not change or close the caller's SDK client.
+            with_options = getattr(self._client, "with_options", None)
+            if callable(with_options):
+                return cast(_OpenAIClient, with_options(max_retries=0))
+        return self._client
+
+    async def close(self, *, deadline: float | None = None) -> None:
+        """Join the once-only cleanup of this provider's owned SDK client."""
+
+        await self._close.close(self._finish_close, deadline=deadline)
+
+    async def _finish_close(self) -> None:
+        client = self._client
+        if self._owns_client and client is not None:
+            await client.close()
+        self._client = None
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        return await execute_generate_attempt(
+            self._native_owner,
+            request,
+            provider_id=self.provider_id,
+            boundary_name="OpenAI",
+            operation=self._generate,
+            headers_supported=True,
+        )
+
+    async def _generate(
+        self, request: ModelRequest, attempt: AttemptLifecycle
+    ) -> ModelResponse:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        arguments = self._request_arguments(request)
+        requested_at = self._clock()
+        counted_input_tokens = await self._admit_request(
+            request, arguments, attempt, requested_at=requested_at
+        )
+        try:
+            attempt.values["output_cap"] = arguments.get("max_output_tokens")
+            attempt.dispatch()
+            response = await self._sdk_call(
+                self.client.responses, "create", arguments, attempt, "generation"
+            )
+        except asyncio.CancelledError:
+            raise
+        except ImportError:
+            raise
+        except ModelProviderError:
+            raise
+        except Exception as error:
+            attempt.transport_failure(error, phase="generation")
+            raise _normalize_error(error) from error
+        try:
+            return with_request_admission(
+                self._decode_response(response, requested_at=requested_at),
+                request,
+                input_tokens=counted_input_tokens,
+                output_cap=cast(int | None, arguments.get("max_output_tokens")),
+            )
+        except ModelProviderError:
+            raise
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise ModelProviderError(
+                ProviderErrorCode.MALFORMED_RESPONSE,
+                "OpenAI returned a malformed response",
+                provider_id=self.provider_id,
+                diagnostic=_openai_failure_diagnostic(
+                    response,
+                    phase=ProviderFailurePhase.RESPONSE_DECODE,
+                    code=(
+                        error.diagnostic_code
+                        if isinstance(error, _OpenAIResponseDecodeFailure)
+                        else "response_decode_failed"
+                    ),
+                ),
+            ) from error
+
+    def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
+        """Translate ordered Responses API events into canonical stream events."""
+        return execute_stream_attempt(
+            self._native_owner,
+            request,
+            provider_id=self.provider_id,
+            boundary_name="OpenAI",
+            operation=self._stream,
+            headers_supported=True,
+        )
+
+    async def _stream(
+        self,
+        request: ModelRequest,
+        attempt: AttemptLifecycle,
+    ) -> AsyncIterator[ModelStreamEvent]:
+        if not isinstance(request, ModelRequest):
+            raise TypeError("request must be a canonical ModelRequest")
+        arguments = self._request_arguments(request)
+        requested_at = self._clock()
+        counted_input_tokens = await self._admit_request(
+            request, arguments, attempt, requested_at=requested_at
+        )
+        arguments["stream"] = True
+        try:
+            attempt.values["output_cap"] = arguments.get("max_output_tokens")
+            attempt.dispatch()
+            source = native_events(
+                lambda: self.client.responses.create(
+                    **arguments, timeout=transport_timeout(request)
+                ),
+                observe=lambda stream: self._observe_headers(
+                    attempt, "generation", _safe_field(stream, "response")
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except ImportError:
+            raise
+        except ModelProviderError:
+            raise
+        except Exception as error:
+            response = _safe_field(error, "response")
+            if response is not None:
+                self._observe_headers(attempt, "generation", response, arrived=False)
+            attempt.transport_failure(error, phase="generation")
+            raise _normalize_error(error) from error
+
+        from .stream import decode_openai_stream
+
+        async with closing_stream(
+            decode_openai_stream(
+                self,
+                source,
+                request,
+                attempt,
+                arguments=arguments,
+                requested_at=requested_at,
+                counted_input_tokens=counted_input_tokens,
+            )
+        ) as events:
+            async for event in events:
+                yield event
+
+    @staticmethod
+    def _observe_headers(
+        attempt: AttemptLifecycle, phase: str, response: object, *, arrived: bool = True
+    ) -> None:
+        try:
+            headers = getattr(response, "headers", None)
+            request_id = (
+                headers.get("x-request-id") if isinstance(headers, Mapping) else None
+            )
+            attempt.headers(
+                phase,
+                getattr(response, "status_code", None),
+                request_id,
+                arrived=arrived,
+            )
+        except Exception:
+            pass  # Optional SDK metadata cannot change request behavior.
+
+    async def _sdk_call(
+        self,
+        resource: object,
+        method: str,
+        arguments: dict[str, object],
+        attempt: AttemptLifecycle,
+        phase: str,
+    ) -> object:
+        arguments = {
+            **arguments,
+            "timeout": transport_timeout(
+                attempt.request, deadline=attempt._phase_deadline
+            ),
+        }
+
+        async def scope():
+            view = getattr(resource, "with_streaming_response", None)
+            if view is None:
+                attempt.values[f"{phase}_headers_availability"] = "unsupported"
+                yield await getattr(resource, method)(**arguments)
+                return
+            try:
+                async with getattr(view, method)(**arguments) as raw:
+                    attempt.track_response_release(_safe_field(raw, "http_response"))
+                    self._observe_headers(attempt, phase, raw)
+                    yield await raw.parse()
+            except Exception as error:
+                self._observe_headers(
+                    attempt, phase, _safe_field(error, "response"), arrived=False
+                )
+                raise
+
+        if phase == "count":
+
+            async def count():
+                async with closing_stream(scope()) as results:
+                    return await anext(results)
+
+            return await attempt.run_native(count())
+        async with attempt.stream(scope()) as results:
+            response = await anext(results)
+            attempt.response(
+                self._decode_response(response, requested_at=self._clock())
+            )
+            return response
+
+    def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
+        arguments: dict[str, object] = {
+            "model": self.model,
+            "input": _response_input(request.messages, self.provider_id),
+            "include": ["reasoning.encrypted_content"],
+            "service_tier": self._service_tier,
+            "store": False,
+        }
+        if self._max_output_tokens is not None:
+            arguments["max_output_tokens"] = self._max_output_tokens
+        if request.allow_parallel_tool_calls is not None:
+            arguments["parallel_tool_calls"] = request.allow_parallel_tool_calls
+        if request.tools:
+            arguments["tools"] = [
+                {
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": FrozenJsonObject.from_mapping(
+                        tool.input_schema
+                    ).to_dict(),
+                    "strict": False,
+                }
+                for tool in request.tools
+            ]
+        if request.response_schema is not None:
+            arguments["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    "name": "daita_response",
+                    "schema": FrozenJsonObject.from_mapping(
+                        request.response_schema
+                    ).to_dict(),
+                    "strict": True,
+                }
+            }
+        return arguments
+
+    async def _admit_request(
+        self,
+        request: ModelRequest,
+        arguments: dict[str, object],
+        attempt: AttemptLifecycle,
+        *,
+        requested_at: datetime,
+    ) -> int | None:
+        request.remaining_after(
+            ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+        )
+        if request.max_total_tokens is None and request.max_estimated_cost_usd is None:
+            return None
+
+        def output_limit(input_tokens: int, *, counted: bool = True) -> int:
+            return bound_request_output(
+                request,
+                input_tokens=input_tokens,
+                input_tokens_counted=counted,
+                maximum_output_tokens=self._max_output_tokens
+                or request.max_total_tokens
+                or 1_024,
+                schedules=self._pricing_schedules,
+                provider="openai",
+                model=self.model,
+                endpoint="responses",
+                requested_at=requested_at,
+                qualifiers={"service_tier": self._service_tier, "region": self._region},
+            )
+
+        # Reject exhausted/unpriced allowances before any counting I/O. Count
+        # the exact prepared input, omitting generation/transport-only controls.
+        output_limit(0, counted=False)
+        count_arguments = {
+            key: value
+            for key, value in arguments.items()
+            if key not in {"max_output_tokens", "service_tier", "store", "include"}
+        }
+        attempt.start_count()
+        try:
+            counter = cast(
+                _InputTokensResource,
+                getattr(self.client.responses, "input_tokens", None),
+            )
+            counted = await self._sdk_call(
+                counter, "count", count_arguments, attempt, "count"
+            )
+        except asyncio.CancelledError as error:
+            raise with_cancelled_model_usage(
+                error, ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
+            ) from None
+        except ImportError:
+            raise
+        except (TypeError, ValueError):
+            raise token_count_error(invalid=True) from None
+        except Exception as error:
+            attempt.transport_failure(error, phase="count")
+            raise before_generation(
+                _normalize_error(error),
+                code="input_token_count_failed",
+            ) from None
+        tokens = _field(counted, "input_tokens", None)
+        if type(tokens) is not int or tokens < 0:
+            raise token_count_error(invalid=True)
+        attempt.counted(tokens)
+        arguments["max_output_tokens"] = output_limit(tokens)
+        attempt.values["output_cap"] = arguments["max_output_tokens"]
+        return tokens
+
+    def _decode_response(
+        self,
+        response: object,
+        *,
+        requested_at: datetime | None = None,
+        canonical_ids_by_index: Mapping[int, str] | None = None,
+        canonical_ids_by_provider_call_id: Mapping[str, str] | None = None,
+    ) -> ModelResponse:
+        try:
+            status = _optional_text(
+                _field(response, "status", None),
+                "response status",
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("response_status_invalid") from error
+        if status == "failed":
+            failure = _field(response, "error", None)
+            code = _optional_text(_field(failure, "code", None), "response error code")
+            raise ModelProviderError(
+                _code_from_provider_value(code),
+                "OpenAI reported a failed response",
+            )
+
+        try:
+            output = _field(response, "output", ())
+            if not isinstance(output, Sequence) or isinstance(output, (str, bytes)):
+                raise ValueError("response output must be a sequence")
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("response_output_invalid") from error
+
+        text_parts: list[str] = []
+        calls: list[ToolCall] = []
+        replay_items: list[dict[str, object]] = []
+        canonical_ids: set[str] = set()
+        index_ids = {} if canonical_ids_by_index is None else canonical_ids_by_index
+        provider_ids = (
+            {}
+            if canonical_ids_by_provider_call_id is None
+            else canonical_ids_by_provider_call_id
+        )
+        try:
+            for output_index, item in enumerate(output):
+                item_type = _required_text(_field(item, "type"), "response item type")
+                if item_type == "function_call":
+                    provider_call_id = _required_text(
+                        _field(item, "call_id"), "provider call_id"
+                    )
+                    name = _required_text(_field(item, "name"), "function name")
+                    encoded_arguments = _required_text(
+                        _field(item, "arguments"), "function arguments"
+                    )
+                    decoded_arguments = json.loads(encoded_arguments)
+                    if not isinstance(decoded_arguments, dict):
+                        raise ValueError("function arguments must decode to an object")
+                    canonical_id = provider_ids.get(
+                        provider_call_id,
+                        index_ids.get(output_index),
+                    )
+                    if canonical_id is None:
+                        canonical_id = self._id_factory("call")
+                    if canonical_id in canonical_ids:
+                        raise ValueError("id_factory returned a duplicate call ID")
+                    canonical_ids.add(canonical_id)
+                    calls.append(
+                        ToolCall(
+                            id=canonical_id,
+                            provider_call_id=provider_call_id,
+                            name=name,
+                            arguments=decoded_arguments,
+                        )
+                    )
+                elif item_type == "message":
+                    text_parts.extend(_message_text(item))
+                elif item_type == "reasoning":
+                    replay_items.append(_plain_provider_item(item))
+                elif item_type == "computer_tool_call":
+                    continue
+        except ModelProviderError:
+            raise
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            raise _OpenAIResponseDecodeFailure("response_item_invalid") from error
+
+        try:
+            fallback_value = _field(response, "output_text", None)
+            if fallback_value is not None and not isinstance(fallback_value, str):
+                raise ValueError("response output_text must be text")
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure(
+                "response_output_text_invalid"
+            ) from error
+        fallback_text = (
+            None
+            if fallback_value is None or not fallback_value.strip()
+            else fallback_value
+        )
+        text = "\n".join(part for part in text_parts if part.strip()).strip()
+        if not text and fallback_text is not None:
+            text = fallback_text.strip()
+        normalized_text = text or None
+
+        if calls:
+            finish_reason = FinishReason.TOOL_CALLS
+        elif normalized_text is not None and status == "incomplete":
+            finish_reason = FinishReason.LENGTH
+        elif normalized_text is not None:
+            finish_reason = FinishReason.STOP
+        else:
+            incomplete_details = _field(response, "incomplete_details", None)
+            incomplete_reason = _optional_text(
+                _field(incomplete_details, "reason", None),
+                "incomplete reason",
+            )
+            if status == "incomplete" and incomplete_reason == "max_output_tokens":
+                raise ModelProviderError(
+                    ProviderErrorCode.OUTPUT_LIMIT,
+                    "OpenAI exhausted the output token limit",
+                )
+            raise _OpenAIResponseDecodeFailure("terminal_content_missing")
+
+        try:
+            response_id = _optional_text(_field(response, "id", None), "response id")
+            response_model = _required_text(
+                _field(response, "model"),
+                "response model",
+            )
+            service_tier = _optional_text(
+                _field(response, "service_tier", None),
+                "response service tier",
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("response_metadata_invalid") from error
+        provider_metadata: dict[str, object] = {}
+        if replay_items:
+            provider_metadata["openai_replay_items"] = replay_items
+        provider_metadata["pricing_dimensions"] = {
+            "response_model": response_model,
+            "service_tier": service_tier,
+            "region": self._region,
+        }
+        usage_value = _field(response, "usage", None)
+        try:
+            usage = _decode_usage(usage_value)
+        except (KeyError, TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("usage_invalid") from error
+        if usage_value is not None:
+            if not _has_complete_billing_dimensions(usage_value):
+                usage = replace(
+                    usage,
+                    cost_estimate=CostEstimate.unavailable(
+                        "billing_dimensions_incomplete"
+                    ),
+                )
+            else:
+                qualifiers = (
+                    {"service_tier": service_tier, "region": self._region}
+                    if service_tier is not None
+                    else {"region": self._region}
+                )
+                try:
+                    usage = replace(
+                        usage,
+                        cost_estimate=calculate_cost_estimate(
+                            self._pricing_schedules,
+                            provider="openai",
+                            model=response_model,
+                            endpoint="responses",
+                            requested_at=requested_at or self._clock(),
+                            qualifiers=qualifiers,
+                            usage_values={
+                                "request_input_tokens": Decimal(usage.input_tokens)
+                            },
+                            quantities=_billable_quantities(usage),
+                        ),
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise _OpenAIResponseDecodeFailure("pricing_invalid") from error
+        try:
+            return ModelResponse(
+                finish_reason=finish_reason,
+                text=normalized_text,
+                tool_calls=tuple(calls),
+                usage=usage,
+                provider_id=self.provider_id,
+                provider_response_id=response_id,
+                provider_metadata=provider_metadata,
+            )
+        except (TypeError, ValueError) as error:
+            raise _OpenAIResponseDecodeFailure("canonical_response_invalid") from error
+
+
+OpenAIProvider = OpenAIResponsesProvider
+
+
+def _plain_provider_item(item: object) -> dict[str, object]:
+    if isinstance(item, FrozenJsonObject):
+        return item.to_dict()
+    if isinstance(item, Mapping):
+        return FrozenJsonObject.from_mapping(item).to_dict()
+    model_dump = getattr(item, "model_dump", None)
+    if callable(model_dump):
+        dumped_value = model_dump(mode="json", exclude_none=True)
+        if isinstance(dumped_value, Mapping):
+            return FrozenJsonObject.from_mapping(dumped_value).to_dict()
+    provider_item: dict[str, object] = {}
+    for name in ("id", "type", "summary", "status", "encrypted_content"):
+        field = getattr(item, name, _MISSING)
+        if field is not _MISSING and field is not None:
+            provider_item[name] = field
+    if provider_item.get("type") != "reasoning":
+        raise ValueError("reasoning replay item is malformed")
+    return FrozenJsonObject.from_mapping(provider_item).to_dict()
+
+
+def _message_text(item: object) -> list[str]:
+    content = _field(item, "content", ())
+    if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+        raise ValueError("message content must be a sequence")
+    text: list[str] = []
+    for part in content:
+        part_type = _required_text(_field(part, "type"), "message part type")
+        if part_type == "output_text":
+            value = _stream_fragment(_field(part, "text"), "output text")
+            if value.strip():
+                text.append(value)
+        elif part_type == "refusal":
+            raise ModelProviderError(
+                ProviderErrorCode.CONTENT_BLOCKED,
+                "OpenAI refused the response",
+            )
+    return text
+
+
+def _decode_usage(value: object) -> ModelUsage:
+    if value is None:
+        return ModelUsage()
+    input_details = _field(value, "input_tokens_details", None)
+    output_details = _field(value, "output_tokens_details", None)
+    input_tokens = _nonnegative_int(
+        _field(value, "input_tokens"),
+        "input tokens",
+    )
+    output_tokens = _nonnegative_int(
+        _field(value, "output_tokens"),
+        "output tokens",
+    )
+    reasoning_tokens = _nonnegative_int(
+        _field(output_details, "reasoning_tokens", 0),
+        "reasoning tokens",
+    )
+    cache_read_tokens = _nonnegative_int(
+        _field(input_details, "cached_tokens", 0),
+        "cached tokens",
+    )
+    cache_write_tokens = _nonnegative_int(
+        _field(input_details, "cache_write_tokens", 0),
+        "cache write tokens",
+    )
+    if cache_read_tokens + cache_write_tokens > input_tokens:
+        raise ValueError("OpenAI cache token subsets exceed total input tokens")
+    if reasoning_tokens > output_tokens:
+        raise ValueError("OpenAI reasoning tokens exceed total output tokens")
+    return ModelUsage(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+
+
+def _has_complete_billing_dimensions(value: object) -> bool:
+    input_details = _field(value, "input_tokens_details", None)
+    output_details = _field(value, "output_tokens_details", None)
+    return (
+        input_details is not None
+        and output_details is not None
+        and _field(input_details, "cached_tokens", _MISSING) is not _MISSING
+        and _field(input_details, "cache_write_tokens", _MISSING) is not _MISSING
+        and _field(output_details, "reasoning_tokens", _MISSING) is not _MISSING
+    )
+
+
+def _billable_quantities(usage: ModelUsage) -> tuple[BillableQuantity, ...]:
+    uncached = usage.input_tokens - usage.cache_read_tokens - usage.cache_write_tokens
+    if uncached < 0 or usage.reasoning_tokens > usage.output_tokens:
+        raise ValueError("OpenAI usage counters are internally inconsistent")
+    return (
+        BillableQuantity(
+            "input_uncached_tokens",
+            Decimal(uncached),
+            "token",
+        ),
+        BillableQuantity(
+            "input_cache_read_tokens",
+            Decimal(usage.cache_read_tokens),
+            "token",
+        ),
+        BillableQuantity(
+            "input_cache_write_tokens",
+            Decimal(usage.cache_write_tokens),
+            "token",
+        ),
+        BillableQuantity(
+            "output_tokens",
+            Decimal(usage.output_tokens),
+            "token",
+        ),
+    )
+
+
+def _normalize_error(error: Exception) -> ModelProviderError:
+    if isinstance(error, ModelProviderError):
+        return error
+    status_value = _field(error, "status_code", None)
+    status = (
+        status_value
+        if isinstance(status_value, int) and not isinstance(status_value, bool)
+        else None
+    )
+    code = _optional_text(_field(error, "code", None), "provider error code")
+    name = type(error).__name__.lower()
+    if (
+        isinstance(error, (asyncio.TimeoutError, TimeoutError))
+        or status == 408
+        or "timeout" in name
+    ):
+        normalized = ProviderErrorCode.TIMEOUT
+    elif status in {401, 403} or "authentication" in name or "permission" in name:
+        normalized = ProviderErrorCode.AUTHENTICATION_ERROR
+    elif status == 429 or "ratelimit" in name or "rate_limit" in name:
+        normalized = ProviderErrorCode.RATE_LIMIT_ERROR
+    elif status == 404 or code in {"model_not_found", "unknown_model"}:
+        normalized = ProviderErrorCode.MODEL_NOT_FOUND
+    elif code in {"context_length_exceeded", "context_window_exceeded"}:
+        normalized = ProviderErrorCode.CONTEXT_OVERFLOW
+    elif code in {"content_policy_violation", "content_blocked"}:
+        normalized = ProviderErrorCode.CONTENT_BLOCKED
+    elif isinstance(error, ConnectionError) or status is not None and status >= 500:
+        normalized = ProviderErrorCode.PROVIDER_UNAVAILABLE
+    elif status is not None and 400 <= status < 500:
+        normalized = ProviderErrorCode.INVALID_REQUEST
+    else:
+        normalized = ProviderErrorCode.PROVIDER_UNAVAILABLE
+    return ModelProviderError(
+        normalized,
+        f"OpenAI request failed: {normalized.value}",
+        retry_after_seconds=(
+            retry_after_from_headers(
+                _field(_field(error, "response", None), "headers", None)
+            )
+            if normalized
+            in {
+                ProviderErrorCode.RATE_LIMIT_ERROR,
+                ProviderErrorCode.PROVIDER_UNAVAILABLE,
+            }
+            else None
+        ),
+    )
+
+
+def _code_from_provider_value(value: str | None) -> ProviderErrorCode:
+    if value in {"authentication_error", "invalid_api_key", "permission_denied"}:
+        return ProviderErrorCode.AUTHENTICATION_ERROR
+    if value in {"rate_limit_error", "rate_limit_exceeded"}:
+        return ProviderErrorCode.RATE_LIMIT_ERROR
+    if value in {"context_length_exceeded", "context_window_exceeded"}:
+        return ProviderErrorCode.CONTEXT_OVERFLOW
+    if value in {"content_policy_violation", "content_blocked"}:
+        return ProviderErrorCode.CONTENT_BLOCKED
+    if value in {"model_not_found", "unknown_model"}:
+        return ProviderErrorCode.MODEL_NOT_FOUND
+    if value in {"invalid_request", "invalid_request_error"}:
+        return ProviderErrorCode.INVALID_REQUEST
+    if value in {"timeout", "request_timeout"}:
+        return ProviderErrorCode.TIMEOUT
+    return ProviderErrorCode.PROVIDER_UNAVAILABLE
+
+
+def _openai_failure_diagnostic(
+    response: object,
+    *,
+    phase: ProviderFailurePhase,
+    code: str,
+    event_type: str | None = None,
+) -> ProviderFailureDiagnostic:
+    status = _safe_structural_token(_safe_field(response, "status"))
+    response_id = _safe_structural_token(_safe_field(response, "id"))
+    output_item_types: list[str] = []
+    output = _safe_field(response, "output")
+    if isinstance(output, Sequence) and not isinstance(output, (str, bytes)):
+        for item in output[:8]:
+            item_type = _safe_structural_token(_safe_field(item, "type"))
+            if item_type is not None:
+                output_item_types.append(item_type)
+    return ProviderFailureDiagnostic(
+        phase=phase,
+        code=code,
+        event_type=_safe_structural_token(event_type),
+        terminal_status=status,
+        output_item_types=tuple(output_item_types),
+        response_id_digest=(
+            None
+            if response_id is None
+            else "sha256:" + sha256(response_id.encode("utf-8")).hexdigest()
+        ),
+    )
+
+
+def _safe_field(value: object, name: str) -> object | None:
+    try:
+        return _field(value, name, None)
+    except Exception:
+        return None
+
+
+def _stream_fragment(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be text")
+    return value
+
+
+def _optional_stream_identity(value: object, label: str) -> str | None:
+    fragment = _stream_fragment(value, label) if value is not None else ""
+    return fragment if fragment.strip() else None
+
+
+__all__ = ["OpenAIProvider", "OpenAIResponsesProvider"]

@@ -72,6 +72,14 @@ def freeze_json(value: object, *, _path: str = "$") -> FrozenJsonValue:
             raise ValueError(f"Non-finite number at {_path} is not valid JSON")
         return value
 
+    # Construction already validates and recursively freezes every child. Reuse
+    # exact immutable objects: rebuilding them here makes each parent constructor
+    # recursively validate the entire already-frozen subtree again. Nested schema
+    # trees otherwise grow exponentially expensive to freeze and canonicalize.
+    # Subclasses still pass through Mapping validation rather than inheriting trust.
+    if type(value) is FrozenJsonObject:
+        return value
+
     if isinstance(value, Mapping):
         items: list[tuple[str, FrozenJsonValue]] = []
         for key, item in value.items():
