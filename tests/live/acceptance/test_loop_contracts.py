@@ -237,12 +237,7 @@ def _successful_query(
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(
-        max_steps=6,
-        max_total_tokens=12_000,
-        max_wall_time_seconds=90,
-        max_estimated_cost_usd=_cost_limit(),
-    )
+    return LoopLimits(max_estimated_cost_usd=_cost_limit())
 
 
 async def test_live_tool_round_trip_has_stable_context_and_durable_completion(

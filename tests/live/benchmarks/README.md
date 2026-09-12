@@ -2,10 +2,12 @@
 
 This directory separates paid model variability from deterministic failure and
 load mechanics. All paid modules are skipped unless their exact authorization
-variable is set. Every live `Agent.run` retains a 12-step, 30,000-token,
-180-second, and per-interaction estimated-cost ceiling. The default ceiling is
-`$0.15`; override it only with an explicitly authorized positive value in
-`DAITA_STAGE_B_BENCHMARK_MAX_COST_USD`.
+variable is set. Every live `Agent.run` retains the ordinary 24-step,
+100,000-token, 300-second functional safety envelope and a per-interaction
+estimated-cost ceiling. Token use is recorded as benchmark evidence rather than
+enforced through a tighter run limit that can stop the behavior under evaluation.
+The default cost ceiling is `$0.15`; override it only with an explicitly
+authorized positive value in `DAITA_STAGE_B_BENCHMARK_MAX_COST_USD`.
 
 Supply one model with `DAITA_STAGE_B_BENCHMARK_MODEL_IDS` or a comma-separated
 release-reviewed model matrix. Supply credentials through the generic

@@ -118,12 +118,7 @@ def limits() -> LoopLimits:
         raise ValueError(f"{COST_ENV} must be a finite positive decimal") from error
     if not amount.is_finite() or amount <= 0:
         raise ValueError(f"{COST_ENV} must be a finite positive decimal")
-    return LoopLimits(
-        max_steps=24 if user_flow else 14,
-        max_total_tokens=100_000 if user_flow else 30_000,
-        max_wall_time_seconds=300 if user_flow else 180,
-        max_estimated_cost_usd=amount,
-    )
+    return LoopLimits(max_estimated_cost_usd=amount)
 
 
 def live_provider(model_id: str) -> tuple[ModelProfile, ManagedModelProvider]:

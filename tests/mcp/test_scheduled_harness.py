@@ -203,7 +203,12 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         )
         assert result.usage.total_tokens == 22417
         requests = scenario.provider.requests
-        assert [r.max_total_tokens for r in requests] == [30000, 26276, 21696, 14765]
+        assert [r.max_total_tokens for r in requests] == [
+            100000,
+            96276,
+            91696,
+            84765,
+        ]
         texts = [
             "".join(b.text for b in r.messages[0].content if isinstance(b, TextBlock))
             for r in requests
@@ -222,7 +227,7 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert "Framework inbox destinations" not in texts[0]
         assert model.provider_id not in texts[0]
         assert model.provider_id in texts[1]
-        assert '"maximum_per_run_tokens":30000' in texts[1]
+        assert '"maximum_per_run_tokens":100000' in texts[1]
         assert '"maximum_per_run_cost_usd":"0.15"' in texts[1]
         assert "Routine authoring choices" not in texts[3]
         assert model.provider_id not in transcript.run.message
@@ -234,7 +239,7 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert "Latest measured request input: 6915 tokens" in texts[3]
         assert "recent input growth: 2382 tokens" in texts[3]
         assert "24976 tokens" in texts[3]
-        assert "Budget pressure" in texts[3]
+        assert "Budget pressure" not in texts[3]
         assert "not reserved capacity or a guaranteed count" in texts[3]
         assert len(await scenario.agent.list_routines()) == 0
         assert scenario.server.calls == []
@@ -380,7 +385,7 @@ async def test_scheduled_mcp_harness_measures_runtime_and_preserves_failure_evid
         (item["first_event_seconds"] is not None) == streaming
         for item in report["model_timings"]
     )
-    ceiling = 100_000 if profile_name == "user_flow" else 30_000
+    ceiling = 100_000
     assert report["model_requests"][0]["remaining_tokens"] == ceiling
     assert report["model_requests"][1]["remaining_tokens"] == ceiling - 120
     assert report["evaluation_profile"] == profile_name
@@ -442,9 +447,7 @@ async def test_scheduled_mcp_harness_reaches_both_occurrences_with_one_approval(
                 sensitivity_ceiling=scenario.binding.maximum_outbound_sensitivity,
             )
         )[0]
-        assert scenario.limits.max_total_tokens == (
-            100_000 if profile_name == "user_flow" else 30_000
-        )
+        assert scenario.limits.max_total_tokens == 100_000
         draft = owner_routine_draft(scenario, origin.run_id, destination.destination_id)
         proposal = await scenario.agent.propose_routine(draft)
         properties = _spec_schema(update=False)["properties"]
@@ -799,9 +802,10 @@ def test_scheduled_mcp_explicit_profile_preserves_strict_defaults(
         value.max_wall_time_seconds,
         value.max_estimated_cost_usd,
     ) == (
-        (24, 100_000, 300, Decimal("0.50"))
-        if selected == "user_flow"
-        else (14, 30_000, 180, Decimal("0.15"))
+        24,
+        100_000,
+        300,
+        Decimal("0.50") if selected == "user_flow" else Decimal("0.15"),
     )
 
 

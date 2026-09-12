@@ -64,7 +64,6 @@ async def test_immediate_target_survives_catalog_distractors(
         assert "data_query" in names
         assert "start_data_profile" not in names
         assert await fixture.agent.list_jobs() == ()
-        assert capture.result.usage.total_tokens <= 30_000
         assert capture.result.final_text is not None
         assert IMMEDIATE_TOKEN in capture.result.final_text
         assert str(IMMEDIATE_AMOUNT) in capture.result.final_text
@@ -105,7 +104,6 @@ async def test_profile_target_survives_catalog_distractors(
         assert result is not None
         assert result.summary["sampled_rows"] == PROFILE_SAMPLE_ROWS
         await assert_profile_result(fixture.agent, job_id)
-        assert capture.result.usage.total_tokens <= 30_000
     finally:
         await fixture.close()
 

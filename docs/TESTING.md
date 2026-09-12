@@ -87,6 +87,13 @@ resource limits. For example, only after explicit authorization:
   -o addopts="--tb=short -q --strict-markers" -v
 ```
 
+Functional live suites use the ordinary outer safety envelope of 24 model
+requests, 100,000 total tokens, and 300 seconds, together with each module's
+explicit cost cap. These limits prevent runaway execution without turning an
+efficiency target into the functional oracle. Record token use as benchmark
+evidence. Test exact token admission and exhaustion behavior with deterministic
+providers in the owning loop and LLM suites.
+
 The fully offline job concurrency soak retains its explicit enable flag:
 
 ```bash

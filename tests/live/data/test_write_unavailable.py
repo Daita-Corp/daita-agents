@@ -257,12 +257,7 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
         model_profile=profile,
         secret_provider=EnvironmentSecretProvider(),
         approval_handler=reject_unexpected_approval,
-        limits=LoopLimits(
-            max_steps=12,
-            max_total_tokens=20_000,
-            max_wall_time_seconds=120,
-            max_estimated_cost_usd=_cost_limit(),
-        ),
+        limits=LoopLimits(max_estimated_cost_usd=_cost_limit()),
         workspace=workspace_for(tmp_path),
     )
     try:

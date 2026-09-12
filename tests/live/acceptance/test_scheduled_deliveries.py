@@ -161,12 +161,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         max_output_tokens=min(profile.max_output_tokens, 1_024),
     )
     cost_limit = _cost_limit()
-    limits = LoopLimits(
-        max_steps=8,
-        max_total_tokens=12_000,
-        max_wall_time_seconds=120,
-        max_estimated_cost_usd=cost_limit,
-    )
+    limits = LoopLimits(max_estimated_cost_usd=cost_limit)
     agent = await Agent.open(
         "stage-d2-live",
         root=root,
