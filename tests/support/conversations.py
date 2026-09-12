@@ -282,6 +282,9 @@ class CatalogSpy:
 
     def __init__(self, resources=(), sources=()):
         self.queries = []
+        self.context_selections: list[
+            tuple[tuple[str, ...], tuple[str, ...], frozenset[str] | None]
+        ] = []
         self.resources = resources
         self.sources = sources
 
@@ -300,11 +303,15 @@ class CatalogSpy:
         limit,
         source_ids=(),
         resource_ids=(),
+        readable_resource_ids=None,
     ):
-        del agent_id, limit, source_ids, resource_ids
+        del agent_id, limit
         from daita._json import FrozenJsonObject
 
         self.queries.append((query, prior_query))
+        self.context_selections.append(
+            (source_ids, resource_ids, readable_resource_ids)
+        )
         return FrozenJsonObject.from_mapping(
             {
                 "resources": self.resources,

@@ -597,6 +597,13 @@ async def test_catalog_queries_keep_current_and_most_recent_prior_user_separate(
         step=1,
     )
     assert catalog.queries == [("Now only EMEA", "history user 1")]
+    assert catalog.context_selections == [
+        (
+            ("source-history",),
+            (),
+            frozenset({"resource-unmatched"}),
+        )
+    ]
     system_text = request.messages[0].content[0]
     assert isinstance(system_text, TextBlock)
     assert (
