@@ -256,7 +256,53 @@ async def test_catalog_search_capability_exposes_correct_returned_and_scoped_cou
         assert output.data["returned_count"] == 1
         assert output.data["total_matches"] == 8
         assert output.data["truncated"] is True
+        match_outcome = output.data["match_outcome"]
+        assert isinstance(match_outcome, Mapping)
+        assert match_outcome["binding_status"] == "ambiguous"
+        assert match_outcome["source_status"] == "unique"
+        assert match_outcome["candidate_count"] == 8
         assert registry.validate_output(capability.id, output) == output
+
+        for accepted_outcome in (
+            {
+                "binding_status": "unique",
+                "source_status": "unique",
+                "evidence_tier": "exact_resource",
+                "candidate_count": 1,
+                "candidate_bindings": (
+                    {"source_id": "source-a", "resource_id": "resource-a"},
+                ),
+                "omitted_candidate_count": 0,
+                "ambiguity_reasons": (),
+                "assessment_provenance": "catalog_service",
+                "trust_classification": "untrusted_external_data",
+            },
+            {
+                "binding_status": "no_match",
+                "source_status": "no_match",
+                "evidence_tier": "none",
+                "candidate_count": 0,
+                "candidate_bindings": (),
+                "omitted_candidate_count": 0,
+                "ambiguity_reasons": (),
+                "assessment_provenance": "catalog_service",
+                "trust_classification": "untrusted_external_data",
+            },
+        ):
+            accepted = output.data.to_dict()
+            accepted["match_outcome"] = accepted_outcome
+            validated = ToolOutput(kind=output.kind, data=accepted)
+            assert registry.validate_output(capability.id, validated) == validated
+
+        malformed = output.data.to_dict()
+        malformed_outcome = dict(cast(Mapping[str, object], malformed["match_outcome"]))
+        malformed_outcome["binding_status"] = "confident"
+        malformed["match_outcome"] = malformed_outcome
+        with pytest.raises(ToolOutputValidationError):
+            registry.validate_output(
+                capability.id,
+                ToolOutput(kind=output.kind, data=malformed),
+            )
     finally:
         await agent.close()
 
@@ -288,6 +334,22 @@ async def test_catalog_model_facing_bounds_and_internal_search_contracts_are_exp
             search_output_properties["returned_count"]
         ) == canonical_json({"type": "integer"})
         assert "returned_count" in search_output_required
+        match_outcome_rule = search_output_properties["match_outcome"]
+        assert isinstance(match_outcome_rule, Mapping)
+        outcome_properties = match_outcome_rule["properties"]
+        outcome_required = match_outcome_rule["required"]
+        assert isinstance(outcome_properties, Mapping)
+        assert isinstance(outcome_required, (tuple, list))
+        assert "authority" not in outcome_properties
+        assert canonical_json(
+            outcome_properties["assessment_provenance"]
+        ) == canonical_json(
+            {
+                "type": "string",
+                "enum": ("catalog_service",),
+            }
+        )
+        assert set(outcome_required) == set(outcome_properties)
 
         query_rule = {
             "type": "string",
@@ -716,6 +778,9 @@ async def test_structural_search_ranks_direct_matches_before_one_hop_neighbors(
         assert result.hits[1].match_reasons == ("structural_field_contains",)
         assert "column:needle_code" in result.hits[1].matched_fields
         assert result.hits[2].match_reasons == ("relationship_neighbor",)
+        assert result.match_outcome.binding_status == "unique"
+        assert result.match_outcome.candidate_count == 1
+        assert result.match_outcome.evidence_tier == "exact_resource"
         no_synonym = await agent.search_catalog(
             CatalogSearchRequest(
                 agent_id=agent.id,
@@ -729,6 +794,11 @@ async def test_structural_search_ranks_direct_matches_before_one_hop_neighbors(
         assert all(
             hit.match_reasons == ("unmatched_fallback",) for hit in no_synonym.hits
         )
+        assert no_synonym.match_outcome.binding_status == "no_match"
+        assert no_synonym.match_outcome.source_status == "no_match"
+        assert no_synonym.match_outcome.evidence_tier == "none"
+        assert no_synonym.match_outcome.candidate_count == 0
+        assert no_synonym.match_outcome.candidate_bindings == ()
     finally:
         await agent.close()
 

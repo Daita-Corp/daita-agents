@@ -19,6 +19,7 @@ _RELATIONSHIP_ID = re.compile(r"catalog-relationship:sha256:[0-9a-f]{64}\Z")
 
 CATALOG_CONTEXT_DEFAULT_LIMIT = 12
 CATALOG_MAX_LIMIT = 50
+CATALOG_MATCH_CANDIDATE_BINDING_LIMIT = 12
 CATALOG_RESOURCE_ID_MAX_CHARACTERS = 256
 CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT = 20
 CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS = 4_000
@@ -1364,9 +1365,156 @@ class CatalogSearchHit:
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogMatchOutcome:
+    """Bounded catalog-owned assessment of the strongest target evidence tier."""
+
+    binding_status: str
+    source_status: str
+    evidence_tier: str
+    candidate_count: int
+    candidate_bindings: tuple[FrozenJsonObject, ...]
+    omitted_candidate_count: int
+    ambiguity_reasons: tuple[str, ...]
+    assessment_provenance: str = "catalog_service"
+    trust_classification: str = "untrusted_external_data"
+
+    def __post_init__(self) -> None:
+        statuses = frozenset({"unique", "ambiguous", "no_match"})
+        if self.binding_status not in statuses:
+            raise ValueError("catalog match binding_status is invalid")
+        if self.source_status not in statuses:
+            raise ValueError("catalog match source_status is invalid")
+        evidence_tiers = frozenset(
+            {
+                "explicit_resource_ids",
+                "exact_resource",
+                "catalog_metadata",
+                "source_hint",
+                "none",
+            }
+        )
+        if self.evidence_tier not in evidence_tiers:
+            raise ValueError("catalog match evidence_tier is invalid")
+        _non_negative_int(self.candidate_count, "catalog match candidate_count")
+        _non_negative_int(
+            self.omitted_candidate_count,
+            "catalog match omitted_candidate_count",
+        )
+        if isinstance(self.candidate_bindings, (str, bytes)):
+            raise TypeError("catalog match candidate_bindings must be a sequence")
+        candidate_bindings: list[FrozenJsonObject] = []
+        for raw_binding in self.candidate_bindings:
+            binding = _exact_payload_fields(
+                raw_binding,
+                frozenset({"source_id", "resource_id"}),
+                "catalog match candidate binding",
+            )
+            source_id = binding["source_id"]
+            resource_id = binding["resource_id"]
+            if not isinstance(source_id, str) or not isinstance(resource_id, str):
+                raise TypeError("catalog match candidate IDs must be strings")
+            _required_text(
+                source_id,
+                "catalog match candidate source_id",
+                maximum=CATALOG_SOURCE_ID_MAX_CHARACTERS,
+            )
+            _required_text(
+                resource_id,
+                "catalog match candidate resource_id",
+                maximum=CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+            )
+            candidate_bindings.append(FrozenJsonObject.from_mapping(binding))
+        if len(candidate_bindings) > CATALOG_MATCH_CANDIDATE_BINDING_LIMIT:
+            raise ValueError(
+                "catalog match candidate_bindings exceeds "
+                f"{CATALOG_MATCH_CANDIDATE_BINDING_LIMIT} items"
+            )
+        binding_keys = tuple(
+            (binding["source_id"], binding["resource_id"])
+            for binding in candidate_bindings
+        )
+        if len(binding_keys) != len(set(binding_keys)):
+            raise ValueError("catalog match candidate bindings cannot repeat")
+        if (
+            self.candidate_count
+            != len(candidate_bindings) + self.omitted_candidate_count
+        ):
+            raise ValueError(
+                "catalog match candidate_count disagrees with presented candidates"
+            )
+        expected_binding_status = (
+            "no_match"
+            if self.candidate_count == 0
+            else "unique" if self.candidate_count == 1 else "ambiguous"
+        )
+        if self.binding_status != expected_binding_status:
+            raise ValueError(
+                "catalog match binding_status disagrees with candidate_count"
+            )
+        if self.candidate_count == 0:
+            if self.source_status != "no_match" or self.evidence_tier != "none":
+                raise ValueError(
+                    "catalog no-match status requires no source and no evidence tier"
+                )
+        elif self.source_status == "no_match" or self.evidence_tier == "none":
+            raise ValueError("catalog candidates require source and evidence status")
+        if self.omitted_candidate_count == 0 and candidate_bindings:
+            expected_source_status = (
+                "unique"
+                if len({binding["source_id"] for binding in candidate_bindings}) == 1
+                else "ambiguous"
+            )
+            if self.source_status != expected_source_status:
+                raise ValueError(
+                    "catalog match source_status disagrees with candidate sources"
+                )
+        ambiguity_reasons = _text_tuple(
+            self.ambiguity_reasons,
+            "catalog match ambiguity_reasons",
+            maximum_items=2,
+            maximum_characters=64,
+        )
+        allowed_reasons = frozenset({"multiple_sources", "multiple_resources"})
+        if not set(ambiguity_reasons) <= allowed_reasons:
+            raise ValueError(
+                "catalog match ambiguity_reasons contains an invalid value"
+            )
+        if (self.binding_status == "ambiguous") != bool(ambiguity_reasons):
+            raise ValueError(
+                "catalog match ambiguity_reasons disagrees with binding_status"
+            )
+        if self.assessment_provenance != "catalog_service":
+            raise ValueError(
+                "catalog match assessment_provenance must be catalog_service"
+            )
+        if self.trust_classification != "untrusted_external_data":
+            raise ValueError(
+                "catalog match trust_classification must be untrusted_external_data"
+            )
+        object.__setattr__(self, "candidate_bindings", tuple(candidate_bindings))
+        object.__setattr__(self, "ambiguity_reasons", ambiguity_reasons)
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "binding_status": self.binding_status,
+            "source_status": self.source_status,
+            "evidence_tier": self.evidence_tier,
+            "candidate_count": self.candidate_count,
+            "candidate_bindings": tuple(
+                binding.to_dict() for binding in self.candidate_bindings
+            ),
+            "omitted_candidate_count": self.omitted_candidate_count,
+            "ambiguity_reasons": self.ambiguity_reasons,
+            "assessment_provenance": self.assessment_provenance,
+            "trust_classification": self.trust_classification,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogSearchResult:
     request: CatalogSearchRequest
     hits: tuple[CatalogSearchHit, ...]
+    match_outcome: CatalogMatchOutcome
     total_matches: int
     returned_count: int
     truncated: bool
@@ -1378,6 +1526,10 @@ class CatalogSearchResult:
         if not isinstance(self.request, CatalogSearchRequest):
             raise TypeError(
                 "catalog search result request must be CatalogSearchRequest"
+            )
+        if not isinstance(self.match_outcome, CatalogMatchOutcome):
+            raise TypeError(
+                "catalog search result match_outcome must be CatalogMatchOutcome"
             )
         hits = _record_tuple(self.hits, CatalogSearchHit, "catalog search hits")
         _non_negative_int(self.total_matches, "catalog search total_matches")
@@ -1568,6 +1720,7 @@ class CatalogTraversalResult:
 
 __all__ = [
     "CatalogFacet",
+    "CatalogMatchOutcome",
     "CatalogPath",
     "CatalogPathStep",
     "CatalogRelationship",

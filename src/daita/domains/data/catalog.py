@@ -120,6 +120,15 @@ class CatalogDataView:
             and (not selected_source_ids or registration.id in selected_source_ids)
         )
 
+    def empty_catalog_context(
+        self,
+        *,
+        prior_query: str | None = None,
+    ) -> FrozenJsonObject:
+        """Project the catalog-owned no-match result without reading source state."""
+
+        return self._service.empty_catalog_context(prior_query=prior_query)
+
     async def readable_resource_ids(
         self,
         agent_id: str,

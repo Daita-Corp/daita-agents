@@ -18,6 +18,7 @@ from .capabilities import (
 )
 from .models import (
     CatalogFacet,
+    CatalogMatchOutcome,
     CatalogPath,
     CatalogPathStep,
     CatalogRelationship,
@@ -61,6 +62,7 @@ from .service import CatalogService
 
 __all__ = [
     "CatalogFacet",
+    "CatalogMatchOutcome",
     "CatalogDeclarations",
     "CatalogInspectExecutor",
     "CatalogPath",

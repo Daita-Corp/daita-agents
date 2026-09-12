@@ -25,6 +25,7 @@ from .catalog.capabilities import (
 from .catalog.models import (
     CATALOG_CONTEXT_DEFAULT_LIMIT,
     CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
+    CatalogMatchOutcome,
 )
 from .domains.data.capabilities import (
     DATA_QUERY_TOOL_NAME,
@@ -162,6 +163,12 @@ _SIDE_EFFECT_TOOL_NAMES = frozenset(
 
 
 class CatalogContextReader(SourceScopeCatalog, Protocol):
+    def empty_catalog_context(
+        self,
+        *,
+        prior_query: str | None = None,
+    ) -> FrozenJsonObject: ...
+
     async def admitted_model_sensitivity(
         self,
         agent_id: str,
@@ -707,20 +714,11 @@ class AgentContextBuilder:
             else await self._artifact_destinations.model_destinations(run.id)
         )
         catalog_query = run.message[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS]
-        if not source_scope.resource_ids:
-            catalog = FrozenJsonObject.from_mapping(
-                {
-                    "resources": (),
-                    "sources": (),
-                    "total_matches": 0,
-                    "returned_count": 0,
-                    "truncated": False,
-                    "trust_classification": "untrusted_external_data",
-                }
-            )
-        else:
-            prior_catalog_query = _latest_prior_user_query(prior_turns)
-            catalog = await self._catalog.catalog_context(
+        prior_catalog_query = _latest_prior_user_query(prior_turns)
+        catalog = (
+            self._catalog.empty_catalog_context(prior_query=prior_catalog_query)
+            if not source_scope.resource_ids
+            else await self._catalog.catalog_context(
                 run.agent_id,
                 catalog_query,
                 prior_query=prior_catalog_query,
@@ -729,6 +727,7 @@ class AgentContextBuilder:
                 resource_ids=(),
                 readable_resource_ids=source_scope.resource_ids,
             )
+        )
         catalog_payload = catalog.to_dict()
         source_presentations = (
             await self._catalog.source_routing_facts(
@@ -1193,6 +1192,9 @@ class AgentContextBuilder:
         returned_count = catalog.get("returned_count")
         trust = catalog.get("trust_classification")
         service_truncated = catalog.get("truncated")
+        match_outcomes = _validated_catalog_match_outcomes(
+            catalog.get("match_outcomes")
+        )
         if not isinstance(total_matches, int) or isinstance(total_matches, bool):
             raise TypeError("catalog context total_matches must be an integer")
         if (
@@ -1220,6 +1222,9 @@ class AgentContextBuilder:
                     "total_matches": total_matches,
                     "returned_count": 0,
                     "truncated": service_truncated or bool(resources),
+                    "match_outcomes": _catalog_match_outcomes_without_bindings(
+                        match_outcomes
+                    ),
                     "trust_classification": trust,
                 },
                 current_messages,
@@ -1247,6 +1252,7 @@ class AgentContextBuilder:
             )
 
         retained = list(resources)
+        retained_match_outcomes = match_outcomes
         while True:
             retained_source_ids = {
                 item.get("source_id")
@@ -1265,6 +1271,7 @@ class AgentContextBuilder:
                 "total_matches": total_matches,
                 "returned_count": len(retained),
                 "truncated": service_truncated or len(retained) < len(resources),
+                "match_outcomes": retained_match_outcomes,
                 "trust_classification": trust,
                 "connector_directory": catalog.get("connector_directory"),
             }
@@ -1338,6 +1345,8 @@ class AgentContextBuilder:
             if retained:
                 retained.pop()
                 continue
+            if _drop_one_catalog_match_binding(retained_match_outcomes):
+                continue
             if newest_continuity and estimate <= self._profile.maximum_input_tokens:
                 # Once optional discovery is exhausted, retain useful newest
                 # continuity with the headroom actually available. The growth
@@ -1368,6 +1377,101 @@ class AgentContextBuilder:
                     optional_input_limit,
                 )
             raise ContextWindowExceeded()
+
+
+def _validated_catalog_match_outcomes(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "current_query",
+        "prior_query",
+    }:
+        raise TypeError(
+            "catalog context match_outcomes must contain current_query and prior_query"
+        )
+
+    def validate_outcome(raw: object, field_name: str) -> dict[str, object]:
+        expected = {
+            "binding_status",
+            "source_status",
+            "evidence_tier",
+            "candidate_count",
+            "candidate_bindings",
+            "omitted_candidate_count",
+            "ambiguity_reasons",
+            "assessment_provenance",
+            "trust_classification",
+        }
+        if not isinstance(raw, Mapping) or set(raw) != expected:
+            raise TypeError(f"catalog context {field_name} match outcome is malformed")
+        try:
+            outcome = CatalogMatchOutcome(
+                binding_status=cast(str, raw["binding_status"]),
+                source_status=cast(str, raw["source_status"]),
+                evidence_tier=cast(str, raw["evidence_tier"]),
+                candidate_count=cast(int, raw["candidate_count"]),
+                candidate_bindings=cast(
+                    tuple[FrozenJsonObject, ...],
+                    raw["candidate_bindings"],
+                ),
+                omitted_candidate_count=cast(int, raw["omitted_candidate_count"]),
+                ambiguity_reasons=cast(tuple[str, ...], raw["ambiguity_reasons"]),
+                assessment_provenance=cast(str, raw["assessment_provenance"]),
+                trust_classification=cast(str, raw["trust_classification"]),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise TypeError(
+                f"catalog context {field_name} match outcome is malformed"
+            ) from error
+        payload = outcome.to_payload()
+        payload["candidate_bindings"] = [
+            dict(binding)
+            for binding in cast(
+                tuple[dict[str, object], ...], payload["candidate_bindings"]
+            )
+        ]
+        payload["ambiguity_reasons"] = list(
+            cast(tuple[str, ...], payload["ambiguity_reasons"])
+        )
+        return payload
+
+    current = validate_outcome(value["current_query"], "current_query")
+    raw_prior = value["prior_query"]
+    prior = None if raw_prior is None else validate_outcome(raw_prior, "prior_query")
+    return {"current_query": current, "prior_query": prior}
+
+
+def _catalog_match_outcomes_without_bindings(
+    match_outcomes: Mapping[str, object],
+) -> dict[str, object]:
+    compacted: dict[str, object] = {}
+    for key in ("current_query", "prior_query"):
+        raw = match_outcomes[key]
+        if raw is None:
+            compacted[key] = None
+            continue
+        outcome = dict(cast(Mapping[str, object], raw))
+        outcome["candidate_bindings"] = []
+        outcome["omitted_candidate_count"] = outcome["candidate_count"]
+        compacted[key] = outcome
+    return compacted
+
+
+def _drop_one_catalog_match_binding(match_outcomes: Mapping[str, object]) -> bool:
+    for key in ("prior_query", "current_query"):
+        raw = match_outcomes[key]
+        if not isinstance(raw, dict):
+            continue
+        bindings = raw.get("candidate_bindings")
+        omitted = raw.get("omitted_candidate_count")
+        if (
+            isinstance(bindings, list)
+            and bindings
+            and isinstance(omitted, int)
+            and not isinstance(omitted, bool)
+        ):
+            bindings.pop()
+            raw["omitted_candidate_count"] = omitted + 1
+            return True
+    return False
 
 
 def _connector_directory(
@@ -2605,7 +2709,9 @@ def _tool_guidance(
         )
     if "catalog.search" in capability_ids:
         instructions.append(
-            "Use catalog_search only when the target is missing or ambiguous; do not rediscover exact supplied resources."
+            "Use catalog_search only when the target is missing or ambiguous; do not "
+            "rediscover exact supplied resources. Its match_outcome is computed across "
+            "the full candidate set before pagination and does not authorize a hit."
         )
     if capability_ids & {
         "memory.set",

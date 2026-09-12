@@ -20,6 +20,7 @@ from ..capabilities import (
     ToolView,
 )
 from .models import (
+    CATALOG_MATCH_CANDIDATE_BINDING_LIMIT,
     CATALOG_MAX_LIMIT,
     CATALOG_RESOURCE_ID_MAX_CHARACTERS,
     CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
@@ -150,6 +151,7 @@ class CatalogSearchExecutor:
                     for hit in result.hits
                 ],
                 "query": query,
+                "match_outcome": result.match_outcome.to_payload(),
                 "total_matches": result.total_matches,
                 "total_candidates": result.total_candidates,
                 "next_cursor": result.next_cursor,
@@ -298,7 +300,10 @@ def catalog_declarations(
     traverse_executor = CatalogTraverseExecutor(agent_id, service)
     search = Capability(
         id=CATALOG_SEARCH_CAPABILITY_ID,
-        description="Find catalog IDs by name or field; use catalog_schema next.",
+        description=(
+            "Find catalog IDs by name or field and report whether the strongest "
+            "target evidence is unique, ambiguous, or no_match; use catalog_schema next."
+        ),
         input_schema={
             "type": "object",
             "properties": {
@@ -528,8 +533,14 @@ def catalog_declarations(
                     toolbox_id=ToolboxId.SOURCES,
                     load_mode=ToolLoadMode.PINNED,
                     text_trust=ToolTextTrust.CODE,
-                    summary="Find catalog resources and fields by trusted structural metadata.",
-                    when_to_use="Use when exact source or resource identifiers are not yet known.",
+                    summary=(
+                        "Find catalog resources and fields with a deterministic "
+                        "unique, ambiguous, or no-match assessment."
+                    ),
+                    when_to_use=(
+                        "Use when exact source or resource identifiers are not yet "
+                        "known; do not treat the first ambiguous hit as selected."
+                    ),
                     keywords=("catalog", "find", "resource", "schema"),
                 ),
             ),
@@ -581,6 +592,7 @@ def _search_output_schema() -> dict[str, object]:
         "type": "object",
         "properties": {
             "hits": {"type": "array"},
+            "match_outcome": _match_outcome_output_schema(),
             "query": {"type": "string"},
             "total_matches": {"type": "integer"},
             "total_candidates": {"type": "integer"},
@@ -591,12 +603,92 @@ def _search_output_schema() -> dict[str, object]:
         },
         "required": [
             "hits",
+            "match_outcome",
             "query",
             "total_matches",
             "total_candidates",
             "next_cursor",
             "returned_count",
             "truncated",
+            "trust_classification",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def _match_outcome_output_schema() -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {
+            "binding_status": {
+                "type": "string",
+                "enum": ["unique", "ambiguous", "no_match"],
+            },
+            "source_status": {
+                "type": "string",
+                "enum": ["unique", "ambiguous", "no_match"],
+            },
+            "evidence_tier": {
+                "type": "string",
+                "enum": [
+                    "explicit_resource_ids",
+                    "exact_resource",
+                    "catalog_metadata",
+                    "source_hint",
+                    "none",
+                ],
+            },
+            "candidate_count": {"type": "integer", "minimum": 0},
+            "candidate_bindings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "source_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": CATALOG_SOURCE_ID_MAX_CHARACTERS,
+                        },
+                        "resource_id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": CATALOG_RESOURCE_ID_MAX_CHARACTERS,
+                        },
+                    },
+                    "required": ["source_id", "resource_id"],
+                    "additionalProperties": False,
+                },
+                "maxItems": CATALOG_MATCH_CANDIDATE_BINDING_LIMIT,
+                "uniqueItems": True,
+            },
+            "omitted_candidate_count": {"type": "integer", "minimum": 0},
+            "ambiguity_reasons": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["multiple_sources", "multiple_resources"],
+                },
+                "maxItems": 2,
+                "uniqueItems": True,
+            },
+            "assessment_provenance": {
+                "type": "string",
+                "enum": ["catalog_service"],
+            },
+            "trust_classification": {
+                "type": "string",
+                "enum": ["untrusted_external_data"],
+            },
+        },
+        "required": [
+            "binding_status",
+            "source_status",
+            "evidence_tier",
+            "candidate_count",
+            "candidate_bindings",
+            "omitted_candidate_count",
+            "ambiguity_reasons",
+            "assessment_provenance",
             "trust_classification",
         ],
         "additionalProperties": False,

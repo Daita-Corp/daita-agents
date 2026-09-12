@@ -17,11 +17,13 @@ from typing import TYPE_CHECKING
 
 from .._json import FrozenJsonObject, canonical_json
 from .models import (
+    CATALOG_MATCH_CANDIDATE_BINDING_LIMIT,
     CATALOG_MAX_LIMIT,
     CATALOG_TRAVERSAL_MAX_EDGES,
     CATALOG_TRAVERSAL_MAX_NODES,
     CATALOG_TRAVERSAL_MAX_PATHS,
     CatalogFacet,
+    CatalogMatchOutcome,
     CatalogPath,
     CatalogPathStep,
     CatalogRelationship,
@@ -219,6 +221,7 @@ class _RankedCandidate:
 class _CatalogHitSelection:
     exact_anchors: tuple[CatalogSearchHit, ...]
     broad_matches: tuple[CatalogSearchHit, ...]
+    source_hint_matches: tuple[CatalogSearchHit, ...]
     relationship_neighbors: tuple[CatalogSearchHit, ...]
 
     @property
@@ -226,6 +229,7 @@ class _CatalogHitSelection:
         return (
             *self.exact_anchors,
             *self.broad_matches,
+            *self.source_hint_matches,
             *self.relationship_neighbors,
         )
 
@@ -260,6 +264,29 @@ class CatalogService:
         self._source_indexes: dict[tuple[str, str, str], _SourceCatalogIndex] = {}
         self._source_index_lock = asyncio.Lock()
         self._search_cursor_key = secrets.token_bytes(32)
+
+    def empty_catalog_context(
+        self,
+        *,
+        prior_query: str | None = None,
+    ) -> FrozenJsonObject:
+        """Return the catalog-owned assessment for an explicitly empty ceiling."""
+
+        no_match = _catalog_match_outcome(None).to_payload()
+        return FrozenJsonObject.from_mapping(
+            {
+                "resources": (),
+                "sources": (),
+                "match_outcomes": {
+                    "current_query": no_match,
+                    "prior_query": no_match if prior_query is not None else None,
+                },
+                "total_matches": 0,
+                "returned_count": 0,
+                "truncated": False,
+                "trust_classification": "untrusted_external_data",
+            }
+        )
 
     async def summary(self, agent_id: str) -> CatalogSummary:
         """Project active source counts from their current committed snapshots."""
@@ -464,18 +491,9 @@ class CatalogService:
                 request,
                 tuple(indexes),
                 readable_resource_ids=readable_resource_ids,
-                source_hints=tuple(
-                    {
-                        "source_id": source.id,
-                        "label": source.display_name,
-                        "summary": source.summary,
-                        "when_to_use": source.when_to_use,
-                        "keywords": source.keywords,
-                    }
-                    for source in await self._sources.list_sources(request.agent_id)
-                    if source.agent_id == request.agent_id
-                    and source.active
-                    and source.id in scoped_source_ids
+                source_hints=await self._source_hints(
+                    request.agent_id,
+                    frozenset(scoped_source_ids),
                 ),
             )
             current_active_source_ids = await self._active_source_ids(request.agent_id)
@@ -573,60 +591,10 @@ class CatalogService:
             request,
             indexes,
             readable_resource_ids=readable_resource_ids,
+            source_hints=source_hints,
         )
         matched_hits = selection.ordered_hits
         matched_ids = {hit.resource_id for hit in matched_hits}
-        query_terms = (
-            set(_normalize_search_text(request.query).tokens) - _SEARCH_STOP_WORDS
-        )
-        hinted_sources = {
-            hint["source_id"]
-            for hint in source_hints
-            if query_terms
-            & set(
-                _normalize_search_text(
-                    canonical_json(
-                        {
-                            key: value
-                            for key, value in hint.items()
-                            if key != "source_id"
-                        }
-                    )
-                ).tokens
-            )
-        }
-        hinted_hits = tuple(
-            CatalogSearchHit(
-                resource_id=resource.id,
-                source_id=resource.source_id,
-                kind=resource.kind,
-                name=resource.name,
-                revision=resource.current_revision,
-                sensitivity=resource.sensitivity,
-                score=1,
-                match_reasons=("source_hint",),
-            )
-            for resource in sorted(
-                (
-                    resource
-                    for index in indexes
-                    for resource in index.resources_by_id.values()
-                    if resource.source_id in hinted_sources
-                    and resource.id not in matched_ids
-                    and (
-                        readable_resource_ids is None
-                        or resource.id in readable_resource_ids
-                    )
-                    and (
-                        not request.resource_kinds
-                        or resource.kind in request.resource_kinds
-                    )
-                ),
-                key=_resource_search_tie_key,
-            )
-        )
-        matched_hits = (*matched_hits, *hinted_hits)
-        matched_ids.update(hit.resource_id for hit in hinted_hits)
         fallback = (
             tuple(
                 CatalogSearchHit(
@@ -700,6 +668,7 @@ class CatalogService:
         return CatalogSearchResult(
             request=request,
             hits=hits,
+            match_outcome=_catalog_match_outcome(selection),
             total_matches=len(matched_hits),
             returned_count=len(hits),
             truncated=truncated,
@@ -714,6 +683,7 @@ class CatalogService:
         indexes: tuple[_SourceCatalogIndex, ...],
         *,
         readable_resource_ids: frozenset[str] | None = None,
+        source_hints: tuple[Mapping[str, object], ...] = (),
     ) -> _CatalogHitSelection:
         for index in indexes:
             if index.agent_id != request.agent_id or (
@@ -903,13 +873,84 @@ class CatalogService:
 
         exact_hits = tuple(candidate.hit for candidate in exact_anchors)
         broad_hits = tuple(candidate.hit for candidate in broad_candidates)
+        direct_ids = {hit.resource_id for hit in (*exact_hits, *broad_hits)}
+        query_terms = (
+            set(_normalize_search_text(request.query).tokens) - _SEARCH_STOP_WORDS
+        )
+        hinted_sources = {
+            hint["source_id"]
+            for hint in source_hints
+            if query_terms
+            & set(
+                _normalize_search_text(
+                    canonical_json(
+                        {
+                            key: value
+                            for key, value in hint.items()
+                            if key != "source_id"
+                        }
+                    )
+                ).tokens
+            )
+        }
+        hinted_hits = tuple(
+            CatalogSearchHit(
+                resource_id=resource.id,
+                source_id=resource.source_id,
+                kind=resource.kind,
+                name=resource.name,
+                revision=resource.current_revision,
+                sensitivity=resource.sensitivity,
+                score=1,
+                match_reasons=("source_hint",),
+            )
+            for resource in sorted(
+                (
+                    resource
+                    for index in indexes
+                    for resource in index.resources_by_id.values()
+                    if resource.source_id in hinted_sources
+                    and resource.id not in direct_ids
+                    and (
+                        readable_resource_ids is None
+                        or resource.id in readable_resource_ids
+                    )
+                    and (
+                        not request.resource_kinds
+                        or resource.kind in request.resource_kinds
+                    )
+                ),
+                key=_resource_search_tie_key,
+            )
+        )
+        hinted_ids = {hit.resource_id for hit in hinted_hits}
         neighbors = tuple(
-            hit for _, hit in sorted(neighbor_by_id.values(), key=lambda item: item[0])
+            hit
+            for _, hit in sorted(neighbor_by_id.values(), key=lambda item: item[0])
+            if hit.resource_id not in hinted_ids
         )
         return _CatalogHitSelection(
             exact_anchors=exact_hits,
             broad_matches=broad_hits,
+            source_hint_matches=hinted_hits,
             relationship_neighbors=neighbors,
+        )
+
+    async def _source_hints(
+        self,
+        agent_id: str,
+        source_ids: frozenset[str],
+    ) -> tuple[Mapping[str, object], ...]:
+        return tuple(
+            {
+                "source_id": source.id,
+                "label": source.display_name,
+                "summary": source.summary,
+                "when_to_use": source.when_to_use,
+                "keywords": source.keywords,
+            }
+            for source in await self._sources.list_sources(agent_id)
+            if source.agent_id == agent_id and source.active and source.id in source_ids
         )
 
     async def schema_slice(
@@ -2432,6 +2473,10 @@ class CatalogService:
                 break
 
             indexed = tuple(indexes)
+            source_hints = await self._source_hints(
+                agent_id,
+                frozenset(scoped_source_ids),
+            )
             resources_by_id = {
                 resource.id: resource
                 for index in indexed
@@ -2454,11 +2499,17 @@ class CatalogService:
                         key=_resource_search_tie_key,
                     )
                 )
+                current_outcome = _catalog_match_outcome(
+                    None,
+                    explicit_resource_hits=all_hits,
+                )
+                prior_outcome = None
             else:
                 current_selection = self._select_index_hits(
                     current_request,
                     indexed,
                     readable_resource_ids=readable_resource_ids,
+                    source_hints=source_hints,
                 )
                 prior_selection = (
                     None
@@ -2467,11 +2518,18 @@ class CatalogService:
                         prior_request,
                         indexed,
                         readable_resource_ids=readable_resource_ids,
+                        source_hints=source_hints,
                     )
                 )
                 all_hits = _merge_context_selections(
                     current_selection,
                     prior_selection,
+                )
+                current_outcome = _catalog_match_outcome(current_selection)
+                prior_outcome = (
+                    None
+                    if prior_selection is None
+                    else _catalog_match_outcome(prior_selection)
                 )
 
             hits = all_hits[: min(limit, CATALOG_MAX_LIMIT)]
@@ -2501,6 +2559,14 @@ class CatalogService:
                         }
                         for hit in hits
                     ],
+                    "match_outcomes": {
+                        "current_query": current_outcome.to_payload(),
+                        "prior_query": (
+                            None
+                            if prior_outcome is None
+                            else prior_outcome.to_payload()
+                        ),
+                    },
                     "total_matches": len(all_hits),
                     "returned_count": len(hits),
                     "truncated": len(all_hits) > len(hits),
@@ -2926,12 +2992,15 @@ def _merge_context_selections(
 ) -> tuple[CatalogSearchHit, ...]:
     prior_exact = () if prior is None else prior.exact_anchors
     prior_broad = () if prior is None else prior.broad_matches
+    prior_source_hints = () if prior is None else prior.source_hint_matches
     prior_neighbors = () if prior is None else prior.relationship_neighbors
     ordered = (
         current.exact_anchors,
         prior_exact,
         current.broad_matches,
         prior_broad,
+        current.source_hint_matches,
+        prior_source_hints,
         current.relationship_neighbors,
         prior_neighbors,
     )
@@ -2944,6 +3013,68 @@ def _merge_context_selections(
             selected.append(hit)
             selected_ids.add(hit.resource_id)
     return tuple(selected)
+
+
+def _catalog_match_outcome(
+    selection: _CatalogHitSelection | None,
+    *,
+    explicit_resource_hits: tuple[CatalogSearchHit, ...] = (),
+) -> CatalogMatchOutcome:
+    """Assess the complete strongest evidence tier without score-gap selection."""
+
+    if explicit_resource_hits:
+        evidence_tier = "explicit_resource_ids"
+        candidates = explicit_resource_hits
+    elif selection is not None and selection.exact_anchors:
+        evidence_tier = "exact_resource"
+        candidates = selection.exact_anchors
+    elif selection is not None and selection.broad_matches:
+        evidence_tier = "catalog_metadata"
+        candidates = selection.broad_matches
+    elif selection is not None and selection.source_hint_matches:
+        evidence_tier = "source_hint"
+        candidates = selection.source_hint_matches
+    else:
+        evidence_tier = "none"
+        candidates = ()
+
+    candidate_count = len(candidates)
+    source_counts: dict[str, int] = {}
+    for hit in candidates:
+        source_counts[hit.source_id] = source_counts.get(hit.source_id, 0) + 1
+    binding_status = (
+        "no_match"
+        if candidate_count == 0
+        else "unique" if candidate_count == 1 else "ambiguous"
+    )
+    source_status = (
+        "no_match"
+        if not source_counts
+        else "unique" if len(source_counts) == 1 else "ambiguous"
+    )
+    ambiguity_reasons: list[str] = []
+    if len(source_counts) > 1:
+        ambiguity_reasons.append("multiple_sources")
+    if any(count > 1 for count in source_counts.values()):
+        ambiguity_reasons.append("multiple_resources")
+    retained = candidates[:CATALOG_MATCH_CANDIDATE_BINDING_LIMIT]
+    return CatalogMatchOutcome(
+        binding_status=binding_status,
+        source_status=source_status,
+        evidence_tier=evidence_tier,
+        candidate_count=candidate_count,
+        candidate_bindings=tuple(
+            FrozenJsonObject.from_mapping(
+                {
+                    "source_id": hit.source_id,
+                    "resource_id": hit.resource_id,
+                }
+            )
+            for hit in retained
+        ),
+        omitted_candidate_count=candidate_count - len(retained),
+        ambiguity_reasons=tuple(ambiguity_reasons),
+    )
 
 
 def _rank_index_candidate(

@@ -328,6 +328,13 @@ async def test_runtime_binds_catalog_scope_without_injection_and_rejects_outside
         assert isinstance(blocked_result, ToolResultBlock)
         catalog_data = catalog_result.output["data"]
         assert isinstance(catalog_data, Mapping)
+        match_outcome = catalog_data["match_outcome"]
+        assert isinstance(match_outcome, Mapping)
+        assert match_outcome["binding_status"] == "unique"
+        assert match_outcome["candidate_count"] == 1
+        bindings = match_outcome["candidate_bindings"]
+        assert isinstance(bindings, tuple)
+        assert bindings[0]["source_id"] == first_source.id
         hits = catalog_data["hits"]
         assert isinstance(hits, tuple)
         assert hits
