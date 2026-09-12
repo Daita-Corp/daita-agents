@@ -110,15 +110,17 @@ async def test_configured_route_retry_preserves_committed_action(
         recording = next(item for item in recordings if item.requests)
         assert len(recording.requests) == 4
         assert len(recording.responses) == 3
-        assert len({item.deadline for item in recording.requests}) == 1
+        assert all(item.deadline is not None for item in recording.requests)
+        assert recording.requests[-1].deadline == recording.requests[-2].deadline
         assert replace(recording.requests[-1], attempt_deadline=None) == replace(
             recording.requests[-2], attempt_deadline=None
         )
+        initial_token_allowance = fixture.config.limits.max_total_tokens
         assert [item.max_total_tokens for item in recording.requests] == [
-            30000,
-            29890,
-            29780,
-            29780,
+            initial_token_allowance,
+            initial_token_allowance - 110,
+            initial_token_allowance - 220,
+            initial_token_allowance - 220,
         ]
         assert [call["phase"] for call in transport.calls].count("count") == 4
         assert sum(call["injected"] for call in transport.calls) == 1

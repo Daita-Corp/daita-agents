@@ -121,7 +121,7 @@ class _NoSourceCatalog:
                 "sources": (),
                 "match_outcomes": {
                     "current_query": no_match,
-                    "prior_query": no_match if prior_query is not None else None,
+                    "prior_query": no_match if has_prior else None,
                 },
                 "total_matches": 0,
                 "returned_count": 0,

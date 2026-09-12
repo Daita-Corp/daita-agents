@@ -289,12 +289,12 @@ async def test_catalog_search_capability_exposes_correct_returned_and_scoped_cou
                 "trust_classification": "untrusted_external_data",
             },
         ):
-            accepted = output.data.to_dict()
+            accepted = dict(output.data)
             accepted["match_outcome"] = accepted_outcome
             validated = ToolOutput(kind=output.kind, data=accepted)
             assert registry.validate_output(capability.id, validated) == validated
 
-        malformed = output.data.to_dict()
+        malformed = dict(output.data)
         malformed_outcome = dict(cast(Mapping[str, object], malformed["match_outcome"]))
         malformed_outcome["binding_status"] = "confident"
         malformed["match_outcome"] = malformed_outcome

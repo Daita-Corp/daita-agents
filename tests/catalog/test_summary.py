@@ -807,65 +807,6 @@ async def test_catalog_context_ranks_within_frozen_resource_ceiling(
         await agent.close()
 
 
-async def test_catalog_context_ranks_within_frozen_resource_ceiling(
-    tmp_path: Path,
-):
-    database = tmp_path / "catalog-context-ceiling.sqlite"
-    with sqlite3.connect(database) as connection:
-        connection.executescript("""
-            CREATE TABLE aaa_inventory (id INTEGER PRIMARY KEY);
-            CREATE TABLE zz_ranked_target (id INTEGER PRIMARY KEY);
-            CREATE TABLE zz_ranked_target_archive (id INTEGER PRIMARY KEY);
-            """)
-    agent = await Agent.create(
-        "catalog-context-ceiling", root=tmp_path, workspace=workspace_for(tmp_path)
-    )
-    try:
-        source = await agent.attach(SQLiteSource(database))
-        resources = {
-            resource.name: resource
-            for resource in await agent.list_catalog_resources(source_id=source.id)
-        }
-        all_readable = frozenset(resource.id for resource in resources.values())
-
-        ranked = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            "Profile zz_ranked_target.",
-            limit=1,
-            source_ids=(source.id,),
-            resource_ids=(),
-            readable_resource_ids=all_readable,
-        )
-        ranked_resources = ranked["resources"]
-        assert isinstance(ranked_resources, tuple)
-        first = ranked_resources[0]
-        assert isinstance(first, Mapping)
-        assert first["resource_id"] == resources["zz_ranked_target"].id
-
-        archive_only = await agent._embedded._data_view.catalog_context(
-            agent.id,
-            "Profile zz_ranked_target.",
-            limit=12,
-            source_ids=(source.id,),
-            resource_ids=(),
-            readable_resource_ids=frozenset(
-                {
-                    resources["aaa_inventory"].id,
-                    resources["zz_ranked_target_archive"].id,
-                }
-            ),
-        )
-        archive_resources = archive_only["resources"]
-        assert isinstance(archive_resources, tuple)
-        archive_records = cast(tuple[Mapping[str, object], ...], archive_resources)
-        assert tuple(item["resource_id"] for item in archive_records) == (
-            resources["zz_ranked_target_archive"].id,
-        )
-        assert resources["zz_ranked_target"].id not in str(archive_only)
-    finally:
-        await agent.close()
-
-
 async def test_catalog_context_merges_current_and_prior_queries_by_contract_priority(
     tmp_path: Path,
 ):
