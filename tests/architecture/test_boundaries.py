@@ -386,6 +386,11 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         assert resolved["distribution_destination_list"] == "distribution"
         assert resolved["delivery_list"] == "distribution"
         assert resolved["delivery_inspect"] == "distribution"
+
+        query_schema = registry.tool_definition("data_query").input_schema
+        query_required = query_schema.get("required")
+        assert isinstance(query_required, (tuple, list))
+        assert {"source_id", "resource_ids", "sql"} <= set(query_required)
     finally:
         await agent.close()
 
@@ -1737,16 +1742,38 @@ def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
     service = (PACKAGE / "catalog" / "service.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
     loop = _python_text(PACKAGE / "loop")
+    context = (PACKAGE / "context.py").read_text(encoding="utf-8")
+    context_tree = ast.parse(context)
+    toolbox = (PACKAGE / "capabilities.py").read_text(encoding="utf-8")
 
+    assert _class_owners("CatalogMatchOutcome") == {"catalog/models.py"}
     assert "search" not in protocol_methods
     assert "search" not in storage_methods
     assert "_SourceCatalogIndex" in service
     assert "_source_indexes" in service
     assert "_compile_source_index" in service
+    assert "_catalog_match_outcome" in service
+    assert "_catalog_match_outcome" not in {
+        node.name
+        for node in ast.walk(context_tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert "CatalogMatchOutcome" not in toolbox
     assert "_catalog_search_reason" not in storage
     assert "_SourceCatalogIndex" not in storage
     assert "CatalogSearchHit" not in storage
     assert "_SourceCatalogIndex" not in loop
+    assert "CatalogMatchOutcome" not in loop
+    assert "ClarificationRequiredError" not in _python_text(PACKAGE)
+    assert "clarification_required" not in _python_text(PACKAGE)
+    for prohibited in (
+        "CatalogSearchService",
+        "SourceRouter",
+        "SelectedSource",
+        "SelectedSourceState",
+        'name="catalog_resolve"',
+    ):
+        assert prohibited not in _python_text(PACKAGE)
 
 
 def test_catalog_bounded_traversal_is_catalog_owned_and_not_storage_owned():

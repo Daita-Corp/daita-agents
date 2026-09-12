@@ -21,7 +21,7 @@ from daita.catalog import (
     ResourceKind,
 )
 from daita.catalog.models import CatalogSnapshotRef
-from daita.catalog.protocols import CatalogStoreError
+from daita.catalog.protocols import CatalogResourceNotFoundError, CatalogStoreError
 from daita.llm.models import FinishReason, ModelProfile, ModelResponse
 from daita.llm.providers.mock import MockModelProvider
 from daita.storage.sqlite import SQLiteStateStore
@@ -217,6 +217,11 @@ async def test_broad_catalog_discovery_matches_any_term_and_resource_kind(
         assert result.total_matches == 2
         assert result.returned_count == 2
         assert all("kind" in hit.matched_fields for hit in result.hits)
+        assert result.match_outcome.binding_status == "ambiguous"
+        assert result.match_outcome.source_status == "unique"
+        assert result.match_outcome.evidence_tier == "catalog_metadata"
+        assert result.match_outcome.candidate_count == 2
+        assert result.match_outcome.ambiguity_reasons == ("multiple_resources",)
     finally:
         await agent.close()
 
@@ -307,6 +312,9 @@ async def test_catalog_search_ranks_posting_candidates_before_unmatched_fallback
         )
         assert result.next_cursor is not None
         assert rank_count == 1
+        first_outcome = result.match_outcome
+        assert first_outcome.binding_status == "unique"
+        assert first_outcome.evidence_tier == "catalog_metadata"
         seen = {hit.resource_id for hit in result.hits}
         while result.next_cursor is not None:
             result = await agent.search_catalog(
@@ -317,6 +325,7 @@ async def test_catalog_search_ranks_posting_candidates_before_unmatched_fallback
                     cursor=result.next_cursor,
                 )
             )
+            assert result.match_outcome == first_outcome
             assert len(result.hits) <= 50
             for hit in result.hits:
                 assert hit.resource_id not in seen
@@ -559,6 +568,14 @@ async def test_indexed_search_normalizes_ranks_diversifies_and_exposes_evidence(
         exact_column = next(hit for hit in exact.hits if hit.name == "column_match")
         assert exact_column.match_reasons == ("structural_field_exact",)
         assert exact.hits[0].score > exact_column.score
+        assert exact.match_outcome.binding_status == "unique"
+        assert exact.match_outcome.source_status == "unique"
+        assert exact.match_outcome.evidence_tier == "exact_resource"
+        assert exact.match_outcome.candidate_count == 1
+        assert (
+            exact.match_outcome.candidate_bindings[0]["resource_id"]
+            == exact.hits[0].resource_id
+        )
         assert qualified.hits[0].name == "needle"
         assert qualified.hits[1].name == "main.needle"
         assert qualified.hits[0].score > exact.hits[0].score
@@ -616,6 +633,18 @@ async def test_embedded_exact_name_anchor_outranks_128_lookalikes_and_has_bounda
         assert result.total_matches == 129
         assert result.returned_count == 12
         assert result.truncated is True
+        assert result.match_outcome.binding_status == "unique"
+        assert result.match_outcome.candidate_count == 1
+        assert result.match_outcome.evidence_tier == "exact_resource"
+
+        broad = await agent.search_catalog(
+            CatalogSearchRequest(agent_id=agent.id, query="table", limit=1)
+        )
+        assert broad.match_outcome.binding_status == "ambiguous"
+        assert broad.match_outcome.source_status == "unique"
+        assert broad.match_outcome.candidate_count == 129
+        assert len(broad.match_outcome.candidate_bindings) == 12
+        assert broad.match_outcome.omitted_candidate_count == 117
 
         boundary = await agent.search_catalog(
             CatalogSearchRequest(
@@ -692,6 +721,11 @@ async def test_embedded_exact_duplicate_names_remain_source_scoped(
         assert all(
             hit.match_reasons == ("resource_name_exact_mention",) for hit in result.hits
         )
+        assert result.match_outcome.binding_status == "ambiguous"
+        assert result.match_outcome.source_status == "ambiguous"
+        assert result.match_outcome.evidence_tier == "exact_resource"
+        assert result.match_outcome.candidate_count == 2
+        assert result.match_outcome.ambiguity_reasons == ("multiple_sources",)
     finally:
         await agent.close()
 
@@ -730,6 +764,12 @@ async def test_catalog_context_ranks_within_frozen_resource_ceiling(
         first = ranked_resources[0]
         assert isinstance(first, Mapping)
         assert first["resource_id"] == resources["zz_ranked_target"].id
+        outcomes = ranked["match_outcomes"]
+        assert isinstance(outcomes, Mapping)
+        current = outcomes["current_query"]
+        assert isinstance(current, Mapping)
+        assert current["binding_status"] == "unique"
+        assert current["candidate_count"] == 1
 
         archive_only = await agent._embedded._data_view.catalog_context(
             agent.id,
@@ -751,6 +791,18 @@ async def test_catalog_context_ranks_within_frozen_resource_ceiling(
             resources["zz_ranked_target_archive"].id,
         )
         assert resources["zz_ranked_target"].id not in str(archive_only)
+
+        with pytest.raises(CatalogResourceNotFoundError):
+            await agent._embedded._data_view.catalog_context(
+                agent.id,
+                "Profile zz_ranked_target.",
+                limit=12,
+                source_ids=(source.id,),
+                resource_ids=(resources["zz_ranked_target"].id,),
+                readable_resource_ids=frozenset(
+                    {resources["zz_ranked_target_archive"].id}
+                ),
+            )
     finally:
         await agent.close()
 
@@ -790,6 +842,17 @@ async def test_catalog_context_merges_current_and_prior_queries_by_contract_prio
             "prior_target",
             "profile_metrics",
         )
+        continuity_outcomes = continuity["match_outcomes"]
+        assert isinstance(continuity_outcomes, Mapping)
+        current_outcome = continuity_outcomes["current_query"]
+        prior_outcome = continuity_outcomes["prior_query"]
+        assert isinstance(current_outcome, Mapping)
+        assert isinstance(prior_outcome, Mapping)
+        assert current_outcome["evidence_tier"] == "catalog_metadata"
+        assert prior_outcome["evidence_tier"] == "exact_resource"
+        assert (
+            current_outcome["candidate_bindings"] != prior_outcome["candidate_bindings"]
+        )
 
         switched = await view.catalog_context(
             agent.id,
@@ -827,6 +890,13 @@ async def test_catalog_context_merges_current_and_prior_queries_by_contract_prio
         assert exact_id["total_matches"] == 1
         assert exact_id["returned_count"] == 1
         assert exact_id["truncated"] is False
+        exact_outcomes = exact_id["match_outcomes"]
+        assert isinstance(exact_outcomes, Mapping)
+        exact_current = exact_outcomes["current_query"]
+        assert isinstance(exact_current, Mapping)
+        assert exact_current["evidence_tier"] == "explicit_resource_ids"
+        assert exact_current["binding_status"] == "unique"
+        assert exact_outcomes["prior_query"] is None
     finally:
         await agent.close()
 
@@ -886,6 +956,22 @@ async def test_catalog_search_and_private_context_rank_across_more_than_64_sourc
         assert context["total_matches"] == 65
         assert context["returned_count"] == 3
         assert context["truncated"] is True
+        broad_context = await agent._embedded._data_view.catalog_context(
+            agent.id,
+            "table",
+            limit=3,
+            source_ids=tuple(source_ids),
+            resource_ids=(),
+            readable_resource_ids=readable_resource_ids,
+        )
+        broad_outcomes = broad_context["match_outcomes"]
+        assert isinstance(broad_outcomes, Mapping)
+        broad_current = broad_outcomes["current_query"]
+        assert isinstance(broad_current, Mapping)
+        assert broad_current["binding_status"] == "ambiguous"
+        assert broad_current["candidate_count"] == 65
+        assert len(cast(tuple[object, ...], broad_current["candidate_bindings"])) == 12
+        assert broad_current["omitted_candidate_count"] == 53
     finally:
         await agent.close()
 

@@ -294,6 +294,35 @@ class CatalogSpy:
         del agent_id, source_ids
         return ModelSensitivity.PUBLIC
 
+    def empty_catalog_context(self, *, prior_query=None):
+        from daita._json import FrozenJsonObject
+
+        no_match = {
+            "binding_status": "no_match",
+            "source_status": "no_match",
+            "evidence_tier": "none",
+            "candidate_count": 0,
+            "candidate_bindings": (),
+            "omitted_candidate_count": 0,
+            "ambiguity_reasons": (),
+            "assessment_provenance": "catalog_service",
+            "trust_classification": "untrusted_external_data",
+        }
+        return FrozenJsonObject.from_mapping(
+            {
+                "resources": (),
+                "sources": (),
+                "match_outcomes": {
+                    "current_query": no_match,
+                    "prior_query": no_match if prior_query is not None else None,
+                },
+                "total_matches": 0,
+                "returned_count": 0,
+                "truncated": False,
+                "trust_classification": "untrusted_external_data",
+            }
+        )
+
     async def catalog_context(
         self,
         agent_id,
@@ -312,10 +341,64 @@ class CatalogSpy:
         self.context_selections.append(
             (source_ids, resource_ids, readable_resource_ids)
         )
+        direct = tuple(
+            item
+            for item in self.resources
+            if item.get("match_reasons")
+            not in {("relationship_neighbor",), ("unmatched_fallback",)}
+        )
+        exact = tuple(
+            item
+            for item in direct
+            if "exact" in " ".join(item.get("match_reasons", ()))
+        )
+        candidates = exact or direct
+        source_count = len({item["source_id"] for item in candidates})
+        candidate_count = len(candidates)
+        binding_status = (
+            "no_match"
+            if not candidates
+            else "unique" if candidate_count == 1 else "ambiguous"
+        )
+        source_status = (
+            "no_match"
+            if not candidates
+            else "unique" if source_count == 1 else "ambiguous"
+        )
+        ambiguity_reasons = []
+        if source_count > 1:
+            ambiguity_reasons.append("multiple_sources")
+        if candidates and candidate_count > source_count:
+            ambiguity_reasons.append("multiple_resources")
+        outcome = {
+            "binding_status": binding_status,
+            "source_status": source_status,
+            "evidence_tier": (
+                "none"
+                if not candidates
+                else "exact_resource" if exact else "catalog_metadata"
+            ),
+            "candidate_count": candidate_count,
+            "candidate_bindings": tuple(
+                {
+                    "source_id": item["source_id"],
+                    "resource_id": item["resource_id"],
+                }
+                for item in candidates[:12]
+            ),
+            "omitted_candidate_count": max(0, candidate_count - 12),
+            "ambiguity_reasons": tuple(ambiguity_reasons),
+            "assessment_provenance": "catalog_service",
+            "trust_classification": "untrusted_external_data",
+        }
         return FrozenJsonObject.from_mapping(
             {
                 "resources": self.resources,
                 "sources": self.sources,
+                "match_outcomes": {
+                    "current_query": outcome,
+                    "prior_query": outcome if prior_query is not None else None,
+                },
                 "total_matches": len(self.resources),
                 "returned_count": len(self.resources),
                 "truncated": False,

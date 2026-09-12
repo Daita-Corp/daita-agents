@@ -51,12 +51,7 @@ NOW = datetime(2026, 9, 13, 12, tzinfo=UTC)
 NEXT_SLOT = datetime(2026, 9, 14, 14, tzinfo=UTC)
 EXPIRES = datetime(2026, 9, 20, 12, tzinfo=UTC)
 FIXTURE_SENSITIVITY = ModelSensitivity.INTERNAL
-LIMITS = LoopLimits(
-    max_steps=14,
-    max_total_tokens=30_000,
-    max_wall_time_seconds=180,
-    max_estimated_cost_usd=Decimal("0.15"),
-)
+LIMITS = replace(LoopLimits(), max_estimated_cost_usd=Decimal("0.15"))
 USER_FLOW_LIMITS = replace(LoopLimits(), max_estimated_cost_usd=Decimal("0.50"))
 REPORT_INSTRUCTION = (
     'Return only JSON with "status" ("succeeded", "not_applied", or "uncertain"), '

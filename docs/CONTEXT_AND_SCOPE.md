@@ -4,6 +4,37 @@ Daita discovers currently admitted readable sources for an ordinary question.
 There is no selected-source mode. Every data call still names its exact source
 and resource, and current permissions are checked before I/O.
 
+The frozen readable resource set is a candidate ceiling, not an exact selection.
+Initial catalog context ranks only within that ceiling and reports separate
+`match_outcomes.current_query` and `match_outcomes.prior_query` assessments. The
+prior assessment may be null and is continuity evidence only; the two assessments
+are never merged into an effective source or persisted as sticky selection state.
+An explicit catalog-context `resource_ids` request retains its separate exact-ID
+semantics and fails when any requested ID is not currently readable.
+
+Each catalog-owned match outcome reports `binding_status` and `source_status` as
+`unique`, `ambiguous`, or `no_match`. It also names the strongest evidence tier,
+the exact candidate count, up to 12 `(source_id, resource_id)` bindings, an omitted
+count, and deterministic ambiguity reasons. Exact resource evidence outranks broad
+catalog metadata, which outranks source hints. Scores order candidates within the
+presentation but never turn a multi-candidate tier into a silent winner.
+Relationship neighbors and `unmatched_fallback` inventory are not target
+candidates. A unique source can still contain several ambiguous resource bindings.
+The `assessment_provenance="catalog_service"` field identifies the code owner of
+the calculation; it is not authorization. Outcome content remains classified as
+untrusted external data.
+
+For a single-target read, a unique current binding can be used by exact ID after
+any missing schema is obtained. An ambiguous single-target request should be
+clarified instead of choosing the first hit. An explicit comparison may use the
+candidate set, with separate exact relational calls grouped by source before
+synthesis. A no-match result can be refined with a grounded `catalog_search` query;
+fallback inventory is not a match. A prior unique binding is reusable only when the
+current wording clearly refers to it. Ambiguous update or upsert intent should be
+clarified before preview. These are model-facing presentation rules, not a runtime
+clarification gate; exact scope, ID, schema, permission, approval, and receipt checks
+remain the execution authority.
+
 Initial context contains a bounded connector directory drawn from current source
 registrations, admitted MCP bindings, and eligible skills. A separate compact
 manifest lists applicable toolboxes; the directory does not repeat those entries.

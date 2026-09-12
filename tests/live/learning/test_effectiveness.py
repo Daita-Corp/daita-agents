@@ -248,12 +248,7 @@ async def test_live_fixture_baseline_teaching_and_learned_report(tmp_path: Path)
                 return ApprovalDecision.APPROVE
             return ApprovalDecision.DENY
 
-        limits = LoopLimits(
-            max_steps=16,
-            max_total_tokens=60_000,
-            max_wall_time_seconds=240,
-            max_estimated_cost_usd=_cost_limit(),
-        )
+        limits = LoopLimits(max_estimated_cost_usd=_cost_limit())
         async with await Agent.create(
             "live-learning-evaluation",
             root=tmp_path,

@@ -160,12 +160,7 @@ async def test_live_model_route_admits_internal_scope_and_blocks_public_only_rou
     provider = _RecordingProvider(delegate)
     async with AsyncExitStack() as cleanup:
         cleanup.push_async_callback(provider.close)
-        limits = LoopLimits(
-            max_steps=3,
-            max_total_tokens=8_000,
-            max_wall_time_seconds=90,
-            max_estimated_cost_usd=_cost_limit(),
-        )
+        limits = LoopLimits(max_estimated_cost_usd=_cost_limit())
         database = tmp_path / "stage0-live.sqlite"
         _database(database)
 

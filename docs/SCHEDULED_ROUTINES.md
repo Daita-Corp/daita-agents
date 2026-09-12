@@ -71,6 +71,14 @@ authority. MCP grants fix exact top-level arguments and allow only named scalar
 variables, with 1–256 reserved calls per occurrence further narrowed by run limits.
 MCP completion evidence is server-reported invocation only. See
 [MCP admission and actions](MCP_CONNECTIVITY.md) for the supported subset.
+
+Capability contracts are revalidated by exact digest. The catalog-search output
+now includes its catalog-owned `match_outcome`, so this schema addition changes the
+`catalog.search` contract digest. A retained routine bound to the previous digest
+fails closed and must be recreated or revised and approved again from the
+foreground. There is no compatibility decoder, digest bridge, or implicit
+acceptance of the replacement contract.
+
 If an artifact is required, admission also proves that at least one allowed
 producer can satisfy its media type, authorship, exact-source, sensitivity, and
 byte bounds. Impossible contracts fail before the routine is created.

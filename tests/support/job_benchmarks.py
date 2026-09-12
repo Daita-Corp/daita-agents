@@ -326,12 +326,7 @@ def configured_model_ids() -> tuple[str, ...]:
 
 
 def benchmark_limits() -> LoopLimits:
-    return LoopLimits(
-        max_steps=12,
-        max_total_tokens=30_000,
-        max_wall_time_seconds=180,
-        max_estimated_cost_usd=_cost_limit(),
-    )
+    return LoopLimits(max_estimated_cost_usd=_cost_limit())
 
 
 def live_provider(model_id: str) -> tuple[ModelProfile, RecordingProvider]:

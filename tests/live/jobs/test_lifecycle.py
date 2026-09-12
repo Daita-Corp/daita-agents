@@ -165,12 +165,7 @@ def _live_provider() -> tuple[ModelProfile, _RecordingProvider]:
 
 
 def _limits() -> LoopLimits:
-    return LoopLimits(
-        max_steps=12,
-        max_total_tokens=30_000,
-        max_wall_time_seconds=180,
-        max_estimated_cost_usd=_cost_limit(),
-    )
+    return LoopLimits(max_estimated_cost_usd=_cost_limit())
 
 
 def _database(path: Path) -> None:

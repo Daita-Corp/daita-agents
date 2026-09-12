@@ -1129,12 +1129,34 @@ class _Catalog:
         del agent_id, source_ids
         return ModelSensitivity.PUBLIC
 
+    def empty_catalog_context(self, *, prior_query=None) -> FrozenJsonObject:
+        return self._empty_catalog_context(prior_query is not None)
+
     async def catalog_context(self, *args, **kwargs) -> FrozenJsonObject:
         del args, kwargs
+        return self._empty_catalog_context(False)
+
+    @staticmethod
+    def _empty_catalog_context(has_prior: bool) -> FrozenJsonObject:
+        no_match = {
+            "binding_status": "no_match",
+            "source_status": "no_match",
+            "evidence_tier": "none",
+            "candidate_count": 0,
+            "candidate_bindings": (),
+            "omitted_candidate_count": 0,
+            "ambiguity_reasons": (),
+            "assessment_provenance": "catalog_service",
+            "trust_classification": "untrusted_external_data",
+        }
         return FrozenJsonObject.from_mapping(
             {
                 "resources": [],
                 "sources": [],
+                "match_outcomes": {
+                    "current_query": no_match,
+                    "prior_query": None,
+                },
                 "total_matches": 0,
                 "returned_count": 0,
                 "truncated": False,

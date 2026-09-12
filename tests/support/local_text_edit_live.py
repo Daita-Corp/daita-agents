@@ -113,13 +113,7 @@ def _limits() -> LoopLimits:
     profile = os.environ.get("DAITA_LOCAL_TEXT_EDIT_LIVE_PROFILE", "strict")
     if profile not in {"strict", "user_flow"}:
         raise ValueError("local text edit profile must be strict or user_flow")
-    user_flow = profile == "user_flow"
-    return LoopLimits(
-        max_steps=24 if user_flow else 14,
-        max_total_tokens=100_000 if user_flow else 30_000,
-        max_wall_time_seconds=300 if user_flow else 120,
-        max_estimated_cost_usd=_cost_limit(),
-    )
+    return LoopLimits(max_estimated_cost_usd=_cost_limit())
 
 
 def _successful_exchanges(

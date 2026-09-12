@@ -302,6 +302,9 @@ async def test_context_fitting_retains_exact_current_anchor_and_updates_counts()
     assert '"returned_count":1' in system.text
     assert '"total_matches":3' in system.text
     assert '"truncated":true' in system.text
+    assert '"binding_status":"ambiguous"' in system.text
+    assert '"candidate_count":2' in system.text
+    assert '"assessment_provenance":"catalog_service"' in system.text
 
 
 @pytest.mark.parametrize(

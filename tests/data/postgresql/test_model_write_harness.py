@@ -286,7 +286,7 @@ def test_model_write_config_preserves_router_budgets_and_lazy_secret_reference(
         LIMITS.max_total_tokens,
         LIMITS.max_wall_time_seconds,
         LIMITS.max_estimated_cost_usd,
-    ) == (14, 30000, 180, Decimal("0.15"))
+    ) == (24, 100000, 300, Decimal("0.15"))
     route = config.model_route
     assert route is not None
     assert route.retry_policy.max_attempts_per_candidate == 2
@@ -333,7 +333,7 @@ def test_user_flow_profile_is_explicit_bounded_and_keeps_strict_defaults(monkeyp
         USER_FLOW_LIMITS.max_wall_time_seconds,
         USER_FLOW_LIMITS.max_estimated_cost_usd,
     ) == (24, 100000, 300, Decimal("0.50"))
-    assert LIMITS.max_total_tokens == 30000
+    assert LIMITS.max_total_tokens == 100000
     assert LIMITS.max_estimated_cost_usd == Decimal("0.15")
     monkeypatch.setenv(PROFILE_ENV, "unbounded")
     with pytest.raises(ValueError, match="strict or user_flow"):
