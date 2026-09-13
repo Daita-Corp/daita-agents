@@ -1,5 +1,6 @@
 """Export the public APIs for configuring and running a Daita agent."""
 
+from ._version import __version__
 from .adapters import (
     MCPAdmissionError,
     MCPAuthentication,
@@ -125,16 +126,13 @@ from .semantics import (
     SemanticValidationError,
 )
 from .skills import Skill, SkillSummary
-from .storage.sqlite_records import RelationalWriteScope
-from .workspace import LocalWorkspace
-
-__version__ = "1.0.1"
-
 from .storage.sqlite_records import (
     EffectReceipt,
     EffectResolution,
     EffectResolutionDecision,
+    RelationalWriteScope,
 )
+from .workspace import LocalWorkspace
 
 __all__ = [
     "EffectReceipt",

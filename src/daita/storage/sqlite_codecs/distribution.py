@@ -1,4 +1,4 @@
-"""Encode the sole current codec-v1 outcome and logical-delivery families."""
+"""Encode the sole current canonical outcome and logical-delivery families."""
 
 from __future__ import annotations
 
@@ -35,8 +35,6 @@ from .common import (
     text,
 )
 
-_DELIVERY_VERSION = 1
-
 
 def encode_delivery(value: Delivery) -> str:
     if not isinstance(value, Delivery):
@@ -45,7 +43,6 @@ def encode_delivery(value: Delivery) -> str:
         record(
             "Delivery",
             {
-                "version": _DELIVERY_VERSION,
                 "conversation_id": value.conversation_id,
                 "subject_kind": value.subject_kind.value,
                 "subject_id": value.subject_id,
@@ -72,7 +69,6 @@ def decode_delivery(
         load_payload(value),
         "Delivery",
         (
-            "version",
             "conversation_id",
             "subject_kind",
             "subject_id",
@@ -86,8 +82,6 @@ def decode_delivery(
             "updated_at",
         ),
     )
-    if integer(fields["version"], "delivery version") != _DELIVERY_VERSION:
-        raise ValueError("stored delivery version is unsupported")
     try:
         subject_kind = DeliverySubjectKind(
             text(fields["subject_kind"], "delivery subject kind")

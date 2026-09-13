@@ -1,4 +1,4 @@
-"""Collect explicit codec-v1 serializers used by the SQLite state store."""
+"""Collect serializers for the one current canonical SQLite record shape."""
 
 from .autonomy import (
     decode_autonomous_followup,
@@ -50,7 +50,12 @@ from .source_permissions import (
     encode_relational_write_scope,
     encode_source_read_scope,
 )
-from .sources import CurrentSourceAdapterError, decode_source, encode_source
+from .sources import (
+    CurrentSourceAdapterError,
+    decode_source,
+    decode_source_credential_reference_for_deletion,
+    encode_source,
+)
 from .transcripts import (
     decode_loop_exit,
     decode_message,
@@ -84,6 +89,7 @@ __all__ = [
     "decode_run_input",
     "decode_semantic_annotation",
     "decode_source",
+    "decode_source_credential_reference_for_deletion",
     "decode_source_read_scope",
     "decode_scheduled_routine",
     "encode_autonomous_followup",

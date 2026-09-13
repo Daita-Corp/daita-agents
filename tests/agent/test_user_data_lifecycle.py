@@ -228,13 +228,68 @@ async def test_agent_delete_removes_home_and_all_owned_credentials(
     await configured.close()
     config_path = home / "config.json"
     document = json.loads(config_path.read_text(encoding="utf-8"))
-    document["model_route"]["candidates"][0]["profile"]["healthy"] = False
+    document["model_route"]["candidates"][0]["profile_limits"][
+        "context_window_tokens"
+    ] = "invalid"
     config_path.write_text(json.dumps(document), encoding="utf-8")
 
     await Agent.delete("atlas", root=tmp_path, keychain=keychain)
 
     assert not home.exists()
     assert await Agent.list(root=tmp_path) == ()
+    assert keychain.deleted == [reference.name]
+    assert keychain.values == {}
+
+
+async def test_agent_delete_accepts_incompatible_preproduction_source_state(
+    tmp_path: Path,
+) -> None:
+    keychain = _Keychain()
+    agent = await Agent.create(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
+    reference = SecretReference.keychain(
+        embedded._credential_account(agent.id, "postgresql", "credential-fixed")
+    )
+    keychain.values[reference.name] = "secret"
+    registration = SourceRegistration.build(
+        agent_id=agent.id,
+        adapter_id="postgresql",
+        native_identity="postgresql:test",
+        display_name="Warehouse",
+        configuration={"credential_ref": reference.to_uri()},
+        attached_at=NOW,
+    )
+    await agent._embedded._store.register_source(registration)
+    home = agent.home
+    await agent.close()
+
+    with sqlite3.connect(home / "state.db") as connection:
+        data = connection.execute(
+            "SELECT data FROM sources WHERE agent_id = ? AND id = ?",
+            (agent.id, registration.id),
+        ).fetchone()[0]
+        document = json.loads(data)
+        for field in (
+            "keywords",
+            "presentation_sensitivity",
+            "summary",
+            "when_to_use",
+        ):
+            document["fields"].pop(field)
+        connection.execute(
+            "UPDATE sources SET data = ? WHERE agent_id = ? AND id = ?",
+            (json.dumps(document), agent.id, registration.id),
+        )
+        connection.execute("DROP TABLE relational_write_scopes")
+        connection.execute(
+            "UPDATE agent_home_migrations SET checksum = ? WHERE revision = 1",
+            ("f" * 64,),
+        )
+
+    await Agent.delete("atlas", root=tmp_path, keychain=keychain)
+
+    assert not home.exists()
     assert keychain.deleted == [reference.name]
     assert keychain.values == {}
 

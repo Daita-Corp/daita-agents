@@ -84,8 +84,8 @@ src/daita/
   skills/                     # bounded retained Markdown procedures
   storage/sqlite.py           # durable state operation boundary
   storage/sqlite_schema.py    # exact current physical schema
-  storage/sqlite_codecs/      # current persisted-record codecs
-  storage/sqlite_migrations/  # checksummed copy-and-swap migration engine
+  storage/sqlite_codecs/      # strict current-record serializers
+  storage/home_migrations/    # sole append-only agent-home revision registry
   security/                   # secret references and lazy resolution
   config.py                   # immutable runtime and model configuration
   workspace.py                # runtime-only local workspace admission
@@ -505,29 +505,42 @@ exact frozen arguments. It does not create pending state or a resume API.
 Observation is one best-effort callback. It cannot direct execution and does
 not create durable events, telemetry, tracing, or replay state.
 
-## Persistence and pre-production state
+## Persistence and production upgrades
 
-`daita.storage.sqlite.SQLiteStateStore` is the sole durable state operation and
-admission boundary. The current schema contains only state used by the product,
-including identities, sources, catalog snapshots, transcripts, terminal
-results, advisory knowledge, permission scopes, write receipts, MCP bindings,
-jobs, follow-ups, routines, occurrences, and deliveries.
+`daita.storage.sqlite.SQLiteStateStore` is the sole current SQLite operation
+boundary. `daita.storage.home_migrations` is the sole persistence-compatibility
+authority for the complete agent home. One monotonic home revision covers the
+database, persisted records, model configuration, memory, user profile, skills,
+artifacts, and other durable files that must change together. It is independent
+of the package version and Git tag.
 
-Until the first production state format is frozen:
+Production home revision 1 is frozen. The registry is ordered and append-only;
+released migration IDs, checksums, implementations, target schemas, historical
+decoders, and golden fixtures never change. `CURRENT_HOME_REVISION` derives from
+the last registry entry. A format change appends one owner-local home migration
+and declares every affected relative path. Fresh homes are created directly at
+the current complete format rather than replaying history.
 
-- SQLite has one current physical schema and each record family has one current
-  shape;
-- codec discriminators remain at `version = 1` where present;
-- schema, codec, and the checksummed `development_baseline` change in place;
-- unreleased formats receive no compatibility decoder, bridge, migration, or
-  fixture; and
-- development agent homes are disposable after a state-shape change.
+Current runtime serializers accept only the current shape and contain no
+per-record version discriminators or compatibility branches. Historical parsing
+belongs only to the immutable migration that consumes that shape. The revision-1
+bridge admits only the exact three observed preproduction shapes; it is not a
+general legacy framework.
 
-The existing checksummed copy-and-swap migration engine remains the only
-production upgrade mechanism. Once a production baseline is frozen, durable
-changes use immutable migration IDs/checksums and owner-local migration files.
-Migrations validate a verified copy under the agent-home writer boundary and
-replace the active database only after complete target validation.
+Open owns the existing agent-home writer lock across inspection, crash recovery,
+upgrade, full-home validation, and runtime composition. Upgrades preflight disk
+space, stage and back up all affected files, use SQLite's backup API, apply the
+known suffix in order, validate the complete staged home, and publish `state.db`
+last. Hash-bound journals recover staging, partial commit, and rollback states.
+Publication failure restores the prior home, and one rollback bundle is retained.
+Newer, unsupported, reordered, checksum-edited, or damaged homes fail closed
+without a state rewrite.
+
+Every supported production revision has one immutable whole-home golden fixture.
+Tests cover every supported-to-current path, durable-data preservation, failure
+and crash boundaries, recovery, rollback, and downgrade refusal. The inclusive
+support window is an explicit registry policy; changing it is a release decision.
+See `docs/LOCAL_STATE_UPGRADES.md` for the operational contract.
 
 Source read authority exists only in `source_read_scopes`. Native relational write
 authority exists only in `relational_write_scopes`. Connection JSON never
@@ -674,6 +687,14 @@ cd /path/to/daita-agents
 python3.11 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 ```
+
+`pyproject.toml` `[project].version` is the sole authored Daita release
+identity. Runtime version displays read installed `daita-agents` distribution
+metadata. Because editable metadata is an installation snapshot, rerun the
+editable install command after changing that value or checking out a commit
+with another value, before importing Daita or running tests. The agent-home
+revision remains independent and changes only through an appended durable-format
+migration.
 
 Python 3.11 and 3.12 are supported.
 
@@ -841,8 +862,9 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/artifacts/store.py` | committed artifact storage boundary |
 | `src/daita/storage/sqlite.py` | durable state operations |
 | `src/daita/storage/sqlite_schema.py` | current physical schema |
-| `src/daita/storage/sqlite_codecs/` | current record-family codecs |
-| `src/daita/storage/sqlite_migrations/` | checksummed migration engine |
+| `src/daita/storage/sqlite_codecs/` | strict current-record serializers |
+| `src/daita/storage/home_migrations/` | whole-home revision registry and immutable transitions |
+| `src/daita/hosting/home_upgrade.py` | staged upgrade, validation, rollback, and crash recovery |
 | `src/daita/llm/routing.py` | normalized provider routing |
 | `tests/architecture/test_boundaries.py` | architecture and public-surface boundaries |
 

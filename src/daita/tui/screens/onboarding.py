@@ -74,8 +74,9 @@ class AgentCreateScreen(Screen[str | None]):
 class ModelSetupScreen(Screen[bool]):
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self) -> None:
+    def __init__(self, *, initial_help: str | None = None) -> None:
         super().__init__()
+        self._initial_help = initial_help or "Choose a provider, then a model."
         self._provider: str | None = None
         self._model: str | None = None
         self._subscription_prompt: tuple[str, str] | None = None
@@ -84,7 +85,14 @@ class ModelSetupScreen(Screen[bool]):
         with Vertical(id="onboard", classes="control-panel"):
             yield Label("Configure a model", id="onboard-title", markup=False)
             yield Static(
-                "Choose a provider, then a model.", id="model-help", markup=False
+                sanitize_terminal_text(
+                    self._initial_help,
+                    maximum=512,
+                    preserve_lines=True,
+                    fallback="Choose a provider, then a model.",
+                ),
+                id="model-help",
+                markup=False,
             )
             yield Button("Choose provider", id="choose-provider", variant="primary")
             yield Input(

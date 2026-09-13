@@ -159,9 +159,12 @@ async def test_model_configuration_round_trips_without_persisting_the_key(tmp_pa
     persisted = config_path.read_text(encoding="utf-8")
     assert "secret-value" not in persisted
     document = json.loads(persisted)
-    stored_profile = document["model_route"]["candidates"][0]["profile"]
-    assert stored_profile["input_cost_per_million_usd"] is None
-    assert stored_profile["output_cost_per_million_usd"] is None
+    stored_candidate = document["model_route"]["candidates"][0]
+    assert stored_candidate["profile_limits"] == {
+        "context_window_tokens": 8192,
+        "max_output_tokens": 1024,
+    }
+    assert "profile" not in stored_candidate
     assert route.candidates[0].secret_reference is not None
     assert route.candidates[0].secret_reference.to_uri() in persisted
 
@@ -334,7 +337,6 @@ async def test_incomplete_or_terminal_unsafe_route_fails_closed(tmp_path, mutati
         candidate["secret_reference"] = None
     else:
         candidate["provider_id"] = "openai:test\x1b[2J"
-        candidate["profile"]["id"] = candidate["provider_id"]
     path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(Exception, match="model configuration"):
@@ -437,7 +439,7 @@ async def test_reviewed_openai_suggestions_use_authoritative_profile_facts(tmp_p
         assert profile.supports_reasoning is True
 
 
-async def test_stale_profile_is_rejected_with_reconfiguration_error(tmp_path):
+async def test_invalid_custom_profile_limits_require_reconfiguration(tmp_path):
     await _create_unconfigured(tmp_path)
     keychain = _FakeKeychain()
     await _configure(
@@ -448,9 +450,9 @@ async def test_stale_profile_is_rejected_with_reconfiguration_error(tmp_path):
     )
     path = tmp_path / "agents" / "atlas" / "config.json"
     document = json.loads(path.read_text(encoding="utf-8"))
-    document["model_route"]["candidates"][0]["profile"][
-        "supports_parallel_tools"
-    ] = True
+    document["model_route"]["candidates"][0]["profile_limits"][
+        "context_window_tokens"
+    ] = 0
     path.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(

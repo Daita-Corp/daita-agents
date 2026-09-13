@@ -85,6 +85,7 @@ async def test_agent_picker_create_button_routes_to_existing_creation_flow(
                 break
         picker = app.screen
         assert isinstance(picker, SelectionScreen)
+        await pilot.pause()
         create = picker.query_one("#picker-secondary", Button)
         assert str(create.label) == "Create new agent"
         assert await pilot.click(create) is True
@@ -125,6 +126,164 @@ async def test_agent_picker_create_button_routes_to_existing_creation_flow(
         "existing-one",
         "existing-two",
     )
+
+
+async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
+    tmp_path: Path,
+):
+    first = await Agent.create(
+        "existing-one", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    await first.close()
+    second = await Agent.create(
+        "existing-two", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    await second.close()
+
+    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
+    async with app.run_test(size=(90, 28)) as pilot:
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen):
+                break
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        await pilot.pause()
+        buttons = tuple(picker.query_one("#picker-actions").query(Button))
+        assert [str(button.label) for button in buttons] == [
+            "Create new agent",
+            "Delete agent",
+        ]
+        assert len({button.region.y for button in buttons}) == 1
+
+        assert await pilot.click("#picker-tertiary") is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen) and app.screen is not picker:
+                break
+        delete_picker = app.screen
+        assert isinstance(delete_picker, SelectionScreen)
+        assert "Select an agent to delete" in str(
+            delete_picker.query_one("#picker-title").render()
+        )
+        listing = delete_picker.query_one("#picker-options", OptionList)
+        assert await pilot.click(listing, offset=(2, 1)) is True
+
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, ConfirmScreen):
+                break
+        confirmation = app.screen
+        assert isinstance(confirmation, ConfirmScreen)
+        assert "existing-two" in str(
+            confirmation.query_one("#confirm-message").render()
+        )
+        assert "workspace files are not modified" in str(
+            confirmation.query_one("#confirm-message").render()
+        )
+        confirmation_input = confirmation.query_one("#confirm-input", Input)
+        confirmation_input.value = "not-an-agent"
+        confirmation_input.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert app.screen is confirmation
+        assert "did not match" in str(
+            confirmation.query_one("#confirm-message").render()
+        )
+        assert await Agent.list(root=tmp_path) == ("existing-one", "existing-two")
+
+        confirmation_input.value = "existing-two"
+        await pilot.press("enter")
+
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen):
+                break
+        assert isinstance(app.screen, SelectionScreen)
+        assert await Agent.list(root=tmp_path) == ("existing-one",)
+
+        assert await pilot.click("#picker-tertiary") is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if (
+                isinstance(app.screen, SelectionScreen)
+                and app.screen is not picker
+                and "to delete" in str(app.screen.query_one("#picker-title").render())
+            ):
+                break
+        final_delete_picker = app.screen
+        assert isinstance(final_delete_picker, SelectionScreen)
+        listing = final_delete_picker.query_one("#picker-options", OptionList)
+        assert await pilot.click(listing, offset=(2, 0)) is True
+
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, ConfirmScreen):
+                break
+        delete_confirmation = app.screen
+        assert isinstance(delete_confirmation, ConfirmScreen)
+        confirmation_input = delete_confirmation.query_one("#confirm-input", Input)
+        confirmation_input.value = "existing-one"
+        confirmation_input.focus()
+        await pilot.press("enter")
+
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, AgentCreateScreen):
+                break
+        assert isinstance(app.screen, AgentCreateScreen)
+        assert await Agent.list(root=tmp_path) == ()
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert app.return_value == 0
+
+
+async def test_agent_picker_recovers_incompatible_model_settings_for_replacement(
+    tmp_path: Path,
+):
+    legacy = await Agent.create(
+        "legacy-model", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    await legacy.close()
+    other = await Agent.create(
+        "other-agent", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    await other.close()
+    config_path = tmp_path / "agents" / "legacy-model" / "config.json"
+    config_path.write_text("{}", encoding="utf-8")
+    before = config_path.read_bytes()
+
+    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
+    async with app.run_test(size=(90, 28)) as pilot:
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen):
+                break
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        listing = picker.query_one("#picker-options", OptionList)
+        assert await pilot.click(listing, offset=(2, 0)) is True
+
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, ModelSetupScreen):
+                break
+        setup = app.screen
+        assert isinstance(setup, ModelSetupScreen)
+        assert "no longer compatible" in str(
+            setup.query_one("#model-help", Static).content
+        )
+        assert app.controller.require_agent().name == "legacy-model"
+        assert app.controller.require_agent().model_profile is None
+        assert config_path.read_bytes() == before
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, ChatScreen)
+        app.exit(0)
+
+    assert config_path.read_bytes() == before
 
 
 async def test_app_resize_and_too_small_screen(tmp_path: Path):
@@ -180,7 +339,9 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
     boot = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with boot.run_test(size=(80, 24)):
         welcome = boot.query_one("#boot", WelcomeView)
-        assert "DAITA  1.0.1" in str(welcome.content)
+        from daita import __version__
+
+        assert f"DAITA  {__version__}" in str(welcome.content)
         assert "█████       ███" in str(welcome.content)
         assert "████████████▄" in str(welcome.content)
         assert "Your persistent data agent" in str(welcome.content)

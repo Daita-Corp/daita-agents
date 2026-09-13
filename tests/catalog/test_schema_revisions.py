@@ -179,6 +179,8 @@ async def test_schema_slice_reopens_with_one_decode_and_identical_payload(
         workspace=workspace_for(tmp_path),
     )
     try:
+        assert decode_count == 1
+        decode_count = 0
         first = await _schema(reopened, resource_ids=resource_ids)
         second = await _schema(reopened, resource_ids=resource_ids)
         assert canonical_json(first) == expected
@@ -303,6 +305,8 @@ async def test_validation_schema_reopen_decodes_and_compiles_once(
         "catalog-validation-reopen", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     try:
+        assert decode_count == 1
+        decode_count = 0
         store = reopened._embedded._store
         snapshot_read_count = 0
         original_snapshot = store.load_current_snapshot

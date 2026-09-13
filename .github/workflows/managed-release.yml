@@ -23,8 +23,10 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     outputs:
-      version: ${{ steps.release.outputs.version }}
-      wheel: ${{ steps.release.outputs.wheel }}
+      version: ${{ steps.identity.outputs.version }}
+      tag: ${{ steps.identity.outputs.tag }}
+      wheel: ${{ steps.artifact.outputs.wheel }}
+      mode: ${{ steps.identity.outputs.mode }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,44 +34,112 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -e ".[dev]" pipx build==1.5.1
-      - id: release
-        name: Validate release identity
+      - run: python -m pip install -e ".[dev]" pipx
+      - id: identity
+        name: Validate project, tag, and checkout identity
         env:
           PUBLISH_REQUESTED: ${{ inputs.publish || false }}
         shell: bash
         run: |
-          version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          policy_version="$(python -c 'import json; print(json.load(open("release/managed-installer.json"))["installer"]["version"])')"
-          test "$policy_version" = "$version"
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            test "$GITHUB_REF_NAME" = "v$version"
-            test "$(git rev-list -n 1 "$GITHUB_REF_NAME")" = "$GITHUB_SHA"
-          fi
+          version="$(python scripts/release_identity.py project-version)"
+          tag="$(python scripts/release_identity.py project-tag)"
+          mode=branch
           if [[ "$PUBLISH_REQUESTED" == "true" ]]; then
             test "$GITHUB_REF_TYPE" = "tag"
+            mode=protected
+          elif [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            mode=candidate
           fi
-          wheel="daita_agents-${version}-py3-none-any.whl"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "wheel=$wheel" >> "$GITHUB_OUTPUT"
-          echo "source_date_epoch=$(git show -s --format=%ct HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Build candidate wheel once
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            test "$GITHUB_REF_NAME" = "$tag"
+            test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+            test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "mode=$mode"
+            echo "source_date_epoch=$(git show -s --format=%ct HEAD)"
+          } >> "$GITHUB_OUTPUT"
+      - name: Collect complete GitHub and PyPI published-version evidence
         env:
-          SOURCE_DATE_EPOCH: ${{ steps.release.outputs.source_date_epoch }}
-        run: python -m build --wheel --outdir release-artifacts
-      - name: Render immutable installer and release evidence
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          candidate="release-artifacts/${{ steps.release.outputs.wheel }}"
-          test -f "$candidate"
+          gh api --paginate --slurp \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/github-release-pages.json"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 3 \
+            --output "$RUNNER_TEMP/pypi-project.json" \
+            "https://pypi.org/pypi/daita-agents/json"
+          python - \
+            "$RUNNER_TEMP/github-release-pages.json" \
+            "$RUNNER_TEMP/pypi-project.json" \
+            "$RUNNER_TEMP/prior-versions.txt" \
+            "${{ steps.identity.outputs.version }}" \
+            "${{ steps.identity.outputs.tag }}" \
+            "${{ steps.identity.outputs.mode }}" \
+            "${{ github.ref_type }}" <<'PY'
+          import json
+          import sys
+
+          from scripts.release_identity import (
+              parse_published_version_evidence,
+              prior_versions_for_mode,
+          )
+
+          github_path, pypi_path, output_path, candidate, tag, mode, ref_type = sys.argv[1:]
+          github_pages = json.load(open(github_path, encoding="utf-8"))
+          pypi = json.load(open(pypi_path, encoding="utf-8"))
+          evidence = parse_published_version_evidence(github_pages, pypi)
+          ordered = prior_versions_for_mode(
+              evidence,
+              candidate=candidate,
+              tag=tag,
+              mode=mode,
+              tagged=ref_type == "tag",
+          )
+          with open(output_path, "w", encoding="utf-8") as output:
+              for value in ordered:
+                  output.write(value + "\n")
+          PY
+      - name: Admit candidate before building
+        if: steps.identity.outputs.mode != 'branch' || github.ref_type == 'tag'
+        run: |
+          python scripts/release_identity.py require-newer \
+            --candidate "${{ steps.identity.outputs.version }}" \
+            --previous-file "$RUNNER_TEMP/prior-versions.txt"
+      - id: artifact
+        name: Build and inspect the candidate wheel once
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.identity.outputs.source_date_epoch }}
+        shell: bash
+        run: |
+          python -m build --wheel --outdir release-artifacts
+          shopt -s nullglob
+          wheels=(release-artifacts/*.whl)
+          test "${#wheels[@]}" -eq 1
+          candidate="${wheels[0]}"
+          wheel="$(basename "$candidate")"
+          inspected="$(python -c 'import pathlib, sys; from scripts.render_managed_installer import inspect_wheel; print(inspect_wheel(pathlib.Path(sys.argv[1])).version)' "$candidate")"
+          test "$inspected" = "${{ steps.identity.outputs.version }}"
+          test "$wheel" = "daita_agents-${inspected}-py3-none-any.whl"
+          echo "wheel=$wheel" >> "$GITHUB_OUTPUT"
+      - name: Render immutable installer and release evidence twice
+        shell: bash
+        run: |
+          candidate="release-artifacts/${{ steps.artifact.outputs.wheel }}"
+          url="https://github.com/Daita-Corp/daita-agents/releases/download/${{ steps.identity.outputs.tag }}/${{ steps.artifact.outputs.wheel }}"
           python scripts/render_managed_installer.py \
-            --wheel "$candidate" \
-            --wheel-url "https://github.com/Daita-Corp/daita-agents/releases/download/v${{ steps.release.outputs.version }}/${{ steps.release.outputs.wheel }}" \
+            --wheel "$candidate" --wheel-url "$url" \
             --installer-output release-artifacts/install.sh \
             --manifest-output release-artifacts/release-manifest.json
           python scripts/render_managed_installer.py \
-            --wheel "$candidate" \
-            --wheel-url "https://github.com/Daita-Corp/daita-agents/releases/download/v${{ steps.release.outputs.version }}/${{ steps.release.outputs.wheel }}" \
+            --wheel "$candidate" --wheel-url "$url" \
             --installer-output "$RUNNER_TEMP/install.sh" \
             --manifest-output "$RUNNER_TEMP/release-manifest.json"
           cmp release-artifacts/install.sh "$RUNNER_TEMP/install.sh"
@@ -78,22 +148,49 @@ jobs:
           shellcheck release-artifacts/install.sh
           release-artifacts/install.sh --version
           release-artifacts/install.sh --dry-run --no-onboard --no-modify-path
-      - name: Exercise the once-built wheel through both local lifecycles
+      - name: Verify the once-built wheel through local managed and pipx lifecycles
         shell: bash
         run: |
-          candidate="$(pwd)/release-artifacts/${{ steps.release.outputs.wheel }}"
+          candidate="$(pwd)/release-artifacts/${{ steps.artifact.outputs.wheel }}"
           python -m tests.packaging.managed_installer_lifecycle_smoke --candidate-wheel "$candidate"
           python -m tests.packaging.pipx_lifecycle_smoke --candidate-wheel "$candidate"
       - name: Record release checksums
         working-directory: release-artifacts
         shell: bash
-        run: sha256sum "${{ steps.release.outputs.wheel }}" install.sh release-manifest.json > SHA256SUMS
+        run: sha256sum "${{ steps.artifact.outputs.wheel }}" install.sh release-manifest.json > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: managed-release
           path: release-artifacts/
           if-no-files-found: error
           retention-days: 30
+
+  deterministic-and-static:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: managed-release
+          path: release-artifacts
+      - name: Install the exact producer wheel with verification dependencies
+        run: |
+          python -m pip install \
+            "$(pwd)/release-artifacts/${{ needs.build.outputs.wheel }}[dev]"
+      - name: Run deterministic and static release gates
+        env:
+          DAITA_TEST_CANDIDATE_WHEEL: ${{ github.workspace }}/release-artifacts/${{ needs.build.outputs.wheel }}
+        run: |
+          python -m pytest tests/ -m "not requires_llm and not requires_db and not requires_network and not slow"
+          python -m black --check src tests scripts
+          python -m ruff check --select I .
+          python -m mypy src/daita tests
+          bash -n release-artifacts/install.sh
+          shellcheck release-artifacts/install.sh
 
   native-installer-smoke:
     needs: build
@@ -152,7 +249,7 @@ jobs:
             "${{ steps.runtime.outputs.uv_url }}"
           actual="$(python -c 'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' "$archive")"
           test "$actual" = "${{ steps.runtime.outputs.uv_sha256 }}"
-      - name: Exercise real managed lifecycle on ${{ matrix.target }}
+      - name: Exercise exact built artifact on ${{ matrix.target }}
         shell: bash
         run: |
           python -m tests.packaging.managed_installer_lifecycle_smoke \
@@ -167,6 +264,7 @@ jobs:
     if: github.event_name == 'workflow_dispatch' && inputs.publish == true && github.ref_type == 'tag'
     needs:
       - build
+      - deterministic-and-static
       - native-installer-smoke
     runs-on: ubuntu-24.04
     environment: managed-installer-release
@@ -175,19 +273,80 @@ jobs:
       contents: write
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions/download-artifact@v4
         with:
           name: managed-release
           path: release-artifacts
-      - name: Refuse an existing mutable release
+      - name: Verify propagated project, tag, wheel, and manifest identity
+        shell: bash
+        run: |
+          project_version="$(python scripts/release_identity.py project-version)"
+          project_tag="$(python scripts/release_identity.py project-tag)"
+          test "$project_version" = "${{ needs.build.outputs.version }}"
+          test "$project_tag" = "$GITHUB_REF_NAME"
+          python - \
+            release-artifacts/release-manifest.json \
+            "$project_version" \
+            "${{ needs.build.outputs.wheel }}" <<'PY'
+          import json
+          import sys
+
+          path, version, wheel = sys.argv[1:]
+          manifest = json.load(open(path, encoding="utf-8"))
+          if manifest.get("application", {}).get("version") != version:
+              raise SystemExit("manifest application version does not match the project")
+          if manifest.get("wheel", {}).get("filename") != wheel:
+              raise SystemExit("manifest wheel filename does not match the build")
+          PY
+      - name: Repeat complete protected published-version admission
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "Release $GITHUB_REF_NAME already exists; refusing to replace assets." >&2
-            exit 1
-          fi
+          gh api --paginate --slurp \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            > "$RUNNER_TEMP/final-github-release-pages.json"
+          curl --fail --silent --show-error --location \
+            --proto '=https' --tlsv1.2 \
+            --retry 10 --retry-all-errors --retry-delay 3 \
+            --output "$RUNNER_TEMP/final-pypi-project.json" \
+            "https://pypi.org/pypi/daita-agents/json"
+          python - \
+            "$RUNNER_TEMP/final-github-release-pages.json" \
+            "$RUNNER_TEMP/final-pypi-project.json" \
+            "$RUNNER_TEMP/final-prior-versions.txt" \
+            "${{ needs.build.outputs.version }}" \
+            "$GITHUB_REF_NAME" <<'PY'
+          import json
+          import sys
+
+          from scripts.release_identity import (
+              parse_published_version_evidence,
+              prior_versions_for_mode,
+          )
+
+          github_path, pypi_path, output_path, candidate, tag = sys.argv[1:]
+          github_pages = json.load(open(github_path, encoding="utf-8"))
+          pypi = json.load(open(pypi_path, encoding="utf-8"))
+          evidence = parse_published_version_evidence(github_pages, pypi)
+          ordered = prior_versions_for_mode(
+              evidence, candidate=candidate, tag=tag, mode="protected"
+          )
+          with open(output_path, "w", encoding="utf-8") as output:
+              for value in ordered:
+                  output.write(value + "\n")
+          PY
+          python scripts/release_identity.py require-newer \
+            --candidate "${{ needs.build.outputs.version }}" \
+            --previous-file "$RUNNER_TEMP/final-prior-versions.txt"
       - name: Require the exact public PyPI wheel
         env:
           VERSION: ${{ needs.build.outputs.version }}
@@ -208,8 +367,7 @@ jobs:
           import sys
 
           response, version, wheel, expected = sys.argv[1:]
-          with open(response, encoding="utf-8") as source:
-              document = json.load(source)
+          document = json.load(open(response, encoding="utf-8"))
           if document.get("info", {}).get("version") != version:
               raise SystemExit("PyPI returned the wrong release version")
           files = document.get("urls", [])
@@ -219,26 +377,6 @@ jobs:
           if actual != expected:
               raise SystemExit("PyPI wheel SHA-256 does not match the release artifact")
           PY
-      - name: Require a forward-only release sequence
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          current="$(python -c 'import json; print(json.load(open("release-artifacts/release-manifest.json"))["installer"]["release_sequence"])')"
-          previous_tag="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
-          if [[ -z "$previous_tag" ]]; then
-            test "$current" -eq 1
-            exit 0
-          fi
-          mkdir "$RUNNER_TEMP/previous-release"
-          gh release download "$previous_tag" \
-            --pattern release-manifest.json \
-            --dir "$RUNNER_TEMP/previous-release"
-          previous="$(python -c 'import json, os; print(json.load(open(os.path.join(os.environ["RUNNER_TEMP"], "previous-release", "release-manifest.json")))["installer"]["release_sequence"])')"
-          if (( current <= previous )); then
-            echo "Release sequence $current must be greater than published sequence $previous." >&2
-            exit 1
-          fi
       - name: Attest exact release artifacts
         uses: actions/attest-build-provenance@v3
         with:
@@ -247,7 +385,7 @@ jobs:
             release-artifacts/install.sh
             release-artifacts/release-manifest.json
             release-artifacts/SHA256SUMS
-      - name: Publish versioned release
+      - name: Publish immutable versioned release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash

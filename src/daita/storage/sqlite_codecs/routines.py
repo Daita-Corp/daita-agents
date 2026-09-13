@@ -1,4 +1,4 @@
-"""Encode and decode the current codec-v1 routine aggregates."""
+"""Encode and decode the current canonical routine aggregates."""
 
 from __future__ import annotations
 
@@ -58,9 +58,6 @@ from .execution_scope import (
     encode_execution_scope,
 )
 
-_ROUTINE_VERSION = 1
-_OCCURRENCE_VERSION = 1
-
 
 def encode_scheduled_routine(value: ScheduledRoutine) -> str:
     if not isinstance(value, ScheduledRoutine):
@@ -69,7 +66,6 @@ def encode_scheduled_routine(value: ScheduledRoutine) -> str:
         record(
             "ScheduledRoutine",
             {
-                "version": _ROUTINE_VERSION,
                 "conversation_id": value.conversation_id,
                 "owner_principal_id": value.owner_principal_id,
                 "title": value.title,
@@ -162,7 +158,6 @@ def decode_scheduled_routine(
         load_payload(value),
         "ScheduledRoutine",
         (
-            "version",
             "conversation_id",
             "owner_principal_id",
             "title",
@@ -214,8 +209,6 @@ def decode_scheduled_routine(
             "updated_at",
         ),
     )
-    if integer(fields["version"], "routine version") != _ROUTINE_VERSION:
-        raise ValueError("stored routine version is unsupported")
     try:
         misfire = MisfirePolicy(text(fields["misfire_policy"], "misfire policy"))
         reporting = ReportingMode(text(fields["reporting_mode"], "reporting mode"))
@@ -365,7 +358,6 @@ def encode_routine_occurrence(value: RoutineOccurrence) -> str:
         record(
             "RoutineOccurrence",
             {
-                "version": _OCCURRENCE_VERSION,
                 "routine_id": value.routine_id,
                 "routine_revision": value.routine_revision,
                 "slot_kind": value.slot_kind.value,
@@ -417,7 +409,6 @@ def decode_routine_occurrence(
         load_payload(value),
         "RoutineOccurrence",
         (
-            "version",
             "routine_id",
             "routine_revision",
             "slot_kind",
@@ -448,8 +439,6 @@ def decode_routine_occurrence(
             "updated_at",
         ),
     )
-    if integer(fields["version"], "occurrence version") != _OCCURRENCE_VERSION:
-        raise ValueError("stored occurrence version is unsupported")
     try:
         slot_kind = RoutineSlotKind(text(fields["slot_kind"], "slot kind"))
         disposition = RoutineOccurrenceDisposition(

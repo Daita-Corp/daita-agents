@@ -14,9 +14,6 @@ from .common import (
     text,
 )
 
-_SOURCE_READ_SCOPE_VERSION = 1
-_RELATIONAL_WRITE_SCOPE_VERSION = 1
-
 
 def encode_source_read_scope(value: SourceReadScope) -> str:
     if not isinstance(value, SourceReadScope):
@@ -25,7 +22,6 @@ def encode_source_read_scope(value: SourceReadScope) -> str:
         record(
             "SourceReadScope",
             {
-                "version": _SOURCE_READ_SCOPE_VERSION,
                 "mode": value.mode.value,
                 "resource_ids": list(value.resource_ids),
             },
@@ -42,10 +38,8 @@ def decode_source_read_scope(
     fields = record_fields(
         load_payload(value),
         "SourceReadScope",
-        ("version", "mode", "resource_ids"),
+        ("mode", "resource_ids"),
     )
-    if integer(fields["version"], "read scope version") != _SOURCE_READ_SCOPE_VERSION:
-        raise ValueError("stored read scope version is unsupported")
     try:
         mode = SourceReadMode(text(fields["mode"], "read scope mode"))
     except ValueError:
@@ -69,7 +63,6 @@ def encode_relational_write_scope(value: RelationalWriteScope) -> str:
         record(
             "RelationalWriteScope",
             {
-                "version": _RELATIONAL_WRITE_SCOPE_VERSION,
                 **{
                     key: plain_encode(item) for key, item in value.constraints().items()
                 },
@@ -90,7 +83,6 @@ def decode_relational_write_scope(
         load_payload(value),
         "RelationalWriteScope",
         (
-            "version",
             "resource_revision",
             "allowed_operations",
             "allowed_insert_columns",
@@ -100,11 +92,6 @@ def decode_relational_write_scope(
             "max_rows",
         ),
     )
-    if (
-        integer(fields["version"], "write scope version")
-        != _RELATIONAL_WRITE_SCOPE_VERSION
-    ):
-        raise ValueError("stored relational write scope version is unsupported")
 
     def names(name: str) -> tuple[str, ...]:
         return tuple(text(item, name) for item in sequence(fields[name], name))

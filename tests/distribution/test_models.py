@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -422,9 +423,11 @@ def test_delivery_and_embedded_contract_codecs_round_trip_one_current_shape() ->
         )
         == exact_delivery
     )
-    with pytest.raises(ValueError, match="version is unsupported"):
+    payload = json.loads(encoded_delivery)
+    payload["fields"]["version"] = 1
+    with pytest.raises(ValueError, match="unknown fields"):
         decode_delivery(
-            encoded_delivery.replace('"version":1', '"version":2'),
+            json.dumps(payload),
             agent_id=exact_delivery.agent_id,
             delivery_id=exact_delivery.delivery_id,
         )

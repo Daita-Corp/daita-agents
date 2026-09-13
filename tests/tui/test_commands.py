@@ -244,6 +244,59 @@ async def test_selection_screen_secondary_action_is_distinct_from_options():
     assert app.return_value == ("create",)
 
 
+async def test_selection_screen_tertiary_action_does_not_require_a_selection():
+    class Harness(App[tuple[str, ...] | None]):
+        def compose(self) -> ComposeResult:
+            yield Static("host")
+
+        def on_mount(self) -> None:
+            self.run_worker(self._present(), exclusive=True)
+
+        async def _present(self) -> None:
+            result = await self.push_screen_wait(
+                SelectionScreen(
+                    title="Pick",
+                    options=(
+                        PickerOption("first", "First"),
+                        PickerOption("second", "Second"),
+                    ),
+                    secondary_action=PickerOption("create", "Create new"),
+                    tertiary_action=PickerOption("delete", "Delete"),
+                )
+            )
+            self.exit(result)
+
+    with pytest.raises(ValueError, match="tertiary action identity must differ"):
+        SelectionScreen(
+            title="Invalid",
+            options=(PickerOption("same", "Existing"),),
+            tertiary_action=PickerOption("same", "Delete"),
+        )
+    with pytest.raises(ValueError, match="picker action identities must be distinct"):
+        SelectionScreen(
+            title="Invalid",
+            options=(PickerOption("existing", "Existing"),),
+            secondary_action=PickerOption("action", "Create"),
+            tertiary_action=PickerOption("action", "Delete"),
+        )
+
+    app = Harness()
+    async with app.run_test(size=(90, 28)) as pilot:
+        await pilot.pause()
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        buttons = tuple(picker.query_one("#picker-actions").query(Button))
+        assert [str(button.label) for button in buttons] == [
+            "Select",
+            "Create new",
+            "Delete",
+        ]
+        assert len({button.region.y for button in buttons}) == 1
+        assert await pilot.click("#picker-tertiary") is True
+        await pilot.pause()
+    assert app.return_value == ("delete",)
+
+
 async def test_multi_selection_shows_literal_marks_and_continue_button():
     class Harness(App[tuple[str, ...] | None]):
         def compose(self) -> ComposeResult:

@@ -1852,7 +1852,7 @@ def test_pricing_semantics_have_one_provider_neutral_owner():
         assert provider not in pricing
 
 
-def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
+def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
     pragma_owners = {
         path.relative_to(PACKAGE).as_posix()
         for path in PACKAGE.rglob("*.py")
@@ -1860,13 +1860,14 @@ def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
     }
     assert pragma_owners == set()
     migration_files = {
-        path.name for path in (PACKAGE / "storage" / "sqlite_migrations").glob("*.py")
+        path.name for path in (PACKAGE / "storage" / "home_migrations").glob("*.py")
     }
     assert migration_files == {
         "__init__.py",
         "baseline.py",
         "models.py",
-        "runner.py",
+        "registry.py",
+        "revision_0001.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 
@@ -1885,12 +1886,13 @@ def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
         "schema_version",
         "schema-version",
         "user_version",
-        "sqlite_migrations",
+        "storage/sqlite_migrations",
         "sqlite_codecs",
     ):
         assert term not in text
 
-    assert (PACKAGE / "storage" / "sqlite_migrations").is_dir()
+    assert not (PACKAGE / "storage" / "sqlite_migrations").exists()
+    assert (PACKAGE / "storage" / "home_migrations").is_dir()
     assert (PACKAGE / "storage" / "sqlite_codecs").is_dir()
     assert not (PACKAGE / "migrations").exists()
     production = _python_text(PACKAGE)
@@ -1919,7 +1921,7 @@ def test_sqlite_journal_and_codecs_have_one_append_only_storage_owner():
         relative = path.relative_to(PACKAGE).as_posix()
         text = path.read_text(encoding="utf-8")
         if not relative.startswith("storage/"):
-            assert "sqlite_migrations" not in text
+            assert "storage.sqlite_migrations" not in text
             assert "sqlite_codecs" not in text
 
 

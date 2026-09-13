@@ -51,7 +51,7 @@ async def test_current_state_schema_and_conversation_index_are_exact(tmp_path):
             "snapshots",
             "source_read_scopes",
             "sources",
-            "state_migrations",
+            "agent_home_migrations",
             "syncs",
         }
         assert columns == {
@@ -130,7 +130,7 @@ async def test_current_state_schema_and_conversation_index_are_exact(tmp_path):
             "snapshots": ("agent_id", "source_id", "sync_id", "data"),
             "source_read_scopes": ("agent_id", "source_id", "data"),
             "sources": ("agent_id", "id", "data"),
-            "state_migrations": ("ordinal", "migration_id", "checksum"),
+            "agent_home_migrations": ("revision", "migration_id", "checksum"),
             "syncs": ("agent_id", "id", "source_id", "data"),
         }
         assert named_indexes == {

@@ -1259,42 +1259,11 @@ class LocalArtifactDelivery:
             )
 
     def _load_config(self) -> None:
-        if not self._config_path.exists():
-            return
         try:
-            facts = self._config_path.lstat()
-            if not stat.S_ISREG(facts.st_mode) or self._config_path.is_symlink():
-                raise ValueError("delivery config is not a regular file")
-            if os.name != "nt" and stat.S_IMODE(facts.st_mode) != 0o600:
-                raise ValueError("delivery config permissions are invalid")
-            content = self._config_path.read_bytes()
-            if len(content) > _MAX_CONFIG_BYTES:
-                raise ValueError("delivery config exceeds its bound")
-            raw = json.loads(content.decode("utf-8"))
-            if not isinstance(raw, dict) or set(raw) != {
-                "default_destination_id",
-                "persistent_destinations",
-            }:
-                raise ValueError("delivery config shape is invalid")
-            entries = raw["persistent_destinations"]
-            if (
-                not isinstance(entries, list)
-                or len(entries) > MAX_PERSISTENT_DESTINATIONS
-            ):
-                raise ValueError("delivery destination count is invalid")
-            persistent: dict[str, _DestinationGrant] = {}
-            for item in entries:
-                if not isinstance(item, dict):
-                    raise ValueError("delivery destination entry is invalid")
-                grant = _grant_from_mapping(item)
-                if grant.destination_id in persistent:
-                    raise ValueError("delivery destination identity duplicates")
-                persistent[grant.destination_id] = grant
-            default_id = raw["default_destination_id"]
-            if default_id is not None and default_id not in persistent:
-                raise ValueError("delivery default is not a persistent destination")
-            if content != canonical_json(raw).encode("utf-8"):
-                raise ValueError("delivery config is not canonical")
+            loaded = _read_delivery_configuration(self._config_path)
+            if loaded is None:
+                return
+            persistent, default_id = loaded
             self._persistent = persistent
             self._default_id = default_id
         except Exception as error:
@@ -1376,6 +1345,62 @@ class LocalArtifactDelivery:
             "sha256:"
             + sha256(canonical_json(self._config_mapping()).encode("utf-8")).hexdigest()
         )
+
+
+def _read_delivery_configuration(
+    path: Path,
+) -> tuple[dict[str, _DestinationGrant], str | None] | None:
+    if not path.exists():
+        if path.is_symlink():
+            raise ValueError("delivery config cannot be a broken symlink")
+        return None
+    facts = path.lstat()
+    if not stat.S_ISREG(facts.st_mode) or path.is_symlink():
+        raise ValueError("delivery config is not a regular file")
+    if os.name != "nt" and stat.S_IMODE(facts.st_mode) != 0o600:
+        raise ValueError("delivery config permissions are invalid")
+    content = path.read_bytes()
+    if len(content) > _MAX_CONFIG_BYTES:
+        raise ValueError("delivery config exceeds its bound")
+    raw = json.loads(content.decode("utf-8"))
+    if not isinstance(raw, dict) or set(raw) != {
+        "default_destination_id",
+        "persistent_destinations",
+    }:
+        raise ValueError("delivery config shape is invalid")
+    entries = raw["persistent_destinations"]
+    if not isinstance(entries, list) or len(entries) > MAX_PERSISTENT_DESTINATIONS:
+        raise ValueError("delivery destination count is invalid")
+    persistent: dict[str, _DestinationGrant] = {}
+    for item in entries:
+        if not isinstance(item, dict):
+            raise ValueError("delivery destination entry is invalid")
+        grant = _grant_from_mapping(item)
+        if grant.destination_id in persistent:
+            raise ValueError("delivery destination identity duplicates")
+        persistent[grant.destination_id] = grant
+    default_id = raw["default_destination_id"]
+    if default_id is not None and default_id not in persistent:
+        raise ValueError("delivery default is not a persistent destination")
+    if content != canonical_json(raw).encode("utf-8"):
+        raise ValueError("delivery config is not canonical")
+    return persistent, default_id
+
+
+def validate_delivery_configuration(agent_home: Path) -> None:
+    """Validate the current optional export-location document without mutation."""
+
+    if not isinstance(agent_home, Path) or not agent_home.is_absolute():
+        raise ValueError("agent home must be an absolute path")
+    home = Path(os.path.abspath(os.fspath(agent_home)))
+    facts = home.lstat()
+    if (
+        not stat.S_ISDIR(facts.st_mode)
+        or stat.S_ISLNK(facts.st_mode)
+        or home.resolve(strict=True) != home
+    ):
+        raise ValueError("agent home must be an exact directory")
+    _read_delivery_configuration(home / "artifacts" / "delivery-config.json")
 
 
 def _grant_to_mapping(grant: _DestinationGrant) -> dict[str, object]:
@@ -1798,4 +1823,5 @@ __all__ = [
     "DeliverySourceReader",
     "LocalArtifactDelivery",
     "resolve_os_downloads_directory",
+    "validate_delivery_configuration",
 ]

@@ -72,3 +72,7 @@ class ConfirmScreen(ModalScreen[bool]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self._decide(event.button.id == "confirm-yes")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "confirm-input":
+            self._decide(True)
