@@ -1,4 +1,4 @@
-"""Encode and decode the current codec-v1 durable JobRun aggregate."""
+"""Encode and decode the current canonical durable JobRun aggregate."""
 
 from __future__ import annotations
 
@@ -41,8 +41,6 @@ from .common import (
     text,
 )
 
-_JOB_RUN_VERSION = 1
-
 
 def encode_job_run(value: JobRun) -> str:
     if not isinstance(value, JobRun):
@@ -51,7 +49,6 @@ def encode_job_run(value: JobRun) -> str:
         record(
             "JobRun",
             {
-                "version": _JOB_RUN_VERSION,
                 "conversation_id": value.conversation_id,
                 "origin_run_id": value.origin_run_id,
                 "origin_call_id": value.origin_call_id,
@@ -90,7 +87,6 @@ def decode_job_run(value: str, *, agent_id: str, job_id: str) -> JobRun:
         load_payload(value),
         "JobRun",
         (
-            "version",
             "conversation_id",
             "origin_run_id",
             "origin_call_id",
@@ -111,8 +107,6 @@ def decode_job_run(value: str, *, agent_id: str, job_id: str) -> JobRun:
             "failure_code",
         ),
     )
-    if integer(fields["version"], "job version") != _JOB_RUN_VERSION:
-        raise ValueError("stored job version is unsupported")
     try:
         status = JobStatus(text(fields["status"], "job status"))
         desired = JobDesiredState(text(fields["desired_state"], "job desired state"))

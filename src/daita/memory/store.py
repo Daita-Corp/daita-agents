@@ -340,6 +340,44 @@ class MemoryStore:
             raise MemoryPathError("agent home path is invalid") from error
 
 
+def validate_memory_documents(agent_home: Path) -> None:
+    """Read and validate every current memory document without changing it."""
+
+    if not isinstance(agent_home, Path) or not agent_home.is_absolute():
+        raise MemoryPathError("agent home must be an absolute path")
+    home = Path(os.path.abspath(os.fspath(agent_home)))
+    try:
+        facts = os.lstat(home)
+        if (
+            not stat.S_ISDIR(facts.st_mode)
+            or stat.S_ISLNK(facts.st_mode)
+            or home.resolve(strict=True) != home
+        ):
+            raise MemoryPathError("agent home must be an exact directory")
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        directory = os.open(home, flags)
+    except MemoryPathError:
+        raise
+    except OSError as error:
+        raise MemoryPathError("agent home path is invalid") from error
+    try:
+        _read_owned(
+            directory,
+            _MEMORY_NAME,
+            MEMORY_MAX_CHARACTERS,
+            MEMORY_MAX_UTF8_BYTES,
+        )
+        _read_owned(
+            directory,
+            _USER_NAME,
+            USER_MAX_CHARACTERS,
+            USER_MAX_UTF8_BYTES,
+        )
+    finally:
+        os.close(directory)
+
+
 def _validate_text(text: str, max_characters: int, max_bytes: int) -> bytes:
     if not isinstance(text, str):
         raise TypeError("memory content must be text")
@@ -496,4 +534,5 @@ __all__ = [
     "MemoryStore",
     "MemoryStoreError",
     "MemoryValidationError",
+    "validate_memory_documents",
 ]

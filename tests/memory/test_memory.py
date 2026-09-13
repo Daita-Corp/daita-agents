@@ -27,7 +27,7 @@ from daita.memory import (
     MemoryStore,
     MemoryValidationError,
 )
-from daita.storage.sqlite_migrations import migration_rows
+from daita.storage.home_migrations import migration_rows
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
@@ -415,13 +415,13 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
             "snapshots",
             "source_read_scopes",
             "sources",
-            "state_migrations",
+            "agent_home_migrations",
             "scheduled_routines",
             "syncs",
         }
         for table in tables:
             expected_rows = 1 if table == "metadata" else 0
-            if table == "state_migrations":
+            if table == "agent_home_migrations":
                 expected_rows = len(migration_rows())
             assert (
                 connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

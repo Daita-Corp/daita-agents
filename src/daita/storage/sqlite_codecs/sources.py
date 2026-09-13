@@ -22,19 +22,13 @@ from .common import (
 )
 
 _CURRENT_SOURCE_ADAPTER_IDS = frozenset({"sqlite", "postgresql"})
-_REMOVED_DEVELOPMENT_SOURCE_ADAPTER_IDS = frozenset({"local-directory"})
 
 
 class CurrentSourceAdapterError(ValueError):
-    """Reject source adapter state outside the one current pre-production shape."""
+    """Reject a source adapter outside the one canonical runtime shape."""
 
 
 def _require_current_adapter(adapter_id: str) -> None:
-    if adapter_id in _REMOVED_DEVELOPMENT_SOURCE_ADAPTER_IDS:
-        raise CurrentSourceAdapterError(
-            "agent home contains removed pre-production file-source state; "
-            "delete and recreate this disposable development agent"
-        )
     if adapter_id not in _CURRENT_SOURCE_ADAPTER_IDS:
         raise CurrentSourceAdapterError(
             "stored source registration uses an unsupported current adapter"
@@ -59,6 +53,32 @@ def decode_source(value: str) -> SourceRegistration:
     if decoded.adapter_id == "postgresql" and "write_access" in decoded.configuration:
         raise ValueError("stored PostgreSQL source contains embedded write admission")
     return decoded
+
+
+def decode_source_credential_reference_for_deletion(
+    value: str,
+    *,
+    agent_id: str,
+    source_id: str,
+) -> str | None:
+    """Read only deletion-critical fields across pre-production source shapes."""
+
+    decoded = load_payload(value)
+    if not isinstance(decoded, dict) or set(decoded) != {"__record__", "fields"}:
+        raise ValueError("stored SourceRegistration record envelope is invalid")
+    if decoded["__record__"] != "SourceRegistration":
+        raise ValueError("stored record is not SourceRegistration")
+    fields = mapping(decoded["fields"], "SourceRegistration fields")
+    stored_agent_id = text(fields.get("agent_id"), "source agent_id")
+    stored_source_id = text(fields.get("id"), "source id")
+    if stored_agent_id != agent_id or stored_source_id != source_id:
+        raise ValueError("stored source row identity is invalid")
+    adapter_id = text(fields.get("adapter_id"), "source adapter_id")
+    configuration = mapping(fields.get("configuration"), "source configuration")
+    if adapter_id != "postgresql":
+        return None
+    reference = configuration.get("credential_ref")
+    return None if reference is None else text(reference, "source credential_ref")
 
 
 def _encode_source(value: SourceRegistration) -> dict[str, JsonValue]:
@@ -129,4 +149,9 @@ def _decode_source(value: JsonValue) -> SourceRegistration:
     )
 
 
-__all__ = ["CurrentSourceAdapterError", "decode_source", "encode_source"]
+__all__ = [
+    "CurrentSourceAdapterError",
+    "decode_source",
+    "decode_source_credential_reference_for_deletion",
+    "encode_source",
+]

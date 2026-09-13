@@ -856,7 +856,7 @@ assert any(item.startswith("XlsxWriter") for item in requirements)
         if any(
             migrated_database_rows.get(table) != rows
             for table, rows in preserved_database_rows.items()
-            if table not in {"effect_receipts", "sources", "state_migrations"}
+            if table not in {"effect_receipts", "sources", "agent_home_migrations"}
         ):
             raise AssertionError(
                 "candidate migration changed rows owned by the baseline format"
@@ -866,15 +866,15 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from daita.storage.sqlite_migrations import migration_rows
+from daita.storage.home_migrations import migration_rows
 
 
 path = Path(sys.argv[1]) / "agents" / "preservation-agent" / "state.db"
 with sqlite3.connect(path) as connection:
     journal = tuple(
         connection.execute(
-            "SELECT ordinal, migration_id, checksum "
-            "FROM state_migrations ORDER BY ordinal"
+            "SELECT revision, migration_id, checksum "
+            "FROM agent_home_migrations ORDER BY revision"
         )
     )
 assert journal == migration_rows()

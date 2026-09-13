@@ -48,7 +48,7 @@ from daita.skills.capabilities import (
     SKILL_VIEW_OUTPUT_KIND,
     SKILL_VIEW_TOOL_NAME,
 )
-from daita.storage.sqlite_migrations import migration_rows
+from daita.storage.home_migrations import migration_rows
 from tests.support.capability_runtime import execute_projected
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
@@ -590,12 +590,15 @@ async def test_progressive_view_returns_full_skill_but_initial_prompt_is_shallow
         assert result_block.output["kind"] == SKILL_VIEW_OUTPUT_KIND
         data = result_block.output["data"]
         assert isinstance(data, Mapping)
-        exists, preflight_sha256, _state, _index = (
-            await agent._embedded._skill_store.preflight_save(
-                "monthly-revenue",
-                "Analyze monthly revenue.",
-                instructions,
-            )
+        (
+            exists,
+            preflight_sha256,
+            _state,
+            _index,
+        ) = await agent._embedded._skill_store.preflight_save(
+            "monthly-revenue",
+            "Analyze monthly revenue.",
+            instructions,
         )
         assert exists is True
         assert dict(data) == {
@@ -1062,12 +1065,12 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
             "snapshots",
             "source_read_scopes",
             "sources",
-            "state_migrations",
+            "agent_home_migrations",
             "syncs",
         }
         for table in tables:
             expected_rows = 1 if table == "metadata" else 0
-            if table == "state_migrations":
+            if table == "agent_home_migrations":
                 expected_rows = len(migration_rows())
             assert (
                 connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]

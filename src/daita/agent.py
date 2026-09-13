@@ -59,6 +59,7 @@ from .hosting.embedded import (
     SourceEditPreview as SourceEditPreview,
     SourceEditResult,
 )
+from .hosting.home_upgrade import AgentHomeStatus
 from .jobs.models import (
     JobExecutionMode,
     JobInspection,
@@ -119,6 +120,17 @@ class Agent:
         """Return valid agent names beneath one admitted Daita root."""
 
         return await EmbeddedAgent.list(root=root)
+
+    @classmethod
+    async def inspect_home(
+        cls,
+        name: str,
+        *,
+        root: str | Path | None = None,
+    ) -> AgentHomeStatus:
+        """Read agent-home revision diagnostics without performing an upgrade."""
+
+        return await EmbeddedAgent.inspect_home(name, root=root)
 
     @classmethod
     async def delete(

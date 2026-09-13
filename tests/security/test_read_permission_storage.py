@@ -28,8 +28,8 @@ from daita.catalog.service import CatalogService
 from daita.domains.data.catalog import CatalogDataView
 from daita.llm.models import ModelSensitivity
 from daita.storage import sqlite as sqlite_module
+from daita.storage.home_migrations import migration_rows
 from daita.storage.sqlite import SQLiteStateStore
-from daita.storage.sqlite_migrations import migration_rows
 from daita.storage.sqlite_records import (
     RelationalWriteScope,
     SourcePermissionStateError,
@@ -178,8 +178,8 @@ async def test_fresh_schema_has_only_scoped_permission_tables(tmp_path: Path) ->
         assert (
             tuple(
                 connection.execute(
-                    "SELECT ordinal, migration_id, checksum "
-                    "FROM state_migrations ORDER BY ordinal"
+                    "SELECT revision, migration_id, checksum "
+                    "FROM agent_home_migrations ORDER BY revision"
                 )
             )
             == migration_rows()

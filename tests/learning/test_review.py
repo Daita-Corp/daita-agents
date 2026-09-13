@@ -167,9 +167,11 @@ async def test_explicit_review_creates_only_inactive_idempotent_candidate(tmp_pa
         await agent.close()
 
 
-async def test_review_skips_unreadable_history_and_reviews_new_compatible_runs(
+async def test_agent_open_rejects_noncanonical_history_without_modifying_state(
     tmp_path,
 ):
+    from daita.errors import StateCompatibilityCode, StateCompatibilityError
+
     ids = _ids()
     foreground = MockModelProvider(
         [
@@ -208,33 +210,20 @@ async def test_review_skips_unreadable_history_and_reviews_new_compatible_runs(
             (json.dumps(document), run_id),
         )
 
-    agent = await Agent.open(
-        "phase4-unreadable-history",
-        root=tmp_path,
-        model=foreground,
-        model_profile=foreground.model_profile,
-        reviewer_model=reviewer,
-        id_factory=ids,
-        workspace=workspace_for(tmp_path),
-    )
-    try:
-        unavailable = await agent.review_learning_candidates()
-        assert unavailable.status is LearningReviewStatus.HISTORY_UNAVAILABLE
-        assert unavailable.skipped_run_count == 1
-        assert unavailable.model_calls == 0
-        assert reviewer.requests == ()
-
-        await agent.run("Remember that booked revenue excludes completed refunds.")
-        reviewed = await agent.review_learning_candidates()
-
-        assert reviewed.status is LearningReviewStatus.COMPLETED
-        assert reviewed.reviewed_run_ids == ("run-2",)
-        assert reviewed.skipped_run_count == 1
-        assert reviewed.model_calls == 1
-        assert len(reviewed.candidates) == 1
-        assert len(reviewer.requests) == 1
-    finally:
-        await agent.close()
+    before = database.read_bytes()
+    with pytest.raises(StateCompatibilityError) as captured:
+        await Agent.open(
+            "phase4-unreadable-history",
+            root=tmp_path,
+            model=foreground,
+            model_profile=foreground.model_profile,
+            reviewer_model=reviewer,
+            id_factory=ids,
+            workspace=workspace_for(tmp_path),
+        )
+    assert captured.value.code is StateCompatibilityCode.DAMAGED
+    assert database.read_bytes() == before
+    assert reviewer.requests == ()
 
 
 async def test_local_review_preparation_failure_is_not_a_provider_failure(

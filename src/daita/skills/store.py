@@ -685,6 +685,94 @@ def validate_skill_name(name: str) -> None:
         raise SkillValidationError("skill name must match [a-z][a-z0-9-]{0,63}")
 
 
+def validate_skill_documents(agent_home: Path) -> None:
+    """Read and validate current and retained skill trees without changing them."""
+
+    store = SkillStore(agent_home, asyncio.Lock())
+    home = store._open_home()
+    try:
+        current, current_state = _open_directory(
+            home, _SKILLS_DIRECTORY, required=False
+        )
+        if current is not None:
+            try:
+                _list_from_root(current)
+                _require_directory_identity(home, _SKILLS_DIRECTORY, current_state)
+            finally:
+                os.close(current)
+
+        retained, retained_state = _open_directory(
+            home, _RETAINED_DIRECTORY, required=False
+        )
+        if retained is None:
+            return
+        try:
+            names = tuple(sorted(os.listdir(retained)))
+            if len(names) > SKILL_RETAINED_MAX_COUNT:
+                raise SkillValidationError("retained skill count exceeds its limit")
+            total_bytes = 0
+            for filename in names:
+                match = re.fullmatch(r"([0-9a-f]{64})\.md", filename)
+                if match is None:
+                    raise SkillPathError(
+                        "retained skill root contains an invalid entry"
+                    )
+                state = _target_state(retained, filename)
+                if state is None:
+                    raise SkillPathError("retained skill content disappeared")
+                _require_regular_owned_file(state, filename)
+                total_bytes += state.st_size
+                if total_bytes > SKILL_RETAINED_MAX_TOTAL_BYTES:
+                    raise SkillValidationError(
+                        "retained skill bytes exceed their limit"
+                    )
+                flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(filename, flags, dir_fd=retained)
+                try:
+                    opened = os.fstat(descriptor)
+                    _require_same_file_state(state, opened, filename)
+                    with os.fdopen(descriptor, "rb") as file:
+                        data = file.read(SKILL_RENDERED_MAX_UTF8_BYTES + 1)
+                        final = os.fstat(file.fileno())
+                    descriptor = -1
+                    _require_same_file_state(state, final, filename)
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                try:
+                    text_value = data.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as error:
+                    raise SkillValidationError(
+                        "retained SKILL.md is not strict UTF-8"
+                    ) from error
+                if text_value.startswith("<!-- daita-sensitivity: "):
+                    _label, separator, text_value = text_value.partition("\n")
+                    if not separator:
+                        raise SkillValidationError(
+                            "retained skill sensitivity label is invalid"
+                        )
+                heading, separator, _body = text_value.partition("\n")
+                if not separator or not heading.startswith("# "):
+                    raise SkillValidationError(
+                        "retained SKILL.md has no canonical identity"
+                    )
+                name = heading.removeprefix("# ")
+                validate_skill_name(name)
+                parsed = store._read_retained_from_root(
+                    retained,
+                    name,
+                    match.group(1),
+                )
+                if parsed.name != name:
+                    raise SkillValidationError("retained skill identity is invalid")
+            _require_directory_identity(home, _RETAINED_DIRECTORY, retained_state)
+        finally:
+            os.close(retained)
+    finally:
+        os.close(home)
+
+
 def render_skill_index(summaries: Iterable[SkillSummary]) -> str:
     values = tuple(sorted(tuple(summaries), key=lambda item: item.name))
     if len(values) > SKILL_MAX_COUNT:
@@ -998,5 +1086,6 @@ __all__ = [
     "SkillSummary",
     "SkillValidationError",
     "render_skill_index",
+    "validate_skill_documents",
     "validate_skill_name",
 ]
