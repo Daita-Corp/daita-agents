@@ -15,7 +15,7 @@ CatalogSnapshot codec-v1 retains column collation and supported conflict-index f
 current pre-production SQLite state shape;
 effect_receipts replace adapter-owned database receipts with runtime reservations and separate human resolutions;
 ExecutionScope and ScheduledRoutine codec-v1 embed normalized capability grants and exact ExecutionContractBindings;
-RunInput codec-v1 uses explicit prepared source scope and history sensitivity;
+RunInput codec-v1 uses explicit prepared source scope, caller-owned target posture and history sensitivity;
 LoopExit, SemanticAnnotation and LearningCandidate codec-v1 retain sensitivity;
 active-source metadata is absent;
 MCPToolBinding codec-v1 uses exact toolbox presentation fields and mcp.tool identities, explicit local access/effect/eligibility/outbound admission, completion semantics and remote task support;

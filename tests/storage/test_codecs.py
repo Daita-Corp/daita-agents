@@ -46,7 +46,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostBasis, CostComponent, CostEstimate
-from daita.loop.models import LoopExit, LoopExitKind, RunInput
+from daita.loop.models import LoopExit, LoopExitKind, RunInput, TargetPosture
 from daita.semantics import (
     ResourceRevisionBinding,
     SemanticAnnotation,
@@ -320,6 +320,7 @@ def test_every_persisted_root_record_family_round_trips_deterministically() -> N
         NOW,
         conversation_id="conversation-codec",
         source_scope_ids=("source-codec",),
+        target_posture=TargetPosture.COMPARE_SET,
     )
     message = CanonicalMessage(MessageRole.USER, content=(TextBlock("Question?"),))
     result = _loop_exit()

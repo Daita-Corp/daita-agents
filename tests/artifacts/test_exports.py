@@ -921,7 +921,7 @@ async def test_csv_export_reuses_current_sql_and_catalog_validation(
         )
     )
     try:
-        result = await agent.run("Export this as CSV.")
+        result = await agent.run("Export records as CSV.")
         transcript = await agent.transcript(result.run_id)
         block = _result_for_call(transcript, "invalid")
         assert _error_code(block) == expected
@@ -966,7 +966,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
                 _stop(),
             )
         )
-        mismatch = await agent.run("Export this as CSV.")
+        mismatch = await agent.run("Export records as CSV.")
         mismatch_block = _result_for_call(
             await agent.transcript(mismatch.run_id), "mismatch"
         )
@@ -991,7 +991,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         )
         with sqlite3.connect(database) as connection:
             connection.execute("ALTER TABLE records ADD COLUMN changed TEXT")
-        stale = await agent.run("Export this as CSV.")
+        stale = await agent.run("Export records as CSV.")
         stale_block = _result_for_call(await agent.transcript(stale.run_id), "stale")
         assert _error_code(stale_block) == "catalog_source_stale"
         assert stale.artifacts == ()
@@ -1014,7 +1014,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
                 _stop(),
             )
         )
-        detached = await agent.run("Export this as CSV.")
+        detached = await agent.run("Export records as CSV.")
         detached_block = _result_for_call(
             await agent.transcript(detached.run_id), "detached"
         )
@@ -1084,7 +1084,7 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
         )
     )
     try:
-        result = await agent.run("Export these CSV files.")
+        result = await agent.run("Export these records CSV files.")
         transcript = await agent.transcript(result.run_id)
         blocks = tuple(
             message.content[0]

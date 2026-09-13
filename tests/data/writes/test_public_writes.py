@@ -409,7 +409,9 @@ async def wait_delivery(agent, conversation_id, count):
 async def test_native_insert_discovery_keeps_catalog_and_export_queries_distinct(
     tmp_path, monkeypatch
 ):
-    agent, provider, db, *_ = await create_fixture(tmp_path, monkeypatch)
+    agent, provider, db, _, _, resource, *_ = await create_fixture(
+        tmp_path, monkeypatch
+    )
     cases = (
         (
             "Insert one row into an admitted catalog database table with exact supplied fields, preserving omitted columns, and return effect evidence.",
@@ -431,7 +433,9 @@ async def test_native_insert_discovery_keeps_catalog_and_export_queries_distinct
         )
     )
     try:
-        result = await agent.run("Discover the admitted tools without executing work.")
+        result = await agent.run(
+            f"Discover the admitted tools for {resource.name} without executing work."
+        )
         assert result.reason == "completed"
         transcript = await agent.transcript(result.run_id)
         results = dict((call.id, block) for call, block in transcript.tool_pairs)
@@ -1002,7 +1006,9 @@ async def test_public_upsert_admission_cannot_invent_preview_evidence_or_insert_
                 response(text="No verified write occurred."),
             )
         )
-        result = await agent.run("Save only admitted cited findings.")
+        result = await agent.run(
+            f"Save only admitted cited findings to {resource.name}."
+        )
         transcript = await agent._embedded._store.load(result.run_id)
         failures = [
             block

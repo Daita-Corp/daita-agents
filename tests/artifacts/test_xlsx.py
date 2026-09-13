@@ -795,7 +795,7 @@ async def test_concurrent_csv_xlsx_exports_keep_order_and_failed_siblings(
         )
     )
     try:
-        result = await agent.run("Export these CSV and XLSX files.")
+        result = await agent.run("Export these records CSV and XLSX files.")
         transcript = await agent.transcript(result.run_id)
         blocks = tuple(
             message.content[0]

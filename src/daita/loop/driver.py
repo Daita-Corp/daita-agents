@@ -15,6 +15,7 @@ from ..artifacts.models import (
     artifact_delivery_receipt_from_mapping,
     artifact_ref_from_mapping,
 )
+from ..errors import ClarificationRequiredError
 from ..llm._lifecycle import closing_stream
 from ..llm.errors import (
     ContextEvidencePressureExceeded,
@@ -76,6 +77,7 @@ from .models import (
 _T = TypeVar("_T")
 
 _EXPECTED_LOOP_FAILURE_REASONS: dict[type[Exception], str] = {
+    ClarificationRequiredError: "clarification_required",
     ContextWindowExceeded: "context_window_exceeded",
     ContextEvidencePressureExceeded: "context_evidence_limit_exceeded",
     ToolSurfaceLimitExceeded: "tool_surface_limit_exceeded",
@@ -758,6 +760,7 @@ class AgentLoop:
                 sensitivity=sensitivity,
             )
         except (
+            ClarificationRequiredError,
             ContextWindowExceeded,
             ContextEvidencePressureExceeded,
             ToolSurfaceLimitExceeded,

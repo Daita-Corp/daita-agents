@@ -585,6 +585,36 @@ def test_run_without_model_opens_the_persisted_route_without_injection():
     agent.close.assert_awaited_once()
 
 
+def test_clarification_run_returns_json_without_loading_a_nonexistent_transcript():
+    result = SimpleNamespace(
+        run_id="run-clarify",
+        conversation_id="conversation-clarify",
+        kind=SimpleNamespace(value="failed"),
+        reason="clarification_required",
+        final_text="Please clarify which single catalog target you mean.",
+        steps=0,
+        artifacts=(),
+        artifact_deliveries=(),
+    )
+    agent = AsyncMock()
+    agent.run.return_value = result
+    agent.transcript.side_effect = AssertionError(
+        "clarification must not have a durable transcript"
+    )
+    arguments = cli.build_parser().parse_args(["run", "runner", "ambiguous data"])
+
+    with patch.object(Agent, "open", new=AsyncMock(return_value=agent)):
+        record = asyncio.run(cli._execute(arguments))
+
+    assert isinstance(record, dict)
+    assert record["status"] == "failed"
+    assert record["reason"] == "clarification_required"
+    assert record["tool_results"] == ()
+    assert record["notice"] == result.final_text
+    agent.transcript.assert_not_awaited()
+    agent.close.assert_awaited_once()
+
+
 def test_run_override_options_require_an_explicit_invocation_local_model():
     arguments = cli.build_parser().parse_args(
         ["run", "runner", "question", "--base-url", "https://models.invalid"]

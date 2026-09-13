@@ -9,7 +9,7 @@ from typing import cast
 
 import pytest
 
-from daita import Agent, SQLiteSource
+from daita import Agent, SQLiteSource, TargetPosture
 from daita._json import canonical_json
 from daita.llm.models import (
     FinishReason,
@@ -57,6 +57,20 @@ def _user_texts(request: object) -> tuple[str, ...]:
         for block in message.content
         if isinstance(block, TextBlock)
     )
+
+
+def test_run_input_defaults_to_a_caller_owned_single_target_posture() -> None:
+    run = RunInput("posture", "agent", "question", datetime.now(UTC))
+
+    assert run.target_posture is TargetPosture.SINGLE_TARGET
+    with pytest.raises(TypeError, match="target_posture"):
+        RunInput(
+            "invalid-posture",
+            "agent",
+            "question",
+            datetime.now(UTC),
+            target_posture=cast(TargetPosture, "compare_set"),
+        )
 
 
 async def test_admitted_sources_persist_without_active_selection(
@@ -349,6 +363,56 @@ async def test_runtime_binds_catalog_scope_without_injection_and_rejects_outside
         await agent.close()
 
 
+@pytest.mark.parametrize(
+    ("message", "expected_text"),
+    (
+        ("Summarize orders", "which single catalog target"),
+        ("Summarize intergalactic ledgers", "more precisely"),
+    ),
+)
+async def test_single_target_ambiguity_or_no_match_requires_fresh_clarification(
+    tmp_path: Path,
+    message: str,
+    expected_text: str,
+) -> None:
+    database = tmp_path / (message.split()[-1] + ".sqlite")
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE orders_east (id INTEGER PRIMARY KEY);
+            CREATE TABLE orders_west (id INTEGER PRIMARY KEY);
+            """)
+    provider = MockModelProvider((_stop("must not be spent"),))
+    agent = await Agent.create(
+        "hard-clarification-" + message.split()[-1],
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        await agent.attach(SQLiteSource(database, name="Orders"))
+
+        result = await agent.run(message)
+
+        assert result.kind is LoopExitKind.FAILED
+        assert result.reason == "clarification_required"
+        assert result.steps == 0 and result.usage.total_tokens == 0
+        assert result.final_text is not None and expected_text in result.final_text
+        assert provider.requests == ()
+        assert not await agent.conversation_exists(result.conversation_id)
+        with pytest.raises(KeyError, match="unknown run"):
+            await agent.transcript(result.run_id)
+
+        clarified = await agent.run("Summarize orders_east")
+        assert clarified.kind is LoopExitKind.COMPLETED
+        assert len(provider.requests) == 1
+        clarified_run = (await agent.transcript(clarified.run_id)).run
+        assert clarified_run.id != result.run_id
+        assert clarified_run.target_posture is TargetPosture.SINGLE_TARGET
+    finally:
+        await agent.close()
+
+
 async def test_source_filter_still_projects_source_independent_file_tools(
     tmp_path: Path,
 ):
@@ -370,8 +434,9 @@ async def test_source_filter_still_projects_source_independent_file_tools(
 
         second = await agent.resolve_source("second-source")
         await agent.run(
-            "What data and workspace files are available?",
+            "What second_records data and workspace files are available?",
             source_scope_ids=(second.id,),
+            target_posture=TargetPosture.COMPARE_SET,
         )
 
         tool_names = {tool.name for tool in provider.requests[0].tools}
@@ -651,11 +716,13 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
     )
     try:
         result = await agent.run(
-            "Compare customer counts in our billing warehouse and application database."
+            "Compare customer counts in our billing warehouse and application database.",
+            target_posture=TargetPosture.COMPARE_SET,
         )
         assert result.kind is LoopExitKind.COMPLETED
         transcript = await agent.transcript(result.run_id)
         assert transcript.run.source_scope_ids == ()
+        assert transcript.run.target_posture is TargetPosture.COMPARE_SET
         results = [
             block
             for message in transcript.messages

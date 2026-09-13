@@ -286,7 +286,7 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
         authoring_run = RunInput(
             id="revision-facts",
             agent_id=agent.id,
-            message="Revise the report schedule.",
+            message="Revise the current_value report schedule.",
             created_at=now,
             conversation_id=origin.conversation_id,
         )
@@ -317,7 +317,7 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
         assert "routine_update" in {tool.name for tool in request.tools}
 
         revision_origin = await agent.run(
-            "Authorize the revised scheduled report definition.",
+            "Authorize the revised current_value scheduled report definition.",
             conversation_id=origin.conversation_id,
         )
 

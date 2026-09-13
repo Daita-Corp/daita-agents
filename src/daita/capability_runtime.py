@@ -889,6 +889,7 @@ class CapabilityRuntime:
                     "run_id": run.id,
                     "agent_id": run.agent_id,
                     "source_scope_ids": run.source_scope_ids,
+                    "target_posture": run.target_posture.value,
                     "source_scope": (
                         None
                         if run.resolved_source_scope is None

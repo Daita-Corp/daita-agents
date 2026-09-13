@@ -578,6 +578,13 @@ def tool_outcome_summary(result: ToolResultBlock) -> str | None:
 
 def run_failure_notice(result: LoopExit, transcript: Transcript | None = None) -> str:
     """Describe a stopped run without treating completed tools as rolled back."""
+    if result.reason == "clarification_required":
+        return sanitize_terminal_text(
+            result.final_text or "Please clarify the single catalog target.",
+            maximum=MAX_RENDER_CHARACTERS,
+            preserve_lines=True,
+            fallback="Please clarify the single catalog target.",
+        )
     if result.reason == "timeout":
         reason = "The model provider timed out after bounded retries."
     elif result.reason == "wall_time_exhausted":

@@ -1235,7 +1235,11 @@ async def _execute(args: argparse.Namespace) -> object:
                     conversation_id=args.conversation_id,
                 )
             )
-            transcript = await run_agent.transcript(result.run_id)
+            transcript = (
+                None
+                if result.reason == "clarification_required"
+                else await run_agent.transcript(result.run_id)
+            )
             return {
                 "run_id": result.run_id,
                 "conversation_id": result.conversation_id,
@@ -1257,7 +1261,9 @@ async def _execute(args: argparse.Namespace) -> object:
                             None if outcome is None else tool_outcome_summary(outcome)
                         ),
                     }
-                    for call, outcome in transcript.tool_pairs
+                    for call, outcome in (
+                        () if transcript is None else transcript.tool_pairs
+                    )
                 ),
                 "artifacts": tuple(
                     artifact_ref_to_mapping(item) for item in result.artifacts

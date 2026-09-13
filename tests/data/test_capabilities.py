@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
 import pytest
 
+from daita._json import FrozenJsonObject
 from daita.capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
     ToolExecution,
 )
 from daita.catalog.capabilities import CatalogProjection, catalog_declarations
-from daita.catalog.models import Sensitivity
+from daita.catalog.models import CatalogMatchOutcome, Sensitivity
 from daita.domains.data import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     DATA_EXPORT_TABULAR_TOOL_NAME,
@@ -39,7 +41,8 @@ from daita.domains.data import (
 )
 from daita.domains.data.routine_precheck import ResourceRevisionCatalog
 from daita.domains.learning import LearningCandidateGuard
-from daita.loop.models import RunInput
+from daita.llm.models import ModelSensitivity, ToolCall
+from daita.loop.models import RunInput, TargetPosture
 
 
 def test_data_query_is_one_backend_neutral_model_tool() -> None:
@@ -107,6 +110,7 @@ class _Catalog:
                 revision="sha256:" + "1" * 64,
                 source_revision="sha256:" + "2" * 64,
                 resource_kind="table",
+                sensitivity_class="public",
             ),
             "source-postgresql": ResourceSchema(
                 resource_id="resource-postgresql",
@@ -117,6 +121,7 @@ class _Catalog:
                 revision="sha256:" + "3" * 64,
                 source_revision="sha256:" + "4" * 64,
                 resource_kind="table",
+                sensitivity_class="public",
             ),
         }
         self.sqlite_other = ResourceSchema(
@@ -127,6 +132,47 @@ class _Catalog:
             revision="sha256:" + "8" * 64,
             source_revision="sha256:" + "2" * 64,
             resource_kind="table",
+            sensitivity_class="public",
+        )
+        self.match_outcome = CatalogMatchOutcome(
+            binding_status="unique",
+            source_status="unique",
+            evidence_tier="catalog_metadata",
+            candidate_count=1,
+            candidate_bindings=(
+                FrozenJsonObject.from_mapping(
+                    {
+                        "source_id": "source-sqlite",
+                        "resource_id": "resource-sqlite",
+                    }
+                ),
+            ),
+            omitted_candidate_count=0,
+            ambiguity_reasons=(),
+        )
+        self.last_readable_ceiling: frozenset[str] | None = None
+
+    async def catalog_context(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        prior_query: str | None = None,
+        limit: int,
+        source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] = (),
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> FrozenJsonObject:
+        del agent_id, query, prior_query, limit, source_ids
+        assert resource_ids == ()
+        self.last_readable_ceiling = readable_resource_ids
+        return FrozenJsonObject.from_mapping(
+            {
+                "match_outcomes": {
+                    "current_query": self.match_outcome.to_payload(),
+                    "prior_query": None,
+                }
+            }
         )
 
     async def source_adapter_id(self, agent_id: str, source_id: str) -> str | None:
@@ -200,6 +246,26 @@ class _Catalog:
             if not source_ids or item.source_id in source_ids
         )
 
+    async def relational_write_scope_issue(
+        self,
+        agent_id: str,
+        source_id: str,
+        resource_id: str,
+        assignment_columns: tuple[str, ...],
+        **kwargs: object,
+    ) -> tuple[str, str]:
+        del agent_id, source_id, resource_id, assignment_columns, kwargs
+        return (
+            "resource_write_not_allowed",
+            "The exact write permission is unavailable.",
+        )
+
+    async def load_relational_write_scope(
+        self, agent_id: str, source_id: str, resource_id: str
+    ) -> None:
+        del agent_id, source_id, resource_id
+        return None
+
 
 def _run() -> RunInput:
     return RunInput(
@@ -210,8 +276,7 @@ def _run() -> RunInput:
     )
 
 
-async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> None:
-    catalog = _Catalog()
+def _data_domain(catalog: _Catalog) -> DataCapabilityDomain:
     catalog_bundle = catalog_declarations(
         "agent-relational", cast(CatalogProjection, catalog)
     )
@@ -234,7 +299,7 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> No
         *upsert_bundle.capabilities,
         *revision_bundle.capabilities,
     )
-    domain = DataCapabilityDomain(
+    return DataCapabilityDomain(
         CapabilityDeclarations(
             domain_owner_id="data",
             capabilities=capabilities,
@@ -252,10 +317,166 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> No
         LearningCandidateGuard(),
     )
 
+
+async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> None:
+    catalog = _Catalog()
+    domain = _data_domain(catalog)
+
     projected = await domain.project(_run())
 
     assert projected.count(DATA_QUERY_TOOL_NAME) == 1
     assert projected.count(DATA_EXPORT_TABULAR_TOOL_NAME) == 1
+
+
+async def test_data_domain_refuses_ambiguous_single_target_but_allows_compare_set() -> (
+    None
+):
+    catalog = _Catalog()
+    catalog.match_outcome = CatalogMatchOutcome(
+        binding_status="ambiguous",
+        source_status="ambiguous",
+        evidence_tier="catalog_metadata",
+        candidate_count=2,
+        candidate_bindings=(
+            FrozenJsonObject.from_mapping(
+                {
+                    "source_id": "source-sqlite",
+                    "resource_id": "resource-sqlite",
+                }
+            ),
+            FrozenJsonObject.from_mapping(
+                {
+                    "source_id": "source-postgresql",
+                    "resource_id": "resource-postgresql",
+                }
+            ),
+        ),
+        omitted_candidate_count=0,
+        ambiguity_reasons=("multiple_sources",),
+    )
+    domain = _data_domain(catalog)
+    capability = data_query_capability_declarations().capabilities[0]
+    blocked_capabilities = (
+        capability,
+        relational_update_preview_capability_declarations().capabilities[0],
+        relational_update_capability_declarations().capabilities[0],
+        *relational_upsert_capability_declarations().capabilities,
+    )
+    arguments = FrozenJsonObject.from_mapping(
+        {
+            "source_id": "source-sqlite",
+            "resource_ids": ("resource-sqlite",),
+            "sql": "SELECT id FROM items",
+        }
+    )
+    call = ToolCall("query", DATA_QUERY_TOOL_NAME, arguments)
+
+    for blocked_capability in blocked_capabilities:
+        with pytest.raises(CapabilityInputError) as blocked:
+            await domain.prepare_call(
+                _run(),
+                ToolCall(
+                    f"blocked-{blocked_capability.id}",
+                    call.name,
+                    arguments,
+                ),
+                blocked_capability,
+                arguments,
+                request_sensitivity=ModelSensitivity.PUBLIC,
+            )
+        assert blocked.value.code == "clarification_required"
+
+    prepared = await domain.prepare_call(
+        replace(_run(), target_posture=TargetPosture.COMPARE_SET),
+        call,
+        capability,
+        arguments,
+        request_sensitivity=ModelSensitivity.PUBLIC,
+    )
+    assert prepared["source_id"] == "source-sqlite"
+    assert prepared["resource_ids"] == ("resource-sqlite",)
+    assert prepared["_adapter_id"] == "sqlite"
+    assert catalog.last_readable_ceiling == frozenset(
+        {"resource-sqlite", "resource-sqlite-other", "resource-postgresql"}
+    )
+
+    catalog.match_outcome = CatalogMatchOutcome(
+        binding_status="no_match",
+        source_status="no_match",
+        evidence_tier="none",
+        candidate_count=0,
+        candidate_bindings=(),
+        omitted_candidate_count=0,
+        ambiguity_reasons=(),
+    )
+    with pytest.raises(CapabilityInputError) as no_match:
+        await domain.prepare_call(
+            replace(_run(), target_posture=TargetPosture.COMPARE_SET),
+            call,
+            capability,
+            arguments,
+            request_sensitivity=ModelSensitivity.PUBLIC,
+        )
+    assert no_match.value.code == "clarification_required"
+
+
+async def test_catalog_outcome_neither_grants_read_scope_nor_write_permission() -> None:
+    catalog = _Catalog()
+    domain = _data_domain(catalog)
+    query = data_query_capability_declarations().capabilities[0]
+    outside_arguments = FrozenJsonObject.from_mapping(
+        {
+            "source_id": "source-postgresql",
+            "resource_ids": ("resource-postgresql",),
+            "sql": "SELECT id FROM public.items",
+        }
+    )
+    narrowed = replace(_run(), source_scope_ids=("source-sqlite",))
+
+    with pytest.raises(CapabilityInputError) as outside:
+        await domain.prepare_call(
+            narrowed,
+            ToolCall("outside", DATA_QUERY_TOOL_NAME, outside_arguments),
+            query,
+            outside_arguments,
+            request_sensitivity=ModelSensitivity.PUBLIC,
+        )
+    assert outside.value.code == "source_scope_violation"
+
+    catalog.match_outcome = CatalogMatchOutcome(
+        binding_status="unique",
+        source_status="unique",
+        evidence_tier="catalog_metadata",
+        candidate_count=1,
+        candidate_bindings=(
+            FrozenJsonObject.from_mapping(
+                {
+                    "source_id": "source-postgresql",
+                    "resource_id": "resource-postgresql",
+                }
+            ),
+        ),
+        omitted_candidate_count=0,
+        ambiguity_reasons=(),
+    )
+    preview = relational_update_preview_capability_declarations().capabilities[0]
+    write_arguments = FrozenJsonObject.from_mapping(
+        {
+            "source_id": "source-postgresql",
+            "resource_id": "resource-postgresql",
+            "where": ({"column": "id", "operator": "eq", "value": 1},),
+            "assignments": ({"column": "id", "value": 2},),
+        }
+    )
+    with pytest.raises(CapabilityInputError) as write_denied:
+        await domain.prepare_call(
+            _run(),
+            ToolCall("preview", "data_preview_update_rows", write_arguments),
+            preview,
+            write_arguments,
+            request_sensitivity=ModelSensitivity.PUBLIC,
+        )
+    assert write_denied.value.code == "resource_write_not_allowed"
 
 
 async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:

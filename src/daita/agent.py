@@ -77,7 +77,13 @@ from .llm.models import ModelProfile, ModelSensitivity
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
-from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
+from .loop.models import (
+    ConversationRun,
+    LoopExit,
+    LoopLimits,
+    TargetPosture,
+    Transcript,
+)
 from .observation import AgentObserver
 from .routines import (
     RoutineState,
@@ -326,6 +332,7 @@ class Agent:
         *,
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
+        target_posture: TargetPosture = TargetPosture.SINGLE_TARGET,
         files_only: bool = False,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
@@ -333,6 +340,7 @@ class Agent:
             message,
             conversation_id=conversation_id,
             source_scope_ids=source_scope_ids,
+            target_posture=target_posture,
             files_only=files_only,
             job_executor_profile_id=job_executor_profile_id,
         )

@@ -613,9 +613,13 @@ async def test_owned_route_evidence_cleanup_and_exact_accounting_offline(
                 with pytest.raises(AssertionError, match="ordinary user request"):
                     await scenario.run("Never submit this structured prompt.")
                 assert not any(item.requests for item in providers)
-            natural = "Please save the company details and tell me what changed."
+            natural = (
+                f"Please save the company details in {resource.name} and tell me "
+                "what changed."
+            )
             result, transcript = await scenario.run(
-                "Offline harness check only.", user_prompt=natural
+                f"Offline harness check for {resource.name} only.",
+                user_prompt=natural,
             )
             first_request = next(item for item in providers if item.requests).requests[
                 0

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from daita.domains.data import DATA_QUERY_CAPABILITY_ID
+from daita.errors import ClarificationRequiredError
+from tests.support.capability_runtime import ContextToolProjectionAdapter
 from tests.support.conversations import (
     _HISTORY_OMISSION_MARKER,
     _MAXIMUM_PRIOR_UTF8_BYTES,
@@ -39,6 +42,56 @@ from tests.support.conversations import (
 
 def test_context_builder_exposes_only_fixed_absolute_history_bounds():
     assert "retain_messages" not in inspect.signature(AgentContextBuilder).parameters
+
+
+async def test_clarification_gate_uses_full_outcome_before_catalog_fitting() -> None:
+    source_id = "source:full-assessment"
+    resources = tuple(
+        {
+            "kind": "table",
+            "match_reasons": ("resource_name_contains",),
+            "name": name,
+            "resource_id": f"resource:{name}",
+            "revision": "sha256:" + character * 64,
+            "sensitivity": "public",
+            "source_id": source_id,
+        }
+        for name, character in (("orders_east", "a"), ("orders_west", "b"))
+    )
+
+    class _Builder(AgentContextBuilder):
+        fitting_started = False
+
+        def _fit_mandatory_request(self, *args, **kwargs):
+            self.fitting_started = True
+            raise AssertionError("clarification must happen before fitting")
+
+    provider = MockModelProvider((_stop("unused"),))
+    builder = _Builder(CatalogSpy(resources), profile=_profile(provider))
+    run = RunInput(
+        "full-assessment-run",
+        "agent-history",
+        "Summarize orders",
+        NOW,
+    )
+    projection = ContextToolProjectionAdapter(
+        (
+            ToolDefinition(
+                name="data_query",
+                description="Query one exact catalog target.",
+                input_schema={"type": "object"},
+            ),
+        ),
+        capability_ids=(DATA_QUERY_CAPABILITY_ID,),
+    )
+    catalog = await projection.prepare_run(run)
+
+    with pytest.raises(ClarificationRequiredError) as blocked:
+        await builder.prepare(run, (run.start_message(),), catalog)
+
+    assert blocked.value.match_outcome["binding_status"] == "ambiguous"
+    assert blocked.value.match_outcome["candidate_count"] == 2
+    assert builder.fitting_started is False
 
 
 def test_small_useful_query_turn_can_use_full_projection():

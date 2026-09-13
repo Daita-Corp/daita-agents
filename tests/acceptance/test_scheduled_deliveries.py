@@ -266,7 +266,9 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
     try:
         source = await agent.attach(SQLiteSource(database, name="Current value"))
         (resource,) = await agent.list_catalog_resources(source_id=source.id)
-        origin = await agent.run("Authorize the scheduled CSV outcome.")
+        origin = await agent.run(
+            f"Authorize the scheduled CSV outcome for {resource.name}."
+        )
         assert origin.conversation_id is not None
         delivery = await _run_routine(
             agent,
@@ -365,7 +367,7 @@ async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
             resource.name: resource
             for resource in await agent.list_catalog_resources(source_id=source.id)
         }
-        origin = await agent.run("Authorize only the allowed table for scheduling.")
+        origin = await agent.run("Authorize only allowed_value for scheduling.")
         assert origin.conversation_id is not None
         delivery = await _run_routine(
             agent,
@@ -456,7 +458,9 @@ async def test_restart_after_artifact_and_terminal_commit_does_not_repeat_work(
     try:
         source = await agent.attach(SQLiteSource(database))
         (resource,) = await agent.list_catalog_resources(source_id=source.id)
-        origin = await agent.run("Authorize the recoverable scheduled outcome.")
+        origin = await agent.run(
+            f"Authorize the recoverable scheduled outcome for {resource.name}."
+        )
         assert origin.conversation_id is not None
         created = await _create_routine(
             agent,
@@ -759,7 +763,9 @@ async def test_scheduled_postgresql_xlsx_uses_the_same_inbox_path(
     try:
         source = await agent.attach(_OfflinePostgreSQLSource(agent.id))
         (resource,) = await agent.list_catalog_resources(source_id=source.id)
-        origin = await agent.run("Authorize the scheduled XLSX outcome.")
+        origin = await agent.run(
+            f"Authorize the scheduled XLSX outcome for {resource.name}."
+        )
         assert origin.conversation_id is not None
         delivery = await _run_routine(
             agent,
@@ -1050,7 +1056,9 @@ async def test_required_artifact_cardinality_failure_is_one_failed_delivery(
     try:
         source = await agent.attach(SQLiteSource(database))
         (resource,) = await agent.list_catalog_resources(source_id=source.id)
-        origin = await agent.run("Authorize the required document outcome.")
+        origin = await agent.run(
+            f"Authorize the required document outcome for {resource.name}."
+        )
         assert origin.conversation_id is not None
         delivery = await _run_routine(
             agent,
@@ -1200,7 +1208,9 @@ async def test_corrupt_committed_artifact_is_one_failed_delivery(
     try:
         source = await agent.attach(SQLiteSource(database))
         (resource,) = await agent.list_catalog_resources(source_id=source.id)
-        origin = await agent.run("Authorize the required document outcome.")
+        origin = await agent.run(
+            f"Authorize the required document outcome for {resource.name}."
+        )
         assert origin.conversation_id is not None
         created = await _create_routine(
             agent,
