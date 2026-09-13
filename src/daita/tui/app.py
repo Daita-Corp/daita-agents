@@ -1107,6 +1107,29 @@ class DaitaApp(App[int]):
             return
 
     async def _settle_result(self, result: LoopExit) -> None:
+        if result.reason == "clarification_required":
+            # Clarification exits deliberately have no durable run. Keep an
+            # existing conversation selected, but do not point the UI at the
+            # fresh unpersisted conversation identity.
+            screen = self.chat()
+            if screen is None:
+                return
+            screen.remove_block(self._partial_identity)
+            if self._pending_user_identity is not None:
+                screen.remove_block(self._pending_user_identity)
+                self._pending_user_identity = None
+            self._partial_text = ""
+            screen.append_block(
+                TranscriptBlock(
+                    "notice",
+                    f"clarification-{result.run_id}",
+                    render_model_answer(
+                        result.final_text,
+                        fallback="Please clarify the single catalog target.",
+                    ),
+                )
+            )
+            return
         self.controller.conversation_id = result.conversation_id
         self._context_conversation_id = result.conversation_id
         screen = self.chat()

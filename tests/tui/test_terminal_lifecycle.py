@@ -48,6 +48,23 @@ def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
     assert "keep the fiscal year" in taught
 
 
+def test_clarification_notice_does_not_claim_that_a_run_or_tool_result_exists():
+    notice = run_failure_notice(
+        LoopExit(
+            run_id="run-clarify",
+            conversation_id="conversation-clarify",
+            kind=LoopExitKind.FAILED,
+            reason="clarification_required",
+            final_text="Please identify the single catalog target more precisely.",
+            created_at=datetime.now(UTC),
+        )
+    )
+
+    assert notice == "Please identify the single catalog target more precisely."
+    assert "tool results" not in notice
+    assert "receipts" not in notice
+
+
 async def test_one_interactive_run_path_is_unique():
     source = Path("src/daita/tui").read_text(encoding="utf-8") if False else None
     text = ""

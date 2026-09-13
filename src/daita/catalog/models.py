@@ -1509,6 +1509,38 @@ class CatalogMatchOutcome:
             "trust_classification": self.trust_classification,
         }
 
+    @classmethod
+    def from_payload(cls, value: Mapping[str, object]) -> "CatalogMatchOutcome":
+        """Validate one complete catalog-owned outcome projection."""
+
+        expected = {
+            "binding_status",
+            "source_status",
+            "evidence_tier",
+            "candidate_count",
+            "candidate_bindings",
+            "omitted_candidate_count",
+            "ambiguity_reasons",
+            "assessment_provenance",
+            "trust_classification",
+        }
+        if not isinstance(value, Mapping) or set(value) != expected:
+            raise TypeError("catalog match outcome payload is malformed")
+        return cls(
+            binding_status=cast(str, value["binding_status"]),
+            source_status=cast(str, value["source_status"]),
+            evidence_tier=cast(str, value["evidence_tier"]),
+            candidate_count=cast(int, value["candidate_count"]),
+            candidate_bindings=cast(
+                tuple[FrozenJsonObject, ...],
+                value["candidate_bindings"],
+            ),
+            omitted_candidate_count=cast(int, value["omitted_candidate_count"]),
+            ambiguity_reasons=cast(tuple[str, ...], value["ambiguity_reasons"]),
+            assessment_provenance=cast(str, value["assessment_provenance"]),
+            trust_classification=cast(str, value["trust_classification"]),
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class CatalogSearchResult:

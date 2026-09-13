@@ -24,16 +24,33 @@ The `assessment_provenance="catalog_service"` field identifies the code owner of
 the calculation; it is not authorization. Outcome content remains classified as
 untrusted external data.
 
-For a single-target read, a unique current binding can be used by exact ID after
-any missing schema is obtained. An ambiguous single-target request should be
-clarified instead of choosing the first hit. An explicit comparison may use the
-candidate set, with separate exact relational calls grouped by source before
-synthesis. A no-match result can be refined with a grounded `catalog_search` query;
-fallback inventory is not a match. A prior unique binding is reusable only when the
-current wording clearly refers to it. Ambiguous update or upsert intent should be
-clarified before preview. These are model-facing presentation rules, not a runtime
-clarification gate; exact scope, ID, schema, permission, approval, and receipt checks
-remain the execution authority.
+Every fresh foreground run has a caller-owned target posture. `single_target` is the default;
+`compare_set` must be supplied by the caller for an intentional comparison and is
+never inferred from ambiguous model chat. For `single_target`, the complete
+`current_query` `CatalogMatchOutcome` must report `binding_status="unique"` and
+`candidate_count=1`. An ambiguous or no-match outcome raises the code-owned hard
+clarification gate before transcript creation or model spend. The failed exit has
+reason `clarification_required`. The user's answer starts a fresh run and is assessed
+again; no selected-source or target state is retained.
+
+`compare_set` suppresses only intentional multi-candidate ambiguity. A no-match
+outcome still requires a more precise fresh request because there is no grounded set
+to compare.
+
+The data domain repeats that refusal for foreground relational query, preview, or
+write as defense in depth. It reassesses within the run's frozen readable-resource ceiling.
+Outcomes are negative evidence only: they never inject source/resource arguments,
+grant read or write access, or replace exact scope, schema, permission, preview,
+approval, revalidation, and receipt checks. An intentional `compare_set` still uses
+separate exact relational calls grouped by source before synthesis; federated SQL is
+not introduced.
+
+The R2 presentation rules remain separate from this runtime stop. Ranked resources,
+bounded candidate bindings, omitted counts, prior-query evidence, and model-facing
+guidance explain the catalog assessment. Fitting may omit candidate bindings, but it
+cannot decide or weaken the gate: the gate uses the full assessment tier's current
+binding status and candidate count. Prior-query evidence is continuity context, not
+selected-source state or a substitute for a unique current binding.
 
 Initial context contains a bounded connector directory drawn from current source
 registrations, admitted MCP bindings, and eligible skills. A separate compact

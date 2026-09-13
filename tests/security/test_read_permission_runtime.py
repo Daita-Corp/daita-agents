@@ -284,7 +284,7 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
     run = RunInput(
         id="permission-runtime-run",
         agent_id=agent.id,
-        message="read data",
+        message="read parent data",
         created_at=agent._embedded.identity.created_at,
     )
     try:

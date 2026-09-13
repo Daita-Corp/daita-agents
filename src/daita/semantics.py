@@ -1588,6 +1588,7 @@ class SemanticDomainCatalog(Protocol):
         limit: int,
         source_ids: tuple[str, ...] = (),
         resource_ids: tuple[str, ...] = (),
+        readable_resource_ids: frozenset[str] | None = None,
     ) -> FrozenJsonObject: ...
 
     async def readable_resource_ids(
@@ -2324,6 +2325,11 @@ class SemanticCapabilityDomain:
                 tuple(sorted(run.resolved_source_scope.source_ids))
                 if run.resolved_source_scope is not None
                 else run.source_scope_ids
+            ),
+            readable_resource_ids=(
+                run.resolved_source_scope.resource_ids
+                if run.resolved_source_scope is not None
+                else None
             ),
         )
         resources = catalog.get("resources")

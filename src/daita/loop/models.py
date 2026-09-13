@@ -51,6 +51,13 @@ class RunOrigin(str, Enum):
     SCHEDULED_ROUTINE = "scheduled_routine"
 
 
+class TargetPosture(str, Enum):
+    """Caller-owned catalog target cardinality for one fresh run."""
+
+    SINGLE_TARGET = "single_target"
+    COMPARE_SET = "compare_set"
+
+
 class InstructionAuthority(str, Enum):
     CODE_OWNED = "code_owned"
     FOREGROUND_AUTHORIZED = "foreground_authorized"
@@ -197,6 +204,7 @@ class RunInput:
     created_at: datetime
     conversation_id: str | None = None
     source_scope_ids: tuple[str, ...] = ()
+    target_posture: TargetPosture = TargetPosture.SINGLE_TARGET
     start: RunStartEnvelope | None = None
     history_sensitivity: ModelSensitivity = ModelSensitivity.PUBLIC
     resolved_source_scope: EffectiveSourceScope | None = None
@@ -208,6 +216,8 @@ class RunInput:
         _aware(self.created_at, "run created_at")
         if not isinstance(self.history_sensitivity, ModelSensitivity):
             raise TypeError("run history_sensitivity must be ModelSensitivity")
+        if not isinstance(self.target_posture, TargetPosture):
+            raise TypeError("run target_posture must be TargetPosture")
         if self.conversation_id is not None:
             _required_text(self.conversation_id, "run conversation_id")
         if (

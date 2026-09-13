@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, ApprovalDecision, ApprovalRequest
+from daita import Agent, ApprovalDecision, ApprovalRequest, TargetPosture
 from daita._json import FrozenJsonObject
 from daita.catalog import CatalogResource
 from daita.evaluation import (
@@ -357,6 +357,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         "Using orders, order_items, products, customers, and regions, calculate "
         "paid contribution margin by region and currency.",
         source_scope_ids=(source.id,),
+        target_posture=TargetPosture.COMPARE_SET,
     )
     baseline_events = tuple(events[baseline_start:])
     baseline_transcript = await baseline_agent.transcript(baseline_exit.run_id)
@@ -502,6 +503,7 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         "Using orders, order_items, products, customers, and regions, calculate "
         "paid contribution margin by region and currency.",
         source_scope_ids=(source.id,),
+        target_posture=TargetPosture.COMPARE_SET,
     )
     learned_events = tuple(events[learned_lifecycle_start:])
     learned_transcript = await learned_agent.transcript(learned_exit.run_id)
@@ -577,8 +579,10 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
     )
     denied_baseline_start = len(events)
     denied_baseline = await denied_agent.run(
-        "Calculate paid contribution margin.",
+        "Using orders, order_items, products, customers, and regions, calculate "
+        "paid contribution margin.",
         source_scope_ids=(denied_source.id,),
+        target_posture=TargetPosture.COMPARE_SET,
     )
     denied_baseline_events = tuple(events[denied_baseline_start:])
     denied_learned_start = len(events)
@@ -611,8 +615,10 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
         workspace=workspace_for(tmp_path),
     )
     denied_follow_up = await denied_reopened.run(
-        "Calculate paid contribution margin.",
+        "Using orders, order_items, products, customers, and regions, calculate "
+        "paid contribution margin.",
         source_scope_ids=(denied_source.id,),
+        target_posture=TargetPosture.COMPARE_SET,
     )
     denied_lifecycle_events = tuple(events[denied_learned_start:])
     assert denied_follow_up.final_text == denied_baseline.final_text

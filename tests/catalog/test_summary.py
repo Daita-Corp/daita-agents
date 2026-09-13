@@ -1469,7 +1469,7 @@ async def test_catalog_summary_is_not_persisted_or_added_to_model_state(tmp_path
         await agent.attach(SQLiteSource(database))
         summary = await agent.catalog_summary()
         assert summary.is_empty is False
-        result = await agent.run("Answer normally")
+        result = await agent.run("Answer normally about parent")
         transcript = await agent.transcript(result.run_id)
         request_text = repr(provider.requests[0])
         transcript_text = repr(transcript)

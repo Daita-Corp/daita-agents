@@ -513,20 +513,14 @@ async def test_postgresql_dispatch_returns_structured_failure_without_fallback(
         result = await agent.run(
             PHASE5_ROUTES["postgres_query"][0], source_scope_ids=(source.id,)
         )
-        transcript = await agent.transcript(result.run_id)
-        _assert_route(transcript, "postgres_query")
-        assert "data_query" in {tool.name for tool in provider.requests[0].tools}
-        failure = _results(transcript)["postgres-query"]
-        assert failure.is_error
-        error = failure.output.get("error")
-        assert isinstance(error, Mapping)
-        assert isinstance(error.get("code"), str)
-        assert result.final_text is not None and "could not run" in result.final_text
+        assert result.reason == "clarification_required"
+        assert result.steps == 0 and result.usage.total_tokens == 0
+        assert provider.requests == ()
+        assert not await agent.conversation_exists(result.conversation_id)
         assert not any(
             name in agent._embedded._capabilities.tool_names
             for name in ("shell", "shell_run", "terminal", "terminal_run")
         )
-        _assert_no_workspace_path(workspace, provider, transcript)
     finally:
         await agent.close()
 

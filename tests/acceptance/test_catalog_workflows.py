@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from daita import TargetPosture
 from tests.catalog._schema_support import (
     Agent,
     ModelProfile,
@@ -38,7 +39,10 @@ async def test_inventory_uses_one_catalog_tool_call_and_records_efficiency(
     )
     try:
         await agent.attach(SQLiteSource(database))
-        result = await agent.run("What tables and relationships are available?")
+        result = await agent.run(
+            "What tables and relationships are available?",
+            target_posture=TargetPosture.COMPARE_SET,
+        )
         assert (
             result.final_text == "Eight tables and their relationships are available."
         )
@@ -82,7 +86,10 @@ async def test_regional_margin_plan_uses_one_schema_slice_before_querying(
     )
     try:
         await agent.attach(SQLiteSource(database))
-        result = await agent.run("Summarize paid revenue and gross margin by region.")
+        result = await agent.run(
+            "Summarize paid revenue and gross margin by region.",
+            target_posture=TargetPosture.COMPARE_SET,
+        )
         assert result.final_text == "EMEA paid revenue is 110 with gross margin 60."
         assert provider.planned_from_schema is True
         assert provider.catalog_tool_call_count == 1
@@ -122,7 +129,10 @@ async def test_one_connected_schema_call_supplies_bridges_before_one_data_query(
     )
     try:
         await agent.attach(SQLiteSource(database))
-        result = await agent.run("What is gross margin by customer segment?")
+        result = await agent.run(
+            "What is gross margin by customer segment?",
+            target_posture=TargetPosture.COMPARE_SET,
+        )
         assert result.final_text == "Enterprise gross margin is 60."
         assert provider.saw_complete_bridge_evidence is True
         calls = {
@@ -158,16 +168,24 @@ async def test_unchanged_revision_reuses_schema_but_refresh_requires_new_slice(
     try:
         source = await agent.attach(SQLiteSource(database))
         prompt = "What tables and relationships are available now?"
-        first = await agent.run(prompt)
+        first = await agent.run(prompt, target_posture=TargetPosture.COMPARE_SET)
         assert provider.schema_calls == 1
 
-        await agent.run(prompt, conversation_id=first.conversation_id)
+        await agent.run(
+            prompt,
+            conversation_id=first.conversation_id,
+            target_posture=TargetPosture.COMPARE_SET,
+        )
         assert provider.schema_calls == 1
 
         with sqlite3.connect(database) as connection:
             connection.execute("ALTER TABLE orders ADD COLUMN sales_note TEXT")
         await agent.refresh_source(source.id)
-        await agent.run(prompt, conversation_id=first.conversation_id)
+        await agent.run(
+            prompt,
+            conversation_id=first.conversation_id,
+            target_posture=TargetPosture.COMPARE_SET,
+        )
         assert provider.schema_calls == 2
     finally:
         await agent.close()

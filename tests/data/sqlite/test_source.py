@@ -392,7 +392,7 @@ async def test_invalid_sql_is_a_model_visible_tool_error(tmp_path):
         ),
     )
     try:
-        result = await agent.run("Delete the rows")
+        result = await agent.run("Delete the rows from sales")
         transcript = await agent.transcript(result.run_id)
         error = transcript.messages[2].content[0]
         assert isinstance(error, ToolResultBlock)

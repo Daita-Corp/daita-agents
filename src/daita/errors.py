@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from enum import Enum
 from pathlib import Path
+
+from ._json import FrozenJsonObject
 
 _ERROR_CODE = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 
@@ -81,6 +84,35 @@ class AgentError(DaitaError):
             message,
             error_code=error_code,
             retryability=retryability,
+        )
+
+
+class ClarificationRequiredError(DaitaError):
+    """A required single catalog target is not uniquely identified."""
+
+    def __init__(self, match_outcome: Mapping[str, object]) -> None:
+        evidence = FrozenJsonObject.from_mapping(match_outcome)
+        binding_status = evidence.get("binding_status")
+        candidate_count = evidence.get("candidate_count")
+        if binding_status not in {"ambiguous", "no_match"}:
+            raise ValueError("clarification evidence must be ambiguous or no_match")
+        if (
+            not isinstance(candidate_count, int)
+            or isinstance(candidate_count, bool)
+            or candidate_count < 0
+            or (binding_status == "no_match") != (candidate_count == 0)
+        ):
+            raise ValueError("clarification evidence candidate count is invalid")
+        self.match_outcome = evidence
+        message = (
+            "Please clarify which single catalog target you mean before continuing."
+            if binding_status == "ambiguous"
+            else "Please identify the single catalog target more precisely before continuing."
+        )
+        super().__init__(
+            message,
+            error_code="clarification_required",
+            retryability=ErrorRetryability.PERMANENT,
         )
 
 
@@ -241,6 +273,7 @@ class AuthenticationError(PermanentError):
 __all__ = [
     "AgentError",
     "AuthenticationError",
+    "ClarificationRequiredError",
     "ConfigError",
     "DaitaError",
     "ErrorRetryability",

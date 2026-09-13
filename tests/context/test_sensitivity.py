@@ -335,7 +335,7 @@ async def test_sensitive_admitted_source_excludes_route_before_provider_io(tmp_p
         source = await agent.attach(SQLiteSource(database))
 
         result = await agent.run(
-            "Read the attached data.", source_scope_ids=(source.id,)
+            "Read confidential_rows.", source_scope_ids=(source.id,)
         )
 
         assert result.kind is LoopExitKind.FAILED

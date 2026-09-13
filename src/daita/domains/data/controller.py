@@ -36,9 +36,14 @@ from ...catalog.capabilities import (
     CATALOG_SEARCH_CAPABILITY_ID,
     CATALOG_TRAVERSE_CAPABILITY_ID,
 )
-from ...catalog.models import Sensitivity
+from ...catalog.models import (
+    CATALOG_CONTEXT_DEFAULT_LIMIT,
+    CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS,
+    CatalogMatchOutcome,
+    Sensitivity,
+)
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
-from ...loop.models import RunInput, RunOrigin, Transcript
+from ...loop.models import RunInput, RunOrigin, TargetPosture, Transcript
 from ...scope import resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
 from ..learning import LearningCandidateGuard
@@ -91,6 +96,9 @@ _UPDATE_CAPABILITIES = frozenset(
 _UPSERT_CAPABILITIES = frozenset({"data.preview_upsert_rows", "data.upsert_rows"})
 _NATIVE_WRITE_CAPABILITIES = frozenset(
     {RELATIONAL_UPDATE_CAPABILITY_ID, "data.upsert_rows"}
+)
+_CLARIFICATION_GATED_CAPABILITIES = frozenset(
+    {*_RELATIONAL_READ_CAPABILITIES, *_UPDATE_CAPABILITIES, *_UPSERT_CAPABILITIES}
 )
 
 
@@ -181,6 +189,18 @@ class DataDomainCatalog(
         source_ids: tuple[str, ...] = (),
     ) -> tuple[Mapping[str, object], ...]: ...
 
+    async def catalog_context(
+        self,
+        agent_id: str,
+        query: str,
+        *,
+        prior_query: str | None = None,
+        limit: int,
+        source_ids: tuple[str, ...] = (),
+        resource_ids: tuple[str, ...] = (),
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> FrozenJsonObject: ...
+
     async def relational_write_applicable_source_ids(
         self,
         agent_id: str,
@@ -262,6 +282,7 @@ class DataCapabilityDomain:
                     f"data adapter capability admission is incomplete: {adapter_id}"
                 )
         for method_name in (
+            "catalog_context",
             "source_routing_facts",
             "resource_schemas",
             "readable_resource_ids",
@@ -430,6 +451,7 @@ class DataCapabilityDomain:
                 prepared["sql_fingerprint"] = validated.sql_fingerprint
                 return FrozenJsonObject.from_mapping(prepared)
             return arguments
+        await self._require_unique_catalog_target(run, capability)
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(run.id, call)
         await self._validate_source_scope(run, capability, arguments)
@@ -559,6 +581,59 @@ class DataCapabilityDomain:
                     )
                 self._check_native_grant(run, capability, arguments, permission)
         return arguments
+
+    async def _require_unique_catalog_target(
+        self,
+        run: RunInput,
+        capability: Capability,
+    ) -> None:
+        """Refuse target-dependent data calls when full current evidence is not unique."""
+
+        if (
+            run.origin is not RunOrigin.USER
+            or capability.id not in _CLARIFICATION_GATED_CAPABILITIES
+        ):
+            return
+        scope = run.resolved_source_scope
+        assert scope is not None
+        catalog = await self._catalog.catalog_context(
+            run.agent_id,
+            run.message[:CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS],
+            limit=CATALOG_CONTEXT_DEFAULT_LIMIT,
+            source_ids=tuple(sorted(scope.source_ids)),
+            resource_ids=(),
+            readable_resource_ids=scope.resource_ids,
+        )
+        try:
+            outcomes = catalog["match_outcomes"]
+            if not isinstance(outcomes, Mapping):
+                raise TypeError("match outcomes must be a mapping")
+            current = outcomes["current_query"]
+            if not isinstance(current, Mapping):
+                raise TypeError("current outcome must be a mapping")
+            outcome = CatalogMatchOutcome.from_payload(current)
+        except (KeyError, TypeError, ValueError) as error:
+            raise CapabilityInputError(
+                "catalog_match_evidence_invalid",
+                "Current catalog target evidence is unavailable or malformed.",
+            ) from error
+        if (
+            outcome.binding_status == "no_match"
+            or outcome.candidate_count == 0
+            or (
+                run.target_posture is TargetPosture.SINGLE_TARGET
+                and (outcome.binding_status != "unique" or outcome.candidate_count != 1)
+            )
+        ):
+            raise CapabilityInputError(
+                "clarification_required",
+                "Clarify the required single catalog target before querying, "
+                "previewing, or writing data.",
+                {
+                    "binding_status": outcome.binding_status,
+                    "candidate_count": outcome.candidate_count,
+                },
+            )
 
     async def prepare_automation_grant(
         self,

@@ -34,6 +34,7 @@ from .domains.data.capabilities import (
 )
 from .domains.data.controller import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
+    DATA_QUERY_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
     RELATIONAL_UPDATE_CAPABILITY_ID,
     RELATIONAL_UPDATE_EVIDENCE_KIND,
@@ -59,6 +60,7 @@ from .domains.data.file_capabilities import (
     LOCAL_FILE_SEARCH_CAPABILITY_ID,
 )
 from .domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
+from .errors import ClarificationRequiredError
 from .jobs.capabilities import (
     JOB_CANCEL_CAPABILITY_ID,
     JOB_INSPECT_CAPABILITY_ID,
@@ -82,7 +84,13 @@ from .llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from .loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
+from .loop.models import (
+    ConversationRun,
+    LoopExitKind,
+    RunInput,
+    RunOrigin,
+    TargetPosture,
+)
 from .memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
 from .scope import SourceScopeCatalog, resolve_effective_source_scope
 from .semantics import (
@@ -729,6 +737,40 @@ class AgentContextBuilder:
             )
         )
         catalog_payload = catalog.to_dict()
+        match_outcomes = catalog_payload.get("match_outcomes")
+        if not isinstance(match_outcomes, Mapping):
+            raise TypeError("catalog context match_outcomes must be a mapping")
+        current_match = match_outcomes.get("current_query")
+        try:
+            current_outcome = CatalogMatchOutcome.from_payload(
+                cast(Mapping[str, object], current_match)
+            )
+        except (TypeError, ValueError) as error:
+            raise TypeError(
+                "catalog context current_query match outcome is malformed"
+            ) from error
+        if (
+            not files_only
+            and run.origin is RunOrigin.USER
+            and not explicit_learning
+            and selected_candidate is None
+            and DATA_QUERY_CAPABILITY_ID in tool_context.capability_ids
+            and (
+                current_outcome.binding_status == "no_match"
+                or current_outcome.candidate_count == 0
+                or (
+                    run.target_posture is TargetPosture.SINGLE_TARGET
+                    and (
+                        current_outcome.binding_status != "unique"
+                        or current_outcome.candidate_count != 1
+                    )
+                )
+            )
+        ):
+            # This is the complete service assessment. The fitter below may
+            # omit candidate bindings for presentation pressure, but it cannot
+            # weaken or decide this pre-model stop.
+            raise ClarificationRequiredError(current_outcome.to_payload())
         source_presentations = (
             await self._catalog.source_routing_facts(
                 run.agent_id, tuple(sorted(source_scope.source_ids))
@@ -1403,20 +1445,7 @@ def _validated_catalog_match_outcomes(value: object) -> dict[str, object]:
         if not isinstance(raw, Mapping) or set(raw) != expected:
             raise TypeError(f"catalog context {field_name} match outcome is malformed")
         try:
-            outcome = CatalogMatchOutcome(
-                binding_status=cast(str, raw["binding_status"]),
-                source_status=cast(str, raw["source_status"]),
-                evidence_tier=cast(str, raw["evidence_tier"]),
-                candidate_count=cast(int, raw["candidate_count"]),
-                candidate_bindings=cast(
-                    tuple[FrozenJsonObject, ...],
-                    raw["candidate_bindings"],
-                ),
-                omitted_candidate_count=cast(int, raw["omitted_candidate_count"]),
-                ambiguity_reasons=cast(tuple[str, ...], raw["ambiguity_reasons"]),
-                assessment_provenance=cast(str, raw["assessment_provenance"]),
-                trust_classification=cast(str, raw["trust_classification"]),
-            )
+            outcome = CatalogMatchOutcome.from_payload(cast(Mapping[str, object], raw))
         except (KeyError, TypeError, ValueError) as error:
             raise TypeError(
                 f"catalog context {field_name} match outcome is malformed"
