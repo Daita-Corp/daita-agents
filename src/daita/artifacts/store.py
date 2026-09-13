@@ -1011,4 +1011,173 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-__all__ = ["AgentHomeArtifactStore", "ArtifactReferenceReader"]
+def validate_artifact_home(
+    *,
+    agent_id: str,
+    agent_home: Path,
+    references: tuple[ArtifactRef, ...],
+    delivery_references: tuple[OutcomeArtifactReference, ...],
+    reservations: frozenset[tuple[str, str]],
+) -> None:
+    """Validate the complete current artifact tree without cleaning or changing it."""
+
+    if not isinstance(agent_id, str) or not agent_id:
+        raise ValueError("agent_id must be non-empty text")
+    home = Path(os.path.abspath(os.fspath(agent_home)))
+    try:
+        home_state = home.lstat()
+    except OSError as error:
+        raise ArtifactError(
+            "artifact_storage_failed",
+            "Artifact storage identity is unavailable.",
+            {"stage": "home_validation"},
+        ) from error
+    if (
+        not stat.S_ISDIR(home_state.st_mode)
+        or stat.S_ISLNK(home_state.st_mode)
+        or home.resolve(strict=True) != home
+    ):
+        raise ArtifactError(
+            "artifact_storage_failed",
+            "Artifact storage identity is invalid.",
+            {"stage": "home_validation"},
+        )
+    root = home / "artifacts"
+    if not root.exists():
+        if references or delivery_references:
+            raise ArtifactError(
+                "artifact_corrupt",
+                "Referenced artifact storage is missing.",
+                {"artifact_id": "unknown"},
+            )
+        return
+    root_state = root.lstat()
+    if not stat.S_ISDIR(root_state.st_mode) or root.is_symlink():
+        raise ArtifactError(
+            "artifact_storage_failed",
+            "Artifact storage root is invalid.",
+            {"stage": "home_validation"},
+        )
+    staging = root / ".staging"
+    staging_state = staging.lstat()
+    if not stat.S_ISDIR(staging_state.st_mode) or staging.is_symlink():
+        raise ArtifactError(
+            "artifact_storage_failed",
+            "Artifact staging root is invalid.",
+            {"stage": "home_validation"},
+        )
+    with os.scandir(staging) as iterator:
+        staging_entries = tuple(iterator)
+    if len(staging_entries) > _MAX_STAGING_ENTRIES:
+        raise ArtifactError(
+            "artifact_storage_failed",
+            "Artifact staging exceeds its fixed bound.",
+            {"stage": "home_validation"},
+        )
+    for entry in staging_entries:
+        path = Path(entry.path)
+        facts = path.lstat()
+        if _CONFIG_STAGING_NAME.fullmatch(entry.name) is not None:
+            if not stat.S_ISREG(facts.st_mode) or path.is_symlink():
+                raise ArtifactError(
+                    "artifact_storage_failed",
+                    "Artifact staging entry is invalid.",
+                    {"stage": "home_validation"},
+                )
+            continue
+        if (
+            _STAGING_NAME.fullmatch(entry.name) is None
+            or not stat.S_ISDIR(facts.st_mode)
+            or path.is_symlink()
+        ):
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "Artifact staging entry is invalid.",
+                {"stage": "home_validation"},
+            )
+        with os.scandir(path) as children:
+            staged_children = tuple(children)
+        if len(staged_children) > 2 or any(
+            child.name not in {"manifest.json", "payload"}
+            or child.is_symlink()
+            or not child.is_file(follow_symlinks=False)
+            for child in staged_children
+        ):
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "Artifact staging entry exceeds its fixed shape.",
+                {"stage": "home_validation"},
+            )
+
+    store = AgentHomeArtifactStore(
+        agent_id=agent_id,
+        agent_home=home,
+        references=cast(ArtifactReferenceReader, object()),
+    )
+    stored: dict[str, ArtifactRef] = {}
+    count = 0
+    byte_total = 0
+    for run_entry in _run_entries(root):
+        if (
+            _RUN_ID.fullmatch(run_entry.name) is None
+            or run_entry.is_symlink()
+            or not run_entry.is_dir(follow_symlinks=False)
+        ):
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "Artifact run entry is invalid.",
+                {"stage": "home_validation"},
+            )
+        run_count = 0
+        run_bytes = 0
+        with os.scandir(run_entry.path) as iterator:
+            entries = tuple(iterator)
+        for entry in entries:
+            if (
+                _ARTIFACT_ID.fullmatch(entry.name) is None
+                or entry.is_symlink()
+                or not entry.is_dir(follow_symlinks=False)
+            ):
+                raise ArtifactError(
+                    "artifact_storage_failed",
+                    "Artifact entry is invalid.",
+                    {"stage": "home_validation"},
+                )
+            ref = store._load_manifest_ref(run_entry.name, entry.name)
+            store._read_ref(ref)
+            if ref.artifact_id in stored:
+                raise ArtifactError(
+                    "artifact_corrupt",
+                    "Artifact identity is duplicated.",
+                    {"artifact_id": ref.artifact_id},
+                )
+            stored[ref.artifact_id] = ref
+            count += 1
+            run_count += 1
+            byte_total += ref.byte_size
+            run_bytes += ref.byte_size
+        _check_quota("run", "count", MAX_ARTIFACTS_PER_RUN, run_count)
+        _check_quota("run", "bytes", MAX_ARTIFACT_BYTES_PER_RUN, run_bytes)
+    _check_quota("agent", "count", MAX_ARTIFACTS_PER_AGENT, count)
+    _check_quota("agent", "bytes", MAX_ARTIFACT_BYTES_PER_AGENT, byte_total)
+
+    for expected in references:
+        if stored.get(expected.artifact_id) != expected:
+            _corrupt(expected.artifact_id, "referenced_manifest_mismatch")
+    for delivery_reference in delivery_references:
+        actual = stored.get(delivery_reference.artifact_id)
+        if actual is None or not _matches_delivery_reference(
+            actual, delivery_reference
+        ):
+            _corrupt(delivery_reference.artifact_id, "delivery_manifest_mismatch")
+    for run_id, artifact_id in reservations:
+        actual = stored.get(artifact_id)
+        if actual is not None and actual.run_id != run_id:
+            _corrupt(artifact_id, "reservation_manifest_mismatch")
+
+
+__all__ = [
+    "AgentHomeArtifactStore",
+    "ArtifactReferenceReader",
+    "validate_artifact_home",
+]

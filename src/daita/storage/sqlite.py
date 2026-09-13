@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import sqlite3
-import tempfile
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import replace
@@ -157,6 +155,13 @@ from ..semantics import (
     SemanticValidationError,
     semantic_annotation_sha256,
 )
+from .home_migrations import (
+    CURRENT_HOME_REVISION,
+    HomeMigrationJournalError,
+    HomeMigrationJournalNewerError,
+    create_current_database,
+    inspect_home_revision,
+)
 from .sqlite_codecs import (
     CurrentSourceAdapterError,
     decode_autonomous_followup,
@@ -177,6 +182,7 @@ from .sqlite_codecs import (
     decode_scheduled_routine,
     decode_semantic_annotation,
     decode_source,
+    decode_source_credential_reference_for_deletion,
     decode_source_read_scope,
     encode_autonomous_followup,
     encode_catalog_snapshot,
@@ -198,15 +204,6 @@ from .sqlite_codecs import (
     encode_source,
     encode_source_read_scope,
 )
-from .sqlite_migrations import (
-    CURRENT_REVISION,
-    MIGRATIONS,
-    MigrationJournalError,
-    MigrationJournalNewerError,
-    create_current,
-    inspect_journal,
-    upgrade_journaled,
-)
 from .sqlite_records import (
     EffectOutcome,
     EffectReceipt,
@@ -225,8 +222,7 @@ from .sqlite_records import (
     validate_effect_receipt_id,
 )
 from .sqlite_schema import (
-    CURRENT_TABLES,
-    require_healthy,
+    CURRENT_SCHEMA,
     require_schema,
     table_names,
 )
@@ -300,8 +296,7 @@ def _load_followup_row(
     followup_id: str,
 ) -> tuple[AutonomousFollowup, str] | None:
     row = connection.execute(
-        "SELECT data FROM autonomous_followups "
-        "WHERE agent_id = ? AND followup_id = ?",
+        "SELECT data FROM autonomous_followups WHERE agent_id = ? AND followup_id = ?",
         (agent_id, followup_id),
     ).fetchone()
     if row is None:
@@ -418,7 +413,7 @@ def _load_routine_row(
     routine_id: str,
 ) -> tuple[ScheduledRoutine, str] | None:
     row = connection.execute(
-        "SELECT data FROM scheduled_routines " "WHERE agent_id = ? AND routine_id = ?",
+        "SELECT data FROM scheduled_routines WHERE agent_id = ? AND routine_id = ?",
         (agent_id, routine_id),
     ).fetchone()
     if row is None:
@@ -464,8 +459,7 @@ def _load_routine_occurrence_row(
     occurrence_id: str,
 ) -> tuple[RoutineOccurrence, str] | None:
     row = connection.execute(
-        "SELECT data FROM routine_occurrences "
-        "WHERE agent_id = ? AND occurrence_id = ?",
+        "SELECT data FROM routine_occurrences WHERE agent_id = ? AND occurrence_id = ?",
         (agent_id, occurrence_id),
     ).fetchone()
     if row is None:
@@ -668,53 +662,10 @@ class _CatalogCommitGate:
             return True
 
 
-class _UpgradeCommitGate:
-    """Let task cancellation veto a not-yet-committed state migration."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._cancelled = False
-        self._committed = False
-
-    def start(self, connection: sqlite3.Connection) -> bool:
-        with self._lock:
-            if self._cancelled:
-                return False
-        connection.execute("BEGIN IMMEDIATE")
-        with self._lock:
-            if self._cancelled:
-                connection.rollback()
-                return False
-            return True
-
-    def commit(self, connection: sqlite3.Connection) -> bool:
-        with self._lock:
-            if self._cancelled:
-                connection.rollback()
-                return False
-            connection.commit()
-            return True
-
-    def activate(self, callback: Callable[[], None]) -> bool:
-        with self._lock:
-            if self._cancelled:
-                return False
-            callback()
-            self._committed = True
-            return True
-
-    def cancel_before_commit(self) -> bool:
-        with self._lock:
-            if self._committed:
-                return False
-            self._cancelled = True
-            return True
-
-
 class SQLiteStateStore:
-    """Sole persistence and upgrade boundary for one admitted agent home."""
+    """Sole SQLite operation boundary for one admitted current agent home."""
 
-    current_revision = CURRENT_REVISION
+    current_revision = str(CURRENT_HOME_REVISION)
 
     def __init__(
         self, path: Path, *, clock: Callable[[], datetime] | None = None
@@ -732,16 +683,19 @@ class SQLiteStateStore:
         path: str | Path,
         *,
         clock: Callable[[], datetime] | None = None,
+        current_home_validated: bool = False,
         **_: object,
     ) -> SQLiteStateStore:
         resolved = Path(path).resolve()
         resolved_clock = clock or (lambda: datetime.now(UTC))
 
-        upgrade_gate = _UpgradeCommitGate()
-
         def admit() -> None:
-            if _initialize(resolved, upgrade_gate=upgrade_gate):
-                _recover_started_effect_receipts(resolved, resolved_clock)
+            if current_home_validated:
+                if not resolved.is_file():
+                    raise ValueError("validated current state database is missing")
+            else:
+                _initialize(resolved)
+            _recover_started_effect_receipts(resolved, resolved_clock)
 
         worker = asyncio.create_task(asyncio.to_thread(admit))
         cancelled = False
@@ -750,7 +704,6 @@ class SQLiteStateStore:
                 await asyncio.shield(worker)
             except asyncio.CancelledError:
                 cancelled = True
-                upgrade_gate.cancel_before_commit()
         worker.result()
         if cancelled:
             raise asyncio.CancelledError
@@ -788,6 +741,45 @@ class SQLiteStateStore:
                     "SELECT data FROM metadata WHERE key = 'identity'"
                 ).fetchone()
             return None if row is None else decode_identity(row[0])
+
+        return await asyncio.to_thread(read)
+
+    async def load_deletion_credential_inventory(
+        self,
+        agent_id: str,
+    ) -> tuple[AgentIdentity | None, tuple[str, ...]]:
+        """Read identity and owned-source reference candidates without admission."""
+
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be non-empty text")
+
+        def read() -> tuple[AgentIdentity | None, tuple[str, ...]]:
+            with _connect_read_only(self.path) as connection:
+                identity_row = connection.execute(
+                    "SELECT data FROM metadata WHERE key = 'identity'"
+                ).fetchone()
+                rows = connection.execute(
+                    """SELECT agent_id, id, data FROM sources
+                       WHERE agent_id = ? ORDER BY id""",
+                    (agent_id,),
+                ).fetchall()
+            identity = (
+                None if identity_row is None else decode_identity(identity_row[0])
+            )
+            references: list[str] = []
+            for row_agent_id, source_id, data in rows:
+                if not all(
+                    isinstance(item, str) for item in (row_agent_id, source_id, data)
+                ):
+                    raise ValueError("stored source deletion inventory is invalid")
+                reference = decode_source_credential_reference_for_deletion(
+                    data,
+                    agent_id=agent_id,
+                    source_id=source_id,
+                )
+                if reference is not None:
+                    references.append(reference)
+            return identity, tuple(references)
 
         return await asyncio.to_thread(read)
 
@@ -2769,8 +2761,7 @@ class SQLiteStateStore:
 
         def write(connection: sqlite3.Connection) -> tuple[AutonomousFollowup, ...]:
             rows = connection.execute(
-                "SELECT followup_id, data FROM autonomous_followups "
-                "WHERE agent_id = ?",
+                "SELECT followup_id, data FROM autonomous_followups WHERE agent_id = ?",
                 (agent_id,),
             ).fetchall()
             recovered: list[AutonomousFollowup] = []
@@ -2913,8 +2904,7 @@ class SQLiteStateStore:
 
         def write(connection: sqlite3.Connection) -> AutonomousFollowup | None:
             rows = connection.execute(
-                "SELECT followup_id, data FROM autonomous_followups "
-                "WHERE agent_id = ?",
+                "SELECT followup_id, data FROM autonomous_followups WHERE agent_id = ?",
                 (agent_id,),
             ).fetchall()
             items = sorted(
@@ -6576,8 +6566,7 @@ def _current_snapshot_row(
 ) -> tuple[str, str] | None:
     with _connect(path) as connection:
         row = connection.execute(
-            "SELECT sync_id, data FROM snapshots "
-            "WHERE agent_id = ? AND source_id = ?",
+            "SELECT sync_id, data FROM snapshots WHERE agent_id = ? AND source_id = ?",
             (agent_id, source_id),
         ).fetchone()
     if row is None:
@@ -6921,7 +6910,7 @@ def _validate_current_mcp_binding_bounds(connection: sqlite3.Connection) -> None
                 )
 
 
-def _validate_current_records(connection: sqlite3.Connection) -> None:
+def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity | None:
     _validate_current_mcp_binding_bounds(connection)
     identity: AgentIdentity | None = None
     for key, data in connection.execute("SELECT key, data FROM metadata"):
@@ -6935,6 +6924,8 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
             agent_id = key.removeprefix(_LEARNING_REVIEW_STAMPS_KEY_PREFIX)
             if not agent_id:
                 raise ValueError("stored learning review owner is invalid")
+            if identity is not None and agent_id != identity.id:
+                raise ValueError("stored learning review belongs to another agent")
             decode_review_stamps(data)
         else:
             raise ValueError("state metadata key is unsupported")
@@ -7033,6 +7024,9 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
             raise ValueError("stored catalog snapshot ownership is invalid")
 
     run_ids: set[str] = set()
+    run_inputs: dict[str, RunInput] = {}
+    run_results: dict[str, LoopExit] = {}
+    run_messages: dict[str, list[CanonicalMessage]] = {}
     message_positions: dict[str, list[int]] = {}
     for (
         run_id,
@@ -7055,33 +7049,40 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
             or turn_index < 0
         ):
             raise ValueError("stored run ownership is invalid")
+        if identity is not None and run_input.agent_id != identity.id:
+            raise ValueError("stored run belongs to another agent")
         if result is not None:
-            try:
-                exit_record = decode_loop_exit(result)
-            except (TypeError, ValueError):
-                pass
-            else:
-                if (
-                    exit_record.run_id != run_id
-                    or exit_record.conversation_id != conversation_id
-                ):
-                    raise ValueError("stored run result ownership is invalid")
+            exit_record = decode_loop_exit(result)
+            if (
+                exit_record.run_id != run_id
+                or exit_record.conversation_id != conversation_id
+            ):
+                raise ValueError("stored run result ownership is invalid")
+            run_results[run_id] = exit_record
         run_ids.add(run_id)
+        run_inputs[run_id] = run_input
     for run_id, position, data in connection.execute(
         "SELECT run_id, position, data FROM messages ORDER BY run_id, position"
     ):
         if run_id not in run_ids:
             raise ValueError("stored message belongs to an unknown run")
-        try:
-            decode_message(data)
-        except (TypeError, ValueError):
-            pass
+        message = decode_message(data)
         message_positions.setdefault(run_id, []).append(position)
+        run_messages.setdefault(run_id, []).append(message)
     if any(
         positions != list(range(len(positions)))
         for positions in message_positions.values()
     ):
         raise ValueError("stored transcript message positions are not contiguous")
+    for run_id, result in run_results.items():
+        if result.kind is LoopExitKind.COMPLETED:
+            validate_completed_transcript(
+                Transcript(
+                    run=run_inputs[run_id],
+                    messages=tuple(run_messages.get(run_id, ())),
+                ),
+                result,
+            )
 
     for (
         agent_id,
@@ -7122,12 +7123,29 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
         annotation = decode_semantic_annotation(data)
         if annotation.agent_id != agent_id or annotation.id != annotation_id:
             raise ValueError("stored semantic annotation ownership is invalid")
+        if identity is not None and annotation.agent_id != identity.id:
+            raise ValueError("stored semantic annotation belongs to another agent")
     for agent_id, candidate_id, data in connection.execute(
         "SELECT agent_id, id, data FROM learning_candidates"
     ):
         candidate = decode_learning_candidate(data)
         if candidate.agent_id != agent_id or candidate.id != candidate_id:
             raise ValueError("stored learning candidate ownership is invalid")
+        if identity is not None and candidate.agent_id != identity.id:
+            raise ValueError("stored learning candidate belongs to another agent")
+
+    job_counts: dict[str, int] = {}
+    for agent_id, job_id, data in connection.execute(
+        "SELECT agent_id, job_id, data FROM job_runs"
+    ):
+        job = decode_job_run(data, agent_id=agent_id, job_id=job_id)
+        if job.agent_id != agent_id or job.job_id != job_id:
+            raise ValueError("stored job ownership is invalid")
+        if identity is not None and job.agent_id != identity.id:
+            raise ValueError("stored job belongs to another agent")
+        job_counts[agent_id] = job_counts.get(agent_id, 0) + 1
+        if job_counts[agent_id] > MAX_JOBS_PER_AGENT:
+            raise ValueError("stored job count exceeds its fixed bound")
 
     routines: dict[tuple[str, str], ScheduledRoutine] = {}
     routine_counts: dict[str, int] = {}
@@ -7287,268 +7305,168 @@ def _validate_current_records(connection: sqlite3.Connection) -> None:
         delivery_counts[agent_id] = delivery_counts.get(agent_id, 0) + 1
         if delivery_counts[agent_id] > MAX_DELIVERIES_PER_AGENT:
             raise ValueError("stored delivery count exceeds its fixed bound")
+    return identity
 
 
-def _logical_state_fingerprint(connection: sqlite3.Connection) -> str:
-    objects = tuple(
-        connection.execute("""SELECT type, name, tbl_name, sql FROM sqlite_master
-               WHERE name NOT LIKE 'sqlite_%'
-               ORDER BY type, name""")
-    )
-    rows = {
-        table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
-        for table in sorted(table_names(connection))
-    }
-    material = json.dumps(
-        {"objects": objects, "rows": rows},
-        ensure_ascii=True,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return sha256(material.encode("utf-8")).hexdigest()
-
-
-def _temporary_state_path(path: Path, label: str) -> Path:
-    descriptor, raw_path = tempfile.mkstemp(
-        prefix=f".{path.name}.{label}-",
-        suffix=".db",
-        dir=path.parent,
-    )
-    os.close(descriptor)
-    candidate = Path(raw_path)
-    os.chmod(candidate, 0o600)
-    return candidate
-
-
-def _copy_state_database(
-    source: Path,
-    destination: Path,
-    *,
-    expected_fingerprint: str,
-) -> None:
-    with _connect_read_only(source) as source_connection:
-        if _logical_state_fingerprint(source_connection) != expected_fingerprint:
-            raise RuntimeError("state changed while its upgrade copy was prepared")
-        destination_connection = _connect(destination)
-        try:
-            source_connection.backup(destination_connection)
-            destination_connection.commit()
-        finally:
-            destination_connection.close()
-    os.chmod(destination, 0o600)
-    with _connect_read_only(destination) as copied_connection:
-        if _logical_state_fingerprint(copied_connection) != expected_fingerprint:
-            raise RuntimeError("state upgrade copy does not match its source")
-        require_healthy(copied_connection)
-
-
-def _rollback_state_path(
+def load_current_artifact_inventory(
     path: Path,
-    *,
-    found_revision: str,
-    fingerprint: str,
-) -> Path:
-    revision = re.sub(r"[^A-Za-z0-9._-]+", "-", found_revision).strip("-._")
-    if not revision:
-        revision = "unknown"
-    return path.with_name(f"{path.name}.rollback-{revision[:80]}-{fingerprint[:12]}")
+    agent_id: str,
+) -> tuple[
+    tuple[ArtifactRef, ...],
+    tuple[OutcomeArtifactReference, ...],
+    frozenset[tuple[str, str]],
+]:
+    """Read exact artifact roots from an already validated current database."""
 
+    if not isinstance(agent_id, str) or not agent_id:
+        raise ValueError("agent_id must be non-empty text")
+    with _connect_read_only(path) as connection:
+        message_rows = tuple(
+            connection.execute(
+                """SELECT r.id, r.conversation_id, m.data
+                   FROM runs AS r
+                   JOIN messages AS m ON m.run_id = r.id
+                   WHERE r.agent_id = ?
+                   ORDER BY r.id, m.position""",
+                (agent_id,),
+            )
+        )
+        job_rows = tuple(
+            connection.execute(
+                "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
+                (agent_id,),
+            )
+        )
+        delivery_rows = tuple(
+            connection.execute(
+                "SELECT delivery_id, data FROM deliveries "
+                "WHERE agent_id = ? ORDER BY created_at_us, delivery_id",
+                (agent_id,),
+            )
+        )
 
-def _fsync_state_file(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
-def _prune_older_rollback_points(path: Path, retained: Path) -> None:
-    for candidate in path.parent.glob(f"{path.name}.rollback-*"):
-        if candidate == retained:
+    refs: dict[str, ArtifactRef] = {}
+    for run_id, conversation_id, data in message_rows:
+        message = decode_message(data)
+        if message.role is not MessageRole.TOOL:
             continue
-        try:
-            candidate.unlink()
-        except OSError:
-            pass
+        for block in message.content:
+            if not isinstance(block, ToolResultBlock) or block.is_error:
+                continue
+            raw = block.output.get("artifact")
+            if not isinstance(raw, Mapping):
+                continue
+            ref = artifact_ref_from_mapping(raw)
+            if (
+                ref.run_id != run_id
+                or ref.conversation_id != conversation_id
+                or ref.call_id != block.call_id
+            ):
+                raise ValueError("stored artifact reference identity is invalid")
+            prior = refs.get(ref.artifact_id)
+            if prior is not None and prior != ref:
+                raise ValueError("stored artifact identity is ambiguous")
+            refs[ref.artifact_id] = ref
+    jobs = _decode_job_rows(job_rows, agent_id=agent_id)
+    reservations: set[tuple[str, str]] = set()
+    for job in jobs:
+        if job.result is not None:
+            for ref in job.result.artifact_refs:
+                if ref.conversation_id != job.conversation_id:
+                    raise ValueError("stored job artifact identity is invalid")
+                prior = refs.get(ref.artifact_id)
+                if prior is not None and prior != ref:
+                    raise ValueError("stored artifact identity is ambiguous")
+                refs[ref.artifact_id] = ref
+        if job.status not in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}:
+            continue
+        attempt = job.current_attempt
+        if attempt is not None and attempt.status is JobAttemptStatus.CLAIMED:
+            reservations.add((attempt.execution_run_id, attempt.reserved_artifact_id))
 
-
-def _upgrade_staged_state(
-    path: Path,
-    *,
-    applied: int,
-    source_fingerprint: str,
-    found_revision: str,
-    upgrade_gate: _UpgradeCommitGate | None,
-) -> bool:
-    rollback_candidate = _temporary_state_path(path, "rollback")
-    staged = _temporary_state_path(path, "upgrade")
-    retained_rollback = _rollback_state_path(
-        path,
-        found_revision=found_revision,
-        fingerprint=source_fingerprint,
+    delivery_references: dict[str, OutcomeArtifactReference] = {}
+    for delivery_id, data in delivery_rows:
+        delivery = decode_delivery(data, agent_id=agent_id, delivery_id=delivery_id)
+        for reference in delivery.outcome.artifact_references:
+            prior_delivery = delivery_references.get(reference.artifact_id)
+            if prior_delivery is not None and prior_delivery != reference:
+                raise ValueError("stored delivery artifact identity is ambiguous")
+            delivery_references[reference.artifact_id] = reference
+    return (
+        tuple(
+            sorted(refs.values(), key=lambda item: (item.created_at, item.artifact_id))
+        ),
+        tuple(
+            sorted(
+                delivery_references.values(),
+                key=lambda item: (item.producing_run_id, item.artifact_id),
+            )
+        ),
+        frozenset(reservations),
     )
-    published_rollback = False
-    activated = False
-    try:
-        _copy_state_database(
-            path,
-            rollback_candidate,
-            expected_fingerprint=source_fingerprint,
-        )
-        _copy_state_database(
-            rollback_candidate,
-            staged,
-            expected_fingerprint=source_fingerprint,
-        )
-
-        connection = _connect(staged)
-        try:
-            if upgrade_gate is None:
-                connection.execute("BEGIN IMMEDIATE")
-            elif not upgrade_gate.start(connection):
-                return False
-            if inspect_journal(connection) != applied:
-                raise RuntimeError("migration journal changed during admission")
-            upgrade_journaled(connection, applied)
-            require_schema(connection, CURRENT_TABLES)
-            require_healthy(connection)
-            if upgrade_gate is None:
-                connection.commit()
-            elif not upgrade_gate.commit(connection):
-                return False
-        except BaseException:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-        with _connect_read_only(staged) as staged_connection:
-            if inspect_journal(staged_connection) != len(MIGRATIONS):
-                raise RuntimeError("staged state did not reach the current revision")
-            _validate_current_records(staged_connection)
-
-        os.chmod(staged, 0o600)
-        os.chmod(rollback_candidate, 0o600)
-        _fsync_state_file(staged)
-        _fsync_state_file(rollback_candidate)
-
-        def activate() -> None:
-            nonlocal activated, published_rollback
-            if retained_rollback.exists():
-                with _connect_read_only(retained_rollback) as existing_rollback:
-                    if (
-                        _logical_state_fingerprint(existing_rollback)
-                        != source_fingerprint
-                    ):
-                        raise RuntimeError(
-                            "existing rollback point has conflicting state"
-                        )
-                rollback_candidate.unlink()
-            else:
-                os.replace(rollback_candidate, retained_rollback)
-                published_rollback = True
-            try:
-                os.replace(staged, path)
-            except BaseException:
-                if published_rollback:
-                    retained_rollback.unlink(missing_ok=True)
-                    published_rollback = False
-                raise
-            activated = True
-
-        if upgrade_gate is None:
-            activate()
-        elif not upgrade_gate.activate(activate):
-            return False
-        _prune_older_rollback_points(path, retained_rollback)
-        return True
-    finally:
-        rollback_candidate.unlink(missing_ok=True)
-        staged.unlink(missing_ok=True)
-        if published_rollback and not activated:
-            retained_rollback.unlink(missing_ok=True)
 
 
-def _initialize(
-    path: Path,
-    *,
-    upgrade_gate: _UpgradeCommitGate | None = None,
-) -> bool:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        admitted = _admit_existing_state(path, upgrade_gate=upgrade_gate)
-        if admitted:
-            os.chmod(path, 0o600)
-        return admitted
-    with _connect(path) as connection:
-        create_current(connection)
-    os.chmod(path, 0o600)
-    return True
+def validate_current_state_database(path: Path) -> AgentIdentity | None:
+    """Validate the entire canonical database without changing it."""
 
-
-def _admit_existing_state(
-    path: Path,
-    *,
-    upgrade_gate: _UpgradeCommitGate | None = None,
-) -> bool:
     try:
         with _connect_read_only(path) as connection:
-            applied = inspect_journal(connection)
-            if applied == len(MIGRATIONS):
-                _validate_current_mcp_binding_bounds(connection)
-                return True
-            found_revision = MIGRATIONS[applied - 1].migration_id
-            source_fingerprint = _logical_state_fingerprint(connection)
-    except MigrationJournalNewerError as error:
+            if "agent_home_migrations" not in table_names(connection):
+                raise StateCompatibilityError(
+                    StateCompatibilityCode.LEGACY,
+                    path,
+                    "This database must be admitted by the agent-home upgrade owner.",
+                    current_revision=str(CURRENT_HOME_REVISION),
+                    found_revision="preproduction",
+                )
+            revision = inspect_home_revision(connection)
+            if revision != CURRENT_HOME_REVISION:
+                raise StateCompatibilityError(
+                    StateCompatibilityCode.REVISION_UNSUPPORTED,
+                    path,
+                    "This agent-home revision is not current.",
+                    current_revision=str(CURRENT_HOME_REVISION),
+                    found_revision=str(revision),
+                )
+            require_schema(connection, CURRENT_SCHEMA)
+            return _validate_current_records(connection)
+    except HomeMigrationJournalNewerError as error:
         raise StateCompatibilityError(
             StateCompatibilityCode.NEWER_REVISION,
             path,
-            (
-                "This local state was created by a newer Daita release. Install "
-                "the same or a newer package. No state was changed."
+            "This local state was created by a newer Daita release. No state was changed.",
+            current_revision=str(CURRENT_HOME_REVISION),
+            found_revision=(
+                None if error.found_revision is None else str(error.found_revision)
             ),
-            current_revision=CURRENT_REVISION,
-            found_revision=error.found_revision,
         ) from None
-    except MigrationJournalError as error:
+    except HomeMigrationJournalError as error:
         raise StateCompatibilityError(
             StateCompatibilityCode.REVISION_UNSUPPORTED,
             path,
-            (
-                "This local state has an unknown, incomplete, reordered, or edited "
-                "migration history. No state was changed. Install the matching "
-                "Daita release before continuing."
+            "This local state has an invalid agent-home migration history. No state was changed.",
+            current_revision=str(CURRENT_HOME_REVISION),
+            found_revision=(
+                "invalid-journal"
+                if error.found_revision is None
+                else str(error.found_revision)
             ),
-            current_revision=CURRENT_REVISION,
-            found_revision=error.found_revision or "invalid-journal",
         ) from None
     except StateCompatibilityError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):
         raise _damaged_state_error(path, None) from None
 
-    try:
-        return _upgrade_staged_state(
-            path,
-            applied=applied,
-            source_fingerprint=source_fingerprint,
-            found_revision=found_revision,
-            upgrade_gate=upgrade_gate,
-        )
-    except BaseException as error:
-        if isinstance(error, (KeyboardInterrupt, SystemExit)):
-            raise
-        raise StateCompatibilityError(
-            StateCompatibilityCode.UPGRADE_FAILED,
-            path,
-            (
-                "Daita could not update the local state safely. The active "
-                "database was not replaced. Reinstall the prior working Daita "
-                "package before continuing, then report this upgrade failure."
-            ),
-            current_revision=CURRENT_REVISION,
-            found_revision=found_revision,
-        ) from None
+
+def _initialize(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        validate_current_state_database(path)
+        os.chmod(path, 0o600)
+        return
+    with _connect(path) as connection:
+        create_current_database(connection)
+    os.chmod(path, 0o600)
 
 
 def _damaged_state_error(
@@ -7563,7 +7481,7 @@ def _damaged_state_error(
             "Daita revision. No state was changed. Reinstall the matching Daita "
             "release or restore the database through your normal recovery process."
         ),
-        current_revision=CURRENT_REVISION,
+        current_revision=str(CURRENT_HOME_REVISION),
         found_revision=found_revision,
     )
 
@@ -7648,7 +7566,7 @@ def _recover_started_effect_receipts(
     except RuntimeError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):
-        raise _damaged_state_error(path, CURRENT_REVISION) from None
+        raise _damaged_state_error(path, str(CURRENT_HOME_REVISION)) from None
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -7684,5 +7602,7 @@ __all__ = [
     "StateCompatibilityCode",
     "StateCompatibilityError",
     "effect_receipt_id",
+    "load_current_artifact_inventory",
     "relational_write_authorization_fingerprint",
+    "validate_current_state_database",
 ]

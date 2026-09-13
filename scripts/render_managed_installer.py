@@ -10,8 +10,8 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
-import tomllib
 import zipfile
 from dataclasses import dataclass
 from email.parser import Parser
@@ -20,6 +20,11 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(ROOT))
+
+from scripts.release_identity import parse_version, read_project_identity
+
 DEFAULT_POLICY = ROOT / "release" / "managed-installer.json"
 DEFAULT_PROJECT = ROOT / "pyproject.toml"
 DEFAULT_TEMPLATE = ROOT / "scripts" / "install.sh"
@@ -49,7 +54,7 @@ TARGET_RUNTIME_SHAPES = {
     ),
 }
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
-_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][A-Za-z0-9.-]+)?\Z")
+_UV_VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\Z")
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
 _PYTHON_REQUEST = re.compile(r"cpython-3\.12\.[0-9]+(?:\+[A-Za-z0-9._-]+)?\Z")
 _PYTHON_IDENTITY = re.compile(
@@ -146,26 +151,8 @@ def load_release_policy(path: Path) -> dict[str, Any]:
     root = _required_object(
         policy,
         label="release policy",
-        keys={"schema_version", "installer", "runtime"},
+        keys={"runtime"},
     )
-    if type(root["schema_version"]) is not int or root["schema_version"] != 1:
-        raise ReleaseInputError("release policy schema_version must be 1")
-
-    installer = _required_object(
-        root["installer"],
-        label="installer policy",
-        keys={"version", "release_sequence"},
-    )
-    installer_version = _required_string(
-        installer["version"], label="installer.version"
-    )
-    if _VERSION.fullmatch(installer_version) is None:
-        raise ReleaseInputError("installer.version must be a semantic version")
-    release_sequence = installer["release_sequence"]
-    if not isinstance(release_sequence, int) or isinstance(release_sequence, bool):
-        raise ReleaseInputError("installer.release_sequence must be an integer")
-    if release_sequence < 1:
-        raise ReleaseInputError("installer.release_sequence must be positive")
 
     runtime = _required_object(
         root["runtime"],
@@ -173,7 +160,7 @@ def load_release_policy(path: Path) -> dict[str, Any]:
         keys={"uv_version", "python_request", "targets"},
     )
     uv_version = _safe_token(runtime["uv_version"], label="runtime.uv_version")
-    if _VERSION.fullmatch(uv_version) is None:
+    if _UV_VERSION.fullmatch(uv_version) is None:
         raise ReleaseInputError("runtime.uv_version must be a semantic version")
     python_request = _safe_token(
         runtime["python_request"], label="runtime.python_request"
@@ -252,11 +239,6 @@ def load_release_policy(path: Path) -> dict[str, Any]:
         }
 
     return {
-        "schema_version": 1,
-        "installer": {
-            "version": installer_version,
-            "release_sequence": release_sequence,
-        },
         "runtime": {
             "uv_version": uv_version,
             "python_request": python_request,
@@ -329,8 +311,10 @@ def inspect_wheel(path: Path) -> WheelMetadata:
             requires_python = _required_string(
                 python_requirements[0], label="candidate wheel Requires-Python"
             )
-            if _VERSION.fullmatch(version) is None:
-                raise ReleaseInputError("candidate wheel version is not supported")
+            try:
+                parse_version(version, label="candidate wheel version")
+            except ValueError as error:
+                raise ReleaseInputError(str(error)) from error
             expected_root = f"daita_agents-{version}.dist-info"
             if roots != {expected_root}:
                 raise ReleaseInputError("candidate wheel metadata path is inconsistent")
@@ -367,18 +351,6 @@ def inspect_wheel(path: Path) -> WheelMetadata:
     )
 
 
-def project_metadata(path: Path) -> tuple[str, str]:
-    with path.open("rb") as source:
-        project = tomllib.load(source).get("project")
-    if not isinstance(project, dict):
-        raise ReleaseInputError("pyproject.toml has no project table")
-    version = project.get("version")
-    requires_python = project.get("requires-python")
-    if not isinstance(version, str) or not isinstance(requires_python, str):
-        raise ReleaseInputError("project version and requires-python must be strings")
-    return version, requires_python
-
-
 def _normalized_requires_python(value: str) -> tuple[str, ...]:
     return tuple(sorted(part.strip() for part in value.split(",") if part.strip()))
 
@@ -398,6 +370,7 @@ def render_managed_installer(
     wheel: Path,
     wheel_url: str,
     template: Path = DEFAULT_TEMPLATE,
+    enable_test_failpoints: bool = False,
 ) -> RenderedRelease:
     metadata = inspect_wheel(wheel)
     checked_wheel_url = _immutable_url(
@@ -414,12 +387,10 @@ def render_managed_installer(
             f"wheel URL must contain the immutable release tag {expected_tag_segment}"
         )
 
-    installer = policy["installer"]
     runtime = policy["runtime"]
     replacements = {
-        "UNRESOLVED_INSTALLER_VERSION": installer["version"],
-        "UNRESOLVED_RELEASE_SEQUENCE": str(installer["release_sequence"]),
         "UNRESOLVED_DAITA_VERSION": metadata.version,
+        "UNRESOLVED_TEST_FAILPOINTS": "1" if enable_test_failpoints else "0",
         "UNRESOLVED_WHEEL_FILENAME": metadata.filename,
         "UNRESOLVED_WHEEL_URL": checked_wheel_url,
         "UNRESOLVED_WHEEL_SHA256": metadata.sha256,
@@ -451,11 +422,9 @@ def render_managed_installer(
 
     installer_sha256 = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "installer": {
             "filename": "install.sh",
-            "version": installer["version"],
-            "release_sequence": installer["release_sequence"],
             "sha256": installer_sha256,
         },
         "application": {
@@ -520,20 +489,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         policy = load_release_policy(arguments.policy)
         metadata = inspect_wheel(arguments.wheel)
-        version, requires_python = project_metadata(arguments.project)
-        if metadata.version != version:
+        project = read_project_identity(arguments.project)
+        if metadata.version != project.version:
             raise ReleaseInputError(
                 "candidate wheel version does not match pyproject.toml"
             )
         if _normalized_requires_python(
             metadata.requires_python
-        ) != _normalized_requires_python(requires_python):
+        ) != _normalized_requires_python(project.requires_python):
             raise ReleaseInputError(
                 "candidate wheel Requires-Python does not match pyproject.toml"
             )
         authoritative_wheel_url = (
             "https://github.com/Daita-Corp/daita-agents/releases/download/"
-            f"v{version}/{metadata.filename}"
+            f"{project.tag}/{metadata.filename}"
         )
         if arguments.wheel_url != authoritative_wheel_url:
             raise ReleaseInputError(
@@ -550,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
             installer_output=arguments.installer_output,
             manifest_output=arguments.manifest_output,
         )
-    except (OSError, ReleaseInputError, tomllib.TOMLDecodeError) as error:
+    except (OSError, ReleaseInputError, ValueError) as error:
         parser.exit(2, f"error: {error}\n")
     return 0
 

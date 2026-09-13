@@ -470,10 +470,18 @@ ModelSetupScreen #model-help {
     background: #242424;
 }
 
-#picker-confirm,
-#picker-secondary {
-    width: auto;
+#picker-actions {
+    height: 3;
     margin-top: 1;
+}
+
+#picker-actions Button {
+    width: auto;
+    margin-right: 1;
+}
+
+#picker-tertiary {
+    color: #D87979;
 }
 
 #catalog-summary {

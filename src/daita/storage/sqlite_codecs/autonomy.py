@@ -1,4 +1,4 @@
-"""Encode the current codec-v1 follow-up and shared delivery families."""
+"""Encode the current canonical follow-up and shared delivery families."""
 
 from __future__ import annotations
 
@@ -37,8 +37,6 @@ from .distribution import (
 )
 from .execution_scope import decode_execution_scope, encode_execution_scope
 
-_FOLLOWUP_VERSION = 1
-
 
 def encode_autonomous_followup(value: AutonomousFollowup) -> str:
     if not isinstance(value, AutonomousFollowup):
@@ -47,7 +45,6 @@ def encode_autonomous_followup(value: AutonomousFollowup) -> str:
         record(
             "AutonomousFollowup",
             {
-                "version": _FOLLOWUP_VERSION,
                 "conversation_id": value.conversation_id,
                 "event_id": value.event_id,
                 "observation_source": value.observation_source.value,
@@ -97,7 +94,6 @@ def decode_autonomous_followup(
         load_payload(value),
         "AutonomousFollowup",
         (
-            "version",
             "conversation_id",
             "event_id",
             "observation_source",
@@ -130,8 +126,6 @@ def decode_autonomous_followup(
             "failure_code",
         ),
     )
-    if integer(fields["version"], "follow-up version") != _FOLLOWUP_VERSION:
-        raise ValueError("stored follow-up version is unsupported")
     try:
         source = FollowupObservationSource(
             text(fields["observation_source"], "follow-up observation source")

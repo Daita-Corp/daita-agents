@@ -2,10 +2,71 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import dataclass
+from types import MappingProxyType
 
 TableSchema = Mapping[str, tuple[tuple[object, ...], ...]]
+ForeignKeySchema = Mapping[str, tuple[tuple[object, ...], ...]]
+UniqueConstraintSchema = Mapping[str, frozenset[tuple[str, ...]]]
+NamedIndexSchema = Mapping[str, tuple[str, bool, tuple[str, ...]]]
+RequiredSQLSchema = Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class SQLiteSchema:
+    """Immutable complete contract for one agent-home SQLite shape."""
+
+    tables: TableSchema
+    foreign_keys: ForeignKeySchema
+    unique_constraints: UniqueConstraintSchema
+    named_indexes: NamedIndexSchema
+    required_sql_fragments: RequiredSQLSchema
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "tables",
+            MappingProxyType(
+                {table: tuple(columns) for table, columns in self.tables.items()}
+            ),
+        )
+        object.__setattr__(
+            self,
+            "foreign_keys",
+            MappingProxyType(
+                {
+                    table: tuple(foreign_keys)
+                    for table, foreign_keys in self.foreign_keys.items()
+                }
+            ),
+        )
+        object.__setattr__(
+            self,
+            "unique_constraints",
+            MappingProxyType(
+                {
+                    table: frozenset(constraints)
+                    for table, constraints in self.unique_constraints.items()
+                }
+            ),
+        )
+        object.__setattr__(
+            self, "named_indexes", MappingProxyType(dict(self.named_indexes))
+        )
+        object.__setattr__(
+            self,
+            "required_sql_fragments",
+            MappingProxyType(
+                {
+                    table: tuple(fragments)
+                    for table, fragments in self.required_sql_fragments.items()
+                }
+            ),
+        )
+
 
 CORE_TABLES: dict[str, tuple[tuple[object, ...], ...]] = {
     "learning_candidates": (
@@ -67,9 +128,9 @@ RECEIPT_TABLE = (
     ("data", "TEXT", 1, None, 0),
 )
 
-JOURNAL_TABLE = (
-    ("ordinal", "INTEGER", 1, None, 0),
-    ("migration_id", "TEXT", 1, None, 1),
+AGENT_HOME_MIGRATION_TABLE = (
+    ("revision", "INTEGER", 1, None, 1),
+    ("migration_id", "TEXT", 1, None, 0),
     ("checksum", "TEXT", 1, None, 0),
 )
 READ_SCOPE_TABLE = (
@@ -137,7 +198,7 @@ ROUTINE_OCCURRENCE_TABLE = (
 CURRENT_TABLES = {
     **CORE_TABLES,
     "effect_receipts": RECEIPT_TABLE,
-    "state_migrations": JOURNAL_TABLE,
+    "agent_home_migrations": AGENT_HOME_MIGRATION_TABLE,
     "source_read_scopes": READ_SCOPE_TABLE,
     "relational_write_scopes": RELATIONAL_WRITE_SCOPE_TABLE,
     "mcp_server_bindings": MCP_BINDING_TABLE,
@@ -207,7 +268,7 @@ UNIQUE_CONSTRAINTS = {
     "effect_receipts": frozenset(
         {("agent_id", "run_id", "call_id"), ("agent_id", "operation_key")}
     ),
-    "state_migrations": frozenset({("ordinal",)}),
+    "agent_home_migrations": frozenset({("migration_id",)}),
     "autonomous_followups": frozenset(
         {("agent_id", "event_id"), ("agent_id", "job_id")}
     ),
@@ -229,6 +290,28 @@ UNIQUE_CONSTRAINTS = {
         }
     ),
 }
+REQUIRED_SQL_FRAGMENTS = {
+    table: ("CHECK (json_valid(data))",)
+    for table in (
+        "deliveries",
+        "mcp_server_bindings",
+        "routine_occurrences",
+        "scheduled_routines",
+    )
+}
+SCHEMA_REVISION_1 = SQLiteSchema(
+    tables=CURRENT_TABLES,
+    foreign_keys={
+        "messages": MESSAGES_FOREIGN_KEYS,
+        "source_read_scopes": SOURCE_SCOPE_FOREIGN_KEYS,
+        "relational_write_scopes": SOURCE_SCOPE_FOREIGN_KEYS,
+        "routine_occurrences": ROUTINE_OCCURRENCE_FOREIGN_KEYS,
+    },
+    unique_constraints=UNIQUE_CONSTRAINTS,
+    named_indexes=NAMED_INDEXES,
+    required_sql_fragments=REQUIRED_SQL_FRAGMENTS,
+)
+CURRENT_SCHEMA = SCHEMA_REVISION_1
 
 BASE_TABLE_SQL = """
 CREATE TABLE metadata (
@@ -305,10 +388,10 @@ CREATE INDEX effect_receipts_unresolved ON effect_receipts(agent_id, unresolved,
 CREATE INDEX effect_receipts_grant_reservations ON effect_receipts(agent_id, occurrence_id, grant_digest)
 """
 
-JOURNAL_TABLE_SQL = """
-CREATE TABLE state_migrations (
-    ordinal INTEGER NOT NULL UNIQUE,
-    migration_id TEXT NOT NULL PRIMARY KEY,
+AGENT_HOME_MIGRATION_TABLE_SQL = """
+CREATE TABLE agent_home_migrations (
+    revision INTEGER NOT NULL PRIMARY KEY,
+    migration_id TEXT NOT NULL UNIQUE,
     checksum TEXT NOT NULL
 )
 """
@@ -427,6 +510,30 @@ CREATE INDEX routine_occurrences_stale
     ON routine_occurrences(agent_id, state, lease_expires_at_us, occurrence_id)
 """
 
+REVISION_1_DATABASE_SQL = (
+    BASE_TABLE_SQL
+    + RECEIPT_TABLE_SQL
+    + ";\n"
+    + AGENT_HOME_MIGRATION_TABLE_SQL
+    + ";\n"
+    + SOURCE_READ_SCOPE_TABLE_SQL
+    + ";\n"
+    + RELATIONAL_WRITE_SCOPE_TABLE_SQL
+    + ";\n"
+    + MCP_SERVER_BINDING_TABLE_SQL
+    + ";\n"
+    + JOB_RUN_TABLE_SQL
+    + ";\n"
+    + AUTONOMOUS_FOLLOWUP_TABLE_SQL
+    + ";\n"
+    + DELIVERY_TABLE_SQL
+    + ";\n"
+    + SCHEDULED_ROUTINE_TABLE_SQL
+    + ";\n"
+    + ROUTINE_OCCURRENCE_TABLE_SQL
+    + ";\n"
+)
+
 
 def table_names(connection: sqlite3.Connection) -> frozenset[str]:
     return frozenset(
@@ -438,7 +545,10 @@ def table_names(connection: sqlite3.Connection) -> frozenset[str]:
     )
 
 
-def schema_matches(connection: sqlite3.Connection, definitions: TableSchema) -> bool:
+def schema_matches(
+    connection: sqlite3.Connection,
+    definitions: TableSchema | SQLiteSchema,
+) -> bool:
     try:
         require_schema(connection, definitions)
     except (sqlite3.Error, ValueError):
@@ -446,15 +556,47 @@ def schema_matches(connection: sqlite3.Connection, definitions: TableSchema) -> 
     return True
 
 
-def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> None:
-    if table_names(connection) != set(definitions):
+def require_schema(
+    connection: sqlite3.Connection,
+    definitions: TableSchema | SQLiteSchema,
+) -> None:
+    if isinstance(definitions, SQLiteSchema):
+        tables = definitions.tables
+        expected_foreign_keys = definitions.foreign_keys
+        expected_unique_constraints = definitions.unique_constraints
+        expected_named_indexes = definitions.named_indexes
+        required_sql_fragments = definitions.required_sql_fragments
+    else:
+        tables = definitions
+        expected_foreign_keys = {
+            "messages": MESSAGES_FOREIGN_KEYS,
+            **(
+                {"source_read_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
+                if "source_read_scopes" in tables
+                else {}
+            ),
+            **(
+                {"relational_write_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
+                if "relational_write_scopes" in tables
+                else {}
+            ),
+            **(
+                {"routine_occurrences": ROUTINE_OCCURRENCE_FOREIGN_KEYS}
+                if "routine_occurrences" in tables
+                else {}
+            ),
+        }
+        expected_unique_constraints = UNIQUE_CONSTRAINTS
+        expected_named_indexes = NAMED_INDEXES
+        required_sql_fragments = REQUIRED_SQL_FRAGMENTS
+    if table_names(connection) != set(tables):
         raise ValueError("state tables do not match the declared revision")
-    for table, expected in definitions.items():
+    for table, expected in tables.items():
         actual = tuple(
-            (row[1], str(row[2]).upper(), row[3], row[4], row[5])
-            for row in connection.execute(f"PRAGMA table_info({table})")
+            (row[1], str(row[2]).upper(), row[3], row[4], row[5], row[6])
+            for row in connection.execute(f"PRAGMA table_xinfo({table})")
         )
-        if actual != expected:
+        if actual != tuple((*column, 0) for column in expected):
             raise ValueError(f"state table does not match its revision: {table}")
 
     foreign_keys: dict[str, tuple[tuple[object, ...], ...]] = {
@@ -462,40 +604,27 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
             (row[2], row[3], row[4], row[5], row[6], row[7])
             for row in connection.execute(f"PRAGMA foreign_key_list({table})")
         )
-        for table in definitions
-    }
-    expected_foreign_keys: dict[str, tuple[tuple[object, ...], ...]] = {
-        "messages": MESSAGES_FOREIGN_KEYS,
-        **(
-            {"source_read_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
-            if "source_read_scopes" in definitions
-            else {}
-        ),
-        **(
-            {"relational_write_scopes": SOURCE_SCOPE_FOREIGN_KEYS}
-            if "relational_write_scopes" in definitions
-            else {}
-        ),
-        **(
-            {"routine_occurrences": ROUTINE_OCCURRENCE_FOREIGN_KEYS}
-            if "routine_occurrences" in definitions
-            else {}
-        ),
+        for table in tables
     }
     for table, actual_foreign_keys in foreign_keys.items():
         if actual_foreign_keys != expected_foreign_keys.get(table, ()):
             raise ValueError(f"state foreign keys are invalid: {table}")
 
-    for table in definitions:
+    for table in tables:
+        index_rows = tuple(connection.execute(f"PRAGMA index_list({table})"))
+        if any(row[4] != 0 for row in index_rows):
+            raise ValueError(f"state partial indexes are invalid: {table}")
         actual_unique_constraints = frozenset(
             tuple(
                 column[2]
                 for column in connection.execute(f"PRAGMA index_info({index[1]})")
             )
-            for index in connection.execute(f"PRAGMA index_list({table})")
+            for index in index_rows
             if index[3] == "u"
         )
-        if actual_unique_constraints != UNIQUE_CONSTRAINTS.get(table, frozenset()):
+        if actual_unique_constraints != expected_unique_constraints.get(
+            table, frozenset()
+        ):
             raise ValueError(f"state unique constraints are invalid: {table}")
 
     named_indexes = {
@@ -506,10 +635,14 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
         )
     }
     if named_indexes != {
-        name: definition[0] for name, definition in NAMED_INDEXES.items()
+        name: definition[0] for name, definition in expected_named_indexes.items()
     }:
         raise ValueError("state named indexes do not match the declared revision")
-    for name, (table, expected_unique, expected_columns) in NAMED_INDEXES.items():
+    for name, (
+        table,
+        expected_unique,
+        expected_columns,
+    ) in expected_named_indexes.items():
         indexes = {
             row[1]: bool(row[2])
             for row in connection.execute(f"PRAGMA index_list({table})")
@@ -517,7 +650,7 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
         }
         if indexes != {
             index_name: definition[1]
-            for index_name, definition in NAMED_INDEXES.items()
+            for index_name, definition in expected_named_indexes.items()
             if definition[0] == table
         }:
             raise ValueError(f"state index is invalid: {name}")
@@ -526,6 +659,38 @@ def require_schema(connection: sqlite3.Connection, definitions: TableSchema) -> 
         )
         if columns != expected_columns:
             raise ValueError(f"state index columns are invalid: {name}")
+
+    for table in tables:
+        for index in connection.execute(f"PRAGMA index_list({table})"):
+            key_columns = tuple(
+                row
+                for row in connection.execute(f'PRAGMA index_xinfo("{index[1]}")')
+                if row[5] == 1
+            )
+            if any(row[3] != 0 or row[4] != "BINARY" for row in key_columns):
+                raise ValueError(f"state index ordering is invalid: {index[1]}")
+
+    for table in tables:
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if row is None or not isinstance(row[0], str):
+            raise ValueError(f"state table SQL is unavailable: {table}")
+        normalized_sql = " ".join(row[0].split())
+        fragments = required_sql_fragments.get(table, ())
+        if any(fragment not in normalized_sql for fragment in fragments):
+            raise ValueError(f"state table checks are invalid: {table}")
+        if len(re.findall(r"\bCHECK\s*\(", normalized_sql, re.IGNORECASE)) != len(
+            fragments
+        ):
+            raise ValueError(f"state table checks are invalid: {table}")
+        if re.search(
+            r"\b(COLLATE|DEFERRABLE|GENERATED|STRICT|WITHOUT\s+ROWID)\b",
+            normalized_sql,
+            re.IGNORECASE,
+        ):
+            raise ValueError(f"state table options are invalid: {table}")
 
     extra_objects = tuple(
         connection.execute(

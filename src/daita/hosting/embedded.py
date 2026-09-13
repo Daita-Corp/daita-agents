@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import shutil
+import sqlite3
 import stat
 import tomllib
 from collections.abc import Awaitable, Callable, Mapping
@@ -49,13 +50,16 @@ from ..adapters.postgresql_write import (
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
-from ..artifacts.delivery import LocalArtifactDelivery
+from ..artifacts.delivery import (
+    LocalArtifactDelivery,
+    validate_delivery_configuration,
+)
 from ..artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,
     ArtifactPayload,
 )
-from ..artifacts.store import AgentHomeArtifactStore
+from ..artifacts.store import AgentHomeArtifactStore, validate_artifact_home
 from ..autonomy import (
     FOLLOWUP_INSTRUCTION,
     FOLLOWUP_INSTRUCTION_DIGEST,
@@ -224,6 +228,7 @@ from ..memory.capabilities import (
     MemoryCapabilityDomain,
     memory_set_declarations,
 )
+from ..memory.store import validate_memory_documents
 from ..observation import AgentObserver
 from ..routines.capabilities import (
     ROUTINE_DOMAIN_OWNER_ID,
@@ -272,7 +277,12 @@ from ..skills.capabilities import (
     SkillCapabilityDomain,
     skill_declarations,
 )
-from ..storage.sqlite import SQLiteStateStore
+from ..skills.store import validate_skill_documents
+from ..storage.sqlite import (
+    SQLiteStateStore,
+    load_current_artifact_inventory,
+    validate_current_state_database,
+)
 from ..storage.sqlite_records import (
     EffectReceipt,
     EffectResolution,
@@ -289,6 +299,7 @@ from ..storage.sqlite_records import (
     validate_effect_receipt_id,
 )
 from ..workspace import LocalWorkspace
+from .home_upgrade import AgentHomeStatus, inspect_agent_home, upgrade_agent_home
 
 
 class _RoutineDraftValues(TypedDict):
@@ -418,7 +429,7 @@ def _model_execution_contracts(
     """Digest declared non-secret execution configuration, never SDK state."""
 
     if route is not None:
-        material = _encode_agent_config(AgentConfig(model_route=route))["model_route"]
+        material = _encode_model_route_contract(route)
         route_ids = tuple(candidate.provider_id for candidate in route.candidates)
     elif isinstance(model, ModelRouter):
         material = {
@@ -461,6 +472,34 @@ def _model_execution_contracts(
             ).encode("utf-8")
         ).hexdigest()
         for route_id in route_ids
+    }
+
+
+def _encode_model_route_contract(route: ModelRoute) -> dict[str, object]:
+    """Encode exact runtime facts used to authorize frozen model execution."""
+
+    return {
+        "candidates": [
+            {
+                "allowed_sensitivities": sorted(
+                    sensitivity.value for sensitivity in candidate.allowed_sensitivities
+                ),
+                "base_url": candidate.base_url,
+                "profile": _encode_model_profile(candidate.profile),
+                "provider_id": candidate.provider_id,
+                "secret_reference": (
+                    None
+                    if candidate.secret_reference is None
+                    else candidate.secret_reference.to_uri()
+                ),
+            }
+            for candidate in route.candidates
+        ],
+        "retry_policy": {
+            "max_attempts_per_candidate": route.retry_policy.max_attempts_per_candidate,
+            "max_total_attempts": route.retry_policy.max_total_attempts,
+            "backoff_seconds": route.retry_policy.backoff_seconds,
+        },
     }
 
 
@@ -843,6 +882,29 @@ class EmbeddedAgent:
         return tuple(names)
 
     @classmethod
+    async def inspect_home(
+        cls,
+        name: str,
+        *,
+        root: str | Path | None = None,
+    ) -> AgentHomeStatus:
+        """Read the persisted revision and recovery state without upgrading it."""
+
+        if not isinstance(name, str) or _AGENT_NAME.fullmatch(name) is None:
+            raise AgentNameError(
+                "agent name must contain 1-64 ASCII letters, digits, '_' or '-'"
+            )
+        state_root = _resolve_state_root(root)
+        _reject_legacy_state_root(state_root)
+        agents_root = state_root / "agents"
+        home = agents_root / name
+        if not home.is_dir():
+            raise AgentNotFoundError(f"agent does not exist: {name}")
+        _require_unaliased_path(agents_root, "agents directory")
+        home = _require_unaliased_path(home, "agent home")
+        return await asyncio.to_thread(inspect_agent_home, home)
+
+    @classmethod
     async def delete(
         cls,
         name: str,
@@ -880,7 +942,16 @@ class EmbeddedAgent:
                 lambda: _read_manifest(home, name)
             )
             store = SQLiteStateStore(home / "state.db")
-            identity = await store.load_identity()
+            try:
+                (
+                    identity,
+                    source_reference_values,
+                ) = await store.load_deletion_credential_inventory(manifest.id)
+            except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+                raise AgentHomeError(
+                    "agent credential inventory is invalid; "
+                    "the agent home was preserved"
+                ) from error
             if identity is None or identity != manifest:
                 raise AgentIdentityMismatchError(
                     "agent.toml does not match state.db identity"
@@ -888,11 +959,10 @@ class EmbeddedAgent:
             model_document, _cancelled = await _await_sync_completion(
                 lambda: _read_model_configuration_document(home)
             )
-            sources = await store.list_sources(identity.id)
             references = _owned_agent_credential_references(
                 identity.id,
                 model_document=model_document,
-                sources=sources,
+                source_reference_values=source_reference_values,
             )
             failures = 0
             for reference in references:
@@ -1133,18 +1203,37 @@ class EmbeddedAgent:
         store: SQLiteStateStore | None = None
         workspace_backend: LocalWorkspaceBackend | None = None
         try:
+            manifest, cancelled = await _await_sync_completion(
+                lambda: _read_manifest(home, name)
+            )
+            if cancelled:
+                raise asyncio.CancelledError
+            _, cancelled = await _await_sync_completion(
+                lambda: upgrade_agent_home(
+                    home,
+                    validate_home=lambda source, candidate, affected: (
+                        _validate_agent_home_target(
+                            manifest,
+                            source,
+                            candidate,
+                            affected,
+                        )
+                    ),
+                )
+            )
+            if cancelled:
+                raise asyncio.CancelledError
             workspace_backend = await _open_workspace_backend(
                 workspace,
                 hosted=hosted,
                 home=home,
                 clock=resolved_clock,
             )
-            manifest, cancelled = await _await_sync_completion(
-                lambda: _read_manifest(home, name)
+            store = await SQLiteStateStore.open(
+                home / "state.db",
+                clock=resolved_clock,
+                current_home_validated=True,
             )
-            if cancelled:
-                raise asyncio.CancelledError
-            store = await SQLiteStateStore.open(home / "state.db", clock=resolved_clock)
             identity = await store.load_identity()
             if identity is None or identity != manifest:
                 raise AgentIdentityMismatchError(
@@ -1798,11 +1887,13 @@ class EmbeddedAgent:
             )
             try:
                 async with run_lock:
-                    conversation_exists, conversation, older_history_exists = (
-                        await store.completed_conversation_tail(
-                            identity.id,
-                            run_input.conversation_id or run_input.id,
-                        )
+                    (
+                        conversation_exists,
+                        conversation,
+                        older_history_exists,
+                    ) = await store.completed_conversation_tail(
+                        identity.id,
+                        run_input.conversation_id or run_input.id,
                     )
                     if not conversation_exists:
                         raise ValueError("routine_destination_conversation_missing")
@@ -2222,11 +2313,13 @@ class EmbeddedAgent:
             else conversation_id
         )
         _validate_conversation_id(resolved_conversation)
-        conversation_exists, conversation, older_history_exists = (
-            await self._store.completed_conversation_tail(
-                self.identity.id,
-                resolved_conversation,
-            )
+        (
+            conversation_exists,
+            conversation,
+            older_history_exists,
+        ) = await self._store.completed_conversation_tail(
+            self.identity.id,
+            resolved_conversation,
         )
         if supplied_conversation and not conversation_exists:
             raise ValueError("unknown conversation for this agent")
@@ -5291,7 +5384,7 @@ def _owned_agent_credential_references(
     agent_id: str,
     *,
     model_document: object | None,
-    sources: tuple[SourceRegistration, ...],
+    source_reference_values: tuple[str, ...],
 ) -> tuple[SecretReference, ...]:
     references: dict[str, SecretReference] = {}
     if model_document is not None:
@@ -5331,13 +5424,17 @@ def _owned_agent_credential_references(
                 provider=provider,
             ):
                 references[reference.to_uri()] = reference
-    for source in sources:
-        source_reference = _owned_source_credential_reference(
-            source,
+    for reference_value in source_reference_values:
+        try:
+            reference = SecretReference.parse(reference_value)
+        except ValueError:
+            continue
+        if _credential_reference_is_owned(
+            reference,
             agent_id=agent_id,
-        )
-        if source_reference is not None:
-            references[source_reference.to_uri()] = source_reference
+            provider="postgresql",
+        ):
+            references[reference.to_uri()] = reference
     return tuple(references[key] for key in sorted(references))
 
 
@@ -5534,7 +5631,9 @@ def _read_model_configuration(home: Path, agent_id: str) -> AgentConfig | None:
     except AgentHomeError:
         raise
     except Exception:
-        raise AgentHomeError("model configuration is invalid") from None
+        raise AgentModelConfigurationError(
+            "saved model configuration must be replaced"
+        ) from None
 
 
 def _write_model_configuration(home: Path, config: AgentConfig) -> None:
@@ -5612,7 +5711,7 @@ def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
                         for sensitivity in candidate.allowed_sensitivities
                     ),
                     "base_url": candidate.base_url,
-                    "profile": _encode_model_profile(candidate.profile),
+                    "profile_limits": _persisted_profile_limits(candidate),
                     "provider_id": candidate.provider_id,
                     "secret_reference": (
                         None
@@ -5628,6 +5727,31 @@ def _encode_agent_config(config: AgentConfig) -> dict[str, object]:
                 "backoff_seconds": route.retry_policy.backoff_seconds,
             },
         },
+    }
+
+
+def _persisted_profile_limits(candidate: ModelRouteCandidate) -> dict[str, int] | None:
+    reviewed = reviewed_model_profile(candidate.provider_id)
+    if reviewed is not None:
+        if candidate.profile != reviewed:
+            raise ValueError(
+                "reviewed model route contains non-canonical profile facts"
+            )
+        return None
+    provider_name, separator, model_name = candidate.provider_id.partition(":")
+    if not separator:
+        raise ValueError("provider ID is incomplete")
+    expected = _model_profile(
+        provider_name,
+        model_name,
+        context_window_tokens=candidate.profile.context_window_tokens,
+        max_output_tokens=candidate.profile.max_output_tokens,
+    )
+    if candidate.profile != expected:
+        raise ValueError("custom model route contains non-canonical profile facts")
+    return {
+        "context_window_tokens": candidate.profile.context_window_tokens,
+        "max_output_tokens": candidate.profile.max_output_tokens,
     }
 
 
@@ -5669,7 +5793,7 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
             {
                 "allowed_sensitivities",
                 "base_url",
-                "profile",
+                "profile_limits",
                 "provider_id",
                 "secret_reference",
             },
@@ -5686,7 +5810,6 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
         provider_id = candidate["provider_id"]
         if not isinstance(provider_id, str):
             raise TypeError("provider ID must be text")
-        profile = _decode_model_profile(candidate["profile"])
         provider_name, separator, model_name = provider_id.partition(":")
         if not separator:
             raise ValueError("provider ID is incomplete")
@@ -5696,19 +5819,32 @@ def _decode_agent_config(value: object, *, agent_id: str) -> AgentConfig:
             base_url,
         )
         reviewed_profile = reviewed_model_profile(provider_id)
-        expected_profile = (
-            reviewed_profile
-            if reviewed_profile is not None
-            else _model_profile(
+        limits_value = candidate["profile_limits"]
+        if limits_value is None:
+            if reviewed_profile is None:
+                raise AgentModelConfigurationError(
+                    "saved model configuration must be replaced"
+                )
+            profile = reviewed_profile
+        else:
+            profile_limits = _strict_mapping(
+                limits_value,
+                {"context_window_tokens", "max_output_tokens"},
+            )
+            context_window_tokens = profile_limits["context_window_tokens"]
+            max_output_tokens = profile_limits["max_output_tokens"]
+            if (
+                not isinstance(context_window_tokens, int)
+                or isinstance(context_window_tokens, bool)
+                or not isinstance(max_output_tokens, int)
+                or isinstance(max_output_tokens, bool)
+            ):
+                raise ValueError("saved custom model limits are invalid")
+            profile = _model_profile(
                 provider_name,
                 model_name,
-                context_window_tokens=profile.context_window_tokens,
-                max_output_tokens=profile.max_output_tokens,
-            )
-        )
-        if profile != expected_profile:
-            raise AgentModelConfigurationError(
-                "saved model configuration must be replaced"
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
             )
         reference = (
             None if reference_value is None else SecretReference.parse(reference_value)
@@ -6038,6 +6174,55 @@ def _write_manifest(home: Path, identity: AgentIdentity) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def _validate_agent_home_target(
+    manifest: AgentIdentity,
+    source_home: Path,
+    candidate_home: Path,
+    affected_paths: frozenset[str],
+) -> None:
+    """Validate one complete home view assembled by the upgrade coordinator."""
+
+    state_home = (
+        candidate_home
+        if candidate_home == source_home or "state.db" in affected_paths
+        else source_home
+    )
+    identity = validate_current_state_database(state_home / "state.db")
+    if identity is None or identity != manifest:
+        raise AgentIdentityMismatchError(
+            "agent.toml does not match the upgraded state identity"
+        )
+
+    config_home = (
+        candidate_home
+        if candidate_home == source_home or _MODEL_CONFIG_NAME in affected_paths
+        else source_home
+    )
+    _read_model_configuration_document(config_home)
+    if candidate_home != source_home:
+        _read_model_configuration(config_home, manifest.id)
+    memory_home = (
+        candidate_home
+        if candidate_home == source_home
+        or {"MEMORY.md", "USER.md"}.intersection(affected_paths)
+        else source_home
+    )
+    validate_memory_documents(memory_home)
+    validate_skill_documents(source_home)
+    references, delivery_references, reservations = load_current_artifact_inventory(
+        state_home / "state.db",
+        manifest.id,
+    )
+    validate_artifact_home(
+        agent_id=manifest.id,
+        agent_home=source_home,
+        references=references,
+        delivery_references=delivery_references,
+        reservations=reservations,
+    )
+    validate_delivery_configuration(source_home)
 
 
 def _read_manifest(home: Path, expected_name: str) -> AgentIdentity:

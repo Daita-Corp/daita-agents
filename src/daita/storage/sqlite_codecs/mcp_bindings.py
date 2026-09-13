@@ -39,8 +39,6 @@ from .common import (
     text,
 )
 
-_MCP_BINDING_VERSION = 1
-
 
 def encode_mcp_binding(value: MCPServerBinding) -> str:
     if not isinstance(value, MCPServerBinding):
@@ -49,7 +47,6 @@ def encode_mcp_binding(value: MCPServerBinding) -> str:
         record(
             "MCPServerBinding",
             {
-                "version": _MCP_BINDING_VERSION,
                 "endpoint": value.endpoint,
                 "authentication_mode": value.authentication.mode.value,
                 "secret_reference": (
@@ -89,7 +86,6 @@ def decode_mcp_binding(
         load_payload(value),
         "MCPServerBinding",
         (
-            "version",
             "endpoint",
             "authentication_mode",
             "secret_reference",
@@ -110,8 +106,6 @@ def decode_mcp_binding(
             "stale_reason",
         ),
     )
-    if integer(fields["version"], "MCP binding version") != _MCP_BINDING_VERSION:
-        raise ValueError("stored MCP binding version is unsupported")
     try:
         authentication_mode = MCPAuthenticationMode(
             text(fields["authentication_mode"], "MCP authentication mode")

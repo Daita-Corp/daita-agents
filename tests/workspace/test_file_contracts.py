@@ -22,6 +22,7 @@ from daita.domains.data.export_capabilities import (
     LOCAL_ARTIFACT_EDIT_CAPABILITY_IDS,
     LOCAL_ARTIFACT_EDIT_EXECUTOR_IDS,
 )
+from daita.errors import StateCompatibilityCode, StateCompatibilityError
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -408,5 +409,8 @@ async def test_removed_preproduction_file_source_home_is_explicitly_rejected(
             (json.dumps(payload, sort_keys=True, separators=(",", ":")), source_id),
         )
 
-    with pytest.raises(RuntimeError, match="delete and recreate"):
+    before = state_path.read_bytes()
+    with pytest.raises(StateCompatibilityError) as captured:
         await Agent.open("old-file-state", workspace=workspace, root=tmp_path)
+    assert captured.value.code is StateCompatibilityCode.DAMAGED
+    assert state_path.read_bytes() == before

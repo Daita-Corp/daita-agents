@@ -244,6 +244,14 @@ def build_parser() -> argparse.ArgumentParser:
     sources = commands.add_parser("sources", help="list attached sources")
     sources.add_argument("name")
 
+    state = commands.add_parser("state", help="inspect agent-home persistence state")
+    state_commands = state.add_subparsers(dest="state_command", required=True)
+    state_status = state_commands.add_parser(
+        "status",
+        help="show revision and pending-recovery facts without changing the home",
+    )
+    state_status.add_argument("name")
+
     mcp = commands.add_parser("mcp", help="manage admitted remote MCP tools")
     mcp_commands = mcp.add_subparsers(dest="mcp_command", required=True)
     mcp_inspect = mcp_commands.add_parser(
@@ -679,8 +687,7 @@ def _candidate_review_cost_limit_from_environment() -> Decimal | None:
         value = Decimal(raw)
     except (InvalidOperation, ValueError):
         raise ValueError(
-            f"{_CANDIDATE_REVIEW_COST_LIMIT_ENV} must be a finite "
-            "non-negative decimal"
+            f"{_CANDIDATE_REVIEW_COST_LIMIT_ENV} must be a finite non-negative decimal"
         ) from None
     _validate_candidate_review_cost_limit(value)
     return value
@@ -1136,6 +1143,16 @@ def _routine_datetime(value: str) -> datetime:
 
 
 async def _execute(args: argparse.Namespace) -> object:
+    if args.command == "state":
+        status = await Agent.inspect_home(args.name, root=args.root)
+        return {
+            "current_revision": status.current_revision,
+            "found_revision": status.found_revision,
+            "minimum_supported_revision": status.minimum_supported_revision,
+            "recovery_required": status.recovery_required,
+            "source_kind": status.source_kind,
+            "upgrade_required": status.upgrade_required,
+        }
     if args.command == "delete":
         if not args.yes:
             raise ValueError("delete requires --yes")
@@ -1411,7 +1428,7 @@ async def _execute(args: argparse.Namespace) -> object:
                         args.tool
                     )
                 )
-                status = await agent.attach_mcp_server(
+                attached_status = await agent.attach_mcp_server(
                     endpoint=args.endpoint,
                     authentication=_mcp_authentication(args.bearer_env),
                     maximum_outbound_sensitivity=ModelSensitivity(
@@ -1420,7 +1437,7 @@ async def _execute(args: argparse.Namespace) -> object:
                     selections=selections,
                     binding_id=args.binding_id,
                 )
-                return _mcp_status_mapping(status)
+                return _mcp_status_mapping(attached_status)
             if args.mcp_command == "status":
                 statuses = await agent.list_mcp_servers()
                 if args.binding_id is not None:

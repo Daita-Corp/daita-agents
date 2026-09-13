@@ -14,6 +14,7 @@ from typing import Any
 
 from daita import (
     Agent,
+    AgentConfig,
     ApprovalHandler,
     ConversationRun,
     DeliveryInspection,
@@ -42,8 +43,10 @@ from daita import (
 )
 from daita.agent import (
     AgentAlreadyExistsError,
+    AgentHomeError,
     AgentModelConfigurationError,
     AgentNameError,
+    HostActiveError,
     SourceRefreshError,
 )
 from daita.learning_candidates import (
@@ -199,6 +202,7 @@ class PresentationController:
         self.agent: Agent | None = None
         self.conversation_id: str | None = None
         self.validated_model = False
+        self.model_configuration_requires_replacement = False
 
     def require_agent(self) -> Agent:
         if self.agent is None:
@@ -211,6 +215,7 @@ class PresentationController:
     async def close_agent(self) -> None:
         agent = self.agent
         self.agent = None
+        self.model_configuration_requires_replacement = False
         if agent is not None:
             await agent.close()
 
@@ -227,24 +232,42 @@ class PresentationController:
         approval_handler: ApprovalHandler | None,
     ) -> Agent:
         await self.close_agent()
-        opened = await Agent.open(
-            name,
-            workspace=self.workspace,
-            root=self.root,
-            model=self.model,
-            model_profile=self.model_profile,
-            keychain=self.keychain,
-            model_validator=self.model_validator,
-            reviewer_max_estimated_cost_usd=self.reviewer_max_estimated_cost_usd,
-            observer=observer,
-            approval_handler=approval_handler,
-        )
+        requires_replacement = False
+        try:
+            opened = await Agent.open(
+                name,
+                workspace=self.workspace,
+                root=self.root,
+                model=self.model,
+                model_profile=self.model_profile,
+                keychain=self.keychain,
+                model_validator=self.model_validator,
+                reviewer_max_estimated_cost_usd=self.reviewer_max_estimated_cost_usd,
+                observer=observer,
+                approval_handler=approval_handler,
+            )
+        except AgentModelConfigurationError:
+            opened = await Agent.open(
+                name,
+                workspace=self.workspace,
+                root=self.root,
+                config=AgentConfig(),
+                model=self.model,
+                model_profile=self.model_profile,
+                keychain=self.keychain,
+                model_validator=self.model_validator,
+                reviewer_max_estimated_cost_usd=self.reviewer_max_estimated_cost_usd,
+                observer=observer,
+                approval_handler=approval_handler,
+            )
+            requires_replacement = True
         try:
             await self._preload_active_credentials(opened)
         except BaseException:
             await opened.close()
             raise
         self.agent = opened
+        self.model_configuration_requires_replacement = requires_replacement
         return opened
 
     async def _preload_active_credentials(self, agent: Agent) -> None:
@@ -300,7 +323,19 @@ class PresentationController:
         agent = self.require_agent()
         name = agent.name
         await self.close_agent()
-        await Agent.delete(name, root=self.root, keychain=self.keychain)
+        await self.delete_agent(name)
+
+    async def delete_agent(self, name: str) -> None:
+        """Delete one closed agent through the public lifecycle boundary."""
+
+        try:
+            await Agent.delete(name, root=self.root, keychain=self.keychain)
+        except HostActiveError as error:
+            raise UserInputError(
+                "That agent is active in another Daita process. Close it, then retry."
+            ) from error
+        except AgentHomeError as error:
+            raise UserInputError(str(error)) from error
 
     async def reopen_agent(
         self,

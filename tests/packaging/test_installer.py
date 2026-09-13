@@ -13,6 +13,7 @@ import pytest
 
 from tests.support.installer import (
     INSTALLER_SOURCE,
+    build_minimal_wheel,
     create_installer_fixture,
     fixture_environment,
     sha256,
@@ -75,6 +76,61 @@ def _restricted_commands(directory: Path, names: tuple[str, ...]) -> Path:
 
 def _current_target(home: Path) -> str:
     return os.readlink(_managed_root(home) / "current")
+
+
+def _current_generation(home: Path) -> Path:
+    return (_managed_root(home) / "current").resolve(strict=True)
+
+
+def _manifest_fields(path: Path) -> dict[str, str]:
+    return dict(
+        line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines()
+    )
+
+
+def _replace_manifest_field(path: Path, key: str, value: str | None) -> None:
+    fields = _manifest_fields(path)
+    if value is None:
+        fields.pop(key, None)
+    else:
+        fields[key] = value
+    path.write_text(
+        "".join(f"{name}={field_value}\n" for name, field_value in fields.items()),
+        encoding="utf-8",
+    )
+
+
+def _installed_distribution_metadata(home: Path) -> Path:
+    candidates = tuple(
+        path
+        for path in _current_generation(home).rglob("METADATA")
+        if path.parent.name.startswith("daita_agents-")
+        and path.parent.name.endswith(".dist-info")
+    )
+    assert len(candidates) == 1
+    return candidates[0]
+
+
+def _refusal_snapshot(home: Path) -> dict[str, str]:
+    root = _managed_root(home)
+    app_data = home / ".daita"
+    return {
+        "managed": _tree_digest(root),
+        "application": _tree_digest(app_data),
+        "current": (
+            os.readlink(root / "current") if (root / "current").is_symlink() else ""
+        ),
+        "previous": (
+            os.readlink(root / "previous") if (root / "previous").is_symlink() else ""
+        ),
+    }
+
+
+def _assert_refused_without_mutation(
+    completed: subprocess.CompletedProcess[str], home: Path, before: dict[str, str]
+) -> None:
+    assert completed.returncode == 1
+    assert _refusal_snapshot(home) == before
 
 
 def _install(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
@@ -478,6 +534,20 @@ def test_install_repeat_verify_repair_rollback_and_uninstall_preserve_data(
     launcher = home / ".local" / "bin" / "daita"
     assert launcher.is_file() and not launcher.is_symlink()
     first_target = _current_target(home)
+    assert set(_manifest_fields(_current_generation(home) / "manifest")) == {
+        "marker",
+        "app_version",
+        "wheel_filename",
+        "wheel_url",
+        "wheel_sha256",
+        "requires_python",
+        "uv_version",
+        "uv_target",
+        "uv_archive_sha256",
+        "python_request",
+        "python_identity",
+        "generation_python",
+    }
     first_generations = tuple((_managed_root(home) / "generations").iterdir())
     shell_before_repeat = (home / ".zshrc").read_bytes()
 
@@ -540,6 +610,348 @@ def test_install_repeat_verify_repair_rollback_and_uninstall_preserve_data(
         "PIP_CONFIG_FILE=/dev/null",
     ):
         assert variable in uv_log
+
+
+def test_semantic_upgrade_downgrade_refusal_and_repeated_rollback(
+    tmp_path: Path,
+) -> None:
+    older_wheel = build_minimal_wheel(tmp_path, version="1.2.9")
+    newer_wheel = build_minimal_wheel(tmp_path, version="1.2.10")
+    older = create_installer_fixture(tmp_path / "older", wheel=older_wheel)
+    newer = create_installer_fixture(tmp_path / "newer", wheel=newer_wheel)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".daita").mkdir()
+    (home / ".daita" / "sentinel").write_text("preserved", encoding="utf-8")
+    older_environment = fixture_environment(older, home)
+    newer_environment = fixture_environment(newer, home)
+
+    assert (
+        _run(
+            older.installer, "--no-onboard", "--no-modify-path", env=older_environment
+        ).returncode
+        == 0
+    )
+    older_target = _current_target(home)
+    upgraded = _run(
+        newer.installer, "--no-onboard", "--no-modify-path", env=newer_environment
+    )
+    assert upgraded.returncode == 0, upgraded.stderr
+    newer_target = _current_target(home)
+    assert newer_target != older_target
+    assert _manifest_fields(_current_generation(home) / "manifest")["app_version"] == (
+        "1.2.10"
+    )
+
+    for arguments in ((), ("--repair",)):
+        before = _refusal_snapshot(home)
+        refused = _run(
+            older.installer,
+            *arguments,
+            "--no-onboard",
+            "--no-modify-path",
+            env=older_environment,
+        )
+        _assert_refused_without_mutation(refused, home, before)
+        assert "cannot replace newer installed Daita 1.2.10" in refused.stderr
+
+    assert _run(newer.installer, "--rollback", env=newer_environment).returncode == 0
+    assert _current_target(home) == older_target
+    assert _run(newer.installer, "--rollback", env=newer_environment).returncode == 0
+    assert _current_target(home) == newer_target
+
+
+def test_same_version_artifact_conflict_requires_explicit_repair(
+    tmp_path: Path,
+) -> None:
+    original_wheel = build_minimal_wheel(tmp_path, version="1.4.0")
+    alternate_dir = tmp_path / "alternate-wheel"
+    alternate_dir.mkdir()
+    alternate_wheel = build_minimal_wheel(alternate_dir, version="1.4.0")
+    with zipfile.ZipFile(alternate_wheel, "a") as archive:
+        archive.writestr("daita/fixture_marker.txt", "different immutable bytes")
+    original = create_installer_fixture(tmp_path / "original", wheel=original_wheel)
+    alternate = create_installer_fixture(tmp_path / "alternate", wheel=alternate_wheel)
+    home = tmp_path / "home"
+    home.mkdir()
+    original_environment = fixture_environment(original, home)
+    alternate_environment = fixture_environment(alternate, home)
+    assert (
+        _run(
+            original.installer,
+            "--no-onboard",
+            "--no-modify-path",
+            env=original_environment,
+        ).returncode
+        == 0
+    )
+
+    before = _refusal_snapshot(home)
+    conflict = _run(
+        alternate.installer,
+        "--no-onboard",
+        "--no-modify-path",
+        env=alternate_environment,
+    )
+    _assert_refused_without_mutation(conflict, home, before)
+    assert "different wheel bytes" in conflict.stderr
+
+    repaired = _run(
+        alternate.installer,
+        "--repair",
+        "--no-onboard",
+        "--no-modify-path",
+        env=alternate_environment,
+    )
+    assert repaired.returncode == 0, repaired.stderr
+    assert _manifest_fields(_current_generation(home) / "manifest")[
+        "wheel_sha256"
+    ] == sha256(alternate_wheel)
+
+
+@pytest.mark.parametrize(
+    "bad_version",
+    (
+        "",
+        "1.2",
+        "1.2.03",
+        "1.2.3-beta",
+        "1.2.4",
+        "1000000000.0.0",
+        "1.2.$(touch should-not-run)",
+    ),
+)
+def test_malformed_active_manifest_version_is_non_mutating_and_repairable(
+    tmp_path: Path, bad_version: str
+) -> None:
+    installer, environment, home = _install(tmp_path)
+    sentinel = tmp_path / "should-not-run"
+    value = bad_version.replace("should-not-run", str(sentinel))
+    manifest = _current_generation(home) / "manifest"
+    _replace_manifest_field(manifest, "app_version", value)
+    before = _refusal_snapshot(home)
+
+    refused = _run(
+        installer,
+        "--no-onboard",
+        "--no-modify-path",
+        env=environment,
+    )
+    _assert_refused_without_mutation(refused, home, before)
+    assert "manifest version is missing, malformed, or disagrees" in refused.stderr
+    assert not sentinel.exists()
+
+    repaired = _run(
+        installer,
+        "--repair",
+        "--no-onboard",
+        "--no-modify-path",
+        env=environment,
+    )
+    assert repaired.returncode == 0, repaired.stderr
+    assert not sentinel.exists()
+
+
+@pytest.mark.parametrize("manifest_version", (None, "1.2.03", "1.2.4"))
+def test_repair_recovers_active_version_only_from_installed_metadata(
+    tmp_path: Path, manifest_version: str | None
+) -> None:
+    wheel = build_minimal_wheel(tmp_path, version="1.2.3")
+    fixture = create_installer_fixture(tmp_path / "fixture", wheel=wheel)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = fixture_environment(fixture, home)
+    assert (
+        _run(
+            fixture.installer,
+            "--no-onboard",
+            "--no-modify-path",
+            env=environment,
+        ).returncode
+        == 0
+    )
+    _replace_manifest_field(
+        _current_generation(home) / "manifest", "app_version", manifest_version
+    )
+    repaired = _run(
+        fixture.installer,
+        "--repair",
+        "--no-onboard",
+        "--no-modify-path",
+        env=environment,
+    )
+    assert repaired.returncode == 0, repaired.stderr
+    assert _manifest_fields(_current_generation(home) / "manifest")["app_version"] == (
+        "1.2.3"
+    )
+
+
+@pytest.mark.parametrize("damage", ("missing", "malformed", "ambiguous"))
+def test_install_and_repair_refuse_when_active_metadata_is_unrecoverable(
+    tmp_path: Path, damage: str
+) -> None:
+    installer, environment, home = _install(tmp_path)
+    metadata = _installed_distribution_metadata(home)
+    if damage == "missing":
+        metadata.unlink()
+    elif damage == "malformed":
+        metadata.write_text(
+            metadata.read_text(encoding="utf-8").replace(
+                "Version: 1.0.0", "Version: 1.0.00"
+            ),
+            encoding="utf-8",
+        )
+    else:
+        duplicate = metadata.parent.parent / "daita_agents-9.9.9.dist-info"
+        duplicate.mkdir()
+        (duplicate / "METADATA").write_text(
+            "Metadata-Version: 2.4\nName: daita-agents\nVersion: 9.9.9\n",
+            encoding="utf-8",
+        )
+
+    for arguments in ((), ("--repair",)):
+        before = _refusal_snapshot(home)
+        refused = _run(
+            installer,
+            *arguments,
+            "--no-onboard",
+            "--no-modify-path",
+            env=environment,
+        )
+        _assert_refused_without_mutation(refused, home, before)
+        assert (
+            "cannot be recovered from installed distribution metadata" in refused.stderr
+            or "installed distribution version is not canonical" in refused.stderr
+        )
+
+
+def test_active_metadata_inspection_ignores_inherited_distribution_metadata(
+    tmp_path: Path,
+) -> None:
+    installer, environment, home = _install(tmp_path)
+    metadata = _installed_distribution_metadata(home)
+    site_packages = metadata.parent.parent
+    inherited = tmp_path / "inherited-site"
+    duplicate = inherited / "daita_agents-9.9.9.dist-info"
+    duplicate.mkdir(parents=True)
+    (duplicate / "METADATA").write_text(
+        "Metadata-Version: 2.4\nName: daita-agents\nVersion: 9.9.9\n",
+        encoding="utf-8",
+    )
+    (site_packages / "inherited-daita.pth").write_text(
+        f"{inherited}\n", encoding="utf-8"
+    )
+    python = _current_generation(home) / "tool" / "daita-agents" / "bin" / "python"
+    visible = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            (
+                "from importlib import metadata; "
+                "print(len(tuple(metadata.distributions(name='daita-agents'))))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert int(visible.stdout) >= 2
+    first_target = _current_target(home)
+
+    repeated = _run(
+        installer,
+        "--no-onboard",
+        "--no-modify-path",
+        env=environment,
+    )
+
+    assert repeated.returncode == 0, repeated.stderr
+    assert _current_target(home) == first_target
+
+
+def test_recovered_newer_metadata_still_blocks_an_older_repair(
+    tmp_path: Path,
+) -> None:
+    older_wheel = build_minimal_wheel(tmp_path, version="1.2.3")
+    newer_wheel = build_minimal_wheel(tmp_path, version="1.2.4")
+    older = create_installer_fixture(tmp_path / "older", wheel=older_wheel)
+    newer = create_installer_fixture(tmp_path / "newer", wheel=newer_wheel)
+    home = tmp_path / "home"
+    home.mkdir()
+    newer_environment = fixture_environment(newer, home)
+    assert (
+        _run(
+            newer.installer,
+            "--no-onboard",
+            "--no-modify-path",
+            env=newer_environment,
+        ).returncode
+        == 0
+    )
+    _replace_manifest_field(_current_generation(home) / "manifest", "app_version", None)
+    before = _refusal_snapshot(home)
+
+    refused = _run(
+        older.installer,
+        "--repair",
+        "--no-onboard",
+        "--no-modify-path",
+        env=fixture_environment(older, home),
+    )
+    _assert_refused_without_mutation(refused, home, before)
+    assert "cannot replace newer installed Daita 1.2.4" in refused.stderr
+
+
+def test_unknown_manifest_fields_do_not_change_current_or_previous_verification(
+    tmp_path: Path,
+) -> None:
+    installer, environment, home = _install(tmp_path)
+    assert (
+        _run(
+            installer,
+            "--repair",
+            "--no-onboard",
+            "--no-modify-path",
+            env=environment,
+        ).returncode
+        == 0
+    )
+    root = _managed_root(home)
+    current = (root / "current").resolve(strict=True)
+    previous = (root / "previous").resolve(strict=True)
+    for generation in (current, previous):
+        with (generation / "manifest").open("a", encoding="utf-8") as output:
+            output.write("harmless_future_field=ignored\n")
+
+    verified = _run(installer, "--verify", env=environment)
+    assert verified.returncode == 0, verified.stderr
+    rolled_back = _run(installer, "--rollback", env=environment)
+    assert rolled_back.returncode == 0, rolled_back.stderr
+
+
+def test_production_render_ignores_the_test_failpoint_environment(
+    tmp_path: Path,
+) -> None:
+    fixture = create_installer_fixture(
+        tmp_path / "fixture", enable_test_failpoints=False
+    )
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = fixture_environment(fixture, home)
+    environment["DAITA_INSTALLER_TEST_FAILPOINT"] = "after-lock"
+
+    installed = _run(
+        fixture.installer,
+        "--no-onboard",
+        "--no-modify-path",
+        env=environment,
+    )
+    assert installed.returncode == 0, installed.stderr
+    assert 'readonly TEST_FAILPOINTS_ENABLED="0"' in fixture.installer.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_repair_recovers_a_damaged_current_without_recording_it_as_previous(

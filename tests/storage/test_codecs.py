@@ -129,7 +129,7 @@ def _source() -> SourceRegistration:
 @pytest.mark.parametrize(
     ("adapter_id", "message"),
     (
-        ("local-directory", "removed pre-production file-source state"),
+        ("local-directory", "unsupported current adapter"),
         ("future-adapter", "unsupported current adapter"),
     ),
 )
@@ -541,16 +541,14 @@ def test_classified_tool_result_provenance_round_trips_without_entering_output()
     assert block.sensitivity_provenance["resource_ids"] == ("resource-1",)
 
 
-def test_source_permission_codecs_reject_unknown_versions_and_noncanonical_sets() -> (
-    None
-):
+def test_source_permission_codecs_reject_unknown_fields_and_noncanonical_sets() -> None:
     read_scope = SourceReadScope.allow_all(
         agent_id="agent-codec",
         source_id="source:sha256:" + "1" * 64,
     )
     payload = json.loads(encode_source_read_scope(read_scope))
-    payload["fields"]["version"] = 2
-    with pytest.raises(ValueError, match="version is unsupported"):
+    payload["fields"]["version"] = 1
+    with pytest.raises(ValueError, match="unknown fields"):
         decode_source_read_scope(
             json.dumps(payload),
             agent_id=read_scope.agent_id,

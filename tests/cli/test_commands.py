@@ -1000,6 +1000,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "export-location",
         "delete",
         "run",
+        "state",
         "chat",
         "host",
         "memory",
@@ -1016,6 +1017,12 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
     assert _surface(commands["delete"]) == (
         ("name",),
         frozenset({"-h", "--help", "--yes"}),
+    )
+    state = _subcommands(commands["state"])
+    assert set(state) == {"status"}
+    assert _surface(state["status"]) == (
+        ("name",),
+        frozenset({"-h", "--help"}),
     )
     assert _surface(commands["relational-update-readiness"])[0] == (
         "name",

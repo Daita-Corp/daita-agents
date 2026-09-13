@@ -98,6 +98,7 @@ DAITA_THEME = Theme(
 )
 
 _CREATE_NEW_AGENT_SELECTION = "daita:create-new-agent"
+_DELETE_AGENT_SELECTION = "daita:delete-agent"
 
 
 class DaitaApp(App[int]):
@@ -262,6 +263,7 @@ class DaitaApp(App[int]):
         elif len(names) == 1:
             await self._open(names[0])
         elif names:
+            picker_error = ""
             while self.controller.agent is None:
                 selected = await self._await_modal(
                     SelectionScreen(
@@ -271,13 +273,55 @@ class DaitaApp(App[int]):
                             _CREATE_NEW_AGENT_SELECTION,
                             "Create new agent",
                         ),
+                        tertiary_action=PickerOption(
+                            _DELETE_AGENT_SELECTION,
+                            "Delete agent",
+                        ),
+                        initial_error=picker_error,
+                        show_confirm_action=False,
                     )
                 )
+                picker_error = ""
                 if selected is None:
                     self.exit(0)
                     return
                 if selected == (_CREATE_NEW_AGENT_SELECTION,):
                     await self._await_modal(AgentCreateScreen())
+                    continue
+                if selected == (_DELETE_AGENT_SELECTION,):
+                    target = await self._await_modal(
+                        SelectionScreen(
+                            title="Select an agent to delete",
+                            options=tuple(PickerOption(name, name) for name in names),
+                            show_confirm_action=False,
+                        )
+                    )
+                    if target is None:
+                        continue
+                    name = target[0]
+                    accepted = await self._await_modal(
+                        ConfirmScreen(
+                            "Permanently delete agent "
+                            + name
+                            + "?\nThis removes its conversations, memory, skills, "
+                            "settings, schedules, artifacts, and Daita-owned "
+                            "credentials.\nConnected databases and workspace files "
+                            "are not modified.",
+                            expected_text=name,
+                        )
+                    )
+                    if not accepted:
+                        continue
+                    try:
+                        await self.controller.delete_agent(name)
+                    except UserInputError as error:
+                        picker_error = str(error)
+                    names = await self.controller.list_agents()
+                    if not names:
+                        created = await self._await_modal(AgentCreateScreen())
+                        if created is None:
+                            self.exit(0)
+                            return
                     continue
                 await self._open(selected[0])
         else:
@@ -305,6 +349,25 @@ class DaitaApp(App[int]):
 
     async def _ensure_ready(self) -> None:
         await self._show_chat()
+        if self.controller.model_configuration_requires_replacement:
+            changed = await self._await_modal(
+                ModelSetupScreen(
+                    initial_help=(
+                        "This agent's saved model settings are no longer compatible "
+                        "with this Daita release. Choose a provider and model to "
+                        "replace them. The agent's conversations, memory, sources, "
+                        "and other data are preserved."
+                    )
+                )
+            )
+            if changed:
+                await self.controller.reopen_agent(
+                    observer=self._observer,
+                    approval_handler=self.handle_approval,
+                )
+                self._reset_context_usage()
+                await self._replace_conversation_transcript()
+                await self._refresh_status()
         await self._show_home_guidance()
 
     async def _show_home_guidance(self) -> None:
