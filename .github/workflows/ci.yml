@@ -6,6 +6,97 @@ on:
   workflow_dispatch:
 
 jobs:
+  release-artifact:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.artifact.outputs.version }}
+      wheel: ${{ steps.artifact.outputs.wheel }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -e ".[dev]"
+      - name: Validate the sole project release identity
+        run: |
+          python scripts/release_identity.py project-version
+          python scripts/release_identity.py project-tag
+      - name: Require a changed pull-request version to increase
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git show "$BASE_SHA:pyproject.toml" > "$RUNNER_TEMP/base-pyproject.toml"
+          current="$(python scripts/release_identity.py project-version)"
+          base="$(python scripts/release_identity.py project-version --project "$RUNNER_TEMP/base-pyproject.toml")"
+          if [[ "$current" != "$base" ]]; then
+            python scripts/release_identity.py require-project-increase \
+              --base-project "$RUNNER_TEMP/base-pyproject.toml"
+          fi
+      - name: Reject retired release-ordering surfaces
+        shell: bash
+        run: |
+          legacy_pattern='installer[.]version|installer[.]release_'
+          legacy_pattern+='sequence|INSTALLER_'
+          legacy_pattern+='VERSION|RELEASE_'
+          legacy_pattern+='SEQUENCE|UNRESOLVED_INSTALLER_'
+          legacy_pattern+='VERSION|UNRESOLVED_RELEASE_'
+          legacy_pattern+='SEQUENCE|installer_'
+          legacy_pattern+='version|release_'
+          legacy_pattern+='sequence'
+          if rg -n "$legacy_pattern" src scripts release .github/workflows; then
+            echo "Retired release-ordering behavior remains in an active surface." >&2
+            exit 1
+          fi
+      - id: artifact
+        name: Build and inspect the candidate wheel once
+        shell: bash
+        run: |
+          python -m build --wheel --outdir release-artifacts
+          shopt -s nullglob
+          wheels=(release-artifacts/*.whl)
+          test "${#wheels[@]}" -eq 1
+          candidate="${wheels[0]}"
+          version="$(python scripts/release_identity.py project-version)"
+          wheel="$(basename "$candidate")"
+          inspected="$(python -c 'import pathlib, sys; from scripts.render_managed_installer import inspect_wheel; print(inspect_wheel(pathlib.Path(sys.argv[1])).version)' "$candidate")"
+          test "$inspected" = "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "wheel=$wheel" >> "$GITHUB_OUTPUT"
+      - name: Install and verify the exact wheel in isolation
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/daita-wheel-runtime"
+          "$RUNNER_TEMP/daita-wheel-runtime/bin/python" -m pip install \
+            --disable-pip-version-check --no-deps \
+            "release-artifacts/${{ steps.artifact.outputs.wheel }}"
+          expected="${{ steps.artifact.outputs.version }}"
+          actual="$("$RUNNER_TEMP/daita-wheel-runtime/bin/python" -I -c 'import daita; print(daita.__version__)')"
+          test "$actual" = "$expected"
+          test "$("$RUNNER_TEMP/daita-wheel-runtime/bin/daita" --version)" = "daita $expected"
+      - name: Render deterministic release evidence from the exact wheel
+        shell: bash
+        run: |
+          candidate="release-artifacts/${{ steps.artifact.outputs.wheel }}"
+          url="https://github.com/Daita-Corp/daita-agents/releases/download/v${{ steps.artifact.outputs.version }}/${{ steps.artifact.outputs.wheel }}"
+          python scripts/render_managed_installer.py \
+            --wheel "$candidate" --wheel-url "$url" \
+            --installer-output release-artifacts/install.sh \
+            --manifest-output release-artifacts/release-manifest.json
+          python scripts/render_managed_installer.py \
+            --wheel "$candidate" --wheel-url "$url" \
+            --installer-output "$RUNNER_TEMP/install.sh" \
+            --manifest-output "$RUNNER_TEMP/release-manifest.json"
+          cmp release-artifacts/install.sh "$RUNNER_TEMP/install.sh"
+          cmp release-artifacts/release-manifest.json "$RUNNER_TEMP/release-manifest.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifact
+          path: release-artifacts/
+          if-no-files-found: error
+
   deterministic:
     runs-on: ubuntu-latest
     strategy:
@@ -20,7 +111,8 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest tests/ -m "not requires_llm and not requires_db and not requires_network and not slow"
 
-  pipx-release:
+  pipx-lifecycle:
+    needs: release-artifact
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -31,17 +123,34 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m pip install -e ".[dev]" pipx
-      - run: python -m build --wheel --outdir dist
-      - name: Exercise the same candidate wheel through managed and pipx lifecycles
-        shell: bash
+      - run: python -m pip install pipx
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifact
+          path: release-artifacts
+      - name: Exercise the exact producer wheel through pipx
         run: |
-          shopt -s nullglob
-          wheels=(dist/*.whl)
-          test "${#wheels[@]}" -eq 1
-          candidate="$(pwd)/${wheels[0]}"
-          python -m tests.packaging.managed_installer_lifecycle_smoke --candidate-wheel "$candidate"
-          python -m tests.packaging.pipx_lifecycle_smoke --candidate-wheel "$candidate"
+          python -m tests.packaging.pipx_lifecycle_smoke \
+            --candidate-wheel "$(pwd)/release-artifacts/${{ needs.release-artifact.outputs.wheel }}"
+
+  managed-lifecycle:
+    needs: release-artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifact
+          path: release-artifacts
+      - name: Install dependencies from the exact producer wheel
+        run: python -m pip install "release-artifacts/${{ needs.release-artifact.outputs.wheel }}"
+      - name: Exercise the exact producer wheel through the managed lifecycle
+        run: |
+          python -m tests.packaging.managed_installer_lifecycle_smoke \
+            --candidate-wheel "$(pwd)/release-artifacts/${{ needs.release-artifact.outputs.wheel }}"
 
   static:
     runs-on: ubuntu-latest
@@ -51,7 +160,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m pip install -e ".[dev]"
-      - run: python -m black --check src tests
+      - run: python -m black --check src tests scripts
       - run: python -m ruff check --select I .
       - run: python -m mypy src/daita tests
       - run: bash -n scripts/install.sh

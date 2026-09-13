@@ -475,8 +475,7 @@ def _encode_model_route_contract(route: ModelRoute) -> dict[str, object]:
         "candidates": [
             {
                 "allowed_sensitivities": sorted(
-                    sensitivity.value
-                    for sensitivity in candidate.allowed_sensitivities
+                    sensitivity.value for sensitivity in candidate.allowed_sensitivities
                 ),
                 "base_url": candidate.base_url,
                 "profile": _encode_model_profile(candidate.profile),

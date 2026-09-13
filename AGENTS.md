@@ -688,6 +688,14 @@ python3.11 -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
+`pyproject.toml` `[project].version` is the sole authored Daita release
+identity. Runtime version displays read installed `daita-agents` distribution
+metadata. Because editable metadata is an installation snapshot, rerun the
+editable install command after changing that value or checking out a commit
+with another value, before importing Daita or running tests. The agent-home
+revision remains independent and changes only through an appended durable-format
+migration.
+
 Python 3.11 and 3.12 are supported.
 
 ## Tests and checks

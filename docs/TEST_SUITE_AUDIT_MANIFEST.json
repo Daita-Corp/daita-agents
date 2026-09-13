@@ -21207,7 +21207,7 @@
       "evidence": "Baseline and final pytest collection plus reviewed source/assertion mapping; command results are recorded in the reorganization report.",
       "markers_after": [],
       "markers_before": [],
-      "oracle": "`project['version'] == '1.0.1'`; `__version__ == project['version']`; `project['requires-python'] == '>=3.11,<3.13'`",
+      "oracle": "`project['version'] == read_project_identity().version`; `__version__ == distribution_version('daita-agents')`; `project['requires-python'] == '>=3.11,<3.13'`",
       "original_case_count": 1,
       "original_nodeids": [
         "tests/test_packaging.py::test_default_distribution_contains_every_supported_production_dependency"
@@ -39049,7 +39049,7 @@
       "markers_before": [
         "asyncio"
       ],
-      "oracle": "`'DAITA  1.0.1' in str(welcome.content)`; `'\u2588\u2588\u2588\u2588\u2588       \u2588\u2588\u2588' in str(welcome.content)`; `'\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2584' in str(welcome.content)`",
+      "oracle": "`f'DAITA  {__version__}' in str(welcome.content)`; `'\u2588\u2588\u2588\u2588\u2588       \u2588\u2588\u2588' in str(welcome.content)`; `'\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2588\u2584' in str(welcome.content)`",
       "original_case_count": 1,
       "original_nodeids": [
         "tests/test_textual_tui.py::test_boot_and_empty_chat_show_the_responsive_daita_welcome"

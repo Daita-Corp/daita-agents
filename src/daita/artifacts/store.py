@@ -1164,10 +1164,12 @@ def validate_artifact_home(
     for expected in references:
         if stored.get(expected.artifact_id) != expected:
             _corrupt(expected.artifact_id, "referenced_manifest_mismatch")
-    for expected in delivery_references:
-        actual = stored.get(expected.artifact_id)
-        if actual is None or not _matches_delivery_reference(actual, expected):
-            _corrupt(expected.artifact_id, "delivery_manifest_mismatch")
+    for delivery_reference in delivery_references:
+        actual = stored.get(delivery_reference.artifact_id)
+        if actual is None or not _matches_delivery_reference(
+            actual, delivery_reference
+        ):
+            _corrupt(delivery_reference.artifact_id, "delivery_manifest_mismatch")
     for run_id, artifact_id in reservations:
         actual = stored.get(artifact_id)
         if actual is not None and actual.run_id != run_id:

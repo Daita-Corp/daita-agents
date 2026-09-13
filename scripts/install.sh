@@ -11,9 +11,8 @@ readonly LAUNCHER_MARKER="# DAITA-MANAGED-LAUNCHER:v1"
 readonly PATH_START="# >>> Daita managed PATH >>>"
 readonly PATH_END="# <<< Daita managed PATH <<<"
 
-readonly INSTALLER_VERSION="UNRESOLVED_INSTALLER_VERSION"
-readonly RELEASE_SEQUENCE="UNRESOLVED_RELEASE_SEQUENCE"
 readonly DAITA_VERSION="UNRESOLVED_DAITA_VERSION"
+readonly TEST_FAILPOINTS_ENABLED="UNRESOLVED_TEST_FAILPOINTS"
 readonly WHEEL_FILENAME="UNRESOLVED_WHEEL_FILENAME"
 readonly WHEEL_URL="UNRESOLVED_WHEEL_URL"
 readonly WHEEL_SHA256="UNRESOLVED_WHEEL_SHA256"
@@ -59,6 +58,10 @@ OLD_CURRENT=""
 OLD_PREVIOUS=""
 NEW_LAUNCHER_PUBLISHED=0
 OLD_CURRENT_VERIFIED=0
+ACTIVE_GENERATION=""
+ACTIVE_VERSION=""
+ACTIVE_WHEEL_SHA256=""
+ALREADY_INSTALLED=0
 UV_BIN=""
 PYTHON_BIN=""
 GENERATION_STAGE=""
@@ -104,7 +107,7 @@ Options:
   --dry-run         Report resolved paths, artifacts, and mutations; write nothing
   --no-onboard      Do not launch Daita after a successful install
   --no-modify-path  Do not edit a supported shell startup file
-  --version         Print pinned installer, Daita, and uv versions; write nothing
+  --version         Print pinned Daita and runtime artifact identities; write nothing
   -h, --help        Show this help; write nothing
 
 Close every running Daita process before install, upgrade, repair, rollback,
@@ -113,8 +116,9 @@ EOF
 }
 
 version() {
-    printf 'Daita installer %s (release sequence %s); Daita %s; uv %s\n' \
-        "$INSTALLER_VERSION" "$RELEASE_SEQUENCE" "$DAITA_VERSION" "$UV_VERSION"
+    printf 'Daita installer for Daita %s; wheel %s (%s); uv %s; Python %s\n' \
+        "$DAITA_VERSION" "$WHEEL_FILENAME" "$WHEEL_SHA256" "$UV_VERSION" \
+        "$PYTHON_IDENTITY"
 }
 
 say() {
@@ -137,13 +141,10 @@ usage_error() {
 }
 
 test_failpoint() {
-    case "$INSTALLER_VERSION" in
-        *-fixture)
-            if [[ "${DAITA_INSTALLER_TEST_FAILPOINT:-}" == "$1" ]]; then
-                fail "deterministic fixture failure at $1"
-            fi
-            ;;
-    esac
+    if [[ "$TEST_FAILPOINTS_ENABLED" == "1" && \
+        "${DAITA_INSTALLER_TEST_FAILPOINT:-}" == "$1" ]]; then
+        fail "deterministic fixture failure at $1"
+    fi
 }
 
 set_action() {
@@ -165,6 +166,7 @@ parse_arguments() {
                 if (($# != 1 || ACTION_COUNT != 0 || DRY_RUN != 0 || NO_ONBOARD != 0 || NO_MODIFY_PATH != 0)); then
                     usage_error "--version cannot be combined with another argument"
                 fi
+                resolve_platform
                 version
                 exit 0
                 ;;
@@ -327,6 +329,37 @@ validate_sha256_literal() {
     [[ "$value" =~ ^[0-9a-f]{64}$ ]] || fail "release SHA-256 literal is unresolved or invalid"
 }
 
+validate_application_version() {
+    local value="$1"
+    [[ "$value" =~ ^(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$ ]]
+}
+
+compare_application_versions() {
+    local left="$1"
+    local right="$2"
+    validate_application_version "$left" || return 2
+    validate_application_version "$right" || return 2
+    local left_major left_minor left_patch
+    local right_major right_minor right_patch
+    IFS=. read -r left_major left_minor left_patch <<<"$left"
+    IFS=. read -r right_major right_minor right_patch <<<"$right"
+    if ((left_major < right_major)); then
+        printf 'older\n'
+    elif ((left_major > right_major)); then
+        printf 'newer\n'
+    elif ((left_minor < right_minor)); then
+        printf 'older\n'
+    elif ((left_minor > right_minor)); then
+        printf 'newer\n'
+    elif ((left_patch < right_patch)); then
+        printf 'older\n'
+    elif ((left_patch > right_patch)); then
+        printf 'newer\n'
+    else
+        printf 'equal\n'
+    fi
+}
+
 validate_url_literal() {
     local value="$1"
     [[ "$value" == https://* ]] || fail "release URL must be immutable HTTPS"
@@ -337,13 +370,16 @@ validate_url_literal() {
 
 validate_release_literals() {
     local value
-    for value in "$INSTALLER_VERSION" "$RELEASE_SEQUENCE" "$DAITA_VERSION" \
+    for value in "$DAITA_VERSION" "$TEST_FAILPOINTS_ENABLED" \
         "$WHEEL_FILENAME" "$WHEEL_REQUIRES_PYTHON" "$UV_VERSION" "$PYTHON_REQUEST" \
         "$PYTHON_IDENTITY" "$UV_ARCHIVE" "$UV_ARCHIVE_MEMBER"; do
         [[ "$value" != *UNRESOLVED* && -n "$value" ]] || \
             fail "this installer is not release-ready: required artifact literals are unresolved"
     done
-    [[ "$RELEASE_SEQUENCE" =~ ^[1-9][0-9]*$ ]] || fail "release sequence must be a positive integer"
+    validate_application_version "$DAITA_VERSION" || \
+        fail "Daita version must be canonical MAJOR.MINOR.PATCH"
+    [[ "$TEST_FAILPOINTS_ENABLED" == "0" || "$TEST_FAILPOINTS_ENABLED" == "1" ]] || \
+        fail "test failpoint boundary is unresolved or invalid"
     validate_url_literal "$WHEEL_URL"
     validate_url_literal "$UV_ARCHIVE_URL"
     validate_sha256_literal "$WHEEL_SHA256"
@@ -745,6 +781,28 @@ assert entries == {"daita": "daita.cli:main"}
 ' "$expected_version" "$expected_python"
 }
 
+installed_application_version() {
+    local generation="$1"
+    local python
+    python=$(generation_python "$generation")
+    [[ -x "$python" ]] || return 1
+    "$python" -I -c '
+from importlib import metadata
+
+matches = [
+    distribution
+    for distribution in metadata.distributions(name="daita-agents")
+    if distribution.metadata.get_all("Name") == ["daita-agents"]
+]
+if len(matches) != 1:
+    raise SystemExit(1)
+value = matches[0].version
+if not isinstance(value, str) or not value:
+    raise SystemExit(1)
+print(value)
+'
+}
+
 lazy_import_check() {
     local python="$1"
     "$python" -I -c '
@@ -793,8 +851,6 @@ write_generation_manifest() {
     python=$(generation_python "$generation")
     {
         printf 'marker=%s\n' "$OWNER_MARKER"
-        printf 'installer_version=%s\n' "$INSTALLER_VERSION"
-        printf 'release_sequence=%s\n' "$RELEASE_SEQUENCE"
         printf 'app_version=%s\n' "$DAITA_VERSION"
         printf 'wheel_filename=%s\n' "$WHEEL_FILENAME"
         printf 'wheel_url=%s\n' "$WHEEL_URL"
@@ -828,10 +884,7 @@ verify_manifest() {
     [[ "$(state_value "$manifest" marker)" == "$OWNER_MARKER" ]] || fail "generation ownership marker is invalid"
     local app_version
     app_version=$(state_value "$manifest" app_version) || fail "generation version is missing"
-    [[ "$app_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "generation version is invalid"
-    local sequence
-    sequence=$(state_value "$manifest" release_sequence) || fail "generation sequence is missing"
-    [[ "$sequence" =~ ^[1-9][0-9]*$ ]] || fail "generation sequence is invalid"
+    validate_application_version "$app_version" || fail "generation version is invalid"
     local wheel_sha
     wheel_sha=$(state_value "$manifest" wheel_sha256) || fail "generation wheel digest is missing"
     validate_sha256_literal "$wheel_sha"
@@ -865,13 +918,6 @@ verify_installation() {
     say "Verified Daita $(state_value "$generation/manifest" app_version)"
     say "Launcher: $PUBLIC_LAUNCHER"
     say "Generation: $generation"
-}
-
-current_manifest_value() {
-    local key="$1"
-    local generation
-    generation=$(validate_generation_path "$MANAGED_ROOT/current") || return 1
-    state_value "$generation/manifest" "$key"
 }
 
 create_launcher() {
@@ -1046,8 +1092,6 @@ remove_path() {
 
 dry_run() {
     say "Action: $ACTION (dry-run; no downloads or writes)"
-    say "Installer version: $INSTALLER_VERSION"
-    say "Release sequence: $RELEASE_SEQUENCE"
     say "Daita version: $DAITA_VERSION"
     say "Target: $TARGET"
     say "Wheel: $WHEEL_FILENAME"
@@ -1068,6 +1112,46 @@ dry_run() {
     fi
 }
 
+inspect_active_release() {
+    local repair="$1"
+    [[ -e "$MANAGED_ROOT" ]] || return 0
+    ACTIVE_GENERATION=$(validate_generation_path "$MANAGED_ROOT/current") || \
+        fail "the active application version cannot be established; inspect or uninstall the damaged managed installation"
+    local installed_version
+    installed_version=$(installed_application_version "$ACTIVE_GENERATION" 2>/dev/null) || \
+        fail "the active application version cannot be recovered from installed distribution metadata; inspect or uninstall the damaged managed installation"
+    validate_application_version "$installed_version" || \
+        fail "the active installed distribution version is not canonical; inspect or uninstall the damaged managed installation"
+    ACTIVE_VERSION="$installed_version"
+
+    local manifest_version=""
+    manifest_version=$(state_value "$ACTIVE_GENERATION/manifest" app_version 2>/dev/null || true)
+    if ! validate_application_version "$manifest_version" || \
+        [[ "$manifest_version" != "$ACTIVE_VERSION" ]]; then
+        if ((repair == 0)); then
+            fail "the active manifest version is missing, malformed, or disagrees with installed distribution metadata; rerun with --repair only after reviewing the managed installation"
+        fi
+    fi
+
+    ACTIVE_WHEEL_SHA256=$(state_value "$ACTIVE_GENERATION/manifest" wheel_sha256 2>/dev/null || true)
+    local relation
+    relation=$(compare_application_versions "$DAITA_VERSION" "$ACTIVE_VERSION") || \
+        fail "the active application version cannot be compared safely"
+    if [[ "$relation" == "older" ]]; then
+        fail "Daita $DAITA_VERSION cannot replace newer installed Daita $ACTIVE_VERSION; use --rollback only to reactivate the recorded previous generation"
+    fi
+    if [[ "$relation" == "equal" && "$ACTIVE_WHEEL_SHA256" != "$WHEEL_SHA256" && \
+        "$repair" == "0" ]]; then
+        fail "installed Daita $ACTIVE_VERSION records different wheel bytes; use this exact versioned installer with --repair after reviewing the conflict"
+    fi
+    if [[ "$relation" == "equal" && "$ACTIVE_WHEEL_SHA256" == "$WHEEL_SHA256" && \
+        "$repair" == "0" ]]; then
+        GENERATION_STAGE="$ACTIVE_GENERATION"
+        verify_installation 0
+        ALREADY_INSTALLED=1
+    fi
+}
+
 write_owner() {
     local source="$STAGE/owner"
     {
@@ -1078,28 +1162,10 @@ write_owner() {
 }
 
 install_generation() {
-    local repair="$1"
-    local installed_sequence=""
-    local installed_sha=""
-    if installed_sequence=$(current_manifest_value release_sequence 2>/dev/null); then
-        [[ "$installed_sequence" =~ ^[1-9][0-9]*$ ]] || fail "active release sequence is invalid"
-        if ((installed_sequence > RELEASE_SEQUENCE)); then
-            fail "this older installer refuses to replace newer release sequence $installed_sequence"
-        fi
-        installed_sha=$(current_manifest_value wheel_sha256 2>/dev/null || true)
-        if ((repair == 0)) && [[ "$installed_sequence" == "$RELEASE_SEQUENCE" && "$installed_sha" == "$WHEEL_SHA256" ]]; then
-            verify_installation 0
-            ensure_path
-            say "Daita $DAITA_VERSION is already installed and verified."
-            return
-        fi
-    fi
-    local active_generation=""
-    if active_generation=$(validate_generation_path "$MANAGED_ROOT/current" 2>/dev/null); then
-        if (verify_manifest "$active_generation") >/dev/null 2>&1; then
+    if [[ -n "$ACTIVE_GENERATION" ]]; then
+        GENERATION_STAGE="$ACTIVE_GENERATION"
+        if (verify_manifest "$ACTIVE_GENERATION") >/dev/null 2>&1; then
             OLD_CURRENT_VERIFIED=1
-        elif ((repair == 0)); then
-            fail "the active generation is damaged; rerun this installer with --repair"
         fi
     fi
 
@@ -1230,6 +1296,7 @@ maybe_onboard() {
 }
 
 preflight_mutation() {
+    local repair="$1"
     reject_elevated_execution
     require_command curl
     require_command tar
@@ -1245,6 +1312,7 @@ preflight_mutation() {
     printf 'daita-installer-hash-preflight' | sha256_stdin >/dev/null
     admit_managed_root
     reject_launcher_collision
+    inspect_active_release "$repair"
     mkdir -p -- "$MANAGED_ROOT" "$INSTALL_STATE" "$STAGING_DIR"
     chmod 700 "$MANAGED_ROOT" "$INSTALL_STATE" "$STAGING_DIR"
     acquire_lock
@@ -1269,12 +1337,20 @@ main() {
             ;;
         install|repair)
             validate_release_literals
-            preflight_mutation
             local repair=0
             if [[ "$ACTION" == "repair" ]]; then
                 repair=1
             fi
-            install_generation "$repair"
+            preflight_mutation "$repair"
+            if ((ALREADY_INSTALLED == 1)); then
+                STAGE="$STAGING_DIR/transaction-$$"
+                [[ ! -e "$STAGE" ]] || fail "staging collision"
+                mkdir -- "$STAGE"
+                ensure_path
+                say "Daita $DAITA_VERSION is already installed and verified."
+                return
+            fi
+            install_generation
             ;;
         rollback)
             reject_elevated_execution

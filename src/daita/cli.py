@@ -1422,7 +1422,7 @@ async def _execute(args: argparse.Namespace) -> object:
                         args.tool
                     )
                 )
-                status = await agent.attach_mcp_server(
+                attached_status = await agent.attach_mcp_server(
                     endpoint=args.endpoint,
                     authentication=_mcp_authentication(args.bearer_env),
                     maximum_outbound_sensitivity=ModelSensitivity(
@@ -1431,7 +1431,7 @@ async def _execute(args: argparse.Namespace) -> object:
                     selections=selections,
                     binding_id=args.binding_id,
                 )
-                return _mcp_status_mapping(status)
+                return _mcp_status_mapping(attached_status)
             if args.mcp_command == "status":
                 statuses = await agent.list_mcp_servers()
                 if args.binding_id is not None:

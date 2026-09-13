@@ -211,18 +211,18 @@ async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
                 and "to delete" in str(app.screen.query_one("#picker-title").render())
             ):
                 break
-        delete_picker = app.screen
-        assert isinstance(delete_picker, SelectionScreen)
-        listing = delete_picker.query_one("#picker-options", OptionList)
+        final_delete_picker = app.screen
+        assert isinstance(final_delete_picker, SelectionScreen)
+        listing = final_delete_picker.query_one("#picker-options", OptionList)
         assert await pilot.click(listing, offset=(2, 0)) is True
 
         for _ in range(20):
             await pilot.pause(0.05)
             if isinstance(app.screen, ConfirmScreen):
                 break
-        confirmation = app.screen
-        assert isinstance(confirmation, ConfirmScreen)
-        confirmation_input = confirmation.query_one("#confirm-input", Input)
+        delete_confirmation = app.screen
+        assert isinstance(delete_confirmation, ConfirmScreen)
+        confirmation_input = delete_confirmation.query_one("#confirm-input", Input)
         confirmation_input.value = "existing-one"
         confirmation_input.focus()
         await pilot.press("enter")
@@ -339,7 +339,9 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
     boot = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with boot.run_test(size=(80, 24)):
         welcome = boot.query_one("#boot", WelcomeView)
-        assert "DAITA  1.0.1" in str(welcome.content)
+        from daita import __version__
+
+        assert f"DAITA  {__version__}" in str(welcome.content)
         assert "█████       ███" in str(welcome.content)
         assert "████████████▄" in str(welcome.content)
         assert "Your persistent data agent" in str(welcome.content)

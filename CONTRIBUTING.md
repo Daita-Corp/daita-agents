@@ -20,6 +20,10 @@ python3.11 -m venv .venv
 .venv/bin/python -m pre_commit install
 ```
 
+After changing `[project].version` in `pyproject.toml` or checking out a commit
+with a different value, rerun the editable install command before importing
+Daita or running tests. Installed distribution metadata is a snapshot.
+
 ## Report a problem
 
 Open a [GitHub issue](https://github.com/Daita-Corp/daita-agents/issues) with:

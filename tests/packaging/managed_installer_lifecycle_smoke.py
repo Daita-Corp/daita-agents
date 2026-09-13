@@ -65,15 +65,11 @@ def _create_fixture(
     *,
     wheel: Path,
     arguments: argparse.Namespace,
-    installer_version: str = "1.0.0-fixture",
-    release_sequence: int = 1,
 ) -> InstallerFixture:
     if arguments.real_uv_archive is None:
         return create_installer_fixture(
             directory,
             wheel=wheel,
-            installer_version=installer_version,
-            release_sequence=release_sequence,
         )
     assert isinstance(arguments.real_uv_version, str)
     assert isinstance(arguments.real_uv_member, str)
@@ -82,8 +78,6 @@ def _create_fixture(
     return create_installer_fixture(
         directory,
         wheel=wheel,
-        installer_version=installer_version,
-        release_sequence=release_sequence,
         bootstrap_uv_archive=arguments.real_uv_archive,
         bootstrap_uv_version=arguments.real_uv_version,
         bootstrap_uv_member=arguments.real_uv_member,
@@ -194,7 +188,6 @@ def main() -> int:
             workspace / "candidate-fixture",
             wheel=candidate,
             arguments=arguments,
-            release_sequence=1,
         )
         environment = fixture_environment(active_fixture, home)
         _run(
@@ -302,6 +295,21 @@ asyncio.run(main())
 
         generation = _current_generation(managed_root)
         manifest = _manifest(generation / "manifest")
+        if set(manifest) != {
+            "marker",
+            "app_version",
+            "wheel_filename",
+            "wheel_url",
+            "wheel_sha256",
+            "requires_python",
+            "uv_version",
+            "uv_target",
+            "uv_archive_sha256",
+            "python_request",
+            "python_identity",
+            "generation_python",
+        }:
+            raise AssertionError("managed manifest has an unexpected field set")
         python = generation / manifest["generation_python"]
         inspect_write_admission = """
 import asyncio

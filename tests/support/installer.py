@@ -65,15 +65,21 @@ def build_minimal_wheel(directory: Path, *, version: str = "1.0.0") -> Path:
     wheel = directory / f"daita_agents-{version}-py3-none-any.whl"
     dist_info = f"daita_agents-{version}.dist-info"
     with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("daita/__init__.py", f'__version__ = "{version}"\n')
+        archive.writestr("daita/__init__.py", "from ._version import __version__\n")
+        archive.writestr(
+            "daita/_version.py",
+            "from importlib.metadata import version\n"
+            '__version__ = version("daita-agents")\n',
+        )
         archive.writestr(
             "daita/cli.py",
-            textwrap.dedent(f"""\
+            textwrap.dedent("""\
                 import argparse
+                from ._version import __version__
 
                 def main(argv=None):
                     parser = argparse.ArgumentParser(prog="daita")
-                    parser.add_argument("--version", action="version", version="daita {version}")
+                    parser.add_argument("--version", action="version", version=f"daita {__version__}")
                     parser.parse_args(argv)
                     return 0
 
@@ -107,13 +113,12 @@ def create_installer_fixture(
     directory: Path,
     *,
     wheel: Path | None = None,
-    installer_version: str = "1.0.0-fixture",
-    release_sequence: int = 1,
     bootstrap_uv_archive: Path | None = None,
     bootstrap_uv_version: str = FIXTURE_UV_VERSION,
     bootstrap_uv_member: str | None = None,
     bootstrap_python_request: str = FIXTURE_PYTHON_REQUEST,
     bootstrap_python_identity: str = FIXTURE_PYTHON_IDENTITY,
+    enable_test_failpoints: bool = True,
 ) -> InstallerFixture:
     directory.mkdir(parents=True, exist_ok=True)
     downloads = directory / "downloads"
@@ -185,11 +190,6 @@ def create_installer_fixture(
         "python_identity": bootstrap_python_identity,
     }
     policy = {
-        "schema_version": 1,
-        "installer": {
-            "version": installer_version,
-            "release_sequence": release_sequence,
-        },
         "runtime": {
             "uv_version": bootstrap_uv_version,
             "python_request": bootstrap_python_request,
@@ -207,6 +207,7 @@ def create_installer_fixture(
         wheel_url=(
             f"https://fixtures.invalid/releases/download/v{version}/{wheel_copy.name}"
         ),
+        enable_test_failpoints=enable_test_failpoints,
     ).installer
     installer = directory / "install.sh"
     installer.write_text(rendered, encoding="utf-8")

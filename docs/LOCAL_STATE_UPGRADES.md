@@ -49,6 +49,10 @@ runtime persistence admission. No tag-to-schema table or package-version
 comparison is required for a home to open. Multiple application releases may
 use the same home revision when persistence has not changed.
 
+The application's sole authored release identity is `project.version` in
+`pyproject.toml`; runtime displays read installed distribution metadata. Neither
+fact changes this registry or authorizes a home-format transition.
+
 ## Open and upgrade behavior
 
 The normal operator flow remains:

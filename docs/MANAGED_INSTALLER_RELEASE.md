@@ -1,164 +1,161 @@
-# Managed installer
+# Managed installer and release procedure
 
-`scripts/install.sh` is the repository implementation of Daita's managed
-application delivery contract. It installs the canonical `daita-agents` wheel
-into isolated generations under `~/.local/share/daita`, publishes
-`~/.local/bin/daita`, and leaves application data under `~/.daita` separately
-owned.
+`scripts/install.sh` is the fail-closed source template for Daita's managed
+application delivery. A rendered installer creates isolated binary generations
+under `~/.local/share/daita`, publishes `~/.local/bin/daita`, and never owns or
+changes application data under `~/.daita` or OS-keychain entries.
 
-## Release boundary
+## One application release identity
 
-The checked-in `scripts/install.sh` remains a fail-closed source template. Its
-release literals contain explicit `UNRESOLVED_*` sentinels for:
+The sole authored Daita release version is `[project].version` in
+`pyproject.toml`. The build backend writes it into the `daita-agents` wheel;
+the release renderer inspects that metadata and derives the installer identity,
+public manifest identity, wheel filename, immutable URL, and expected `vX.Y.Z`
+tag. Runtime `daita.__version__`, the CLI, TUI, and MCP client identity read the
+installed distribution metadata.
 
-- installer version and release sequence;
-- the immutable `daita-agents` wheel URL and SHA-256;
-- the official `uv` version; and
-- each packaged target's `uv` archive URL, checksum, and managed CPython 3.12
-  identity.
+For an ordinary release, edit only `project.version`. Never copy the release
+value into source, policy, workflow configuration, tests, or documentation.
+The agent-home revision is independent and changes only through a reviewed,
+append-only durable-format migration.
 
-Installation and repair stop before mutation while any sentinel remains.
-`--help`, `--version`, and `--dry-run` remain available for template review.
-Never serve this source template directly.
-
-`release/managed-installer.json` is the reviewed release policy. It pins one
-installer sequence, uv 0.12.7, exact official uv archives and SHA-256 digests,
-and the CPython 3.12.14 identity for each supported target:
-
-- Apple Silicon macOS;
-- Intel macOS;
-- ARM64 Linux with glibc; and
-- x86-64 Linux with glibc.
-
-`scripts/render_managed_installer.py` validates the policy, the candidate
-wheel archive, its distribution metadata, and its immutable versioned URL. It
-then renders `install.sh` and `release-manifest.json` atomically. The manifest
-records the exact wheel, installer, runtime, target, and checksum evidence.
-The deterministic installer fixtures use this renderer too; there is no
-second test-only substitution implementation.
-
-The public `https://daita-tech.io/install.sh` endpoint has not been promoted
-yet. Keep the customer-facing quick start on pipx until that endpoint serves
-the exact reviewed release asset and passes the post-promotion checks below.
-
-## Candidate verification
-
-The managed lifecycle smoke can exercise an unpublished local wheel with an
-already downloaded official `uv` archive, a real uv-managed Python, and
-production dependencies resolved from PyPI. Supply all verification arguments
-together:
+An editable installation stores a metadata snapshot. After changing
+`project.version` or checking out a commit with another value, refresh it before
+importing Daita or running tests:
 
 ```bash
-.venv/bin/python -m tests.packaging.managed_installer_lifecycle_smoke \
-  --candidate-wheel /absolute/path/to/the-once-built-candidate.whl \
-  --real-uv-archive /absolute/path/to/the-verified-official-uv.tar.gz \
-  --real-uv-version <version> \
-  --real-uv-member <archive-directory>/uv \
-  --real-python-request <exact-request> \
-  --real-python-identity <exact-resolved-identity>
+.venv/bin/python -m pip install -e ".[dev]"
 ```
 
-The smoke copies the candidate wheel and `uv` archive into a temporary fixture
-transport; it does not upload them. The installer verifies both checksums and
-the wheel metadata. The selected `uv` binary downloads the managed Python and
-resolves the wheel's declared production dependencies from PyPI.
+## Reviewed runtime policy and rendered evidence
 
-Run the same once-built candidate wheel through
-`python -m tests.packaging.pipx_lifecycle_smoke`. Release verification also includes syntax,
-shellcheck, deterministic tests, architecture checks, formatting, typing, and
-clean-machine tests on every platform for which support will be claimed.
+`release/managed-installer.json` contains only the reviewed external runtime:
+the exact `uv` version, managed CPython request, and all four target-specific
+archive names, members, immutable URLs, checksums, and Python identities. These
+runtime pins change only when deliberately reviewed; they do not advance for
+every Daita release.
 
-## Automated release
+The checked-in installer template contains fail-closed `UNRESOLVED_*` values
+for the Daita version inspected from the wheel and for every immutable artifact
+fact. Never serve the template directly. `scripts/render_managed_installer.py`
+validates the runtime policy and untrusted wheel archive, requires the wheel
+metadata to equal `pyproject.toml`, validates the authoritative versioned URL,
+and atomically writes `install.sh` plus schema-2 `release-manifest.json`.
+Identical inputs must produce byte-identical outputs.
 
-`.github/workflows/managed-release.yml` is the publication control plane. A
-manual run with **Publish** disabled builds and verifies a release candidate
-without publishing it. Pushing a tag matching the project version, such as
-`v1.0.1`, runs the same verification without publishing. The successful tag
-run retains the exact verified wheel in its `managed-release` workflow
-artifact. Download and publish that wheel to PyPI locally, then manually run
-the workflow on the same tag with **Publish** enabled. The GitHub publication
-job names the `managed-installer-release` environment; configure it with the
-required reviewers.
+The public manifest records one explicit `application.version`, the wheel and
+installer evidence, and the complete runtime policy. `installer.sha256` is the
+checksum of the rendered bytes, not a second version.
 
-The workflow:
+## Installation ordering and recovery
 
-1. validates that the tag, project version, and reviewed installer policy
-   agree;
-2. builds the wheel once and passes those exact bytes to every later job;
-3. renders the installer twice and requires byte-for-byte deterministic output;
-4. runs the managed and pipx lifecycles against the once-built wheel;
-5. downloads and verifies the pinned official uv archive, installs the exact
-   managed Python, and runs the real managed lifecycle on all four native
-   target runners;
-6. records `SHA256SUMS` and retains the verified release artifacts;
-7. requires the exact once-built wheel to be published locally to PyPI before
-   the protected GitHub publication run can proceed;
-8. reads the version-specific PyPI JSON API and verifies that it contains only
-   the expected wheel with the candidate artifact's SHA-256;
-9. refuses to replace an existing GitHub release and enforces a forward-only
-   release sequence; and
-10. attests the exact artifacts, creates the versioned GitHub release, and
-    downloads every public asset again to prove that the published bytes match
-    the verified bytes.
+The rendered installer accepts only stable canonical `MAJOR.MINOR.PATCH`
+versions whose three components are at most nine decimal digits. Its Bash
+comparator uses bounded base-10 integer components and works on the Bash shipped
+with every supported macOS and Linux target.
 
-## Local PyPI publication
+Before install or repair stages anything, the installer contains the active
+generation path, reads its manifest, and independently asks that generation's
+Python for exactly one installed `daita-agents` distribution version without
+importing Daita. A valid matching pair supplies the active ordering identity.
+A missing, malformed, or disagreeing manifest blocks normal installation;
+explicit repair may use the independently recovered metadata version, but only
+after the normal downgrade check. If metadata is missing, ambiguous, malformed,
+or inaccessible, both install and repair fail without mutation.
 
-PyPI publication intentionally uses the project API key on a release operator's
-machine. The workflow stores no PyPI credential, requests no PyPI OIDC token,
-and does not require a `pypi` GitHub environment or Trusted Publisher. Keep the
-key only in the ignored repository-root `.env` file:
+Normal install accepts a fresh install or a newer candidate. An identical
+version and wheel checksum is verified idempotently. Different wheel bytes under
+the same version are refused unless explicit repair reinstalls the exact artifact
+embedded by that versioned installer. Repair never permits an older candidate.
+`--rollback` is the only downgrade operation: it verifies and swaps the recorded
+current and previous binary generations and never changes application data.
 
-```text
-PYPI_API_KEY=pypi-...
-```
+Test failpoints are enabled only by an explicit in-process renderer argument
+used by deterministic fixtures. The public renderer CLI has no such option and
+always emits a disabled gate, so the test environment variable cannot affect
+published installer bytes.
 
-Use this order for every release:
+## Publication controls
 
-1. merge the reviewed version and installer-sequence change;
-2. create and push the annotated `vX.Y.Z` tag;
-3. wait for the tag-triggered **Daita managed release** workflow to pass on all
-   four native targets;
-4. download and extract that run's `managed-release` artifact into a clean
-   local directory;
-5. verify `SHA256SUMS`, then upload only its wheel with Twine and the local API
-   key; and
-6. manually run **Daita managed release** on the same tag with **Publish**
-   enabled and approve the `managed-installer-release` environment.
+Production release safety depends on repository controls as well as workflow
+code. Configure all of the following before publishing:
 
-From the repository root, with the downloaded files in
-`/absolute/path/to/managed-release`, run:
+- a GitHub ruleset protecting every `v*` tag from update or deletion, without a
+  routine release-actor bypass;
+- the `managed-installer-release` protected environment with required reviewers;
+- the managed release workflow as the only supported GitHub release publisher;
+  and
+- the repository-wide `managed-release` concurrency group with
+  `cancel-in-progress: false`.
+
+Manual tag moves or deletion, manual GitHub release creation, and administrator
+bypass are unsupported emergency actions requiring incident review.
+
+The managed workflow has three modes:
+
+| Mode | Required ref and registry state | Publication |
+| --- | --- | --- |
+| Branch/manual verification | A branch may verify an already published matching project version; a manually selected tag must still pass every tagged-ref identity and forward-ordering gate | Never |
+| Tag candidate | Exact derived tag; candidate absent from PyPI and newer than the complete registry union | Never |
+| Protected publication | Exact derived tag; exact candidate present on PyPI, no GitHub release, and candidate newer than every other registry version | After approval |
+
+For candidate and protected modes, the workflow exhaustively paginates
+published non-draft GitHub releases and reads the complete PyPI release map.
+Every release key with at least one file counts, including releases whose files
+are all yanked. Malformed, prerelease, truncated, unauthenticated, rate-limited,
+or otherwise uncertain evidence blocks the run. The protected run repeats this
+collection immediately before publication and permits only the expected equal
+PyPI candidate; every higher version still blocks it.
+
+Each CI or managed-release workflow run builds one wheel. All managed, pipx,
+and four native lifecycle jobs download and consume those exact bytes without
+rebuilding. The managed release retains syntax and shellcheck gates, deterministic
+double rendering, exact runtime downloads, checksums, all-platform native smoke,
+four-artifact provenance attestation, GitHub release immutability, exact PyPI
+filename and SHA-256 verification, and post-publication downloads compared byte
+for byte.
+
+## Release procedure
+
+1. Confirm the protected-tag ruleset, exclusive workflow publisher, protected
+   environment, and global concurrency control are active.
+2. Query both registries and set `project.version` to the next unused patch
+   release after their semantic maximum. Refresh the editable environment.
+3. Merge only after ordinary CI and release-identity checks pass.
+4. Run `python scripts/release_identity.py project-tag` and create that exact
+   annotated tag.
+5. Push the tag and wait for the candidate workflow and all four native smokes.
+6. Download that run's `managed-release` artifact and verify `SHA256SUMS`.
+7. Upload only its exact wheel to PyPI.
+8. Run the protected workflow on the same tag with **Publish** enabled and
+   approve `managed-installer-release`.
+9. Confirm it re-read both registries, verified the exact PyPI wheel, attested
+   all four artifacts, created the immutable release, and compared downloaded
+   public bytes.
+10. Promote the exact versioned `install.sh` bytes to the stable website endpoint
+    and verify its SHA-256 against `release-manifest.json`.
+
+PyPI upload remains a deliberate local operator step using the ignored
+repository-root `.env` value `PYPI_API_KEY`. The workflow stores no PyPI secret
+and requests no PyPI publishing token. From the clean downloaded artifact
+directory:
 
 ```bash
-cd /absolute/path/to/managed-release
 shasum -a 256 -c SHA256SUMS
-
-(
-  set -eu
-  PYPI_API_KEY="$(sed -n 's/^PYPI_API_KEY=//p' /absolute/path/to/daita-agents/.env)"
-  test -n "$PYPI_API_KEY"
-  TWINE_USERNAME=__token__ TWINE_PASSWORD="$PYPI_API_KEY" \
-    /absolute/path/to/daita-agents/.venv/bin/python -m twine upload \
-    --non-interactive --disable-progress-bar \
-    daita_agents-X.Y.Z-py3-none-any.whl
-)
+TWINE_USERNAME=__token__ TWINE_PASSWORD="$PYPI_API_KEY" \
+  /absolute/path/to/daita-agents/.venv/bin/python -m twine upload \
+  --non-interactive --disable-progress-bar \
+  daita_agents-X.Y.Z-py3-none-any.whl
 ```
 
-The final workflow run fails closed unless PyPI returns exactly that wheel
-filename and SHA-256. PyPI versions are immutable, so never rebuild or retry
-with different bytes under the same version. Rotate the API key immediately if
-the local `.env` file or release machine is exposed.
-
-Before tagging a later release, increment `installer.release_sequence` in the
-reviewed policy. An older installer refuses to replace a newer installed
-sequence.
+Never rebuild or upload different bytes under an existing version.
 
 ## Stable endpoint promotion
 
-The release workflow intentionally does not mutate the marketing deployment.
-After the versioned GitHub release succeeds, deploy its exact `install.sh`
-asset to `/install.sh` on `daita-tech.io` without templating, redirects, or
-runtime substitution. Record the release-manifest checksum in the deployment
-change and verify the public bytes:
+The release workflow does not mutate the marketing deployment. After the
+versioned GitHub release succeeds, deploy its exact `install.sh` asset to
+`https://daita-tech.io/install.sh` without templating, redirects, or runtime
+substitution, then verify the public bytes:
 
 ```bash
 curl -fsSL --proto '=https' --tlsv1.2 \
@@ -168,7 +165,22 @@ bash /tmp/daita-install.sh --version
 bash /tmp/daita-install.sh --dry-run --no-onboard --no-modify-path
 ```
 
-The SHA-256 must equal `installer.sha256` in the versioned
-`release-manifest.json`. Only then should the website expose the pipe-to-shell
-command. Stable rollback means redeploying an earlier reviewed `install.sh`;
-it never changes application data or OS-keychain entries.
+The checksum must equal `installer.sha256` in the versioned public manifest.
+
+## Accepted operational limits
+
+- An installer-only correction consumes a new Daita patch version and wheel.
+- The stable-only globally increasing contract has no beta channel and cannot
+  publish a maintenance release below an already published higher version.
+- Normal installation cannot select an arbitrary older release; rollback is
+  limited to the recorded verified previous generation.
+- Binary rollback may be unable to open a home advanced by a forward-only home
+  migration; persistence admission continues to fail closed.
+- Release verification is intentionally expensive even though every consumer
+  reuses one wheel.
+- Registry reachability and complete trustworthy responses are mandatory.
+  Deleted registry history cannot be reconstructed, so versions must never be
+  deleted or reused.
+
+The stable public endpoint has not yet been promoted. Keep the customer quick
+start on pipx until the exact reviewed asset passes the promotion checks above.

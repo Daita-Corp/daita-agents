@@ -15,6 +15,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .._installation import repair_guidance
 from .._json import FrozenJsonObject, canonical_json
+from .._version import __version__
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
@@ -833,7 +834,7 @@ class StreamableHTTPMCPClient:
                     "params": {
                         "protocolVersion": MCP_SUPPORTED_PROTOCOL_VERSIONS[0],
                         "capabilities": {},
-                        "clientInfo": {"name": "daita", "version": "1.0.1"},
+                        "clientInfo": {"name": "daita", "version": __version__},
                     },
                 },
                 include_protocol=False,

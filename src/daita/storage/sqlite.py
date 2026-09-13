@@ -7388,8 +7388,8 @@ def load_current_artifact_inventory(
     for delivery_id, data in delivery_rows:
         delivery = decode_delivery(data, agent_id=agent_id, delivery_id=delivery_id)
         for reference in delivery.outcome.artifact_references:
-            prior = delivery_references.get(reference.artifact_id)
-            if prior is not None and prior != reference:
+            prior_delivery = delivery_references.get(reference.artifact_id)
+            if prior_delivery is not None and prior_delivery != reference:
                 raise ValueError("stored delivery artifact identity is ambiguous")
             delivery_references[reference.artifact_id] = reference
     return (

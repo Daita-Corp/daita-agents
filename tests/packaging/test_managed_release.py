@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from scripts.release_identity import read_project_identity
 from scripts.render_managed_installer import (
     DEFAULT_POLICY,
     DEFAULT_TEMPLATE,
@@ -23,7 +24,7 @@ from tests.support.paths import REPO_ROOT
 
 ROOT = REPO_ROOT
 RENDERER = ROOT / "scripts" / "render_managed_installer.py"
-RELEASE_VERSION = "1.0.1"
+RELEASE_VERSION = read_project_identity().version
 WHEEL_URL = (
     f"https://github.com/Daita-Corp/daita-agents/releases/download/v{RELEASE_VERSION}/"
     f"daita_agents-{RELEASE_VERSION}-py3-none-any.whl"
@@ -59,7 +60,23 @@ def test_reviewed_policy_renders_one_deterministic_release(tmp_path: Path):
     assert f'readonly DAITA_VERSION="{RELEASE_VERSION}"' in first.installer
     assert 'readonly UV_VERSION="0.12.7"' in first.installer
     assert 'readonly PYTHON_REQUEST="cpython-3.12.14"' in first.installer
-    assert first.manifest["installer"]["release_sequence"] == 2
+    assert first.manifest == {
+        "schema_version": 2,
+        "application": {
+            "version": RELEASE_VERSION,
+            "requires_python": ">=3.11,<3.13",
+        },
+        "wheel": {
+            "filename": wheel.name,
+            "url": WHEEL_URL,
+            "sha256": hashlib.sha256(wheel.read_bytes()).hexdigest(),
+        },
+        "installer": {
+            "filename": "install.sh",
+            "sha256": hashlib.sha256(first.installer.encode("utf-8")).hexdigest(),
+        },
+        "runtime": policy["runtime"],
+    }
     assert first.manifest["wheel"]["url"] == WHEEL_URL
     assert (
         first.manifest["installer"]["sha256"]
@@ -93,6 +110,18 @@ def test_release_build_backend_is_exactly_pinned():
 
 
 def test_policy_requires_exact_target_coverage_and_checksums(tmp_path: Path):
+    assert set(_policy_document()) == {"runtime"}
+
+    document = _policy_document()
+    document["schema_version"] = 2
+    with pytest.raises(ReleaseInputError, match="fields do not match"):
+        load_release_policy(_write_policy(tmp_path / "extra-root.json", document))
+
+    document = _policy_document()
+    document["installer"] = {}
+    with pytest.raises(ReleaseInputError, match="fields do not match"):
+        load_release_policy(_write_policy(tmp_path / "retired-root.json", document))
+
     document = _policy_document()
     targets = document["runtime"]["targets"]
     del targets["macos-x86_64"]
@@ -165,7 +194,9 @@ def test_renderer_rejects_mutable_or_mistagged_wheel_urls(tmp_path: Path):
 
 
 def test_cli_binds_wheel_metadata_to_the_project(tmp_path: Path):
-    wheel = build_minimal_wheel(tmp_path, version="2.0.0")
+    major, minor, patch = (int(part) for part in RELEASE_VERSION.split("."))
+    mismatch = f"{major}.{minor}.{patch + 1}"
+    wheel = build_minimal_wheel(tmp_path, version=mismatch)
     completed = subprocess.run(
         [
             sys.executable,
@@ -174,7 +205,7 @@ def test_cli_binds_wheel_metadata_to_the_project(tmp_path: Path):
             str(wheel),
             "--wheel-url",
             (
-                "https://github.com/Daita-Corp/daita-agents/releases/download/v2.0.0/"
+                f"https://github.com/Daita-Corp/daita-agents/releases/download/v{mismatch}/"
                 f"{wheel.name}"
             ),
             "--installer-output",
@@ -198,9 +229,8 @@ def test_template_exposes_every_release_value_as_a_fail_closed_sentinel():
     source = DEFAULT_TEMPLATE.read_text(encoding="utf-8")
 
     for placeholder in (
-        "UNRESOLVED_INSTALLER_VERSION",
-        "UNRESOLVED_RELEASE_SEQUENCE",
         "UNRESOLVED_DAITA_VERSION",
+        "UNRESOLVED_TEST_FAILPOINTS",
         "UNRESOLVED_WHEEL_FILENAME",
         "UNRESOLVED_WHEEL_URL",
         "UNRESOLVED_WHEEL_SHA256",
@@ -218,26 +248,41 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     policy = load_release_policy(DEFAULT_POLICY)
 
     assert workflow.count("python -m build --wheel") == 1
-    assert "build==1.5.1" in workflow
     assert "group: managed-release\n" in workflow
+    assert "cancel-in-progress: false" in workflow
     assert "workflow_dispatch:" in workflow
     assert "publish:" in workflow
     assert "default: false" in workflow
     assert 'tags:\n      - "v*"' in workflow
     assert "managed-installer-release" in workflow
-    assert "needs:\n      - build\n      - native-installer-smoke" in workflow
-    assert "Refuse an existing mutable release" in workflow
+    assert (
+        "needs:\n      - build\n      - deterministic-and-static\n"
+        "      - native-installer-smoke" in workflow
+    )
+    assert "Collect complete GitHub and PyPI published-version evidence" in workflow
+    assert "Repeat complete protected published-version admission" in workflow
+    assert workflow.count("gh api --paginate --slurp") == 2
+    assert workflow.count('"https://pypi.org/pypi/daita-agents/json"') == 2
+    assert workflow.count("parse_published_version_evidence") == 4
+    assert workflow.count("prior_versions_for_mode") == 4
+    assert 'mode="protected"' in workflow
+    assert '"$GITHUB_EVENT_NAME" == "push"' in workflow
+    assert (
+        "steps.identity.outputs.mode != 'branch' || github.ref_type == 'tag'"
+        in workflow
+    )
     assert "Require the exact public PyPI wheel" in workflow
-    assert "Require a forward-only release sequence" in workflow
-    assert "current <= previous" in workflow
+    assert "require-newer" in workflow
     assert "inputs.publish == true" in workflow
     assert 'test "$GITHUB_REF_TYPE" = "tag"' in workflow
     assert "actions/attest-build-provenance@v3" in workflow
     assert "gh release create" in workflow
     assert "Verify published bytes" in workflow
     assert 'cmp "release-artifacts/$artifact"' in workflow
-    assert workflow.index("Require the exact public PyPI wheel") < workflow.index(
-        "gh release create"
+    assert (
+        workflow.index("Repeat complete protected published-version admission")
+        < workflow.index("Require the exact public PyPI wheel")
+        < workflow.index("gh release create")
     )
     assert "sha256sum --check SHA256SUMS" in workflow
     assert 'len(files) != 1 or files[0].get("filename") != wheel' in workflow
@@ -248,6 +293,23 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "Resolve the reviewed target policy" in workflow
     assert 'policy = json.load(open("release/managed-installer.json"' in workflow
     assert "steps.runtime.outputs.uv_sha256" in workflow
+    assert (
+        workflow.index("Validate project, tag, and checkout identity")
+        < workflow.index("Collect complete GitHub and PyPI published-version evidence")
+        < workflow.index("Admit candidate before building")
+        < workflow.index("Build and inspect the candidate wheel once")
+    )
+    assert "deterministic-and-static:" in workflow
+    release_gates = workflow[
+        workflow.index("  deterministic-and-static:") : workflow.index(
+            "  native-installer-smoke:"
+        )
+    ]
+    assert "needs: build" in release_gates
+    assert "actions/download-artifact@v4" in release_gates
+    assert "${{ needs.build.outputs.wheel }}[dev]" in release_gates
+    assert "python -m build --wheel" not in release_gates
+    assert "python -m pytest tests/" in release_gates
     for runner in (
         "macos-15",
         "macos-15-intel",
@@ -260,3 +322,26 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
         assert target["uv_archive"] not in workflow
         assert target["uv_sha256"] not in workflow
         assert target["python_identity"] not in workflow
+
+
+def test_ci_builds_one_wheel_and_lifecycle_jobs_only_consume_that_artifact():
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+    assert workflow.count("python -m build --wheel") == 1
+    assert "release-artifact:" in workflow
+    assert "pipx-lifecycle:" in workflow
+    assert "managed-lifecycle:" in workflow
+    assert workflow.count("name: release-artifact") >= 3
+    assert workflow.count("actions/download-artifact@v4") == 2
+    producer = workflow.index("Build and inspect the candidate wheel once")
+    first_render = workflow.index("python scripts/render_managed_installer.py")
+    second_render = workflow.index(
+        "python scripts/render_managed_installer.py", first_render + 1
+    )
+    assert producer < first_render < second_render
+    assert (
+        workflow.index("Require a changed pull-request version to increase") < producer
+    )
+    consumers = workflow[workflow.index("  pipx-lifecycle:") :]
+    assert "python -m build --wheel" not in consumers
+    assert "--candidate-wheel" in consumers
