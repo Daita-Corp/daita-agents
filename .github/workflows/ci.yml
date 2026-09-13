@@ -98,6 +98,7 @@ jobs:
           if-no-files-found: error
 
   deterministic:
+    needs: release-artifact
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -108,8 +109,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-artifact
+          path: release-artifacts
       - run: python -m pip install -e ".[dev]"
-      - run: python -m pytest tests/ -m "not requires_llm and not requires_db and not requires_network and not slow"
+      - env:
+          DAITA_TEST_CANDIDATE_WHEEL: ${{ github.workspace }}/release-artifacts/${{ needs.release-artifact.outputs.wheel }}
+        run: python -m pytest tests/ -m "not requires_llm and not requires_db and not requires_network and not slow"
 
   pipx-lifecycle:
     needs: release-artifact

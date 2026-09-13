@@ -35,11 +35,55 @@ from tests.support.paths import REPO_ROOT
 
 ROOT = REPO_ROOT
 PIPX_REPAIR = "pipx reinstall daita-agents"
+_CANDIDATE_WHEEL_ENV = "DAITA_TEST_CANDIDATE_WHEEL"
 
 
 def _project_metadata() -> dict[str, Any]:
     with (ROOT / "pyproject.toml").open("rb") as source:
         return tomllib.load(source)["project"]
+
+
+def _candidate_wheel(tmp_path: Path) -> Path:
+    supplied = os.environ.get(_CANDIDATE_WHEEL_ENV)
+    if supplied is not None:
+        path = Path(supplied)
+        if not path.is_absolute():
+            raise AssertionError(f"{_CANDIDATE_WHEEL_ENV} must be an absolute path")
+        return path.resolve(strict=True)
+    if os.environ.get("CI") == "true":
+        raise AssertionError(
+            f"CI must supply the producer wheel through {_CANDIDATE_WHEEL_ENV}"
+        )
+
+    project = tmp_path / "project"
+    project.mkdir()
+    for filename in ("pyproject.toml", "README.md", "LICENSE"):
+        shutil.copy2(ROOT / filename, project / filename)
+    shutil.copytree(
+        ROOT / "src",
+        project / "src",
+        ignore=shutil.ignore_patterns("*.egg-info", "__pycache__", "*.pyc"),
+    )
+    distribution = tmp_path / "dist"
+    built = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            str(distribution),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=project,
+    )
+    assert built.returncode == 0, built.stderr
+    wheels = tuple(distribution.glob("*.whl"))
+    assert len(wheels) == 1
+    return wheels[0]
 
 
 def test_default_distribution_contains_every_supported_production_dependency():
@@ -64,6 +108,15 @@ def test_default_distribution_contains_every_supported_production_dependency():
     }
     assert set(project["optional-dependencies"]) == {"dev"}
     assert project["scripts"] == {"daita": "daita.cli:main"}
+
+
+def test_local_no_isolation_build_requirements_are_in_the_dev_extra() -> None:
+    with (ROOT / "pyproject.toml").open("rb") as source:
+        project = tomllib.load(source)
+
+    assert set(project["build-system"]["requires"]) <= set(
+        project["project"]["optional-dependencies"]["dev"]
+    )
 
 
 def test_import_fails_explicitly_without_installed_distribution_metadata(
@@ -125,36 +178,14 @@ def test_stale_editable_metadata_is_detected_instead_of_hidden(
 def test_real_wheel_metadata_drives_installed_runtime_cli_tui_and_mcp(
     tmp_path: Path,
 ) -> None:
-    project = tmp_path / "project"
-    project.mkdir()
-    for filename in ("pyproject.toml", "README.md", "LICENSE"):
-        shutil.copy2(ROOT / filename, project / filename)
-    shutil.copytree(
-        ROOT / "src",
-        project / "src",
-        ignore=shutil.ignore_patterns("*.egg-info", "__pycache__", "*.pyc"),
-    )
-    distribution = tmp_path / "dist"
-    built = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "build",
-            "--wheel",
-            "--no-isolation",
-            "--outdir",
-            str(distribution),
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        cwd=project,
-    )
-    assert built.returncode == 0, built.stderr
-    wheels = tuple(distribution.glob("*.whl"))
-    assert len(wheels) == 1
-    wheel = wheels[0]
+    wheel = _candidate_wheel(tmp_path)
     metadata = inspect_wheel(wheel)
+    identity = read_project_identity()
+    assert metadata.version == identity.version
+    assert sorted(metadata.requires_python.split(",")) == sorted(
+        identity.requires_python.split(",")
+    )
+    assert wheel.name == f"daita_agents-{identity.version}-py3-none-any.whl"
 
     runtime = tmp_path / "runtime"
     created = subprocess.run(
@@ -263,7 +294,9 @@ def test_ci_requires_clean_pipx_wheel_smoke_on_each_supported_python():
     assert "not requires_network and not slow" in workflow
     assert "--candidate-wheel" in workflow
     assert workflow.count("python -m build --wheel") == 1
-    assert workflow.count("actions/download-artifact@v4") == 2
+    assert workflow.count("actions/download-artifact@v4") == 3
+    assert "DAITA_TEST_CANDIDATE_WHEEL:" in workflow
+    assert "needs: release-artifact" in workflow
     lifecycle_jobs = workflow[workflow.index("  pipx-lifecycle:") :]
     assert "python -m build --wheel" not in lifecycle_jobs
     assert "[dev,sqlite]" not in workflow

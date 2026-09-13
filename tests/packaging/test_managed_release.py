@@ -308,6 +308,7 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "needs: build" in release_gates
     assert "actions/download-artifact@v4" in release_gates
     assert "${{ needs.build.outputs.wheel }}[dev]" in release_gates
+    assert "DAITA_TEST_CANDIDATE_WHEEL:" in release_gates
     assert "python -m build --wheel" not in release_gates
     assert "python -m pytest tests/" in release_gates
     for runner in (
@@ -332,7 +333,7 @@ def test_ci_builds_one_wheel_and_lifecycle_jobs_only_consume_that_artifact():
     assert "pipx-lifecycle:" in workflow
     assert "managed-lifecycle:" in workflow
     assert workflow.count("name: release-artifact") >= 3
-    assert workflow.count("actions/download-artifact@v4") == 2
+    assert workflow.count("actions/download-artifact@v4") == 3
     producer = workflow.index("Build and inspect the candidate wheel once")
     first_render = workflow.index("python scripts/render_managed_installer.py")
     second_render = workflow.index(
