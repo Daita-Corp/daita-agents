@@ -771,11 +771,37 @@ installed_metadata_check() {
     local expected_python="$3"
     "$python" -I -c '
 from importlib import metadata
+from pathlib import Path
+import re
 import sys
-d = metadata.distribution("daita-agents")
+
+import sysconfig
+
+
+def normalized_name(value):
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
+prefix = Path(sys.prefix).resolve()
+paths = {
+    Path(value).resolve()
+    for key in ("purelib", "platlib")
+    if (value := sysconfig.get_path(key))
+}
+assert paths and all(path.is_relative_to(prefix) for path in paths)
+matches = [
+    distribution
+    for distribution in metadata.distributions(path=[str(path) for path in sorted(paths)])
+    if (
+        len(names := distribution.metadata.get_all("Name", [])) == 1
+        and normalized_name(names[0]) == "daita-agents"
+    )
+]
+assert len(matches) == 1
+d = matches[0]
 entries = {e.name: e.value for e in d.entry_points if e.group == "console_scripts"}
 assert d.version == sys.argv[1]
-assert d.metadata.get_all("Name") == ["daita-agents"]
+assert normalized_name(d.metadata.get_all("Name")[0]) == "daita-agents"
 assert d.metadata.get_all("Requires-Python") == [sys.argv[2]]
 assert entries == {"daita": "daita.cli:main"}
 ' "$expected_version" "$expected_python"
@@ -788,11 +814,34 @@ installed_application_version() {
     [[ -x "$python" ]] || return 1
     "$python" -I -c '
 from importlib import metadata
+from pathlib import Path
+import re
 
+import sys
+import sysconfig
+
+
+def normalized_name(value):
+    return re.sub(r"[-_.]+", "-", value).lower()
+
+
+prefix = Path(sys.prefix).resolve()
+paths = {
+    Path(value).resolve()
+    for key in ("purelib", "platlib")
+    if (value := sysconfig.get_path(key))
+}
+if not paths or not all(path.is_relative_to(prefix) for path in paths):
+    raise SystemExit(1)
 matches = [
     distribution
-    for distribution in metadata.distributions(name="daita-agents")
-    if distribution.metadata.get_all("Name") == ["daita-agents"]
+    for distribution in metadata.distributions(
+        path=[str(path) for path in sorted(paths)]
+    )
+    if (
+        len(names := distribution.metadata.get_all("Name", [])) == 1
+        and normalized_name(names[0]) == "daita-agents"
+    )
 ]
 if len(matches) != 1:
     raise SystemExit(1)

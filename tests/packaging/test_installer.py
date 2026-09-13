@@ -825,6 +825,52 @@ def test_install_and_repair_refuse_when_active_metadata_is_unrecoverable(
         )
 
 
+def test_active_metadata_inspection_ignores_inherited_distribution_metadata(
+    tmp_path: Path,
+) -> None:
+    installer, environment, home = _install(tmp_path)
+    metadata = _installed_distribution_metadata(home)
+    site_packages = metadata.parent.parent
+    inherited = tmp_path / "inherited-site"
+    duplicate = inherited / "daita_agents-9.9.9.dist-info"
+    duplicate.mkdir(parents=True)
+    (duplicate / "METADATA").write_text(
+        "Metadata-Version: 2.4\nName: daita-agents\nVersion: 9.9.9\n",
+        encoding="utf-8",
+    )
+    (site_packages / "inherited-daita.pth").write_text(
+        f"{inherited}\n", encoding="utf-8"
+    )
+    python = _current_generation(home) / "tool" / "daita-agents" / "bin" / "python"
+    visible = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-c",
+            (
+                "from importlib import metadata; "
+                "print(len(tuple(metadata.distributions(name='daita-agents'))))"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert int(visible.stdout) >= 2
+    first_target = _current_target(home)
+
+    repeated = _run(
+        installer,
+        "--no-onboard",
+        "--no-modify-path",
+        env=environment,
+    )
+
+    assert repeated.returncode == 0, repeated.stderr
+    assert _current_target(home) == first_target
+
+
 def test_recovered_newer_metadata_still_blocks_an_older_repair(
     tmp_path: Path,
 ) -> None:
