@@ -442,6 +442,29 @@ def test_recovery_workflow_is_protected_exact_and_forward_only():
     assert "rollback" not in workflow.lower()
 
 
+def test_managed_installer_trust_boundary_has_codeowners():
+    source = (ROOT / ".github" / "CODEOWNERS").read_text(encoding="utf-8")
+    entries = {
+        parts[0]: tuple(parts[1:])
+        for line in source.splitlines()
+        if (stripped := line.strip()) and not stripped.startswith("#")
+        for parts in (stripped.split(),)
+    }
+    expected_owners = ("@jendala", "@pablo-prieto")
+
+    for pattern in (
+        "*",
+        "src/daita/",
+        "tests/",
+        "docs/",
+        "release/",
+        "scripts/",
+        ".github/",
+        "pyproject.toml",
+    ):
+        assert entries[pattern] == expected_owners
+
+
 def test_all_release_workflow_actions_are_pinned_to_full_commit_shas():
     import re
 
