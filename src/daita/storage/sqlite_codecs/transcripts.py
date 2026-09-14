@@ -27,7 +27,6 @@ from ...loop.models import (
     RunInput,
     RunOrigin,
     RunStartEnvelope,
-    TargetPosture,
 )
 from ...scope import EffectiveSourceScope
 from .artifacts import (
@@ -103,7 +102,6 @@ def _encode_run_input(value: RunInput) -> dict[str, JsonValue]:
             "created_at": datetime_encode(value.created_at),
             "conversation_id": value.conversation_id,
             "source_scope_ids": list(value.source_scope_ids),
-            "target_posture": value.target_posture.value,
             "resolved_source_scope": (
                 None
                 if value.resolved_source_scope is None
@@ -126,7 +124,6 @@ def _decode_run_input(value: JsonValue) -> RunInput:
             "created_at",
             "conversation_id",
             "source_scope_ids",
-            "target_posture",
             "resolved_source_scope",
             "history_sensitivity",
             "start",
@@ -141,9 +138,6 @@ def _decode_run_input(value: JsonValue) -> RunInput:
         source_scope_ids=tuple(
             text(item, "run source scope ID")
             for item in sequence(fields["source_scope_ids"], "run source scope")
-        ),
-        target_posture=TargetPosture(
-            text(fields["target_posture"], "run target posture")
         ),
         resolved_source_scope=_decode_resolved_source_scope(
             fields["resolved_source_scope"]

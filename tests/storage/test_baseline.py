@@ -39,11 +39,10 @@ async def test_fresh_state_uses_the_current_production_home_revision(
 
     with sqlite3.connect(path) as connection:
         assert table_names(connection) == set(CURRENT_SCHEMA.tables)
-    assert CURRENT_HOME_REVISION == 2
-    assert SQLiteStateStore.current_revision == "2"
+    assert CURRENT_HOME_REVISION == 1
+    assert SQLiteStateStore.current_revision == "1"
     assert migration_rows() == (
         (1, "agent_home_revision_1", HOME_MIGRATIONS[0].checksum),
-        (2, "agent_home_revision_2", HOME_MIGRATIONS[1].checksum),
     )
     assert _journal(path) == migration_rows()
 

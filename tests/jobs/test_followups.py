@@ -440,7 +440,7 @@ async def test_failed_terminal_job_delivers_grounded_no_result_report(
 
     monkeypatch.setattr(executor, "execute", fail_execution)
     try:
-        await agent.run("profile customers and fail", source_scope_ids=(source.id,))
+        await agent.run("profile and fail", source_scope_ids=(source.id,))
         job_id = _job_id(seed)
         terminal = await _terminal(agent, job_id)
         assert terminal.summary.status is JobStatus.FAILED
@@ -520,9 +520,7 @@ async def test_injected_router_fallback_is_scoped_sticky_and_delivers_once(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run(
-            "profile customers before fallback", source_scope_ids=(source.id,)
-        )
+        await agent.run("profile before fallback", source_scope_ids=(source.id,))
         job_id = _job_id(seed)
         terminal = await _terminal(agent, job_id)
         assert terminal.summary.status is JobStatus.SUCCEEDED
@@ -621,7 +619,7 @@ async def test_store_deduplicates_exact_event_and_rejects_conflicts(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(provider)
         await _terminal(agent, job_id)
         job = await agent._embedded._store.load_job(agent.id, job_id)
@@ -756,7 +754,7 @@ async def test_unavailable_pricing_fails_before_run_creation(tmp_path: Path) -> 
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(provider)
         await _terminal(agent, job_id)
     finally:
@@ -818,7 +816,7 @@ async def test_revoked_resource_scope_blocks_followup_before_reasoning(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(seed)
         await _terminal(agent, job_id)
         await agent.detach(source.id)
@@ -883,7 +881,7 @@ async def test_host_loss_before_run_creation_recovers_stale_claim(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(seed)
         await _terminal(agent, job_id)
         job = await agent._embedded._store.load_job(agent.id, job_id)
@@ -1008,7 +1006,7 @@ async def test_host_loss_after_terminal_commit_retries_delivery_not_reasoning(
         blocked_finalizer,
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(provider)
         await _terminal(agent, job_id)
         await asyncio.wait_for(entered_finalizer.wait(), timeout=3)
@@ -1090,7 +1088,7 @@ async def test_acknowledgment_unblocks_pending_delivery_at_capacity(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers first")
+        await agent.run("profile first")
         first_job_id = _job_id(provider)
         assert first_job_id == "job-capacity-1"
         await _terminal(agent, first_job_id)
@@ -1104,7 +1102,7 @@ async def test_acknowledgment_unblocks_pending_delivery_at_capacity(
                 _stop("Second terminal result delivered after capacity is freed."),
             )
         )
-        await agent.run("profile customers second")
+        await agent.run("profile second")
         second_job_id = _job_id_from_request(provider, 5)
         assert second_job_id == "job-capacity-2"
         await _terminal(agent, second_job_id)
@@ -1167,9 +1165,9 @@ async def test_one_delivery_failure_does_not_block_a_sibling_followup(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers first")
+        await agent.run("profile first")
         first_job_id = _job_id_from_request(seed, 1)
-        await agent.run("profile customers second")
+        await agent.run("profile second")
         second_job_id = _job_id_from_request(seed, 3)
         await _terminal(agent, first_job_id)
         await _terminal(agent, second_job_id)
@@ -1263,7 +1261,7 @@ async def test_delivery_is_blocked_when_destination_sensitivity_is_too_low(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(seed)
         await _terminal(agent, job_id)
         job = await agent._embedded._store.load_job(agent.id, job_id)
@@ -1381,7 +1379,7 @@ async def test_completed_model_text_without_all_job_evidence_fails_closed(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(provider)
         await _terminal(agent, job_id)
         items = await _inbox(agent)
@@ -1423,7 +1421,7 @@ async def test_cleared_origin_conversation_does_not_revoke_followup(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers before clearing")
+        await agent.run("origin text must not be required after clearing")
         job_id = _job_id(seed)
         await _terminal(agent, job_id)
         assert await agent.clear_conversations() >= 1
@@ -1497,7 +1495,7 @@ async def test_followup_is_self_contained_with_only_its_classified_source_advice
     )
     try:
         first_result = await agent.run(
-            "remember the other customers source",
+            "remember the other source",
             source_scope_ids=(second.id,),
         )
         created_at = (await agent.transcript(first_result.run_id)).run.created_at
@@ -1547,7 +1545,7 @@ async def test_followup_is_self_contained_with_only_its_classified_source_advice
                 ),
             )
         await agent.run(
-            "profile customers from the first source",
+            "profile the first source",
             conversation_id=first_result.conversation_id,
             source_scope_ids=(first.id,),
         )
@@ -1599,7 +1597,7 @@ async def test_terminal_event_uses_bounded_result_preview_and_exact_digest(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(seed)
         await _terminal(agent, job_id)
         job = await agent._embedded._store.load_job(agent.id, job_id)
@@ -1742,7 +1740,7 @@ async def test_inbox_uses_bounded_report_preview_and_run_reference(
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("profile customers")
+        await agent.run("profile")
         job_id = _job_id(provider)
         await _terminal(agent, job_id)
         item = (await _inbox(agent))[0]

@@ -10,9 +10,7 @@ from pathlib import Path
 import pytest
 
 from daita import Agent
-from daita.errors import StateCompatibilityCode, StateCompatibilityError
 from daita.llm.models import TextBlock
-from daita.loop.models import TargetPosture
 from daita.storage.home_migrations import (
     CURRENT_HOME_REVISION,
     HOME_MIGRATIONS,
@@ -46,22 +44,26 @@ def test_every_production_home_revision_has_one_golden_fixture() -> None:
     }
 
 
-async def test_current_golden_whole_home_opens_without_rewrite(
+async def test_revision_1_golden_whole_home_opens_without_rewrite(
     tmp_path: Path,
 ) -> None:
-    fixture = FIXTURES / f"revision-{CURRENT_HOME_REVISION}"
+    fixture = FIXTURES / "revision-1"
     home = tmp_path / "agents/golden"
     _materialize_fixture(fixture, home)
     before = _sha256(home / "state.db")
 
     status = await Agent.inspect_home("golden", root=tmp_path)
-    assert status.current_revision == CURRENT_HOME_REVISION
-    assert status.found_revision == CURRENT_HOME_REVISION
+    assert status.current_revision == 1
+    assert status.found_revision == 1
     assert status.minimum_supported_revision == 1
     assert not status.upgrade_required
     assert not status.recovery_required
 
-    agent = await Agent.open("golden", root=tmp_path, workspace=workspace_for(tmp_path))
+    agent = await Agent.open(
+        "golden",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
     try:
         assert agent.id == "agent-golden-revision-1"
         assert await agent.read_memory() == "Golden durable memory.\n"
@@ -99,12 +101,12 @@ async def test_every_supported_golden_home_reaches_current_revision(
     assert initial.found_revision == source_revision
     assert initial.upgrade_required is (source_revision < CURRENT_HOME_REVISION)
 
-    agent = await Agent.open("golden", root=tmp_path, workspace=workspace_for(tmp_path))
-    try:
-        transcript = await agent.transcript("run-golden-revision-1")
-        assert transcript.run.target_posture is TargetPosture.SINGLE_TARGET
-    finally:
-        await agent.close()
+    agent = await Agent.open(
+        "golden",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
+    await agent.close()
 
     current = await Agent.inspect_home("golden", root=tmp_path)
     assert current.found_revision == CURRENT_HOME_REVISION
@@ -115,25 +117,3 @@ async def test_every_supported_golden_home_reaches_current_revision(
         assert not (home / ".home-rollbacks").exists()
     else:
         assert len(tuple((home / ".home-rollbacks").iterdir())) == 1
-
-
-async def test_revision_1_invalid_run_input_fails_upgrade_without_rewrite(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "agents/golden"
-    _materialize_fixture(FIXTURES / "revision-1", home)
-    with sqlite3.connect(home / "state.db") as connection:
-        connection.execute(
-            "UPDATE runs SET input = '{}' WHERE id = 'run-golden-revision-1'"
-        )
-    before = _sha256(home / "state.db")
-
-    with pytest.raises(StateCompatibilityError) as raised:
-        await Agent.open(
-            "golden",
-            root=tmp_path,
-            workspace=workspace_for(tmp_path),
-        )
-
-    assert raised.value.code is StateCompatibilityCode.UPGRADE_FAILED
-    assert _sha256(home / "state.db") == before

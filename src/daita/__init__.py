@@ -59,7 +59,6 @@ from .distribution import (
     OutcomeReference,
     OutcomeState,
 )
-from .errors import ClarificationRequiredError
 from .hosting.resident import ResidentReady, run_resident_host
 from .jobs import (
     JobExecutionMode,
@@ -93,7 +92,6 @@ from .loop import (
     LoopExit,
     LoopExitKind,
     LoopLimits,
-    TargetPosture,
     Transcript,
 )
 from .observation import AgentEvent, AgentEventKind, AgentObserver
@@ -159,7 +157,6 @@ __all__ = [
     "AmbiguousTimePolicy",
     "CalendarDaySelector",
     "CalendarSchedule",
-    "ClarificationRequiredError",
     "ConversationRun",
     "CatalogSummary",
     "LocalWorkspace",
@@ -197,7 +194,6 @@ __all__ = [
     "ToolLoadMode",
     "ToolPresentation",
     "ToolTextTrust",
-    "TargetPosture",
     "MCPAdmissionError",
     "MCPAuthentication",
     "MCPAuthenticationMode",

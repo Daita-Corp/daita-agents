@@ -160,16 +160,16 @@ An empty machine ceiling or resolved scope means no sources. Files-only excludes
 both catalog and MCP tools. There is no active source, conversation source, or
 implicit source argument injection.
 
-`RunInput.target_posture` is caller-owned and defaults to `single_target`;
-`compare_set` is explicit, suppresses only intentional multi-candidate ambiguity,
-and is never inferred from model text; no-match still requires clarification. Foreground
-preparation applies the code-owned clarification gate to the complete catalog-owned
-current-query match outcome before transcript creation or model spend. Ambiguous or
-no-match single-target evidence returns a failed `clarification_required` exit. The
-data domain independently refuses foreground target-dependent relational query,
-preview and write calls under the same condition. Fitted candidate bindings are presentation,
-not gate authority. Outcomes never inject exact IDs or grant read/write authority,
-and clarification retains no selected-source or target state.
+Clarification is ordinary foreground model behavior within the direct loop, not a
+run state, admission layer, persisted selection, or special terminal result. Current
+catalog outcomes, the connector directory, toolbox metadata, and ordinary tool
+results provide domain-owned evidence. When a request depends on one materially
+ambiguous resource, connector or account, recipient, or destination, the model asks
+one concise question unless the user selected a choice or requested the set or a
+comparison. Multiple search results alone are not ambiguity. Exact scope, argument,
+permission, approval, and receipt validation remain with the existing runtime and
+domains; approval never resolves ambiguity. Machine runs instead carry exact frozen
+bindings and fail normally when those bindings cannot be revalidated.
 
 Completed-run sensitivity is a conservative floor retained with conversation
 continuity, including compressed assistant answers after source detach. Requests

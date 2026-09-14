@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
+
+from daita import SQLiteSource
 from tests.support.conversations import (
     _HISTORY_OMISSION_MARKER,
     _MAXIMUM_PRIOR_UTF8_BYTES,
@@ -75,6 +78,54 @@ async def test_follow_up_uses_history_without_copying_it_into_new_transcript(tmp
             for block in message.content
             if isinstance(block, TextBlock)
         ) == ("follow-up user sentinel", "follow-up answer")
+    finally:
+        await agent.close()
+
+
+async def test_catalog_clarification_is_an_ordinary_completed_turn(tmp_path):
+    clarification = "I found East orders and West orders. Which one should I use?"
+    provider = MockModelProvider(
+        (_stop(clarification), _stop("I will use East orders."))
+    )
+    database = tmp_path / "orders.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE orders_east (id INTEGER PRIMARY KEY)")
+        connection.execute("CREATE TABLE orders_west (id INTEGER PRIMARY KEY)")
+    agent = await Agent.create(
+        "ordinary-clarification",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        await agent.attach(SQLiteSource(database))
+        first = await agent.run("Show me the orders.")
+        assert first.kind is LoopExitKind.COMPLETED
+        assert first.reason == "completed"
+        assert first.final_text == clarification
+        assert "data_query" in {tool.name for tool in provider.requests[0].tools}
+        system = provider.requests[0].messages[0].content[0]
+        assert isinstance(system, TextBlock)
+        assert "catalog assessment reports multiple plausible" in system.text
+
+        transcript = await agent.transcript(first.run_id)
+        assert tuple(
+            block.text
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, TextBlock)
+        ) == ("Show me the orders.", clarification)
+
+        await agent.run(
+            "Use East orders.",
+            conversation_id=first.conversation_id,
+        )
+        assert _request_text(provider.requests[1])[-3:] == (
+            "Show me the orders.",
+            clarification,
+            "Use East orders.",
+        )
     finally:
         await agent.close()
 

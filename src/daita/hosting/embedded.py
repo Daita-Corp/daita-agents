@@ -141,12 +141,7 @@ from ..domains.data.sql import (
 )
 from ..domains.learning import LearningCandidateGuard
 from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
-from ..errors import (
-    AgentError,
-    ClarificationRequiredError,
-    StateCompatibilityCode,
-    StateCompatibilityError,
-)
+from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
 from ..jobs.capabilities import (
     JOB_DOMAIN_OWNER_ID,
@@ -214,12 +209,10 @@ from ..loop.models import (
     ConversationRun,
     InstructionAuthority,
     LoopExit,
-    LoopExitKind,
     LoopLimits,
     RunInput,
     RunOrigin,
     RunStartEnvelope,
-    TargetPosture,
     Transcript,
 )
 from ..memory import MemoryStore
@@ -2176,7 +2169,6 @@ class EmbeddedAgent:
         *,
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
-        target_posture: TargetPosture = TargetPosture.SINGLE_TARGET,
         files_only: bool = False,
         job_executor_profile_id: str | None = None,
     ) -> LoopExit:
@@ -2184,7 +2176,6 @@ class EmbeddedAgent:
             message,
             conversation_id=conversation_id,
             source_scope_ids=source_scope_ids,
-            target_posture=target_posture,
             files_only=files_only,
             job_executor_profile_id=job_executor_profile_id,
         )
@@ -2211,7 +2202,6 @@ class EmbeddedAgent:
         *,
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
-        target_posture: TargetPosture = TargetPosture.SINGLE_TARGET,
         learning_candidate_id: str | None = None,
         learning_candidate_text: str | None = None,
         learning_candidate: LearningCandidate | None = None,
@@ -2225,8 +2215,6 @@ class EmbeddedAgent:
             not isinstance(item, str) or not item.strip() for item in source_scope_ids
         ):
             raise ValueError("source_scope_ids must be a tuple of exact source IDs")
-        if not isinstance(target_posture, TargetPosture):
-            raise TypeError("target_posture must be TargetPosture")
         if not isinstance(files_only, bool):
             raise TypeError("files_only must be bool")
         if files_only and source_scope_ids:
@@ -2266,7 +2254,6 @@ class EmbeddedAgent:
                 message,
                 conversation_id=conversation_id,
                 source_scope_ids=source_scope_ids,
-                target_posture=target_posture,
                 files_only=files_only,
                 learning_candidate_id=learning_candidate_id,
                 learning_candidate_text=learning_candidate_text,
@@ -2282,7 +2269,6 @@ class EmbeddedAgent:
         *,
         conversation_id: str | None,
         source_scope_ids: tuple[str, ...],
-        target_posture: TargetPosture,
         learning_candidate_id: str | None,
         learning_candidate_text: str | None,
         learning_candidate: LearningCandidate | None,
@@ -2299,8 +2285,6 @@ class EmbeddedAgent:
             not isinstance(item, str) or not item.strip() for item in source_scope_ids
         ):
             raise ValueError("source_scope_ids must be a tuple of exact source IDs")
-        if not isinstance(target_posture, TargetPosture):
-            raise TypeError("target_posture must be TargetPosture")
         if self._model_reopen_required:
             raise AgentNotConfiguredError(
                 "model configuration changed; close and reopen required"
@@ -2343,7 +2327,6 @@ class EmbeddedAgent:
             created_at=self._clock(),
             conversation_id=resolved_conversation,
             source_scope_ids=source_scope_ids,
-            target_posture=target_posture,
             history_sensitivity=max(
                 (
                     item.result.sensitivity
@@ -2387,45 +2370,9 @@ class EmbeddedAgent:
                     run_input, self._data_view, files_only=files_only
                 ),
             )
-            try:
-                prepared = await loop.prepare(
-                    run_input,
-                    prior_messages=prior_messages,
-                )
-            except LoopPreparationError as error:
-                if error.code == "clarification_required":
-                    cause = error.__cause__
-                    final_text = (
-                        str(cause)
-                        if isinstance(cause, ClarificationRequiredError)
-                        else "Please clarify the single catalog target before continuing."
-                    )
-                    return LoopExit(
-                        run_id=run_input.id,
-                        conversation_id=resolved_conversation,
-                        kind=LoopExitKind.FAILED,
-                        reason="clarification_required",
-                        final_text=final_text,
-                        steps=0,
-                        created_at=self._clock(),
-                    )
-                # Preserve the existing durable failure behavior for all other
-                # preparation failures.
-                return await loop.run(
-                    run_input,
-                    prior_messages=prior_messages,
-                )
-            except Exception:
-                # Unexpected preparation errors retain the loop's existing
-                # terminalization and diagnostic path.
-                return await loop.run(
-                    run_input,
-                    prior_messages=prior_messages,
-                )
             return await loop.run(
                 run_input,
                 prior_messages=prior_messages,
-                prepared=prepared,
             )
         finally:
             if self._artifact_delivery is not None:
@@ -3472,7 +3419,6 @@ class EmbeddedAgent:
                     source_scope_ids=(
                         () if effective_source_id is None else (effective_source_id,)
                     ),
-                    target_posture=TargetPosture.SINGLE_TARGET,
                     learning_candidate_id=candidate.id,
                     learning_candidate_text=candidate_text,
                     learning_candidate=candidate,

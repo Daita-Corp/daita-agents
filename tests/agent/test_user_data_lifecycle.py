@@ -363,7 +363,7 @@ async def test_terminal_lifecycle_commands_require_confirmation(
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
-    result = await agent.run("Create records history.")
+    result = await agent.run("Create history.")
     controller = PresentationController(
         root=tmp_path, workspace=workspace_for(tmp_path)
     )
@@ -398,7 +398,7 @@ async def test_terminal_can_clear_history_detach_source_and_delete_agent(
         workspace=workspace_for(tmp_path),
     )
     source = await agent.attach(SQLiteSource(database, name="Warehouse"))
-    result = await agent.run("Create records history.")
+    result = await agent.run("Create history.")
     controller = PresentationController(
         root=tmp_path, workspace=workspace_for(tmp_path)
     )

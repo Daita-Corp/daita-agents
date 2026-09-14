@@ -265,7 +265,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
         assert first.artifacts[0].artifact_id == xlsx_id
         assert first.artifacts[0].media_type == XLSX_MEDIA_TYPE
 
-        other = await agent.run("Create a separate TXT artifact about records.")
+        other = await agent.run("Create a separate TXT artifact.")
         assert other.artifacts[0].artifact_id == other_id
 
         connection = sqlite3.connect(database)
@@ -276,7 +276,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
 
         follow_up_request = len(provider.requests)
         converted = await agent.run(
-            "Convert the records workbook we just made to CSV and save it.",
+            "Convert the workbook we just made to CSV and save it.",
             conversation_id=first.conversation_id,
         )
         assert converted.kind.value == "completed", converted
@@ -313,7 +313,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
         )
 
         cross_conversation = await agent.run(
-            "Read the exact earlier records workbook by its artifact ID."
+            "Read the exact earlier workbook by its artifact ID."
         )
         assert cross_conversation.conversation_id != first.conversation_id
         cross_list = await _result(agent, cross_conversation.run_id, "cross-list")
@@ -327,7 +327,7 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
         assert cross_read_data["rows"] == (("alpha", 1), ("beta", 2))
 
         cross_convert = await agent.run(
-            "Convert the earlier records workbook from another conversation."
+            "Convert the earlier workbook from another conversation."
         )
         conversion = await _result(agent, cross_convert.run_id, "cross-convert")
         assert conversion.is_error is True
@@ -496,10 +496,10 @@ async def test_artifact_conversion_cancellation_leaves_no_child_or_staging(
 
     monkeypatch.setattr(artifact_capabilities, "read_exact_xlsx_data", blocked)
     try:
-        first = await agent.run("Export the current records as XLSX.")
+        first = await agent.run("Create an XLSX workbook.")
         running = asyncio.create_task(
             agent.run(
-                "Convert the records workbook to CSV.",
+                "Convert it to CSV.",
                 conversation_id=first.conversation_id,
             )
         )

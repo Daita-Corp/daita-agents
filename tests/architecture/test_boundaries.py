@@ -438,7 +438,6 @@ def test_public_surface_is_focused():
         "AmbiguousTimePolicy",
         "CalendarDaySelector",
         "CalendarSchedule",
-        "ClarificationRequiredError",
         "ConversationInboxTarget",
         "ConversationRun",
         "CatalogSummary",
@@ -476,7 +475,6 @@ def test_public_surface_is_focused():
         "ToolboxDefinition",
         "ToolboxId",
         "ToolTextTrust",
-        "TargetPosture",
         "MCPAdmissionError",
         "MCPAuthentication",
         "MCPAuthenticationMode",
@@ -1766,14 +1764,10 @@ def test_catalog_indexed_retrieval_is_private_and_catalog_owned():
     assert "CatalogSearchHit" not in storage
     assert "_SourceCatalogIndex" not in loop
     assert "CatalogMatchOutcome" not in loop
-    assert _class_owners("ClarificationRequiredError") == {"errors.py"}
-    assert "ClarificationRequiredError" in context
-    assert "clarification_required" in (
-        PACKAGE / "domains" / "data" / "controller.py"
-    ).read_text(encoding="utf-8")
-    assert "clarification_required" in (PACKAGE / "hosting" / "embedded.py").read_text(
-        encoding="utf-8"
-    )
+    assert "TargetPosture" not in _python_text(PACKAGE)
+    assert "target_posture" not in _python_text(PACKAGE)
+    assert "ClarificationRequiredError" not in _python_text(PACKAGE)
+    assert "clarification_required" not in _python_text(PACKAGE)
     for prohibited in (
         "CatalogSearchService",
         "SourceRouter",
@@ -1876,7 +1870,6 @@ def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
         "models.py",
         "registry.py",
         "revision_0001.py",
-        "revision_0002.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 
