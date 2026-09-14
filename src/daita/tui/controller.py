@@ -22,7 +22,6 @@ from daita import (
     InboxView,
     JobInspection,
     JobResultView,
-    JobStatus,
     JobSummary,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
@@ -1031,52 +1030,14 @@ class PresentationController:
 
     async def _jobs_command(self, parts: list[str]) -> CommandOutcome:
         conversation_id = self.conversation_id
-        usage = (
-            "Usage: /jobs | /jobs inspect <id> | /jobs results <id> | "
-            "/jobs cancel <id>"
-        )
         if len(parts) == 1:
             return CommandOutcome(
                 "screen",
                 screen="jobs",
                 conversation_id=conversation_id,
             )
-        if len(parts) != 3 or parts[1] not in {"inspect", "results", "cancel"}:
-            return CommandOutcome("notice", usage, conversation_id=conversation_id)
-        action, job_id = parts[1], parts[2]
-        if action != "cancel":
-            return CommandOutcome(
-                "screen",
-                screen="jobs",
-                conversation_id=conversation_id,
-                payload={"job_id": job_id, "view": action},
-            )
-        inspection = await self.inspect_job(job_id)
-        if inspection is None:
-            raise UserInputError("No durable job with that ID belongs to this agent.")
-        status = inspection.summary.status
-        if status not in {JobStatus.QUEUED, JobStatus.RUNNING}:
-            return CommandOutcome(
-                "notice",
-                "Job "
-                + safe_display(job_id, fallback="job", maximum=256)
-                + f" is {status.value} and cannot be cancelled.",
-                conversation_id=conversation_id,
-            )
         return CommandOutcome(
-            "confirm",
-            "Cancel durable job "
-            + safe_display(job_id, fallback="job", maximum=256)
-            + "?\n"
-            + safe_display(
-                inspection.summary.job_kind,
-                fallback="job",
-                maximum=128,
-            )
-            + f" · {status.value}\n\nCancellation is requested immediately and cannot be undone.",
-            conversation_id=conversation_id,
-            screen="confirm_cancel_job",
-            payload={"job_id": job_id},
+            "notice", "Usage: /jobs", conversation_id=conversation_id
         )
 
     async def _mcp_command(self, parts: list[str]) -> CommandOutcome:

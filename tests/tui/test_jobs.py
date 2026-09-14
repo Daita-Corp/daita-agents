@@ -10,8 +10,6 @@ from tests.tui._support import (
     AgentEvent,
     AgentEventKind,
     Button,
-    ChatScreen,
-    Composer,
     ConfirmScreen,
     DaitaApp,
     DeliveryState,
@@ -31,68 +29,37 @@ from tests.tui._support import (
     Static,
     Text,
     TranscriptView,
-    UserInputError,
     _tui_inbox_item,
     _tui_job_inspection,
     _tui_job_summary,
     datetime,
-    pytest,
     render_inbox_item,
     replace,
     workspace_for,
 )
 
 
-async def test_jobs_commands_route_without_model_calls(monkeypatch):
+async def test_jobs_command_opens_interactive_manager_without_model_calls():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
-    running = _tui_job_summary("job-running", JobStatus.RUNNING, result_available=False)
-    succeeded = _tui_job_summary(
-        "job-succeeded", JobStatus.SUCCEEDED, result_available=True
-    )
-
-    async def inspect_job(job_id: str) -> object | None:
-        if job_id == running.job_id:
-            return _tui_job_inspection(running)
-        if job_id == succeeded.job_id:
-            return _tui_job_inspection(succeeded)
-        return None
-
-    monkeypatch.setattr(app.controller, "inspect_job", inspect_job)
 
     assert {
         insertion
         for insertion, _display, _description in SLASH_COMMAND_COMPLETIONS
         if insertion.startswith("/jobs")
-    } == {"/jobs", "/jobs inspect ", "/jobs results ", "/jobs cancel "}
+    } == {"/jobs"}
 
     listed = await app.controller.dispatch_command("/jobs")
     assert listed.kind == "screen"
     assert listed.screen == "jobs"
 
-    inspected = await app.controller.dispatch_command("/jobs inspect job-running")
-    assert inspected.screen == "jobs"
-    assert inspected.payload == {"job_id": "job-running", "view": "inspect"}
-
-    results = await app.controller.dispatch_command("/jobs results job-succeeded")
-    assert results.screen == "jobs"
-    assert results.payload == {"job_id": "job-succeeded", "view": "results"}
-
-    cancellation = await app.controller.dispatch_command("/jobs cancel job-running")
-    assert cancellation.kind == "confirm"
-    assert cancellation.screen == "confirm_cancel_job"
-    assert cancellation.payload == {"job_id": "job-running"}
-    assert "data_profile · running" in cancellation.message
-
-    terminal = await app.controller.dispatch_command("/jobs cancel job-succeeded")
-    assert terminal.kind == "notice"
-    assert "succeeded and cannot be cancelled" in terminal.message
-
-    malformed = await app.controller.dispatch_command("/jobs retry job-running")
-    assert malformed.kind == "notice"
-    assert malformed.message.startswith("Usage: /jobs")
-
-    with pytest.raises(UserInputError, match="belongs to this agent"):
-        await app.controller.dispatch_command("/jobs cancel job-missing")
+    for removed_command in (
+        "/jobs inspect job-running",
+        "/jobs results job-succeeded",
+        "/jobs cancel job-running",
+    ):
+        outcome = await app.controller.dispatch_command(removed_command)
+        assert outcome.kind == "notice"
+        assert outcome.message == "Usage: /jobs"
 
 
 async def test_inbox_command_routes_without_a_model_call():
@@ -480,65 +447,4 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
             manager.query_one("#jobs-notice", Static).content
         )
         assert await pilot.click("#jobs-close") is True
-        app.exit(0)
-
-
-async def test_direct_jobs_cancel_command_confirms_and_opens_updated_manager(
-    monkeypatch,
-):
-    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
-    running = _tui_job_summary(
-        "job-direct-cancel", JobStatus.RUNNING, result_available=False
-    )
-    current = running
-    cancel_calls: list[str] = []
-
-    async def list_jobs() -> tuple[object, ...]:
-        return (current,)
-
-    async def inspect_job(job_id: str) -> object | None:
-        return _tui_job_inspection(current) if job_id == current.job_id else None
-
-    async def cancel_job(job_id: str) -> object | None:
-        nonlocal current
-        cancel_calls.append(job_id)
-        current = _tui_job_summary(
-            job_id, JobStatus.CANCEL_REQUESTED, result_available=False
-        )
-        return _tui_job_inspection(current)
-
-    async def skill_invocation_message(_message: str) -> None:
-        return None
-
-    monkeypatch.setattr(app.controller, "list_jobs", list_jobs)
-    monkeypatch.setattr(app.controller, "inspect_job", inspect_job)
-    monkeypatch.setattr(app.controller, "cancel_job", cancel_job)
-    monkeypatch.setattr(
-        app.controller, "skill_invocation_message", skill_invocation_message
-    )
-
-    async with app.run_test(size=(110, 36)) as pilot:
-        await app.push_screen(ChatScreen())
-        composer = app.screen.query_one(Composer)
-        composer.load_text(f"/jobs cancel {running.job_id}")
-        composer.action_submit()
-        for _ in range(20):
-            await pilot.pause(0.05)
-            if isinstance(app.screen, ConfirmScreen):
-                break
-        assert isinstance(app.screen, ConfirmScreen)
-        assert "data_profile · running" in str(
-            app.screen.query_one("#confirm-message").render()
-        )
-        await pilot.press("y")
-        for _ in range(20):
-            await pilot.pause(0.05)
-            if isinstance(app.screen, JobsScreen):
-                break
-        manager = app.screen
-        assert isinstance(manager, JobsScreen)
-        assert cancel_calls == [running.job_id]
-        assert "Cancellation requested" in str(
-            manager.query_one("#jobs-notice", Static).content
-        )
         app.exit(0)

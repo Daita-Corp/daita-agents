@@ -31,20 +31,10 @@ class JobsScreen(ModalScreen[None]):
         Binding("c", "cancel_job", "Cancel", priority=True),
     ]
 
-    def __init__(
-        self,
-        *,
-        job_id: str | None = None,
-        initial_view: str = "details",
-        notice: str = "",
-    ) -> None:
+    def __init__(self) -> None:
         super().__init__()
         self._jobs: tuple[JobSummary, ...] = ()
-        self._target_job_id = job_id
-        self._initial_view = (
-            initial_view if initial_view in {"details", "results"} else "details"
-        )
-        self._notice = notice
+        self._notice = ""
         self._busy = False
 
     def compose(self) -> ComposeResult:
@@ -137,16 +127,9 @@ class JobsScreen(ModalScreen[None]):
         try:
             await self._load_jobs()
             self.query_one("#jobs-list", OptionList).focus()
-            job_id = self._target_job_id
-            if job_id is None:
-                summary = self._selected_summary()
-                if summary is not None:
-                    self._render_overview(summary)
-                return
-            if self._initial_view == "results":
-                await self._show_results(job_id)
-            else:
-                await self._show_details(job_id)
+            summary = self._selected_summary()
+            if summary is not None:
+                self._render_overview(summary)
         except (ValueError, RuntimeError, OSError) as error:
             self._show_error(error)
         finally:
@@ -181,7 +164,7 @@ class JobsScreen(ModalScreen[None]):
                 self._set_busy(False)
 
     async def _load_jobs(self) -> None:
-        selected = self._selected_job_id() or self._target_job_id
+        selected = self._selected_job_id()
         self._jobs = await self.app.controller.list_jobs()  # type: ignore[attr-defined]
         listing = self.query_one("#jobs-list", OptionList)
         listing.clear_options()
@@ -200,7 +183,7 @@ class JobsScreen(ModalScreen[None]):
             )
             listing.highlighted = selected_index
         self.query_one("#jobs-summary", Static).update(self._summary_text())
-        if not self._jobs and self._target_job_id is None:
+        if not self._jobs:
             self.query_one("#jobs-detail", Static).update(
                 "No durable jobs yet. Ask the agent to start a data profile when one is needed."
             )

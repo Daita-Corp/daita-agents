@@ -750,16 +750,7 @@ class DaitaApp(App[int]):
             await self._complete_mcp_screen(result)
             return
         if screen_name == "jobs":
-            await self._await_modal(
-                JobsScreen(
-                    job_id=(
-                        str(payload["job_id"])
-                        if isinstance(payload.get("job_id"), str)
-                        else None
-                    ),
-                    initial_view=str(payload.get("view", "details")),
-                )
-            )
+            await self._await_modal(JobsScreen())
             return
         if screen_name == "routines":
             await self._await_modal(RoutinesScreen())
@@ -837,34 +828,6 @@ class DaitaApp(App[int]):
             if accepted:
                 await self.controller.delete_open_agent()
                 self.exit(0)
-            return
-        if screen_name == "confirm_cancel_job":
-            job_id = str(payload.get("job_id", ""))
-            accepted = await self._await_modal(ConfirmScreen(message))
-            if not accepted:
-                return
-            inspection = await self.controller.cancel_job(job_id)
-            if inspection is None:
-                raise UserInputError(
-                    "The job no longer exists within this agent boundary."
-                )
-            status = inspection.summary.status.value
-            if status in {"cancel_requested", "cancelled"}:
-                notice = "Cancellation requested · " + job_id + " · " + status
-            else:
-                notice = (
-                    "Job became "
-                    + status
-                    + " before cancellation was applied · "
-                    + job_id
-                )
-            await self._await_modal(
-                JobsScreen(
-                    job_id=job_id,
-                    initial_view="details",
-                    notice=notice,
-                )
-            )
             return
         if screen_name == "confirm_detach_source":
             accepted = await self._await_modal(ConfirmScreen(message))

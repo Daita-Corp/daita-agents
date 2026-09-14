@@ -34,9 +34,6 @@ SLASH_COMMAND_COMPLETIONS = (
         "Configure read and PostgreSQL update/upsert access",
     ),
     ("/jobs", "/jobs", "Manage durable jobs"),
-    ("/jobs inspect ", "/jobs inspect <id>", "Inspect one durable job"),
-    ("/jobs results ", "/jobs results <id>", "Read one completed job result"),
-    ("/jobs cancel ", "/jobs cancel <id>", "Cancel one queued or running job"),
     ("/inbox", "/inbox", "Inspect and acknowledge completed background reports"),
     ("/routines", "/routines", "Inspect and control saved assignments"),
     (
