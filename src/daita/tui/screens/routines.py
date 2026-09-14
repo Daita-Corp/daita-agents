@@ -279,7 +279,8 @@ def render_routine_inspection(inspection: ScheduledRoutineInspection) -> Text:
             f"run {item.terminal_run_id or item.reserved_run_id or 'not started'}"
         )
     lines.append(
-        "Receipt references and artifact/delivery evidence are in the exact details below. Use /effects to inspect or resolve uncertainty."
+        "Receipt references and artifact/delivery evidence are in the exact details below. "
+        "An uncertain action requires operator recovery before it can be retried."
     )
     lines.append(exact)
     return Text("\n".join(lines))

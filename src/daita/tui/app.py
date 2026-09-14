@@ -47,7 +47,6 @@ from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
-from .screens.effects import EffectsScreen
 from .screens.inbox import InboxScreen
 from .screens.jobs import JobsScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
@@ -225,11 +224,6 @@ class DaitaApp(App[int]):
             raise asyncio.CancelledError
         if self.size.height < 15:
             raise RuntimeError("terminal is too small to review this change")
-        if isinstance(self.screen, EffectsScreen):
-            decision = await self.screen.request_approval(request)
-            if decision is None:
-                raise asyncio.CancelledError
-            return decision
         screen = self.chat()
         if screen is None:
             raise RuntimeError("chat view is unavailable for approval review")
@@ -770,17 +764,6 @@ class DaitaApp(App[int]):
         if screen_name == "routines":
             await self._await_modal(RoutinesScreen())
             await self.refresh_background_status(notify_new=False)
-            return
-        if screen_name == "effects":
-            await self._await_modal(
-                EffectsScreen(
-                    receipt_id=(
-                        str(payload["receipt_id"])
-                        if isinstance(payload.get("receipt_id"), str)
-                        else None
-                    )
-                )
-            )
             return
         if screen_name == "inbox":
             await self._await_modal(InboxScreen())

@@ -60,7 +60,7 @@ class StatusBar(Horizontal):
         background.tooltip = (
             "Background jobs, autonomous reporting, and unacknowledged inbox "
             "results. Saved assignments execute only while this host is open and share "
-            "the run lock. Use /jobs, /routines, /effects or /inbox."
+            "the run lock. Use /jobs, /routines or /inbox."
         )
         yield background
         context = Static(context_window_text(None, None), id="context-window")

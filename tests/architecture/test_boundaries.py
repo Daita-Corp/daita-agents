@@ -2196,9 +2196,8 @@ def test_native_write_contracts_are_neutral_and_use_the_existing_domain():
     assert not (PACKAGE / "domains/data/sql/postgresql_update.py").exists()
 
 
-def test_product_recovery_and_permissions_keep_existing_execution_and_state_owners():
+def test_product_permissions_and_routines_keep_existing_execution_and_state_owners():
     for relative in (
-        "tui/screens/effects.py",
         "tui/screens/permissions.py",
         "tui/screens/routines.py",
     ):
@@ -2235,9 +2234,6 @@ def test_product_recovery_and_permissions_keep_existing_execution_and_state_owne
         )
     controller = (PACKAGE / "tui/controller.py").read_text(encoding="utf-8")
     for name in (
-        "inspect_effect",
-        "list_effects",
-        "resolve_effect",
         "preview_source_permissions",
         "apply_source_permissions",
     ):
@@ -2247,3 +2243,19 @@ def test_product_recovery_and_permissions_keep_existing_execution_and_state_owne
     cli = (PACKAGE / "cli.py").read_text(encoding="utf-8")
     assert "routine_inspection_projection" in cli
     assert "def _routine_mapping" not in cli
+
+
+def test_effect_receipts_have_no_textual_user_surface():
+    assert not (PACKAGE / "tui/screens/effects.py").exists()
+    textual_surface = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (PACKAGE / "tui").rglob("*")
+        if path.is_file() and path.suffix in {".py", ".tcss"}
+    )
+    assert "/effects" not in textual_surface
+    assert "EffectsScreen" not in textual_surface
+    assert "EffectReceipt" not in textual_surface
+    controller = (PACKAGE / "tui/controller.py").read_text(encoding="utf-8")
+    assert "list_effects" not in controller
+    assert "inspect_effect" not in controller
+    assert "resolve_effect" not in controller

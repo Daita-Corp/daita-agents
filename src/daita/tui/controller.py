@@ -19,8 +19,6 @@ from daita import (
     ConversationRun,
     DeliveryInspection,
     DistributionDestination,
-    EffectReceipt,
-    EffectResolutionDecision,
     InboxView,
     JobInspection,
     JobResultView,
@@ -682,33 +680,6 @@ class PresentationController:
     async def list_routines(self) -> tuple[ScheduledRoutineSummary, ...]:
         return await self.require_agent().list_routines(limit=50)
 
-    async def list_effects(
-        self, *, unresolved_only: bool = False, limit: int = 20, offset: int = 0
-    ) -> tuple[EffectReceipt, ...]:
-        return await self.require_agent().list_effects(
-            unresolved_only=unresolved_only, limit=limit, offset=offset
-        )
-
-    async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
-        return await self.require_agent().inspect_effect(receipt_id)
-
-    async def resolve_effect(
-        self,
-        receipt_id: str,
-        *,
-        expected_digest: str,
-        decision: EffectResolutionDecision,
-        note: str,
-        evidence_references: tuple[str, ...] = (),
-    ) -> EffectReceipt:
-        return await self.require_agent().resolve_effect(
-            receipt_id,
-            expected_digest=expected_digest,
-            decision=decision,
-            note=note,
-            evidence_references=evidence_references,
-        )
-
     async def inspect_routine(
         self, routine_id: str
     ) -> ScheduledRoutineInspection | None:
@@ -847,19 +818,6 @@ class PresentationController:
             return await self._jobs_command(parts)
         if name == "/routines":
             return await self._routines_command(parts, command)
-        if name == "/effects":
-            if len(parts) == 1 or (len(parts) == 3 and parts[1] == "inspect"):
-                return CommandOutcome(
-                    "screen",
-                    screen="effects",
-                    conversation_id=conversation_id,
-                    payload={} if len(parts) == 1 else {"receipt_id": parts[2]},
-                )
-            return CommandOutcome(
-                "notice",
-                "Usage: /effects | /effects inspect <receipt-id>",
-                conversation_id=conversation_id,
-            )
         if name == "/inbox":
             if len(parts) == 1:
                 return CommandOutcome(

@@ -252,9 +252,9 @@ When an outcome is unknown:
    result.
 5. Review PostgreSQL logs and operational evidence through the authorized DBA
    process.
-6. Open `/effects inspect <receipt-id>` and record an exact human recovery
-   decision after investigation. Recovery performs no action. A corrective update
-   requires a separate current preview, permission and approval.
+6. Use the operator recovery controls to record an exact human decision after
+   investigation. Recovery performs no action. A corrective update requires a
+   separate current preview, permission and approval.
 
 Seeing the intended state in a later read does not prove that this particular
 attempt caused it. The original receipt remains immutable and is never changed
