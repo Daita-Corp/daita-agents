@@ -113,6 +113,27 @@ jobs:
           python scripts/release_identity.py require-newer \
             --candidate "${{ steps.identity.outputs.version }}" \
             --previous-file "$RUNNER_TEMP/prior-versions.txt"
+      - name: Verify the candidate agent-home release contract
+        shell: bash
+        run: |
+          python scripts/check_home_release_contract.py check
+          previous_ref=""
+          while IFS= read -r ref; do
+            if [[ "$GITHUB_REF_TYPE" == "tag" && "$ref" == "$GITHUB_REF_NAME" ]]; then
+              continue
+            fi
+            if git cat-file -e "$ref:release/agent-home-contract.json" 2>/dev/null; then
+              previous_ref="$ref"
+              break
+            fi
+          done < <(git tag --merged HEAD --sort=-version:refname --list 'v*')
+          if [[ -z "$previous_ref" ]]; then
+            echo "No prior tagged agent-home snapshot exists; this release establishes the baseline."
+          else
+            prior="$RUNNER_TEMP/tagged-agent-home-contract.json"
+            git show "$previous_ref:release/agent-home-contract.json" > "$prior"
+            python scripts/check_home_release_contract.py compare --base "$prior"
+          fi
       - id: artifact
         name: Build and inspect the candidate wheel once
         env:
@@ -148,6 +169,11 @@ jobs:
           shellcheck release-artifacts/install.sh
           release-artifacts/install.sh --version
           release-artifacts/install.sh --dry-run --no-onboard --no-modify-path
+      - name: Attach the verified agent-home contract snapshot
+        run: |
+          install -m 0644 \
+            release/agent-home-contract.json \
+            release-artifacts/agent-home-contract.json
       - name: Verify the once-built wheel through local managed and pipx lifecycles
         shell: bash
         run: |
@@ -157,7 +183,13 @@ jobs:
       - name: Record release checksums
         working-directory: release-artifacts
         shell: bash
-        run: sha256sum "${{ steps.artifact.outputs.wheel }}" install.sh release-manifest.json > SHA256SUMS
+        run: |
+          sha256sum \
+            "${{ steps.artifact.outputs.wheel }}" \
+            install.sh \
+            release-manifest.json \
+            agent-home-contract.json \
+            > SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: managed-release
@@ -384,6 +416,7 @@ jobs:
             release-artifacts/${{ needs.build.outputs.wheel }}
             release-artifacts/install.sh
             release-artifacts/release-manifest.json
+            release-artifacts/agent-home-contract.json
             release-artifacts/SHA256SUMS
       - name: Publish immutable versioned release
         env:
@@ -394,6 +427,7 @@ jobs:
             "release-artifacts/${{ needs.build.outputs.wheel }}" \
             "release-artifacts/install.sh" \
             "release-artifacts/release-manifest.json" \
+            "release-artifacts/agent-home-contract.json" \
             "release-artifacts/SHA256SUMS" \
             --verify-tag \
             --title "Daita ${{ needs.build.outputs.version }}" \
@@ -402,7 +436,12 @@ jobs:
         shell: bash
         run: |
           base="https://github.com/Daita-Corp/daita-agents/releases/download/$GITHUB_REF_NAME"
-          for artifact in "${{ needs.build.outputs.wheel }}" install.sh release-manifest.json SHA256SUMS; do
+          for artifact in \
+            "${{ needs.build.outputs.wheel }}" \
+            install.sh \
+            release-manifest.json \
+            agent-home-contract.json \
+            SHA256SUMS; do
             curl --fail --silent --show-error --location \
               --proto '=https' --tlsv1.2 \
               --retry 5 --retry-all-errors \

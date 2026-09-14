@@ -53,6 +53,46 @@ The application's sole authored release identity is `project.version` in
 `pyproject.toml`; runtime displays read installed distribution metadata. Neither
 fact changes this registry or authorizes a home-format transition.
 
+## Release contract gate
+
+Compatibility is a release-to-release promise. Development commits may evolve
+one candidate next migration; Daita does not promise that a home written by one
+unreleased commit can be opened by another unreleased commit.
+
+`release/agent-home-contract.json` is deterministic release evidence generated
+from the current persistence owners. It records:
+
+- the normalized complete SQLite target schema;
+- every literal strict `record_fields` contract in `sqlite_codecs`;
+- the model configuration, agent manifest, retained-skill, artifact, and
+  delivery-configuration layouts; and
+- the current migration definitions, affected paths, and checksums.
+
+Refresh and verify it from the repository root with the configured development
+environment:
+
+```bash
+python scripts/check_home_release_contract.py write
+python scripts/check_home_release_contract.py check
+```
+
+Pull-request and tag CI compare the candidate with the latest earlier tagged
+snapshot. A changed durable contract with the same or an older home revision is
+rejected. A persistence-changing release therefore appends one migration and
+advances the revision; a release without persistence changes reuses the current
+revision. The first release containing this mechanism establishes the baseline
+when no earlier tag has a snapshot.
+
+The managed release attaches `agent-home-contract.json` to every GitHub release
+and includes it in release checksums and provenance. This records the exact
+contract shipped by each tag without introducing a tag-to-schema runtime map.
+
+The generator detects structural changes, but it cannot prove that unchanged
+field names retain unchanged meaning. A developer changing durable semantics,
+authorization, classification, receipts, or cross-file invariants must append a
+home migration even when the generated structural snapshot would be unchanged.
+The migration registry remains the sole runtime compatibility authority.
+
 ## Open and upgrade behavior
 
 The normal operator flow remains:
@@ -101,6 +141,11 @@ decoders, and golden fixtures are immutable. A durable format change requires a
 new revision even when it changes only a non-SQLite file. Fresh homes are built
 directly at the latest complete revision; they do not replay historical
 migrations.
+
+A new revision is a mutable release candidate only until its first Git tag. It
+may be refined across development commits by updating its implementation,
+candidate checksum, fixture, and release-contract snapshot together. After that
+tag, it is released and falls under the immutability rule above.
 
 To add revision `N`:
 

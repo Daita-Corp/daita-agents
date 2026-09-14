@@ -111,9 +111,11 @@ Each CI or managed-release workflow run builds one wheel. All managed, pipx,
 and four native lifecycle jobs download and consume those exact bytes without
 rebuilding. The managed release retains syntax and shellcheck gates, deterministic
 double rendering, exact runtime downloads, checksums, all-platform native smoke,
-four-artifact provenance attestation, GitHub release immutability, exact PyPI
+five-artifact provenance attestation, GitHub release immutability, exact PyPI
 filename and SHA-256 verification, and post-publication downloads compared byte
-for byte.
+for byte. The fifth artifact is the verified `agent-home-contract.json` snapshot;
+it records release compatibility evidence without participating in runtime home
+admission.
 
 ## Release procedure
 
@@ -121,18 +123,20 @@ for byte.
    environment, and global concurrency control are active.
 2. Query both registries and set `project.version` to the next unused patch
    release after their semantic maximum. Refresh the editable environment.
-3. Merge only after ordinary CI and release-identity checks pass.
-4. Run `python scripts/release_identity.py project-tag` and create that exact
+3. Refresh `release/agent-home-contract.json`; if it differs from the latest
+   tagged snapshot, include the candidate home migration and golden fixture.
+4. Merge only after ordinary CI, home-contract, and release-identity checks pass.
+5. Run `python scripts/release_identity.py project-tag` and create that exact
    annotated tag.
-5. Push the tag and wait for the candidate workflow and all four native smokes.
-6. Download that run's `managed-release` artifact and verify `SHA256SUMS`.
-7. Upload only its exact wheel to PyPI.
-8. Run the protected workflow on the same tag with **Publish** enabled and
+6. Push the tag and wait for the candidate workflow and all four native smokes.
+7. Download that run's `managed-release` artifact and verify `SHA256SUMS`.
+8. Upload only its exact wheel to PyPI.
+9. Run the protected workflow on the same tag with **Publish** enabled and
    approve `managed-installer-release`.
-9. Confirm it re-read both registries, verified the exact PyPI wheel, attested
-   all four artifacts, created the immutable release, and compared downloaded
+10. Confirm it re-read both registries, verified the exact PyPI wheel, attested
+   all five artifacts, created the immutable release, and compared downloaded
    public bytes.
-10. Promote the exact versioned `install.sh` bytes to the stable website endpoint
+11. Promote the exact versioned `install.sh` bytes to the stable website endpoint
     and verify its SHA-256 against `release-manifest.json`.
 
 PyPI upload remains a deliberate local operator step using the ignored

@@ -553,6 +553,32 @@ and crash boundaries, recovery, rollback, and downgrade refusal. The inclusive
 support window is an explicit registry policy; changing it is a release decision.
 See `docs/LOCAL_STATE_UPGRADES.md` for the operational contract.
 
+Release compatibility is maintained between tagged releases, not arbitrary
+development commits. `release/agent-home-contract.json` is the committed
+semantic snapshot of the current physical SQLite schema, strict stored-record
+field contracts, owned home-file layouts, and migration registry. Before a pull
+request or tag, refresh and verify it with:
+
+```bash
+python scripts/check_home_release_contract.py write
+python scripts/check_home_release_contract.py check
+```
+
+CI compares the candidate with the latest earlier tag containing a snapshot. A
+durable-contract change requires `CURRENT_HOME_REVISION` to exceed that tagged
+revision and requires the matching migration and golden fixture. A release with
+no persistence change retains the current home revision. Every managed GitHub
+release publishes its exact snapshot even when it matches the prior release.
+
+One not-yet-released next migration may be amended across development commits;
+update its candidate checksum, fixture, and snapshot together. Compatibility
+between homes created by unreleased commits is not promised. Once the first Git
+tag containing that revision is created, its migration ID, checksum,
+implementation, target schema, historical decoder, and golden fixture are
+immutable. The snapshot is release evidence, not a second runtime compatibility
+authority. A semantic durable-format change that the generator cannot infer
+still requires an explicit new home revision.
+
 Source read authority exists only in `source_read_scopes`. Native relational write
 authority exists only in `relational_write_scopes`. Connection JSON never
 owns either permission. Reconstruction fails closed, refresh preserves exact

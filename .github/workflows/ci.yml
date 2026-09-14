@@ -19,6 +19,25 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[dev]"
+      - name: Verify the committed agent-home contract snapshot
+        run: python scripts/check_home_release_contract.py check
+      - name: Require a new home revision for release-contract changes
+        shell: bash
+        run: |
+          previous_ref=""
+          while IFS= read -r ref; do
+            if git cat-file -e "$ref:release/agent-home-contract.json" 2>/dev/null; then
+              previous_ref="$ref"
+              break
+            fi
+          done < <(git tag --merged HEAD --sort=-version:refname --list 'v*')
+          if [[ -z "$previous_ref" ]]; then
+            echo "No tagged agent-home snapshot exists; this change establishes the baseline."
+          else
+            prior="$RUNNER_TEMP/tagged-agent-home-contract.json"
+            git show "$previous_ref:release/agent-home-contract.json" > "$prior"
+            python scripts/check_home_release_contract.py compare --base "$prior"
+          fi
       - name: Validate the sole project release identity
         run: |
           python scripts/release_identity.py project-version
