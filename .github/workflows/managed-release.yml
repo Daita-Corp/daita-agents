@@ -564,7 +564,7 @@ jobs:
             --artifacts release-artifacts
       - name: Request atomic stable installer promotion
         env:
-          DEPLOY_HOST: ${{ vars.MANAGED_INSTALLER_SSH_HOST }}
+          DEPLOY_HOST: ${{ secrets.MANAGED_INSTALLER_SSH_HOST }}
           DEPLOY_PRIVATE_KEY: ${{ secrets.MANAGED_INSTALLER_SSH_PRIVATE_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.MANAGED_INSTALLER_SSH_KNOWN_HOSTS }}
         shell: bash

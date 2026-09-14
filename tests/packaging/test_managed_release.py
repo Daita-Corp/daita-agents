@@ -306,6 +306,8 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "unset DEPLOY_PRIVATE_KEY DEPLOY_KNOWN_HOSTS" in workflow
     assert "MANAGED_INSTALLER_SSH_PRIVATE_KEY" in workflow
     assert "MANAGED_INSTALLER_SSH_KNOWN_HOSTS" in workflow
+    assert "${{ secrets.MANAGED_INSTALLER_SSH_HOST }}" in workflow
+    assert "vars.MANAGED_INSTALLER_SSH_HOST" not in workflow
     assert "group: managed-installer-stable" in workflow
     assert 'cmp "release-artifacts/$artifact"' in workflow
     assert (
@@ -433,6 +435,8 @@ def test_recovery_workflow_is_protected_exact_and_forward_only():
     assert "request_managed_installer_promotion.py promote" in workflow
     assert "request_managed_installer_promotion.py verify" in workflow
     assert "unset DEPLOY_PRIVATE_KEY DEPLOY_KNOWN_HOSTS" in workflow
+    assert "${{ secrets.MANAGED_INSTALLER_SSH_HOST }}" in workflow
+    assert "vars.MANAGED_INSTALLER_SSH_HOST" not in workflow
     assert (
         workflow.index("Verify release immutability and artifact provenance")
         < workflow.index("Validate installer before admitting deployment credentials")

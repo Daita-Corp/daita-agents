@@ -204,7 +204,7 @@ release.
 
 Configure these protected-environment values once:
 
-- variable `MANAGED_INSTALLER_SSH_HOST`: the Lightsail host or fixed public IPv4;
+- secret `MANAGED_INSTALLER_SSH_HOST`: the Lightsail host or fixed public IPv4;
 - secret `MANAGED_INSTALLER_SSH_PRIVATE_KEY`: the dedicated unencrypted Ed25519
   private key used only by this forced command; and
 - secret `MANAGED_INSTALLER_SSH_KNOWN_HOSTS`: a reviewed pinned host-key line for

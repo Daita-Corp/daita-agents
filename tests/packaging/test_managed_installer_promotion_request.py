@@ -19,6 +19,7 @@ from scripts.request_managed_installer_promotion import (
 from tests.support.paths import REPO_ROOT
 
 REQUEST_PROGRAM = REPO_ROOT / "scripts" / "request_managed_installer_promotion.py"
+TEST_HOST = "192.0.2.10"
 
 
 def _bundle(tmp_path: Path, content: bytes = b"verified installer") -> ReleaseBundle:
@@ -30,7 +31,7 @@ def _bundle(tmp_path: Path, content: bytes = b"verified installer") -> ReleaseBu
     )
 
 
-def _known_host(host: str = "18.207.21.166") -> str:
+def _known_host(host: str = TEST_HOST) -> str:
     blob = b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" + b"x" * 32
     return f"{host} ssh-ed25519 {base64.b64encode(blob).decode()}\n"
 
@@ -51,8 +52,8 @@ def test_request_program_is_runnable_by_its_workflow_path() -> None:
 @pytest.mark.parametrize(
     ("user", "host"),
     (
-        ("-oProxyCommand=id", "18.207.21.166"),
-        ("root;id", "18.207.21.166"),
+        ("-oProxyCommand=id", TEST_HOST),
+        ("root;id", TEST_HOST),
         ("deploy", "-oProxyCommand=id"),
         ("deploy", "999.207.21.166"),
         ("deploy", "host..example.com"),
@@ -97,7 +98,7 @@ def test_remote_request_uses_only_pinned_noninteractive_ssh(
     request_remote_promotion(
         bundle,
         user="deploy",
-        host="18.207.21.166",
+        host=TEST_HOST,
         identity_file=identity,
         known_hosts_file=known_hosts,
     )
@@ -109,7 +110,7 @@ def test_remote_request_uses_only_pinned_noninteractive_ssh(
     assert "KbdInteractiveAuthentication=no" in command
     assert "PreferredAuthentications=publickey" in command
     assert "RequestTTY=no" in command
-    assert command[-2:] == ["deploy@18.207.21.166", "promote v1.2.3"]
+    assert command[-2:] == [f"deploy@{TEST_HOST}", "promote v1.2.3"]
 
 
 @pytest.mark.parametrize(
@@ -117,7 +118,7 @@ def test_remote_request_uses_only_pinned_noninteractive_ssh(
     (
         _known_host("wrong.example.com"),
         _known_host() + _known_host(),
-        "18.207.21.166 ssh-rsa AAAA\n",
+        f"{TEST_HOST} ssh-rsa AAAA\n",
         "*.example.com ssh-ed25519 AAAA\n",
     ),
 )
@@ -128,7 +129,7 @@ def test_known_hosts_requires_one_exact_destination_ed25519_key(
     known_hosts.write_text(content, encoding="utf-8")
 
     with pytest.raises(InstallerPromotionError):
-        validate_known_hosts(known_hosts, "18.207.21.166")
+        validate_known_hosts(known_hosts, TEST_HOST)
 
 
 def test_public_verification_retries_then_accepts_exact_bytes(
@@ -188,7 +189,7 @@ def test_cli_separates_validation_promotion_and_public_verification(
                 "promote",
                 *common,
                 "--host",
-                "18.207.21.166",
+                TEST_HOST,
                 "--user",
                 "deploy",
                 "--identity-file",
