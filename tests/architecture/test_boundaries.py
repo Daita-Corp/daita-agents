@@ -1876,6 +1876,7 @@ def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
         "models.py",
         "registry.py",
         "revision_0001.py",
+        "revision_0002.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 
