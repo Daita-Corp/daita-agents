@@ -496,10 +496,10 @@ async def test_artifact_conversion_cancellation_leaves_no_child_or_staging(
 
     monkeypatch.setattr(artifact_capabilities, "read_exact_xlsx_data", blocked)
     try:
-        first = await agent.run("Create an XLSX workbook.")
+        first = await agent.run("Export the current records as XLSX.")
         running = asyncio.create_task(
             agent.run(
-                "Convert it to CSV.",
+                "Convert the records workbook to CSV.",
                 conversation_id=first.conversation_id,
             )
         )

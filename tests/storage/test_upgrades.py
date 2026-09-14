@@ -29,9 +29,11 @@ from daita.storage import sqlite as sqlite_store
 from daita.storage.home_migrations import (
     HOME_MIGRATIONS,
     HomeMigration,
+    migration_rows,
     registry as migration_registry,
 )
 from daita.storage.home_migrations.revision_0001 import REVISION_1
+from daita.storage.home_migrations.revision_0002 import REVISION_2
 from daita.storage.sqlite import SQLiteStateStore, validate_current_state_database
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.paths import REPO_ROOT
@@ -68,14 +70,14 @@ def _validate_synthetic_home(
     assert (
         (memory_home / "MEMORY.md")
         .read_text(encoding="utf-8")
-        .endswith("revision two\n")
+        .endswith("synthetic next revision\n")
     )
 
 
 def _synthetic_next_apply(staged_home: Path, source_shape: str | None) -> None:
     assert source_shape is None
     with (staged_home / "MEMORY.md").open("a", encoding="utf-8") as file:
-        file.write("revision two\n")
+        file.write("synthetic next revision\n")
 
 
 def _synthetic_failure(staged_home: Path, source_shape: str | None) -> None:
@@ -85,8 +87,8 @@ def _synthetic_failure(staged_home: Path, source_shape: str | None) -> None:
 
 def _synthetic_next_migration(*, apply=_synthetic_next_apply) -> HomeMigration:
     return HomeMigration(
-        revision=2,
-        migration_id="test_only_agent_home_revision_2",
+        revision=3,
+        migration_id="test_only_agent_home_revision_3",
         definition="test-only whole-home revision",
         affected_paths=("state.db", "MEMORY.md"),
         target_schema=CURRENT_SCHEMA,
@@ -99,13 +101,13 @@ def _patch_next_migration(
     monkeypatch: pytest.MonkeyPatch,
     migration: HomeMigration,
 ) -> None:
-    migrations = (REVISION_1, migration)
+    migrations = (*HOME_MIGRATIONS, migration)
     monkeypatch.setattr(migration_registry, "HOME_MIGRATIONS", migrations)
-    monkeypatch.setattr(migration_registry, "CURRENT_HOME_REVISION", 2)
+    monkeypatch.setattr(migration_registry, "CURRENT_HOME_REVISION", 3)
     monkeypatch.setattr(coordinator, "HOME_MIGRATIONS", migrations)
-    monkeypatch.setattr(coordinator, "CURRENT_HOME_REVISION", 2)
-    monkeypatch.setattr(sqlite_store, "CURRENT_HOME_REVISION", 2)
-    monkeypatch.setattr(SQLiteStateStore, "current_revision", "2")
+    monkeypatch.setattr(coordinator, "CURRENT_HOME_REVISION", 3)
+    monkeypatch.setattr(sqlite_store, "CURRENT_HOME_REVISION", 3)
+    monkeypatch.setattr(SQLiteStateStore, "current_revision", "3")
 
 
 async def _create_rich_home(tmp_path: Path, name: str = "atlas") -> tuple[Path, str]:
@@ -234,6 +236,14 @@ def _make_preproduction_home(home: Path, shape: str) -> None:
         "source_read_scopes",
     )
     with sqlite3.connect(home / "state.db") as connection:
+        runs = tuple(connection.execute('SELECT id, input FROM "runs"'))
+        for run_id, encoded in runs:
+            payload = json.loads(encoded)
+            del payload["fields"]["target_posture"]
+            connection.execute(
+                'UPDATE "runs" SET input = ? WHERE id = ?',
+                (json.dumps(payload, separators=(",", ":"), sort_keys=True), run_id),
+            )
         for table in versioned_tables:
             rows = tuple(connection.execute(f'SELECT rowid, data FROM "{table}"'))
             for rowid, encoded in rows:
@@ -307,15 +317,12 @@ async def test_generic_engine_upgrades_database_and_owned_file_together(
         validate_home=_validate_synthetic_home,
     )
 
-    assert result.source_revision == 1
-    assert result.target_revision == 2
+    assert result.source_revision == 2
+    assert result.target_revision == 3
     assert result.upgraded
-    assert _journal(home / "state.db") == (
-        (1, REVISION_1.migration_id, REVISION_1.checksum),
-        (2, migration.migration_id, migration.checksum),
-    )
+    assert _journal(home / "state.db") == migration_rows()
     assert (home / "MEMORY.md").read_text(encoding="utf-8") == (
-        before_memory + "revision two\n"
+        before_memory + "synthetic next revision\n"
     )
     assert result.rollback_path is not None
     assert (result.rollback_path / "state.db").is_file()
@@ -398,7 +405,7 @@ async def test_publish_failure_restores_the_complete_source_then_recovers(
     )
     assert result.recovered
     assert result.upgraded
-    assert _journal(home / "state.db")[-1][0] == 2
+    assert _journal(home / "state.db")[-1][0] == migration.revision
 
 
 @pytest.mark.parametrize("phase", ("prepared", "committing", "committed"))
@@ -430,7 +437,7 @@ async def test_upgrade_recovers_after_each_durable_commit_boundary(
 
     assert recovered.recovered
     assert _journal(home / "state.db")[-1] == (
-        2,
+        migration.revision,
         migration.migration_id,
         migration.checksum,
     )
@@ -472,7 +479,7 @@ async def test_recovery_finishes_a_partially_published_whole_home(
     )
 
     assert result.recovered
-    assert _journal(home / "state.db")[-1][0] == 2
+    assert _journal(home / "state.db")[-1][0] == migration.revision
     assert not upgrade.exists()
 
 
@@ -491,8 +498,8 @@ async def test_recovery_finishes_a_partially_published_whole_home(
             "unknown",
         ),
         (
-            "UPDATE agent_home_migrations SET revision = 2 WHERE revision = 1",
-            "2",
+            "UPDATE agent_home_migrations SET revision = 3 WHERE revision = 2",
+            "3",
         ),
     ),
 )
@@ -522,7 +529,7 @@ async def test_newer_home_revision_is_a_downgrade_refusal_without_write(
     path = home / "state.db"
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "INSERT INTO agent_home_migrations VALUES (2, 'future_revision', ?)",
+            "INSERT INTO agent_home_migrations VALUES (3, 'future_revision', ?)",
             ("f" * 64,),
         )
     before = _sha256(path)
@@ -531,7 +538,7 @@ async def test_newer_home_revision_is_a_downgrade_refusal_without_write(
         await Agent.open("atlas", root=tmp_path, workspace=workspace_for(tmp_path))
 
     assert raised.value.code is StateCompatibilityCode.NEWER_REVISION
-    assert raised.value.found_revision == "2"
+    assert raised.value.found_revision == "3"
     assert _sha256(path) == before
 
 
@@ -598,8 +605,8 @@ async def test_newer_unfinished_upgrade_is_refused_without_write(
         "operation_id": "a" * 32,
         "phase": "staging",
         "source_kind": "production",
-        "source_revision": 1,
-        "target_revision": 2,
+        "source_revision": 2,
+        "target_revision": 3,
     }
     (upgrade / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
     before = _sha256(home / "state.db")
@@ -665,9 +672,7 @@ async def test_revision_1_bridge_preserves_complete_observed_preproduction_homes
         await reopened.close()
 
     assert _durable_snapshot(home) == expected
-    assert _journal(home / "state.db") == (
-        (1, REVISION_1.migration_id, REVISION_1.checksum),
-    )
+    assert _journal(home / "state.db") == migration_rows()
     assert not (home / ".home-upgrade").exists()
     assert len(tuple((home / ".home-rollbacks").iterdir())) == 1
 
@@ -688,8 +693,8 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     assert stderr.getvalue() == ""
     status = json.loads(stdout.getvalue())
     assert status == {
-        "current_revision": 1,
-        "found_revision": 1,
+        "current_revision": 2,
+        "found_revision": 2,
         "minimum_supported_revision": 1,
         "recovery_required": False,
         "source_kind": "production",
@@ -710,7 +715,7 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     assert stdout.getvalue() == ""
     error = json.loads(stderr.getvalue())["error"]
     assert error["code"] == "state_revision_unsupported"
-    assert error["current_revision"] == "1"
+    assert error["current_revision"] == "2"
     assert error["found_revision"] == "unknown"
     assert error["state_changed"] is False
     assert error["state_path"] == str(path)
@@ -749,21 +754,21 @@ def test_interactive_tui_renders_human_safe_upgrade_diagnostic(tmp_path: Path) -
     assert "current_revision" not in rendered
 
 
-def test_released_home_migration_checksum_binds_its_exact_definition() -> None:
+def test_released_home_migration_checksums_bind_their_exact_definitions() -> None:
     def alternate_apply(staged_home: Path, source_shape: str | None) -> None:
         del staged_home, source_shape
 
-    variants = (
-        replace(REVISION_1, revision=2),
-        replace(REVISION_1, migration_id="alternate"),
-        replace(REVISION_1, definition="alternate definition"),
-        replace(REVISION_1, affected_paths=("state.db",)),
-        replace(REVISION_1, apply=alternate_apply),
-        replace(REVISION_1, implementation_material=("alternate",)),
-    )
-
-    assert len(REVISION_1.checksum) == 64
-    assert all(variant.checksum != REVISION_1.checksum for variant in variants)
+    for migration in HOME_MIGRATIONS:
+        variants = (
+            replace(migration, revision=migration.revision + 10),
+            replace(migration, migration_id="alternate"),
+            replace(migration, definition="alternate definition"),
+            replace(migration, affected_paths=("state.db", "alternate")),
+            replace(migration, apply=alternate_apply),
+            replace(migration, implementation_material=("alternate",)),
+        )
+        assert len(migration.checksum) == 64
+        assert all(variant.checksum != migration.checksum for variant in variants)
 
 
 def test_runtime_has_one_home_revision_owner_and_no_legacy_version_gates() -> None:
@@ -777,8 +782,9 @@ def test_runtime_has_one_home_revision_owner_and_no_legacy_version_gates() -> No
         "models.py",
         "registry.py",
         "revision_0001.py",
+        "revision_0002.py",
     }
-    assert HOME_MIGRATIONS == (REVISION_1,)
+    assert HOME_MIGRATIONS == (REVISION_1, REVISION_2)
     current_code = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (production / "storage/sqlite_codecs").glob("*.py")
@@ -790,3 +796,7 @@ def test_runtime_has_one_home_revision_owner_and_no_legacy_version_gates() -> No
     )
     assert "development_baseline" in historical
     assert 'fields["version"]' in historical
+    revision_2 = (production / "storage/home_migrations/revision_0002.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'fields["target_posture"] = "single_target"' in revision_2

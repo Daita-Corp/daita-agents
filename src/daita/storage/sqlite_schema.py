@@ -311,7 +311,11 @@ SCHEMA_REVISION_1 = SQLiteSchema(
     named_indexes=NAMED_INDEXES,
     required_sql_fragments=REQUIRED_SQL_FRAGMENTS,
 )
-CURRENT_SCHEMA = SCHEMA_REVISION_1
+# Revision 2 changes a retained record codec without changing the physical
+# SQLite schema. Keep a revision-owned name so its migration never depends on
+# a later release's moving current-schema alias.
+SCHEMA_REVISION_2 = SCHEMA_REVISION_1
+CURRENT_SCHEMA = SCHEMA_REVISION_2
 
 BASE_TABLE_SQL = """
 CREATE TABLE metadata (

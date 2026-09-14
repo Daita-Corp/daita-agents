@@ -2,7 +2,7 @@
 
 Daita's production persistence contract is the revision of the complete agent
 home, not the package version, a Git tag, the SQLite schema version, or a set of
-independent record-codec versions. The current production home revision is `1`
+independent record-codec versions. The current production home revision is `2`
 and the minimum automatically supported production revision is `1`.
 
 One home revision covers every durable component whose shapes must remain
@@ -101,6 +101,10 @@ decoders, and golden fixtures are immutable. A durable format change requires a
 new revision even when it changes only a non-SQLite file. Fresh homes are built
 directly at the latest complete revision; they do not replay historical
 migrations.
+
+Revision `2` adds the required caller-owned target posture to retained run
+inputs. Revision `1` runs are translated to the conservative `single_target`
+posture during the staged whole-home upgrade.
 
 To add revision `N`:
 
