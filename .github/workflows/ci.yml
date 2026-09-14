@@ -5,17 +5,44 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  secrets:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan current source and complete history without exposing matches
+        shell: bash
+        run: |
+          image="zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
+          source="$RUNNER_TEMP/gitleaks-source"
+          mkdir -p "$source"
+          git archive --format=tar --output="$RUNNER_TEMP/source.tar" HEAD
+          tar -xf "$RUNNER_TEMP/source.tar" -C "$source"
+          docker run --rm --volume "$source:/repo:ro" "$image" \
+            dir /repo --config /repo/.gitleaks.toml --redact --no-banner
+          docker run --rm --volume "$GITHUB_WORKSPACE:/repo:ro" "$image" \
+            git /repo --config /repo/.gitleaks.toml --redact --no-banner \
+            --log-opts="--all"
+
   release-artifact:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.artifact.outputs.version }}
       wheel: ${{ steps.artifact.outputs.wheel }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[dev]"
@@ -110,7 +137,7 @@ jobs:
             --manifest-output "$RUNNER_TEMP/release-manifest.json"
           cmp release-artifacts/install.sh "$RUNNER_TEMP/install.sh"
           cmp release-artifacts/release-manifest.json "$RUNNER_TEMP/release-manifest.json"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-artifact
           path: release-artifacts/
@@ -124,11 +151,13 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-artifact
           path: release-artifacts
@@ -145,12 +174,14 @@ jobs:
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install pipx
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-artifact
           path: release-artifacts
@@ -163,11 +194,13 @@ jobs:
     needs: release-artifact
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-artifact
           path: release-artifacts
@@ -181,13 +214,23 @@ jobs:
   static:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.11"
+      - name: Validate GitHub Actions workflow syntax
+        shell: bash
+        run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/repo:ro" --workdir /repo \
+            rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 \
+            -ignore 'label "macos-15-intel" is unknown'
       - run: python -m pip install -e ".[dev]"
       - run: python -m black --check src tests scripts
       - run: python -m ruff check --select I .
       - run: python -m mypy src/daita tests
       - run: bash -n scripts/install.sh
+      - run: bash -n scripts/bootstrap_managed_installer_host.sh
       - run: shellcheck scripts/install.sh
+      - run: shellcheck scripts/bootstrap_managed_installer_host.sh

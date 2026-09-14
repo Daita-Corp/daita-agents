@@ -1036,9 +1036,7 @@ class PresentationController:
                 screen="jobs",
                 conversation_id=conversation_id,
             )
-        return CommandOutcome(
-            "notice", "Usage: /jobs", conversation_id=conversation_id
-        )
+        return CommandOutcome("notice", "Usage: /jobs", conversation_id=conversation_id)
 
     async def _mcp_command(self, parts: list[str]) -> CommandOutcome:
         agent = self.require_agent()

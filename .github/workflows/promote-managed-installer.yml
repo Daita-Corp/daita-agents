@@ -1,0 +1,129 @@
+name: Recover managed installer promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing stable release tag to promote, for example v1.0.1
+        required: true
+        type: string
+
+concurrency:
+  group: managed-installer-stable
+  cancel-in-progress: false
+
+permissions:
+  attestations: read
+  contents: read
+
+jobs:
+  promote:
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    environment: managed-installer-release
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Download and validate the exact published release bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          python -c 'import sys; from scripts.managed_installer_host import parse_tag; parse_tag(sys.argv[1])' "$TAG"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease > "$RUNNER_TEMP/release.json"
+          python - "$RUNNER_TEMP/release.json" "$TAG" <<'PY'
+          import json
+          import sys
+
+          document = json.load(open(sys.argv[1], encoding="utf-8"))
+          if document != {
+              "isDraft": False,
+              "isPrerelease": False,
+              "tagName": sys.argv[2],
+          }:
+              raise SystemExit("release must be published, stable, and match the exact tag")
+          PY
+          install -d -m 0755 release-artifacts
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --dir release-artifacts \
+            --pattern install.sh \
+            --pattern release-manifest.json \
+            --pattern SHA256SUMS
+          python - "$TAG" <<'PY'
+          import sys
+          from pathlib import Path
+
+          from scripts.managed_installer_host import validate_release_bundle
+
+          directory = Path("release-artifacts")
+          expected = {"install.sh", "release-manifest.json", "SHA256SUMS"}
+          actual = {entry.name for entry in directory.iterdir()}
+          if actual != expected or any(not entry.is_file() for entry in directory.iterdir()):
+              raise SystemExit("release download did not produce the exact promotion bundle")
+          validate_release_bundle(directory, sys.argv[1])
+          PY
+      - name: Verify release immutability and artifact provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          gh release verify "$TAG" --repo "$GITHUB_REPOSITORY"
+          if [[ "$TAG" == "v1.0.1" ]]; then
+            echo "v1.0.1 is admitted only by its immutable release attestation and pinned host identities."
+            exit 0
+          fi
+          for artifact in install.sh release-manifest.json SHA256SUMS; do
+            gh attestation verify "release-artifacts/$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/managed-release.yml" \
+              --source-ref "refs/tags/$TAG" \
+              --deny-self-hosted-runners
+          done
+      - name: Validate installer before admitting deployment credentials
+        env:
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          python scripts/request_managed_installer_promotion.py validate \
+            --tag "$TAG" \
+            --artifacts release-artifacts
+      - name: Request atomic stable installer promotion
+        env:
+          TAG: ${{ inputs.tag }}
+          DEPLOY_HOST: ${{ vars.MANAGED_INSTALLER_SSH_HOST }}
+          DEPLOY_PRIVATE_KEY: ${{ secrets.MANAGED_INSTALLER_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.MANAGED_INSTALLER_SSH_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_PRIVATE_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          credentials="$(mktemp -d "$RUNNER_TEMP/managed-installer-ssh.XXXXXX")"
+          trap 'rm -rf -- "$credentials"' EXIT
+          printf '%s\n' "$DEPLOY_PRIVATE_KEY" > "$credentials/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$credentials/known_hosts"
+          chmod 0600 "$credentials/id_ed25519" "$credentials/known_hosts"
+          unset DEPLOY_PRIVATE_KEY DEPLOY_KNOWN_HOSTS
+          python scripts/request_managed_installer_promotion.py promote \
+            --tag "$TAG" \
+            --artifacts release-artifacts \
+            --host "$DEPLOY_HOST" \
+            --user daita-installer-deploy \
+            --identity-file "$credentials/id_ed25519" \
+            --known-hosts-file "$credentials/known_hosts"
+      - name: Verify stable installer from public endpoint
+        env:
+          TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          python scripts/request_managed_installer_promotion.py verify \
+            --tag "$TAG" \
+            --artifacts release-artifacts

@@ -28,10 +28,11 @@ jobs:
       wheel: ${{ steps.artifact.outputs.wheel }}
       mode: ${{ steps.identity.outputs.mode }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
       - run: python -m pip install -e ".[dev]" pipx
@@ -52,6 +53,7 @@ jobs:
           fi
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             test "$GITHUB_REF_NAME" = "$tag"
+            test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
             test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
             test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           fi
@@ -190,7 +192,7 @@ jobs:
             release-manifest.json \
             agent-home-contract.json \
             > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: managed-release
           path: release-artifacts/
@@ -201,11 +203,14 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: managed-release
           path: release-artifacts
@@ -213,6 +218,12 @@ jobs:
         run: |
           python -m pip install \
             "$(pwd)/release-artifacts/${{ needs.build.outputs.wheel }}[dev]"
+      - name: Validate GitHub Actions workflow syntax
+        shell: bash
+        run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/repo:ro" --workdir /repo \
+            rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 \
+            -ignore 'label "macos-15-intel" is unknown'
       - name: Run deterministic and static release gates
         env:
           DAITA_TEST_CANDIDATE_WHEEL: ${{ github.workspace }}/release-artifacts/${{ needs.build.outputs.wheel }}
@@ -222,7 +233,22 @@ jobs:
           python -m ruff check --select I .
           python -m mypy src/daita tests
           bash -n release-artifacts/install.sh
+          bash -n scripts/bootstrap_managed_installer_host.sh
           shellcheck release-artifacts/install.sh
+          shellcheck scripts/bootstrap_managed_installer_host.sh
+      - name: Scan the release source and complete history without exposing matches
+        shell: bash
+        run: |
+          image="zricethezav/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
+          source="$RUNNER_TEMP/gitleaks-source"
+          mkdir -p "$source"
+          git archive --format=tar --output="$RUNNER_TEMP/source.tar" HEAD
+          tar -xf "$RUNNER_TEMP/source.tar" -C "$source"
+          docker run --rm --volume "$source:/repo:ro" "$image" \
+            dir /repo --config /repo/.gitleaks.toml --redact --no-banner
+          docker run --rm --volume "$GITHUB_WORKSPACE:/repo:ro" "$image" \
+            git /repo --config /repo/.gitleaks.toml --redact --no-banner \
+            --log-opts="--all"
 
   native-installer-smoke:
     needs: build
@@ -240,11 +266,13 @@ jobs:
             runner: ubuntu-24.04
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: managed-release
           path: release-artifacts
@@ -299,19 +327,23 @@ jobs:
       - deterministic-and-static
       - native-installer-smoke
     runs-on: ubuntu-24.04
+    concurrency:
+      group: managed-installer-stable
+      cancel-in-progress: false
     environment: managed-installer-release
     permissions:
       attestations: write
       contents: write
       id-token: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v5
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: managed-release
           path: release-artifacts
@@ -410,7 +442,7 @@ jobs:
               raise SystemExit("PyPI wheel SHA-256 does not match the release artifact")
           PY
       - name: Attest exact release artifacts
-        uses: actions/attest-build-provenance@v3
+        uses: actions/attest-build-provenance@62fc1d596301d0ab9914e1fec14dc5c8d93f65cd # v3.2.0
         with:
           subject-path: |
             release-artifacts/${{ needs.build.outputs.wheel }}
@@ -418,7 +450,17 @@ jobs:
             release-artifacts/release-manifest.json
             release-artifacts/agent-home-contract.json
             release-artifacts/SHA256SUMS
-      - name: Publish immutable versioned release
+      - name: Revalidate the remote annotated tag before draft creation
+        shell: bash
+        run: |
+          test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"
+          remote_tag_object="$(
+            git ls-remote --refs --exit-code origin "refs/tags/$GITHUB_REF_NAME" |
+              cut -f1
+          )"
+          test "$remote_tag_object" = "$(git rev-parse "$GITHUB_REF_NAME")"
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+      - name: Create draft release with exact assets
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -429,9 +471,56 @@ jobs:
             "release-artifacts/release-manifest.json" \
             "release-artifacts/agent-home-contract.json" \
             "release-artifacts/SHA256SUMS" \
+            --draft \
             --verify-tag \
             --title "Daita ${{ needs.build.outputs.version }}" \
             --generate-notes
+      - name: Verify draft assets before immutable publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          draft="$RUNNER_TEMP/daita-draft-release"
+          install -d -m 0755 "$draft"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --dir "$draft"
+          python - "$draft" "${{ needs.build.outputs.wheel }}" <<'PY'
+          import pathlib
+          import sys
+
+          directory = pathlib.Path(sys.argv[1])
+          expected = {
+              sys.argv[2],
+              "install.sh",
+              "release-manifest.json",
+              "agent-home-contract.json",
+              "SHA256SUMS",
+          }
+          actual = {entry.name for entry in directory.iterdir()}
+          if actual != expected or any(not entry.is_file() for entry in directory.iterdir()):
+              raise SystemExit("draft release does not contain the exact artifact set")
+          PY
+          for artifact in \
+            "${{ needs.build.outputs.wheel }}" \
+            install.sh \
+            release-manifest.json \
+            agent-home-contract.json \
+            SHA256SUMS; do
+            cmp "release-artifacts/$artifact" "$draft/$artifact"
+          done
+      - name: Publish immutable versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          remote_tag_object="$(
+            git ls-remote --refs --exit-code origin "refs/tags/$GITHUB_REF_NAME" |
+              cut -f1
+          )"
+          test "$remote_tag_object" = "$(git rev-parse "$GITHUB_REF_NAME")"
+          test "$(git rev-parse "$GITHUB_REF_NAME^{commit}")" = "$GITHUB_SHA"
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" --draft=false --verify-tag
       - name: Verify published bytes
         shell: bash
         run: |
@@ -448,3 +537,57 @@ jobs:
               --output "$RUNNER_TEMP/$artifact" "$base/$artifact"
             cmp "release-artifacts/$artifact" "$RUNNER_TEMP/$artifact"
           done
+      - name: Verify published artifact provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release verify "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY"
+          for artifact in \
+            "${{ needs.build.outputs.wheel }}" \
+            install.sh \
+            release-manifest.json \
+            agent-home-contract.json \
+            SHA256SUMS; do
+            gh attestation verify "release-artifacts/$artifact" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/managed-release.yml" \
+              --source-ref "$GITHUB_REF" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
+          done
+      - name: Validate installer before admitting deployment credentials
+        shell: bash
+        run: |
+          python scripts/request_managed_installer_promotion.py validate \
+            --tag "$GITHUB_REF_NAME" \
+            --artifacts release-artifacts
+      - name: Request atomic stable installer promotion
+        env:
+          DEPLOY_HOST: ${{ vars.MANAGED_INSTALLER_SSH_HOST }}
+          DEPLOY_PRIVATE_KEY: ${{ secrets.MANAGED_INSTALLER_SSH_PRIVATE_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.MANAGED_INSTALLER_SSH_KNOWN_HOSTS }}
+        shell: bash
+        run: |
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_PRIVATE_KEY"
+          test -n "$DEPLOY_KNOWN_HOSTS"
+          credentials="$(mktemp -d "$RUNNER_TEMP/managed-installer-ssh.XXXXXX")"
+          trap 'rm -rf -- "$credentials"' EXIT
+          printf '%s\n' "$DEPLOY_PRIVATE_KEY" > "$credentials/id_ed25519"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$credentials/known_hosts"
+          chmod 0600 "$credentials/id_ed25519" "$credentials/known_hosts"
+          unset DEPLOY_PRIVATE_KEY DEPLOY_KNOWN_HOSTS
+          python scripts/request_managed_installer_promotion.py promote \
+            --tag "$GITHUB_REF_NAME" \
+            --artifacts release-artifacts \
+            --host "$DEPLOY_HOST" \
+            --user daita-installer-deploy \
+            --identity-file "$credentials/id_ed25519" \
+            --known-hosts-file "$credentials/known_hosts"
+      - name: Verify stable installer from public endpoint
+        shell: bash
+        run: |
+          python scripts/request_managed_installer_promotion.py verify \
+            --tag "$GITHUB_REF_NAME" \
+            --artifacts release-artifacts

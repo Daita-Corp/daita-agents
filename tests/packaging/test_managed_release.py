@@ -248,6 +248,9 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     policy = load_release_policy(DEFAULT_POLICY)
 
     assert workflow.count("python -m build --wheel") == 1
+    assert workflow.count("persist-credentials: false") == workflow.count(
+        "actions/checkout@"
+    )
     assert "group: managed-release\n" in workflow
     assert "cancel-in-progress: false" in workflow
     assert "workflow_dispatch:" in workflow
@@ -275,14 +278,47 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "require-newer" in workflow
     assert "inputs.publish == true" in workflow
     assert 'test "$GITHUB_REF_TYPE" = "tag"' in workflow
-    assert "actions/attest-build-provenance@v3" in workflow
+    assert 'test "$(git cat-file -t "$GITHUB_REF_NAME")" = "tag"' in workflow
+    assert (
+        "actions/attest-build-provenance@62fc1d596301d0ab9914e1fec14dc5c8d93f65cd"
+        in workflow
+    )
     assert "gh release create" in workflow
+    assert "--draft" in workflow
+    assert "Verify draft assets before immutable publication" in workflow
+    assert "Revalidate the remote annotated tag before draft creation" in workflow
+    assert workflow.count("git ls-remote --refs --exit-code origin") == 2
+    assert 'gh release edit "$GITHUB_REF_NAME"' in workflow
+    assert "--draft=false --verify-tag" in workflow
     assert "Verify published bytes" in workflow
+    assert "Verify published artifact provenance" in workflow
+    assert 'gh release verify "$GITHUB_REF_NAME"' in workflow
+    assert "--signer-workflow" in workflow
+    assert '--source-digest "$GITHUB_SHA"' in workflow
+    assert "--deny-self-hosted-runners" in workflow
+    assert "Validate installer before admitting deployment credentials" in workflow
+    assert "Request atomic stable installer promotion" in workflow
+    assert "Verify stable installer from public endpoint" in workflow
+    assert workflow.count("python scripts/request_managed_installer_promotion.py") == 3
+    assert "request_managed_installer_promotion.py validate" in workflow
+    assert "request_managed_installer_promotion.py promote" in workflow
+    assert "request_managed_installer_promotion.py verify" in workflow
+    assert "unset DEPLOY_PRIVATE_KEY DEPLOY_KNOWN_HOSTS" in workflow
+    assert "MANAGED_INSTALLER_SSH_PRIVATE_KEY" in workflow
+    assert "MANAGED_INSTALLER_SSH_KNOWN_HOSTS" in workflow
+    assert "group: managed-installer-stable" in workflow
     assert 'cmp "release-artifacts/$artifact"' in workflow
     assert (
         workflow.index("Repeat complete protected published-version admission")
         < workflow.index("Require the exact public PyPI wheel")
         < workflow.index("gh release create")
+        < workflow.index("Verify draft assets before immutable publication")
+        < workflow.index('gh release edit "$GITHUB_REF_NAME"')
+        < workflow.index("Verify published bytes")
+        < workflow.index("Verify published artifact provenance")
+        < workflow.index("Validate installer before admitting deployment credentials")
+        < workflow.index("Request atomic stable installer promotion")
+        < workflow.index("Verify stable installer from public endpoint")
     )
     assert "sha256sum --check SHA256SUMS" in workflow
     assert 'len(files) != 1 or files[0].get("filename") != wheel' in workflow
@@ -306,11 +342,21 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
         )
     ]
     assert "needs: build" in release_gates
-    assert "actions/download-artifact@v4" in release_gates
+    assert (
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        in release_gates
+    )
     assert "${{ needs.build.outputs.wheel }}[dev]" in release_gates
     assert "DAITA_TEST_CANDIDATE_WHEEL:" in release_gates
     assert "python -m build --wheel" not in release_gates
     assert "python -m pytest tests/" in release_gates
+    assert "Validate GitHub Actions workflow syntax" in release_gates
+    assert (
+        "rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9"
+        in release_gates
+    )
+    assert "Scan the release source and complete history" in release_gates
+    assert "zricethezav/gitleaks@sha256:" in release_gates
     for runner in (
         "macos-15",
         "macos-15-intel",
@@ -329,11 +375,25 @@ def test_ci_builds_one_wheel_and_lifecycle_jobs_only_consume_that_artifact():
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     assert workflow.count("python -m build --wheel") == 1
+    assert "permissions:\n  contents: read\n" in workflow
+    assert workflow.count("persist-credentials: false") == workflow.count(
+        "actions/checkout@"
+    )
+    assert "Validate GitHub Actions workflow syntax" in workflow
+    assert (
+        "rhysd/actionlint@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9"
+        in workflow
+    )
     assert "release-artifact:" in workflow
     assert "pipx-lifecycle:" in workflow
     assert "managed-lifecycle:" in workflow
     assert workflow.count("name: release-artifact") >= 3
-    assert workflow.count("actions/download-artifact@v4") == 3
+    assert (
+        workflow.count(
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        )
+        == 3
+    )
     producer = workflow.index("Build and inspect the candidate wheel once")
     first_render = workflow.index("python scripts/render_managed_installer.py")
     second_render = workflow.index(
@@ -346,3 +406,51 @@ def test_ci_builds_one_wheel_and_lifecycle_jobs_only_consume_that_artifact():
     consumers = workflow[workflow.index("  pipx-lifecycle:") :]
     assert "python -m build --wheel" not in consumers
     assert "--candidate-wheel" in consumers
+
+
+def test_recovery_workflow_is_protected_exact_and_forward_only():
+    workflow = (ROOT / ".github/workflows/promote-managed-installer.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert "environment: managed-installer-release" in workflow
+    assert workflow.count("persist-credentials: false") == workflow.count(
+        "actions/checkout@"
+    )
+    assert "group: managed-installer-stable" in workflow
+    assert "github.event.repository.default_branch" in workflow
+    assert "persist-credentials: false" in workflow
+    assert 'gh release view "$TAG"' in workflow
+    assert '"isPrerelease": False' in workflow
+    assert workflow.count("--pattern") == 3
+    assert "validate_release_bundle" in workflow
+    assert 'gh release verify "$TAG"' in workflow
+    assert '[[ "$TAG" == "v1.0.1" ]]' in workflow
+    assert '--source-ref "refs/tags/$TAG"' in workflow
+    assert "--deny-self-hosted-runners" in workflow
+    assert workflow.count("python scripts/request_managed_installer_promotion.py") == 3
+    assert "request_managed_installer_promotion.py validate" in workflow
+    assert "request_managed_installer_promotion.py promote" in workflow
+    assert "request_managed_installer_promotion.py verify" in workflow
+    assert "unset DEPLOY_PRIVATE_KEY DEPLOY_KNOWN_HOSTS" in workflow
+    assert (
+        workflow.index("Verify release immutability and artifact provenance")
+        < workflow.index("Validate installer before admitting deployment credentials")
+        < workflow.index("Request atomic stable installer promotion")
+        < workflow.index("Verify stable installer from public endpoint")
+    )
+    assert "rollback" not in workflow.lower()
+
+
+def test_all_release_workflow_actions_are_pinned_to_full_commit_shas():
+    import re
+
+    for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
+        source = path.read_text(encoding="utf-8")
+        for reference in re.findall(
+            r"^\s*-?\s*uses:\s*([^\s#]+)", source, re.MULTILINE
+        ):
+            assert re.fullmatch(r"[^/@\s]+/[^/@\s]+@[0-9a-f]{40}", reference), (
+                path,
+                reference,
+            )
