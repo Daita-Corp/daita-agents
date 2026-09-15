@@ -25,3 +25,5 @@ Describe how you tested this change. If you added tests, point to them.
 - [ ] Live/slow requirements and any unexecuted checks are disclosed
 - [ ] Pre-commit checks pass (`pre-commit run --all-files`)
 - [ ] Public API changes are documented
+- [ ] Durable agent-home compatibility was checked; persistence changes include
+      the candidate migration, golden fixture, and refreshed release snapshot

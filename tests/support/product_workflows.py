@@ -6,12 +6,10 @@ __all__ = (
     "ActionFixture",
     "Agent",
     "ApprovalDecision",
-    "ApprovalPanel",
     "ArtifactAuthorship",
     "ArtifactRequirement",
     "DaitaApp",
     "EffectResolutionDecision",
-    "EffectsScreen",
     "FrozenJsonObject",
     "Input",
     "ModelSensitivity",
@@ -24,7 +22,6 @@ __all__ = (
     "choose",
     "cli",
     "create_fixture",
-    "effect_receipt_mapping",
     "json",
     "patch",
     "pytest",
@@ -56,12 +53,10 @@ from daita.artifacts.models import ArtifactAuthorship
 from daita.distribution import ArtifactRequirement, OutcomeState
 from daita.llm.models import ModelSensitivity, ToolCall
 from daita.tui.app import DaitaApp
-from daita.tui.projection import approval_review_document, effect_receipt_mapping
-from daita.tui.screens.effects import EffectsScreen
+from daita.tui.projection import approval_review_document
 from daita.tui.screens.permissions import PermissionsScreen
 from daita.tui.screens.routines import render_routine_inspection
 from daita.tui.screens.selection import SelectionScreen
-from daita.tui.widgets.approval import ApprovalPanel
 from tests.support.mcp_actions import ActionFixture, response
 from tests.support.native_writes import create_fixture
 from tests.support.workspace import workspace_for

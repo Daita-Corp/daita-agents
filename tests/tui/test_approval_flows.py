@@ -5,10 +5,7 @@ from __future__ import annotations
 from tests.support.product_workflows import (
     ActionFixture,
     Agent,
-    ApprovalPanel,
     DaitaApp,
-    EffectsScreen,
-    Input,
     Static,
     cli,
     patch,
@@ -30,7 +27,7 @@ async def test_background_refresh_preserves_foreground_approval_state(tmp_path):
     )
     app.controller.agent = agent
     try:
-        async with app.run_test(size=(110, 36)) as pilot:
+        async with app.run_test(size=(110, 36)):
             await app.push_screen(ChatScreen())
             await app._refresh_status(running=True, state="approval")
             await app.refresh_background_status(notify_new=False)
@@ -44,37 +41,6 @@ async def test_background_refresh_preserves_foreground_approval_state(tmp_path):
             app.exit(0)
     finally:
         await agent.close()
-
-
-async def test_exiting_during_recovery_review_cancels_without_resolution(tmp_path):
-    import asyncio
-
-    fixture = await ActionFixture(tmp_path).start()
-    fixture.transport.mode = "disconnect"
-    fixture.script()
-    await fixture.agent.run("Send one test notification.")
-    receipt = (await fixture.agent.list_effects(unresolved_only=True))[0]
-    calls = list(fixture.server.calls)
-    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(tmp_path))
-    app.controller.agent = fixture.agent
-    fixture.agent._embedded._approval_handler = app.handle_approval
-    try:
-        async with asyncio.timeout(10):
-            async with app.run_test(size=(100, 32)) as pilot:
-                await app.push_screen(EffectsScreen(receipt_id=receipt.receipt_id))
-                await pilot.pause()
-                app.screen.query_one("#effects-note", Input).value = (
-                    "Investigating only."
-                )
-                assert await pilot.click("#effects-allow-future-work")
-                await pilot.pause()
-                assert app.screen.query_one(ApprovalPanel).active
-                app.exit(0)
-        await fixture.reopen()
-        assert await fixture.agent.inspect_effect(receipt.receipt_id) == receipt
-        assert fixture.server.calls == calls
-    finally:
-        await fixture.agent.close()
 
 
 @pytest.mark.parametrize("command", ("create", "update"))

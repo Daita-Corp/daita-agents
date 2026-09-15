@@ -47,18 +47,13 @@ operation, changes its evidence basis, grants connector access, or proves that t
 original action failed or succeeded. Resolution is a human control, unavailable to
 model tools and scheduled instructions.
 
-## Terminal inspection and recovery
+## Operator inspection and recovery
 
-In the TUI, `/effects` opens unresolved receipts. **Show all**, **Previous**, and
-**Next** page through at most 20 records at a time. `/effects inspect <receipt-id>`
-opens an exact agent-owned receipt independently of the current conversation.
-The review shows the original observation, evidence basis, normalized payload,
-run/occurrence IDs, digest and any separate human resolution.
-
-After investigation, enter a note and optional exact receipt/artifact evidence IDs.
-Choose **Close without retry** or **Allow future work**, then review and approve
-the complete recovery document. No model is called. Denial, cancellation, a stale
-digest or unavailable evidence leaves the observation unresolved.
+Receipt inspection and recovery are intentionally absent from the interactive TUI.
+An operator can use the headless controls to review the original observation,
+evidence basis, normalized payload, run/occurrence IDs, digest and any separate
+human resolution. No model is called. Denial, cancellation, a stale digest or
+unavailable evidence leaves the observation unresolved.
 
 The headless controls use the same Agent APIs:
 

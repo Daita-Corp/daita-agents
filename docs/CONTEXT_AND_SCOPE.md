@@ -35,6 +35,16 @@ clarified before preview. These are model-facing presentation rules, not a runti
 clarification gate; exact scope, ID, schema, permission, approval, and receipt checks
 remain the execution authority.
 
+The same material-ambiguity rule applies to admitted MCP connectors and accounts,
+recipients, artifact or delivery destinations, and other consequential foreground
+choices. Daita asks only when the current request depends on choosing among plausible
+alternatives that bounded read-only discovery cannot distinguish. Multiple search
+results alone do not require a question, and an explicit request for a set or
+comparison can use each exact admitted choice. Clarification is an ordinary completed
+assistant turn retained in conversation continuity; it has no separate run status,
+pending record, sticky selection, or CLI/TUI path. Approval authorizes an exact effect
+but never substitutes for identifying the intended target.
+
 Initial context contains a bounded connector directory drawn from current source
 registrations, admitted MCP bindings, and eligible skills. A separate compact
 manifest lists applicable toolboxes; the directory does not repeat those entries.

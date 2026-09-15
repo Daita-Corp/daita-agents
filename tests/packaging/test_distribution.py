@@ -294,7 +294,12 @@ def test_ci_requires_clean_pipx_wheel_smoke_on_each_supported_python():
     assert "not requires_network and not slow" in workflow
     assert "--candidate-wheel" in workflow
     assert workflow.count("python -m build --wheel") == 1
-    assert workflow.count("actions/download-artifact@v4") == 3
+    assert (
+        workflow.count(
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+        )
+        == 3
+    )
     assert "DAITA_TEST_CANDIDATE_WHEEL:" in workflow
     assert "needs: release-artifact" in workflow
     lifecycle_jobs = workflow[workflow.index("  pipx-lifecycle:") :]

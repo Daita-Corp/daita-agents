@@ -34,15 +34,6 @@ SLASH_COMMAND_COMPLETIONS = (
         "Configure read and PostgreSQL update/upsert access",
     ),
     ("/jobs", "/jobs", "Manage durable jobs"),
-    ("/jobs inspect ", "/jobs inspect <id>", "Inspect one durable job"),
-    ("/jobs results ", "/jobs results <id>", "Read one completed job result"),
-    ("/jobs cancel ", "/jobs cancel <id>", "Cancel one queued or running job"),
-    ("/effects", "/effects", "Inspect action receipts and record human recovery"),
-    (
-        "/effects inspect ",
-        "/effects inspect <receipt-id>",
-        "Review exact action evidence and recovery",
-    ),
     ("/inbox", "/inbox", "Inspect and acknowledge completed background reports"),
     ("/routines", "/routines", "Inspect and control saved assignments"),
     (
@@ -116,7 +107,7 @@ HELP_TEXT = (
     "Type / to browse commands and their descriptions.\n"
     "Ask across admitted connections without selecting a source.\n"
     'Use @"source name" <question> to narrow one request.\n'
-    "Saved assignments: /routines · action evidence/recovery: /effects · results: /inbox\n"
+    "Saved assignments: /routines · results: /inbox\n"
     "Execution requires an open host; stop this TUI before starting daita host --agent <name>.\n"
     "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit\n"
     "Wheel or Page Up/Page Down review · Ctrl-Home start · Ctrl-End latest\n"

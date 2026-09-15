@@ -5,8 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 
-from daita import ConversationRun, EffectReceipt, LoopExit, LoopExitKind, Transcript
-from daita._json import FrozenJsonObject
+from daita import ConversationRun, LoopExit, LoopExitKind, Transcript
 from daita.llm.models import MessageRole, ToolCall, ToolResultBlock
 
 from .models import ToolCardDetails, ToolCardState, ToolTablePreview, TranscriptBlock
@@ -897,27 +896,3 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
             "and grants no connector permission.\n\n"
         )
     return ""
-
-
-def effect_receipt_mapping(receipt: EffectReceipt) -> dict[str, object]:
-    """Project evidence and the separate human decision without a storage codec."""
-    resolution = receipt.resolution
-    return FrozenJsonObject.from_mapping(
-        {
-            **receipt.material(),
-            "receipt_digest": receipt.receipt_digest,
-            "resolution": (
-                None
-                if resolution is None
-                else {
-                    "decision": resolution.decision.value,
-                    "note": resolution.note,
-                    "evidence_references": resolution.evidence_references,
-                    "approving_principal_id": resolution.approving_principal_id,
-                    "control_id": resolution.control_id,
-                    "resolved_at": resolution.resolved_at.isoformat(),
-                    "receipt_digest": resolution.receipt_digest,
-                }
-            ),
-        }
-    ).to_dict()

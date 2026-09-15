@@ -201,8 +201,7 @@ resume, run-now, and disable controls call the public `Agent` methods directly.
 Create and update use the normal foreground routine tools and existing approval
 card. The status bar counts saved assignments separately from active background
 reasoning. A saved or queued assignment is not completed work. Receipt-linked
-failures remain inspectable through `/effects`; recovery is a separate human
-control and never performs an action.
+failures require separate operator recovery, which never performs an action.
 
 The headless CLI exposes the same record-owned lifecycle:
 

@@ -51,6 +51,7 @@ from . import (
     create_llm_provider,
     run_resident_host,
 )
+from ._json import FrozenJsonObject
 from .artifacts.models import (
     ArtifactAuthorship,
     artifact_delivery_receipt_to_mapping,
@@ -88,6 +89,33 @@ from .tui.projection import run_failure_notice, tool_outcome_summary
 from .workspace import paths_overlap
 
 _CANDIDATE_REVIEW_COST_LIMIT_ENV = "DAITA_CANDIDATE_REVIEW_MAX_COST_USD"
+
+
+def _effect_receipt_mapping(receipt: EffectReceipt) -> dict[str, object]:
+    """Project operator evidence without exposing a Textual dependency."""
+
+    resolution = receipt.resolution
+    return FrozenJsonObject.from_mapping(
+        {
+            **receipt.material(),
+            "receipt_digest": receipt.receipt_digest,
+            "resolution": (
+                None
+                if resolution is None
+                else {
+                    "decision": resolution.decision.value,
+                    "note": resolution.note,
+                    "evidence_references": resolution.evidence_references,
+                    "approving_principal_id": resolution.approving_principal_id,
+                    "control_id": resolution.control_id,
+                    "resolved_at": resolution.resolved_at.isoformat(),
+                    "receipt_digest": resolution.receipt_digest,
+                }
+            ),
+        }
+    ).to_dict()
+
+
 _CANDIDATE_REVIEWER_MAX_OUTPUT_TOKENS = LEARNING_REVIEW_MAX_TOTAL_TOKENS // 4
 
 
@@ -1355,11 +1383,9 @@ async def _execute(args: argparse.Namespace) -> object:
     )
     try:
         if args.command == "effects":
-            from .tui.projection import effect_receipt_mapping
-
             if args.effects_command == "list":
                 return [
-                    effect_receipt_mapping(item)
+                    _effect_receipt_mapping(item)
                     for item in await agent.list_effects(
                         unresolved_only=args.unresolved,
                         limit=args.limit,
@@ -1379,7 +1405,7 @@ async def _execute(args: argparse.Namespace) -> object:
                 effect = await agent.inspect_effect(args.receipt_id)
                 if effect is None:
                     raise ValueError("effect receipt not found")
-            return effect_receipt_mapping(effect)
+            return _effect_receipt_mapping(effect)
         if args.command == "artifacts":
             receipt = await agent.save_artifact(
                 args.artifact_id,

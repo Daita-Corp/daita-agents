@@ -305,6 +305,56 @@ async def test_context_fitting_retains_exact_current_anchor_and_updates_counts()
     assert '"binding_status":"ambiguous"' in system.text
     assert '"candidate_count":2' in system.text
     assert '"assessment_provenance":"catalog_service"' in system.text
+    assert (
+        "catalog assessment reports multiple plausible resource bindings" in system.text
+    )
+    assert "rank/approval cannot select" in system.text
+
+
+async def test_material_ambiguity_guidance_covers_mcp_without_catalog_gate():
+    builder = AgentContextBuilder(
+        CatalogSpy(),
+        profile=ModelProfile(
+            id="mock:mcp-ambiguity-guidance",
+            context_window_tokens=20_000,
+            max_output_tokens=1_000,
+            supports_tools=True,
+        ),
+    )
+    run = RunInput(
+        id="mcp-ambiguity-guidance-run",
+        agent_id="agent-history",
+        message="Look up the customer in our CRM.",
+        created_at=NOW,
+    )
+    tools = tuple(
+        ToolDefinition(
+            name=name,
+            description="Read one admitted CRM account.",
+            input_schema={"type": "object"},
+        )
+        for name in ("mcp_hubspot_lookup", "mcp_salesforce_lookup")
+    )
+
+    request = await _prepared_request(
+        builder,
+        run,
+        (run.start_message(),),
+        tools,
+        step=1,
+    )
+
+    system = request.messages[0].content[0]
+    assert isinstance(system, TextBlock)
+    assert "material ambiguity" in system.text
+    assert "Explicit sets/comparisons" in system.text
+    assert "multiple search hits need no question" in system.text
+    assert "rank/approval cannot select a target, connector, account" in system.text
+    assert "catalog assessment reports multiple plausible" not in system.text
+    assert {
+        "mcp_hubspot_lookup",
+        "mcp_salesforce_lookup",
+    } <= {tool.name for tool in request.tools}
 
 
 @pytest.mark.parametrize(

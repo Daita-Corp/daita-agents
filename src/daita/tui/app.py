@@ -47,7 +47,6 @@ from .screens.catalog import CatalogScreen
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
-from .screens.effects import EffectsScreen
 from .screens.inbox import InboxScreen
 from .screens.jobs import JobsScreen
 from .screens.mcp import MCPManagementScreen, MCPSetupScreen
@@ -225,11 +224,6 @@ class DaitaApp(App[int]):
             raise asyncio.CancelledError
         if self.size.height < 15:
             raise RuntimeError("terminal is too small to review this change")
-        if isinstance(self.screen, EffectsScreen):
-            decision = await self.screen.request_approval(request)
-            if decision is None:
-                raise asyncio.CancelledError
-            return decision
         screen = self.chat()
         if screen is None:
             raise RuntimeError("chat view is unavailable for approval review")
@@ -756,31 +750,11 @@ class DaitaApp(App[int]):
             await self._complete_mcp_screen(result)
             return
         if screen_name == "jobs":
-            await self._await_modal(
-                JobsScreen(
-                    job_id=(
-                        str(payload["job_id"])
-                        if isinstance(payload.get("job_id"), str)
-                        else None
-                    ),
-                    initial_view=str(payload.get("view", "details")),
-                )
-            )
+            await self._await_modal(JobsScreen())
             return
         if screen_name == "routines":
             await self._await_modal(RoutinesScreen())
             await self.refresh_background_status(notify_new=False)
-            return
-        if screen_name == "effects":
-            await self._await_modal(
-                EffectsScreen(
-                    receipt_id=(
-                        str(payload["receipt_id"])
-                        if isinstance(payload.get("receipt_id"), str)
-                        else None
-                    )
-                )
-            )
             return
         if screen_name == "inbox":
             await self._await_modal(InboxScreen())
@@ -854,34 +828,6 @@ class DaitaApp(App[int]):
             if accepted:
                 await self.controller.delete_open_agent()
                 self.exit(0)
-            return
-        if screen_name == "confirm_cancel_job":
-            job_id = str(payload.get("job_id", ""))
-            accepted = await self._await_modal(ConfirmScreen(message))
-            if not accepted:
-                return
-            inspection = await self.controller.cancel_job(job_id)
-            if inspection is None:
-                raise UserInputError(
-                    "The job no longer exists within this agent boundary."
-                )
-            status = inspection.summary.status.value
-            if status in {"cancel_requested", "cancelled"}:
-                notice = "Cancellation requested · " + job_id + " · " + status
-            else:
-                notice = (
-                    "Job became "
-                    + status
-                    + " before cancellation was applied · "
-                    + job_id
-                )
-            await self._await_modal(
-                JobsScreen(
-                    job_id=job_id,
-                    initial_view="details",
-                    notice=notice,
-                )
-            )
             return
         if screen_name == "confirm_detach_source":
             accepted = await self._await_modal(ConfirmScreen(message))

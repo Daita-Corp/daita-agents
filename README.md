@@ -72,9 +72,8 @@ a picker when several exist. Use `daita --agent atlas` to select one directly.
 Inside the terminal, `/help` lists commands and controls, `/` opens the command
 palette, and `@` narrows one question to a source. Ordinary questions can discover
 and compare all admitted connections without a selection. `/routines` shows saved
-assignments and occurrence evidence, `/inbox` shows results, and `/effects` opens
-action receipts and human recovery. `/source permissions` guides exact PostgreSQL
-update/upsert authoring.
+assignments and occurrence evidence, and `/inbox` shows results. `/source permissions`
+guides exact PostgreSQL update/upsert authoring.
 
 Saved assignments execute while the TUI or `daita host --agent atlas` keeps the
 agent open. Exit the current host before opening another; no work progresses

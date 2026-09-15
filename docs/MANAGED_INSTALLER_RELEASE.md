@@ -82,11 +82,17 @@ code. Configure all of the following before publishing:
 
 - a GitHub ruleset protecting every `v*` tag from update or deletion, without a
   routine release-actor bypass;
-- the `managed-installer-release` protected environment with required reviewers;
+- repository release immutability, which makes future published assets and their
+  associated tags unchangeable;
+- the `managed-installer-release` protected environment with required reviewers,
+  self-review disabled, and deployment patterns admitting only the default `main`
+  branch plus `v*` tags (publication uses a tag; recovery uses `main`);
+- the default-branch ruleset with CODEOWNER review required for workflow, release,
+  script, documentation, and test changes;
 - the managed release workflow as the only supported GitHub release publisher;
-  and
-- the repository-wide `managed-release` concurrency group with
-  `cancel-in-progress: false`.
+- the repository-wide `managed-release` build/publish concurrency group; and
+- the cross-workflow `managed-installer-stable` promotion concurrency group,
+  both with `cancel-in-progress: false`.
 
 Manual tag moves or deletion, manual GitHub release creation, and administrator
 bypass are unsupported emergency actions requiring incident review.
@@ -111,9 +117,16 @@ Each CI or managed-release workflow run builds one wheel. All managed, pipx,
 and four native lifecycle jobs download and consume those exact bytes without
 rebuilding. The managed release retains syntax and shellcheck gates, deterministic
 double rendering, exact runtime downloads, checksums, all-platform native smoke,
-four-artifact provenance attestation, GitHub release immutability, exact PyPI
+five-artifact provenance attestation, GitHub release immutability, exact PyPI
 filename and SHA-256 verification, and post-publication downloads compared byte
-for byte.
+for byte. Actionlint validates all workflow syntax before release gates continue;
+its sole ignored diagnostic is its outdated runner catalog rejecting GitHub's
+documented `macos-15-intel` hosted-runner label. The fifth artifact is the verified
+`agent-home-contract.json` snapshot;
+it records release compatibility evidence without participating in runtime home
+admission. All third-party Actions plus the Gitleaks and Actionlint containers are
+pinned by full commit or image digest. CI and the managed-release publication gate scan both a
+clean current-source archive and complete Git history with redacted findings.
 
 ## Release procedure
 
@@ -121,19 +134,25 @@ for byte.
    environment, and global concurrency control are active.
 2. Query both registries and set `project.version` to the next unused patch
    release after their semantic maximum. Refresh the editable environment.
-3. Merge only after ordinary CI and release-identity checks pass.
-4. Run `python scripts/release_identity.py project-tag` and create that exact
+3. Refresh `release/agent-home-contract.json`; if it differs from the latest
+   tagged snapshot, include the candidate home migration and golden fixture.
+4. Merge only after ordinary CI, home-contract, and release-identity checks pass.
+5. Run `python scripts/release_identity.py project-tag` and create that exact
    annotated tag.
-5. Push the tag and wait for the candidate workflow and all four native smokes.
-6. Download that run's `managed-release` artifact and verify `SHA256SUMS`.
-7. Upload only its exact wheel to PyPI.
-8. Run the protected workflow on the same tag with **Publish** enabled and
+6. Push the tag and wait for the candidate workflow and all four native smokes.
+7. Download that run's `managed-release` artifact and verify `SHA256SUMS`.
+8. Upload only its exact wheel to PyPI.
+9. Run the protected workflow on the same tag with **Publish** enabled and
    approve `managed-installer-release`.
-9. Confirm it re-read both registries, verified the exact PyPI wheel, attested
-   all four artifacts, created the immutable release, and compared downloaded
-   public bytes.
-10. Promote the exact versioned `install.sh` bytes to the stable website endpoint
-    and verify its SHA-256 against `release-manifest.json`.
+10. Confirm it re-read both registries, verified the exact PyPI wheel, attested
+    all five artifacts, revalidated the exact remote annotated tag, created and
+    byte-verified a draft, revalidated the tag again, published it as an immutable
+    release, compared downloaded public bytes, verified provenance, atomically
+    promoted `install.sh`, and verified the stable public endpoint.
+
+If a run stops after draft creation but before publication, inspect and delete only
+that workflow-created draft before retrying the same protected run. Never replace
+or delete a published release.
 
 PyPI upload remains a deliberate local operator step using the ignored
 repository-root `.env` value `PYPI_API_KEY`. The workflow stores no PyPI secret
@@ -152,10 +171,96 @@ Never rebuild or upload different bytes under an existing version.
 
 ## Stable endpoint promotion
 
-The release workflow does not mutate the marketing deployment. After the
-versioned GitHub release succeeds, deploy its exact `install.sh` asset to
-`https://daita-tech.io/install.sh` without templating, redirects, or runtime
-substitution, then verify the public bytes:
+The Daita-agents repository owns the stable installer. The marketing application
+does not contain or deploy a copy. Nginx on Lightsail serves only the exact
+`/install.sh` route from `/srv/daita-installer/current/install.sh`; every other
+request remains with the existing website application.
+
+The protected publication job performs the normal promotion automatically. It
+verifies the GitHub-hosted provenance of the exact published bytes, connects with
+a dedicated SSH key, and can send only `promote vMAJOR.MINOR.PATCH`. The server's
+forced command downloads `install.sh`, `release-manifest.json`, and `SHA256SUMS`
+from the fixed `Daita-Corp/daita-agents` release URL. It validates their exact
+identity and parses the installer with `bash -n` without executing release bytes,
+then atomically moves an immutable release directory into place and switches one
+relative `current` symlink. The ephemeral GitHub runner performs the version and
+non-mutating dry-run checks immediately before requesting promotion and again from
+the public endpoint. A lower version is refused before any download.
+
+The workflow requires GitHub's immutable-release attestation after publication,
+in addition to the build-provenance attestations it creates. The one-time v1.0.1
+seed predates those build attestations, so recovery admits it only after verifying
+its immutable-release attestation and the host's three hard-coded artifact
+identities. That exception cannot admit any other tag.
+
+The runner then downloads `https://daita-tech.io/install.sh` without following
+redirects, requires HTTP 200 and the exact final URL, checks the expected SHA-256,
+and repeats the non-mutating installer checks. A published GitHub release remains
+available if promotion fails; run `Recover managed installer promotion` on the
+default branch with that exact existing tag after correcting the deployment
+problem. The recovery workflow uses the same protected environment, provenance
+policy, server command, and public verification and cannot create or replace a
+release.
+
+Configure these protected-environment values once:
+
+- secret `MANAGED_INSTALLER_SSH_HOST`: the Lightsail host or fixed public IPv4;
+- secret `MANAGED_INSTALLER_SSH_PRIVATE_KEY`: the dedicated unencrypted Ed25519
+  private key used only by this forced command; and
+- secret `MANAGED_INSTALLER_SSH_KNOWN_HOSTS`: a reviewed pinned host-key line for
+  that exact destination.
+
+The corresponding private key must never be stored in the repository, website,
+server checkout, workflow artifact, or runner log.
+The workflow executes installer validation in a step that receives no deployment
+secrets. Its next step writes the key and known-host pin into one mode-700 temporary
+directory, unsets their environment variables before starting Python, requests only
+the forced promotion, and removes the directory on exit. Public installer execution
+runs in the following secret-free step.
+
+### One-time Lightsail bootstrap and cutover
+
+Generate a new dedicated Ed25519 key outside the repository. From a reviewed
+checkout copied to Lightsail, run the bootstrap as root with only its public key:
+
+```bash
+sudo bash scripts/bootstrap_managed_installer_host.sh \
+  /absolute/path/to/daita-installer-release.pub
+```
+
+The bootstrap creates the locked `daita-installer-deploy` system account, a
+single restrictive root-owned `authorized_keys` entry in a root-owned home,
+root-owned host code under `/usr/local/libexec/daita-installer`, and the deployment tree under
+`/srv/daita-installer`. The key grants no general shell, forwarding, PTY, agent
+forwarding, or rollback command. The installed host command is self-contained and
+the bootstrap requires the server's `/usr/bin/python3` to be version 3.10 or newer.
+
+Seed the current public v1.0.1 release through the same host implementation:
+
+```bash
+sudo -u daita-installer-deploy /usr/bin/python3 \
+  /usr/local/libexec/daita-installer/managed_installer_host.py \
+  --root /srv/daita-installer promote v1.0.1
+```
+
+The host accepts that one pre-schema-2 release only by its three pinned SHA-256
+identities. All later releases require manifest schema 2.
+
+The bootstrap also installs [the reviewed Nginx location](../release/daita-installer-location.nginx.conf)
+and a root-only cutover helper. After confirming the Nginx worker can read
+`/srv/daita-installer/current/install.sh`, run:
+
+```bash
+sudo /usr/bin/python3 \
+  /usr/local/libexec/daita-installer/managed_installer_nginx.py cutover
+```
+
+The helper admits only the observed `daita-tech.io` two-server layout, retains one
+mode-600 backup outside Nginx's include directory, inserts only the exact-match
+location before the existing catch-all, runs the real Nginx configuration test,
+and performs a graceful reload. A failed test or reload automatically restores,
+retests, and reloads the prior configuration. It never replaces the server block
+or the website catch-all location. Then verify:
 
 ```bash
 curl -fsSL --proto '=https' --tlsv1.2 \
@@ -166,6 +271,33 @@ bash /tmp/daita-install.sh --dry-run --no-onboard --no-modify-path
 ```
 
 The checksum must equal `installer.sha256` in the versioned public manifest.
+Only after that check succeeds should the website repository's historical
+`public/install.sh` be removed.
+
+If the initial public cutover check fails, restore the pre-cutover Nginx file with
+the same drift protection:
+
+```bash
+sudo /usr/bin/python3 \
+  /usr/local/libexec/daita-installer/managed_installer_nginx.py restore
+```
+
+### Emergency rollback
+
+The CI deployment key deliberately cannot roll back. An authorized Lightsail
+administrator can atomically restore only the predecessor recorded by the current
+release:
+
+```bash
+sudo -u daita-installer-deploy /usr/bin/python3 \
+  /usr/local/libexec/daita-installer/managed_installer_host.py \
+  --root /srv/daita-installer rollback
+```
+
+The host revalidates the predecessor's identity and syntax before switching the symlink.
+Repeat the public checksum and non-mutating checks immediately afterward. A
+rollback changes only the served installer bytes; it does not change existing
+Daita installations or their agent homes.
 
 ## Accepted operational limits
 
@@ -182,5 +314,6 @@ The checksum must equal `installer.sha256` in the versioned public manifest.
   Deleted registry history cannot be reconstructed, so versions must never be
   deleted or reused.
 
-The stable public endpoint has not yet been promoted. Keep the customer quick
-start on pipx until the exact reviewed asset passes the promotion checks above.
+There is no scheduled live smoke test. Normal publication and manual recovery
+both perform release-time public verification; a user-reported or observed outage
+is handled through the protected recovery or rollback procedures above.
