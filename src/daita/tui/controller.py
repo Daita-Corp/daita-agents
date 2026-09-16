@@ -850,9 +850,9 @@ class PresentationController:
         if name == "/workspace" and len(parts) == 1:
             return CommandOutcome(
                 "notice",
-                "Workspace  "
+                "Working directory  "
                 + safe_display(str(self.workspace.root), fallback="admitted")
-                + f" [{self.workspace.sensitivity.value}]",
+                + f" [{self.workspace.access.value} access; {self.workspace.sensitivity.value}]",
                 conversation_id=conversation_id,
             )
         if name == "/files":
@@ -1604,8 +1604,8 @@ class PresentationController:
             f"Sources    {source}\n"
             "Host       open in this TUI; background reasoning shares the run lock.\n"
             "Handoff    exit this TUI, then start daita host --agent <name>. No progress while all hosts are closed.\n"
-            f"Workspace  {safe_display(str(self.workspace.root), fallback='admitted')} "
-            f"[{self.workspace.sensitivity.value}]\n"
+            f"Working dir  {safe_display(str(self.workspace.root), fallback='admitted')} "
+            f"[{self.workspace.access.value} access; {self.workspace.sensitivity.value}]\n"
             "Conversation  " + safe_display(self.conversation_id, fallback="new")
         )
 

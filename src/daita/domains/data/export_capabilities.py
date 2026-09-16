@@ -793,6 +793,7 @@ class ArtifactEditTextExecutor:
             kind=ARTIFACT_EDIT_TEXT_OUTPUT_KIND,
             data={
                 "relative_path": binding.relative_path,
+                "qualified_path": observation.qualified_path,
                 "filename": filename,
                 "original_physical_revision": binding.original_physical_revision,
                 "observed_content_sha256": binding.observed_content_sha256,
@@ -804,7 +805,7 @@ class ArtifactEditTextExecutor:
             sensitivity=ModelSensitivity(self._workspace.sensitivity.value),
             sensitivity_provenance={
                 "authority": "local_workspace_binding",
-                "workspace_id": self._workspace.workspace_id,
+                "workspace_id": binding.workspace_id,
                 "relative_paths": (binding.relative_path,),
                 "physical_revisions": (binding.original_physical_revision,),
             },
@@ -1341,7 +1342,7 @@ def artifact_capability_declarations(
         description=(
             "Apply one bounded ordered exact UTF-8 text replacement family to an "
             "authenticated current-run file_read binding and commit the complete "
-            "result as an internal artifact without changing the workspace file. "
+            "result as an internal artifact without changing the local file. "
             "Copy file_read data.binding verbatim; it is opaque and must never be "
             "decoded, normalized, or reconstructed."
         ),
@@ -1396,6 +1397,7 @@ def artifact_capability_declarations(
             "type": "object",
             "properties": {
                 "relative_path": {"type": "string"},
+                "qualified_path": {"type": "string"},
                 "filename": {"type": "string"},
                 "original_physical_revision": {"type": "string"},
                 "observed_content_sha256": {"type": "string"},
@@ -1405,6 +1407,7 @@ def artifact_capability_declarations(
             },
             "required": [
                 "relative_path",
+                "qualified_path",
                 "filename",
                 "original_physical_revision",
                 "observed_content_sha256",
@@ -1432,7 +1435,7 @@ def artifact_capability_declarations(
         description=(
             "Publish one committed artifact either as a collision-safe new file in "
             "an authorized destination or as an atomic replacement of only the exact "
-            "unchanged workspace file bound into a text-edit artifact."
+            "unchanged local file bound into a text-edit artifact."
         ),
         input_schema={
             "type": "object",
@@ -1607,7 +1610,7 @@ def artifact_capability_declarations(
                         toolbox_id=ToolboxId.ARTIFACTS,
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
-                        summary="Prepare a bounded exact UTF-8 workspace-file edit artifact.",
+                        summary="Prepare a bounded exact UTF-8 local-file edit artifact.",
                         when_to_use=(
                             "Use only with an authenticated binding returned by file_read; "
                             "then use artifact_save_local in replace_bound_file mode."
@@ -1629,7 +1632,7 @@ def artifact_capability_declarations(
                         toolbox_id=ToolboxId.ARTIFACTS,
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
-                        summary="Save a committed artifact locally or replace its bound workspace file.",
+                        summary="Save a committed artifact locally or replace its bound local file.",
                         when_to_use="Use after artifact creation when local delivery is required.",
                         keywords=("artifact", "save", "deliver", "local"),
                     ),
@@ -1890,7 +1893,7 @@ class ArtifactCapabilityDomain:
             ):
                 raise CapabilityInputError(
                     "workspace_unavailable",
-                    "Workspace text editing is unavailable for this run.",
+                    "Local text editing is unavailable for this run.",
                 )
             token = arguments.get("binding")
             if not isinstance(token, str):
@@ -2418,6 +2421,7 @@ class ArtifactCapabilityDomain:
                 valid = (
                     local_binding is not None
                     and output.data.get("relative_path") == local_binding.relative_path
+                    and isinstance(output.data.get("qualified_path"), str)
                     and output.data.get("filename") == draft.suggested_filename
                     and output.data.get("original_physical_revision")
                     == local_binding.original_physical_revision
@@ -2634,7 +2638,7 @@ class ArtifactCapabilityDomain:
             or run.execution_scope is not None
         ):
             raise ToolOutputValidationError(
-                "artifact local edit lacks workspace authority"
+                "artifact local edit lacks local-file authority"
             )
         token = arguments.get("binding")
         if not isinstance(token, str):
@@ -2648,7 +2652,7 @@ class ArtifactCapabilityDomain:
         binding = draft.provenance.local_file_binding
         if (
             binding is None
-            or binding.workspace_id != self._workspace.workspace_id
+            or not self._workspace.authorizes_anchor(binding.workspace_id)
             or binding.workspace_id != authenticated.workspace_id
             or binding.relative_path != authenticated.relative_path
             or binding.original_physical_revision != authenticated.physical_revision

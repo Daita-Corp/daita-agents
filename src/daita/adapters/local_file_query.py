@@ -22,14 +22,17 @@ from decimal import Decimal
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from uuid import UUID
 
 from .._installation import repair_guidance
 from .._json import FrozenJsonObject, canonical_json
 
 if TYPE_CHECKING:
-    from multiprocessing.connection import Connection
+    from multiprocessing.connection import _ConnectionBase
+    from typing import TypeAlias
+
+    _PipeEndpoint: TypeAlias = _ConnectionBase[Any, Any]
 
     from .local_workspace import LocalFileQueryManifest
 
@@ -193,7 +196,7 @@ class LocalFileQueryBackend:
             manifest.revalidate()
             data = {
                 **payload,
-                "path_pattern": manifest.path_pattern,
+                "path_pattern": manifest.qualified_path_pattern,
                 "format": manifest.format,
                 "input_file_count": len(manifest.bindings),
                 "input_bytes": manifest.input_bytes,
@@ -256,7 +259,7 @@ def _run_private_worker(
 ) -> dict[str, object]:
     scratch = _create_private_scratch(scratch_parent)
     context = multiprocessing.get_context("spawn")
-    parent: Connection | None = None
+    parent: _PipeEndpoint | None = None
     process: Any | None = None
     termination: str | None = None
     peak_spill = 0
@@ -277,7 +280,8 @@ def _run_private_worker(
                 "The complete private file-query request exceeds its byte bound.",
                 {"limit": _MAX_REQUEST_BYTES, "observed": len(request_bytes)},
             )
-        parent, child = context.Pipe(duplex=True)
+        live_parent, child = context.Pipe(duplex=True)
+        parent = live_parent
         process = context.Process(
             target=_private_worker_entry,
             args=(child, os.fspath(scratch)),
@@ -286,19 +290,19 @@ def _run_private_worker(
         started = time.monotonic()
         process.start()
         child.close()
-        parent.send_bytes(request_bytes)
+        live_parent.send_bytes(request_bytes)
         from multiprocessing.reduction import send_handle
 
         assert process.pid is not None
         for binding in manifest.bindings:
-            send_handle(parent, binding.descriptor, process.pid)
+            send_handle(live_parent, binding.descriptor, process.pid)
         while process.is_alive():
             now = time.monotonic()
             peak_spill = max(peak_spill, _directory_bytes(scratch))
             observed_rss = _process_rss_bytes(process.pid)
             if observed_rss is not None:
                 peak_rss = max(peak_rss, observed_rss)
-            final = _receive_messages(parent, final)
+            final = _receive_messages(live_parent, final)
             if cancellation.is_set():
                 termination = "cancelled"
             elif now - started >= limits.max_query_seconds:
@@ -317,7 +321,7 @@ def _run_private_worker(
             process.kill()
             process.join(timeout=1.0)
         process.join()
-        final = _receive_messages(parent, final)
+        final = _receive_messages(live_parent, final)
         peak_spill = max(peak_spill, _directory_bytes(scratch))
         if termination == "cancelled":
             raise _WorkerCancelled()
@@ -414,7 +418,7 @@ class _WorkerFailure(RuntimeError):
 
 
 def _private_worker_entry(
-    connection: Connection,
+    connection: _PipeEndpoint,
     scratch_text: str,
 ) -> None:
     descriptors: list[int] = []
@@ -427,7 +431,7 @@ def _private_worker_entry(
         from multiprocessing.reduction import recv_handle
 
         for _binding in request["bindings"]:
-            descriptors.append(int(recv_handle(connection)))
+            descriptors.append(int(recv_handle(cast(Any, connection))))
         descriptor_paths = tuple(_descriptor_path(item) for item in descriptors)
         _revalidate_descriptors(descriptors, request["bindings"])
         duckdb = _load_duckdb()
@@ -1196,13 +1200,13 @@ def _revalidate_descriptors(
             facts = os.fstat(descriptor)
         except OSError as error:
             raise _WorkerFailure(
-                "file_changed", "A bound workspace file became unavailable."
+                "file_changed", "A bound local file became unavailable."
             ) from error
         if not stat.S_ISREG(facts.st_mode) or _physical_revision(facts) != binding.get(
             "physical_revision"
         ):
             raise _WorkerFailure(
-                "file_changed", "A bound workspace file changed during the query."
+                "file_changed", "A bound local file changed during the query."
             )
 
 
@@ -1240,7 +1244,7 @@ def _sql_list(values: tuple[str, ...]) -> str:
     return "[" + ",".join(_sql_string(item) for item in values) + "]"
 
 
-def _send_message(connection: Connection, value: dict[str, object]) -> None:
+def _send_message(connection: _PipeEndpoint, value: dict[str, object]) -> None:
     encoded = canonical_json(value).encode("utf-8")
     if len(encoded) > _MAX_RESPONSE_BYTES:
         encoded = canonical_json(
@@ -1256,7 +1260,7 @@ def _send_message(connection: Connection, value: dict[str, object]) -> None:
 
 
 def _receive_messages(
-    connection: Connection, final: dict[str, object] | None
+    connection: _PipeEndpoint, final: dict[str, object] | None
 ) -> dict[str, object] | None:
     while connection.poll(0):
         try:

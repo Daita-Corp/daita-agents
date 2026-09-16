@@ -423,14 +423,14 @@ async def test_count_cancellation_preserves_zero_usage_and_cancellation(kind, de
             released.set()
 
     async with provider_at(kind, respond) as provider:
+        task = asyncio.create_task(invoke(provider, input_request(), True))
+        await asyncio.wait_for(entered.wait(), 2)
         if deadline:
             with pytest.raises(TimeoutError) as caught:
                 async with asyncio.timeout(0.1):
-                    await invoke(provider, input_request(), True)
+                    await task
             error: BaseException = caught.value
         else:
-            task = asyncio.create_task(invoke(provider, input_request(), True))
-            await asyncio.wait_for(entered.wait(), 2)
             task.cancel()
             with pytest.raises(asyncio.CancelledError) as cancelled:
                 await task

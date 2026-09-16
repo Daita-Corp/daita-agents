@@ -846,7 +846,7 @@ class EmbeddedAgent:
     @property
     def workspace(self) -> LocalWorkspace:
         if self._workspace is None:
-            raise AgentHomeError("hosted composition has no local workspace")
+            raise AgentHomeError("hosted composition has no local file access")
         return self._workspace
 
     @classmethod
@@ -1575,10 +1575,7 @@ class EmbeddedAgent:
             relational_export_available=relational_export is not None,
             transcript_loader=store.load,
             upsert_readiness=postgresql_preview_backend.upsert_readiness,
-            workspace_id=(
-                None if workspace_backend is None else workspace_backend.workspace_id
-            ),
-            workspace_sensitivity=(
+            local_file_sensitivity=(
                 None if workspace_backend is None else workspace_backend.sensitivity
             ),
             files_only_run_ids=files_only_run_ids,
@@ -1760,9 +1757,7 @@ class EmbeddedAgent:
                 or workspace_backend is not None
                 or artifact_delivery is not None
             ):
-                raise AgentHomeError(
-                    "hosted composition contains local workspace authority"
-                )
+                raise AgentHomeError("hosted composition contains local file authority")
         capabilities = CapabilityRegistry(
             declarations=tuple(domain.declarations for domain in domains),
             executors=registered_executors,
@@ -1832,6 +1827,11 @@ class EmbeddedAgent:
                 ),
                 workspace_sensitivity=(
                     None if workspace_backend is None else workspace_backend.sensitivity
+                ),
+                local_file_context=(
+                    None
+                    if workspace_backend is None
+                    else workspace_backend.model_context()
                 ),
                 files_only_run_ids=files_only_run_ids,
                 max_context_evidence_bytes=limits.max_context_evidence_bytes,
@@ -2361,7 +2361,7 @@ class EmbeddedAgent:
             self._semantic_domain.select_explicit_learning_run(run_input.id)
         if files_only:
             if self._workspace_backend is None:
-                raise AgentHomeError("files_only requires an admitted local workspace")
+                raise AgentHomeError("files_only requires admitted local file access")
             self._files_only_run_ids.add(run_input.id)
         try:
             run_input = replace(
@@ -6060,7 +6060,7 @@ def _validate_workspace_composition(
         raise TypeError("hosted must be bool")
     if hosted:
         if workspace is not None:
-            raise ValueError("hosted composition cannot admit a local workspace")
+            raise ValueError("hosted composition cannot admit local file access")
         return
     if not isinstance(workspace, LocalWorkspace):
         raise TypeError("local agent composition requires LocalWorkspace")

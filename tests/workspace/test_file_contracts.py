@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import daita
-from daita import Agent, LocalWorkspace, SQLiteSource
+from daita import Agent, LocalFileAccess, LocalWorkspace, SQLiteSource
 from daita.adapters.local_workspace import LocalWorkspaceBackend
 from daita.adapters.models import SourceRegistration
 from daita.domains.data import LOCAL_FILE_CAPABILITY_IDS, LOCAL_FILE_EXECUTOR_IDS
@@ -119,6 +119,90 @@ async def test_source_free_user_run_projects_and_executes_workspace_file_tools(
             for request in provider.requests
         )
         assert str(workspace.root) not in repr(provider.requests)
+    finally:
+        await agent.close()
+
+
+async def test_computer_mode_context_exposes_frozen_working_and_known_locations(
+    tmp_path: Path,
+) -> None:
+    working = tmp_path.parent / f"{tmp_path.name}-project"
+    working.mkdir()
+    provider = MockModelProvider((_stop(),))
+    agent = await Agent.create(
+        "computer-context",
+        workspace=LocalWorkspace(working, access=LocalFileAccess.COMPUTER),
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+    )
+    try:
+        await agent.run("Find the latest CSV in Downloads", files_only=True)
+        prompt = "\n".join(
+            block.text
+            for message in provider.requests[0].messages
+            for block in message.content
+            if isinstance(block, TextBlock)
+        )
+        assert '"access":"computer"' in prompt
+        assert f'"working_directory":"{working}"' in prompt
+        assert all(name in prompt for name in ("Downloads", "Documents", "Desktop"))
+        assert "absolute paths and ~/ paths are accepted" in prompt
+        assert "operate only on workspace-relative paths" not in prompt
+    finally:
+        await agent.close()
+
+
+async def test_public_computer_search_executes_multi_root_schema_once(
+    tmp_path: Path,
+) -> None:
+    working = tmp_path.parent / f"{tmp_path.name}-working"
+    downloads = tmp_path.parent / f"{tmp_path.name}-downloads"
+    documents = tmp_path.parent / f"{tmp_path.name}-documents"
+    for directory in (working, downloads, documents):
+        directory.mkdir()
+    first = downloads / "report.csv"
+    second = documents / "report.csv"
+    first.write_text("kind\nfirst\n", encoding="utf-8")
+    second.write_text("kind\nsecond\n", encoding="utf-8")
+    provider = MockModelProvider(
+        (
+            _call(
+                "search",
+                "file_search",
+                {"paths": [str(downloads), str(documents)], "glob": "*.csv"},
+            ),
+            _stop(),
+        )
+    )
+    agent = await Agent.create(
+        "computer-multi-root",
+        workspace=LocalWorkspace(working, access=LocalFileAccess.COMPUTER),
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+    )
+    try:
+        result = await agent.run("Find CSVs in both folders", files_only=True)
+        transcript = await agent.transcript(result.run_id)
+        block = next(
+            block
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and block.call_id == "search"
+        )
+        assert not block.is_error
+        data = block.output["data"]
+        assert isinstance(data, Mapping)
+        matches = data["matches"]
+        assert isinstance(matches, tuple)
+        assert {item["qualified_path"] for item in matches} == {
+            str(first),
+            str(second),
+        }
+        assert block.sensitivity is ModelSensitivity.INTERNAL
+        bindings = block.sensitivity_provenance["bindings"]
+        assert isinstance(bindings, tuple) and len(bindings) == 2
     finally:
         await agent.close()
 

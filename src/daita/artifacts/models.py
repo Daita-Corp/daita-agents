@@ -178,7 +178,7 @@ class ArtifactTextChangeSummary:
 
 @dataclass(frozen=True, slots=True)
 class ArtifactLocalFileBinding:
-    """Exact persisted provenance for one bounded workspace-file edit artifact."""
+    """Exact persisted provenance for one anchor-contained local-file edit artifact."""
 
     workspace_id: str
     relative_path: str

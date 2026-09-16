@@ -108,7 +108,7 @@ def test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure
     )
     uncertain_messages = artifact_delivery_messages(uncertain_edit.tool_pairs)
     assert any(
-        "update outcome for workspace file config.yaml is uncertain" in text
+        "update outcome for local file config.yaml is uncertain" in text
         for text in uncertain_messages
     )
 

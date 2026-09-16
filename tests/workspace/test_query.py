@@ -16,7 +16,7 @@ from typing import cast
 
 import pytest
 
-from daita import Agent, LocalWorkspace
+from daita import Agent, LocalFileAccess, LocalWorkspace
 from daita._json import FrozenJsonObject
 from daita.adapters import local_file_query as query_module
 from daita.adapters.local_file_query import (
@@ -105,6 +105,12 @@ async def _query(
         canonical_sql=validated.canonical_sql,
         sql_fingerprint=validated.sql_fingerprint,
     )
+
+
+def _frozen_objects(value: object) -> tuple[FrozenJsonObject, ...]:
+    assert isinstance(value, tuple)
+    assert all(isinstance(item, FrozenJsonObject) for item in value)
+    return cast(tuple[FrozenJsonObject, ...], value)
 
 
 @pytest.mark.parametrize(
@@ -348,6 +354,54 @@ async def test_csv_tsv_json_ndjson_and_parquet_aggregate_in_private_workers(
             bindings = provenance["bindings"]
             assert isinstance(bindings, tuple)
             assert len(bindings) == 1
+    finally:
+        await backend.close()
+
+
+async def test_computer_query_reads_an_absolute_dataset_outside_the_working_directory(
+    tmp_path: Path,
+) -> None:
+    working = tmp_path / "project"
+    user_home = tmp_path / "home"
+    documents = user_home / "Documents"
+    downloads = user_home / "Downloads"
+    state = user_home / ".daita"
+    agent_home = state / "agent"
+    for directory in (working, documents, downloads, agent_home):
+        directory.mkdir(parents=True)
+    dataset = documents / "sales.csv"
+    dataset.write_text("region,amount\nnorth,7\nsouth,11\nnorth,5\n", encoding="utf-8")
+    downloaded = downloads / "sales.csv"
+    downloaded.write_text("region,amount\nnorth,2\nsouth,4\n", encoding="utf-8")
+    backend = await LocalWorkspaceBackend.open(
+        LocalWorkspace(working, access=LocalFileAccess.COMPUTER),
+        agent_root=state,
+        agent_home=agent_home,
+        user_home=user_home,
+    )
+    try:
+        result = await _query(backend, str(dataset))
+        rows = tuple(dict(row) for row in _frozen_objects(result.data["rows"]))
+        assert rows == (
+            {"region": "north", "total": 12},
+            {"region": "south", "total": 11},
+        )
+        bindings = tuple(
+            dict(item) for item in _frozen_objects(result.data["input_bindings"])
+        )
+        assert bindings == (
+            {
+                "path": "Documents/sales.csv",
+                "qualified_path": str(dataset),
+                "physical_revision": bindings[0]["physical_revision"],
+            },
+        )
+        comparison = await _query(backend, "~/Downloads/sales.csv")
+        assert tuple(dict(row) for row in _frozen_objects(comparison.data["rows"])) == (
+            {"region": "north", "total": 2},
+            {"region": "south", "total": 4},
+        )
+        assert comparison.data["path_pattern"] == str(downloaded)
     finally:
         await backend.close()
 

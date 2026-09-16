@@ -178,7 +178,7 @@ async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
         assert "existing-two" in str(
             confirmation.query_one("#confirm-message").render()
         )
-        assert "workspace files are not modified" in str(
+        assert "local files are not modified" in str(
             confirmation.query_one("#confirm-message").render()
         )
         confirmation_input = confirmation.query_one("#confirm-input", Input)

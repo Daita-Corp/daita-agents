@@ -32,6 +32,7 @@ from . import (
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningCandidateView,
+    LocalFileAccess,
     LocalWorkspace,
     MCPAuthentication,
     MCPBindingStatus,
@@ -86,7 +87,6 @@ from .tui.models import (
     validate_candidate_review_cost_limit as _validate_candidate_review_cost_limit,
 )
 from .tui.projection import run_failure_notice, tool_outcome_summary
-from .workspace import paths_overlap
 
 _CANDIDATE_REVIEW_COST_LIMIT_ENV = "DAITA_CANDIDATE_REVIEW_MAX_COST_USD"
 
@@ -232,7 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="daita")
     parser.add_argument("--version", action="version", version=f"daita {__version__}")
     parser.add_argument("--root", type=Path)
-    parser.add_argument("--workspace", type=Path)
+    parser.add_argument(
+        "--workspace",
+        type=Path,
+        help="default working directory for foreground local file tools",
+    )
     parser.add_argument(
         "--workspace-sensitivity",
         choices=("internal", "confidential", "restricted"),
@@ -898,29 +902,30 @@ def _resolve_cli_workspace(args: argparse.Namespace) -> LocalWorkspace:
     sensitivity = ModelSensitivity(args.workspace_sensitivity)
     explicit = args.workspace
     if explicit is not None:
-        return LocalWorkspace(explicit, sensitivity=sensitivity)
+        return LocalWorkspace(
+            explicit,
+            sensitivity=sensitivity,
+            access=LocalFileAccess.COMPUTER,
+        )
 
     state_root = (
         (Path.home() / ".daita")
         if args.root is None
         else Path(os.path.abspath(os.fspath(args.root))).resolve(strict=False)
     )
+    state_root = state_root.resolve(strict=False)
     cwd = Path.cwd().resolve(strict=True)
     user_home = Path.home().resolve(strict=True)
-    if (
-        cwd != user_home
-        and cwd != Path(cwd.anchor)
-        and not paths_overlap(cwd, state_root)
-    ):
-        return LocalWorkspace(cwd, sensitivity=sensitivity)
-
-    fallback = user_home / "Daita Workspace"
-    if paths_overlap(fallback, state_root):
-        raise ValueError(
-            "the default workspace overlaps agent state; pass --workspace explicitly"
-        )
-    fallback.mkdir(mode=0o700, parents=False, exist_ok=True)
-    return LocalWorkspace(fallback, sensitivity=sensitivity)
+    working = (
+        user_home
+        if cwd == Path(cwd.anchor) or cwd == state_root or state_root in cwd.parents
+        else cwd
+    )
+    return LocalWorkspace(
+        working,
+        sensitivity=sensitivity,
+        access=LocalFileAccess.COMPUTER,
+    )
 
 
 def _write_resident_ready(ready: object) -> None:

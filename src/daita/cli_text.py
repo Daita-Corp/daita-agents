@@ -38,16 +38,15 @@ async def _write_artifact_outcomes(
             continue
         if receipt.mode is ArtifactDeliveryMode.REPLACE_BOUND_FILE:
             if receipt.outcome is ArtifactDeliveryOutcome.SUCCEEDED:
-                message = "Updated workspace file " + safe_display(
+                message = "Updated local file " + safe_display(
                     saved_path, fallback="the bound file"
                 )
             elif receipt.outcome is ArtifactDeliveryOutcome.UNCERTAIN:
-                message = (
-                    "Workspace file update outcome is uncertain for "
-                    + safe_display(saved_path, fallback="the bound file")
+                message = "Local file update outcome is uncertain for " + safe_display(
+                    saved_path, fallback="the bound file"
                 )
             else:
-                message = "Workspace file was not updated: " + safe_display(
+                message = "Local file was not updated: " + safe_display(
                     saved_path, fallback="the bound file"
                 )
             print(message, file=output_stream)

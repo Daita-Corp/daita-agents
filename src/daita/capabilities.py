@@ -661,7 +661,7 @@ TOOLBOX_DEFINITIONS = (
     ToolboxDefinition(
         ToolboxId.FILES,
         "Files",
-        "Admitted workspace files.",
+        "Admitted local files.",
     ),
     ToolboxDefinition(
         ToolboxId.SOURCES,

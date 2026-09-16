@@ -6336,7 +6336,7 @@
       "evidence": "Baseline and final pytest collection plus reviewed source/assertion mapping; command results are recorded in the reorganization report.",
       "markers_after": [],
       "markers_before": [],
-      "oracle": "`any((receipt.filename in getattr(item, 'filename', '') or getattr(item, 'saved_path', '') == receipt.saved_path for item in result.artifact_deliveries))`; `any(('remains available; local delivery failed' in text for text in failed_messages))`; `any(('update outcome for workspace file config.yaml is uncertain' in text for text in uncertain_messages))`",
+      "oracle": "`any((receipt.filename in getattr(item, 'filename', '') or getattr(item, 'saved_path', '') == receipt.saved_path for item in result.artifact_deliveries))`; `any(('remains available; local delivery failed' in text for text in failed_messages))`; `any(('update outcome for local file config.yaml is uncertain' in text for text in uncertain_messages))`",
       "original_case_count": 1,
       "original_nodeids": [
         "tests/test_artifact_surfaces.py::test_terminal_renders_authoritative_saved_path_and_truthful_delivery_failure"
@@ -9686,7 +9686,7 @@
       "evidence": "Baseline and final pytest collection plus reviewed source/assertion mapping; command results are recorded in the reorganization report.",
       "markers_after": [],
       "markers_before": [],
-      "oracle": "`explicit.root == explicit_root.resolve()`; `explicit.sensitivity.value == 'confidential'`; `inferred.root == safe_cwd.resolve()`",
+      "oracle": "`explicit.root == explicit_root.resolve()`; `explicit.access.value == 'computer'`; `explicit.sensitivity.value == 'confidential'`; `inferred.root == safe_cwd.resolve()`; `inferred.access.value == 'computer'`",
       "original_case_count": 1,
       "original_nodeids": [
         "tests/test_cli_mvp.py::test_workspace_resolution_prefers_explicit_then_safe_cwd_and_preserves_sensitivity"
@@ -9695,18 +9695,18 @@
       "owner": "cli",
       "reason": "Distinct current scenario and observable failure retained under its production owner.",
       "replacement_nodeids": [
-        "tests/cli/test_commands.py::test_workspace_resolution_prefers_explicit_then_safe_cwd_and_preserves_sensitivity"
+        "tests/cli/test_commands.py::test_workspace_resolution_uses_computer_access_and_preserves_working_directory"
       ],
       "scenario": "named scenario plus the explicitly listed parameter cases"
     },
     {
       "boundary": "cli owner through the test's exercised public or concrete component boundary",
-      "contract": "workspace resolution creates user only conventional fallback",
+      "contract": "workspace resolution uses home without creating a conventional fallback",
       "decision": "keep",
       "evidence": "Baseline and final pytest collection plus reviewed source/assertion mapping; command results are recorded in the reorganization report.",
       "markers_after": [],
       "markers_before": [],
-      "oracle": "`workspace.root == user_home / 'Daita Workspace'`; `workspace.root.is_dir()`; `stat.S_IMODE(workspace.root.stat().st_mode) == 448`",
+      "oracle": "`workspace.root == user_home.resolve()`; `workspace.access.value == 'computer'`; `not (user_home / 'Daita Workspace').exists()`",
       "original_case_count": 1,
       "original_nodeids": [
         "tests/test_cli_mvp.py::test_workspace_resolution_creates_user_only_conventional_fallback"
@@ -9715,7 +9715,7 @@
       "owner": "cli",
       "reason": "Distinct current scenario and observable failure retained under its production owner.",
       "replacement_nodeids": [
-        "tests/cli/test_commands.py::test_workspace_resolution_creates_user_only_conventional_fallback"
+        "tests/cli/test_commands.py::test_workspace_resolution_uses_home_without_creating_conventional_fallback"
       ],
       "scenario": "named scenario plus the explicitly listed parameter cases"
     },
@@ -21759,7 +21759,7 @@
       "markers_before": [
         "asyncio"
       ],
-      "oracle": "`result.usage.total_tokens == 22417`; `[r.max_total_tokens for r in requests] == [30000, 26276, 21696, 14765]`; `'Workspace text edits are artifact-backed' not in texts[0]`",
+      "oracle": "`result.usage.total_tokens == 22417`; `[r.max_total_tokens for r in requests] == [100000, 96276, 91696, 84765]`; `'Local text edits are artifact-backed' not in texts[0]`",
       "original_case_count": 1,
       "original_nodeids": [
         "tests/test_phase_f_live_harness.py::test_routine_setup_context_follows_working_set_and_actual_usage"
@@ -38845,7 +38845,7 @@
       "evidence": "Baseline and final pytest collection plus reviewed source/assertion mapping; command results are recorded in the reorganization report.",
       "markers_after": [],
       "markers_before": [],
-      "oracle": "`CAPABILITY_LABELS['toolbox_search'] == 'Search toolboxes'`; `CAPABILITY_LABELS['toolbox_load'] == 'Load selected tools'`; `CAPABILITY_LABELS['file_search'] == 'Search workspace files'`",
+      "oracle": "`CAPABILITY_LABELS['toolbox_search'] == 'Search toolboxes'`; `CAPABILITY_LABELS['toolbox_load'] == 'Load selected tools'`; `CAPABILITY_LABELS['file_search'] == 'Search local files'`",
       "original_case_count": 1,
       "original_nodeids": [
         "tests/test_textual_tui.py::test_tool_projection_and_approval_document"

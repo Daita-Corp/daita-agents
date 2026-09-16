@@ -30,10 +30,10 @@ from tests.tui._support import (
 def test_tool_projection_and_approval_document():
     assert CAPABILITY_LABELS["toolbox_search"] == "Search toolboxes"
     assert CAPABILITY_LABELS["toolbox_load"] == "Load selected tools"
-    assert CAPABILITY_LABELS["file_search"] == "Search workspace files"
-    assert CAPABILITY_LABELS["file_read"] == "Read workspace file"
-    assert CAPABILITY_LABELS["file_query"] == "Query workspace data"
-    assert CAPABILITY_LABELS["artifact_edit_text"] == "Prepare workspace edit"
+    assert CAPABILITY_LABELS["file_search"] == "Search local files"
+    assert CAPABILITY_LABELS["file_read"] == "Read local file"
+    assert CAPABILITY_LABELS["file_query"] == "Query local file data"
+    assert CAPABILITY_LABELS["artifact_edit_text"] == "Prepare local file edit"
     assert CAPABILITY_LABELS["artifact_save_local"] == "Save artifact locally"
     details = project_tool_details(
         ToolCall(
@@ -63,10 +63,10 @@ def test_tool_projection_and_approval_document():
         tool_name="tool",
         capability_id="cap",
         arguments_text='{\n  "name": "safe"\n}',
-        reason="Replace the exact unchanged workspace file config.yaml?",
+        reason="Replace the exact unchanged local file config.yaml?",
     )
     assert reviewable and document is not None
-    assert "Change: Replace the exact unchanged workspace file config.yaml?" in document
+    assert "Change: Replace the exact unchanged local file config.yaml?" in document
     _secret_doc, secret_ok = approval_review_document(
         tool_name="tool",
         capability_id="cap",
