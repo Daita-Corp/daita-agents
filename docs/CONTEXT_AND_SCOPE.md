@@ -104,6 +104,15 @@ changing the exact current-run
 transcript or its sensitivity floor. Provider-native counting remains the final
 request admission check on supported API routes.
 
+For an ordinary local foreground run with computer file access, preparation also
+freezes a small host-generated map containing the working directory, home, and
+the resolved Downloads, Documents, and Desktop locators. It does not inventory
+those directories or prove that they exist or are readable. The model can use
+working-relative, absolute, or `~/` paths with the Files tools, whose results
+report qualified locators and search coverage. Bounded typed-workspace callers
+instead retain relative-only guidance. Hosted and machine-originated runs receive
+neither this host context nor ambient local-file execution authority.
+
 `update_source_discovery` and `update_mcp_discovery` edit bounded local `summary`,
 `when_to_use`, and normalized `keywords` hints. They preserve execution
 permissions and connector identity. Source hints appear in current catalog
@@ -131,7 +140,7 @@ Conversation continuity is shared across sources and stays bounded. Private
 answers retain their classification when summarized, when a later question
 narrows its source filter, and after a source is detached or the agent reopens.
 The full request classification also includes admitted connector descriptions,
-workspace context, current tool results, and retained advisory content. A model
+local-file context, current tool results, and retained advisory content. A model
 route or MCP outbound ceiling that cannot accept that classification fails
 before it receives the content.
 

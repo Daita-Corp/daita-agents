@@ -299,7 +299,7 @@ class DaitaApp(App[int]):
                             + name
                             + "?\nThis removes its conversations, memory, skills, "
                             "settings, schedules, artifacts, and Daita-owned "
-                            "credentials.\nConnected databases and workspace files "
+                            "credentials.\nConnected databases and local files "
                             "are not modified.",
                             expected_text=name,
                         )
@@ -1181,15 +1181,15 @@ class DaitaApp(App[int]):
             activity = {
                 "toolbox_search": "Searching toolboxes",
                 "toolbox_load": "Loading selected tools",
-                "file_search": "Searching workspace files",
-                "file_read": "Reading workspace file",
-                "file_query": "Querying workspace data",
+                "file_search": "Searching local files",
+                "file_read": "Reading local file",
+                "file_query": "Querying local file data",
                 "catalog_search": "Searching catalog",
                 "catalog_schema": "Reading catalog schema",
                 "data_query": "Querying data source",
                 "artifact_create_document": "Creating document",
                 "artifact_create_tabular": "Creating findings table",
-                "artifact_edit_text": "Preparing workspace file edit",
+                "artifact_edit_text": "Preparing local file edit",
                 "artifact_save_local": "Publishing local artifact",
             }.get(
                 tool_name,

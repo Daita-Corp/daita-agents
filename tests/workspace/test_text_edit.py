@@ -15,7 +15,13 @@ from typing import Any
 import pytest
 
 import daita.artifacts.delivery as delivery_module
-from daita import Agent, ApprovalDecision, ApprovalRequest, LocalWorkspace
+from daita import (
+    Agent,
+    ApprovalDecision,
+    ApprovalRequest,
+    LocalFileAccess,
+    LocalWorkspace,
+)
 from daita.adapters.local_workspace import LocalWorkspaceBackend
 from daita.artifacts.models import (
     ArtifactDeliveryMode,
@@ -313,6 +319,64 @@ async def test_public_read_edit_approval_save_is_one_bound_atomic_workflow(
         assert receipt.prior_physical_revision == binding.original_physical_revision
         assert receipt.result_physical_revision is not None
         assert receipt.result_physical_revision != receipt.prior_physical_revision
+    finally:
+        await agent.close()
+
+
+async def test_computer_mode_approved_edit_replaces_only_the_external_bound_file(
+    tmp_path: Path,
+) -> None:
+    working = tmp_path / "project"
+    external = tmp_path / "Documents"
+    downloads = tmp_path / "downloads"
+    state = tmp_path / "state"
+    for directory in (working, external, downloads):
+        directory.mkdir()
+    target = external / "config.yaml"
+    collision = working / "config.yaml"
+    target.write_text("timeout: 30\n", encoding="utf-8")
+    collision.write_text("timeout: 10\n", encoding="utf-8")
+    provider = _EditWorkflowProvider(
+        (
+            {
+                "old_text": "timeout: 30",
+                "new_text": "timeout: 60",
+                "expected_occurrences": 1,
+            },
+        ),
+        target_path=str(target),
+    )
+    approvals: list[ApprovalRequest] = []
+
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    agent = await Agent.create(
+        "external-edit",
+        workspace=LocalWorkspace(working, access=LocalFileAccess.COMPUTER),
+        root=state,
+        model=provider,
+        model_profile=_profile(provider),
+        approval_handler=approve,
+        downloads_directory=downloads,
+        id_factory=_ids(),
+    )
+    try:
+        result = await agent.run("Change the external config timeout")
+        assert target.read_text(encoding="utf-8") == "timeout: 60\n"
+        assert collision.read_text(encoding="utf-8") == "timeout: 10\n"
+        assert len(approvals) == 1
+        assert str(target) in approvals[0].reason
+        binding = result.artifacts[0].provenance.local_file_binding
+        assert binding is not None
+        backend = agent._embedded._workspace_backend
+        assert backend is not None
+        assert binding.workspace_id != backend.workspace_id
+        receipt = result.artifact_deliveries[0]
+        assert receipt.workspace_id == binding.workspace_id
+        assert receipt.relative_path is not None
+        assert receipt.relative_path.endswith("Documents/config.yaml")
     finally:
         await agent.close()
 

@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import errno
 import json
 import os
 import re
 import stat
-import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -26,6 +24,7 @@ from ..adapters.local_workspace import (
     physical_revision_for_facts,
 )
 from ..adapters.models import SourceRegistration
+from ..workspace import resolve_os_downloads_directory
 from .models import (
     BOUND_FILE_DESTINATION_ID,
     DEFAULT_DESTINATION_SELECTOR,
@@ -430,6 +429,7 @@ class LocalArtifactDelivery:
                     "mode": ArtifactDeliveryMode.REPLACE_BOUND_FILE.value,
                     "workspace_id": binding.workspace_id,
                     "relative_path": binding.relative_path,
+                    "target_path": target.display_path,
                     "original_physical_revision": (binding.original_physical_revision),
                     "observed_content_sha256": (binding.observed_content_sha256),
                     "source_byte_size": binding.source_byte_size,
@@ -489,7 +489,7 @@ class LocalArtifactDelivery:
         if resolver is None:
             raise ArtifactError(
                 "artifact_edit_binding_invalid",
-                "Exact workspace-file replacement is unavailable.",
+                "Exact local-file replacement is unavailable.",
             )
         try:
             return await resolver.resolve_bound_target(
@@ -505,6 +505,7 @@ class LocalArtifactDelivery:
                 in {
                     "file_changed",
                     "file_not_found",
+                    "path_not_found",
                     "not_regular_file",
                     "path_invalid",
                     "symlink_not_allowed",
@@ -512,9 +513,9 @@ class LocalArtifactDelivery:
                 else "artifact_edit_binding_invalid"
             )
             message = (
-                "The bound workspace file changed; read it again before editing."
+                "The bound local file changed; read it again before editing."
                 if code == "artifact_replacement_drift"
-                else "The exact bound workspace target is unavailable."
+                else "The exact bound local target is unavailable."
             )
             raise ArtifactError(code, message, error.details) from error
 
@@ -522,9 +523,9 @@ class LocalArtifactDelivery:
         self,
         fingerprint: Mapping[str, object],
     ) -> str:
-        relative_path = fingerprint.get("relative_path")
+        target_path = fingerprint.get("target_path")
         summary = fingerprint.get("change_summary")
-        if not isinstance(relative_path, str) or not isinstance(summary, Mapping):
+        if not isinstance(target_path, str) or not isinstance(summary, Mapping):
             raise ArtifactError(
                 "artifact_edit_binding_invalid",
                 "The bound edit approval summary is unavailable.",
@@ -536,7 +537,7 @@ class LocalArtifactDelivery:
                 "The bound edit approval summary is unavailable.",
             )
         return (
-            f"Replace the exact unchanged workspace file “{_safe_relative_display(relative_path)}” "
+            f"Replace the exact unchanged local file “{_safe_relative_display(target_path)}” "
             f"with the committed edit ({description})?"
         )
 
@@ -1441,7 +1442,7 @@ def _validate_bound_target(target: LocalBoundFileTarget) -> None:
     ):
         raise ArtifactError(
             "artifact_edit_binding_invalid",
-            "The bound workspace target has unsafe identity, ownership, links, or metadata.",
+            "The bound local target has unsafe identity, ownership, links, or metadata.",
         )
     list_extended_attributes = getattr(os, "listxattr", None)
     if list_extended_attributes is not None:
@@ -1451,13 +1452,13 @@ def _validate_bound_target(target: LocalBoundFileTarget) -> None:
             if error.errno not in {errno.ENOTSUP, errno.EOPNOTSUPP}:
                 raise ArtifactError(
                     "artifact_edit_binding_invalid",
-                    "The bound workspace target metadata could not be verified.",
+                    "The bound local target metadata could not be verified.",
                 ) from error
         else:
             if attributes:
                 raise ArtifactError(
                     "artifact_edit_binding_invalid",
-                    "The bound workspace target has unsupported extended metadata.",
+                    "The bound local target has unsupported extended metadata.",
                 )
 
 
@@ -1576,7 +1577,7 @@ def _safe_relative_display(value: str) -> str:
         if character.isprintable()
         and unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
     )
-    return projected[:512] or "workspace file"
+    return projected[:512] or "local file"
 
 
 def _grant_from_mapping(value: Mapping[str, object]) -> _DestinationGrant:
@@ -1721,102 +1722,6 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
-
-
-def resolve_os_downloads_directory() -> Path:
-    """Resolve the platform Downloads known folder without a shell."""
-
-    if sys.platform == "win32":
-        return _windows_downloads()
-    if sys.platform == "darwin":
-        return _macos_downloads()
-    return _xdg_downloads()
-
-
-def _windows_downloads() -> Path:
-    class _GUID(ctypes.Structure):
-        _fields_ = [
-            ("Data1", ctypes.c_ulong),
-            ("Data2", ctypes.c_ushort),
-            ("Data3", ctypes.c_ushort),
-            ("Data4", ctypes.c_ubyte * 8),
-        ]
-
-    folder = _GUID(
-        0x374DE290,
-        0x123F,
-        0x4565,
-        (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B),
-    )
-    result = ctypes.c_wchar_p()
-    windows_libraries = getattr(ctypes, "windll")
-    shell32 = windows_libraries.shell32
-    ole32 = windows_libraries.ole32
-    status = shell32.SHGetKnownFolderPath(
-        ctypes.byref(folder), 0, None, ctypes.byref(result)
-    )
-    if status != 0 or not result.value:
-        raise OSError("Downloads known folder is unavailable")
-    try:
-        return Path(result.value)
-    finally:
-        ole32.CoTaskMemFree(result)
-
-
-def _macos_downloads() -> Path:
-    foundation = ctypes.cdll.LoadLibrary(
-        "/System/Library/Frameworks/Foundation.framework/Foundation"
-    )
-    objc = ctypes.cdll.LoadLibrary("/usr/lib/libobjc.A.dylib")
-    foundation.NSSearchPathForDirectoriesInDomains.argtypes = (
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-        ctypes.c_bool,
-    )
-    foundation.NSSearchPathForDirectoriesInDomains.restype = ctypes.c_void_p
-    array = foundation.NSSearchPathForDirectoriesInDomains(15, 1, True)
-    if not array:
-        raise OSError("Downloads search path is unavailable")
-    objc.sel_registerName.argtypes = (ctypes.c_char_p,)
-    objc.sel_registerName.restype = ctypes.c_void_p
-    message_address = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
-    if message_address is None:
-        raise OSError("Objective-C runtime is unavailable")
-    object_at_index = ctypes.CFUNCTYPE(
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong
-    )(message_address)
-    utf8_string = ctypes.CFUNCTYPE(ctypes.c_char_p, ctypes.c_void_p, ctypes.c_void_p)(
-        message_address
-    )
-    string = object_at_index(array, objc.sel_registerName(b"objectAtIndex:"), 0)
-    encoded = utf8_string(string, objc.sel_registerName(b"UTF8String"))
-    if not encoded:
-        raise OSError("Downloads search path is unavailable")
-    return Path(encoded.decode("utf-8"))
-
-
-def _xdg_downloads() -> Path:
-    home = Path.home()
-    config_home = Path(os.environ.get("XDG_CONFIG_HOME", str(home / ".config")))
-    document = config_home / "user-dirs.dirs"
-    try:
-        lines = document.read_text(encoding="utf-8").splitlines()
-    except OSError as error:
-        raise OSError("XDG Downloads configuration is unavailable") from error
-    prefix = "XDG_DOWNLOAD_DIR="
-    for line in lines:
-        if not line.startswith(prefix):
-            continue
-        raw = line[len(prefix) :].strip()
-        if len(raw) < 2 or raw[0] != '"' or raw[-1] != '"':
-            break
-        value = raw[1:-1]
-        value = value.replace("$HOME", str(home), 1)
-        candidate = Path(value)
-        if candidate.is_absolute():
-            return candidate
-        break
-    raise OSError("XDG Downloads configuration is invalid")
 
 
 __all__ = [

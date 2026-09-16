@@ -6,7 +6,6 @@ import io
 import json
 import os
 import shlex
-import stat
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -234,7 +233,7 @@ def test_current_parser_keeps_the_existing_one_shot_surface_green():
     )
 
 
-def test_workspace_resolution_prefers_explicit_then_safe_cwd_and_preserves_sensitivity(
+def test_workspace_resolution_uses_computer_access_and_preserves_working_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -261,6 +260,7 @@ def test_workspace_resolution_prefers_explicit_then_safe_cwd_and_preserves_sensi
     explicit = cli._resolve_cli_workspace(explicit_args)
     assert explicit.root == explicit_root.resolve()
     assert explicit.sensitivity.value == "confidential"
+    assert explicit.access.value == "computer"
 
     monkeypatch.chdir(safe_cwd)
     cwd_args = cli.build_parser().parse_args(
@@ -269,9 +269,10 @@ def test_workspace_resolution_prefers_explicit_then_safe_cwd_and_preserves_sensi
     inferred = cli._resolve_cli_workspace(cwd_args)
     assert inferred.root == safe_cwd.resolve()
     assert inferred.sensitivity.value == "internal"
+    assert inferred.access.value == "computer"
 
 
-def test_workspace_resolution_creates_user_only_conventional_fallback(
+def test_workspace_resolution_uses_home_without_creating_conventional_fallback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -283,9 +284,9 @@ def test_workspace_resolution_creates_user_only_conventional_fallback(
 
     workspace = cli._resolve_cli_workspace(args)
 
-    assert workspace.root == user_home / "Daita Workspace"
-    assert workspace.root.is_dir()
-    assert stat.S_IMODE(workspace.root.stat().st_mode) == 0o700
+    assert workspace.root == user_home
+    assert workspace.access.value == "computer"
+    assert not (user_home / "Daita Workspace").exists()
 
 
 def test_delete_is_state_only_and_does_not_resolve_a_workspace() -> None:

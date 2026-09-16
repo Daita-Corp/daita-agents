@@ -49,10 +49,11 @@ Actual consumption is never clipped to an authorization or reservation ceiling.
 Unknown machine-run usage consumes at least its reservation; it is never recorded
 as measured zero. Exhausted cumulative budgets prevent subsequent reservation.
 
-Daita supports catalog-backed SQLite and PostgreSQL reads, bounded access to
-one admitted local workspace, and explicitly admitted server-neutral remote
-MCP reads and external actions. SQL is validated against the current catalog before source
-I/O. Workspace reads are descriptor-contained and revision-bound. MCP calls
+Daita supports catalog-backed SQLite and PostgreSQL reads, foreground local
+computer file access with a bounded-workspace option for typed callers, and
+explicitly admitted server-neutral remote MCP reads and external actions. SQL is
+validated against the current catalog before source I/O. Local file reads are
+descriptor-contained and revision-bound. MCP calls
 revalidate the exact binding revision, remote identity, and schemas.
 
 Agent identity, source registrations, current catalog snapshots, exact run
@@ -88,7 +89,7 @@ src/daita/
   storage/home_migrations/    # sole append-only agent-home revision registry
   security/                   # secret references and lazy resolution
   config.py                   # immutable runtime and model configuration
-  workspace.py                # runtime-only local workspace admission
+  workspace.py                # runtime-only local file access intent and known folders
   cli.py                      # CLI over the public embedded API
   tui/                        # source-free navigation, approvals and human controls
 tests/                        # deterministic and opt-in live tests
@@ -344,16 +345,26 @@ Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
 insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
 Native implementation acceptance is not production release approval.
 
-## Workspace files and artifacts
+## Local computer files and artifacts
 
-The local workspace is a separate read-first Files surface rather than a
-cataloged source. `file_search`, `file_read`, and `file_query` return bounded,
-revision-bound results. `file_query` uses a private one-call DuckDB worker over
-an exact input manifest and exposes only the relation `data` to validated SQL.
+The local Files surface is separate from cataloged sources. Plain local CLI/TUI
+composition uses computer access: its frozen working directory is the default,
+while absolute and `~/` paths can address other OS-permitted locations.
+`file_search` supports one root or a bounded multi-root set with one shared
+budget, qualified matches, and per-root coverage. Typed `LocalWorkspace` callers
+remain contained by default unless they explicitly select computer access. Both
+modes use the same resolver, descriptor-contained backend, declarations, runtime,
+and edit pipeline. Hosted and machine-originated runs have no ambient local-file
+authority. Private Daita state is rejected when targeted and pruned from broader
+searches.
+
+`file_search`, `file_read`, and `file_query` return bounded, revision-bound
+results. `file_query` uses a private one-call DuckDB worker over an exact input
+manifest and exposes only the relation `data` to validated SQL.
 
 An authenticated current-run `file_read` binding can feed
 `artifact_edit_text`. That capability commits a complete replacement artifact
-without changing the workspace. `artifact_save_local` requires exact approval,
+without changing the local file. `artifact_save_local` requires exact approval,
 revalidates the unchanged bound file, and atomically publishes the artifact.
 Drift requires a fresh read and edit.
 

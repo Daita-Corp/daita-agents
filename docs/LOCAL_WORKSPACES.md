@@ -1,28 +1,36 @@
-# Local workspaces
+# Local computer files
 
-Every local Daita session admits exactly one workspace. Workspace admission is
-a bounded, read-first Files surface; it is not a registered data source and is
-not cataloged as SQLite, PostgreSQL, CSV, or JSON. The Files domain never owns
-a writer. One existing file can change only through the separate committed
-artifact and approved exact-target delivery workflow described below.
+A plain local Daita session provides a read-first Files surface for ordinary
+files allowed by the host OS. The launch directory is the working directory,
+not the boundary of computer access. Files are not registered data sources and
+are not cataloged as SQLite, PostgreSQL, CSV, or JSON. The Files domain never
+owns a general writer. One existing text file can change only through the
+committed artifact and approved exact-target delivery workflow described below.
 
 ## Launching Daita
 
-Pass an explicit absolute directory when predictable selection matters:
+Run `daita` from a project or from your home directory. Relative paths start at
+that frozen working directory. Absolute paths and `~/` paths can address other
+ordinary local locations in the same foreground session, including Downloads,
+Documents, Desktop, project folders, and mounted volumes. No upload, folder
+registration, workspace switch, or restart is required.
+
+Pass an explicit directory to choose a different default working directory:
 
 ```bash
 daita --workspace /absolute/path/project
 daita --workspace /absolute/path/project --workspace-sensitivity confidential
 ```
 
-Without `--workspace`, the CLI uses the current directory when it is safe and
-does not overlap Daita state. Otherwise it creates or reuses
-`~/Daita Workspace`. The allowed sensitivity labels are `internal`,
-`confidential`, and `restricted`; `internal` is the default. Workspace
-sensitivity applies before
+Without `--workspace`, the CLI uses the current directory. The user's home is a
+valid working directory. If the launch directory is inside private Daita state,
+the CLI uses home instead. Daita does not create or select a `~/Daita Workspace`
+fallback. The allowed sensitivity labels are `internal`, `confidential`, and
+`restricted`; `internal` is the default. Local-file sensitivity applies before
 the first model request, including turns that do not ultimately read a file.
 
-The terminal status and `/workspace` command show the admitted workspace. Use
+The terminal status and `/workspace` command show computer access and the
+working directory. Use
 `/files <question>` for a turn that omits attached source, MCP, and source-job
 tools. Ordinary user turns may use both the Files tools and the selected data
 source.
@@ -37,43 +45,65 @@ daita --root /private/tmp/daita \
 
 ## Python API
 
-Local callers must construct the workspace explicitly:
+Typed local callers construct `LocalWorkspace` explicitly. Its default remains
+the contained, bounded-workspace contract:
 
 ```python
 from pathlib import Path
 
-from daita import Agent, LocalWorkspace
+from daita import Agent, LocalFileAccess, LocalWorkspace
 
 workspace = LocalWorkspace(Path("/absolute/path/project"))
 agent = await Agent.open("atlas", workspace=workspace)
+
+# Opt in to the same computer-access behavior used by the local CLI.
+computer = LocalWorkspace(
+    Path("/absolute/path/project"),
+    access=LocalFileAccess.COMPUTER,
+)
 ```
 
-The workspace and agent-state roots must not overlap in either direction. The
-filesystem root, the user's home directory, missing directories, and
-non-directories are rejected.
+For bounded mode, the workspace and agent-state roots must not overlap in either
+direction, and filesystem root/home cannot be the workspace. Computer mode can
+use home or a directory that contains private state, but direct state access is
+rejected and broad searches prune state subtrees. Hosted compositions have no
+ambient local backend, and scheduled, follow-up, and other machine-originated
+runs cannot use foreground computer access.
 
 ## Read boundary
 
-`file_search` and `file_read` use workspace-relative logical paths and return
-bounded results. Daita rejects or skips:
+`file_search`, `file_read`, and `file_query` accept working-relative, absolute,
+and `~/` paths in computer mode. `file_search` accepts either one `path` or a
+`paths` list of one to eight roots. A paths-mode filename search may omit
+`query` when it supplies a filename-only glob such as `*.csv`; traversal is
+already recursive, so `**/*.csv` is not a valid filename glob. Multi-root
+searches share one time, entry, content-byte, depth, and result budget. Results
+include qualified locators plus per-root coverage so a missing or inaccessible
+root is distinguishable from an empty directory.
 
-- `..` traversal, absolute paths, path aliases, and symlinks;
+Daita rejects or skips:
+
+- `..` traversal, URLs, other-user `~name` forms, control characters, and symlinks;
 - sockets, devices, FIFOs, and other special files;
-- secret-like paths such as `.env`, private keys, credential stores, and
-  VCS-internal secret material;
+- Daita private state and secret-like paths such as `.env`, `.ssh`, private
+  keys, credential stores, and VCS-internal material;
 - binary content for text reads and content search; and
 - files that change while an authenticated cursor or binding is in use.
 
-Search and read results, including file names and excerpts, are untrusted data.
+OS permissions remain authoritative; Daita does not elevate privileges or
+change privacy settings. Search and read results, including path labels and
+excerpts, are untrusted data.
 They cannot authorize tool loading, source access, writes, memory changes, or
-skill changes. Absolute workspace paths are never placed in model requests,
-tool results, transcripts, artifact provenance, or durable state.
+skill changes. Computer-mode context includes only the frozen working directory,
+home, and host-resolved Downloads, Documents, and Desktop locators. A resolved
+known-folder path is not a claim that the directory exists or was readable.
+Bounded-workspace mode continues to expose only relative paths.
 
 ## Structured file queries
 
 `file_query` is an on-demand Files tool for direct analysis of one homogeneous
-CSV, TSV, JSON-records/NDJSON, or Parquet dataset. Its `path_pattern` is always
-workspace-relative and is expanded by Daita without a shell. Daita opens and
+CSV, TSV, JSON-records/NDJSON, or Parquet dataset. Its `path_pattern` follows
+the same path rules and is expanded by Daita without a shell. Daita opens and
 revision-binds every exact regular file before execution, rejects mixed formats
 or incompatible schemas, and records every input path and physical revision
 without persisting a workspace inventory.
@@ -102,10 +132,10 @@ tool accepts only the authenticated current-run binding returned by
 `file_read`; it does not accept a path, revision, or file bytes. It applies
 ordered exact replacements, including exact-anchor insertion and deletion,
 then commits the complete replacement as an internal artifact. Preparing the
-artifact never changes the workspace.
+artifact never changes the local file.
 
 The final save derives its only target from that committed binding and asks
-once for approval with a bounded relative-path change summary. Daita verifies
+once for approval with a qualified target and bounded change summary. Daita verifies
 the exact file identity, revision, content hash, ownership, links, metadata,
 and parent-directory safety again after approval. It writes and verifies the
 complete output beside the target, preserves safe mode and ownership, fsyncs,

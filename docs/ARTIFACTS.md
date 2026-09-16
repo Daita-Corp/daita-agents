@@ -14,7 +14,7 @@ Use the two tabular paths for different guarantees:
 - `artifact_create_tabular` packages bounded model-authored findings as CSV,
   XLSX, or HTML. It requires one or more exact earlier successful tool-call IDs
   from the current run. Those results may come from catalog-backed data,
-  workspace files, or admitted MCP tools.
+  local files, or admitted MCP tools.
 
 `artifact_create_tabular` does not claim that its rows are a complete or exact
 copy of a source. Daita authenticates the referenced results against the
@@ -42,3 +42,10 @@ previews. `artifact_convert` converts only a verified exact Daita XLSX snapshot
 to CSV without rerunning its source. `artifact_save_local` remains the explicit
 approval-gated local delivery path; creating an internal artifact does not
 prove that a local file was saved.
+
+An edit artifact retains the exact physical anchor, anchor-relative path,
+revision, and original content hash authenticated by `file_read`. This applies
+equally to the working directory and an external local location. Replacement
+approval displays the qualified target, then the delivery path reopens and
+revalidates that same anchor and file; it never rebases a failed external edit
+onto the working directory or Downloads.

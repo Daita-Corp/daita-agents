@@ -4,14 +4,14 @@
 
 The data agent that learns how your business works.
 
-Daita connects to SQLite, PostgreSQL, and an admitted local workspace, then
+Daita connects to SQLite and PostgreSQL and can work with permitted local computer files, then
 returns grounded answers to questions asked in plain language. Conversations,
 approved memory, and reusable skills persist across sessions so useful business
 context does not have to be explained again.
 
 [Quick start](#quick-start) ·
 [Artifacts](docs/ARTIFACTS.md) ·
-[Local workspaces](docs/LOCAL_WORKSPACES.md) ·
+[Local computer files](docs/LOCAL_WORKSPACES.md) ·
 [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) ·
 [Remote MCP](docs/MCP_CONNECTIVITY.md) ·
 [Scheduled routines](docs/SCHEDULED_ROUTINES.md) ·
@@ -50,8 +50,10 @@ installed Python 3.11 or 3.12 explicitly:
 pipx install --python python3.12 daita-agents
 ```
 
-The first launch guides you through choosing a workspace, creating an agent,
-selecting a model, and optionally attaching a read-only data source. API-backed
+The first launch guides you through creating an agent, selecting a model, and
+optionally attaching a read-only data source. The launch directory is the default
+working directory, while foreground Files tools can also use host-resolved
+Downloads, Documents, Desktop, and other explicit local paths. API-backed
 model credentials are stored in the OS keychain. Ollama needs no API key, and
 supported Codex, Claude Code, and Grok Build subscriptions can use their
 documented sign-in flows. See
@@ -64,7 +66,7 @@ Once setup is complete, try asking:
 Which products grew fastest month over month?
 How many customers have not ordered in 90 days?
 Compare paid revenue by region and plan.
-Summarize the CSV files in this workspace.
+Find the latest CSV in Downloads and compare it with the CSV in Documents.
 ```
 
 Run `daita` again for a returning launch. Daita reopens the only agent or shows
@@ -88,7 +90,7 @@ change the execution policy.
 
 - SQLite and PostgreSQL sources begin read-only.
 - SQL is validated against the current catalog before source I/O.
-- Workspace reads reject traversal, symlinks, secret-like paths, and special
+- Local-file reads reject traversal, symlinks, private state, secret-like paths, and special
   files.
 - Remote MCP tools require explicit local access/effect admission and are
   revalidated at call time. Admitted actions use exact per-call approval or a
@@ -98,7 +100,7 @@ change the execution policy.
   operation/column/row permissions, transactional drift checks, and runtime-owned
   receipts govern each call. A routine permits one native write invocation per occurrence.
 
-Learn more in [Local workspaces](docs/LOCAL_WORKSPACES.md),
+Learn more in [Local computer files](docs/LOCAL_WORKSPACES.md),
 [Remote MCP tools and actions](docs/MCP_CONNECTIVITY.md), and
 [Relational writes](docs/RELATIONAL_WRITES.md).
 
@@ -154,7 +156,7 @@ For the full implementation boundaries, see the
 | Topic | Guide |
 | --- | --- |
 | Exact exports and evidence-bound derived files | [Artifacts](docs/ARTIFACTS.md) |
-| Workspace selection, file reads, queries, and edits | [Local workspaces](docs/LOCAL_WORKSPACES.md) |
+| Working directory, local file reads, queries, and edits | [Local computer files](docs/LOCAL_WORKSPACES.md) |
 | Codex, Claude Code, and Grok Build subscriptions | [Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
 | Remote reads and admitted actions | [Remote MCP connectivity](docs/MCP_CONNECTIVITY.md) |
 | Schedules, outcomes, inboxes, and resident hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |

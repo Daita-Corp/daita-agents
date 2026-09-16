@@ -38,12 +38,12 @@ CAPABILITY_LABELS = {
     "catalog_inspect": "Inspect catalog resource",
     "catalog_traverse": "Follow relationships",
     "data_query": "Query data",
-    "file_search": "Search workspace files",
-    "file_read": "Read workspace file",
-    "file_query": "Query workspace data",
+    "file_search": "Search local files",
+    "file_read": "Read local file",
+    "file_query": "Query local file data",
     "artifact_create_document": "Create document",
     "artifact_create_tabular": "Create findings table",
-    "artifact_edit_text": "Prepare workspace edit",
+    "artifact_edit_text": "Prepare local file edit",
     "artifact_save_local": "Save artifact locally",
     "artifact_set_export_location": "Set export location",
     "memory_set": "Update memory",
@@ -376,15 +376,15 @@ def artifact_delivery_messages(
                 data.get("relative_path"),
                 maximum=512,
                 preserve_lines=False,
-                fallback="the bound workspace file",
+                fallback="the bound local file",
             )
             if outcome == "failed":
                 messages.append(
-                    f"Workspace file {relative_path} was not updated; the committed edit artifact remains available."
+                    f"Local file {relative_path} was not updated; the committed edit artifact remains available."
                 )
             elif outcome == "uncertain":
                 messages.append(
-                    f"The update outcome for workspace file {relative_path} is uncertain; re-read the target before any further edit."
+                    f"The update outcome for local file {relative_path} is uncertain; re-read the target before any further edit."
                 )
             continue
         error = result.output.get("error")

@@ -227,8 +227,7 @@ class DataCapabilityDomain:
         upsert_readiness: (
             Callable[[str, FrozenJsonObject], Awaitable[FrozenJsonObject]] | None
         ) = None,
-        workspace_id: str | None = None,
-        workspace_sensitivity: ModelSensitivity | None = None,
+        local_file_sensitivity: ModelSensitivity | None = None,
         files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
@@ -237,25 +236,16 @@ class DataCapabilityDomain:
         expected_ids = _SOURCE_CAPABILITIES
         if not relational_export_available:
             expected_ids -= {DATA_EXPORT_TABULAR_CAPABILITY_ID}
-        if workspace_id is not None:
+        if local_file_sensitivity is not None:
             expected_ids |= LOCAL_FILE_CAPABILITY_IDS
         if declared_ids != expected_ids:
             raise ValueError(
                 "data declarations must exactly match supported native capabilities"
             )
-        if (workspace_id is None) != (workspace_sensitivity is None):
-            raise ValueError(
-                "workspace identity and sensitivity must be present together"
-            )
-        if workspace_id is not None and (
-            not isinstance(workspace_id, str)
-            or not workspace_id.startswith("workspace:sha256:")
+        if local_file_sensitivity is not None and not isinstance(
+            local_file_sensitivity, ModelSensitivity
         ):
-            raise ValueError("workspace_id must be one admitted workspace identity")
-        if workspace_sensitivity is not None and not isinstance(
-            workspace_sensitivity, ModelSensitivity
-        ):
-            raise TypeError("workspace_sensitivity must be ModelSensitivity")
+            raise TypeError("local_file_sensitivity must be ModelSensitivity")
         for adapter_id, capability_ids in _ADAPTER_CAPABILITIES.items():
             if not capability_ids <= declared_ids:
                 raise ValueError(
@@ -277,8 +267,7 @@ class DataCapabilityDomain:
         self._declarations = declarations
         self._catalog = catalog
         self._learning = learning
-        self._workspace_id = workspace_id
-        self._workspace_sensitivity = workspace_sensitivity
+        self._local_file_sensitivity = local_file_sensitivity
         self._files_only_run_ids = (
             files_only_run_ids if files_only_run_ids is not None else set()
         )
@@ -343,7 +332,11 @@ class DataCapabilityDomain:
                     names.append(name)
                 continue
             if capability.id in LOCAL_FILE_CAPABILITY_IDS:
-                if self._workspace_id is not None and run.origin is RunOrigin.USER:
+                if (
+                    self._local_file_sensitivity is not None
+                    and run.origin is RunOrigin.USER
+                    and run.execution_scope is None
+                ):
                     names.append(name)
                 continue
             if capability.id in _RELATIONAL_READ_CAPABILITIES:
@@ -389,19 +382,18 @@ class DataCapabilityDomain:
         run = replace(run, resolved_source_scope=scope)
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
             if (
-                self._workspace_id is None
-                or self._workspace_sensitivity is None
+                self._local_file_sensitivity is None
                 or run.origin is not RunOrigin.USER
                 or run.execution_scope is not None
             ):
                 raise CapabilityInputError(
                     "workspace_unavailable",
-                    "Workspace file access is unavailable for this run.",
+                    "Local file access is unavailable for this run.",
                 )
             if "source_id" in arguments or "resource_id" in arguments:
                 raise CapabilityInputError(
                     "source_scope_violation",
-                    "Workspace file tools do not accept source authority.",
+                    "Local file tools do not accept source authority.",
                 )
             if capability.id == LOCAL_FILE_READ_CAPABILITY_ID:
                 has_path = "path" in arguments
@@ -1577,42 +1569,15 @@ class DataCapabilityDomain:
         capability: Capability,
         output: ToolOutput,
     ) -> ToolOutput:
-        if output.sensitivity is not None:
-            return output
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
-            if self._workspace_id is None or self._workspace_sensitivity is None:
+            if output.sensitivity is None or not output.sensitivity_provenance:
                 raise CapabilityInputError(
                     "result_classification_unavailable",
-                    "The workspace result cannot be classified safely.",
+                    "The local file result cannot be classified safely.",
                 )
-            relative_paths: list[str] = []
-            physical_revisions: list[str] = []
-            path = output.data.get("path")
-            revision = output.data.get("physical_revision")
-            if isinstance(path, str) and isinstance(revision, str):
-                relative_paths.append(path)
-                physical_revisions.append(revision)
-            matches = output.data.get("matches")
-            if isinstance(matches, tuple):
-                for match in matches:
-                    if not isinstance(match, Mapping):
-                        continue
-                    match_path = match.get("path")
-                    match_revision = match.get("physical_revision")
-                    if isinstance(match_path, str) and isinstance(match_revision, str):
-                        relative_paths.append(match_path)
-                        physical_revisions.append(match_revision)
-            return replace(
-                output,
-                sensitivity=self._workspace_sensitivity,
-                sensitivity_provenance={
-                    "authority": "local_workspace_binding",
-                    "workspace_id": self._workspace_id,
-                    "capability_id": capability.id,
-                    "relative_paths": tuple(relative_paths),
-                    "physical_revisions": tuple(physical_revisions),
-                },
-            )
+            return output
+        if output.sensitivity is not None:
+            return output
         scope = await resolve_effective_source_scope(
             run, self._catalog, files_only=run.id in self._files_only_run_ids
         )

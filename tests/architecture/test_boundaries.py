@@ -465,6 +465,7 @@ def test_public_surface_is_focused():
         "JobResultView",
         "JobStatus",
         "JobSummary",
+        "LocalFileAccess",
         "LocalWorkspace",
         "LoopExit",
         "LoopExitKind",

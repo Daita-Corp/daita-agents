@@ -179,10 +179,10 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             for tool_name, expected in (
                 ("toolbox_search", "Searching toolboxes"),
                 ("toolbox_load", "Loading selected tools"),
-                ("file_search", "Searching workspace files"),
-                ("file_read", "Reading workspace file"),
-                ("file_query", "Querying workspace data"),
-                ("artifact_edit_text", "Preparing workspace file edit"),
+                ("file_search", "Searching local files"),
+                ("file_read", "Reading local file"),
+                ("file_query", "Querying local file data"),
+                ("artifact_edit_text", "Preparing local file edit"),
                 ("artifact_save_local", "Publishing local artifact"),
             ):
                 started = AgentEvent(

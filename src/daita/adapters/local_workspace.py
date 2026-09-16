@@ -1,10 +1,11 @@
-"""Secure on-demand search and read access for one admitted local workspace."""
+"""Secure on-demand search, read, query, and edit binding for local files."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import codecs
+import errno
 import fnmatch
 import hmac
 import json
@@ -15,14 +16,20 @@ import secrets
 import stat
 import threading
 import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import Callable, Literal, TypeVar
+from typing import Literal, TypeVar
 
 from .._json import FrozenJsonObject, canonical_json
-from ..workspace import LocalWorkspace, paths_overlap
+from ..workspace import (
+    LocalFileAccess,
+    LocalWorkspace,
+    paths_overlap,
+    resolve_os_known_directory,
+)
 from .local_file_query import (
     LocalFileQueryBackend,
     LocalFileQueryLimits,
@@ -60,7 +67,7 @@ _SEARCH_NOISE_DIRECTORIES = frozenset(
         "node_modules",
     }
 )
-_RESTRICTED_DIRECTORY_NAMES = frozenset({".aws", ".gnupg", ".ssh"})
+_RESTRICTED_DIRECTORY_NAMES = frozenset({".aws", ".daita", ".gnupg", ".ssh"})
 _RESTRICTED_FILE_NAMES = frozenset(
     {
         ".netrc",
@@ -78,7 +85,7 @@ _T = TypeVar("_T")
 
 
 class LocalWorkspaceError(RuntimeError):
-    """One normalized workspace failure that never includes the absolute root."""
+    """One normalized local-file failure."""
 
     def __init__(
         self,
@@ -204,6 +211,7 @@ class LocalFileQueryBinding:
 
     workspace_id: str
     relative_path: str
+    qualified_path: str
     format: str
     physical_revision: str
     device: int
@@ -238,6 +246,7 @@ class LocalFileQueryBinding:
     def result_mapping(self) -> dict[str, object]:
         return {
             "path": self.relative_path,
+            "qualified_path": self.qualified_path,
             "physical_revision": self.physical_revision,
         }
 
@@ -247,12 +256,12 @@ class LocalFileQueryBinding:
         except OSError as error:
             raise LocalWorkspaceError(
                 "file_changed",
-                "A bound workspace file became unavailable during the query.",
+                "A bound local file became unavailable during the query.",
             ) from error
         if _physical_revision(current) != self.physical_revision:
             raise LocalWorkspaceError(
                 "file_changed",
-                "A bound workspace file changed during the query.",
+                "A bound local file changed during the query.",
             )
 
 
@@ -262,6 +271,7 @@ class LocalFileQueryManifest:
 
     workspace_id: str
     path_pattern: str
+    qualified_path_pattern: str
     format: str
     bindings: tuple[LocalFileQueryBinding, ...]
     input_bytes: int
@@ -305,6 +315,7 @@ class LocalBoundFileObservation:
     """One fully observed current bound file used only by code-owned consumers."""
 
     binding: LocalFileBinding
+    qualified_path: str
     content: bytes
     content_sha256: str
 
@@ -315,8 +326,10 @@ class LocalBoundFileTarget:
 
     workspace_id: str
     relative_path: str
+    display_path: str
     filename: str
     _admitted_root_path: Path = field(repr=False, compare=False)
+    _protected_identities: frozenset[tuple[int, int]] = field(repr=False, compare=False)
     parent_descriptor: int
     parent_device: int
     parent_inode: int
@@ -350,6 +363,8 @@ class LocalBoundFileTarget:
 @dataclass(frozen=True, slots=True)
 class LocalFileSearchMatch:
     path: str
+    qualified_path: str
+    workspace_id: str = field(repr=False)
     match_kind: Literal["path", "content"]
     line: int | None
     excerpt: str | None
@@ -360,6 +375,7 @@ class LocalFileSearchMatch:
     def to_mapping(self) -> dict[str, object]:
         return {
             "path": self.path,
+            "qualified_path": self.qualified_path,
             "match_kind": self.match_kind,
             "line": self.line,
             "excerpt": self.excerpt,
@@ -370,12 +386,37 @@ class LocalFileSearchMatch:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalFileSearchCoverage:
+    path: str
+    status: Literal["complete", "partial", "failed", "unsearched", "deduplicated"]
+    scanned_entries: int
+    scanned_content_bytes: int
+    truncation_reasons: tuple[str, ...]
+    error_code: str | None = None
+    error_message: str | None = None
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "status": self.status,
+            "scanned_entries": self.scanned_entries,
+            "scanned_content_bytes": self.scanned_content_bytes,
+            "truncation_reasons": self.truncation_reasons,
+            "error_code": self.error_code,
+            "error_message": self.error_message,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class LocalFileSearchResult:
     matches: tuple[LocalFileSearchMatch, ...]
     scanned_entries: int
     scanned_content_bytes: int
+    scan_complete: bool
     truncated: bool
     truncation_reasons: tuple[str, ...]
+    coverage: tuple[LocalFileSearchCoverage, ...]
+    anchor_bindings: tuple[tuple[str, str], ...] = field(repr=False)
 
     def to_mapping(self) -> FrozenJsonObject:
         return FrozenJsonObject.from_mapping(
@@ -383,8 +424,33 @@ class LocalFileSearchResult:
                 "matches": [item.to_mapping() for item in self.matches],
                 "scanned_entries": self.scanned_entries,
                 "scanned_content_bytes": self.scanned_content_bytes,
+                "scan_complete": self.scan_complete,
                 "truncated": self.truncated,
                 "truncation_reasons": self.truncation_reasons,
+                "coverage": [item.to_mapping() for item in self.coverage],
+            }
+        )
+
+    def provenance_mapping(self) -> FrozenJsonObject:
+        bindings: dict[tuple[str, str, str], dict[str, object]] = {}
+        for match in self.matches:
+            key = (match.workspace_id, match.path, match.physical_revision)
+            bindings[key] = {
+                "workspace_id": match.workspace_id,
+                "relative_path": match.path,
+                "physical_revision": match.physical_revision,
+            }
+        return FrozenJsonObject.from_mapping(
+            {
+                "authority": "local_workspace_binding",
+                "anchors": tuple(
+                    {
+                        "workspace_id": workspace_id,
+                        "relative_path": relative_path,
+                    }
+                    for workspace_id, relative_path in self.anchor_bindings
+                ),
+                "bindings": tuple(bindings[key] for key in sorted(bindings)),
             }
         )
 
@@ -392,6 +458,8 @@ class LocalFileSearchResult:
 @dataclass(frozen=True, slots=True)
 class LocalFileReadResult:
     path: str
+    qualified_path: str
+    workspace_id: str = field(repr=False)
     binding: str
     media_type: str
     encoding: str
@@ -408,6 +476,7 @@ class LocalFileReadResult:
         return FrozenJsonObject.from_mapping(
             {
                 "path": self.path,
+                "qualified_path": self.qualified_path,
                 "binding": self.binding,
                 "media_type": self.media_type,
                 "encoding": self.encoding,
@@ -422,6 +491,16 @@ class LocalFileReadResult:
             }
         )
 
+    def provenance_mapping(self) -> FrozenJsonObject:
+        return FrozenJsonObject.from_mapping(
+            {
+                "authority": "local_workspace_binding",
+                "workspace_id": self.workspace_id,
+                "relative_path": self.path,
+                "physical_revision": self.physical_revision,
+            }
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class _RootDescriptor:
@@ -429,6 +508,13 @@ class _RootDescriptor:
     descriptor: int
     device: int
     inode: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedLocation:
+    root: _RootDescriptor
+    relative_path: str
+    qualified_path: str
 
 
 @dataclass(slots=True)
@@ -446,15 +532,20 @@ class _SearchState:
     scanned_content_bytes: int = 0
     total_matches: int = 0
     reasons: list[str] | None = None
+    root_reasons: list[str] | None = None
     stop: bool = False
 
     def __post_init__(self) -> None:
         self.reasons = []
+        self.root_reasons = []
 
     def limit(self, reason: str, *, stop: bool = False) -> None:
         assert self.reasons is not None
         if reason not in self.reasons:
             self.reasons.append(reason)
+        assert self.root_reasons is not None
+        if reason not in self.root_reasons:
+            self.root_reasons.append(reason)
         self.stop = self.stop or stop
 
     def check(self) -> None:
@@ -473,11 +564,14 @@ class _QueryPatternState:
     root: _RootDescriptor
     workspace_id: str
     pattern: str
+    qualified_pattern: str
     limits: LocalWorkspaceLimits
     observed_at: str
     cancellation: threading.Event
     deadline: float
     bindings: dict[str, LocalFileQueryBinding]
+    protected_identities: frozenset[tuple[int, int]]
+    protected_paths: tuple[Path, ...]
     scanned_entries: int = 0
     input_bytes: int = 0
 
@@ -494,26 +588,38 @@ class _QueryPatternState:
         if self.scanned_entries > self.limits.max_search_entries:
             raise LocalWorkspaceError(
                 "file_pattern_too_broad",
-                "The file pattern traversed too many workspace entries.",
+                "The file pattern traversed too many local entries.",
                 {"limit": self.limits.max_search_entries},
             )
 
 
 class LocalWorkspaceBackend:
-    """One agent-owned descriptor, token secret, and worker lifecycle."""
+    """One shared descriptor-contained backend for bounded and computer access."""
 
     def __init__(
         self,
         *,
         workspace: LocalWorkspace,
         root: _RootDescriptor,
+        roots: tuple[_RootDescriptor, ...],
+        user_home: Path,
+        known_directories: Mapping[str, Path | None],
+        protected_paths: tuple[Path, ...],
+        protected_identities: frozenset[tuple[int, int]],
         limits: LocalWorkspaceLimits,
         clock: Callable[[], datetime],
         query_backend: LocalFileQueryBackend,
     ) -> None:
         self.workspace_id = _workspace_id(root)
         self.sensitivity = workspace.sensitivity
+        self.access = workspace.access
         self._root = root
+        self._roots = roots
+        self._roots_by_id = {_workspace_id(item): item for item in roots}
+        self._user_home = user_home
+        self._known_directories = dict(known_directories)
+        self._protected_paths = protected_paths
+        self._protected_identities = protected_identities
         self._limits = limits
         self._clock = clock
         self._query_backend = query_backend
@@ -533,23 +639,40 @@ class LocalWorkspaceBackend:
         limits: LocalWorkspaceLimits | None = None,
         query_limits: LocalFileQueryLimits | None = None,
         clock: Callable[[], datetime] | None = None,
-    ) -> "LocalWorkspaceBackend":
+        user_home: Path | None = None,
+        known_directories: Mapping[str, Path] | None = None,
+    ) -> LocalWorkspaceBackend:
         if not isinstance(workspace, LocalWorkspace):
             raise TypeError("workspace must be LocalWorkspace")
         if not isinstance(agent_root, Path) or not isinstance(agent_home, Path):
             raise TypeError("agent root and home must be pathlib.Path")
+        if user_home is not None and not isinstance(user_home, Path):
+            raise TypeError("user_home must be pathlib.Path or None")
+        if known_directories is not None and (
+            not isinstance(known_directories, Mapping)
+            or any(
+                name not in {"Downloads", "Documents", "Desktop"}
+                or not isinstance(path, Path)
+                for name, path in known_directories.items()
+            )
+        ):
+            raise TypeError(
+                "known_directories must map supported names to pathlib.Path"
+            )
         resolved_limits = limits or LocalWorkspaceLimits()
         resolved_clock = clock or (lambda: datetime.now(UTC))
         worker = asyncio.create_task(
             asyncio.to_thread(
-                _admit_root,
+                _admit_roots,
                 workspace,
                 agent_root,
                 agent_home,
+                user_home,
+                known_directories,
             )
         )
         try:
-            root = await asyncio.shield(worker)
+            admitted_values = await asyncio.shield(worker)
         except asyncio.CancelledError:
             while not worker.done():
                 try:
@@ -559,11 +682,25 @@ class LocalWorkspaceBackend:
                 except BaseException:
                     break
             if not worker.cancelled() and worker.exception() is None:
-                os.close(worker.result().descriptor)
+                for admitted in worker.result()[1]:
+                    os.close(admitted.descriptor)
             raise
+        (
+            root,
+            roots,
+            resolved_home,
+            resolved_known,
+            protected_paths,
+            protected_identities,
+        ) = admitted_values
         return cls(
             workspace=workspace,
             root=root,
+            roots=roots,
+            user_home=resolved_home,
+            known_directories=resolved_known,
+            protected_paths=protected_paths,
+            protected_identities=protected_identities,
             limits=resolved_limits,
             clock=resolved_clock,
             query_backend=LocalFileQueryBackend(
@@ -576,19 +713,48 @@ class LocalWorkspaceBackend:
     def closed(self) -> bool:
         return self._closed
 
+    @property
+    def working_directory(self) -> Path:
+        return self._root.path
+
+    def authorizes_anchor(self, workspace_id: str) -> bool:
+        """Return whether an authenticated physical anchor belongs to this host."""
+
+        return workspace_id in self._roots_by_id
+
+    def model_context(self) -> FrozenJsonObject:
+        """Project bounded host facts without probing or inventorying directories."""
+
+        computer = self.access is LocalFileAccess.COMPUTER
+        known = {
+            name: {
+                "path": (None if path is None else str(path)),
+                "status": "unavailable" if path is None else "resolved_unverified",
+            }
+            for name, path in sorted(self._known_directories.items())
+        }
+        return FrozenJsonObject.from_mapping(
+            {
+                "access": self.access.value,
+                "working_directory": str(self._root.path) if computer else ".",
+                "home": str(self._user_home) if computer else None,
+                "known_directories": known if computer else {},
+            }
+        )
+
     async def search(
         self,
         *,
         run_id: str,
-        query: str,
-        path: str = ".",
+        query: str | None = None,
+        path: str | None = None,
+        paths: Sequence[str] | None = None,
         mode: str = "paths",
         glob: str | None = None,
         order_by: str = "path",
     ) -> LocalFileSearchResult:
         _required_run_id(run_id)
-        query = _search_query(query)
-        relative_directory = _logical_path(path, allow_root=True)
+        raw_paths = _search_roots(path, paths)
         if mode not in {"paths", "content", "both"}:
             raise LocalWorkspaceError(
                 "search_invalid", "File search mode must be paths, content, or both."
@@ -597,29 +763,43 @@ class LocalWorkspaceBackend:
             raise LocalWorkspaceError(
                 "search_invalid", "File search order must be path or modified_desc."
             )
-        if glob is not None:
-            if (
-                not isinstance(glob, str)
-                or not glob
-                or len(glob) > _MAX_GLOB_CHARACTERS
-                or any(character in glob for character in ("/", "\\", "\x00"))
-            ):
-                raise LocalWorkspaceError(
-                    "search_invalid",
-                    "File search glob must be one bounded filename glob.",
-                )
-        descriptor = self._duplicate_root()
+        if glob is not None and (
+            not isinstance(glob, str)
+            or not glob
+            or len(glob) > _MAX_GLOB_CHARACTERS
+            or any(character in glob for character in ("/", "\\"))
+            or _invalid_text(glob)
+        ):
+            raise LocalWorkspaceError(
+                "search_invalid",
+                "File search glob must be one bounded filename glob. Use "
+                "glob='*.csv'; file_search searches subdirectories automatically. "
+                "Use path or paths to choose the starting location.",
+            )
+        query = _search_query(query, mode=mode, glob=glob)
+        resolved, initial_coverage = self._resolve_search_roots(raw_paths)
+        duplicated: list[tuple[int, int, _ResolvedLocation]] = []
+        try:
+            duplicated = [
+                (index, self._duplicate_anchor(item.root), item)
+                for index, item in resolved
+            ]
+        except BaseException:
+            for _index, descriptor, _item in duplicated:
+                os.close(descriptor)
+            raise
         cancellation = threading.Event()
         return await self._run_worker(
-            _search_sync,
-            descriptor,
-            self._root,
-            relative_directory,
+            _search_many_sync,
+            tuple(duplicated),
+            initial_coverage,
             query,
             mode,
             glob,
             order_by,
             self._limits,
+            self._protected_identities,
+            self._protected_paths,
             cancellation,
             timeout=self._limits.max_search_seconds + 1.0,
             timeout_code="search_timeout",
@@ -669,19 +849,29 @@ class LocalWorkspaceBackend:
             direction = raw_direction
         else:
             assert path is not None
-            relative_path = _logical_path(path)
+            location = self._resolve_location(path, allow_root=False)
+            relative_path = location.relative_path
             direction = "backward" if position == "end" else "forward"
-        descriptor = self._duplicate_root()
+        if cursor is not None:
+            anchor_id = _token_text(payload, "workspace_id")
+            root = self._anchor_for_workspace_id(anchor_id)
+            location = _ResolvedLocation(
+                root=root,
+                relative_path=relative_path,
+                qualified_path=self._display_path(root, relative_path),
+            )
+        descriptor = self._duplicate_anchor(location.root)
         cancellation = threading.Event()
         observed = await self._run_worker(
             _read_sync,
             descriptor,
-            self._root,
+            location.root,
             relative_path,
             expected_revision,
             next_offset,
             direction,
             self._limits,
+            self._protected_identities,
             cancellation,
             timeout=self._limits.max_read_seconds + 1.0,
             timeout_code="file_read_timeout",
@@ -696,7 +886,7 @@ class LocalWorkspaceBackend:
             content_hash,
         ) = observed
         binding = _binding_from_facts(
-            workspace_id=self.workspace_id,
+            workspace_id=_workspace_id(location.root),
             relative_path=relative_path,
             facts=facts,
             observed_at=_utc_iso(self._clock()),
@@ -713,6 +903,7 @@ class LocalWorkspaceBackend:
                 run_id,
                 {
                     "path": relative_path,
+                    "workspace_id": binding.workspace_id,
                     "physical_revision": binding.physical_revision,
                     "next_offset": (
                         end_offset if direction == "forward" else start_offset
@@ -722,6 +913,8 @@ class LocalWorkspaceBackend:
             )
         return LocalFileReadResult(
             path=relative_path,
+            qualified_path=location.qualified_path,
+            workspace_id=binding.workspace_id,
             binding=binding_token,
             media_type=_media_type(relative_path),
             encoding="utf-8",
@@ -741,22 +934,25 @@ class LocalWorkspaceBackend:
         run_id: str,
         path_pattern: str,
     ) -> LocalFileQueryManifest:
-        """Expand and retain one exact workspace-relative structured dataset."""
+        """Expand and retain one exact structured local dataset."""
 
         _required_run_id(run_id)
-        pattern_parts = _query_pattern(path_pattern)
-        descriptor = self._duplicate_root()
+        location, pattern_parts = self._resolve_query_pattern(path_pattern)
+        descriptor = self._duplicate_anchor(location.root)
         cancellation = threading.Event()
         worker: asyncio.Task[LocalFileQueryManifest] = asyncio.create_task(
             asyncio.to_thread(
                 _bind_query_manifest_sync,
                 descriptor,
-                self._root,
-                self.workspace_id,
-                path_pattern,
+                location.root,
+                _workspace_id(location.root),
+                location.relative_path,
+                location.qualified_path,
                 pattern_parts,
                 self._limits,
                 _utc_iso(self._clock()),
+                self._protected_identities,
+                self._protected_paths,
                 cancellation,
             )
         )
@@ -849,27 +1045,30 @@ class LocalWorkspaceBackend:
         """Fully observe one authenticated current-run binding without path input."""
 
         binding = self.authenticate_file_binding(run_id=run_id, token=token)
-        descriptor = self._duplicate_root()
+        root = self._anchor_for_workspace_id(binding.workspace_id)
+        descriptor = self._duplicate_anchor(root)
         cancellation = threading.Event()
         content, facts = await self._run_worker(
             _observe_bound_file_sync,
             descriptor,
-            self._root,
+            root,
             binding,
             self._limits.max_edit_source_bytes,
+            self._protected_identities,
             cancellation,
             timeout=self._limits.max_edit_seconds + 1.0,
             timeout_code="file_edit_timeout",
             timeout_message="Bounded file observation exceeded its worker time.",
         )
         current = _binding_from_facts(
-            workspace_id=self.workspace_id,
+            workspace_id=binding.workspace_id,
             relative_path=binding.relative_path,
             facts=facts,
             observed_at=_utc_iso(self._clock()),
         )
         return LocalBoundFileObservation(
             binding=current,
+            qualified_path=self._display_path(root, binding.relative_path),
             content=content,
             content_sha256="sha256:" + sha256(content).hexdigest(),
         )
@@ -884,11 +1083,7 @@ class LocalWorkspaceBackend:
     ) -> LocalBoundFileTarget:
         """Resolve one committed binding to exact open parent/target descriptors."""
 
-        if workspace_id != self.workspace_id:
-            raise LocalWorkspaceError(
-                "workspace_unavailable",
-                "The bound artifact belongs to another workspace session.",
-            )
+        root = self._anchor_for_workspace_id(workspace_id)
         logical_path = _logical_path(relative_path)
         if not isinstance(expected_content_sha256, str) or not re.fullmatch(
             r"sha256:[0-9a-f]{64}", expected_content_sha256
@@ -903,19 +1098,170 @@ class LocalWorkspaceBackend:
             raise LocalWorkspaceError(
                 "file_binding_invalid", "The committed file binding is invalid."
             )
-        descriptor = self._duplicate_root()
+        descriptor = self._duplicate_anchor(root)
         cancellation = threading.Event()
         return await self._run_bound_target_worker(
             _resolve_bound_target_sync,
             descriptor,
-            self._root,
-            self.workspace_id,
+            root,
+            workspace_id,
             logical_path,
+            self._display_path(root, logical_path),
             expected_physical_revision,
             expected_content_sha256,
             self._limits.max_edit_source_bytes,
+            self._protected_identities,
             cancellation,
         )
+
+    def _resolve_location(self, value: str, *, allow_root: bool) -> _ResolvedLocation:
+        if self.access is LocalFileAccess.WORKSPACE:
+            relative = _logical_path(value, allow_root=allow_root)
+            return _ResolvedLocation(
+                root=self._root,
+                relative_path=relative,
+                qualified_path=relative,
+            )
+        candidate = _computer_path(value, working=self._root.path, home=self._user_home)
+        self._deny_protected_path(candidate)
+        root = self._select_anchor(candidate)
+        relative = _relative_to_anchor(candidate, root.path, allow_root=allow_root)
+        return _ResolvedLocation(
+            root=root,
+            relative_path=relative,
+            qualified_path=str(candidate),
+        )
+
+    def _resolve_query_pattern(
+        self, value: str
+    ) -> tuple[_ResolvedLocation, tuple[str, ...]]:
+        if self.access is LocalFileAccess.WORKSPACE:
+            parts = _query_pattern(value)
+            return (
+                _ResolvedLocation(
+                    root=self._root,
+                    relative_path=value,
+                    qualified_path=value,
+                ),
+                parts,
+            )
+        candidate, absolute_parts = _computer_pattern(
+            value, working=self._root.path, home=self._user_home
+        )
+        literal_prefix = _literal_pattern_prefix(candidate, absolute_parts)
+        self._deny_protected_path(literal_prefix)
+        root = self._select_anchor(literal_prefix)
+        anchor_parts = root.path.parts
+        if tuple(absolute_parts[: len(anchor_parts)]) != anchor_parts:
+            raise LocalWorkspaceError(
+                "path_invalid",
+                "The local file pattern is outside admitted host anchors.",
+            )
+        relative_parts = tuple(absolute_parts[len(anchor_parts) :])
+        if not relative_parts:
+            raise LocalWorkspaceError(
+                "path_invalid", "The local file pattern must select a file."
+            )
+        relative = PurePosixPath(*relative_parts).as_posix()
+        return (
+            _ResolvedLocation(
+                root=root,
+                relative_path=relative,
+                qualified_path=candidate,
+            ),
+            _query_pattern(relative),
+        )
+
+    def _resolve_search_roots(self, values: tuple[str, ...]) -> tuple[
+        tuple[tuple[int, _ResolvedLocation], ...],
+        tuple[tuple[int, LocalFileSearchCoverage], ...],
+    ]:
+        resolved: list[tuple[int, _ResolvedLocation]] = []
+        failures: list[tuple[int, LocalFileSearchCoverage]] = []
+        for index, value in enumerate(values):
+            try:
+                resolved.append((index, self._resolve_location(value, allow_root=True)))
+            except LocalWorkspaceError as error:
+                if error.code == "path_invalid" or len(values) == 1:
+                    raise
+                failures.append(
+                    (
+                        index,
+                        LocalFileSearchCoverage(
+                            path=value,
+                            status="failed",
+                            scanned_entries=0,
+                            scanned_content_bytes=0,
+                            truncation_reasons=(),
+                            error_code=error.code,
+                            error_message=error.message,
+                        ),
+                    )
+                )
+        effective: list[tuple[int, _ResolvedLocation]] = []
+        for index, location in resolved:
+            physical = _location_path(location)
+            covering = [
+                (other_index, other)
+                for other_index, other in resolved
+                if other_index != index
+                and (
+                    _location_path(other) == physical
+                    and other_index < index
+                    or _location_path(other) in physical.parents
+                )
+            ]
+            if covering:
+                failures.append(
+                    (
+                        index,
+                        LocalFileSearchCoverage(
+                            path=location.qualified_path,
+                            status="deduplicated",
+                            scanned_entries=0,
+                            scanned_content_bytes=0,
+                            truncation_reasons=("overlapping_root",),
+                        ),
+                    )
+                )
+            else:
+                effective.append((index, location))
+        return tuple(effective), tuple(failures)
+
+    def _select_anchor(self, candidate: Path) -> _RootDescriptor:
+        anchors = [
+            item
+            for item in self._roots
+            if candidate == item.path or item.path in candidate.parents
+        ]
+        if not anchors:
+            raise LocalWorkspaceError(
+                "path_invalid", "The local path is outside admitted host anchors."
+            )
+        return max(anchors, key=lambda item: len(item.path.parts))
+
+    def _deny_protected_path(self, candidate: Path) -> None:
+        if any(
+            path == candidate or path in candidate.parents
+            for path in self._protected_paths
+        ):
+            raise LocalWorkspaceError(
+                "path_restricted", "The requested local path is security-restricted."
+            )
+
+    def _anchor_for_workspace_id(self, workspace_id: str) -> _RootDescriptor:
+        root = self._roots_by_id.get(workspace_id)
+        if root is None:
+            raise LocalWorkspaceError(
+                "workspace_unavailable",
+                "The bound artifact's exact local file anchor is unavailable.",
+            )
+        return root
+
+    def _display_path(self, root: _RootDescriptor, relative_path: str) -> str:
+        if self.access is LocalFileAccess.WORKSPACE:
+            return relative_path
+        return str(root.path / relative_path)
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -938,26 +1284,27 @@ class LocalWorkspaceBackend:
                 except BaseException:
                     break
         self._active.clear()
-        descriptor = self._root.descriptor
-        self._root = _RootDescriptor(
-            path=self._root.path,
-            descriptor=-1,
-            device=self._root.device,
-            inode=self._root.inode,
-        )
-        os.close(descriptor)
+        roots = self._roots
+        self._roots = ()
+        self._roots_by_id.clear()
+        for root in roots:
+            os.close(root.descriptor)
         self._secret = b""
 
-    def _duplicate_root(self) -> int:
-        if self._closed or self._root.descriptor < 0:
+    def _duplicate_anchor(self, root: _RootDescriptor) -> int:
+        if (
+            self._closed
+            or root.descriptor < 0
+            or not self.authorizes_anchor(_workspace_id(root))
+        ):
             raise LocalWorkspaceError(
-                "workspace_unavailable", "The local workspace session is closed."
+                "workspace_unavailable", "The local file session is closed."
             )
         try:
-            return os.dup(self._root.descriptor)
+            return os.dup(root.descriptor)
         except OSError as error:
             raise LocalWorkspaceError(
-                "workspace_unavailable", "The local workspace is unavailable."
+                "workspace_unavailable", "Local file access is unavailable."
             ) from error
 
     async def _run_worker(
@@ -1112,7 +1459,7 @@ class LocalWorkspaceBackend:
             raise LocalWorkspaceError(invalid_code, invalid_message)
         if (
             payload.get("purpose") != purpose
-            or payload.get("workspace_id") != self.workspace_id
+            or payload.get("workspace_id") not in self._roots_by_id
             or payload.get("run_id") != run_id
         ):
             if payload.get("run_id") != run_id:
@@ -1155,28 +1502,113 @@ def _close_query_manifest_result(
     manifest.close()
 
 
-def _admit_root(
+def _admit_roots(
     workspace: LocalWorkspace,
     agent_root: Path,
     agent_home: Path,
-) -> _RootDescriptor:
+    user_home: Path | None,
+    known_directories: Mapping[str, Path] | None,
+) -> tuple[
+    _RootDescriptor,
+    tuple[_RootDescriptor, ...],
+    Path,
+    Mapping[str, Path | None],
+    tuple[Path, ...],
+    frozenset[tuple[int, int]],
+]:
     _require_supported_platform()
     try:
         state_root = agent_root.resolve(strict=True)
         state_home = agent_home.resolve(strict=True)
+        resolved_home = (Path.home() if user_home is None else user_home).resolve(
+            strict=True
+        )
     except (OSError, RuntimeError) as error:
         raise LocalWorkspaceError(
             "workspace_state_unavailable",
-            "Daita state paths could not be validated for workspace admission.",
+            "Daita state and user paths could not be validated for local file access.",
         ) from error
-    if paths_overlap(workspace.root, state_root) or paths_overlap(
-        workspace.root, state_home
+    if workspace.access is LocalFileAccess.WORKSPACE and (
+        paths_overlap(workspace.root, state_root)
+        or paths_overlap(workspace.root, state_home)
     ):
         raise LocalWorkspaceError(
             "workspace_state_overlap",
             "The workspace and private Daita state must not contain one another.",
         )
-    return _open_root(workspace.root)
+    if workspace.access is LocalFileAccess.COMPUTER and (
+        workspace.root == state_root
+        or state_root in workspace.root.parents
+        or workspace.root == state_home
+        or state_home in workspace.root.parents
+    ):
+        raise LocalWorkspaceError(
+            "workspace_state_overlap",
+            "The working directory cannot be inside private Daita state.",
+        )
+    if _path_has_restricted_component(workspace.root):
+        raise LocalWorkspaceError(
+            "path_restricted",
+            "The working directory is security-restricted.",
+        )
+
+    protected: list[Path] = [state_root, state_home]
+    default_state = resolved_home / ".daita"
+    if default_state.exists() or default_state.is_symlink():
+        try:
+            default_state = default_state.resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise LocalWorkspaceError(
+                "workspace_state_unavailable",
+                "The default Daita state path could not be validated.",
+            ) from error
+        protected.append(default_state)
+    protected_paths = tuple(
+        dict.fromkeys(sorted(protected, key=lambda item: len(item.parts)))
+    )
+    protected_identities: set[tuple[int, int]] = set()
+    for path in protected_paths:
+        try:
+            facts = path.stat()
+        except OSError as error:
+            raise LocalWorkspaceError(
+                "workspace_state_unavailable",
+                "A private Daita state path could not be validated.",
+            ) from error
+        protected_identities.add((int(facts.st_dev), int(facts.st_ino)))
+
+    anchor_paths = [workspace.root]
+    if workspace.access is LocalFileAccess.COMPUTER:
+        anchor_paths.extend((resolved_home, Path(workspace.root.anchor)))
+    unique_paths = tuple(dict.fromkeys(anchor_paths))
+    roots: list[_RootDescriptor] = []
+    try:
+        roots.extend(_open_root(path) for path in unique_paths)
+    except BaseException:
+        for root in roots:
+            os.close(root.descriptor)
+        raise
+
+    resolved_known: dict[str, Path | None] = {}
+    supplied = {} if known_directories is None else dict(known_directories)
+    for name in ("Downloads", "Documents", "Desktop"):
+        try:
+            candidate = supplied.get(name)
+            if candidate is None:
+                candidate = resolve_os_known_directory(name, user_home=resolved_home)
+            if not candidate.is_absolute():
+                raise OSError("known directory is not absolute")
+            resolved_known[name] = Path(os.path.abspath(os.fspath(candidate)))
+        except (OSError, RuntimeError, ValueError):
+            resolved_known[name] = None
+    return (
+        roots[0],
+        tuple(roots),
+        resolved_home,
+        resolved_known,
+        protected_paths,
+        frozenset(protected_identities),
+    )
 
 
 def _require_supported_platform() -> None:
@@ -1188,7 +1620,7 @@ def _require_supported_platform() -> None:
     ):
         raise LocalWorkspaceError(
             "workspace_platform_unsupported",
-            "This platform cannot provide secure descriptor-relative workspace access.",
+            "This platform cannot provide secure descriptor-relative local file access.",
         )
 
 
@@ -1215,21 +1647,21 @@ def _open_root(path: Path) -> _RootDescriptor:
         for component in path.parts[1:]:
             direct = os.stat(component, dir_fd=descriptor, follow_symlinks=False)
             if not stat.S_ISDIR(direct.st_mode) or stat.S_ISLNK(direct.st_mode):
-                raise OSError("workspace component is not a real directory")
+                raise OSError("local file anchor component is not a real directory")
             child = os.open(component, _root_flags(), dir_fd=descriptor)
             descriptors.append(child)
             child_opened = os.fstat(child)
             if not stat.S_ISDIR(child_opened.st_mode) or not _same_identity(
                 direct, child_opened
             ):
-                raise OSError("workspace component changed during admission")
+                raise OSError("local file anchor changed during admission")
             bindings.append((descriptor, component, child))
             descriptor = child
             opened = child_opened
         for parent, component, child in bindings:
             current = os.stat(component, dir_fd=parent, follow_symlinks=False)
             if not _same_identity(current, os.fstat(child)):
-                raise OSError("workspace component changed during admission")
+                raise OSError("local file anchor changed during admission")
         for ancestor in descriptors[:-1]:
             os.close(ancestor)
         return _RootDescriptor(
@@ -1245,7 +1677,7 @@ def _open_root(path: Path) -> _RootDescriptor:
             except OSError:
                 pass
         raise LocalWorkspaceError(
-            "workspace_unavailable", "The local workspace could not be admitted safely."
+            "workspace_unavailable", "Local file access could not be admitted safely."
         ) from error
 
 
@@ -1255,7 +1687,7 @@ def _verify_root_path(expected: _RootDescriptor) -> None:
         if (actual.device, actual.inode) != (expected.device, expected.inode):
             raise LocalWorkspaceError(
                 "workspace_identity_changed",
-                "The local workspace identity changed after admission.",
+                "The local file anchor changed after admission.",
             )
     finally:
         os.close(actual.descriptor)
@@ -1293,20 +1725,26 @@ def _bind_query_manifest_sync(
     root: _RootDescriptor,
     workspace_id: str,
     pattern: str,
+    qualified_pattern: str,
     pattern_parts: tuple[str, ...],
     limits: LocalWorkspaceLimits,
     observed_at: str,
+    protected_identities: frozenset[tuple[int, int]],
+    protected_paths: tuple[Path, ...],
     cancellation: threading.Event,
 ) -> LocalFileQueryManifest:
     state = _QueryPatternState(
         root=root,
         workspace_id=workspace_id,
         pattern=pattern,
+        qualified_pattern=qualified_pattern,
         limits=limits,
         observed_at=observed_at,
         cancellation=cancellation,
         deadline=time.monotonic() + limits.max_query_binding_seconds,
         bindings={},
+        protected_identities=protected_identities,
+        protected_paths=protected_paths,
     )
     completed = False
     try:
@@ -1315,7 +1753,7 @@ def _bind_query_manifest_sync(
         if (int(opened.st_dev), int(opened.st_ino)) != (root.device, root.inode):
             raise LocalWorkspaceError(
                 "workspace_identity_changed",
-                "The local workspace identity changed after admission.",
+                "The local file anchor changed after admission.",
             )
         _expand_query_pattern(
             root_descriptor,
@@ -1329,7 +1767,7 @@ def _bind_query_manifest_sync(
         if not state.bindings:
             raise LocalWorkspaceError(
                 "file_pattern_empty",
-                "The workspace file pattern matched no supported regular files.",
+                "The local file pattern matched no supported regular files.",
             )
         bindings = tuple(
             state.bindings[path]
@@ -1366,6 +1804,7 @@ def _bind_query_manifest_sync(
         result = LocalFileQueryManifest(
             workspace_id=workspace_id,
             path_pattern=pattern,
+            qualified_path_pattern=qualified_pattern,
             format=format_name,
             bindings=bindings,
             input_bytes=state.input_bytes,
@@ -1381,7 +1820,7 @@ def _bind_query_manifest_sync(
     except OSError as error:
         raise LocalWorkspaceError(
             "workspace_unavailable",
-            "The workspace file pattern could not be bound safely.",
+            "The local file pattern could not be bound safely.",
         ) from error
     finally:
         os.close(root_descriptor)
@@ -1418,7 +1857,7 @@ def _expand_query_pattern(
         if depth >= state.limits.max_search_depth:
             raise LocalWorkspaceError(
                 "file_pattern_too_broad",
-                "The file pattern exceeded the workspace recursion bound.",
+                "The file pattern exceeded the local recursion bound.",
                 {"limit": state.limits.max_search_depth},
             )
         for name in _query_directory_names(directory_descriptor, state):
@@ -1433,8 +1872,14 @@ def _expand_query_pattern(
             except OSError as error:
                 raise LocalWorkspaceError(
                     "workspace_unavailable",
-                    "The workspace changed during file-pattern expansion.",
+                    "The local directory changed during file-pattern expansion.",
                 ) from error
+            if _protected_identity(before, state.protected_identities):
+                continue
+            if _protected_location(
+                state.root.path.joinpath(*parents, name), state.protected_paths
+            ):
+                continue
             if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
                 continue
             child = _open_checked_directory(directory_descriptor, name, before)
@@ -1466,19 +1911,35 @@ def _expand_query_pattern(
         except OSError as error:
             raise LocalWorkspaceError(
                 "workspace_unavailable",
-                "The workspace changed during file-pattern expansion.",
+                "The local directory changed during file-pattern expansion.",
             ) from error
         if stat.S_ISLNK(before.st_mode):
             raise LocalWorkspaceError(
                 "symlink_not_allowed",
-                "Workspace file patterns cannot traverse or select symlinks.",
+                "Local file patterns cannot traverse or select symlinks.",
             )
+        if _protected_identity(before, state.protected_identities):
+            if not _pattern_has_magic(segment):
+                raise LocalWorkspaceError(
+                    "path_restricted",
+                    "The requested local file pattern is security-restricted.",
+                )
+            continue
+        if _protected_location(
+            state.root.path.joinpath(*parents, name), state.protected_paths
+        ):
+            if not _pattern_has_magic(segment):
+                raise LocalWorkspaceError(
+                    "path_restricted",
+                    "The requested local file pattern is security-restricted.",
+                )
+            continue
         if last:
             if not stat.S_ISREG(before.st_mode):
                 if not _pattern_has_magic(segment):
                     raise LocalWorkspaceError(
                         "not_regular_file",
-                        "The workspace file pattern selected a non-regular file.",
+                        "The local file pattern selected a non-regular file.",
                     )
                 continue
             _bind_query_file(directory_descriptor, parents, name, before, state)
@@ -1487,13 +1948,13 @@ def _expand_query_pattern(
             if not _pattern_has_magic(segment):
                 raise LocalWorkspaceError(
                     "path_invalid",
-                    "A workspace file-pattern component is not a directory.",
+                    "A local file-pattern component is not a directory.",
                 )
             continue
         if depth >= state.limits.max_search_depth:
             raise LocalWorkspaceError(
                 "file_pattern_too_broad",
-                "The file pattern exceeded the workspace recursion bound.",
+                "The file pattern exceeded the local recursion bound.",
                 {"limit": state.limits.max_search_depth},
             )
         child = _open_checked_directory(directory_descriptor, name, before)
@@ -1529,7 +1990,7 @@ def _query_directory_names(
     except OSError as error:
         raise LocalWorkspaceError(
             "workspace_unavailable",
-            "A workspace directory became unavailable during file-pattern expansion.",
+            "A local directory became unavailable during file-pattern expansion.",
         ) from error
     for _name in names:
         state.count_entry()
@@ -1575,6 +2036,9 @@ def _bind_query_file(
         binding = LocalFileQueryBinding(
             workspace_id=state.workspace_id,
             relative_path=relative_path,
+            qualified_path=_qualified_pattern_match(
+                state.root.path, relative_path, state.qualified_pattern
+            ),
             format=format_name,
             physical_revision=_physical_revision(facts),
             device=int(facts.st_dev),
@@ -1597,17 +2061,19 @@ def _bind_query_file(
             os.close(descriptor)
 
 
-def _search_sync(
-    root_descriptor: int,
-    root: _RootDescriptor,
-    relative_directory: str,
+def _search_many_sync(
+    roots: tuple[tuple[int, int, _ResolvedLocation], ...],
+    initial_coverage: tuple[tuple[int, LocalFileSearchCoverage], ...],
     query: str,
     mode: str,
     glob: str | None,
     order_by: str,
     limits: LocalWorkspaceLimits,
+    protected_identities: frozenset[tuple[int, int]],
+    protected_paths: tuple[Path, ...],
     cancellation: threading.Event,
 ) -> LocalFileSearchResult:
+    open_descriptors = {descriptor for _index, descriptor, _location in roots}
     state = _SearchState(
         query=query,
         query_folded=query.casefold(),
@@ -1619,45 +2085,148 @@ def _search_sync(
         deadline=time.monotonic() + limits.max_search_seconds,
         matches=[],
     )
-    directory_descriptor = root_descriptor
+    coverage = dict(initial_coverage)
+    if any(item.status == "failed" for item in coverage.values()):
+        state.limit("root_unavailable")
     try:
-        _verify_root_path(root)
-        root_opened = os.fstat(root_descriptor)
-        if (int(root_opened.st_dev), int(root_opened.st_ino)) != (
-            root.device,
-            root.inode,
-        ):
-            raise LocalWorkspaceError(
-                "workspace_identity_changed",
-                "The local workspace identity changed after admission.",
-            )
-        parents = (
-            () if relative_directory == "." else PurePosixPath(relative_directory).parts
-        )
-        for component in parents:
-            _deny_restricted_component(component)
-            before = os.stat(
-                component, dir_fd=directory_descriptor, follow_symlinks=False
-            )
-            if stat.S_ISLNK(before.st_mode):
-                raise LocalWorkspaceError(
-                    "symlink_not_allowed", "Workspace paths cannot traverse symlinks."
+        for index, root_descriptor, location in roots:
+            state.check()
+            if state.scanned_entries >= limits.max_search_entries:
+                state.limit("entry_limit", stop=True)
+            if (
+                mode in {"content", "both"}
+                and state.scanned_content_bytes >= limits.max_content_scan_bytes
+            ):
+                state.limit("content_byte_limit", stop=True)
+            if state.stop:
+                coverage[index] = LocalFileSearchCoverage(
+                    path=location.qualified_path,
+                    status="unsearched",
+                    scanned_entries=0,
+                    scanned_content_bytes=0,
+                    truncation_reasons=("shared_budget_exhausted",),
                 )
-            if not stat.S_ISDIR(before.st_mode):
-                raise LocalWorkspaceError(
-                    "not_directory", "The file-search path is not a directory."
+                os.close(root_descriptor)
+                open_descriptors.discard(root_descriptor)
+                continue
+            entry_start = state.scanned_entries
+            content_start = state.scanned_content_bytes
+            state.root_reasons = []
+            directory_descriptor = root_descriptor
+            try:
+                _verify_root_path(location.root)
+                root_opened = os.fstat(root_descriptor)
+                if (int(root_opened.st_dev), int(root_opened.st_ino)) != (
+                    location.root.device,
+                    location.root.inode,
+                ):
+                    raise LocalWorkspaceError(
+                        "workspace_identity_changed",
+                        "The local file anchor identity changed after admission.",
+                    )
+                parents = (
+                    ()
+                    if location.relative_path == "."
+                    else PurePosixPath(location.relative_path).parts
                 )
-            child = _open_checked_directory(directory_descriptor, component, before)
-            if directory_descriptor != root_descriptor:
-                os.close(directory_descriptor)
-            directory_descriptor = child
-        _scan_directory(directory_descriptor, parents, depth=0, state=state)
+                for component in parents:
+                    _deny_restricted_component(component)
+                    before = os.stat(
+                        component,
+                        dir_fd=directory_descriptor,
+                        follow_symlinks=False,
+                    )
+                    if _protected_identity(before, protected_identities):
+                        raise LocalWorkspaceError(
+                            "path_restricted",
+                            "The requested local search path is security-restricted.",
+                        )
+                    if stat.S_ISLNK(before.st_mode):
+                        raise LocalWorkspaceError(
+                            "symlink_not_allowed",
+                            "Local file paths cannot traverse symlinks.",
+                        )
+                    if not stat.S_ISDIR(before.st_mode):
+                        raise LocalWorkspaceError(
+                            "not_directory", "The file-search path is not a directory."
+                        )
+                    child = _open_checked_directory(
+                        directory_descriptor, component, before
+                    )
+                    if directory_descriptor != root_descriptor:
+                        os.close(directory_descriptor)
+                    directory_descriptor = child
+                _scan_directory(
+                    directory_descriptor,
+                    parents,
+                    depth=0,
+                    state=state,
+                    root=location.root,
+                    absolute_locators=Path(location.qualified_path).is_absolute(),
+                    protected_identities=protected_identities,
+                    protected_paths=protected_paths,
+                )
+            except _WorkerCancelled:
+                raise
+            except LocalWorkspaceError as error:
+                if len(roots) + len(initial_coverage) == 1:
+                    raise
+                state.limit("root_unavailable")
+                coverage[index] = LocalFileSearchCoverage(
+                    path=location.qualified_path,
+                    status="failed",
+                    scanned_entries=state.scanned_entries - entry_start,
+                    scanned_content_bytes=state.scanned_content_bytes - content_start,
+                    truncation_reasons=(),
+                    error_code=error.code,
+                    error_message=error.message,
+                )
+            except OSError as error:
+                normalized = _search_root_os_error(error)
+                if len(roots) + len(initial_coverage) == 1:
+                    raise normalized from error
+                state.limit("root_unavailable")
+                coverage[index] = LocalFileSearchCoverage(
+                    path=location.qualified_path,
+                    status="failed",
+                    scanned_entries=state.scanned_entries - entry_start,
+                    scanned_content_bytes=state.scanned_content_bytes - content_start,
+                    truncation_reasons=(),
+                    error_code=normalized.code,
+                    error_message=normalized.message,
+                )
+            else:
+                root_reasons = tuple(state.root_reasons or ())
+                incomplete = any(
+                    reason
+                    in {
+                        "time_limit",
+                        "entry_limit",
+                        "depth_limit",
+                        "entry_unavailable",
+                        "content_byte_limit",
+                        "result_limit",
+                    }
+                    for reason in root_reasons
+                )
+                coverage[index] = LocalFileSearchCoverage(
+                    path=location.qualified_path,
+                    status="partial" if incomplete else "complete",
+                    scanned_entries=state.scanned_entries - entry_start,
+                    scanned_content_bytes=state.scanned_content_bytes - content_start,
+                    truncation_reasons=root_reasons,
+                )
+            finally:
+                if directory_descriptor != root_descriptor:
+                    os.close(directory_descriptor)
+                os.close(root_descriptor)
+                open_descriptors.discard(root_descriptor)
         assert state.reasons is not None
         if order_by == "modified_desc":
             state.matches.sort(
                 key=lambda item: (
                     -_modified_sort_value(item.modified_at),
-                    item.path.encode("utf-8"),
+                    item.qualified_path.encode("utf-8"),
                     item.line or 0,
                     item.match_kind,
                 )
@@ -1665,7 +2234,7 @@ def _search_sync(
         else:
             state.matches.sort(
                 key=lambda item: (
-                    item.path.encode("utf-8"),
+                    item.qualified_path.encode("utf-8"),
                     item.line or 0,
                     item.match_kind,
                 )
@@ -1673,25 +2242,33 @@ def _search_sync(
         selected = tuple(state.matches[: limits.max_search_results])
         if state.total_matches > len(selected):
             state.limit("result_limit")
+        ordered_coverage = tuple(coverage[index] for index in sorted(coverage))
+        scan_complete = all(
+            item.status in {"complete", "deduplicated"} for item in ordered_coverage
+        )
         return LocalFileSearchResult(
             matches=selected,
             scanned_entries=state.scanned_entries,
             scanned_content_bytes=state.scanned_content_bytes,
+            scan_complete=scan_complete,
             truncated=bool(state.reasons),
             truncation_reasons=tuple(state.reasons),
+            coverage=ordered_coverage,
+            anchor_bindings=tuple(
+                sorted(
+                    {
+                        (_workspace_id(location.root), location.relative_path)
+                        for _index, _descriptor, location in roots
+                    }
+                )
+            ),
         )
-    except _WorkerCancelled:
-        raise
-    except LocalWorkspaceError:
-        raise
-    except OSError as error:
-        raise LocalWorkspaceError(
-            "workspace_unavailable", "File search could not complete safely."
-        ) from error
     finally:
-        if directory_descriptor != root_descriptor:
-            os.close(directory_descriptor)
-        os.close(root_descriptor)
+        for descriptor in open_descriptors:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _scan_directory(
@@ -1700,6 +2277,10 @@ def _scan_directory(
     *,
     depth: int,
     state: _SearchState,
+    root: _RootDescriptor,
+    absolute_locators: bool,
+    protected_identities: frozenset[tuple[int, int]],
+    protected_paths: tuple[Path, ...],
 ) -> None:
     state.check()
     if state.stop:
@@ -1735,6 +2316,10 @@ def _scan_directory(
             continue
         if stat.S_ISLNK(before.st_mode):
             continue
+        if _protected_identity(before, protected_identities):
+            continue
+        if _protected_location(root.path.joinpath(*parents, name), protected_paths):
+            continue
         if stat.S_ISDIR(before.st_mode):
             if name.casefold() in _SEARCH_NOISE_DIRECTORIES:
                 continue
@@ -1747,7 +2332,16 @@ def _scan_directory(
                 state.limit("entry_unavailable")
                 continue
             try:
-                _scan_directory(child, (*parents, name), depth=depth + 1, state=state)
+                _scan_directory(
+                    child,
+                    (*parents, name),
+                    depth=depth + 1,
+                    state=state,
+                    root=root,
+                    absolute_locators=absolute_locators,
+                    protected_identities=protected_identities,
+                    protected_paths=protected_paths,
+                )
             finally:
                 os.close(child)
             continue
@@ -1760,7 +2354,15 @@ def _scan_directory(
         if state.mode in {"paths", "both"} and path_matches:
             _add_search_match(
                 state,
-                _search_match(relative_path, "path", before, line=None, excerpt=None),
+                _search_match(
+                    relative_path,
+                    "path",
+                    before,
+                    root=root,
+                    absolute_locator=absolute_locators,
+                    line=None,
+                    excerpt=None,
+                ),
             )
         if state.mode not in {"content", "both"}:
             continue
@@ -1791,6 +2393,8 @@ def _scan_directory(
                     relative_path,
                     "content",
                     before,
+                    root=root,
+                    absolute_locator=absolute_locators,
                     line=line,
                     excerpt=excerpt,
                 ),
@@ -1815,7 +2419,7 @@ def _add_search_match(state: _SearchState, match: LocalFileSearchMatch) -> None:
         state.matches.sort(
             key=lambda item: (
                 -_modified_sort_value(item.modified_at),
-                item.path.encode("utf-8"),
+                item.qualified_path.encode("utf-8"),
                 item.line or 0,
                 item.match_kind,
             )
@@ -1919,11 +2523,15 @@ def _search_match(
     kind: Literal["path", "content"],
     facts: os.stat_result,
     *,
+    root: _RootDescriptor,
+    absolute_locator: bool,
     line: int | None,
     excerpt: str | None,
 ) -> LocalFileSearchMatch:
     return LocalFileSearchMatch(
         path=path,
+        qualified_path=str(root.path / path) if absolute_locator else path,
+        workspace_id=_workspace_id(root),
         match_kind=kind,
         line=line,
         excerpt=excerpt,
@@ -1941,13 +2549,18 @@ def _read_sync(
     next_offset: int | None,
     direction: str,
     limits: LocalWorkspaceLimits,
+    protected_identities: frozenset[tuple[int, int]],
     cancellation: threading.Event,
 ) -> tuple[str, int, int, bool, os.stat_result, str | None]:
     descriptor = -1
     try:
         _verify_root_path(root)
         _check_cancelled(cancellation)
-        descriptor, before = _open_relative_file(root_descriptor, relative_path)
+        descriptor, before = _open_relative_file(
+            root_descriptor,
+            relative_path,
+            protected_identities=protected_identities,
+        )
         revision = _physical_revision(before)
         if expected_revision is not None and revision != expected_revision:
             raise LocalWorkspaceError(
@@ -2008,9 +2621,7 @@ def _read_sync(
             "encoding_unsupported", "The file is not valid bounded UTF-8 text."
         ) from error
     except OSError as error:
-        raise LocalWorkspaceError(
-            "file_not_found", "The requested workspace file is unavailable."
-        ) from error
+        raise _file_os_error(error) from error
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -2022,16 +2633,21 @@ def _observe_bound_file_sync(
     root: _RootDescriptor,
     binding: LocalFileBinding,
     maximum_bytes: int,
+    protected_identities: frozenset[tuple[int, int]],
     cancellation: threading.Event,
 ) -> tuple[bytes, os.stat_result]:
     descriptor = -1
     try:
         _verify_root_path(root)
         _check_cancelled(cancellation)
-        descriptor, before = _open_relative_file(root_descriptor, binding.relative_path)
+        descriptor, before = _open_relative_file(
+            root_descriptor,
+            binding.relative_path,
+            protected_identities=protected_identities,
+        )
         if _physical_revision(before) != binding.physical_revision:
             raise LocalWorkspaceError(
-                "file_changed", "The bound workspace file changed before editing."
+                "file_changed", "The bound local file changed before editing."
             )
         content = _read_all_bounded(
             descriptor,
@@ -2042,7 +2658,7 @@ def _observe_bound_file_sync(
         finished = os.fstat(descriptor)
         if not _same_file_version(before, finished):
             raise LocalWorkspaceError(
-                "file_changed", "The bound workspace file changed during editing."
+                "file_changed", "The bound local file changed during editing."
             )
         return content, finished
     finally:
@@ -2056,9 +2672,11 @@ def _resolve_bound_target_sync(
     root: _RootDescriptor,
     workspace_id: str,
     relative_path: str,
+    display_path: str,
     expected_physical_revision: str | None,
     expected_content_sha256: str,
     maximum_bytes: int,
+    protected_identities: frozenset[tuple[int, int]],
     cancellation: threading.Event,
 ) -> LocalBoundFileTarget:
     parent_descriptor = -1
@@ -2071,7 +2689,11 @@ def _resolve_bound_target_sync(
             target_descriptor,
             before,
             filename,
-        ) = _open_relative_target(root_descriptor, relative_path)
+        ) = _open_relative_target(
+            root_descriptor,
+            relative_path,
+            protected_identities=protected_identities,
+        )
         root_descriptor = -1
         revision = _physical_revision(before)
         if (
@@ -2079,7 +2701,7 @@ def _resolve_bound_target_sync(
             and revision != expected_physical_revision
         ):
             raise LocalWorkspaceError(
-                "file_changed", "The bound workspace file changed before publication."
+                "file_changed", "The bound local file changed before publication."
             )
         content = _read_all_bounded(
             target_descriptor,
@@ -2090,19 +2712,21 @@ def _resolve_bound_target_sync(
         finished = os.fstat(target_descriptor)
         if not _same_file_version(before, finished):
             raise LocalWorkspaceError(
-                "file_changed", "The bound workspace file changed during validation."
+                "file_changed", "The bound local file changed during validation."
             )
         observed_hash = "sha256:" + sha256(content).hexdigest()
         if observed_hash != expected_content_sha256:
             raise LocalWorkspaceError(
-                "file_changed", "The bound workspace file content changed."
+                "file_changed", "The bound local file content changed."
             )
         parent_facts = os.fstat(parent_descriptor)
         result = LocalBoundFileTarget(
             workspace_id=workspace_id,
             relative_path=relative_path,
+            display_path=display_path,
             filename=filename,
             _admitted_root_path=root.path,
+            _protected_identities=protected_identities,
             parent_descriptor=parent_descriptor,
             parent_device=int(parent_facts.st_dev),
             parent_inode=int(parent_facts.st_ino),
@@ -2147,7 +2771,7 @@ def _revalidate_bound_target_namespace(target: LocalBoundFileTarget) -> None:
         if _workspace_id(actual_root) != target.workspace_id:
             raise LocalWorkspaceError(
                 "workspace_identity_changed",
-                "The local workspace identity changed after admission.",
+                "The local file anchor changed after admission.",
             )
         consumed_root = root_descriptor
         root_descriptor = -1
@@ -2156,7 +2780,11 @@ def _revalidate_bound_target_namespace(target: LocalBoundFileTarget) -> None:
             target_descriptor,
             target_facts,
             filename,
-        ) = _open_relative_target(consumed_root, target.relative_path)
+        ) = _open_relative_target(
+            consumed_root,
+            target.relative_path,
+            protected_identities=target._protected_identities,
+        )
         parent_facts = os.fstat(parent_descriptor)
         if (
             filename != target.filename
@@ -2168,7 +2796,7 @@ def _revalidate_bound_target_namespace(target: LocalBoundFileTarget) -> None:
         ):
             raise LocalWorkspaceError(
                 "file_changed",
-                "The bound workspace file changed before publication.",
+                "The bound local file changed before publication.",
             )
     except LocalWorkspaceError as error:
         raise LocalWorkspaceError(
@@ -2200,7 +2828,7 @@ def _read_all_bounded(
     if size > maximum_bytes:
         raise LocalWorkspaceError(
             "file_too_large",
-            "The workspace file exceeds the bounded text-edit size.",
+            "The local file exceeds the bounded text-edit size.",
             {"limit": maximum_bytes, "observed": size},
         )
     content = bytearray()
@@ -2210,7 +2838,7 @@ def _read_all_bounded(
         chunk = os.pread(descriptor, min(_READ_CHUNK_BYTES, size - offset), offset)
         if not chunk:
             raise LocalWorkspaceError(
-                "file_changed", "The workspace file changed during full observation."
+                "file_changed", "The local file changed during full observation."
             )
         content.extend(chunk)
         offset += len(chunk)
@@ -2229,6 +2857,8 @@ def _read_all_bounded(
 def _open_relative_file(
     root_descriptor: int,
     relative_path: str,
+    *,
+    protected_identities: frozenset[tuple[int, int]],
 ) -> tuple[int, os.stat_result]:
     directory_descriptor = root_descriptor
     try:
@@ -2238,13 +2868,18 @@ def _open_relative_file(
             before = os.stat(
                 component, dir_fd=directory_descriptor, follow_symlinks=False
             )
+            if _protected_identity(before, protected_identities):
+                raise LocalWorkspaceError(
+                    "path_restricted",
+                    "The requested local path is security-restricted.",
+                )
             if stat.S_ISLNK(before.st_mode):
                 raise LocalWorkspaceError(
-                    "symlink_not_allowed", "Workspace paths cannot traverse symlinks."
+                    "symlink_not_allowed", "Local file paths cannot traverse symlinks."
                 )
             if not stat.S_ISDIR(before.st_mode):
                 raise LocalWorkspaceError(
-                    "path_invalid", "A workspace path component is not a directory."
+                    "path_invalid", "A local path component is not a directory."
                 )
             child = _open_checked_directory(directory_descriptor, component, before)
             if directory_descriptor != root_descriptor:
@@ -2253,14 +2888,18 @@ def _open_relative_file(
         name = parts[-1]
         _deny_restricted_component(name)
         before = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if _protected_identity(before, protected_identities):
+            raise LocalWorkspaceError(
+                "path_restricted", "The requested local path is security-restricted."
+            )
         if stat.S_ISLNK(before.st_mode):
             raise LocalWorkspaceError(
-                "symlink_not_allowed", "Workspace files cannot be symlinks."
+                "symlink_not_allowed", "Local files cannot be symlinks."
             )
         if not stat.S_ISREG(before.st_mode):
             raise LocalWorkspaceError(
                 "not_regular_file",
-                "The requested workspace path is not a regular file.",
+                "The requested local path is not a regular file.",
             )
         descriptor = _open_checked_file(directory_descriptor, name, before)
         return descriptor, os.fstat(descriptor)
@@ -2272,6 +2911,8 @@ def _open_relative_file(
 def _open_relative_target(
     root_descriptor: int,
     relative_path: str,
+    *,
+    protected_identities: frozenset[tuple[int, int]],
 ) -> tuple[int, int, os.stat_result, str]:
     """Consume one duplicated root and return an exact parent and target."""
 
@@ -2284,13 +2925,18 @@ def _open_relative_target(
             before = os.stat(
                 component, dir_fd=directory_descriptor, follow_symlinks=False
             )
+            if _protected_identity(before, protected_identities):
+                raise LocalWorkspaceError(
+                    "path_restricted",
+                    "The requested local path is security-restricted.",
+                )
             if stat.S_ISLNK(before.st_mode):
                 raise LocalWorkspaceError(
-                    "symlink_not_allowed", "Workspace paths cannot traverse symlinks."
+                    "symlink_not_allowed", "Local file paths cannot traverse symlinks."
                 )
             if not stat.S_ISDIR(before.st_mode):
                 raise LocalWorkspaceError(
-                    "path_invalid", "A workspace path component is not a directory."
+                    "path_invalid", "A local path component is not a directory."
                 )
             child = _open_checked_directory(directory_descriptor, component, before)
             os.close(directory_descriptor)
@@ -2298,14 +2944,18 @@ def _open_relative_target(
         name = parts[-1]
         _deny_restricted_component(name)
         before = os.stat(name, dir_fd=directory_descriptor, follow_symlinks=False)
+        if _protected_identity(before, protected_identities):
+            raise LocalWorkspaceError(
+                "path_restricted", "The requested local path is security-restricted."
+            )
         if stat.S_ISLNK(before.st_mode):
             raise LocalWorkspaceError(
-                "symlink_not_allowed", "Workspace files cannot be symlinks."
+                "symlink_not_allowed", "Local files cannot be symlinks."
             )
         if not stat.S_ISREG(before.st_mode):
             raise LocalWorkspaceError(
                 "not_regular_file",
-                "The requested workspace path is not a regular file.",
+                "The requested local path is not a regular file.",
             )
         target_descriptor = _open_checked_file(directory_descriptor, name, before)
         facts = os.fstat(target_descriptor)
@@ -2435,8 +3085,9 @@ def _logical_path(value: str, *, allow_root: bool = False) -> str:
         not isinstance(value, str)
         or not value
         or len(value) > _MAX_LOGICAL_PATH_CHARACTERS
-        or "\x00" in value
         or "\\" in value
+        or _invalid_text(value)
+        or _looks_like_url(value)
     ):
         raise LocalWorkspaceError("path_invalid", "Workspace path is invalid.")
     if allow_root and value == ".":
@@ -2459,12 +3110,11 @@ def _query_pattern(value: str) -> tuple[str, ...]:
         not isinstance(value, str)
         or not value
         or len(value) > _MAX_QUERY_PATTERN_CHARACTERS
-        or "\x00" in value
         or "\\" in value
+        or _invalid_text(value)
+        or _looks_like_url(value)
     ):
-        raise LocalWorkspaceError(
-            "path_invalid", "The workspace file pattern is invalid."
-        )
+        raise LocalWorkspaceError("path_invalid", "The local file pattern is invalid.")
     path = PurePosixPath(value)
     if (
         path.is_absolute()
@@ -2473,9 +3123,7 @@ def _query_pattern(value: str) -> tuple[str, ...]:
         or any(not _safe_pattern_segment(item) for item in path.parts)
         or sum(item == "**" for item in path.parts) > 1
     ):
-        raise LocalWorkspaceError(
-            "path_invalid", "The workspace file pattern is invalid."
-        )
+        raise LocalWorkspaceError("path_invalid", "The local file pattern is invalid.")
     for component in path.parts:
         if not _pattern_has_magic(component):
             _deny_restricted_component(component)
@@ -2529,21 +3177,215 @@ def _restricted_component(value: str) -> bool:
 def _deny_restricted_component(value: str) -> None:
     if _restricted_component(value):
         raise LocalWorkspaceError(
-            "path_restricted", "The requested workspace path is security-restricted."
+            "path_restricted", "The requested local file path is security-restricted."
         )
 
 
-def _search_query(value: str) -> str:
+def _search_query(value: str | None, *, mode: str, glob: str | None) -> str:
+    if value is None and mode == "paths" and glob is not None:
+        return ""
     if (
         not isinstance(value, str)
         or not value.strip()
         or len(value) > _MAX_QUERY_CHARACTERS
-        or "\x00" in value
+        or _invalid_text(value)
     ):
         raise LocalWorkspaceError(
             "search_invalid", "File search query must be bounded literal text."
         )
     return value
+
+
+def _search_roots(
+    path: str | None,
+    paths: Sequence[str] | None,
+) -> tuple[str, ...]:
+    if path is not None and paths is not None:
+        raise LocalWorkspaceError(
+            "search_invalid", "File search accepts path or paths, but not both."
+        )
+    if paths is not None:
+        if (
+            isinstance(paths, (str, bytes))
+            or not isinstance(paths, Sequence)
+            or not 1 <= len(paths) <= 8
+            or any(not isinstance(item, str) for item in paths)
+        ):
+            raise LocalWorkspaceError(
+                "search_invalid", "File search paths must contain 1 to 8 paths."
+            )
+        return tuple(paths)
+    if path is not None:
+        if not isinstance(path, str):
+            raise LocalWorkspaceError("path_invalid", "Local file path is invalid.")
+        return (path,)
+    return (".",)
+
+
+def _computer_path(value: str, *, working: Path, home: Path) -> Path:
+    _validate_computer_locator(value, maximum=_MAX_LOGICAL_PATH_CHARACTERS)
+    if value == "~":
+        candidate = home
+    elif value.startswith("~/"):
+        candidate = home / value[2:]
+    elif value.startswith("~"):
+        raise LocalWorkspaceError(
+            "path_invalid", "Local paths do not support another user's home shortcut."
+        )
+    else:
+        supplied = Path(value)
+        candidate = supplied if supplied.is_absolute() else working / supplied
+    return Path(os.path.abspath(os.fspath(candidate)))
+
+
+def _computer_pattern(
+    value: str,
+    *,
+    working: Path,
+    home: Path,
+) -> tuple[str, tuple[str, ...]]:
+    _validate_computer_locator(value, maximum=_MAX_QUERY_PATTERN_CHARACTERS)
+    if value == "~":
+        raise LocalWorkspaceError(
+            "path_invalid", "The local file pattern must select a file."
+        )
+    if value.startswith("~/"):
+        expanded = os.fspath(home / value[2:])
+    elif value.startswith("~"):
+        raise LocalWorkspaceError(
+            "path_invalid", "Local paths do not support another user's home shortcut."
+        )
+    elif Path(value).is_absolute():
+        expanded = value
+    else:
+        expanded = os.fspath(working / value)
+    normalized = os.path.abspath(expanded)
+    parts = Path(normalized).parts
+    if not parts or any(
+        not _safe_pattern_segment(component) for component in parts[1:]
+    ):
+        raise LocalWorkspaceError("path_invalid", "The local file pattern is invalid.")
+    if sum(component == "**" for component in parts) > 1:
+        raise LocalWorkspaceError("path_invalid", "The local file pattern is invalid.")
+    for component in parts[1:]:
+        if not _pattern_has_magic(component):
+            _deny_restricted_component(component)
+    return normalized, tuple(parts)
+
+
+def _validate_computer_locator(value: object, *, maximum: int) -> None:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > maximum
+        or "\\" in value
+        or _invalid_text(value)
+        or _looks_like_url(value)
+        or ".." in PurePosixPath(value).parts
+    ):
+        raise LocalWorkspaceError("path_invalid", "Local file path is invalid.")
+
+
+def _invalid_text(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _looks_like_url(value: str) -> bool:
+    return re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", value) is not None
+
+
+def _relative_to_anchor(candidate: Path, anchor: Path, *, allow_root: bool) -> str:
+    try:
+        relative = candidate.relative_to(anchor)
+    except ValueError as error:
+        raise LocalWorkspaceError(
+            "path_invalid", "The local path is outside its admitted host anchor."
+        ) from error
+    if not relative.parts:
+        if allow_root:
+            return "."
+        raise LocalWorkspaceError("path_invalid", "The local path must select a file.")
+    logical = PurePosixPath(*relative.parts).as_posix()
+    for component in relative.parts:
+        if not _safe_segment(component):
+            raise LocalWorkspaceError("path_invalid", "Local file path is invalid.")
+        _deny_restricted_component(component)
+    return logical
+
+
+def _literal_pattern_prefix(
+    qualified_pattern: str,
+    parts: tuple[str, ...],
+) -> Path:
+    literal: list[str] = []
+    for component in parts:
+        if _pattern_has_magic(component):
+            break
+        literal.append(component)
+    if not literal:
+        return Path(Path(qualified_pattern).anchor)
+    return Path(*literal)
+
+
+def _location_path(location: _ResolvedLocation) -> Path:
+    if location.relative_path == ".":
+        return location.root.path
+    return location.root.path / location.relative_path
+
+
+def _qualified_pattern_match(
+    root: Path,
+    relative_path: str,
+    qualified_pattern: str,
+) -> str:
+    if Path(qualified_pattern).is_absolute():
+        return str(root / relative_path)
+    return relative_path
+
+
+def _path_has_restricted_component(path: Path) -> bool:
+    return any(_restricted_component(component) for component in path.parts[1:])
+
+
+def _protected_identity(
+    facts: os.stat_result,
+    protected_identities: frozenset[tuple[int, int]],
+) -> bool:
+    return (int(facts.st_dev), int(facts.st_ino)) in protected_identities
+
+
+def _protected_location(candidate: Path, protected_paths: tuple[Path, ...]) -> bool:
+    return any(
+        path == candidate or path in candidate.parents for path in protected_paths
+    )
+
+
+def _search_root_os_error(error: OSError) -> LocalWorkspaceError:
+    if error.errno in {errno.ENOENT, errno.ENOTDIR}:
+        return LocalWorkspaceError(
+            "path_not_found", "The local file search path does not exist."
+        )
+    if error.errno in {errno.EACCES, errno.EPERM}:
+        return LocalWorkspaceError(
+            "permission_denied", "OS permissions deny the local file search path."
+        )
+    return LocalWorkspaceError(
+        "workspace_unavailable", "The local file search path became unavailable."
+    )
+
+
+def _file_os_error(error: OSError) -> LocalWorkspaceError:
+    if error.errno in {errno.ENOENT, errno.ENOTDIR}:
+        return LocalWorkspaceError(
+            "path_not_found", "The requested local file does not exist."
+        )
+    if error.errno in {errno.EACCES, errno.EPERM}:
+        return LocalWorkspaceError(
+            "permission_denied", "OS permissions deny the requested local file."
+        )
+    return LocalWorkspaceError(
+        "workspace_unavailable", "The requested local file became unavailable."
+    )
 
 
 def _required_run_id(value: str) -> None:
@@ -2558,6 +3400,7 @@ def _check_cancelled(cancellation: threading.Event) -> None:
 
 def _binding_payload(binding: LocalFileBinding) -> dict[str, object]:
     return {
+        "workspace_id": binding.workspace_id,
         "path": binding.relative_path,
         "physical_revision": binding.physical_revision,
         "device": binding.device,

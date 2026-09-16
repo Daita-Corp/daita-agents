@@ -132,7 +132,7 @@ from .storage.sqlite_records import (
     EffectResolutionDecision,
     RelationalWriteScope,
 )
-from .workspace import LocalWorkspace
+from .workspace import LocalFileAccess, LocalWorkspace
 
 __all__ = [
     "EffectReceipt",
@@ -159,6 +159,7 @@ __all__ = [
     "CalendarSchedule",
     "ConversationRun",
     "CatalogSummary",
+    "LocalFileAccess",
     "LocalWorkspace",
     "DocumentCandidateContent",
     "ConversationInboxTarget",
