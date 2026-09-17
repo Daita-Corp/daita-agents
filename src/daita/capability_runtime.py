@@ -71,6 +71,7 @@ from .loop.models import (
     ToolBatchInterruption,
     ToolBatchOutcome,
 )
+from .loop.session import RunSession
 from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from .scope import EffectiveSourceScope
 
@@ -319,6 +320,7 @@ class RunToolCatalog:
     manifest_bytes: int
     manifest_token_limit: int
     source_scope: EffectiveSourceScope | None = None
+    session: RunSession | None = field(default=None, repr=False, compare=False)
 
     @property
     def capability_ids(self) -> frozenset[str]:
@@ -355,6 +357,7 @@ class StepToolProjection:
     loaded_entries: tuple[RunToolCatalogEntry, ...]
     loaded_definition_bytes: int
     source_scope: EffectiveSourceScope | None = None
+    session: RunSession | None = field(default=None, repr=False, compare=False)
 
     def require_current(
         self,
@@ -825,6 +828,23 @@ class CapabilityRuntime:
     async def prepare_run(self, run: RunInput) -> RunToolCatalog:
         """Prepare the complete immutable applicable catalog exactly once."""
 
+        return await self._prepare_run(run, session=None)
+
+    async def prepare_session(self, session: RunSession) -> RunToolCatalog:
+        """Prepare tools from one exact immutable admitted session."""
+
+        if not isinstance(session, RunSession):
+            raise TypeError("session must be RunSession")
+        return await self._prepare_run(session.run, session=session)
+
+    async def _prepare_run(
+        self,
+        run: RunInput,
+        *,
+        session: RunSession | None,
+    ) -> RunToolCatalog:
+        """Prepare the complete immutable applicable catalog exactly once."""
+
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
         await self._validate_execution_contracts(run)
@@ -835,7 +855,7 @@ class CapabilityRuntime:
         projected: dict[str, RunToolCatalogEntry] = {}
         for owner_id in sorted(self._domains):
             domain = self._domains[owner_id]
-            for name in await domain.project(run):
+            for name in await _domain_project(domain, run, session):
                 if name in projected:
                     raise ValueError(f"tool projected by multiple domains: {name}")
                 view, capability, resolved_owner = self._registry.resolve_tool_owner(
@@ -949,6 +969,7 @@ class CapabilityRuntime:
             manifest_bytes=manifest_bytes,
             manifest_token_limit=self._limits.max_toolbox_manifest_tokens,
             source_scope=run.resolved_source_scope,
+            session=session,
         )
 
     def project(
@@ -1015,6 +1036,7 @@ class CapabilityRuntime:
             loaded_entries=loaded,
             loaded_definition_bytes=loaded_definition_bytes,
             source_scope=catalog.source_scope,
+            session=catalog.session,
         )
 
     async def execute_all(
@@ -1026,12 +1048,63 @@ class CapabilityRuntime:
         messages: tuple[CanonicalMessage, ...],
         sensitivity: ModelSensitivity,
     ) -> ToolBatchOutcome:
+        return await self._execute_all(
+            run,
+            calls,
+            projection=projection,
+            messages=messages,
+            sensitivity=sensitivity,
+            session=None,
+        )
+
+    async def execute_session(
+        self,
+        session: RunSession,
+        calls: tuple[ToolCall, ...],
+        *,
+        projection: object,
+        messages: tuple[CanonicalMessage, ...],
+        sensitivity: ModelSensitivity,
+    ) -> ToolBatchOutcome:
+        if not isinstance(session, RunSession):
+            raise TypeError("session must be RunSession")
+        return await self._execute_all(
+            session.run,
+            calls,
+            projection=projection,
+            messages=messages,
+            sensitivity=sensitivity,
+            session=session,
+        )
+
+    async def _execute_all(
+        self,
+        run: RunInput,
+        calls: tuple[ToolCall, ...],
+        *,
+        projection: object,
+        messages: tuple[CanonicalMessage, ...],
+        sensitivity: ModelSensitivity,
+        session: RunSession | None,
+    ) -> ToolBatchOutcome:
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
         if not isinstance(sensitivity, ModelSensitivity):
             raise TypeError("tool batch sensitivity must be ModelSensitivity")
         if not isinstance(projection, StepToolProjection):
             raise TypeError("projection must be StepToolProjection")
+        prepared_session = projection.session
+        if session is None:
+            if prepared_session is not None:
+                raise ValueError("step projection belongs to an admitted run session")
+        elif (
+            prepared_session is None
+            or prepared_session.run != session.run
+            or prepared_session.writer is not session.writer
+            or prepared_session.options != session.options
+            or prepared_session.evidence is not session.evidence
+        ):
+            raise ValueError("step projection belongs to a different run session")
         projection = projection.require_current(
             run_id=run.id,
             registry_digest=self._registry.digest,
@@ -1086,6 +1159,7 @@ class CapabilityRuntime:
                         resolved,
                         projection,
                         sensitivity=sensitivity,
+                        session=session,
                     )
 
         async def finish_reads() -> ToolBatchInterruption | None:
@@ -1155,6 +1229,7 @@ class CapabilityRuntime:
                         resolved,
                         projection,
                         sensitivity=sensitivity,
+                        session=session,
                     )
                 except _ToolExecutionInterrupted as interrupted:
                     results[index] = interrupted.result
@@ -1308,6 +1383,7 @@ class CapabilityRuntime:
         projection: StepToolProjection,
         *,
         sensitivity: ModelSensitivity,
+        session: RunSession | None,
     ) -> ToolResultBlock:
         if resolved.failure is not None:
             call = (
@@ -1360,6 +1436,7 @@ class CapabilityRuntime:
             resolved.entry,
             sensitivity=sensitivity,
             validated_arguments=resolved.validated_arguments,
+            session=session,
         )
 
     async def _execute_control(
@@ -1739,6 +1816,7 @@ class CapabilityRuntime:
         *,
         sensitivity: ModelSensitivity,
         validated_arguments: FrozenJsonObject | None,
+        session: RunSession | None,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
@@ -1775,12 +1853,14 @@ class CapabilityRuntime:
                 )
             else:
                 arguments = validated_arguments
-            arguments = await domain.prepare_call(
+            arguments = await _domain_prepare_call(
+                domain,
                 run,
                 call,
                 capability,
                 arguments,
                 request_sensitivity=sensitivity,
+                session=session,
             )
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id
@@ -1799,6 +1879,11 @@ class CapabilityRuntime:
                 conversation_id=run.conversation_id or run.id,
                 source_scope=run.resolved_source_scope,
                 request_sensitivity=sensitivity,
+                one_time_artifact_destinations=(
+                    ()
+                    if session is None
+                    else session.options.one_time_artifact_destinations
+                ),
             )
             if capability.operational_effect is not OperationalEffect.NONE:
                 (
@@ -1815,6 +1900,7 @@ class CapabilityRuntime:
                     domain,
                     sensitivity=sensitivity,
                     catalog_entry=entry,
+                    session=session,
                 )
             else:
                 output, artifact_ref = await self._execute_no_effect(
@@ -1825,6 +1911,7 @@ class CapabilityRuntime:
                     arguments,
                     domain,
                     sensitivity=sensitivity,
+                    session=session,
                 )
                 result = _classified_success(call, output, artifact_ref=artifact_ref)
         except _ToolExecutionInterrupted:
@@ -1862,6 +1949,7 @@ class CapabilityRuntime:
         *,
         sensitivity: ModelSensitivity,
         reserved_artifact_id: str | None = None,
+        session: RunSession | None = None,
     ) -> tuple[ToolOutput, ArtifactRef | None]:
         if capability.operational_effect is not OperationalEffect.NONE:
             raise ValueError("non-effect execution requires operational effect none")
@@ -1873,17 +1961,24 @@ class CapabilityRuntime:
             conversation_id=run.conversation_id or run.id,
             source_scope=run.resolved_source_scope,
             request_sensitivity=sensitivity,
+            one_time_artifact_destinations=(
+                ()
+                if session is None
+                else session.options.one_time_artifact_destinations
+            ),
         )
         candidate = await executor.execute(execution)
         if not isinstance(candidate, ToolOutput):
             raise ToolOutputValidationError("executor did not return ToolOutput")
-        output = await domain.finalize_output(
+        output = await _domain_finalize_output(
+            domain,
             run,
             call,
             capability,
             arguments,
             candidate,
             request_sensitivity=sensitivity,
+            session=session,
         )
         output = self._registry.validate_output(capability.id, output)
         _validate_output_execution_scope(run, capability, output)
@@ -1908,6 +2003,7 @@ class CapabilityRuntime:
         *,
         sensitivity: ModelSensitivity,
         catalog_entry: RunToolCatalogEntry,
+        session: RunSession | None,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
@@ -1943,12 +2039,14 @@ class CapabilityRuntime:
         fingerprint = await side_effect.preflight(execution)
         if not isinstance(fingerprint, FrozenJsonObject):
             raise ValueError("side-effect preflight must return FrozenJsonObject")
-        plan = await domain.side_effect_plan(
+        plan = await _domain_side_effect_plan(
+            domain,
             run,
             call,
             capability,
             execution,
             fingerprint,
+            session=session,
         )
         if capability.effect_receipt_policy is not None:
             self._validate_effect_plan(run, capability, domain, plan)
@@ -2054,6 +2152,7 @@ class CapabilityRuntime:
             plan,
             domain,
             sensitivity=sensitivity,
+            session=session,
         )
 
     async def _execute_preflighted_side_effect(
@@ -2069,6 +2168,7 @@ class CapabilityRuntime:
         domain: CapabilityDomain,
         *,
         sensitivity: ModelSensitivity,
+        session: RunSession | None,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
@@ -2077,8 +2177,14 @@ class CapabilityRuntime:
         async with self._mutation_lock:
             await self._validate_execution_contracts(run)
             if capability.effect_receipt_policy is not None:
-                current_arguments = await domain.prepare_call(
-                    run, call, capability, arguments, request_sensitivity=sensitivity
+                current_arguments = await _domain_prepare_call(
+                    domain,
+                    run,
+                    call,
+                    capability,
+                    arguments,
+                    request_sensitivity=sensitivity,
+                    session=session,
                 )
                 if current_arguments != arguments:
                     raise CapabilityInputError(
@@ -2092,12 +2198,14 @@ class CapabilityRuntime:
                         raise ValueError(
                             "side-effect preflight must return FrozenJsonObject"
                         )
-                    current_plan = await domain.side_effect_plan(
+                    current_plan = await _domain_side_effect_plan(
+                        domain,
                         run,
                         call,
                         capability,
                         execution,
                         current,
+                        session=session,
                     )
                     if (
                         capability.effect_receipt_policy is not None
@@ -2146,15 +2254,17 @@ class CapabilityRuntime:
                     plan,
                     domain,
                     sensitivity=sensitivity,
+                    session=session,
                 )
-            candidate, execution_error, interruption_kind, outcome_certainty = (
-                await _execute_definitely(
-                    side_effect,
-                    execution,
-                    recovery_timeout_seconds=(
-                        self._side_effect_recovery_timeout_seconds
-                    ),
-                )
+            (
+                candidate,
+                execution_error,
+                interruption_kind,
+                outcome_certainty,
+            ) = await _execute_definitely(
+                side_effect,
+                execution,
+                recovery_timeout_seconds=(self._side_effect_recovery_timeout_seconds),
             )
             if execution_error is not None:
                 return (
@@ -2165,13 +2275,15 @@ class CapabilityRuntime:
             if not isinstance(candidate, ToolOutput):
                 raise ToolOutputValidationError("executor did not return ToolOutput")
             output = candidate
-            output = await domain.finalize_output(
+            output = await _domain_finalize_output(
+                domain,
                 run,
                 call,
                 capability,
                 arguments,
                 output,
                 request_sensitivity=sensitivity,
+                session=session,
             )
             output = self._registry.validate_output(capability.id, output)
             _validate_output_execution_scope(run, capability, output)
@@ -2245,6 +2357,7 @@ class CapabilityRuntime:
         domain: CapabilityDomain,
         *,
         sensitivity: ModelSensitivity,
+        session: RunSession | None,
     ) -> tuple[ToolResultBlock, ToolBatchInterruption | None, ToolBatchCertainty]:
         from .storage.sqlite_records import EffectReceipt, effect_receipt_id
 
@@ -2330,12 +2443,15 @@ class CapabilityRuntime:
             )
         else:
             try:
-                candidate, execution_error, interruption, certainty = (
-                    await _execute_definitely(
-                        executor,
-                        execution,
-                        recovery_timeout_seconds=self._side_effect_recovery_timeout_seconds,
-                    )
+                (
+                    candidate,
+                    execution_error,
+                    interruption,
+                    certainty,
+                ) = await _execute_definitely(
+                    executor,
+                    execution,
+                    recovery_timeout_seconds=self._side_effect_recovery_timeout_seconds,
                 )
                 if execution_error is not None:
                     failure = domain.normalize_error(call, execution_error)
@@ -2353,13 +2469,15 @@ class CapabilityRuntime:
                         observation = self._registry.validate_effect_observation(
                             capability.id, observation
                         )
-                    output = await domain.finalize_output(
+                    output = await _domain_finalize_output(
+                        domain,
                         run,
                         call,
                         capability,
                         arguments,
                         candidate,
                         request_sensitivity=sensitivity,
+                        session=session,
                     )
                     output = self._registry.validate_output(capability.id, output)
                     _validate_output_execution_scope(run, capability, output)
@@ -3873,6 +3991,123 @@ def _error(
                 "details": {} if details is None else details,
             }
         },
+    )
+
+
+async def _domain_project(
+    domain: CapabilityDomain,
+    run: RunInput,
+    session: RunSession | None,
+) -> tuple[str, ...]:
+    project_session = getattr(domain, "project_session", None)
+    if session is not None and callable(project_session):
+        project = cast(
+            Callable[..., Awaitable[tuple[str, ...]]],
+            project_session,
+        )
+        return await project(run, session)
+    return await domain.project(run)
+
+
+async def _domain_prepare_call(
+    domain: CapabilityDomain,
+    run: RunInput,
+    call: ToolCall,
+    capability: Capability,
+    arguments: FrozenJsonObject,
+    *,
+    request_sensitivity: ModelSensitivity,
+    session: RunSession | None,
+) -> FrozenJsonObject:
+    prepare_session_call = getattr(domain, "prepare_session_call", None)
+    if session is not None and callable(prepare_session_call):
+        prepare = cast(
+            Callable[..., Awaitable[FrozenJsonObject]],
+            prepare_session_call,
+        )
+        return await prepare(
+            run,
+            call,
+            capability,
+            arguments,
+            request_sensitivity=request_sensitivity,
+            session=session,
+        )
+    return await domain.prepare_call(
+        run,
+        call,
+        capability,
+        arguments,
+        request_sensitivity=request_sensitivity,
+    )
+
+
+async def _domain_side_effect_plan(
+    domain: CapabilityDomain,
+    run: RunInput,
+    call: ToolCall,
+    capability: Capability,
+    execution: ToolExecution,
+    fingerprint: FrozenJsonObject,
+    *,
+    session: RunSession | None,
+) -> SideEffectPlan:
+    session_plan = getattr(domain, "session_side_effect_plan", None)
+    if session is not None and callable(session_plan):
+        plan = cast(
+            Callable[..., Awaitable[SideEffectPlan]],
+            session_plan,
+        )
+        return await plan(
+            run,
+            call,
+            capability,
+            execution,
+            fingerprint,
+            session=session,
+        )
+    return await domain.side_effect_plan(
+        run,
+        call,
+        capability,
+        execution,
+        fingerprint,
+    )
+
+
+async def _domain_finalize_output(
+    domain: CapabilityDomain,
+    run: RunInput,
+    call: ToolCall,
+    capability: Capability,
+    arguments: FrozenJsonObject,
+    output: ToolOutput,
+    *,
+    request_sensitivity: ModelSensitivity,
+    session: RunSession | None,
+) -> ToolOutput:
+    finalize_session_output = getattr(domain, "finalize_session_output", None)
+    if session is not None and callable(finalize_session_output):
+        finalize = cast(
+            Callable[..., Awaitable[ToolOutput]],
+            finalize_session_output,
+        )
+        return await finalize(
+            run,
+            call,
+            capability,
+            arguments,
+            output,
+            request_sensitivity=request_sensitivity,
+            session=session,
+        )
+    return await domain.finalize_output(
+        run,
+        call,
+        capability,
+        arguments,
+        output,
+        request_sensitivity=request_sensitivity,
     )
 
 

@@ -23,6 +23,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopLimits, RunInput
+from daita.loop.session import RunSessionOptions
 from daita.semantics import (
     SEMANTIC_DELETE_CAPABILITY_ID,
     SEMANTIC_DELETE_TOOL_NAME,
@@ -37,7 +38,7 @@ from daita.semantics import (
 from daita.tui.commands import (
     learning_invocation_message as _learning_invocation_message,
 )
-from tests.support.capability_runtime import execute_projected
+from tests.support.capability_runtime import execute_projected, make_run_session
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
@@ -174,7 +175,6 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
     )
     try:
         runtime = agent._embedded._capability_runtime
-        semantic_domain = agent._embedded._semantic_domain
         projection_run = RunInput(
             id="projection-run",
             agent_id=agent.id,
@@ -183,13 +183,16 @@ async def test_semantic_tools_use_fixed_identities_and_the_existing_runtime_bran
             conversation_id="projection-conversation",
             source_scope_ids=(source.id,),
         )
-        semantic_domain.select_explicit_learning_run(projection_run.id)
-        catalog = await runtime.prepare_run(projection_run)
+        catalog = await runtime.prepare_session(
+            make_run_session(
+                projection_run,
+                RunSessionOptions(explicit_learning=True),
+            )
+        )
         definitions = tuple(
             runtime._registry.tool_definition(entry.view.name)
             for entry in catalog.entries
         )
-        semantic_domain.clear_explicit_learning_run(projection_run.id)
         names = {item.name for item in definitions}
         assert {
             SEMANTIC_LIST_TOOL_NAME,
@@ -509,8 +512,6 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
             source_scope_ids=(source.id,),
         )
         runtime = agent._embedded._capability_runtime
-        semantic_domain = agent._embedded._semantic_domain
-        semantic_domain.select_explicit_learning_run(delete_run.id)
         deleted = (
             await execute_projected(
                 runtime,
@@ -526,9 +527,9 @@ async def test_semantic_replacement_and_deletion_require_current_digests(tmp_pat
                     ),
                 ),
                 sensitivity=ModelSensitivity.INTERNAL,
+                session_options=RunSessionOptions(explicit_learning=True),
             )
         )[0]
-        semantic_domain.clear_explicit_learning_run(delete_run.id)
         assert deleted.is_error is False
         assert len(approvals) == 2
         assert await agent.read_semantic_annotation("booked-revenue") is None

@@ -28,6 +28,7 @@ from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..domains.learning import LearningCandidateGuard
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput
+from ..loop.session import RunSession
 from .store import (
     MEMORY_MAX_CHARACTERS,
     MemoryStore,
@@ -185,12 +186,16 @@ class MemoryCapabilityDomain:
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
 
-    async def project(self, run: RunInput) -> tuple[str, ...]:
+    async def project(
+        self,
+        run: RunInput,
+        session: RunSession | None = None,
+    ) -> tuple[str, ...]:
         return tuple(
             view.name
             for view in self._views
             if self._learning.allows(
-                run.id,
+                session,
                 view.name,
                 effectful=(
                     self._capabilities[view.capability_id].operational_effect
@@ -198,6 +203,8 @@ class MemoryCapabilityDomain:
                 ),
             )
         )
+
+    project_session = project
 
     def normalize_arguments(
         self,
@@ -214,10 +221,13 @@ class MemoryCapabilityDomain:
         arguments: FrozenJsonObject,
         *,
         request_sensitivity: ModelSensitivity,
+        session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
-        self._learning.validate_effect(run.id, call)
+        self._learning.validate_effect(session, call)
         return arguments
+
+    prepare_session_call = prepare_call
 
     async def prepare_automation_grant(
         self,
@@ -250,8 +260,9 @@ class MemoryCapabilityDomain:
         output: ToolOutput,
         *,
         request_sensitivity: ModelSensitivity,
+        session: RunSession | None = None,
     ) -> ToolOutput:
-        self._learning.mark_effect_succeeded(run.id)
+        self._learning.mark_effect_succeeded(session, call.id)
         if output.sensitivity is not None:
             return output
         return replace(
@@ -262,6 +273,8 @@ class MemoryCapabilityDomain:
                 "capability_id": capability.id,
             },
         )
+
+    finalize_session_output = finalize_output
 
     def normalize_error(
         self,
