@@ -124,6 +124,7 @@ from ..loop.models import (
     Transcript,
     validate_completed_transcript,
 )
+from ..loop.transcripts import ConversationPredecessor
 from ..routines.models import (
     MAX_ACTIVE_ROUTINES_PER_AGENT,
     MAX_ROUTINE_ATTEMPTS,
@@ -5765,58 +5766,114 @@ class SQLiteStateStore:
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
-    async def start(self, run: RunInput) -> Transcript:
+    _UNSPECIFIED_PREDECESSOR = object()
+
+    async def start(
+        self,
+        run: RunInput,
+        *,
+        predecessor=_UNSPECIFIED_PREDECESSOR,
+    ) -> Transcript:
         if run.conversation_id is None:
             raise ValueError("run conversation_id must be resolved before persistence")
 
-        def write() -> Transcript:
-            with _connect(self.path) as connection:
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    row = connection.execute(
-                        """SELECT COALESCE(MAX(turn_index), -1) + 1
+        def write(connection: sqlite3.Connection) -> Transcript:
+            try:
+                row = connection.execute(
+                    """SELECT id, turn_index, input, result
                            FROM runs
-                           WHERE agent_id = ? AND conversation_id = ?""",
-                        (run.agent_id, run.conversation_id),
-                    ).fetchone()
-                    connection.execute(
-                        """INSERT INTO runs(
+                           WHERE agent_id = ? AND conversation_id = ?
+                           ORDER BY turn_index DESC
+                           LIMIT 1""",
+                    (run.agent_id, run.conversation_id),
+                ).fetchone()
+                if predecessor is self._UNSPECIFIED_PREDECESSOR:
+                    turn_index = 0 if row is None else int(row[1]) + 1
+                elif predecessor is None:
+                    if row is not None:
+                        raise ValueError(
+                            "conversation predecessor changed before run start"
+                        )
+                    turn_index = 0
+                else:
+                    if not isinstance(predecessor, ConversationPredecessor):
+                        raise TypeError("conversation predecessor is invalid")
+                    if (
+                        row is None
+                        or row[0] != predecessor.run_id
+                        or int(row[1]) != predecessor.turn_index
+                        or row[3] is None
+                    ):
+                        raise ValueError(
+                            "conversation predecessor changed before run start"
+                        )
+                    current_predecessor = ConversationPredecessor.from_run(
+                        ConversationRun(
+                            turn_index=int(row[1]),
+                            transcript=Transcript(run=decode_run_input(row[2])),
+                            result=decode_loop_exit(row[3]),
+                        )
+                    )
+                    if current_predecessor != predecessor:
+                        raise ValueError(
+                            "conversation predecessor changed before run start"
+                        )
+                    turn_index = predecessor.turn_index + 1
+                connection.execute(
+                    """INSERT INTO runs(
                                id, agent_id, conversation_id, turn_index, input
                            ) VALUES (?, ?, ?, ?, ?)""",
-                        (
-                            run.id,
-                            run.agent_id,
-                            run.conversation_id,
-                            int(row[0]),
-                            encode_run_input(run),
-                        ),
-                    )
-                except sqlite3.IntegrityError as error:
-                    raise ValueError(f"run already exists: {run.id}") from error
+                    (
+                        run.id,
+                        run.agent_id,
+                        run.conversation_id,
+                        turn_index,
+                        encode_run_input(run),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(f"run already exists: {run.id}") from error
             return Transcript(run=run)
 
-        return await asyncio.to_thread(write)
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def append(self, run_id: str, message: CanonicalMessage) -> None:
-        def write() -> None:
-            with _connect(self.path) as connection:
+        def position() -> int:
+            with _connect_read_only(self.path) as connection:
                 row = connection.execute(
                     "SELECT COALESCE(MAX(position), -1) + 1 FROM messages WHERE run_id = ?",
                     (run_id,),
                 ).fetchone()
-                if (
-                    connection.execute(
-                        "SELECT 1 FROM runs WHERE id = ?", (run_id,)
-                    ).fetchone()
-                    is None
-                ):
-                    raise KeyError(f"unknown run: {run_id}")
-                connection.execute(
-                    "INSERT INTO messages(run_id, position, data) VALUES (?, ?, ?)",
-                    (run_id, int(row[0]), encode_message(message)),
-                )
+                return int(row[0])
 
-        await asyncio.to_thread(write)
+        await self.append_at(run_id, await asyncio.to_thread(position), message)
+
+    async def append_at(
+        self,
+        run_id: str,
+        position: int,
+        message: CanonicalMessage,
+    ) -> None:
+        def write(connection: sqlite3.Connection) -> None:
+            run_row = connection.execute(
+                "SELECT result FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"unknown run: {run_id}")
+            if run_row[0] is not None:
+                raise ValueError(f"run is already terminal: {run_id}")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM messages WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if type(position) is not int or int(row[0]) != position:
+                raise ValueError("transcript append position is out of order")
+            connection.execute(
+                "INSERT INTO messages(run_id, position, data) VALUES (?, ?, ?)",
+                (run_id, position, encode_message(message)),
+            )
+
+        await _run_cancellation_safe_transaction(self.path, write)
 
     async def finish(self, result: LoopExit) -> None:
         if result.kind is LoopExitKind.COMPLETED:
@@ -6473,6 +6530,48 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def latest_terminal_conversation_run(
+        self,
+        agent_id: str,
+        conversation_id: str,
+    ) -> ConversationRun | None:
+        """Return the exact latest terminal revision used for writer CAS binding."""
+
+        def read() -> ConversationRun | None:
+            connection = _connect_read_only(self.path)
+            try:
+                row = connection.execute(
+                    """SELECT id, turn_index, input, result
+                       FROM runs
+                       WHERE agent_id = ? AND conversation_id = ?
+                       ORDER BY turn_index DESC LIMIT 1""",
+                    (agent_id, conversation_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                run_id, turn_index, input_data, result_data = row
+                if result_data is None:
+                    raise ValueError("latest conversation run is not terminal")
+                messages = tuple(
+                    decode_message(message_row[0])
+                    for message_row in connection.execute(
+                        "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
+                        (run_id,),
+                    )
+                )
+                return ConversationRun(
+                    turn_index=int(turn_index),
+                    transcript=Transcript(
+                        run=decode_run_input(input_data),
+                        messages=messages,
+                    ),
+                    result=decode_loop_exit(result_data),
+                )
+            finally:
+                connection.close()
+
+        return await asyncio.to_thread(read)
+
     async def _snapshots(
         self,
         agent_id: str,
@@ -6488,13 +6587,9 @@ class SQLiteStateStore:
                     generation_changed = True
                     break
                 snapshots.append(snapshot)
-            if (
-                not generation_changed
-                and refs
-                == await self.list_current_snapshot_refs(
-                    agent_id,
-                    source_ids,
-                )
+            if not generation_changed and refs == await self.list_current_snapshot_refs(
+                agent_id,
+                source_ids,
             ):
                 return tuple(snapshots)
             if attempt == 1:

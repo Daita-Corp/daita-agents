@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import replace
 
@@ -37,7 +38,10 @@ from daita.llm.models import (
     ToolCall,
     ToolDefinition,
 )
+from daita.loop.driver import InMemoryTranscriptStore
 from daita.loop.models import LoopLimits, RunInput
+from daita.loop.session import RunCancellationToken, RunSession, RunSessionOptions
+from daita.loop.transcripts import RunSessionWriter
 
 
 class StaticTestDomain:
@@ -176,8 +180,16 @@ async def execute_projected(
     calls: tuple[ToolCall, ...],
     *,
     sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+    session_options: RunSessionOptions | None = None,
 ):
-    catalog = await runtime.prepare_run(run)
+    session = (
+        None if session_options is None else make_run_session(run, session_options)
+    )
+    catalog = (
+        await runtime.prepare_run(run)
+        if session is None
+        else await runtime.prepare_session(session)
+    )
     projection = runtime.project(catalog, ())
     on_demand_names = tuple(
         sorted(
@@ -197,12 +209,10 @@ async def execute_projected(
             name="toolbox_load",
             arguments={"tool_names": on_demand_names},
         )
-        load_outcome = await runtime.execute_all(
-            run,
-            (load,),
-            projection=projection,
-            messages=(),
-            sensitivity=sensitivity,
+        execute = runtime.execute_all if session is None else runtime.execute_session
+        owner = run if session is None else session
+        load_outcome = await execute(
+            owner, (load,), projection=projection, messages=(), sensitivity=sensitivity
         )
         messages = (
             CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(load,)),
@@ -214,12 +224,27 @@ async def execute_projected(
         projection = runtime.project(catalog, messages)
     else:
         messages = ()
-    return await runtime.execute_all(
-        run,
+    execute = runtime.execute_all if session is None else runtime.execute_session
+    owner = run if session is None else session
+    return await execute(
+        owner,
         calls,
         projection=projection,
         messages=messages,
         sensitivity=sensitivity,
+    )
+
+
+def make_run_session(
+    run: RunInput,
+    options: RunSessionOptions = RunSessionOptions(),
+) -> RunSession:
+    return RunSession(
+        run=run,
+        writer=RunSessionWriter(InMemoryTranscriptStore(), run),
+        absolute_deadline=asyncio.get_running_loop().time() + 60,
+        cancellation=RunCancellationToken(),
+        options=options,
     )
 
 
