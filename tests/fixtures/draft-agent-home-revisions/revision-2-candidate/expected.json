@@ -1,0 +1,13 @@
+{
+  "entry_count": 0,
+  "ledger_digest": "sha256:bf44158c0d5d8714070ea2734dc8d8d506fe0b61b6e76bd8cafbe6e21dcbc2cc",
+  "non_database_paths": [
+    "MEMORY.md",
+    "USER.md",
+    "agent.toml",
+    "skills/golden-skill/SKILL.md"
+  ],
+  "source_revision": 1,
+  "table_count": 30,
+  "target_revision": 2
+}

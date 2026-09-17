@@ -74,6 +74,24 @@ from ..distribution.models import (
 from ..distribution.owner import construct_logical_delivery
 from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
+from ..jobs.graph.models import (
+    AttemptBudgetReservation,
+    BudgetAmount,
+    BudgetLedger,
+    ControlState,
+    GraphAdmission,
+    GraphEventPage,
+    GraphInspection,
+    GraphJob,
+    GraphMutation,
+    GraphMutationRequest,
+    GraphTask,
+    TaskAttempt,
+    TaskCheckpoint,
+    TaskComment,
+    TaskControl,
+    TaskResult,
+)
 from ..jobs.models import (
     MAX_ACTIVE_JOBS_PER_AGENT,
     MAX_JOB_ATTEMPTS,
@@ -155,6 +173,12 @@ from ..semantics import (
     SemanticNotFoundError,
     SemanticValidationError,
     semantic_annotation_sha256,
+)
+from . import sqlite_graph as _draft_graph_store
+from .draft_graph_schema import (
+    connect_draft_graph,
+    initialize_draft_graph_database,
+    require_draft_graph_schema,
 )
 from .home_migrations import (
     CURRENT_HOME_REVISION,
@@ -709,6 +733,323 @@ class SQLiteStateStore:
         if cancelled:
             raise asyncio.CancelledError
         return cls(resolved, clock=resolved_clock)
+
+    @classmethod
+    async def open_draft_graph(
+        cls,
+        path: str | Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        initialize: bool = False,
+    ) -> SQLiteStateStore:
+        """Open an explicit unregistered draft home for persistence tests only.
+
+        Production composition calls :meth:`open`, which accepts only the current
+        revision-1 schema.  This method never stamps or registers revision 2.
+        """
+
+        resolved = Path(path).resolve()
+
+        def admit() -> None:
+            if initialize:
+                initialize_draft_graph_database(resolved)
+            with connect_draft_graph(resolved, read_only=True) as connection:
+                require_draft_graph_schema(connection)
+
+        await asyncio.to_thread(admit)
+        return cls(resolved, clock=clock)
+
+    async def admit_graph(self, admission: GraphAdmission) -> GraphJob:
+        if not isinstance(admission, GraphAdmission):
+            raise TypeError("graph admission must be GraphAdmission")
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.admit_graph(connection, admission),
+        )
+
+    async def inspect_graph(self, agent_id: str, job_id: str) -> GraphInspection | None:
+        return await _run_draft_read(
+            self.path,
+            lambda connection: _draft_graph_store.inspect_graph(
+                connection, agent_id, job_id
+            ),
+        )
+
+    async def apply_graph_mutation(
+        self, request: GraphMutationRequest
+    ) -> GraphMutation:
+        if not isinstance(request, GraphMutationRequest):
+            raise TypeError("graph mutation must be GraphMutationRequest")
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.apply_mutation(connection, request),
+        )
+
+    async def list_ready_graph_tasks(
+        self,
+        agent_id: str,
+        *,
+        now: datetime,
+        limit: int = 64,
+    ) -> tuple[GraphTask, ...]:
+        return await _run_draft_read(
+            self.path,
+            lambda connection: _draft_graph_store.list_ready_tasks(
+                connection, agent_id, now=now, limit=limit
+            ),
+        )
+
+    async def list_stale_graph_attempts(
+        self,
+        agent_id: str,
+        *,
+        now: datetime,
+        limit: int = 64,
+    ) -> tuple[TaskAttempt, ...]:
+        return await _run_draft_read(
+            self.path,
+            lambda connection: _draft_graph_store.list_stale_attempts(
+                connection, agent_id, now=now, limit=limit
+            ),
+        )
+
+    async def claim_graph_task(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        *,
+        attempt_id: str,
+        claim_token: str,
+        run_id: str,
+        executor_id: str,
+        claimed_at: datetime,
+        lease_seconds: int,
+        absolute_deadline_at: datetime,
+        budget_reservations: tuple[BudgetAmount, ...],
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.claim_task(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                run_id=run_id,
+                executor_id=executor_id,
+                claimed_at=claimed_at,
+                lease_seconds=lease_seconds,
+                absolute_deadline_at=absolute_deadline_at,
+                budget_reservations=budget_reservations,
+            ),
+        )
+
+    async def start_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        started_at: datetime,
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.start_attempt(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                started_at=started_at,
+            ),
+        )
+
+    async def heartbeat_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        heartbeat_at: datetime,
+        lease_seconds: int = 30,
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.heartbeat_attempt(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                heartbeat_at=heartbeat_at,
+                lease_seconds=lease_seconds,
+            ),
+        )
+
+    async def checkpoint_graph_attempt(
+        self, checkpoint: TaskCheckpoint, *, claim_token: str
+    ) -> TaskCheckpoint:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.checkpoint_attempt(
+                connection, checkpoint, claim_token=claim_token
+            ),
+        )
+
+    async def add_graph_comment(self, comment: TaskComment) -> TaskComment:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.add_comment(connection, comment),
+        )
+
+    async def complete_graph_attempt(
+        self,
+        result: TaskResult,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        usage: tuple[BudgetAmount, ...] | None,
+    ) -> TaskResult:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.complete_attempt(
+                connection,
+                result,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                usage=usage,
+            ),
+        )
+
+    async def fence_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        fencing_epoch: int,
+        fenced_at: datetime,
+        requeue: bool,
+        reason_code: str,
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.fence_attempt(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                fencing_epoch=fencing_epoch,
+                fenced_at=fenced_at,
+                requeue=requeue,
+                reason_code=reason_code,
+            ),
+        )
+
+    async def open_graph_control(
+        self,
+        control: TaskControl,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+    ) -> TaskControl:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.open_control(
+                connection,
+                control,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+            ),
+        )
+
+    async def resolve_graph_control(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        state: ControlState,
+        resolved_at: datetime,
+        resolved_by_kind: str,
+        resolved_by_id: str,
+        resolution: dict[str, object],
+        make_ready: bool,
+    ) -> TaskControl | None:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.resolve_control(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                control_id=control_id,
+                state=state,
+                resolved_at=resolved_at,
+                resolved_by_kind=resolved_by_kind,
+                resolved_by_id=resolved_by_id,
+                resolution=resolution,
+                make_ready=make_ready,
+            ),
+        )
+
+    async def list_graph_events(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        after_event_id: int = 0,
+        limit: int = 100,
+    ) -> GraphEventPage:
+        return await _run_draft_read(
+            self.path,
+            lambda connection: _draft_graph_store.list_graph_events(
+                connection,
+                agent_id,
+                job_id,
+                after_event_id=after_event_id,
+                limit=limit,
+            ),
+        )
+
+    async def list_graph_budget_ledgers(
+        self, agent_id: str, job_id: str
+    ) -> tuple[BudgetLedger, ...]:
+        return await _run_draft_read(
+            self.path,
+            lambda connection: _draft_graph_store.list_budget_ledgers(
+                connection, agent_id, job_id
+            ),
+        )
+
+    async def list_graph_attempt_reservations(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> tuple[AttemptBudgetReservation, ...]:
+        return await _run_draft_read(
+            self.path,
+            lambda connection: _draft_graph_store.list_attempt_reservations(
+                connection, agent_id, job_id, task_id, attempt_id
+            ),
+        )
 
     async def close(self) -> None:
         async with self._decoded_catalog_snapshot_lock:
@@ -6587,9 +6928,13 @@ class SQLiteStateStore:
                     generation_changed = True
                     break
                 snapshots.append(snapshot)
-            if not generation_changed and refs == await self.list_current_snapshot_refs(
-                agent_id,
-                source_ids,
+            if (
+                not generation_changed
+                and refs
+                == await self.list_current_snapshot_refs(
+                    agent_id,
+                    source_ids,
+                )
             ):
                 return tuple(snapshots)
             if attempt == 1:
@@ -6971,6 +7316,57 @@ async def _run_cancellation_safe_transaction(
         raise asyncio.CancelledError
     if result is cancelled_sentinel:
         raise AssertionError("state transaction stopped without cancellation")
+    return cast(_T, result)
+
+
+async def _run_draft_read(
+    path: Path,
+    callback: Callable[[sqlite3.Connection], _T],
+) -> _T:
+    def read() -> _T:
+        with connect_draft_graph(path, read_only=True) as connection:
+            return callback(connection)
+
+    return await asyncio.to_thread(read)
+
+
+async def _run_cancellation_safe_draft_transaction(
+    path: Path,
+    callback: Callable[[sqlite3.Connection], _T],
+) -> _T:
+    gate = _CatalogCommitGate()
+    cancelled_sentinel = object()
+
+    def write() -> _T | object:
+        connection = connect_draft_graph(path)
+        try:
+            if not gate.start(connection):
+                return cancelled_sentinel
+            result = callback(connection)
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    worker = asyncio.create_task(asyncio.to_thread(write))
+    cancelled_before_start = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled_before_start = (
+                gate.cancel_before_start() or cancelled_before_start
+            )
+    result = worker.result()
+    if cancelled_before_start:
+        if result is not cancelled_sentinel:
+            raise AssertionError("cancelled draft graph transaction committed")
+        raise asyncio.CancelledError
+    if result is cancelled_sentinel:
+        raise AssertionError("draft graph transaction stopped without cancellation")
     return cast(_T, result)
 
 

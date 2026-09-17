@@ -199,6 +199,35 @@ def test_phase_one_removed_global_run_state_without_graph_cutover():
     assert "JOB_TASK" not in _python_text(PACKAGE)
 
 
+def test_draft_graph_kernel_is_unregistered_and_unreachable_from_composition():
+    registry = (PACKAGE / "storage" / "home_migrations" / "registry.py").read_text(
+        encoding="utf-8"
+    )
+    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
+    codec_exports = (PACKAGE / "storage" / "sqlite_codecs" / "__init__.py").read_text(
+        encoding="utf-8"
+    )
+    production_roots = "\n".join(
+        (PACKAGE / relative).read_text(encoding="utf-8")
+        for relative in (
+            "agent.py",
+            "hosting/embedded.py",
+            "hosting/resident.py",
+            "jobs/owner.py",
+            "jobs/supervisor.py",
+        )
+    )
+
+    assert "draft_revision_0002" not in registry
+    assert "REVISION_2" not in registry
+    assert "job_graphs" not in schema
+    assert "draft_graph" not in codec_exports
+    assert "open_draft_graph" not in production_roots
+    assert "admit_graph" not in production_roots
+    assert "claim_graph_task" not in production_roots
+    assert "RunOrigin.JOB_TASK" not in _python_text(PACKAGE)
+
+
 def test_common_runtime_has_one_owner_and_no_domain_dependencies():
     runtime_path = PACKAGE / "capability_runtime.py"
     runtime_tree = ast.parse(runtime_path.read_text(encoding="utf-8"))
