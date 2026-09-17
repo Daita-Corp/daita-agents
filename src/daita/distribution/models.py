@@ -703,6 +703,14 @@ def logical_delivery_key(
     )
 
 
+def graph_job_delivery_key(*, job_id: str, outcome_digest: str) -> str:
+    """Return the draft graph-job logical key without changing revision-1 enums."""
+
+    _text(job_id, "graph-job delivery job_id")
+    _digest(outcome_digest, "graph-job delivery outcome digest")
+    return f"graph_job/{job_id}/{outcome_digest.removeprefix('sha256:')}"
+
+
 @dataclass(frozen=True, slots=True)
 class Delivery:
     """One independently meaningful logical result for one exact target."""
@@ -779,6 +787,72 @@ class Delivery:
         _utc(self.updated_at, "delivery updated_at")
         if self.updated_at < self.created_at:
             raise ValueError("delivery updated_at precedes created_at")
+
+
+@dataclass(frozen=True, slots=True)
+class GraphJobDelivery:
+    """Integration-only revision-2 graph-job delivery projection.
+
+    The current revision-1 :class:`Delivery` enum deliberately remains unchanged.
+    This record is encoded only by the unregistered draft graph codec.
+    """
+
+    delivery_id: str
+    agent_id: str
+    conversation_id: str
+    job_id: str
+    logical_key: str
+    target: ConversationInboxTarget
+    outcome: OutcomeReference
+    visibility_state: DeliveryState
+    blocked_reason_code: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.delivery_id, "graph delivery_id"),
+            (self.agent_id, "graph delivery agent_id"),
+            (self.conversation_id, "graph delivery conversation_id"),
+            (self.job_id, "graph delivery job_id"),
+        ):
+            _text(value, name)
+        if not isinstance(self.target, ConversationInboxTarget):
+            raise TypeError("graph delivery target is invalid")
+        if self.target.conversation_id != self.conversation_id:
+            raise ValueError("graph delivery target conversation differs")
+        if not isinstance(self.outcome, OutcomeReference):
+            raise TypeError("graph delivery outcome is invalid")
+        expected_key = graph_job_delivery_key(
+            job_id=self.job_id,
+            outcome_digest=self.outcome.conclusion_digest,
+        )
+        if self.logical_key != expected_key:
+            raise ValueError("graph delivery logical key is invalid")
+        if self.outcome.conclusion_state is not OutcomeState.SUCCEEDED:
+            raise ValueError("graph job delivery requires a successful outcome")
+        if not isinstance(self.visibility_state, DeliveryState):
+            raise TypeError("graph delivery visibility state is invalid")
+        if self.visibility_state is DeliveryState.ACKNOWLEDGED:
+            raise ValueError("new graph delivery cannot start acknowledged")
+        if self.visibility_state is DeliveryState.BLOCKED:
+            if (
+                self.blocked_reason_code is None
+                or _FAILURE_CODE.fullmatch(self.blocked_reason_code) is None
+            ):
+                raise ValueError("blocked graph delivery requires a safe reason")
+        elif self.blocked_reason_code is not None:
+            raise ValueError("visible graph delivery cannot have a blocked reason")
+        if (
+            self.visibility_state is DeliveryState.AVAILABLE
+            and self.outcome.effective_sensitivity.routing_rank
+            > self.target.sensitivity_ceiling.routing_rank
+        ):
+            raise ValueError("visible graph delivery exceeds its destination")
+        _utc(self.created_at, "graph delivery created_at")
+        _utc(self.updated_at, "graph delivery updated_at")
+        if self.updated_at < self.created_at:
+            raise ValueError("graph delivery updated_at precedes created_at")
 
 
 @dataclass(frozen=True, slots=True)

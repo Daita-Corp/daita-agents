@@ -9,7 +9,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 
-from ..distribution.models import DeliveryState
+from ..distribution.models import (
+    DeliveryState,
+    GraphJobDelivery,
+    graph_job_delivery_key,
+)
 from ..jobs.graph.models import (
     AttemptState,
     BudgetAmount,
@@ -61,6 +65,8 @@ from .sqlite_codecs.common import (
 from .sqlite_codecs.distribution import (
     decode_conversation_inbox_target,
     decode_outcome_reference,
+    encode_conversation_inbox_target,
+    encode_outcome_reference,
 )
 
 
@@ -1117,6 +1123,30 @@ def decode_graph_event(
     )
 
 
+def encode_graph_job_delivery(value: GraphJobDelivery) -> str:
+    if not isinstance(value, GraphJobDelivery):
+        raise TypeError("draft graph delivery codec requires GraphJobDelivery")
+    return dump_payload(
+        record(
+            "Delivery",
+            {
+                "conversation_id": value.conversation_id,
+                "subject_kind": "graph_job",
+                "subject_id": value.job_id,
+                "logical_key": value.logical_key,
+                "target": encode_conversation_inbox_target(value.target),
+                "outcome": encode_outcome_reference(value.outcome),
+                "visibility_state": value.visibility_state.value,
+                "acknowledged_at": None,
+                "blocked_reason_code": value.blocked_reason_code,
+                "created_at": datetime_encode(value.created_at),
+                "updated_at": datetime_encode(value.updated_at),
+                "migration_provenance": {},
+            },
+        )
+    )
+
+
 def decode_draft_delivery(
     value: str,
     *,
@@ -1127,7 +1157,7 @@ def decode_draft_delivery(
     subject_id: str,
     logical_key: str,
     state: str,
-) -> dict[str, object]:
+) -> GraphJobDelivery | dict[str, object]:
     """Strictly validate the draft revision-2 delivery record shape."""
 
     fields = record_fields(
@@ -1167,21 +1197,42 @@ def decode_draft_delivery(
         "graph_attention",
     }:
         raise ValueError("draft delivery subject kind is invalid")
-    if decoded_subject_kind == "graph_job" and decoded_logical_key != (
-        f"graph_job/{decoded_subject_id}"
-    ):
-        raise ValueError("draft graph-job delivery key is invalid")
     target = decode_conversation_inbox_target(fields["target"])
     if target.conversation_id != conversation_id:
         raise ValueError("draft delivery target conversation differs")
-    decode_outcome_reference(fields["outcome"])
+    outcome = decode_outcome_reference(fields["outcome"])
     optional_datetime_decode(fields["acknowledged_at"])
     optional_text(fields["blocked_reason_code"], "delivery blocked reason")
-    datetime_decode(fields["created_at"])
-    datetime_decode(fields["updated_at"])
+    created_at = datetime_decode(fields["created_at"])
+    updated_at = datetime_decode(fields["updated_at"])
     provenance = _mapping(
         fields["migration_provenance"], "delivery migration provenance"
     )
+    if decoded_subject_kind == "graph_job" and not provenance:
+        if decoded_logical_key != graph_job_delivery_key(
+            job_id=decoded_subject_id,
+            outcome_digest=outcome.conclusion_digest,
+        ):
+            raise ValueError("draft graph-job delivery key is invalid")
+        return GraphJobDelivery(
+            delivery_id=delivery_id,
+            agent_id=agent_id,
+            conversation_id=decoded_conversation,
+            job_id=decoded_subject_id,
+            logical_key=decoded_logical_key,
+            target=target,
+            outcome=outcome,
+            visibility_state=decoded_state,
+            blocked_reason_code=optional_text(
+                fields["blocked_reason_code"], "delivery blocked reason"
+            ),
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+    if decoded_subject_kind == "graph_job" and decoded_logical_key != (
+        f"graph_job/{decoded_subject_id}"
+    ):
+        raise ValueError("migrated draft graph-job delivery key is invalid")
     return {
         "agent_id": agent_id,
         "delivery_id": delivery_id,
@@ -1208,6 +1259,7 @@ __all__ = [
     "decode_task_result",
     "encode_graph_event_payload",
     "encode_graph_job",
+    "encode_graph_job_delivery",
     "encode_graph_mutation",
     "encode_graph_task",
     "encode_job_graph",

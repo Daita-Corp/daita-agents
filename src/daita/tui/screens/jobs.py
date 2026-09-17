@@ -11,6 +11,7 @@ from textual.widgets import Button, Footer, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
 from daita import JobInspection, JobResultView, JobStatus, JobSummary
+from daita.jobs.graph.models import GraphInspection
 
 from ..projection import bounded_json_text
 from ..sanitization import safe_display, sanitize_terminal_text
@@ -422,6 +423,70 @@ def render_job_inspection(inspection: JobInspection) -> str:
     )
 
 
+def render_graph_inspection(inspection: GraphInspection) -> str:
+    """Render bounded read-only graph state for the explicit integration surface."""
+
+    if not isinstance(inspection, GraphInspection):
+        raise TypeError("graph inspection renderer requires GraphInspection")
+    lines = [
+        "Graph " + safe_display(inspection.job.job_id, fallback="job", maximum=256),
+        "State: " + inspection.job.state.value,
+        f"Topology: {inspection.graph.task_count} tasks · "
+        f"{inspection.graph.edge_count} dependencies · revision "
+        f"{inspection.graph.revision}",
+        f"Active attempts: {inspection.graph.active_attempt_count}",
+        "",
+        "Tasks",
+    ]
+    attempts_by_task = {
+        task.task_id: tuple(
+            item for item in inspection.attempts if item.task_id == task.task_id
+        )
+        for task in inspection.tasks
+    }
+    for task in inspection.tasks:
+        attempts = attempts_by_task[task.task_id]
+        lines.append(
+            f"{task.role.value} · {task.state.value} · "
+            f"{safe_display(task.task_id, fallback='task', maximum=256)} · "
+            f"{len(attempts)} attempt(s)"
+        )
+        for attempt in attempts:
+            detail = (
+                f"  {attempt.ordinal}. {attempt.state.value} · fence "
+                f"{attempt.fencing_epoch}"
+            )
+            if attempt.error_code is not None:
+                detail += " · " + safe_display(
+                    attempt.error_code,
+                    fallback="attempt failed",
+                    maximum=256,
+                )
+            lines.append(detail)
+    lines.extend(("", "Budgets"))
+    for ledger in inspection.budget_ledgers:
+        owner = "root" if ledger.task_id is None else ledger.task_id
+        lines.append(
+            f"{owner} · {ledger.dimension}: {ledger.settled} settled + "
+            f"{ledger.reserved} reserved / {ledger.ceiling}"
+        )
+    lines.extend(
+        (
+            "",
+            f"Accepted results: {len(inspection.results)}",
+            f"Artifacts: {sum(len(item.artifact_ids) for item in inspection.results)}",
+            f"Deliveries: {len(inspection.delivery_ids)}",
+            f"Recent events: {len(inspection.events)}",
+        )
+    )
+    return sanitize_terminal_text(
+        "\n".join(lines),
+        maximum=32_768,
+        preserve_lines=True,
+        fallback="Graph details unavailable.",
+    )
+
+
 def render_job_result(result: JobResultView) -> str:
     """Render one bounded validated result and its exact artifact references."""
 
@@ -474,6 +539,7 @@ def render_job_result(result: JobResultView) -> str:
 
 __all__ = [
     "JobsScreen",
+    "render_graph_inspection",
     "render_job_inspection",
     "render_job_result",
     "render_job_summary",

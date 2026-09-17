@@ -70,6 +70,7 @@ from .distribution import (
     inbox_view_projection,
 )
 from .errors import StateCompatibilityError
+from .jobs.graph.models import GraphInspection
 from .learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
     learning_candidate_content_to_mapping,
@@ -89,6 +90,84 @@ from .tui.models import (
 from .tui.projection import run_failure_notice, tool_outcome_summary
 
 _CANDIDATE_REVIEW_COST_LIMIT_ENV = "DAITA_CANDIDATE_REVIEW_MAX_COST_USD"
+
+
+def _graph_inspection_mapping(inspection: GraphInspection) -> dict[str, object]:
+    """Project one bounded draft-graph inspection for integration CLI tests."""
+
+    if not isinstance(inspection, GraphInspection):
+        raise TypeError("graph inspection projection requires GraphInspection")
+    attempts_by_task: dict[str, list[dict[str, object]]] = {}
+    for attempt in inspection.attempts:
+        attempts_by_task.setdefault(attempt.task_id, []).append(
+            {
+                "attempt_id": attempt.attempt_id,
+                "ordinal": attempt.ordinal,
+                "state": attempt.state.value,
+                "fencing_epoch": attempt.fencing_epoch,
+                "heartbeat_at": (
+                    None
+                    if attempt.heartbeat_at is None
+                    else attempt.heartbeat_at.isoformat()
+                ),
+                "checkpoint_ids": attempt.checkpoint_ids,
+                "artifact_ids": attempt.artifact_ids,
+                "error_code": attempt.error_code,
+            }
+        )
+    results = {item.task_id: item for item in inspection.results}
+    return {
+        "job_id": inspection.job.job_id,
+        "state": inspection.job.state.value,
+        "desired_state": inspection.job.desired_state.value,
+        "specification_digest": inspection.job.specification_digest,
+        "topology_revision": inspection.graph.revision,
+        "task_count": inspection.graph.task_count,
+        "edge_count": inspection.graph.edge_count,
+        "active_attempt_count": inspection.graph.active_attempt_count,
+        "terminal_result_id": inspection.job.terminal_result_id,
+        "tasks": [
+            {
+                "task_id": task.task_id,
+                "role": task.role.value,
+                "state": task.state.value,
+                "task_revision": task.task_revision,
+                "attempts": attempts_by_task.get(task.task_id, []),
+                "accepted_result": (
+                    None
+                    if task.task_id not in results
+                    else {
+                        "result_id": results[task.task_id].result_id,
+                        "result_digest": results[task.task_id].result_digest,
+                        "artifact_ids": results[task.task_id].artifact_ids,
+                    }
+                ),
+            }
+            for task in inspection.tasks
+        ],
+        "budgets": [
+            {
+                "dimension": item.dimension,
+                "task_id": item.task_id,
+                "ceiling": item.ceiling,
+                "settled": item.settled,
+                "reserved": item.reserved,
+                "control_reserved": item.control_reserved,
+            }
+            for item in inspection.budget_ledgers
+        ],
+        "events": [
+            {
+                "event_id": item.event_id,
+                "kind": item.kind,
+                "task_id": item.task_id,
+                "attempt_id": item.attempt_id,
+                "created_at": item.created_at.isoformat(),
+            }
+            for item in inspection.events
+        ],
+        "delivery_ids": inspection.delivery_ids,
+    }
 
 
 def _effect_receipt_mapping(receipt: EffectReceipt) -> dict[str, object]:

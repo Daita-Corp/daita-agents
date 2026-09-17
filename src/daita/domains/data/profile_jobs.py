@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import json
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
@@ -13,7 +14,9 @@ from ...artifacts.models import (
     ArtifactDraft,
     ArtifactProvenance,
     ArtifactResourceBinding,
+    artifact_ref_from_mapping,
 )
+from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
@@ -35,6 +38,27 @@ from ...capabilities import (
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
+from ...distribution.owner import DistributionOwner
+from ...jobs.graph.models import (
+    BudgetAmount,
+    BudgetLimit,
+    EdgeKind,
+    GraphAdmission,
+    GraphAuthority,
+    GraphDesiredState,
+    GraphJob,
+    GraphJobSpecification,
+    GraphLimits,
+    GraphState,
+    GraphTask,
+    GraphTaskSpecification,
+    JobGraph,
+    TaskDependency,
+    TaskExecutionKind,
+    TaskRole,
+    TaskState,
+    topology_digest,
+)
 from ...jobs.models import (
     MAX_JOB_DEADLINE_SECONDS,
     MAX_JOB_RESOURCE_BINDINGS,
@@ -62,6 +86,9 @@ START_DATA_PROFILE_TOOL_NAME = "start_data_profile"
 DATA_PROFILE_EXECUTION_CAPABILITY_ID = "jobs.data_profile.execute"
 DATA_PROFILE_EXECUTION_EXECUTOR_ID = "jobs.data_profile.execute.executor"
 DATA_PROFILE_EXECUTION_OUTPUT_KIND = "job.data_profile.result"
+DATA_PROFILE_FINALIZE_CAPABILITY_ID = "jobs.data_profile.finalize"
+DATA_PROFILE_FINALIZE_EXECUTOR_ID = "jobs.data_profile.finalize.executor"
+DATA_PROFILE_FINALIZE_OUTPUT_KIND = "job.data_profile.final_result"
 
 _MAX_PROFILE_SAMPLE_ROWS = 100
 _MAX_PROFILE_READ_BYTES = 256 * 1024
@@ -189,6 +216,284 @@ class DataProfileAdmission:
             deadline_at=deadline.astimezone(UTC),
             max_wall_time_seconds=float(wall_time),
             external_executor=external,
+        )
+
+    async def build_static_graph_admission(
+        self,
+        *,
+        run: RunInput,
+        call_id: str,
+        arguments: Mapping[str, object],
+        finalizer_capability: Capability,
+        distribution: DistributionOwner,
+        clock: Callable[[], datetime],
+        id_factory: Callable[[str], str],
+    ) -> GraphAdmission:
+        """Build the explicit integration-only static profile graph."""
+
+        if run.agent_id != self._agent_id or run.conversation_id is None:
+            raise CapabilityInputError(
+                "graph_profile_origin_invalid",
+                "A static profile graph requires the exact owned conversation.",
+            )
+        prepared = dict(arguments)
+        deadline_seconds = prepared.get("deadline_seconds", 300)
+        if not isinstance(deadline_seconds, int) or isinstance(deadline_seconds, bool):
+            raise CapabilityInputError(
+                "data_profile_invalid", "The data-profile deadline is malformed."
+            )
+        now = clock()
+        deadline = now + timedelta(seconds=deadline_seconds)
+        if deadline_seconds < 60:
+            raise CapabilityInputError(
+                "graph_deadline_too_short",
+                "A durable graph deadline must be at least sixty seconds.",
+            )
+        prepared["_deadline_at"] = deadline.isoformat()
+        prepared["_max_wall_time_seconds"] = min(
+            float(deadline_seconds), MAX_JOB_WALL_TIME_SECONDS
+        )
+        profile = await self.build_specification(prepared)
+        profile_sample_rows = profile.arguments.get("sample_rows")
+        if not isinstance(profile_sample_rows, int):
+            raise CapabilityInputError(
+                "data_profile_invalid", "The frozen sample bound is malformed."
+            )
+        if profile.execution_mode is not JobExecutionMode.DAITA:
+            raise CapabilityInputError(
+                "graph_external_executor_forbidden",
+                "The static graph slice admits only Daita-owned internal work.",
+            )
+        finalizer_digest = capability_contract_digest(
+            finalizer_capability,
+            domain_owner_id=DATA_PROFILE_DOMAIN_OWNER_ID,
+        )
+        target = distribution.resolve_conversation_inbox(
+            run.conversation_id,
+            sensitivity_ceiling=profile.sensitivity,
+        )
+        plan = distribution.resolve_plan(
+            run.conversation_id,
+            destination_id=target.destination_id,
+            sensitivity_ceiling=profile.sensitivity,
+        )
+        job_id = id_factory("job")
+        root_authority = GraphAuthority(
+            source_ids=tuple(
+                sorted({item.source_id for item in profile.resource_bindings})
+            ),
+            resource_ids=tuple(item.resource_id for item in profile.resource_bindings),
+            capability_ids=(
+                self._execution_capability.id,
+                finalizer_capability.id,
+            ),
+            access_modes=("read",),
+            operational_effects=("none",),
+            sensitivity=profile.sensitivity,
+            contract_bindings={
+                self._execution_capability.id: self._execution_contract_digest,
+                finalizer_capability.id: finalizer_digest,
+                **{
+                    item.resource_id: _binding_payload(item)
+                    for item in profile.resource_bindings
+                },
+            },
+        )
+        root_specification = GraphJobSpecification(
+            principal_id=self._agent_id,
+            objective="Create one verified profile over the exact selected resources.",
+            outcome_contract={
+                "kind": "data_profile",
+                "resource_ids": tuple(
+                    item.resource_id for item in profile.resource_bindings
+                ),
+                "artifact_media_type": "application/json",
+                "producer_capability_id": finalizer_capability.id,
+                "profile_specification_digest": profile.digest,
+            },
+            authority=root_authority,
+            distribution_plan_digest=plan.plan_digest,
+            budgets=(
+                BudgetLimit(
+                    "work_units",
+                    (len(profile.resource_bindings) + 1) * 3,
+                    control_reserved=3,
+                ),
+            ),
+            deadline_at=deadline,
+            limits=GraphLimits(
+                max_tasks=len(profile.resource_bindings) + 1,
+                max_edges=len(profile.resource_bindings),
+                max_parallelism=min(4, len(profile.resource_bindings)),
+            ),
+            retry_policy={"max_attempts": 3, "backoff_seconds": (1, 5)},
+            cancellation_policy={"preserve_evidence": True},
+            finalizer_task_template={
+                "kind": "data_profile_internal_finalizer",
+                "capability_id": finalizer_capability.id,
+                "contract_digest": finalizer_digest,
+            },
+        )
+        work_tasks: list[GraphTask] = []
+        for binding in profile.resource_bindings:
+            task_id = id_factory("task")
+            authority = GraphAuthority(
+                source_ids=(binding.source_id,),
+                resource_ids=(binding.resource_id,),
+                capability_ids=(self._execution_capability.id,),
+                access_modes=("read",),
+                operational_effects=("none",),
+                sensitivity=binding.sensitivity,
+                contract_bindings={
+                    self._execution_capability.id: self._execution_contract_digest,
+                    binding.resource_id: _binding_payload(binding),
+                },
+            )
+            execution_arguments = {
+                "job_id": job_id,
+                "specification_digest": profile.digest,
+                "resource_ids": (binding.resource_id,),
+                "sample_rows": profile_sample_rows,
+                "resource_bindings": (_binding_payload(binding),),
+            }
+            task_specification = GraphTaskSpecification(
+                title=f"Profile {binding.resource_id}",
+                description="Profile one exact frozen resource through the internal capability.",
+                expected_result_contract={
+                    "kind": "data_profile_work",
+                    "output_kind": DATA_PROFILE_EXECUTION_OUTPUT_KIND,
+                    "capability_id": self._execution_capability.id,
+                    "contract_digest": self._execution_contract_digest,
+                    "arguments": execution_arguments,
+                    "source_permit_key": f"source:{binding.source_id}",
+                    "attempt_budgets": {"work_units": 1},
+                },
+                authority=authority,
+                budgets=(BudgetAmount("work_units", 3),),
+                max_steps=1,
+                max_wall_time_seconds=min(
+                    300, max(1, int(profile.max_wall_time_seconds))
+                ),
+                created_by="job_owner",
+            )
+            work_tasks.append(
+                GraphTask(
+                    agent_id=self._agent_id,
+                    job_id=job_id,
+                    task_id=task_id,
+                    state=TaskState.READY,
+                    role=TaskRole.INTERNAL,
+                    execution_kind=TaskExecutionKind.INTERNAL_CAPABILITY,
+                    priority=100,
+                    not_before=None,
+                    current_attempt_id=None,
+                    task_revision=1,
+                    specification=task_specification,
+                    task_spec_digest=task_specification.digest,
+                    task_scope_digest=authority.digest,
+                    attempt_count=0,
+                    failure_streak=0,
+                    fencing_epoch=0,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        finalizer_id = id_factory("task")
+        finalizer_authority = GraphAuthority(
+            capability_ids=(finalizer_capability.id,),
+            access_modes=("read",),
+            operational_effects=("none",),
+            sensitivity=profile.sensitivity,
+            contract_bindings={finalizer_capability.id: finalizer_digest},
+        )
+        finalizer_specification = GraphTaskSpecification(
+            title="Finalize data profile",
+            description="Authenticate required task results and publish the verified profile.",
+            expected_result_contract={
+                "kind": "data_profile_finalizer",
+                "output_kind": DATA_PROFILE_FINALIZE_OUTPUT_KIND,
+                "capability_id": finalizer_capability.id,
+                "contract_digest": finalizer_digest,
+                "resource_ids": tuple(
+                    item.resource_id for item in profile.resource_bindings
+                ),
+                "sample_rows": profile_sample_rows,
+                "attempt_budgets": {"work_units": 1},
+            },
+            authority=finalizer_authority,
+            budgets=(BudgetAmount("work_units", 3),),
+            max_steps=1,
+            max_wall_time_seconds=min(300, max(1, int(profile.max_wall_time_seconds))),
+            created_by="job_owner",
+        )
+        finalizer = GraphTask(
+            agent_id=self._agent_id,
+            job_id=job_id,
+            task_id=finalizer_id,
+            state=TaskState.PENDING,
+            role=TaskRole.FINALIZER,
+            execution_kind=TaskExecutionKind.INTERNAL_CAPABILITY,
+            priority=1_000,
+            not_before=None,
+            current_attempt_id=None,
+            task_revision=1,
+            specification=finalizer_specification,
+            task_spec_digest=finalizer_specification.digest,
+            task_scope_digest=finalizer_authority.digest,
+            attempt_count=0,
+            failure_streak=0,
+            fencing_epoch=0,
+            created_at=now,
+            updated_at=now,
+        )
+        tasks = (*work_tasks, finalizer)
+        dependencies = tuple(
+            TaskDependency(
+                agent_id=self._agent_id,
+                job_id=job_id,
+                upstream_task_id=task.task_id,
+                downstream_task_id=finalizer_id,
+                edge_kind=EdgeKind.REQUIRES_ACCEPTED_SUCCESS,
+                created_at=now,
+                creator_key="job_owner",
+            )
+            for task in work_tasks
+        )
+        job = GraphJob(
+            agent_id=self._agent_id,
+            job_id=job_id,
+            conversation_id=run.conversation_id,
+            origin_run_id=run.id,
+            origin_call_id=call_id,
+            state=GraphState.QUEUED,
+            desired_state=GraphDesiredState.RUN,
+            created_at=now,
+            updated_at=now,
+            deadline_at=deadline,
+            specification=root_specification,
+            specification_digest=root_specification.digest,
+            finalizer_task_id=finalizer_id,
+        )
+        graph = JobGraph(
+            agent_id=self._agent_id,
+            job_id=job_id,
+            revision=0,
+            task_count=len(tasks),
+            edge_count=len(dependencies),
+            mutation_count=0,
+            active_attempt_count=0,
+            next_ready_at=now,
+            finalization_attempt_id=None,
+            finalization_started_revision=None,
+            created_at=now,
+            updated_at=now,
+            topology_digest=topology_digest(tasks, dependencies),
+        )
+        return GraphAdmission(
+            job=job,
+            graph=graph,
+            tasks=tasks,
+            dependencies=dependencies,
         )
 
     async def validate_internal(
@@ -417,6 +722,105 @@ class StartDataProfileExecutor:
         )
 
 
+class StartStaticDataProfileGraphExecutor:
+    """Integration-only starter for the draft static graph vertical slice."""
+
+    executor_id = START_DATA_PROFILE_EXECUTOR_ID
+
+    def __init__(
+        self,
+        *,
+        owner: JobOwner,
+        admission: DataProfileAdmission,
+        finalizer_capability: Capability,
+        distribution: DistributionOwner,
+        clock: Callable[[], datetime],
+        id_factory: Callable[[str], str],
+    ) -> None:
+        self._owner = owner
+        self._admission = admission
+        self._finalizer_capability = finalizer_capability
+        self._distribution = distribution
+        self._clock = clock
+        self._id_factory = id_factory
+
+    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
+        prepared = dict(request.arguments)
+        deadline_seconds = prepared.get("deadline_seconds", 300)
+        if not isinstance(deadline_seconds, int) or isinstance(deadline_seconds, bool):
+            raise CapabilityInputError(
+                "data_profile_invalid", "The data-profile deadline is malformed."
+            )
+        prepared["_deadline_at"] = (
+            self._clock() + timedelta(seconds=deadline_seconds)
+        ).isoformat()
+        prepared["_max_wall_time_seconds"] = min(
+            float(deadline_seconds), MAX_JOB_WALL_TIME_SECONDS
+        )
+        specification = await self._admission.build_specification(prepared)
+        return FrozenJsonObject.from_mapping(
+            {
+                "profile_specification_digest": specification.digest,
+                "resource_ids": tuple(
+                    item.resource_id for item in specification.resource_bindings
+                ),
+                "graph_kind": "static_data_profile",
+            }
+        )
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        if request.conversation_id is None:
+            raise CapabilityInputError(
+                "graph_profile_origin_invalid",
+                "A static profile graph requires the exact owned conversation.",
+            )
+        admission = await self._admission.build_static_graph_admission(
+            run=RunInput(
+                id=request.run_id,
+                agent_id=self._owner.agent_id,
+                message="Start the exact admitted static data-profile graph.",
+                created_at=self._clock(),
+                conversation_id=request.conversation_id,
+                source_scope_ids=(
+                    ()
+                    if request.source_scope is None
+                    else tuple(sorted(request.source_scope.source_ids))
+                ),
+                resolved_source_scope=request.source_scope,
+            ),
+            call_id=request.call_id,
+            arguments=request.arguments,
+            finalizer_capability=self._finalizer_capability,
+            distribution=self._distribution,
+            clock=self._clock,
+            id_factory=self._id_factory,
+        )
+        job = await self._owner.admit_static_graph(admission)
+        work_capability_id = DATA_PROFILE_EXECUTION_CAPABILITY_ID
+        work_contract = job.specification.authority.contract_bindings.get(
+            work_capability_id
+        )
+        assert isinstance(work_contract, str)
+        return ToolOutput(
+            kind=START_DATA_PROFILE_OUTPUT_KIND,
+            data={
+                "job_id": job.job_id,
+                "job_kind": "data_profile",
+                "status": job.state.value,
+                "execution_mode": JobExecutionMode.DAITA.value,
+                "specification_digest": job.specification_digest,
+                "execution_capability_id": work_capability_id,
+                "execution_contract_digest": work_contract,
+            },
+            sensitivity=job.specification.authority.sensitivity,
+            sensitivity_provenance={
+                "authority": "frozen_static_graph_resource_scope",
+                "job_id": job.job_id,
+                "resource_ids": job.specification.authority.resource_ids,
+            },
+        )
+
+
 class DataProfileExecutor:
     executor_id = DATA_PROFILE_EXECUTION_EXECUTOR_ID
 
@@ -559,6 +963,143 @@ class DataProfileExecutor:
         return result
 
 
+class DataProfileFinalizerExecutor:
+    """Authenticate accepted work artifacts and build one final profile artifact."""
+
+    executor_id = DATA_PROFILE_FINALIZE_EXECUTOR_ID
+
+    def __init__(self, artifacts: AgentHomeArtifactStore) -> None:
+        self._artifacts = artifacts
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        job_id = request.arguments["job_id"]
+        expected_resource_ids = request.arguments["resource_ids"]
+        work_results = request.arguments["work_results"]
+        sample_rows = request.arguments["sample_rows"]
+        assert isinstance(job_id, str)
+        assert isinstance(expected_resource_ids, tuple)
+        assert isinstance(work_results, tuple)
+        assert isinstance(sample_rows, int)
+        resources: list[Mapping[str, object]] = []
+        resource_bindings: dict[tuple[str, str], ArtifactResourceBinding] = {}
+        sensitivities: list[ModelSensitivity] = []
+        sampled_rows = 0
+        truncated_resources = 0
+        observed_resource_ids: set[str] = set()
+        for work_result in work_results:
+            if not isinstance(work_result, Mapping):
+                raise CapabilityInputError(
+                    "graph_profile_result_invalid",
+                    "A required profile result manifest is malformed.",
+                )
+            raw_ref = work_result.get("artifact_ref")
+            if not isinstance(raw_ref, Mapping):
+                raise CapabilityInputError(
+                    "graph_profile_artifact_invalid",
+                    "A required profile artifact reference is malformed.",
+                )
+            ref = artifact_ref_from_mapping(raw_ref)
+            if ref.capability_id != DATA_PROFILE_EXECUTION_CAPABILITY_ID:
+                raise CapabilityInputError(
+                    "graph_profile_artifact_invalid",
+                    "A required artifact was produced by another capability.",
+                )
+            payload = await self._artifacts.read_ref(ref)
+            try:
+                document = json.loads(payload.content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise CapabilityInputError(
+                    "graph_profile_artifact_invalid",
+                    "A required profile artifact is not valid canonical JSON.",
+                ) from error
+            if (
+                not isinstance(document, dict)
+                or document.get("kind") != "data_profile"
+                or document.get("job_id") != job_id
+                or document.get("resource_count") != 1
+                or not isinstance(document.get("resources"), list)
+                or len(document["resources"]) != 1
+            ):
+                raise CapabilityInputError(
+                    "graph_profile_artifact_invalid",
+                    "A required profile artifact differs from its task contract.",
+                )
+            resource = document["resources"][0]
+            if not isinstance(resource, dict):
+                raise CapabilityInputError(
+                    "graph_profile_artifact_invalid",
+                    "A required profile resource payload is malformed.",
+                )
+            resource_id = resource.get("resource_id")
+            if not isinstance(resource_id, str) or resource_id in observed_resource_ids:
+                raise CapabilityInputError(
+                    "graph_profile_artifact_invalid",
+                    "A required profile artifact has invalid resource identity.",
+                )
+            observed_resource_ids.add(resource_id)
+            resources.append(resource)
+            sampled = resource.get("sampled_rows")
+            if not isinstance(sampled, int) or isinstance(sampled, bool):
+                raise CapabilityInputError(
+                    "graph_profile_artifact_invalid",
+                    "A required profile artifact has invalid row evidence.",
+                )
+            sampled_rows += sampled
+            if resource.get("truncated") is True:
+                truncated_resources += 1
+            sensitivities.append(ModelSensitivity(ref.sensitivity.value))
+            for binding in ref.provenance.resource_bindings:
+                resource_bindings[(binding.source_id, binding.resource_id)] = binding
+        if tuple(sorted(observed_resource_ids)) != tuple(
+            sorted(str(item) for item in expected_resource_ids)
+        ):
+            raise CapabilityInputError(
+                "graph_profile_result_incomplete",
+                "The accepted task results do not cover the exact graph resources.",
+            )
+        ordered_resources = sorted(
+            resources,
+            key=lambda item: (str(item.get("source_id")), str(item.get("resource_id"))),
+        )
+        document = {
+            "kind": "data_profile",
+            "job_id": job_id,
+            "resource_count": len(ordered_resources),
+            "sample_row_limit": sample_rows,
+            "resources": ordered_resources,
+            "trust_classification": "untrusted_external_data",
+        }
+        content = canonical_json(document).encode("utf-8")
+        sensitivity = _maximum_sensitivity(tuple(sensitivities))
+        return ToolOutput(
+            kind=DATA_PROFILE_FINALIZE_OUTPUT_KIND,
+            data={
+                "job_id": job_id,
+                "profiled_resources": len(ordered_resources),
+                "sampled_rows": sampled_rows,
+                "truncated_resources": truncated_resources,
+            },
+            artifact=ArtifactDraft(
+                content=content,
+                suggested_filename=f"data-profile-{job_id}.json",
+                media_type="application/json",
+                sensitivity=Sensitivity(sensitivity.value),
+                provenance=ArtifactProvenance(
+                    authorship=ArtifactAuthorship.EXACT_SOURCE_DATA,
+                    resource_bindings=tuple(
+                        resource_bindings[key] for key in sorted(resource_bindings)
+                    ),
+                ),
+            ),
+            sensitivity=sensitivity,
+            sensitivity_provenance={
+                "authority": "authenticated_graph_task_results",
+                "job_id": job_id,
+                "resource_ids": tuple(sorted(observed_resource_ids)),
+            },
+        )
+
+
 class DataProfileCapabilityDomain:
     domain_owner_id = DATA_PROFILE_DOMAIN_OWNER_ID
 
@@ -572,10 +1113,18 @@ class DataProfileCapabilityDomain:
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data-profile declarations have the wrong owner")
-        if {item.id for item in declarations.capabilities} != {
-            START_DATA_PROFILE_CAPABILITY_ID,
-            DATA_PROFILE_EXECUTION_CAPABILITY_ID,
-        }:
+        capability_ids = {item.id for item in declarations.capabilities}
+        if capability_ids not in (
+            {
+                START_DATA_PROFILE_CAPABILITY_ID,
+                DATA_PROFILE_EXECUTION_CAPABILITY_ID,
+            },
+            {
+                START_DATA_PROFILE_CAPABILITY_ID,
+                DATA_PROFILE_EXECUTION_CAPABILITY_ID,
+                DATA_PROFILE_FINALIZE_CAPABILITY_ID,
+            },
+        ):
             raise ValueError("data-profile domain requires its exact capabilities")
         self._declarations = declarations
         self._catalog = catalog
@@ -673,6 +1222,8 @@ class DataProfileCapabilityDomain:
                     "This run can only profile resources in its effective scope.",
                 )
             return FrozenJsonObject.from_mapping(prepared)
+        if capability.id == DATA_PROFILE_FINALIZE_CAPABILITY_ID:
+            return arguments
         await self._admission.validate_internal(arguments)
         return arguments
 
@@ -818,6 +1369,69 @@ def data_profile_declarations(
     )
 
 
+def data_profile_graph_integration_declarations(
+    *,
+    agent_id: str,
+    catalog: DataProfileCatalog,
+    owner: JobOwner,
+    sqlite_backend: SqlReadBackend,
+    postgresql_backend: SqlReadBackend,
+    artifacts: AgentHomeArtifactStore,
+    distribution: DistributionOwner,
+    clock,
+    id_factory: Callable[[str], str],
+) -> tuple[DataProfileDeclarations, DataProfileAdmission]:
+    """Extend the profile domain only for explicit draft-graph integration tests."""
+
+    base, admission = data_profile_declarations(
+        agent_id=agent_id,
+        catalog=catalog,
+        owner=owner,
+        sqlite_backend=sqlite_backend,
+        postgresql_backend=postgresql_backend,
+        clock=clock,
+    )
+    finalizer = Capability(
+        id=DATA_PROFILE_FINALIZE_CAPABILITY_ID,
+        description="Finalize authenticated static data-profile task results.",
+        input_schema=_finalizer_input_schema(),
+        output_kind=DATA_PROFILE_FINALIZE_OUTPUT_KIND,
+        output_schema=_finalizer_output_schema(),
+        executor_id=DATA_PROFILE_FINALIZE_EXECUTOR_ID,
+        access_mode=AccessMode.READ,
+        operational_effect=OperationalEffect.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        artifact_policy=ArtifactPolicy(
+            allowed_media_types=frozenset({"application/json"}),
+            allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),
+            allowed_extensions=(("application/json", (".json",)),),
+            artifact_required=True,
+            max_artifact_count=1,
+            max_bytes_per_artifact=_MAX_PROFILE_ARTIFACT_BYTES,
+            max_total_bytes_per_call=_MAX_PROFILE_ARTIFACT_BYTES,
+        ),
+    )
+    return (
+        DataProfileDeclarations(
+            capabilities=(*base.capabilities, finalizer),
+            executors=(
+                StartStaticDataProfileGraphExecutor(
+                    owner=owner,
+                    admission=admission,
+                    finalizer_capability=finalizer,
+                    distribution=distribution,
+                    clock=clock,
+                    id_factory=id_factory,
+                ),
+                base.executors[1],
+                DataProfileFinalizerExecutor(artifacts),
+            ),
+            tool_views=base.tool_views,
+        ),
+        admission,
+    )
+
+
 def _start_input_schema() -> dict[str, object]:
     return {
         "type": "object",
@@ -933,6 +1547,61 @@ def _internal_output_schema() -> dict[str, object]:
     }
 
 
+def _finalizer_input_schema() -> dict[str, object]:
+    work_result_properties = {
+        "task_id": {"type": "string", "minLength": 1},
+        "result_id": {"type": "string", "minLength": 1},
+        "result_digest": {"type": "string", "minLength": 1},
+        "artifact_ref": {"type": "object"},
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "minLength": 1},
+            "resource_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+                "maxItems": MAX_JOB_RESOURCE_BINDINGS,
+                "uniqueItems": True,
+            },
+            "sample_rows": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": _MAX_PROFILE_SAMPLE_ROWS,
+            },
+            "work_results": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": work_result_properties,
+                    "required": list(work_result_properties),
+                    "additionalProperties": False,
+                },
+                "minItems": 1,
+                "maxItems": MAX_JOB_RESOURCE_BINDINGS,
+            },
+        },
+        "required": ["job_id", "resource_ids", "sample_rows", "work_results"],
+        "additionalProperties": False,
+    }
+
+
+def _finalizer_output_schema() -> dict[str, object]:
+    properties = {
+        "job_id": {"type": "string"},
+        "profiled_resources": {"type": "integer"},
+        "sampled_rows": {"type": "integer"},
+        "truncated_resources": {"type": "integer"},
+    }
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": list(properties),
+        "additionalProperties": False,
+    }
+
+
 def _binding_from_mapping(value: object) -> JobResourceBinding:
     if not isinstance(value, Mapping):
         raise CapabilityInputError(
@@ -969,6 +1638,17 @@ def job_resource_bindings_payload(
         }
         for item in values
     )
+
+
+def _binding_payload(value: JobResourceBinding) -> dict[str, object]:
+    return {
+        "source_id": value.source_id,
+        "source_revision": value.source_revision,
+        "resource_id": value.resource_id,
+        "resource_revision": value.resource_revision,
+        "adapter_id": value.adapter_id,
+        "sensitivity": value.sensitivity.value,
+    }
 
 
 def _model_sensitivity(value: str) -> ModelSensitivity:
@@ -1036,12 +1716,17 @@ __all__ = [
     "DATA_PROFILE_DOMAIN_OWNER_ID",
     "DATA_PROFILE_EXECUTION_CAPABILITY_ID",
     "DATA_PROFILE_EXECUTION_EXECUTOR_ID",
+    "DATA_PROFILE_FINALIZE_CAPABILITY_ID",
+    "DATA_PROFILE_FINALIZE_EXECUTOR_ID",
+    "DATA_PROFILE_FINALIZE_OUTPUT_KIND",
     "DataProfileAdmission",
     "DataProfileCapabilityDomain",
     "DataProfileDeclarations",
+    "StartStaticDataProfileGraphExecutor",
     "START_DATA_PROFILE_CAPABILITY_ID",
     "START_DATA_PROFILE_EXECUTOR_ID",
     "START_DATA_PROFILE_TOOL_NAME",
     "data_profile_declarations",
+    "data_profile_graph_integration_declarations",
     "job_resource_bindings_payload",
 ]

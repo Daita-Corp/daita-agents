@@ -4,12 +4,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..adapters.job_profiles import ConnectedJobProfile
 from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
 from ..loop.models import RunInput
+from .graph.models import (
+    GraphAdmission,
+    GraphEventPage,
+    GraphInspection,
+    GraphJob,
+)
 from .models import (
     MAX_JOB_DEADLINE_SECONDS,
     MAX_JOB_LIST_PAGE_SIZE,
@@ -59,6 +65,23 @@ class JobStore(Protocol):
         *,
         requested_at: datetime,
     ) -> JobRun | None: ...
+
+
+class DraftGraphJobStore(Protocol):
+    async def admit_graph(self, admission: GraphAdmission) -> GraphJob: ...
+
+    async def inspect_graph(
+        self, agent_id: str, job_id: str
+    ) -> GraphInspection | None: ...
+
+    async def list_graph_events(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        after_event_id: int = 0,
+        limit: int = 100,
+    ) -> GraphEventPage: ...
 
 
 class JobOwner:
@@ -273,6 +296,42 @@ class JobOwner:
         self._notify(job_id)
         return job_inspection(updated)
 
+    async def admit_static_graph(self, admission: GraphAdmission) -> GraphJob:
+        """Admit one code-authored draft graph in explicit integration composition."""
+
+        if not isinstance(admission, GraphAdmission):
+            raise TypeError("graph admission must be GraphAdmission")
+        if admission.job.agent_id != self.agent_id:
+            raise JobError("job_owner_mismatch", "The graph owner identity changed.")
+        if admission.job.deadline_at <= self._clock():
+            raise JobError(
+                "job_deadline_expired", "The requested graph deadline has expired."
+            )
+        stored = await self._graph_store().admit_graph(admission)
+        self._notify(stored.job_id)
+        return stored
+
+    async def inspect_graph(self, job_id: str) -> GraphInspection | None:
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("job_id must be non-empty text")
+        return await self._graph_store().inspect_graph(self.agent_id, job_id)
+
+    async def graph_events(
+        self,
+        job_id: str,
+        *,
+        after_event_id: int = 0,
+        limit: int = 100,
+    ) -> GraphEventPage:
+        if not isinstance(job_id, str) or not job_id:
+            raise ValueError("job_id must be non-empty text")
+        return await self._graph_store().list_graph_events(
+            self.agent_id,
+            job_id,
+            after_event_id=after_event_id,
+            limit=limit,
+        )
+
     async def _load_owned(self, job_id: str) -> JobRun | None:
         if not isinstance(job_id, str) or not job_id:
             raise ValueError("job_id must be non-empty text")
@@ -281,6 +340,12 @@ class JobOwner:
     def _notify(self, job_id: str | None) -> None:
         if self._wake is not None:
             self._wake(job_id)
+
+    def _graph_store(self) -> DraftGraphJobStore:
+        for method in ("admit_graph", "inspect_graph", "list_graph_events"):
+            if not callable(getattr(self._store, method, None)):
+                raise RuntimeError("draft graph store is unavailable")
+        return cast(DraftGraphJobStore, self._store)
 
 
 def _sensitivity_rank(value: ModelSensitivity) -> int:
@@ -292,4 +357,4 @@ def _sensitivity_rank(value: ModelSensitivity) -> int:
     }[value]
 
 
-__all__ = ["JobError", "JobOwner", "JobStore"]
+__all__ = ["DraftGraphJobStore", "JobError", "JobOwner", "JobStore"]

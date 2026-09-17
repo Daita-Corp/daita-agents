@@ -64,6 +64,7 @@ from ..distribution.models import (
     Delivery,
     DeliveryState,
     DeliverySubjectKind,
+    GraphJobDelivery,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
     OutcomeState,
@@ -693,10 +694,15 @@ class SQLiteStateStore:
     current_revision = str(CURRENT_HOME_REVISION)
 
     def __init__(
-        self, path: Path, *, clock: Callable[[], datetime] | None = None
+        self,
+        path: Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        draft_graph: bool = False,
     ) -> None:
         self.path = path
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._draft_graph = draft_graph
         self._decoded_catalog_snapshots: dict[
             tuple[str, str, str], SourceCatalogSnapshot
         ] = {}
@@ -757,7 +763,7 @@ class SQLiteStateStore:
                 require_draft_graph_schema(connection)
 
         await asyncio.to_thread(admit)
-        return cls(resolved, clock=clock)
+        return cls(resolved, clock=clock, draft_graph=True)
 
     async def admit_graph(self, admission: GraphAdmission) -> GraphJob:
         if not isinstance(admission, GraphAdmission):
@@ -799,6 +805,23 @@ class SQLiteStateStore:
             ),
         )
 
+    async def expire_due_graphs(
+        self,
+        agent_id: str,
+        *,
+        expired_at: datetime,
+        limit: int = 64,
+    ) -> tuple[GraphJob, ...]:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.expire_due_graphs(
+                connection,
+                agent_id,
+                expired_at=expired_at,
+                limit=limit,
+            ),
+        )
+
     async def list_stale_graph_attempts(
         self,
         agent_id: str,
@@ -810,6 +833,19 @@ class SQLiteStateStore:
             self.path,
             lambda connection: _draft_graph_store.list_stale_attempts(
                 connection, agent_id, now=now, limit=limit
+            ),
+        )
+
+    async def list_active_graph_attempts(
+        self,
+        agent_id: str,
+        *,
+        limit: int = 64,
+    ) -> tuple[TaskAttempt, ...]:
+        return await _run_draft_read(
+            self.path,
+            lambda connection: _draft_graph_store.list_active_attempts(
+                connection, agent_id, limit=limit
             ),
         )
 
@@ -933,6 +969,44 @@ class SQLiteStateStore:
             ),
         )
 
+    async def finalize_graph_attempt(
+        self,
+        result: TaskResult,
+        delivery: GraphJobDelivery,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        usage: tuple[BudgetAmount, ...] | None,
+    ) -> TaskResult:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.complete_attempt(
+                connection,
+                result,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                usage=usage,
+                delivery=delivery,
+            ),
+        )
+
+    async def list_draft_graph_deliveries(
+        self,
+        agent_id: str,
+        *,
+        job_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[GraphJobDelivery, ...]:
+        return await _run_draft_read(
+            self.path,
+            lambda connection: _draft_graph_store.list_graph_deliveries(
+                connection,
+                agent_id,
+                job_id=job_id,
+                limit=limit,
+            ),
+        )
+
     async def fence_graph_attempt(
         self,
         agent_id: str,
@@ -956,6 +1030,35 @@ class SQLiteStateStore:
                 fencing_epoch=fencing_epoch,
                 fenced_at=fenced_at,
                 requeue=requeue,
+                reason_code=reason_code,
+            ),
+        )
+
+    async def fail_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        failed_at: datetime,
+        retryable: bool,
+        reason_code: str,
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.fail_attempt(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                failed_at=failed_at,
+                retryable=retryable,
                 reason_code=reason_code,
             ),
         )
@@ -6444,6 +6547,16 @@ class SQLiteStateStore:
             not isinstance(conversation_id, str) or not conversation_id
         ):
             raise ValueError("conversation_id must be non-empty text or None")
+        if self._draft_graph:
+            return await _run_draft_read(
+                self.path,
+                lambda connection: _draft_graph_store.list_graph_artifact_refs(
+                    connection,
+                    agent_id,
+                    run_id=run_id,
+                    conversation_id=conversation_id,
+                ),
+            )
 
         def read() -> tuple[ArtifactRef, ...]:
             clauses = ["r.agent_id = ?"]
@@ -6544,6 +6657,25 @@ class SQLiteStateStore:
             not isinstance(conversation_id, str) or not conversation_id
         ):
             raise ValueError("conversation_id must be non-empty text or None")
+        if self._draft_graph:
+            deliveries = await self.list_draft_graph_deliveries(
+                agent_id,
+                limit=min(100, MAX_DELIVERIES_PER_AGENT),
+            )
+            references = {
+                reference.artifact_id: reference
+                for delivery in deliveries
+                if conversation_id is None
+                or delivery.conversation_id == conversation_id
+                for reference in delivery.outcome.artifact_references
+                if run_id is None or reference.producing_run_id == run_id
+            }
+            return tuple(
+                sorted(
+                    references.values(),
+                    key=lambda item: (item.producing_run_id, item.artifact_id),
+                )
+            )
 
         def read() -> tuple[OutcomeArtifactReference, ...]:
             clauses = ["agent_id = ?"]
@@ -6588,6 +6720,14 @@ class SQLiteStateStore:
         agent_id: str,
     ) -> frozenset[tuple[str, str]]:
         """Return exact live job artifact reservations for admission recovery."""
+
+        if self._draft_graph:
+            return await _run_draft_read(
+                self.path,
+                lambda connection: _draft_graph_store.list_graph_reserved_artifact_ids(
+                    connection, agent_id
+                ),
+            )
 
         def read() -> frozenset[tuple[str, str]]:
             with _connect_read_only(self.path) as connection:

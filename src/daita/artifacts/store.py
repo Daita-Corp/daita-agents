@@ -295,6 +295,18 @@ class AgentHomeArtifactStore:
             artifact_id,
         )
 
+    async def read_reserved(
+        self,
+        run_id: str,
+        artifact_id: str,
+    ) -> ArtifactPayload | None:
+        """Read one restart-reserved artifact before its durable result promotion."""
+
+        ref = await self.recover_reserved(run_id, artifact_id)
+        if ref is None:
+            return None
+        return await asyncio.to_thread(self._read_ref, ref)
+
     async def commit(
         self,
         draft: ArtifactDraft,

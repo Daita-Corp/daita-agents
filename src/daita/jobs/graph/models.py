@@ -130,6 +130,13 @@ def canonical_digest(value: Mapping[str, object]) -> str:
     return "sha256:" + sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def reserved_artifact_id(attempt_id: str) -> str:
+    """Derive the one restart-stable artifact reservation for an internal attempt."""
+
+    _identifier(attempt_id, "attempt artifact reservation")
+    return "artifact-" + sha256(attempt_id.encode("utf-8")).hexdigest()[:32]
+
+
 class GraphState(str, Enum):
     QUEUED = "queued"
     ACTIVE = "active"
@@ -1438,6 +1445,9 @@ class GraphInspection:
     attempts: tuple[TaskAttempt, ...]
     results: tuple[TaskResult, ...]
     controls: tuple[TaskControl, ...]
+    budget_ledgers: tuple[BudgetLedger, ...] = ()
+    events: tuple[GraphEvent, ...] = ()
+    delivery_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1532,5 +1542,6 @@ __all__ = [
     "TaskRole",
     "TaskState",
     "canonical_digest",
+    "reserved_artifact_id",
     "topology_digest",
 ]

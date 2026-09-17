@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import threading
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
+from functools import partial
 from hashlib import sha256
+from typing import TypeVar
 
 from .._json import canonical_json
 from ..adapters.job_profiles import (
@@ -17,13 +20,39 @@ from ..adapters.job_profiles import (
     ExternalStartRequest,
     ExternalStatusRequest,
 )
-from ..artifacts.models import ArtifactError, ArtifactRef
+from ..artifacts.models import (
+    ArtifactAuthorship,
+    ArtifactError,
+    ArtifactRef,
+    artifact_ref_to_mapping,
+)
 from ..artifacts.store import AgentHomeArtifactStore
 from ..capabilities import CapabilityInputError
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
+from ..distribution.models import (
+    ArtifactRequirement,
+    OutcomeContract,
+    outcome_artifact_reference,
+    validate_outcome_artifact_references,
+)
+from ..distribution.owner import DistributionOwner, construct_graph_job_delivery
+from ..hosting.execution_governor import RunAdmissionCoordinator, WorkloadClass
 from ..llm.models import ModelSensitivity
 from ..loop.models import RunInput
 from ..storage.sqlite import SQLiteStateStore
+from .graph.models import (
+    BudgetAmount,
+    GraphInspection,
+    GraphTask,
+    TaskAttempt,
+    TaskCheckpoint,
+    TaskExecutionKind,
+    TaskResult,
+    TaskRole,
+    TaskState,
+    canonical_digest,
+    reserved_artifact_id,
+)
 from .models import (
     MAX_JOB_EXTERNAL_OBSERVATIONS,
     MAX_RUNNING_JOBS_GLOBAL,
@@ -45,6 +74,9 @@ from .owner import JobError, JobOwner
 _ARTIFACT_ID = re.compile(r"artifact-[0-9a-f]{32}\Z")
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
 _DEFAULT_POLL_SECONDS = 0.05
+_PROFILE_WORK_KIND = "data_profile_work"
+_PROFILE_FINALIZER_KIND = "data_profile_finalizer"
+_T = TypeVar("_T")
 
 
 class _ProcessJobCapacity:
@@ -84,6 +116,10 @@ class JobSupervisor:
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
         on_terminal: Callable[[JobRun], None] | None = None,
+        admission_coordinator: RunAdmissionCoordinator | None = None,
+        distribution: DistributionOwner | None = None,
+        graph_parallelism: int = 1,
+        graph_heartbeat_seconds: float = 10.0,
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
@@ -103,12 +139,37 @@ class JobSupervisor:
         if on_terminal is not None and not callable(on_terminal):
             raise TypeError("terminal observer must be callable or None")
         self._on_terminal = on_terminal
+        if admission_coordinator is not None and not isinstance(
+            admission_coordinator, RunAdmissionCoordinator
+        ):
+            raise TypeError("graph admission coordinator is invalid")
+        if distribution is not None and not isinstance(distribution, DistributionOwner):
+            raise TypeError("graph distribution owner is invalid")
+        if (
+            not isinstance(graph_parallelism, int)
+            or isinstance(graph_parallelism, bool)
+            or not 1 <= graph_parallelism <= 4
+        ):
+            raise ValueError("graph parallelism must be between one and four")
+        if (
+            not isinstance(graph_heartbeat_seconds, (int, float))
+            or isinstance(graph_heartbeat_seconds, bool)
+            or not 10 <= float(graph_heartbeat_seconds) <= 30
+        ):
+            raise ValueError("graph heartbeat interval is outside its bound")
+        self._admission_coordinator = admission_coordinator
+        self._distribution = distribution
+        self._graph_parallelism = graph_parallelism
+        self._graph_heartbeat_seconds = float(graph_heartbeat_seconds)
         self._poll_seconds = float(poll_seconds)
         self._wake = asyncio.Event()
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._worker_modes: dict[str, JobExecutionMode] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._driver: asyncio.Task[None] | None = None
+        self._graph_driver: asyncio.Task[None] | None = None
+        self._graph_workers: dict[tuple[str, str], asyncio.Task[None]] = {}
+        self._graph_wake = asyncio.Event()
         self._closing = False
 
     async def start(self) -> None:
@@ -118,6 +179,19 @@ class JobSupervisor:
         self._driver = asyncio.create_task(
             self._drive(),
             name=f"daita-job-supervisor:{self._agent_id}",
+        )
+
+    async def start_graph_integration(self) -> None:
+        """Start only the explicit draft-graph supervisor path used by integration."""
+
+        if self._graph_driver is not None or self._driver is not None:
+            raise RuntimeError("job supervisor is already started")
+        if self._admission_coordinator is None or self._distribution is None:
+            raise RuntimeError("draft graph integration dependencies are unavailable")
+        await self._recover_graph_attempts()
+        self._graph_driver = asyncio.create_task(
+            self._drive_graph(),
+            name=f"daita-graph-supervisor:{self._agent_id}",
         )
 
     def wake(self, job_id: str | None = None) -> None:
@@ -135,6 +209,7 @@ class JobSupervisor:
                 if worker_job is JobExecutionMode.DAITA:
                     worker.cancel("job_cancel_requested")
         self._wake.set()
+        self._graph_wake.set()
 
     async def close(self) -> None:
         if self._closing:
@@ -142,7 +217,14 @@ class JobSupervisor:
         self._closing = True
         current_loop = asyncio.get_running_loop()
         all_tasks = tuple(
-            item for item in (self._driver, *self._workers.values()) if item is not None
+            item
+            for item in (
+                self._driver,
+                self._graph_driver,
+                *self._workers.values(),
+                *self._graph_workers.values(),
+            )
+            if item is not None
         )
         tasks = tuple(item for item in all_tasks if item.get_loop() is current_loop)
         if tasks:
@@ -154,7 +236,9 @@ class JobSupervisor:
             return_exceptions=True,
         )
         self._driver = None
+        self._graph_driver = None
         self._workers.clear()
+        self._graph_workers.clear()
         self._worker_modes.clear()
         self._cancel_events.clear()
 
@@ -192,6 +276,698 @@ class JobSupervisor:
                 recovered_at=now,
                 restart_safe=True,
             )
+
+    async def _graph_store_call(
+        self,
+        operation: Callable[[], Awaitable[_T]],
+    ) -> _T:
+        coordinator = self._required_graph_coordinator()
+        permit = await coordinator.sqlite_pressure_permit()
+        async with permit:
+            return await operation()
+
+    def _required_graph_coordinator(self) -> RunAdmissionCoordinator:
+        if self._admission_coordinator is None:
+            raise RuntimeError("draft graph coordinator is unavailable")
+        return self._admission_coordinator
+
+    def _required_graph_distribution(self) -> DistributionOwner:
+        if self._distribution is None:
+            raise RuntimeError("draft graph distribution owner is unavailable")
+        return self._distribution
+
+    async def _recover_graph_attempts(self) -> None:
+        attempts = await self._graph_store_call(
+            lambda: self._store.list_active_graph_attempts(self._agent_id)
+        )
+        for attempt in attempts:
+            inspection = await self._graph_store_call(
+                partial(self._store.inspect_graph, self._agent_id, attempt.job_id)
+            )
+            if inspection is None:
+                continue
+            task = _inspection_task(inspection, attempt.task_id)
+            try:
+                _internal_task_contract(task)
+                payload = await self._artifacts.read_reserved(
+                    attempt.run_id,
+                    reserved_artifact_id(attempt.attempt_id),
+                )
+            except (
+                ArtifactError,
+                CapabilityInputError,
+                TypeError,
+                ValueError,
+            ) as error:
+                await self._graph_store_call(
+                    partial(
+                        self._store.fail_graph_attempt,
+                        attempt.agent_id,
+                        attempt.job_id,
+                        attempt.task_id,
+                        attempt.attempt_id,
+                        claim_token=attempt.claim_token,
+                        fencing_epoch=attempt.fencing_epoch,
+                        failed_at=self._clock(),
+                        retryable=False,
+                        reason_code=_safe_graph_failure_code(error),
+                    )
+                )
+                continue
+            if payload is not None:
+                started = await self._graph_store_call(
+                    partial(
+                        self._store.start_graph_attempt,
+                        attempt.agent_id,
+                        attempt.job_id,
+                        attempt.task_id,
+                        attempt.attempt_id,
+                        claim_token=attempt.claim_token,
+                        fencing_epoch=attempt.fencing_epoch,
+                        started_at=attempt.started_at or payload.ref.created_at,
+                    )
+                )
+                if started is not None:
+                    try:
+                        await self._promote_graph_artifact(
+                            inspection,
+                            task,
+                            started,
+                            payload.ref,
+                            payload.content,
+                        )
+                    except (
+                        ArtifactError,
+                        CapabilityInputError,
+                        TypeError,
+                        ValueError,
+                    ) as error:
+                        await self._graph_store_call(
+                            partial(
+                                self._store.fail_graph_attempt,
+                                started.agent_id,
+                                started.job_id,
+                                started.task_id,
+                                started.attempt_id,
+                                claim_token=started.claim_token,
+                                fencing_epoch=started.fencing_epoch,
+                                failed_at=self._clock(),
+                                retryable=False,
+                                reason_code=_safe_graph_failure_code(error),
+                            )
+                        )
+                    continue
+            await self._graph_store_call(
+                partial(
+                    self._store.fence_graph_attempt,
+                    attempt.agent_id,
+                    attempt.job_id,
+                    attempt.task_id,
+                    attempt.attempt_id,
+                    fencing_epoch=attempt.fencing_epoch,
+                    fenced_at=self._clock(),
+                    requeue=True,
+                    reason_code="host_restarted",
+                )
+            )
+
+    async def _drive_graph(self) -> None:
+        try:
+            while not self._closing:
+                self._graph_wake.clear()
+                await self._recover_stale_graph_attempts()
+                await self._graph_store_call(
+                    lambda: self._store.expire_due_graphs(
+                        self._agent_id,
+                        expired_at=self._clock(),
+                    )
+                )
+                await self._launch_ready_graph_tasks()
+                try:
+                    await asyncio.wait_for(
+                        self._graph_wake.wait(),
+                        timeout=self._poll_seconds,
+                    )
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            return
+
+    async def _recover_stale_graph_attempts(self) -> None:
+        stale = await self._graph_store_call(
+            lambda: self._store.list_stale_graph_attempts(
+                self._agent_id,
+                now=self._clock(),
+            )
+        )
+        for attempt in stale:
+            key = (attempt.job_id, attempt.task_id)
+            fenced = await self._graph_store_call(
+                partial(
+                    self._store.fence_graph_attempt,
+                    attempt.agent_id,
+                    attempt.job_id,
+                    attempt.task_id,
+                    attempt.attempt_id,
+                    fencing_epoch=attempt.fencing_epoch,
+                    fenced_at=self._clock(),
+                    requeue=True,
+                    reason_code="lease_expired",
+                )
+            )
+            if fenced is None:
+                continue
+            worker = self._graph_workers.get(key)
+            if worker is not None and not worker.done():
+                worker.cancel("graph_attempt_lease_expired")
+                await asyncio.gather(worker, return_exceptions=True)
+
+    async def _launch_ready_graph_tasks(self) -> None:
+        available = self._graph_parallelism - len(self._graph_workers)
+        if available <= 0:
+            return
+        ready = await self._graph_store_call(
+            lambda: self._store.list_ready_graph_tasks(
+                self._agent_id,
+                now=self._clock(),
+                limit=64,
+            )
+        )
+        for task in ready:
+            key = (task.job_id, task.task_id)
+            if key in self._graph_workers:
+                continue
+            worker = asyncio.create_task(
+                self._run_graph_task(task),
+                name=f"daita-graph-task:{task.job_id}:{task.task_id}",
+            )
+            self._graph_workers[key] = worker
+
+            def done(completed: asyncio.Task[None], *, key=key) -> None:
+                self._graph_workers.pop(key, None)
+                if not completed.cancelled():
+                    completed.exception()
+                self._graph_wake.set()
+
+            worker.add_done_callback(done)
+            available -= 1
+            if available == 0:
+                return
+
+    async def _run_graph_task(self, selected: GraphTask) -> None:
+        coordinator = self._required_graph_coordinator()
+        lease = await coordinator.admit_execution(
+            WorkloadClass.GRAPH,
+            f"{selected.job_id}:{selected.task_id}",
+        )
+        async with lease:
+            inspection = await self._graph_store_call(
+                lambda: self._store.inspect_graph(self._agent_id, selected.job_id)
+            )
+            if inspection is None:
+                return
+            current_task = _inspection_task(inspection, selected.task_id)
+            contract = _internal_task_contract(current_task)
+            attempt_id = self._id_factory("attempt")
+            claim_token = self._id_factory("claim")
+            run_id = _required_generated_id(
+                self._id_factory("run"),
+                _RUN_ID,
+                "graph execution run",
+            )
+            claimed_at = self._clock()
+            absolute_deadline = min(
+                inspection.job.deadline_at,
+                claimed_at
+                + timedelta(seconds=current_task.specification.max_wall_time_seconds),
+            )
+            try:
+                attempt = await self._graph_store_call(
+                    lambda: self._store.claim_graph_task(
+                        self._agent_id,
+                        current_task.job_id,
+                        current_task.task_id,
+                        attempt_id=attempt_id,
+                        claim_token=claim_token,
+                        run_id=run_id,
+                        executor_id=str(contract["capability_id"]),
+                        claimed_at=claimed_at,
+                        lease_seconds=30,
+                        absolute_deadline_at=absolute_deadline,
+                        budget_reservations=_attempt_budget_reservations(current_task),
+                    )
+                )
+            except Exception:
+                attempt = await self._find_graph_attempt(
+                    current_task.job_id,
+                    current_task.task_id,
+                    attempt_id,
+                )
+                if attempt is None:
+                    raise
+            if attempt is None:
+                return
+            started = await self._graph_store_call(
+                lambda: self._store.start_graph_attempt(
+                    attempt.agent_id,
+                    attempt.job_id,
+                    attempt.task_id,
+                    attempt.attempt_id,
+                    claim_token=attempt.claim_token,
+                    fencing_epoch=attempt.fencing_epoch,
+                    started_at=self._clock(),
+                )
+            )
+            if started is None:
+                return
+            await self._checkpoint_graph_start(started)
+            heartbeat = asyncio.create_task(
+                self._heartbeat_graph_attempt(started),
+                name=f"daita-graph-heartbeat:{started.attempt_id}",
+            )
+            try:
+                await self._execute_graph_attempt(inspection, current_task, started)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                current = await self._graph_store_call(
+                    lambda: self._store.inspect_graph(
+                        self._agent_id, current_task.job_id
+                    )
+                )
+                if (
+                    current is not None
+                    and _inspection_task(current, current_task.task_id).state
+                    is TaskState.SUCCEEDED
+                ):
+                    return
+                await self._graph_store_call(
+                    lambda: self._store.fail_graph_attempt(
+                        started.agent_id,
+                        started.job_id,
+                        started.task_id,
+                        started.attempt_id,
+                        claim_token=started.claim_token,
+                        fencing_epoch=started.fencing_epoch,
+                        failed_at=self._clock(),
+                        retryable=_graph_failure_is_retryable(error),
+                        reason_code=_safe_graph_failure_code(error),
+                    )
+                )
+            finally:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _find_graph_attempt(
+        self,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> TaskAttempt | None:
+        inspection = await self._graph_store_call(
+            lambda: self._store.inspect_graph(self._agent_id, job_id)
+        )
+        if inspection is None:
+            return None
+        return next(
+            (
+                item
+                for item in inspection.attempts
+                if item.task_id == task_id and item.attempt_id == attempt_id
+            ),
+            None,
+        )
+
+    async def _checkpoint_graph_start(self, attempt: TaskAttempt) -> None:
+        payload = {
+            "state": "running",
+            "executor_id": attempt.executor_id,
+            "reserved_budgets": {
+                item.dimension: item.amount for item in attempt.reserved_budgets
+            },
+        }
+        checkpoint = TaskCheckpoint(
+            agent_id=attempt.agent_id,
+            job_id=attempt.job_id,
+            task_id=attempt.task_id,
+            attempt_id=attempt.attempt_id,
+            checkpoint_id=f"{attempt.attempt_id}:started",
+            fencing_epoch=attempt.fencing_epoch,
+            ordinal=1,
+            milestone="execution_started",
+            payload=payload,
+            created_at=self._clock(),
+            payload_digest=canonical_digest(payload),
+        )
+        try:
+            await self._graph_store_call(
+                lambda: self._store.checkpoint_graph_attempt(
+                    checkpoint,
+                    claim_token=attempt.claim_token,
+                )
+            )
+        except Exception:
+            inspection = await self._graph_store_call(
+                lambda: self._store.inspect_graph(self._agent_id, attempt.job_id)
+            )
+            current = (
+                None
+                if inspection is None
+                else next(
+                    (
+                        item
+                        for item in inspection.attempts
+                        if item.attempt_id == attempt.attempt_id
+                    ),
+                    None,
+                )
+            )
+            if (
+                current is None
+                or checkpoint.checkpoint_id not in current.checkpoint_ids
+            ):
+                raise
+
+    async def _heartbeat_graph_attempt(self, attempt: TaskAttempt) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._graph_heartbeat_seconds)
+                renewed = await self._graph_store_call(
+                    lambda: self._store.heartbeat_graph_attempt(
+                        attempt.agent_id,
+                        attempt.job_id,
+                        attempt.task_id,
+                        attempt.attempt_id,
+                        claim_token=attempt.claim_token,
+                        fencing_epoch=attempt.fencing_epoch,
+                        heartbeat_at=self._clock(),
+                    )
+                )
+                if renewed is None:
+                    return
+        except asyncio.CancelledError:
+            return
+
+    async def _execute_graph_attempt(
+        self,
+        inspection: GraphInspection,
+        task: GraphTask,
+        attempt: TaskAttempt,
+    ) -> None:
+        contract = _internal_task_contract(task)
+        reservation = reserved_artifact_id(attempt.attempt_id)
+        recovered = await self._artifacts.read_reserved(attempt.run_id, reservation)
+        if recovered is not None:
+            await self._promote_graph_artifact(
+                inspection,
+                task,
+                attempt,
+                recovered.ref,
+                recovered.content,
+            )
+            return
+        arguments = self._graph_execution_arguments(inspection, task, contract)
+        run = RunInput(
+            id=attempt.run_id,
+            agent_id=attempt.agent_id,
+            message="Execute the exact frozen internal graph task.",
+            created_at=attempt.started_at or self._clock(),
+            conversation_id=inspection.job.conversation_id,
+            source_scope_ids=task.specification.authority.source_ids,
+        )
+        request = InternalCapabilityRequest(
+            run=run,
+            call_id=f"graph-call-{attempt.attempt_id}",
+            capability_id=str(contract["capability_id"]),
+            contract_digest=str(contract["contract_digest"]),
+            arguments=arguments,
+            sensitivity=task.specification.authority.sensitivity,
+            reserved_artifact_id=reservation,
+        )
+        permit_key = contract.get("source_permit_key")
+        try:
+            if permit_key is None:
+                outcome = await self._runtime.execute_internal(request)
+            else:
+                if not isinstance(permit_key, str) or not permit_key:
+                    raise ValueError("graph source permit key is invalid")
+                permit = (
+                    await self._required_graph_coordinator().source_resource_permit(
+                        permit_key
+                    )
+                )
+                async with permit:
+                    outcome = await self._runtime.execute_internal(request)
+        except BaseException:
+            recovered = await self._artifacts.read_reserved(attempt.run_id, reservation)
+            if recovered is None:
+                raise
+            await self._promote_graph_artifact(
+                inspection,
+                task,
+                attempt,
+                recovered.ref,
+                recovered.content,
+            )
+            return
+        if outcome.artifact_ref is None:
+            raise ValueError("internal graph capability returned no required artifact")
+        if outcome.output.kind != contract["output_kind"]:
+            raise ValueError("internal graph capability returned the wrong output kind")
+        payload = await self._artifacts.read_reserved(attempt.run_id, reservation)
+        if payload is None or payload.ref != outcome.artifact_ref:
+            raise ValueError("internal graph artifact cannot be authenticated")
+        await self._promote_graph_artifact(
+            inspection,
+            task,
+            attempt,
+            payload.ref,
+            payload.content,
+        )
+
+    def _graph_execution_arguments(
+        self,
+        inspection: GraphInspection,
+        task: GraphTask,
+        contract: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        if contract["kind"] == _PROFILE_WORK_KIND:
+            arguments = contract.get("arguments")
+            if not isinstance(arguments, Mapping):
+                raise ValueError("graph work arguments are malformed")
+            return arguments
+        if task.role is not TaskRole.FINALIZER:
+            raise ValueError("only the reserved finalizer can aggregate graph results")
+        required_task_ids = tuple(
+            sorted(
+                edge.upstream_task_id
+                for edge in inspection.dependencies
+                if edge.downstream_task_id == task.task_id
+            )
+        )
+        accepted = {item.task_id: item for item in inspection.results}
+        if set(accepted) - {item.task_id for item in inspection.tasks}:
+            raise ValueError("graph accepted results reference unknown tasks")
+        work_results: list[dict[str, object]] = []
+        for task_id in required_task_ids:
+            result = accepted.get(task_id)
+            if result is None or len(result.artifact_ids) != 1:
+                raise ValueError("the finalizer barrier has an incomplete result")
+            raw_refs = result.provenance.get("artifact_refs")
+            if not isinstance(raw_refs, tuple) or len(raw_refs) != 1:
+                raise ValueError("a required accepted artifact is unauthenticated")
+            work_results.append(
+                {
+                    "task_id": task_id,
+                    "result_id": result.result_id,
+                    "result_digest": result.result_digest,
+                    "artifact_ref": raw_refs[0],
+                }
+            )
+        resource_ids = contract.get("resource_ids")
+        sample_rows = contract.get("sample_rows")
+        if not isinstance(resource_ids, tuple) or not isinstance(sample_rows, int):
+            raise ValueError("graph finalizer contract is malformed")
+        return {
+            "job_id": inspection.job.job_id,
+            "resource_ids": resource_ids,
+            "sample_rows": sample_rows,
+            "work_results": tuple(work_results),
+        }
+
+    async def _promote_graph_artifact(
+        self,
+        inspection: GraphInspection,
+        task: GraphTask,
+        attempt: TaskAttempt,
+        artifact: ArtifactRef,
+        content: bytes,
+    ) -> TaskResult:
+        contract = _internal_task_contract(task)
+        _validate_graph_artifact(
+            inspection,
+            task,
+            attempt,
+            artifact,
+            content,
+            capability_id=str(contract["capability_id"]),
+        )
+        payload = _profile_result_payload(
+            content,
+            job_id=inspection.job.job_id,
+            expected_resource_ids=(
+                task.specification.authority.resource_ids
+                if contract["kind"] == _PROFILE_WORK_KIND
+                else _contract_resource_ids(contract)
+            ),
+        )
+        completed_at = self._clock()
+        result = _graph_task_result(
+            task=task,
+            attempt=attempt,
+            result_id=self._id_factory("result"),
+            result_kind=str(contract["output_kind"]),
+            payload=payload,
+            artifact=artifact,
+            completed_at=completed_at,
+        )
+        if task.role is TaskRole.FINALIZER:
+            await self._finalize_graph_result(inspection, attempt, result, artifact)
+        else:
+            try:
+                await self._graph_store_call(
+                    lambda: self._store.complete_graph_attempt(
+                        result,
+                        claim_token=attempt.claim_token,
+                        fencing_epoch=attempt.fencing_epoch,
+                        usage=(BudgetAmount("work_units", 1),),
+                    )
+                )
+            except Exception:
+                current = await self._graph_store_call(
+                    lambda: self._store.inspect_graph(result.agent_id, result.job_id)
+                )
+                accepted = (
+                    None
+                    if current is None
+                    else next(
+                        (
+                            item
+                            for item in current.results
+                            if item.task_id == result.task_id
+                        ),
+                        None,
+                    )
+                )
+                if accepted != result:
+                    raise
+        return result
+
+    async def _finalize_graph_result(
+        self,
+        inspection: GraphInspection,
+        attempt: TaskAttempt,
+        result: TaskResult,
+        artifact: ArtifactRef,
+    ) -> None:
+        contract = _internal_task_contract(
+            _inspection_task(inspection, attempt.task_id)
+        )
+        requirement = ArtifactRequirement(
+            required=True,
+            minimum_count=1,
+            maximum_count=1,
+            allowed_media_types=("application/json",),
+            allowed_authorships=(ArtifactAuthorship.EXACT_SOURCE_DATA,),
+            allowed_producer_capability_ids=(str(contract["capability_id"]),),
+            maximum_artifact_bytes=1 * 1024 * 1024,
+            maximum_total_bytes=1 * 1024 * 1024,
+            maximum_sensitivity=inspection.job.specification.authority.sensitivity,
+        )
+        outcome_contract = OutcomeContract(
+            require_terminal_conclusion=True,
+            artifact_requirements=(requirement,),
+            maximum_total_artifact_bytes=1 * 1024 * 1024,
+            maximum_effective_sensitivity=(
+                inspection.job.specification.authority.sensitivity
+            ),
+            require_current_run_provenance=True,
+            require_exact_source_bindings=True,
+        )
+        artifact_references = validate_outcome_artifact_references(
+            (outcome_artifact_reference(artifact),),
+            contract=outcome_contract,
+            resulting_run_id=attempt.run_id,
+        )
+        distribution = self._required_graph_distribution()
+        target = distribution.resolve_conversation_inbox(
+            inspection.job.conversation_id,
+            sensitivity_ceiling=inspection.job.specification.authority.sensitivity,
+        )
+        plan = distribution.resolve_plan(
+            inspection.job.conversation_id,
+            destination_id=target.destination_id,
+            sensitivity_ceiling=inspection.job.specification.authority.sensitivity,
+        )
+        if plan.plan_digest != inspection.job.specification.distribution_plan_digest:
+            raise ValueError("graph distribution plan changed before finalization")
+        delivery = construct_graph_job_delivery(
+            delivery_id=self._id_factory("delivery"),
+            agent_id=result.agent_id,
+            conversation_id=inspection.job.conversation_id,
+            job_id=result.job_id,
+            target=target,
+            result_id=result.result_id,
+            result_digest=result.result_digest,
+            result_summary=result.summary,
+            artifact_references=artifact_references,
+            effective_sensitivity=result.sensitivity,
+            provenance_digest=canonical_digest(
+                {
+                    "job_id": result.job_id,
+                    "result_digest": result.result_digest,
+                    "artifact_ids": result.artifact_ids,
+                }
+            ),
+            observed_at=result.completed_at,
+        )
+        try:
+            await self._graph_store_call(
+                lambda: self._store.finalize_graph_attempt(
+                    result,
+                    delivery,
+                    claim_token=attempt.claim_token,
+                    fencing_epoch=attempt.fencing_epoch,
+                    usage=(BudgetAmount("work_units", 1),),
+                )
+            )
+        except Exception:
+            current, deliveries = await asyncio.gather(
+                self._graph_store_call(
+                    lambda: self._store.inspect_graph(result.agent_id, result.job_id)
+                ),
+                self._graph_store_call(
+                    lambda: self._store.list_draft_graph_deliveries(
+                        result.agent_id,
+                        job_id=result.job_id,
+                        limit=2,
+                    )
+                ),
+            )
+            accepted = (
+                None
+                if current is None
+                else next(
+                    (
+                        item
+                        for item in current.results
+                        if item.task_id == result.task_id
+                    ),
+                    None,
+                )
+            )
+            if accepted != result or deliveries != (delivery,):
+                raise
 
     async def _drive(self) -> None:
         try:
@@ -775,6 +1551,237 @@ def _claimed_attempt(job: JobRun) -> JobAttempt:
     if attempt is None or attempt.status is not JobAttemptStatus.CLAIMED:
         raise ValueError("job does not carry one exact claimed attempt")
     return attempt
+
+
+def _inspection_task(inspection: GraphInspection, task_id: str) -> GraphTask:
+    task = next((item for item in inspection.tasks if item.task_id == task_id), None)
+    if task is None:
+        raise ValueError("graph task is absent from its inspection")
+    return task
+
+
+def _internal_task_contract(task: GraphTask) -> Mapping[str, object]:
+    if task.execution_kind is not TaskExecutionKind.INTERNAL_CAPABILITY:
+        raise ValueError("the Phase 3 graph slice admits only internal tasks")
+    contract = task.specification.expected_result_contract
+    kind = contract.get("kind")
+    capability_id = contract.get("capability_id")
+    contract_digest = contract.get("contract_digest")
+    output_kind = contract.get("output_kind")
+    if kind not in {_PROFILE_WORK_KIND, _PROFILE_FINALIZER_KIND}:
+        raise ValueError("the graph task kind is outside the static slice")
+    if any(
+        not isinstance(value, str) or not value
+        for value in (capability_id, contract_digest, output_kind)
+    ):
+        raise ValueError("the internal graph task contract is malformed")
+    assert isinstance(capability_id, str)
+    assert isinstance(contract_digest, str)
+    if kind == _PROFILE_FINALIZER_KIND and task.role is not TaskRole.FINALIZER:
+        raise ValueError("the profile finalizer contract is not reserved")
+    if kind == _PROFILE_WORK_KIND and task.role is TaskRole.FINALIZER:
+        raise ValueError("the reserved finalizer cannot execute work")
+    if capability_id not in task.specification.authority.capability_ids:
+        raise ValueError("the task capability exceeds its immutable authority")
+    binding = task.specification.authority.contract_bindings.get(capability_id)
+    if binding != contract_digest:
+        raise ValueError("the task capability digest differs from its authority")
+    return contract
+
+
+def _attempt_budget_reservations(task: GraphTask) -> tuple[BudgetAmount, ...]:
+    raw = task.specification.expected_result_contract.get("attempt_budgets")
+    if not isinstance(raw, Mapping) or not raw:
+        raise ValueError("the internal task attempt budget is malformed")
+    task_limits = {item.dimension: item.amount for item in task.specification.budgets}
+    reservations: list[BudgetAmount] = []
+    for dimension, amount in raw.items():
+        if not isinstance(dimension, str) or not isinstance(amount, int):
+            raise ValueError("the internal task attempt budget is malformed")
+        if dimension not in task_limits or amount > task_limits[dimension]:
+            raise ValueError("the attempt budget exceeds the immutable task budget")
+        reservations.append(BudgetAmount(dimension, amount))
+    return tuple(sorted(reservations))
+
+
+def _contract_resource_ids(contract: Mapping[str, object]) -> tuple[str, ...]:
+    raw = contract.get("resource_ids")
+    if not isinstance(raw, tuple) or any(not isinstance(item, str) for item in raw):
+        raise ValueError("the graph finalizer resource contract is malformed")
+    return raw
+
+
+def _validate_graph_artifact(
+    inspection: GraphInspection,
+    task: GraphTask,
+    attempt: TaskAttempt,
+    artifact: ArtifactRef,
+    content: bytes,
+    *,
+    capability_id: str,
+) -> None:
+    if (
+        artifact.run_id != attempt.run_id
+        or artifact.conversation_id != inspection.job.conversation_id
+        or artifact.call_id != f"graph-call-{attempt.attempt_id}"
+        or artifact.capability_id != capability_id
+        or artifact.artifact_id != reserved_artifact_id(attempt.attempt_id)
+        or artifact.media_type != "application/json"
+        or artifact.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA
+        or artifact.byte_size != len(content)
+    ):
+        raise ValueError("the internal graph artifact differs from its attempt")
+    expected_resources = set(task.specification.authority.resource_ids)
+    actual_resources = {
+        item.resource_id for item in artifact.provenance.resource_bindings
+    }
+    if expected_resources and actual_resources != expected_resources:
+        raise ValueError("the internal graph artifact differs from its task scope")
+    if task.role is TaskRole.FINALIZER and actual_resources != set(
+        inspection.job.specification.authority.resource_ids
+    ):
+        raise ValueError("the finalizer artifact lacks exact root resource bindings")
+
+
+def _profile_result_payload(
+    content: bytes,
+    *,
+    job_id: str,
+    expected_resource_ids: tuple[str, ...],
+) -> Mapping[str, object]:
+    try:
+        document = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("the profile artifact is not valid JSON") from error
+    if (
+        not isinstance(document, dict)
+        or document.get("kind") != "data_profile"
+        or document.get("job_id") != job_id
+        or not isinstance(document.get("resources"), list)
+    ):
+        raise ValueError("the profile artifact has the wrong result contract")
+    resources = document["resources"]
+    resource_ids: list[str] = []
+    sampled_rows = 0
+    truncated_resources = 0
+    for resource in resources:
+        if not isinstance(resource, dict):
+            raise ValueError("the profile artifact contains a malformed resource")
+        resource_id = resource.get("resource_id")
+        sampled = resource.get("sampled_rows")
+        if (
+            not isinstance(resource_id, str)
+            or not isinstance(sampled, int)
+            or isinstance(sampled, bool)
+        ):
+            raise ValueError("the profile artifact contains invalid result evidence")
+        resource_ids.append(resource_id)
+        sampled_rows += sampled
+        if resource.get("truncated") is True:
+            truncated_resources += 1
+    if (
+        document.get("resource_count") != len(resources)
+        or tuple(sorted(resource_ids)) != tuple(sorted(expected_resource_ids))
+        or len(resource_ids) != len(set(resource_ids))
+    ):
+        raise ValueError("the profile artifact does not cover its exact resources")
+    return {
+        "job_id": job_id,
+        "profiled_resources": len(resources),
+        "sampled_rows": sampled_rows,
+        "truncated_resources": truncated_resources,
+    }
+
+
+def _graph_task_result(
+    *,
+    task: GraphTask,
+    attempt: TaskAttempt,
+    result_id: str,
+    result_kind: str,
+    payload: Mapping[str, object],
+    artifact: ArtifactRef,
+    completed_at: datetime,
+) -> TaskResult:
+    schema_digest = canonical_digest(
+        {
+            "result_kind": result_kind,
+            "task_contract": task.specification.expected_result_contract,
+        }
+    )
+    sensitivity = ModelSensitivity(artifact.sensitivity.value)
+    provenance = {
+        "authority": "authenticated_internal_capability_artifact",
+        "task_spec_digest": task.task_spec_digest,
+        "artifact_refs": (artifact_ref_to_mapping(artifact),),
+    }
+    verification = {
+        "artifact_sha256": artifact.sha256,
+        "capability_id": artifact.capability_id,
+        "artifact_authenticated": True,
+    }
+    digest_material = {
+        "agent_id": task.agent_id,
+        "job_id": task.job_id,
+        "task_id": task.task_id,
+        "result_id": result_id,
+        "attempt_id": attempt.attempt_id,
+        "run_id": attempt.run_id,
+        "result_kind": result_kind,
+        "schema_digest": schema_digest,
+        "payload": payload,
+        "summary": (
+            f"Profiled {payload['profiled_resources']} exact resource(s) with "
+            f"{payload['sampled_rows']} sampled row(s)."
+        ),
+        "sensitivity": sensitivity.value,
+        "provenance": provenance,
+        "artifact_ids": (artifact.artifact_id,),
+        "effect_receipt_ids": (),
+        "verification": verification,
+        "residual_risk": None,
+        "downstream_constraints": {},
+        "completed_at": completed_at.isoformat(),
+    }
+    return TaskResult(
+        agent_id=task.agent_id,
+        job_id=task.job_id,
+        task_id=task.task_id,
+        result_id=result_id,
+        attempt_id=attempt.attempt_id,
+        run_id=attempt.run_id,
+        result_kind=result_kind,
+        schema_digest=schema_digest,
+        payload=payload,
+        summary=str(digest_material["summary"]),
+        sensitivity=sensitivity,
+        provenance=provenance,
+        artifact_ids=(artifact.artifact_id,),
+        effect_receipt_ids=(),
+        verification=verification,
+        residual_risk=None,
+        downstream_constraints={},
+        completed_at=completed_at,
+        result_digest=canonical_digest(digest_material),
+    )
+
+
+def _safe_graph_failure_code(error: BaseException) -> str:
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9._:/-]{1,256}", code):
+        return code
+    if isinstance(error, ArtifactError):
+        return error.code
+    if isinstance(error, CapabilityInputError):
+        return error.code
+    return "graph_internal_execution_failed"
+
+
+def _graph_failure_is_retryable(error: BaseException) -> bool:
+    return not isinstance(
+        error,
+        (ArtifactError, CapabilityInputError, TypeError, ValueError),
+    )
 
 
 def _resource_binding_payload(value) -> dict[str, object]:

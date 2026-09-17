@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import sqlite3
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from ..artifacts.models import ArtifactRef, artifact_ref_from_mapping
+from ..distribution.models import GraphJobDelivery
 from ..jobs.graph.models import (
     ACTIVE_ATTEMPT_STATES,
     CONTROL_BUDGET_ROLES,
@@ -37,6 +40,7 @@ from ..jobs.graph.models import (
     TaskResult,
     TaskRole,
     TaskState,
+    reserved_artifact_id,
     topology_digest,
 )
 from ..jobs.graph.validation import (
@@ -49,6 +53,7 @@ from ..jobs.graph.validation import (
     validate_mutation,
 )
 from .draft_graph_codecs import (
+    decode_draft_delivery,
     decode_graph_event,
     decode_graph_job,
     decode_graph_mutation,
@@ -60,6 +65,7 @@ from .draft_graph_codecs import (
     decode_task_result,
     encode_graph_event_payload,
     encode_graph_job,
+    encode_graph_job_delivery,
     encode_graph_mutation,
     encode_graph_task,
     encode_job_graph,
@@ -696,6 +702,30 @@ def admit_graph(connection: sqlite3.Connection, admission: GraphAdmission) -> Gr
     return job
 
 
+def _insert_graph_delivery(
+    connection: sqlite3.Connection,
+    delivery: GraphJobDelivery,
+) -> None:
+    connection.execute(
+        """INSERT INTO deliveries(
+               agent_id, delivery_id, conversation_id, subject_kind, subject_id,
+               logical_key, target_kind, target_fingerprint, state,
+               created_at_us, data
+           ) VALUES (?, ?, ?, 'graph_job', ?, ?, 'conversation_inbox', ?, ?, ?, ?)""",
+        (
+            delivery.agent_id,
+            delivery.delivery_id,
+            delivery.conversation_id,
+            delivery.job_id,
+            delivery.logical_key,
+            delivery.target.target_fingerprint,
+            delivery.visibility_state.value,
+            datetime_to_us(delivery.created_at),
+            encode_graph_job_delivery(delivery),
+        ),
+    )
+
+
 def inspect_graph(
     connection: sqlite3.Connection, agent_id: str, job_id: str
 ) -> GraphInspection | None:
@@ -739,6 +769,22 @@ def inspect_graph(
         attempts=attempts,
         results=results,
         controls=controls,
+        budget_ledgers=list_budget_ledgers(connection, agent_id, job_id),
+        events=list_graph_events(
+            connection,
+            agent_id,
+            job_id,
+            limit=MAX_GRAPH_INSPECTION_EVENTS,
+        ).events,
+        delivery_ids=tuple(
+            item.delivery_id
+            for item in list_graph_deliveries(
+                connection,
+                agent_id,
+                job_id=job_id,
+                limit=2,
+            )
+        ),
     )
 
 
@@ -831,6 +877,85 @@ def list_ready_tasks(
     return tuple(tasks)
 
 
+def expire_due_graphs(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    expired_at: datetime,
+    limit: int = 64,
+) -> tuple[GraphJob, ...]:
+    """Fail deadline-expired graphs once every active attempt has been fenced."""
+
+    if not 1 <= limit <= 64:
+        raise ValueError("expired graph limit is outside its bound")
+    rows = tuple(
+        connection.execute(
+            """SELECT job_id FROM job_runs
+               WHERE agent_id = ? AND state IN ('queued','active')
+                 AND desired_state = 'run' AND deadline_at_us <= ?
+               ORDER BY deadline_at_us, job_id LIMIT ?""",
+            (agent_id, datetime_to_us(expired_at), limit),
+        )
+    )
+    expired: list[GraphJob] = []
+    for (job_id_raw,) in rows:
+        job_id = str(job_id_raw)
+        loaded_job = _load_job(connection, agent_id, job_id)
+        loaded_graph = _load_graph(connection, agent_id, job_id)
+        if loaded_job is None or loaded_graph is None:
+            continue
+        job, job_data = loaded_job
+        graph, graph_data = loaded_graph
+        if graph.active_attempt_count != 0:
+            continue
+        require_graph_transition(job.state, GraphState.FAILED)
+        terminal_job = replace(
+            job,
+            state=GraphState.FAILED,
+            updated_at=expired_at,
+            terminal_at=expired_at,
+            failure_code="deadline_exceeded",
+        )
+        _replace_job(connection, job_data, terminal_job)
+        tasks: list[GraphTask] = []
+        for task in _load_tasks(connection, agent_id, job_id):
+            if task.state in {TaskState.PENDING, TaskState.READY}:
+                require_task_transition(task.state, TaskState.SKIPPED)
+                loaded_task = _load_task(connection, agent_id, job_id, task.task_id)
+                if loaded_task is None:
+                    raise GraphStoreConflictError(
+                        "graph task disappeared during expiry"
+                    )
+                skipped = replace(
+                    task,
+                    state=TaskState.SKIPPED,
+                    task_revision=task.task_revision + 1,
+                    updated_at=expired_at,
+                    terminal_at=expired_at,
+                )
+                _replace_task(connection, loaded_task[1], skipped)
+                tasks.append(skipped)
+            else:
+                tasks.append(task)
+        terminal_graph = replace(
+            graph,
+            next_ready_at=_next_ready_at(tuple(tasks)),
+            updated_at=expired_at,
+        )
+        _replace_graph(connection, graph_data, terminal_graph)
+        _insert_event(
+            connection,
+            agent_id=agent_id,
+            job_id=job_id,
+            kind="graph_deadline_exceeded",
+            created_at=expired_at,
+            payload={"deadline_at": job.deadline_at.isoformat()},
+            maximum=job.specification.limits.max_events,
+        )
+        expired.append(terminal_job)
+    return tuple(expired)
+
+
 def list_stale_attempts(
     connection: sqlite3.Connection,
     agent_id: str,
@@ -858,6 +983,168 @@ def list_stale_attempts(
         if loaded is not None:
             attempts.append(loaded[0])
     return tuple(attempts)
+
+
+def list_active_attempts(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    limit: int,
+) -> tuple[TaskAttempt, ...]:
+    if not 1 <= limit <= 64:
+        raise ValueError("active-attempt list limit is outside its bound")
+    rows = tuple(
+        connection.execute(
+            """SELECT job_id, task_id, attempt_id
+               FROM job_task_attempts
+               WHERE agent_id = ? AND state IN ('claimed','running')
+               ORDER BY absolute_deadline_at_us, attempt_id LIMIT ?""",
+            (agent_id, limit),
+        )
+    )
+    attempts = []
+    for job_id, task_id, attempt_id in rows:
+        loaded = _load_attempt(
+            connection, agent_id, str(job_id), str(task_id), str(attempt_id)
+        )
+        if loaded is not None:
+            attempts.append(loaded[0])
+    return tuple(attempts)
+
+
+def _load_graph_delivery(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    job_id: str,
+) -> GraphJobDelivery | None:
+    row = connection.execute(
+        """SELECT delivery_id, conversation_id, subject_kind, subject_id,
+                  logical_key, state, data
+           FROM deliveries
+           WHERE agent_id = ? AND subject_kind = 'graph_job' AND subject_id = ?""",
+        (agent_id, job_id),
+    ).fetchone()
+    if row is None:
+        return None
+    decoded = decode_draft_delivery(
+        _required_text(row[6], "graph delivery payload"),
+        agent_id=agent_id,
+        delivery_id=_required_text(row[0], "graph delivery ID"),
+        conversation_id=_required_text(row[1], "graph delivery conversation"),
+        subject_kind=_required_text(row[2], "graph delivery subject kind"),
+        subject_id=_required_text(row[3], "graph delivery subject ID"),
+        logical_key=_required_text(row[4], "graph delivery logical key"),
+        state=_required_text(row[5], "graph delivery state"),
+    )
+    if not isinstance(decoded, GraphJobDelivery):
+        raise ValueError("migrated delivery cannot be a live graph finalization")
+    return decoded
+
+
+def list_graph_deliveries(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    job_id: str | None = None,
+    limit: int = 100,
+) -> tuple[GraphJobDelivery, ...]:
+    if not 1 <= limit <= 100:
+        raise ValueError("graph delivery list limit is outside its bound")
+    clauses = ["agent_id = ?", "subject_kind = 'graph_job'"]
+    parameters: list[object] = [agent_id]
+    if job_id is not None:
+        clauses.append("subject_id = ?")
+        parameters.append(job_id)
+    parameters.append(limit)
+    rows = tuple(
+        connection.execute(
+            """SELECT delivery_id, conversation_id, subject_kind, subject_id,
+                      logical_key, state, data
+               FROM deliveries WHERE """
+            + " AND ".join(clauses)
+            + " ORDER BY created_at_us, delivery_id LIMIT ?",
+            tuple(parameters),
+        )
+    )
+    deliveries: list[GraphJobDelivery] = []
+    for row in rows:
+        decoded = decode_draft_delivery(
+            _required_text(row[6], "graph delivery payload"),
+            agent_id=agent_id,
+            delivery_id=_required_text(row[0], "graph delivery ID"),
+            conversation_id=_required_text(row[1], "graph delivery conversation"),
+            subject_kind=_required_text(row[2], "graph delivery subject kind"),
+            subject_id=_required_text(row[3], "graph delivery subject ID"),
+            logical_key=_required_text(row[4], "graph delivery logical key"),
+            state=_required_text(row[5], "graph delivery state"),
+        )
+        if isinstance(decoded, GraphJobDelivery):
+            deliveries.append(decoded)
+    return tuple(deliveries)
+
+
+def list_graph_artifact_refs(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    run_id: str | None = None,
+    conversation_id: str | None = None,
+) -> tuple[ArtifactRef, ...]:
+    clauses = ["r.agent_id = ?"]
+    parameters: list[object] = [agent_id]
+    if conversation_id is not None:
+        clauses.append("j.conversation_id = ?")
+        parameters.append(conversation_id)
+    rows = tuple(
+        connection.execute(
+            """SELECT r.data, j.conversation_id
+               FROM job_task_results AS r
+               JOIN job_runs AS j
+                 ON j.agent_id = r.agent_id AND j.job_id = r.job_id
+               WHERE """
+            + " AND ".join(clauses)
+            + " ORDER BY r.completed_at_us, r.result_id",
+            tuple(parameters),
+        )
+    )
+    refs: dict[str, ArtifactRef] = {}
+    for data, stored_conversation_id in rows:
+        result = decode_task_result(_required_text(data, "task result payload"))
+        raw_refs = result.provenance.get("artifact_refs", ())
+        if not isinstance(raw_refs, tuple):
+            raise ValueError("graph task result artifact references are malformed")
+        decoded: list[ArtifactRef] = []
+        for raw in raw_refs:
+            if not isinstance(raw, Mapping):
+                raise ValueError("graph task result artifact reference is malformed")
+            decoded.append(artifact_ref_from_mapping(raw))
+        if tuple(sorted(item.artifact_id for item in decoded)) != result.artifact_ids:
+            raise ValueError("graph task result artifact identities differ")
+        for ref in decoded:
+            if ref.run_id != result.run_id or ref.conversation_id != str(
+                stored_conversation_id
+            ):
+                raise ValueError("graph task result artifact ownership differs")
+            if run_id is not None and ref.run_id != run_id:
+                continue
+            current = refs.get(ref.artifact_id)
+            if current is not None and current != ref:
+                raise ValueError("graph task result artifact identity is ambiguous")
+            refs[ref.artifact_id] = ref
+    return tuple(
+        sorted(refs.values(), key=lambda item: (item.created_at, item.artifact_id))
+    )
+
+
+def list_graph_reserved_artifact_ids(
+    connection: sqlite3.Connection,
+    agent_id: str,
+) -> frozenset[tuple[str, str]]:
+    attempts = list_active_attempts(connection, agent_id, limit=64)
+    return frozenset(
+        (attempt.run_id, reserved_artifact_id(attempt.attempt_id))
+        for attempt in attempts
+    )
 
 
 def _attempt_binding_is_current(
@@ -1402,7 +1689,12 @@ def claim_task(
     existing = _load_attempt(connection, agent_id, job_id, task_id, attempt_id)
     if existing is not None:
         attempt = existing[0]
-        if attempt.claim_token != claim_token or attempt.run_id != run_id:
+        if (
+            attempt.claim_token != claim_token
+            or attempt.run_id != run_id
+            or attempt.executor_id != executor_id
+            or attempt.reserved_budgets != budget_reservations
+        ):
             raise GraphStoreConflictError("attempt identity was reused")
         return attempt
     loaded_job = _load_job(connection, agent_id, job_id)
@@ -1804,6 +2096,7 @@ def complete_attempt(
     claim_token: str,
     fencing_epoch: int,
     usage: tuple[BudgetAmount, ...] | None,
+    delivery: GraphJobDelivery | None = None,
 ) -> TaskResult:
     existing_row = connection.execute(
         """SELECT data FROM job_task_results
@@ -1815,6 +2108,14 @@ def complete_attempt(
             _required_text(existing_row[0], "task result payload")
         )
         if existing == result:
+            if (
+                delivery is not None
+                and _load_graph_delivery(connection, result.agent_id, result.job_id)
+                != delivery
+            ):
+                raise GraphStoreConflictError(
+                    "finalization result exists without its exact delivery"
+                )
             return existing
         raise GraphStoreConflictError(
             "task completion response was retried with different content"
@@ -1867,6 +2168,24 @@ def complete_attempt(
         or not _finalizer_barrier_satisfied(connection, job, task)
     ):
         raise GraphValidationError("finalizer_seal", "finalizer seal is stale")
+    if delivery is not None:
+        if task.role is not TaskRole.FINALIZER:
+            raise GraphValidationError(
+                "delivery_task", "only the finalizer can publish a graph delivery"
+            )
+        if (
+            delivery.agent_id != job.agent_id
+            or delivery.job_id != job.job_id
+            or delivery.conversation_id != job.conversation_id
+            or delivery.outcome.conclusion_id != result.result_id
+            or delivery.outcome.conclusion_digest != result.result_digest
+            or tuple(item.artifact_id for item in delivery.outcome.artifact_references)
+            != result.artifact_ids
+            or delivery.outcome.effective_sensitivity != result.sensitivity
+        ):
+            raise GraphValidationError(
+                "delivery_result", "graph delivery differs from the finalizer result"
+            )
     connection.execute(
         """INSERT INTO job_task_results(
                agent_id, job_id, task_id, result_id, attempt_id, completed_at_us,
@@ -1921,6 +2240,8 @@ def complete_attempt(
             terminal_result_id=result.result_id,
         )
         _replace_job(connection, job_data, terminal_job)
+        if delivery is not None:
+            _insert_graph_delivery(connection, delivery)
     else:
         _promote_ready(connection, job=job, changed_at=result.completed_at)
     final_tasks = _load_tasks(connection, result.agent_id, result.job_id)
@@ -2059,6 +2380,125 @@ def fence_attempt(
         maximum=job.specification.limits.max_events,
     )
     return fenced
+
+
+def fail_attempt(
+    connection: sqlite3.Connection,
+    *,
+    agent_id: str,
+    job_id: str,
+    task_id: str,
+    attempt_id: str,
+    claim_token: str,
+    fencing_epoch: int,
+    failed_at: datetime,
+    retryable: bool,
+    reason_code: str,
+) -> TaskAttempt | None:
+    loaded_job = _load_job(connection, agent_id, job_id)
+    loaded_graph = _load_graph(connection, agent_id, job_id)
+    loaded_task = _load_task(connection, agent_id, job_id, task_id)
+    loaded_attempt = _load_attempt(connection, agent_id, job_id, task_id, attempt_id)
+    if (
+        loaded_job is None
+        or loaded_graph is None
+        or loaded_task is None
+        or loaded_attempt is None
+    ):
+        return None
+    job, job_data = loaded_job
+    graph, graph_data = loaded_graph
+    task, task_data = loaded_task
+    attempt, attempt_data = loaded_attempt
+    require_current_attempt(
+        task=task,
+        attempt=attempt,
+        claim_token=claim_token,
+        fencing_epoch=fencing_epoch,
+    )
+    if attempt.state not in ACTIVE_ATTEMPT_STATES:
+        return attempt
+    measured_usage = _settle_budgets(
+        connection, attempt=attempt, usage=None, settled_at=failed_at
+    )
+    require_attempt_transition(attempt.state, AttemptState.FAILED)
+    failed_attempt = replace(
+        attempt,
+        state=AttemptState.FAILED,
+        lease_expires_at=None,
+        ended_at=failed_at,
+        error_code=reason_code,
+        diagnostic="The internal graph attempt failed within its bounded contract.",
+        measured_usage=measured_usage,
+    )
+    _replace_attempt(connection, attempt_data, failed_attempt)
+    can_retry = (
+        retryable
+        and job.desired_state is GraphDesiredState.RUN
+        and task.attempt_count < job.specification.limits.max_attempts_per_task
+        and job.deadline_at > failed_at
+    )
+    next_state = TaskState.READY if can_retry else TaskState.FAILED
+    require_task_transition(task.state, next_state)
+    updated_task = replace(
+        task,
+        state=next_state,
+        current_attempt_id=None,
+        failure_streak=task.failure_streak + 1,
+        task_revision=task.task_revision + 1,
+        not_before=(
+            failed_at + timedelta(seconds=1 if task.attempt_count == 1 else 5)
+            if can_retry
+            else task.not_before
+        ),
+        updated_at=failed_at,
+        terminal_at=None if can_retry else failed_at,
+    )
+    _replace_task(connection, task_data, updated_task)
+    updated_job = job
+    if not can_retry:
+        require_graph_transition(job.state, GraphState.FAILED)
+        updated_job = replace(
+            job,
+            state=GraphState.FAILED,
+            updated_at=failed_at,
+            terminal_at=failed_at,
+            failure_code=reason_code,
+        )
+        _replace_job(connection, job_data, updated_job)
+    tasks = tuple(
+        updated_task if item.task_id == task_id else item
+        for item in _load_tasks(connection, agent_id, job_id)
+    )
+    updated_graph = replace(
+        graph,
+        active_attempt_count=graph.active_attempt_count - 1,
+        next_ready_at=_next_ready_at(tasks),
+        finalization_attempt_id=(
+            None
+            if graph.finalization_attempt_id == attempt_id
+            else graph.finalization_attempt_id
+        ),
+        finalization_started_revision=(
+            None
+            if graph.finalization_attempt_id == attempt_id
+            else graph.finalization_started_revision
+        ),
+        updated_at=failed_at,
+    )
+    _replace_graph(connection, graph_data, updated_graph)
+    _insert_event(
+        connection,
+        agent_id=agent_id,
+        job_id=job_id,
+        task_id=task_id,
+        attempt_id=attempt_id,
+        kind="task_attempt_failed",
+        created_at=failed_at,
+        payload={"reason_code": reason_code, "requeued": can_retry},
+        maximum=updated_job.specification.limits.max_events,
+    )
+    return failed_attempt
 
 
 def open_control(
@@ -2399,12 +2839,18 @@ __all__ = [
     "complete_attempt",
     "datetime_from_us",
     "datetime_to_us",
+    "expire_due_graphs",
+    "fail_attempt",
     "fence_attempt",
     "heartbeat_attempt",
     "inspect_graph",
+    "list_active_attempts",
     "list_attempt_reservations",
     "list_budget_ledgers",
+    "list_graph_artifact_refs",
+    "list_graph_deliveries",
     "list_graph_events",
+    "list_graph_reserved_artifact_ids",
     "list_ready_tasks",
     "list_stale_attempts",
     "open_control",

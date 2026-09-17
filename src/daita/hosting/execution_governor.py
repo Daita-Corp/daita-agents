@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Self
@@ -42,6 +42,7 @@ class WorkloadClass(str, Enum):
     FOREGROUND = "foreground"
     SYSTEM = "system"
     ROUTINE = "routine"
+    GRAPH = "graph"
 
 
 class PermitKind(str, Enum):
@@ -220,12 +221,34 @@ class RunAdmissionCoordinator:
         self,
         *,
         execution_capacity: int = 1,
+        source_resource_capacities: Mapping[str, int] | None = None,
+        sqlite_pressure_capacity: int = 1,
         clock: Callable[[], float] | None = None,
         id_factory: Callable[[str], str] | None = None,
         cancellation_grace_seconds: float = 5.0,
     ) -> None:
-        if execution_capacity != 1:
-            raise ValueError("Phase 1 execution capacity must remain one")
+        if (
+            not isinstance(execution_capacity, int)
+            or isinstance(execution_capacity, bool)
+            or not 1 <= execution_capacity <= 4
+        ):
+            raise ValueError("execution capacity must be between one and four")
+        if (
+            not isinstance(sqlite_pressure_capacity, int)
+            or isinstance(sqlite_pressure_capacity, bool)
+            or not 1 <= sqlite_pressure_capacity <= 4
+        ):
+            raise ValueError("SQLite pressure capacity must be between one and four")
+        source_capacities = dict(source_resource_capacities or {})
+        for key, capacity in source_capacities.items():
+            if (
+                not isinstance(key, str)
+                or not key
+                or not isinstance(capacity, int)
+                or isinstance(capacity, bool)
+                or not 1 <= capacity <= 2
+            ):
+                raise ValueError("source/resource capacities must be one or two")
         if (
             not isinstance(cancellation_grace_seconds, (int, float))
             or isinstance(cancellation_grace_seconds, bool)
@@ -235,6 +258,9 @@ class RunAdmissionCoordinator:
         self._clock = clock or (lambda: asyncio.get_running_loop().time())
         self._id_factory = id_factory or (lambda prefix: f"{prefix}-{uuid4().hex}")
         self._cancellation_grace_seconds = float(cancellation_grace_seconds)
+        self._execution_capacity = execution_capacity
+        self._source_resource_capacities = source_capacities
+        self._sqlite_pressure_capacity = sqlite_pressure_capacity
         self._condition = asyncio.Condition()
         self._state = CoordinatorState.OPEN
         self._sequence = 0
@@ -242,7 +268,7 @@ class RunAdmissionCoordinator:
         self._active: dict[str, AdmissionLease] = {}
         self._active_conversations: set[str] = set()
         self._permit_conditions: dict[tuple[PermitKind, str], asyncio.Condition] = {}
-        self._permit_active: set[tuple[PermitKind, str]] = set()
+        self._permit_active: dict[tuple[PermitKind, str], int] = {}
         self.effect_coordinator = EffectCoordinator(self)
 
     @property
@@ -254,7 +280,7 @@ class RunAdmissionCoordinator:
             state=self._state,
             active_leases=len(self._active),
             waiting_admissions=len(self._waiters),
-            active_permits=len(self._permit_active),
+            active_permits=sum(self._permit_active.values()),
             acquisition_sequence=self._sequence,
         )
 
@@ -310,6 +336,7 @@ class RunAdmissionCoordinator:
                 self._active[lease.lease_id] = lease
                 if conversation_id is not None:
                     self._active_conversations.add(conversation_id)
+                self._condition.notify_all()
                 return lease
             except BaseException:
                 if waiter in self._waiters:
@@ -322,7 +349,7 @@ class RunAdmissionCoordinator:
             self._state is CoordinatorState.OPEN
             and bool(self._waiters)
             and self._waiters[0] is waiter
-            and not self._active
+            and len(self._active) < self._execution_capacity
             and (
                 waiter.conversation_id is None
                 or waiter.conversation_id not in self._active_conversations
@@ -471,11 +498,12 @@ class RunAdmissionCoordinator:
             raise ValueError("permit key must be bounded non-empty text")
         permit_key = (kind, key)
         condition = self._permit_conditions.setdefault(permit_key, asyncio.Condition())
+        capacity = self._permit_capacity(kind, key)
         resolved_deadline = _deadline_or_infinity(deadline)
         if resolved_deadline <= asyncio.get_running_loop().time():
             raise TimeoutError("permit deadline expired")
         async with condition:
-            while permit_key in self._permit_active:
+            while self._permit_active.get(permit_key, 0) >= capacity:
                 if (
                     self._state is not CoordinatorState.OPEN
                     and not self._current_task_is_admitted()
@@ -504,8 +532,15 @@ class RunAdmissionCoordinator:
                 raise AdmissionClosedError("host admission is not open")
             if cancellation is not None:
                 cancellation.raise_if_cancelled()
-            self._permit_active.add(permit_key)
+            self._permit_active[permit_key] = self._permit_active.get(permit_key, 0) + 1
         return PermitLease(self, kind, key)
+
+    def _permit_capacity(self, kind: PermitKind, key: str) -> int:
+        if kind is PermitKind.SOURCE_RESOURCE:
+            return self._source_resource_capacities.get(key, 1)
+        if kind is PermitKind.SQLITE_PRESSURE:
+            return self._sqlite_pressure_capacity
+        return 1
 
     def _current_task_is_admitted(self) -> bool:
         task = asyncio.current_task()
@@ -519,9 +554,13 @@ class RunAdmissionCoordinator:
         if condition is None:
             raise RuntimeError("permit does not belong to this coordinator")
         async with condition:
-            if permit_key not in self._permit_active:
+            active = self._permit_active.get(permit_key, 0)
+            if active < 1:
                 raise RuntimeError("permit is not active")
-            self._permit_active.remove(permit_key)
+            if active == 1:
+                del self._permit_active[permit_key]
+            else:
+                self._permit_active[permit_key] = active - 1
             condition.notify_all()
         async with self._condition:
             self._condition.notify_all()

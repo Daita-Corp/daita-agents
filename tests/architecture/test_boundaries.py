@@ -213,10 +213,9 @@ def test_draft_graph_kernel_is_unregistered_and_unreachable_from_composition():
             "agent.py",
             "hosting/embedded.py",
             "hosting/resident.py",
-            "jobs/owner.py",
-            "jobs/supervisor.py",
         )
     )
+    graph_supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
 
     assert "draft_revision_0002" not in registry
     assert "REVISION_2" not in registry
@@ -225,6 +224,8 @@ def test_draft_graph_kernel_is_unregistered_and_unreachable_from_composition():
     assert "open_draft_graph" not in production_roots
     assert "admit_graph" not in production_roots
     assert "claim_graph_task" not in production_roots
+    assert "start_graph_integration" not in production_roots
+    assert "start_graph_integration" in graph_supervisor
     assert "RunOrigin.JOB_TASK" not in _python_text(PACKAGE)
 
 
@@ -1334,7 +1335,7 @@ def test_job_scope_has_one_agent_owner_and_no_conversation_gate():
     assert "origin_conversation_id" in models
     assert (
         "conversation_id: str | None = None"
-        not in owner.split("async def inspect", 1)[1]
+        not in owner.split("class JobOwner:", 1)[1].split("async def inspect", 1)[1]
     )
     assert "JobCapabilityDomain(job_declaration_bundle, job_owner)" in embedded
     assert "ToolLoadMode.PINNED" in capabilities
