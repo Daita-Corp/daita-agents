@@ -47,7 +47,6 @@ from ...jobs.models import (
 from ...jobs.owner import JobError, JobOwner
 from ...llm.models import ModelSensitivity, ToolCall
 from ...loop.models import RunInput
-from ...loop.session import RunSession
 from ...scope import resolve_effective_source_scope
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
@@ -569,6 +568,7 @@ class DataProfileCapabilityDomain:
         catalog: DataProfileCatalog,
         admission: DataProfileAdmission,
         learning: LearningCandidateGuard,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data-profile declarations have the wrong owner")
@@ -581,23 +581,30 @@ class DataProfileCapabilityDomain:
         self._catalog = catalog
         self._admission = admission
         self._learning = learning
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
+        self._selected_profiles: dict[str, str] = {}
 
     @property
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
 
-    async def project(
-        self,
-        run: RunInput,
-        session: RunSession | None = None,
-    ) -> tuple[str, ...]:
-        files_only = session is not None and session.options.files_only
-        if files_only:
+    def select_connected_executor(self, run_id: str, profile_id: str) -> None:
+        if self._selected_profiles:
+            raise RuntimeError("connected job selection exceeds its live run bound")
+        self._selected_profiles[run_id] = profile_id
+
+    def clear_connected_executor(self, run_id: str) -> None:
+        self._selected_profiles.pop(run_id, None)
+
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        if run.id in self._files_only_run_ids:
             return ()
         scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=files_only
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
         )
         facts = (
             ()
@@ -611,10 +618,8 @@ class DataProfileCapabilityDomain:
         return tuple(
             view.name
             for view in self._views
-            if self._learning.allows(session, view.name, effectful=True)
+            if self._learning.allows(run.id, view.name, effectful=True)
         )
-
-    project_session = project
 
     def normalize_arguments(
         self,
@@ -631,11 +636,10 @@ class DataProfileCapabilityDomain:
         arguments: FrozenJsonObject,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
         if capability.id == START_DATA_PROFILE_CAPABILITY_ID:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(run.id, call)
             deadline_seconds = arguments.get("deadline_seconds", 300)
             if not isinstance(deadline_seconds, int):
                 raise CapabilityInputError(
@@ -650,18 +654,12 @@ class DataProfileCapabilityDomain:
                 float(deadline_seconds),
                 MAX_JOB_WALL_TIME_SECONDS,
             )
-            selected = (
-                None
-                if session is None
-                else session.options.selected_executor_profile_id
-            )
+            selected = self._selected_profiles.get(run.id)
             if selected is not None:
                 prepared["_connected_profile_id"] = selected
             specification = await self._admission.build_specification(prepared)
             scope = await resolve_effective_source_scope(
-                run,
-                self._catalog,
-                files_only=session is not None and session.options.files_only,
+                run, self._catalog, files_only=run.id in self._files_only_run_ids
             )
             if any(
                 item.source_id not in scope.source_ids
@@ -675,8 +673,6 @@ class DataProfileCapabilityDomain:
             return FrozenJsonObject.from_mapping(prepared)
         await self._admission.validate_internal(arguments)
         return arguments
-
-    prepare_session_call = prepare_call
 
     async def prepare_automation_grant(
         self,
@@ -716,14 +712,11 @@ class DataProfileCapabilityDomain:
         output: ToolOutput,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> ToolOutput:
-        del arguments, request_sensitivity
+        del call, arguments, request_sensitivity
         if capability.id == START_DATA_PROFILE_CAPABILITY_ID:
-            self._learning.mark_effect_succeeded(session, call.id)
+            self._learning.mark_effect_succeeded(run.id)
         return output
-
-    finalize_session_output = finalize_output
 
     def normalize_error(
         self,

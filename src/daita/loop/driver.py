@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol, TypeVar, cast
 
@@ -62,7 +62,6 @@ from ..llm.protocols import (
 )
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from .models import (
-    ConversationRun,
     LoopExit,
     LoopExitKind,
     LoopLimits,
@@ -73,8 +72,6 @@ from .models import (
     Transcript,
     validate_completed_transcript,
 )
-from .session import RunCancellationToken, RunSession, RunSessionOptions
-from .transcripts import ConversationPredecessor, RunSessionWriter
 
 _T = TypeVar("_T")
 
@@ -144,21 +141,9 @@ class ToolRuntime(Protocol):
 
 
 class TranscriptStore(Protocol):
-    async def start(
-        self,
-        run: RunInput,
-        *,
-        predecessor: ConversationPredecessor | None = None,
-    ) -> Transcript: ...
+    async def start(self, run: RunInput) -> Transcript: ...
 
     async def append(self, run_id: str, message: CanonicalMessage) -> None: ...
-
-    async def append_at(
-        self,
-        run_id: str,
-        position: int,
-        message: CanonicalMessage,
-    ) -> None: ...
 
     async def complete(
         self,
@@ -172,80 +157,22 @@ class TranscriptStore(Protocol):
 class InMemoryTranscriptStore:
     """Small default store for embedded use and focused loop tests."""
 
-    _UNSPECIFIED_PREDECESSOR = object()
-
     def __init__(self) -> None:
         self._transcripts: dict[str, Transcript] = {}
         self._results: dict[str, LoopExit] = {}
-        self._turn_indexes: dict[str, int] = {}
 
-    async def start(
-        self,
-        run: RunInput,
-        *,
-        predecessor=_UNSPECIFIED_PREDECESSOR,
-    ) -> Transcript:
+    async def start(self, run: RunInput) -> Transcript:
         if run.id in self._transcripts:
             raise ValueError(f"run already exists: {run.id}")
-        conversation_id = run.conversation_id or run.id
-        prior = tuple(
-            (run_id, self._turn_indexes[run_id], transcript)
-            for run_id, transcript in self._transcripts.items()
-            if (transcript.run.conversation_id or transcript.run.id) == conversation_id
-        )
-        latest = max(prior, key=lambda item: item[1], default=None)
-        if predecessor is self._UNSPECIFIED_PREDECESSOR:
-            turn_index = 0 if latest is None else latest[1] + 1
-        elif predecessor is None:
-            if latest is not None:
-                raise ValueError("conversation predecessor changed before run start")
-            turn_index = 0
-        else:
-            if not isinstance(predecessor, ConversationPredecessor):
-                raise TypeError("conversation predecessor is invalid")
-            if (
-                latest is None
-                or latest[0] != predecessor.run_id
-                or latest[1] != predecessor.turn_index
-                or self._results.get(latest[0]) is None
-            ):
-                raise ValueError("conversation predecessor changed before run start")
-            current_predecessor = ConversationPredecessor.from_run(
-                ConversationRun(
-                    turn_index=latest[1],
-                    transcript=latest[2],
-                    result=self._results[latest[0]],
-                )
-            )
-            if current_predecessor != predecessor:
-                raise ValueError("conversation predecessor changed before run start")
-            turn_index = predecessor.turn_index + 1
         transcript = Transcript(run=run)
         self._transcripts[run.id] = transcript
-        self._turn_indexes[run.id] = turn_index
         return transcript
 
     async def append(self, run_id: str, message: CanonicalMessage) -> None:
         try:
-            position = len(self._transcripts[run_id].messages)
-        except KeyError as error:
-            raise KeyError(f"unknown run: {run_id}") from error
-        await self.append_at(run_id, position, message)
-
-    async def append_at(
-        self,
-        run_id: str,
-        position: int,
-        message: CanonicalMessage,
-    ) -> None:
-        try:
             current = self._transcripts[run_id]
         except KeyError as error:
             raise KeyError(f"unknown run: {run_id}") from error
-        if run_id in self._results:
-            raise ValueError(f"run is already terminal: {run_id}")
-        if type(position) is not int or position != len(current.messages):
-            raise ValueError("transcript append position is out of order")
         self._transcripts[run_id] = Transcript(
             run=current.run,
             messages=(*current.messages, message),
@@ -295,7 +222,6 @@ class PreparedLoopRun:
     context_snapshot: object
     run_route: object | None
     limits: LoopLimits
-    session_options: RunSessionOptions = field(default_factory=RunSessionOptions)
 
 
 class LoopPreparationError(RuntimeError):
@@ -361,28 +287,19 @@ class AgentLoop:
 
     async def prepare(
         self,
-        run: RunInput | RunSession,
+        run: RunInput,
         *,
         prior_messages: tuple[CanonicalMessage, ...] = (),
     ) -> PreparedLoopRun:
         """Validate the first request and route before durable run creation."""
 
-        if isinstance(run, RunSession):
-            session: RunSession | None = run
-            run_input = run.run
-        else:
-            session = None
-            run_input = run
-        if not isinstance(run_input, RunInput):
-            raise TypeError("run must be RunInput or RunSession")
-        run = run_input
         if run.conversation_id is None:
             run = replace(run, conversation_id=run.id)
         start_message = run.start_message()
         messages = (*prior_messages, start_message)
         try:
             limits = _effective_run_limits(self._limits, run)
-            tool_catalog = await _prepare_tools(self._tools, run, session)
+            tool_catalog = await self._tools.prepare_run(run)
             snapshot = await self._context_builder.prepare(
                 run, messages, tool_catalog, max_total_tokens=limits.max_total_tokens
             )
@@ -427,60 +344,26 @@ class AgentLoop:
             context_snapshot=snapshot,
             run_route=run_route,
             limits=limits,
-            session_options=(
-                RunSessionOptions() if session is None else session.options
-            ),
         )
 
     async def run(
         self,
-        run: RunInput | RunSession,
+        run: RunInput,
         *,
         prior_messages: tuple[CanonicalMessage, ...] = (),
         prepared: PreparedLoopRun | None = None,
     ) -> LoopExit:
-        if isinstance(run, RunSession):
-            session = run
-            runtime_session: RunSession | None = session
-            run = session.run
-            if run.conversation_id is None:
-                raise ValueError("run session requires a resolved conversation_id")
-            if prepared is None and isinstance(session.prepared, PreparedLoopRun):
-                prepared = session.prepared
-        elif isinstance(run, RunInput):
-            runtime_session = None
-            if run.conversation_id is None:
-                run = replace(run, conversation_id=run.id)
-            limits = _effective_run_limits(self._limits, run)
-            session = RunSession(
-                run=run,
-                # Compatibility-only direct callers have no preparation-time
-                # predecessor token. Production host origins always construct an
-                # admitted session with an exact predecessor binding.
-                writer=RunSessionWriter(
-                    self._transcripts,
-                    run,
-                    bind_predecessor=False,
-                ),
-                absolute_deadline=(
-                    asyncio.get_running_loop().time() + limits.max_wall_time_seconds
-                ),
-                cancellation=RunCancellationToken(),
-            )
-        else:
-            raise TypeError("run must be RunInput or RunSession")
+        if not isinstance(run, RunInput):
+            raise TypeError("run must be RunInput")
         if any(not isinstance(message, CanonicalMessage) for message in prior_messages):
             raise TypeError("prior_messages must contain CanonicalMessage records")
+        if run.conversation_id is None:
+            run = replace(run, conversation_id=run.id)
         if prepared is not None and (
-            prepared.run != run
-            or prepared.prior_messages != prior_messages
-            or prepared.session_options != session.options
+            prepared.run != run or prepared.prior_messages != prior_messages
         ):
             raise ValueError("prepared loop run differs from its execution input")
-        session.consume()
-        session.cancellation.raise_if_cancelled()
-        writer = session.writer
-        transcript = await writer.start()
+        transcript = await self._transcripts.start(run)
         run_started = asyncio.get_running_loop().time()
         if self._observer is not None:
             self._emit(
@@ -506,18 +389,12 @@ class AgentLoop:
 
         try:
             start_message = run.start_message()
-            await writer.append(start_message, position=writer.next_position)
+            await self._transcripts.append(run.id, start_message)
             messages = (*messages, start_message)
             started = asyncio.get_running_loop().time()
-            deadline = min(
-                session.absolute_deadline,
-                started + limits.max_wall_time_seconds,
-            )
+            deadline = started + limits.max_wall_time_seconds
             if prepared is None:
-                tool_catalog = await _before(
-                    deadline,
-                    _prepare_tools(self._tools, run, runtime_session),
-                )
+                tool_catalog = await _before(deadline, self._tools.prepare_run(run))
                 context_snapshot = await _before(
                     deadline,
                     self._context_builder.prepare(
@@ -531,11 +408,9 @@ class AgentLoop:
                 tool_catalog = prepared.tool_catalog
                 context_snapshot = prepared.context_snapshot
             for step in range(1, limits.max_steps + 1):
-                session.cancellation.raise_if_cancelled()
                 if limits.max_estimated_cost_usd == 0:
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.FAILED,
                         "cost_limit_reached",
                         step - 1,
@@ -548,7 +423,6 @@ class AgentLoop:
                 if self._wall_time_exhausted(started, limits):
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.FAILED,
                         "wall_time_exhausted",
                         step - 1,
@@ -591,7 +465,6 @@ class AgentLoop:
                     # Admission consumed nothing; retained usage is already cumulative.
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.FAILED,
                         error.code.value,
                         step - 1,
@@ -607,7 +480,6 @@ class AgentLoop:
                     except ModelProviderError:
                         return await self._finish(
                             run,
-                            writer,
                             LoopExitKind.FAILED,
                             "model_route_ineligible",
                             step - 1,
@@ -624,7 +496,6 @@ class AgentLoop:
                 ):
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.FAILED,
                         "model_route_ineligible",
                         step - 1,
@@ -637,7 +508,6 @@ class AgentLoop:
                 if not self._cost_limit_allows_request(request, run_route, limits):
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.FAILED,
                         "cost_limit_unpriced_route",
                         step - 1,
@@ -707,7 +577,7 @@ class AgentLoop:
                 ):
                     budget_reason = "tool_calls_per_run_exceeded"
                 if budget_reason is not None:
-                    await writer.append(assistant, position=writer.next_position)
+                    await self._transcripts.append(run.id, assistant)
                     messages = (*messages, assistant)
                     for call in response.tool_calls:
                         result_message = CanonicalMessage(
@@ -725,14 +595,10 @@ class AgentLoop:
                                 ),
                             ),
                         )
-                        await writer.append(
-                            result_message,
-                            position=writer.next_position,
-                        )
+                        await self._transcripts.append(run.id, result_message)
                         messages = (*messages, result_message)
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.FAILED,
                         budget_reason,
                         step,
@@ -748,7 +614,6 @@ class AgentLoop:
                     assert response.text is not None and not response.tool_calls
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.COMPLETED,
                         "completed",
                         step,
@@ -762,11 +627,10 @@ class AgentLoop:
                     )
 
                 if response.finish_reason is not FinishReason.TOOL_CALLS:
-                    await writer.append(assistant, position=writer.next_position)
+                    await self._transcripts.append(run.id, assistant)
                     messages = (*messages, assistant)
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.FAILED,
                         _finish_reason_failure(response.finish_reason),
                         step,
@@ -779,14 +643,12 @@ class AgentLoop:
 
                 assert response.tool_calls
                 tool_call_count += len(response.tool_calls)
-                await writer.append(assistant, position=writer.next_position)
+                await self._transcripts.append(run.id, assistant)
                 messages = (*messages, assistant)
 
                 outcome, cancellation_requested = await _tool_batch_before(
                     deadline,
-                    _execute_tools(
-                        self._tools,
-                        runtime_session,
+                    self._tools.execute_all(
                         run,
                         response.tool_calls,
                         projection=step_tool_projection,
@@ -819,16 +681,10 @@ class AgentLoop:
                         content=(result,),
                     )
                     if outcome.interruption_kind is None:
-                        await writer.append(
-                            tool_message,
-                            position=writer.next_position,
-                        )
+                        await self._transcripts.append(run.id, tool_message)
                     else:
                         await _complete_before_cancellation(
-                            writer.append(
-                                tool_message,
-                                position=writer.next_position,
-                            )
+                            self._transcripts.append(run.id, tool_message)
                         )
                     messages = (*messages, tool_message)
                     artifact = _artifact_ref(result)
@@ -844,7 +700,6 @@ class AgentLoop:
                     if outcome.interruption_kind is ToolBatchInterruption.DEADLINE:
                         return await self._finish(
                             run,
-                            writer,
                             LoopExitKind.FAILED,
                             "wall_time_exhausted",
                             step,
@@ -856,7 +711,6 @@ class AgentLoop:
                         )
                     return await self._finish(
                         run,
-                        writer,
                         LoopExitKind.INTERRUPTED,
                         "tool_batch_interrupted",
                         step,
@@ -869,7 +723,6 @@ class AgentLoop:
 
             return await self._finish(
                 run,
-                writer,
                 LoopExitKind.FAILED,
                 "step_limit_reached",
                 limits.max_steps,
@@ -882,7 +735,6 @@ class AgentLoop:
         except asyncio.CancelledError:
             await self._finish_best_effort(
                 run,
-                writer,
                 LoopExitKind.INTERRUPTED,
                 "cancelled",
                 _completed_steps(messages[current_start:]),
@@ -896,7 +748,6 @@ class AgentLoop:
         except TimeoutError:
             return await self._finish(
                 run,
-                writer,
                 LoopExitKind.FAILED,
                 "wall_time_exhausted",
                 _completed_steps(messages[current_start:]),
@@ -916,7 +767,6 @@ class AgentLoop:
         ) as error:
             return await self._finish(
                 run,
-                writer,
                 LoopExitKind.FAILED,
                 _expected_loop_failure_reason(error),
                 _completed_steps(messages[current_start:]),
@@ -930,7 +780,6 @@ class AgentLoop:
             usage = _add_usage(usage, error.usage)
             return await self._finish(
                 run,
-                writer,
                 LoopExitKind.FAILED,
                 error.code.value,
                 _completed_steps(messages[current_start:]),
@@ -945,7 +794,6 @@ class AgentLoop:
         except Exception:
             await self._finish_best_effort(
                 run,
-                writer,
                 LoopExitKind.FAILED,
                 "unexpected_internal_error",
                 _completed_steps(messages[current_start:]),
@@ -960,7 +808,6 @@ class AgentLoop:
     async def _finish(
         self,
         run: RunInput,
-        writer: RunSessionWriter,
         kind: LoopExitKind,
         reason: str,
         steps: int,
@@ -993,11 +840,11 @@ class AgentLoop:
         if kind is LoopExitKind.COMPLETED:
             if final_message is None:
                 raise ValueError("completed loop exit requires a final assistant")
-            await writer.complete(result, final_message)
+            await self._transcripts.complete(result, final_message)
         else:
             if final_message is not None:
                 raise ValueError("only completed loop exits accept a final assistant")
-            await writer.finish(result)
+            await self._transcripts.finish(result)
         if self._observer is not None:
             self._emit(
                 AgentEventKind.RUN_COMPLETED,
@@ -1036,7 +883,6 @@ class AgentLoop:
     async def _finish_best_effort(
         self,
         run: RunInput,
-        writer: RunSessionWriter,
         kind: LoopExitKind,
         reason: str,
         steps: int,
@@ -1051,7 +897,6 @@ class AgentLoop:
             await _complete_before_cancellation(
                 self._finish(
                     run,
-                    writer,
                     kind,
                     reason,
                     steps,
@@ -1323,53 +1168,6 @@ def _provider_has_complete_run_pricing(
         except Exception:
             return False
     return provider_has_complete_pricing(provider, request)
-
-
-async def _prepare_tools(
-    tools: ToolRuntime,
-    run: RunInput,
-    session: RunSession | None,
-) -> object:
-    prepare_session = getattr(tools, "prepare_session", None)
-    if session is not None and callable(prepare_session):
-        prepare = cast(
-            Callable[[RunSession], Awaitable[object]],
-            prepare_session,
-        )
-        return await prepare(session)
-    return await tools.prepare_run(run)
-
-
-async def _execute_tools(
-    tools: ToolRuntime,
-    session: RunSession | None,
-    run: RunInput,
-    calls: tuple[ToolCall, ...],
-    *,
-    projection: object,
-    messages: tuple[CanonicalMessage, ...],
-    sensitivity: ModelSensitivity,
-) -> ToolBatchOutcome:
-    execute_session = getattr(tools, "execute_session", None)
-    if session is not None and callable(execute_session):
-        execute = cast(
-            Callable[..., Awaitable[ToolBatchOutcome]],
-            execute_session,
-        )
-        return await execute(
-            session,
-            calls,
-            projection=projection,
-            messages=messages,
-            sensitivity=sensitivity,
-        )
-    return await tools.execute_all(
-        run,
-        calls,
-        projection=projection,
-        messages=messages,
-        sensitivity=sensitivity,
-    )
 
 
 def _add_usage(left: ModelUsage, right: ModelUsage) -> ModelUsage:

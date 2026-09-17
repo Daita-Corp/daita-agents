@@ -110,18 +110,13 @@ class OrderingStore(InMemoryTranscriptStore):
         super().__init__()
         self.actions = []
 
-    async def start(
-        self,
-        run,
-        *,
-        predecessor=InMemoryTranscriptStore._UNSPECIFIED_PREDECESSOR,
-    ):
-        transcript = await super().start(run, predecessor=predecessor)
+    async def start(self, run):
+        transcript = await super().start(run)
         self.actions.append("persisted:start")
         return transcript
 
-    async def append_at(self, run_id, position, message):
-        await super().append_at(run_id, position, message)
+    async def append(self, run_id, message):
+        await super().append(run_id, message)
         self.actions.append(f"persisted:{message.role.value}")
 
     async def finish(self, result):
@@ -526,13 +521,8 @@ async def test_stream_fragments_are_bounded_and_observer_failure_is_non_directiv
 
 async def test_failed_start_emits_nothing():
     class FailedStartStore(InMemoryTranscriptStore):
-        async def start(
-            self,
-            run,
-            *,
-            predecessor=InMemoryTranscriptStore._UNSPECIFIED_PREDECESSOR,
-        ):
-            del run, predecessor
+        async def start(self, run):
+            del run
             raise RuntimeError("start failed")
 
     events: list[AgentEvent] = []

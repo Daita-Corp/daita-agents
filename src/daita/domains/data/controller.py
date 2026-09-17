@@ -39,7 +39,6 @@ from ...catalog.capabilities import (
 from ...catalog.models import Sensitivity
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
 from ...loop.models import RunInput, RunOrigin, Transcript
-from ...loop.session import RunSession
 from ...scope import resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
 from ..learning import LearningCandidateGuard
@@ -229,6 +228,7 @@ class DataCapabilityDomain:
             Callable[[str, FrozenJsonObject], Awaitable[FrozenJsonObject]] | None
         ) = None,
         local_file_sensitivity: ModelSensitivity | None = None,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("data declarations have the wrong domain owner")
@@ -268,6 +268,9 @@ class DataCapabilityDomain:
         self._catalog = catalog
         self._learning = learning
         self._local_file_sensitivity = local_file_sensitivity
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = {item.name: item for item in declarations.tool_views}
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -280,12 +283,8 @@ class DataCapabilityDomain:
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
 
-    async def project(
-        self,
-        run: RunInput,
-        session: RunSession | None = None,
-    ) -> tuple[str, ...]:
-        files_only = session is not None and session.options.files_only
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        files_only = run.id in self._files_only_run_ids
         scope = await resolve_effective_source_scope(
             run, self._catalog, files_only=files_only
         )
@@ -323,7 +322,7 @@ class DataCapabilityDomain:
             view = self._views[name]
             capability = self._capabilities[view.capability_id]
             if not self._learning.allows(
-                session,
+                run.id,
                 name,
                 effectful=capability.operational_effect is not OperationalEffect.NONE,
             ):
@@ -361,8 +360,6 @@ class DataCapabilityDomain:
             names.append(name)
         return tuple(names)
 
-    project_session = project
-
     def normalize_arguments(
         self,
         capability: Capability,
@@ -378,12 +375,9 @@ class DataCapabilityDomain:
         arguments: FrozenJsonObject,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> FrozenJsonObject:
         scope = await resolve_effective_source_scope(
-            run,
-            self._catalog,
-            files_only=session is not None and session.options.files_only,
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
         )
         run = replace(run, resolved_source_scope=scope)
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
@@ -429,7 +423,7 @@ class DataCapabilityDomain:
                 return FrozenJsonObject.from_mapping(prepared)
             return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(run.id, call)
         await self._validate_source_scope(run, capability, arguments)
         self._validate_execution_resource_scope(run, capability, arguments)
         await self._validate_resource_read_scope(run, capability, arguments)
@@ -558,8 +552,6 @@ class DataCapabilityDomain:
                 self._check_native_grant(run, capability, arguments, permission)
         return arguments
 
-    prepare_session_call = prepare_call
-
     async def prepare_automation_grant(
         self,
         capability: Capability,
@@ -587,9 +579,8 @@ class DataCapabilityDomain:
                 f"Include {required_preview} in the proposed scope. A corrected proposal "
                 "requires foreground review; execution still needs its own successful current-run preview.",
             )
-        source_id, resource_id = (
-            cast(str, constraints["source_id"]),
-            cast(str, constraints["resource_id"]),
+        source_id, resource_id = cast(str, constraints["source_id"]), cast(
+            str, constraints["resource_id"]
         )
         if (
             source_id not in proposal.allowed_source_ids
@@ -802,7 +793,6 @@ class DataCapabilityDomain:
         output: ToolOutput,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> ToolOutput:
         del request_sensitivity
         if capability.id == DATA_EXPORT_TABULAR_CAPABILITY_ID:
@@ -817,10 +807,8 @@ class DataCapabilityDomain:
                 ),
             )
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.mark_effect_succeeded(session, call.id)
+            self._learning.mark_effect_succeeded(run.id)
         return await self._classify(run, call, capability, output)
-
-    finalize_session_output = finalize_output
 
     @staticmethod
     def _validate_export_summary(output: ToolOutput) -> None:
@@ -982,7 +970,7 @@ class DataCapabilityDomain:
         arguments: Mapping[str, object],
     ) -> None:
         scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
         )
         selected_source_ids = scope.source_ids
         supplied_source_id = arguments.get("source_id")
@@ -1591,7 +1579,7 @@ class DataCapabilityDomain:
         if output.sensitivity is not None:
             return output
         scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
         )
         run = replace(run, resolved_source_scope=scope)
         source_id = call.arguments.get("source_id")

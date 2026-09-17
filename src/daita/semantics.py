@@ -36,7 +36,6 @@ from .catalog.models import CATALOG_CONTEXT_DEFAULT_LIMIT
 from .domains.learning import LearningCandidateGuard
 from .llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
 from .loop.models import RunInput, Transcript
-from .loop.session import RunSession
 from .scope import resolve_effective_source_scope
 from .storage.sqlite_records import SourcePermissionStateError
 
@@ -1621,6 +1620,8 @@ class SemanticCapabilityDomain:
         catalog: SemanticDomainCatalog,
         store: SemanticStore,
         learning: LearningCandidateGuard,
+        *,
+        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("semantic declarations have the wrong domain owner")
@@ -1637,12 +1638,31 @@ class SemanticCapabilityDomain:
         self._catalog = catalog
         self._store = store
         self._learning = learning
+        self._files_only_run_ids = (
+            files_only_run_ids if files_only_run_ids is not None else set()
+        )
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
+        self._explicit_learning_runs: set[str] = set()
 
     @property
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
+
+    def select_explicit_learning_run(self, run_id: str) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("explicit learning run_id must be non-empty text")
+        if self._explicit_learning_runs:
+            raise RuntimeError("explicit learning guard exceeds its live bound")
+        self._explicit_learning_runs.add(run_id)
+
+    def clear_explicit_learning_run(self, run_id: str) -> None:
+        self._explicit_learning_runs.discard(run_id)
+
+    def explicit_learning_requested(self, run_id: str) -> bool:
+        """Read the existing host-owned selection without deriving intent from text."""
+
+        return run_id in self._explicit_learning_runs
 
     async def validate_annotation(
         self,
@@ -1655,16 +1675,11 @@ class SemanticCapabilityDomain:
         if issue is not None:
             raise SemanticValidationError(issue[1])
 
-    async def project(
-        self,
-        run: RunInput,
-        session: RunSession | None = None,
-    ) -> tuple[str, ...]:
-        files_only = session is not None and session.options.files_only
-        if files_only:
+    async def project(self, run: RunInput) -> tuple[str, ...]:
+        if run.id in self._files_only_run_ids:
             return ()
         scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=files_only
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
         )
         run = replace(run, resolved_source_scope=scope)
         facts = (
@@ -1676,16 +1691,16 @@ class SemanticCapabilityDomain:
         )
         if not facts:
             return ()
-        requested = session is not None and session.options.explicit_learning
+        requested = self.explicit_learning_requested(run.id)
         if not requested:
             requested = await self._maintenance_requested(run)
-        selected_tool = self._learning.selected_mutation_tool(session)
+        selected_tool = self._learning.selected_mutation_tool(run.id)
         return tuple(
             view.name
             for view in self._views
             if (requested or view.name == selected_tool)
             and self._learning.allows(
-                session,
+                run.id,
                 view.name,
                 effectful=(
                     self._capabilities[view.capability_id].operational_effect
@@ -1693,8 +1708,6 @@ class SemanticCapabilityDomain:
                 ),
             )
         )
-
-    project_session = project
 
     def normalize_arguments(
         self,
@@ -1729,18 +1742,15 @@ class SemanticCapabilityDomain:
         arguments: FrozenJsonObject,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(run.id, call)
         await self._validate_source_scope(run, capability, arguments)
         await self._validate_read_scope(run, capability, arguments)
         if capability.id == SEMANTIC_SAVE_CAPABILITY_ID:
             arguments = await self._bind_current_evidence(run, arguments)
         return arguments
-
-    prepare_session_call = prepare_call
 
     async def prepare_automation_grant(
         self,
@@ -1781,18 +1791,17 @@ class SemanticCapabilityDomain:
         output: ToolOutput,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> ToolOutput:
         if capability.id == SEMANTIC_VIEW_CAPABILITY_ID:
             output = await self._decorate_view(run, arguments, output)
         elif capability.id == SEMANTIC_LIST_CAPABILITY_ID:
             output = await self._filter_list(run, arguments, output)
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.mark_effect_succeeded(session, call.id)
+            self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
         )
         source_id = arguments.get("source_id")
         source_ids = (
@@ -1824,8 +1833,6 @@ class SemanticCapabilityDomain:
                 "resource_ids": tuple(sorted(readable)),
             },
         )
-
-    finalize_session_output = finalize_output
 
     def normalize_error(
         self,
@@ -1997,7 +2004,7 @@ class SemanticCapabilityDomain:
         output: ToolOutput,
     ) -> ToolOutput:
         scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
         )
         source_id = arguments.get("source_id")
         resource_id = arguments.get("resource_id")
@@ -2243,7 +2250,7 @@ class SemanticCapabilityDomain:
         arguments: Mapping[str, object],
     ) -> None:
         scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=False
+            run, self._catalog, files_only=run.id in self._files_only_run_ids
         )
         selected_source_ids = scope.source_ids
         supplied = arguments.get("source_id")

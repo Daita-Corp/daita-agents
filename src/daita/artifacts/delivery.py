@@ -14,7 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import NoReturn, Protocol, cast
+from typing import NoReturn, Protocol
 from uuid import uuid4
 
 from .._json import FrozenJsonObject, canonical_json
@@ -79,7 +79,7 @@ class ExactBoundFileResolver(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class ArtifactDestinationGrant:
+class _DestinationGrant:
     destination_id: str
     display_name: str
     kind: ArtifactDestinationKind
@@ -147,9 +147,10 @@ class LocalArtifactDelivery:
         self._clock = clock
         self._id_factory = id_factory
         self._config_path = self.agent_home / "artifacts" / "delivery-config.json"
-        self._persistent: dict[str, ArtifactDestinationGrant] = {}
+        self._persistent: dict[str, _DestinationGrant] = {}
+        self._one_time: dict[str, _DestinationGrant] = {}
         self._default_id: str | None = None
-        self._system: ArtifactDestinationGrant | None = None
+        self._system: _DestinationGrant | None = None
         self._config_error: ArtifactError | None = None
         self._downloads_error: ArtifactError | None = None
 
@@ -212,14 +213,9 @@ class LocalArtifactDelivery:
         return owner
 
     async def close(self) -> None:
-        return None
+        self._one_time.clear()
 
-    async def model_destinations(
-        self,
-        run_id: str,
-        *,
-        one_time_grants: tuple[object, ...] = (),
-    ) -> tuple[ArtifactDestination, ...]:
+    async def model_destinations(self, run_id: str) -> tuple[ArtifactDestination, ...]:
         views: list[ArtifactDestination] = [self._system_view()]
         for grant in sorted(
             self._persistent.values(), key=lambda item: item.destination_id
@@ -228,8 +224,7 @@ class LocalArtifactDelivery:
                 self._view(grant, is_default=grant.destination_id == self._default_id)
             )
         for grant in sorted(
-            self._validated_one_time_grants(run_id, one_time_grants),
-            key=lambda item: item.destination_id,
+            self._one_time.values(), key=lambda item: item.destination_id
         ):
             if grant.run_id == run_id:
                 views.append(self._view(grant, is_default=False))
@@ -237,7 +232,19 @@ class LocalArtifactDelivery:
 
     async def register_one_time(
         self, directory: Path, *, run_id: str
-    ) -> ArtifactDestinationGrant:
+    ) -> ArtifactDestination:
+        matching = sum(grant.run_id == run_id for grant in self._one_time.values())
+        if matching >= MAX_ONE_TIME_DESTINATIONS:
+            raise ArtifactError(
+                "artifact_quota_exceeded",
+                "The one-time destination limit would be exceeded.",
+                {
+                    "scope": "run",
+                    "limit_kind": "one_time_destinations",
+                    "limit": MAX_ONE_TIME_DESTINATIONS,
+                    "attempted": matching + 1,
+                },
+            )
         destination_id = self._next_destination_id()
         grant = await self._admit_path(
             directory,
@@ -247,7 +254,13 @@ class LocalArtifactDelivery:
             display_name=None,
             run_id=run_id,
         )
-        return grant
+        self._one_time[destination_id] = grant
+        return self._view(grant, is_default=False)
+
+    def end_run(self, run_id: str) -> None:
+        for destination_id in tuple(self._one_time):
+            if self._one_time[destination_id].run_id == run_id:
+                del self._one_time[destination_id]
 
     async def export_destination(self) -> ArtifactDestination:
         if self._default_id is not None:
@@ -334,7 +347,6 @@ class LocalArtifactDelivery:
         mode: str,
         destination_id: str | None = None,
         filename: str | None = None,
-        one_time_grants: tuple[object, ...] = (),
     ) -> FrozenJsonObject:
         if mode == ArtifactDeliveryMode.REPLACE_BOUND_FILE.value:
             if destination_id is not None or filename is not None:
@@ -350,11 +362,7 @@ class LocalArtifactDelivery:
         ref = await self.artifacts.find_ref(artifact_id)
         requested = self._filename_for_ref(ref, filename)
         try:
-            grant = self._resolve(
-                destination_id,
-                run_id=run_id,
-                one_time_grants=one_time_grants,
-            )
+            grant = self._resolve(destination_id, run_id=run_id)
             self._verify_grant(grant)
         except ArtifactError as error:
             raise _retained_artifact_error(error, ref.artifact_id) from error
@@ -382,7 +390,6 @@ class LocalArtifactDelivery:
         mode: str,
         destination_id: str | None = None,
         filename: str | None = None,
-        one_time_grants: tuple[object, ...] = (),
     ) -> ArtifactDeliveryReceipt:
         if mode == ArtifactDeliveryMode.REPLACE_BOUND_FILE.value:
             if destination_id is not None or filename is not None:
@@ -398,11 +405,7 @@ class LocalArtifactDelivery:
         ref = await self.artifacts.find_ref(artifact_id)
         requested = self._filename_for_ref(ref, filename)
         try:
-            grant = self._resolve(
-                destination_id,
-                run_id=run_id,
-                one_time_grants=one_time_grants,
-            )
+            grant = self._resolve(destination_id, run_id=run_id)
             self._verify_grant(grant)
         except ArtifactError as error:
             raise _retained_artifact_error(error, ref.artifact_id) from error
@@ -631,8 +634,7 @@ class LocalArtifactDelivery:
         *,
         run_id: str | None,
         permit_one_time: bool = True,
-        one_time_grants: tuple[object, ...] = (),
-    ) -> ArtifactDestinationGrant:
+    ) -> _DestinationGrant:
         self._require_config()
         selected = destination_id
         if destination_id == DEFAULT_DESTINATION_SELECTOR:
@@ -648,45 +650,14 @@ class LocalArtifactDelivery:
         grant = self._persistent.get(selected)
         if grant is not None:
             return grant
-        if run_id is not None and permit_one_time:
-            for grant in self._validated_one_time_grants(run_id, one_time_grants):
-                if grant.destination_id == selected:
-                    return grant
+        grant = self._one_time.get(selected)
+        if grant is not None and permit_one_time and grant.run_id == run_id:
+            return grant
         raise ArtifactError(
             "artifact_destination_unauthorized",
             "The requested artifact destination is not authorized.",
             {"destination_id": destination_id},
         )
-
-    def _validated_one_time_grants(
-        self,
-        run_id: str,
-        grants: tuple[object, ...],
-    ) -> tuple[ArtifactDestinationGrant, ...]:
-        selected = tuple(grants)
-        if len(selected) > MAX_ONE_TIME_DESTINATIONS:
-            raise ArtifactError(
-                "artifact_quota_exceeded",
-                "The one-time destination limit would be exceeded.",
-                {
-                    "scope": "run",
-                    "limit_kind": "one_time_destinations",
-                    "limit": MAX_ONE_TIME_DESTINATIONS,
-                    "attempted": len(selected),
-                },
-            )
-        if any(
-            not isinstance(item, ArtifactDestinationGrant)
-            or item.authorization is not DestinationAuthorization.ONE_TIME
-            or item.run_id != run_id
-            for item in selected
-        ):
-            raise ArtifactError(
-                "artifact_destination_unauthorized",
-                "The one-time artifact destination does not belong to this run.",
-                {},
-            )
-        return cast(tuple[ArtifactDestinationGrant, ...], selected)
 
     async def _admit_path(
         self,
@@ -697,7 +668,7 @@ class LocalArtifactDelivery:
         kind: ArtifactDestinationKind,
         display_name: str | None,
         run_id: str | None,
-    ) -> ArtifactDestinationGrant:
+    ) -> _DestinationGrant:
         if not isinstance(directory, Path):
             raise ArtifactError(
                 "artifact_destination_unauthorized",
@@ -762,7 +733,7 @@ class LocalArtifactDelivery:
                 ).encode("utf-8")
             ).hexdigest()
         )
-        return ArtifactDestinationGrant(
+        return _DestinationGrant(
             destination_id=destination_id,
             display_name=safe_display,
             kind=kind,
@@ -775,7 +746,7 @@ class LocalArtifactDelivery:
             run_id=run_id,
         )
 
-    def _verify_grant(self, grant: ArtifactDestinationGrant) -> None:
+    def _verify_grant(self, grant: _DestinationGrant) -> None:
         try:
             facts = grant.path.lstat()
         except OSError as error:
@@ -789,7 +760,7 @@ class LocalArtifactDelivery:
 
     def _destination_failure(
         self,
-        grant: ArtifactDestinationGrant,
+        grant: _DestinationGrant,
         *,
         unavailable: bool,
         cause: BaseException | None = None,
@@ -833,7 +804,7 @@ class LocalArtifactDelivery:
     async def _deliver(
         self,
         payload: ArtifactPayload,
-        grant: ArtifactDestinationGrant,
+        grant: _DestinationGrant,
         filename: str,
     ) -> ArtifactDeliveryReceipt:
         gate = _DeliveryGate()
@@ -1073,7 +1044,7 @@ class LocalArtifactDelivery:
     def _deliver_sync(
         self,
         payload: ArtifactPayload,
-        grant: ArtifactDestinationGrant,
+        grant: _DestinationGrant,
         filename: str,
         gate: _DeliveryGate,
     ) -> ArtifactDeliveryReceipt:
@@ -1246,7 +1217,7 @@ class LocalArtifactDelivery:
         return self._view(self._system, is_default=self._default_id is None)
 
     def _view(
-        self, grant: ArtifactDestinationGrant, *, is_default: bool
+        self, grant: _DestinationGrant, *, is_default: bool
     ) -> ArtifactDestination:
         try:
             self._verify_grant(grant)
@@ -1379,7 +1350,7 @@ class LocalArtifactDelivery:
 
 def _read_delivery_configuration(
     path: Path,
-) -> tuple[dict[str, ArtifactDestinationGrant], str | None] | None:
+) -> tuple[dict[str, _DestinationGrant], str | None] | None:
     if not path.exists():
         if path.is_symlink():
             raise ValueError("delivery config cannot be a broken symlink")
@@ -1401,7 +1372,7 @@ def _read_delivery_configuration(
     entries = raw["persistent_destinations"]
     if not isinstance(entries, list) or len(entries) > MAX_PERSISTENT_DESTINATIONS:
         raise ValueError("delivery destination count is invalid")
-    persistent: dict[str, ArtifactDestinationGrant] = {}
+    persistent: dict[str, _DestinationGrant] = {}
     for item in entries:
         if not isinstance(item, dict):
             raise ValueError("delivery destination entry is invalid")
@@ -1433,7 +1404,7 @@ def validate_delivery_configuration(agent_home: Path) -> None:
     _read_delivery_configuration(home / "artifacts" / "delivery-config.json")
 
 
-def _grant_to_mapping(grant: ArtifactDestinationGrant) -> dict[str, object]:
+def _grant_to_mapping(grant: _DestinationGrant) -> dict[str, object]:
     return {
         "destination_id": grant.destination_id,
         "display_name": grant.display_name,
@@ -1609,7 +1580,7 @@ def _safe_relative_display(value: str) -> str:
     return projected[:512] or "local file"
 
 
-def _grant_from_mapping(value: Mapping[str, object]) -> ArtifactDestinationGrant:
+def _grant_from_mapping(value: Mapping[str, object]) -> _DestinationGrant:
     if set(value) != {
         "destination_id",
         "display_name",
@@ -1669,7 +1640,7 @@ def _grant_from_mapping(value: Mapping[str, object]) -> ArtifactDestinationGrant
     ):
         raise ValueError("persistent destination identity is invalid")
     path = Path(raw_path)
-    grant = ArtifactDestinationGrant(
+    grant = _DestinationGrant(
         destination_id=destination_id,
         display_name=display_name,
         kind=ArtifactDestinationKind(raw_kind),
@@ -1754,7 +1725,6 @@ def _fsync_directory(path: Path) -> None:
 
 
 __all__ = [
-    "ArtifactDestinationGrant",
     "DeliverySourceReader",
     "LocalArtifactDelivery",
     "resolve_os_downloads_directory",

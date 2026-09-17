@@ -1128,7 +1128,6 @@ class ToolExecution:
     source_scope: EffectiveSourceScope | None = None
     request_sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
     effect_receipt_id: str | None = None
-    one_time_artifact_destinations: tuple[object, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
@@ -1148,11 +1147,6 @@ class ToolExecution:
             raise ValueError("tool effect receipt ID is invalid")
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
-        )
-        object.__setattr__(
-            self,
-            "one_time_artifact_destinations",
-            tuple(self.one_time_artifact_destinations),
         )
 
 

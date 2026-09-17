@@ -20,50 +20,7 @@ Use this order of authority when repository material disagrees:
 Preserve unrelated working-tree changes. Historical code and documents can
 explain intent, but they do not define current behavior.
 
-## Architecture status: current revision 1 and ratified target
-
-The production code, current schema, tests and all ordinary statements in this file
-describe **current agent-home revision 1** unless a paragraph is explicitly labeled
-as the ratified target. Revision 1 remains the only runnable/current home format and
-the existing single-job behavior remains authoritative until the atomic revision-2
-cutover. Do not infer that a target type, table, tool or concurrency behavior exists
-before its implementation phase and cutover gate.
-
-The revision-2 target rules below are normative for graph implementation. They do
-not imply that target behavior is currently implemented. In particular, do not
-create or register revision 2, change current job behavior, compose a graph runtime,
-delete legacy code, or add a feature flag/fallback selecting a draft graph path
-before the atomic cutover prerequisites are satisfied.
-
-The ratified revision-2 target has these non-negotiable boundaries:
-
-- the adaptive task graph is owned inside `jobs`; `JobOwner` owns commands and one
-  graph-aware `JobSupervisor` owns graph-local selection, claims and recovery;
-- there is still one reentrant `AgentLoop` semantic implementation and one
-  `CapabilityRuntime`; each model task attempt has a fresh isolated `RunSession`,
-  exact transcript and one `RunSessionWriter`;
-- `RunAdmissionCoordinator` owns host workload admission, lifecycle drain and keyed
-  provider/source/MCP/SQLite/effect permits; it does not own graph transitions,
-  model routing or capability semantics;
-- root authority, outcome, distribution, deadlines and total budgets are immutable;
-  planner-created task scope is a validated subset and model text never grants
-  authority;
-- graph V1 is structurally effect-free. Effectful graph work is a separately gated
-  later phase; the existing receipt boundary remains the only effect truth;
-- graph transactions are short indexed SQLite CAS operations. Provider, source, MCP,
-  artifact and effect I/O never occurs beneath a graph transaction or broad host
-  lock;
-- normalized tasks, edges, attempts, accepted results, controls, mutations, budget
-  ledgers and bounded audit events are current graph state/evidence. Events are never
-  event-sourced authority;
-- routines remain the separate time-triggered occurrence system; a routine is not a
-  graph task and no routine-to-graph bridge is part of graph V1;
-- revision 2 is one atomic conversion/cutover. Current runtime codecs contain only
-  the graph shape afterward; revision-1 decoders remain migration-only; the old
-  single-job, connected-executor and autonomous-follow-up paths are deleted at the
-  specified gates rather than retained as a selectable compatibility engine.
-
-## Current production architecture (revision 1)
+## Product architecture
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
 explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL,
@@ -152,11 +109,10 @@ delegates to `EmbeddedAgent`; it does not implement model progression, catalog
 truth, capability execution, or persistence.
 
 `daita.hosting.embedded.EmbeddedAgent` is the composition root. It admits the
-agent home, holds the process-level writer lock, composes the capacity-one
-`RunAdmissionCoordinator` and retains the broad mutation lock, constructs the
-catalog, registry, domains, context builder, runtime, loop, artifact store, and
-supervisors, and closes them in drain-safe order. Composition belongs here rather
-than in the loop or a dependency-injection framework.
+agent home, holds the process-level writer lock and in-process run/mutation
+locks, constructs the catalog, registry, domains, context builder, runtime,
+loop, artifact store, and supervisors, and closes them in order. Composition
+belongs here rather than in the loop or a dependency-injection framework.
 
 One open agent home has one writer. A foreground TUI or CLI process and the
 resident host must hand off that lock; they cannot open the same home
@@ -173,19 +129,10 @@ concurrently.
 - enforcing outer budgets; and
 - returning one terminal `LoopExit`.
 
-Each host-owned loop invocation consumes one immutable, single-use `RunSession`.
-The session owns its cancellation/deadline state, immutable run options and exactly
-one `RunSessionWriter`; the writer alone starts, appends to and terminates that run's
-transcript with exact ordering and conversation-predecessor binding. The capacity-one
-coordinator preserves revision-1 serial behavior while owning execution admission,
-keyed conversation ordering, provider admission and shutdown drain. Conservative
-source/resource, MCP, SQLite-pressure and effect permit interfaces do not yet enable
-cross-run I/O concurrency or replace the mutation lock.
-
-The loop depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
-transcript-store protocols through those session boundaries. Provider payloads,
-catalog operations, SQL validation, source I/O, policy, and feature lifecycle state
-stay outside the loop.
+It depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
+`TranscriptStore` protocols. Provider payloads, catalog operations, SQL
+validation, source I/O, policy, and feature lifecycle state stay outside the
+loop.
 
 `daita.context.AgentContextBuilder` creates each model request from
 the current transcript, current catalog, projected tool definitions, and model
@@ -648,12 +595,9 @@ authority exists only in `relational_write_scopes`. Connection JSON never
 owns either permission. Reconstruction fails closed, refresh preserves exact
 scopes, and detach revokes both scope families atomically.
 
-In current revision 1, all state mutation must be atomic and cancellation-safe. Do
-not add event sourcing, replay projections, graph/task checkpoints, another state
-abstraction, or a second writer around SQLite. The ratified revision-2 target permits
-only the normalized graph records, bounded task checkpoints/comments and audit event
-cursor defined by its schema contract; those records are not an event-sourced replay
-system and remain behind `SQLiteStateStore`.
+All state mutation must be atomic and cancellation-safe. Do not add event
+sourcing, replay projections, checkpoints, another state abstraction, or a
+second writer around SQLite.
 
 ## Models and providers
 
@@ -770,20 +714,12 @@ Do not add provider branches to `AgentLoop`.
 
 ## Architectural constraints
 
-Current revision 1 has one `AgentLoop`, one `CapabilityRuntime`, one capability
-registry, one catalog, one artifact store, one jobs supervisor, one routines
-supervisor, one SQLite state boundary, and one writer per agent home. Until the
-atomic cutover, do not make draft graph code reachable from production composition
-or change current job semantics.
-
-The ratified target replaces the current jobs implementation with a graph coordinator
-inside `jobs`; it does not add a second execution runtime. Do not add a second
-AgentLoop implementation, capability runtime, state store, transcript path, jobs
-supervisor, agent-home writer, generic workflow engine, graph engine outside `jobs`,
-dynamic executor/plugin registry, event bus, completion router, parallel recovery
-service, policy DSL or generic scheduler. `RunSession` is isolated invocation state,
-not a second loop or resumable conversation runtime. `RunAdmissionCoordinator`
-coordinates host capacity, not graph truth. Audit events cannot drive replay.
+The product has one `AgentLoop`, one `CapabilityRuntime`, one capability
+registry, one catalog, one artifact store, one scheduler/supervisor path for
+routines, one SQLite state boundary, and one writer per agent home. Do not add
+a second execution loop, generic workflow or graph engine, dynamic executor or
+plugin registry, event bus, completion router, recovery service, policy DSL,
+generic scheduler, session runtime, or competing writer.
 
 Keep feature responsibilities in the existing concrete components. Avoid
 middleware frameworks, lifecycle-hook systems, dynamic extension scanning,

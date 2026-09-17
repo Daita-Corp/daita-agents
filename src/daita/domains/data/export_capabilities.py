@@ -90,7 +90,6 @@ from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
 from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
 from ...loop.models import RunInput, RunOrigin, Transcript
-from ...loop.session import RunSession
 from ...scope import SourceScopeCatalog, resolve_effective_source_scope
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
@@ -876,7 +875,6 @@ class ArtifactSaveLocalExecutor:
             mode=mode,
             destination_id=destination_id,
             filename=filename,
-            one_time_grants=request.one_time_artifact_destinations,
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
@@ -894,7 +892,6 @@ class ArtifactSaveLocalExecutor:
             mode=mode,
             destination_id=destination_id,
             filename=filename,
-            one_time_grants=request.one_time_artifact_destinations,
         )
         return ToolOutput(
             kind=ARTIFACT_DELIVERY_RECEIPT_OUTPUT_KIND,
@@ -1804,11 +1801,7 @@ class ArtifactCapabilityDomain:
             raise ValueError("artifact capability registry is already bound")
         self._registry = registry
 
-    async def project(
-        self,
-        run: RunInput,
-        session: RunSession | None = None,
-    ) -> tuple[str, ...]:
+    async def project(self, run: RunInput) -> tuple[str, ...]:
         all_refs = await self._artifacts.list_refs()
         conversation_id = run.conversation_id or run.id
         refs = tuple(
@@ -1820,7 +1813,7 @@ class ArtifactCapabilityDomain:
         for view in self._views:
             capability = self._capabilities[view.capability_id]
             if not self._learning.allows(
-                session,
+                run.id,
                 view.name,
                 effectful=capability.operational_effect is not OperationalEffect.NONE,
             ):
@@ -1867,8 +1860,6 @@ class ArtifactCapabilityDomain:
             names.append(view.name)
         return tuple(names)
 
-    project_session = project
-
     def normalize_arguments(
         self,
         capability: Capability,
@@ -1885,7 +1876,6 @@ class ArtifactCapabilityDomain:
         arguments: FrozenJsonObject,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> FrozenJsonObject:
         if capability.id == RESULT_SNAPSHOT_CAPABILITY_ID:
             return await self._prepare_result_snapshot(
@@ -1928,7 +1918,7 @@ class ArtifactCapabilityDomain:
                 ) from error
             return arguments
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(run.id, call)
         scope = await resolve_effective_source_scope(run, self._catalog)
         supplied_source_id = arguments.get("source_id")
         if (
@@ -2268,8 +2258,6 @@ class ArtifactCapabilityDomain:
         )
         return FrozenJsonObject.from_mapping(prepared)
 
-    prepare_session_call = prepare_call
-
     async def prepare_automation_grant(
         self,
         capability: Capability,
@@ -2321,7 +2309,6 @@ class ArtifactCapabilityDomain:
         output: ToolOutput,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> ToolOutput:
         if output.artifact is not None:
             self._validate_artifact_summary(capability, output)
@@ -2374,7 +2361,7 @@ class ArtifactCapabilityDomain:
             capability.id == ARTIFACT_SAVE_LOCAL_CAPABILITY_ID
             and output.data.get("outcome") == "failed"
         ):
-            self._learning.mark_effect_succeeded(session, call.id)
+            self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         # Remaining outputs describe local management state and reflect the
@@ -2387,8 +2374,6 @@ class ArtifactCapabilityDomain:
                 "capability_id": capability.id,
             },
         )
-
-    finalize_session_output = finalize_output
 
     def normalize_error(
         self,

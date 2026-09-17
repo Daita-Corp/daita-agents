@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from decimal import Decimal
-from hashlib import sha256
-from urllib.parse import urlsplit, urlunsplit
 
 from ..security import (
     KeychainStore,
@@ -306,41 +304,10 @@ def create_model_route_provider(
             profile=candidate.profile,
             allowed_sensitivities=candidate.allowed_sensitivities,
             close_with_router=True,
-            concurrency_key=_provider_concurrency_key(candidate),
         )
         for candidate in route.candidates
     )
     return ModelRouter(registrations, retry_policy=route.retry_policy)
-
-
-def _provider_concurrency_key(candidate: ModelRouteCandidate) -> str:
-    family = candidate.provider_id.partition(":")[0]
-    definition = provider_definition(family)
-    endpoint = candidate.base_url
-    if endpoint is None and definition is not None:
-        endpoint = definition.default_endpoint
-    normalized_endpoint = _normalized_endpoint(endpoint)
-    credential = (
-        "none"
-        if candidate.secret_reference is None
-        else sha256(candidate.secret_reference.to_uri().encode("utf-8")).hexdigest()
-    )
-    return f"provider:{family}:{normalized_endpoint}:{credential}"
-
-
-def _normalized_endpoint(value: str | None) -> str:
-    if value is None:
-        return "default"
-    parsed = urlsplit(value.strip())
-    return urlunsplit(
-        (
-            parsed.scheme.lower(),
-            parsed.netloc.lower(),
-            parsed.path.rstrip("/") or "/",
-            "",
-            "",
-        )
-    )
 
 
 __all__ = ["create_llm_provider", "create_model_route_provider"]

@@ -31,7 +31,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopLimits, RunInput
-from daita.loop.session import RunSessionOptions
 from daita.semantics import semantic_annotation_sha256
 from daita.tui.commands import SLASH_COMMAND_COMPLETIONS, learning_invocation_message
 from daita.tui.controller import PresentationController
@@ -487,6 +486,7 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
         await agent._embedded._store.save_semantic_annotation(agent.id, stale)
 
         runtime = agent._embedded._capability_runtime
+        semantic_domain = agent._embedded._semantic_domain
         read_run = RunInput(
             id="semantic-read-run",
             agent_id=agent.id,
@@ -495,7 +495,7 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
             conversation_id="semantic-read-conversation",
             source_scope_ids=(source.id,),
         )
-        learning_options = RunSessionOptions(explicit_learning=True)
+        semantic_domain.select_explicit_learning_run(read_run.id)
         listed = (
             await execute_projected(
                 runtime,
@@ -507,7 +507,6 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
                         arguments={"limit": 1},
                     ),
                 ),
-                session_options=learning_options,
             )
         )[0]
         listed_data = listed.output["data"]
@@ -526,7 +525,6 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
                         arguments={"id": "conflict-a"},
                     ),
                 ),
-                session_options=learning_options,
             )
         )[0]
         assert not conflict_view.is_error
@@ -537,6 +535,8 @@ async def test_memory_terminal_surface_shows_semantic_states(tmp_path):
         assert conflict_maintenance["state"] == "conflicting"
         assert conflict_maintenance["usable_as_current_meaning"] is False
         assert conflict_maintenance["requires_revalidation"] is True
+        semantic_domain.clear_explicit_learning_run(read_run.id)
+
         controller = PresentationController(root=None, workspace=workspace_for(None))
         controller.agent = agent
         rendered = (await controller.dispatch_command("/memory")).message

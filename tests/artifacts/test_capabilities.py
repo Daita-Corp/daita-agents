@@ -47,7 +47,6 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import RunInput, Transcript
-from daita.loop.session import RunSessionOptions
 from daita.storage.sqlite_codecs import decode_message, encode_message
 from tests.support.capability_runtime import (
     ContextToolProjectionAdapter,
@@ -829,9 +828,6 @@ async def test_one_time_save_approval_is_bound_to_frozen_artifact_and_destinatio
                     ),
                 ),
                 sensitivity=ModelSensitivity.INTERNAL,
-                session_options=RunSessionOptions(
-                    one_time_artifact_destinations=(destination,)
-                ),
             )
         )[0]
         assert not result.is_error

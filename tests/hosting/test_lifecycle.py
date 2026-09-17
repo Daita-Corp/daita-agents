@@ -7,14 +7,7 @@ import pytest
 
 from daita import Agent
 from daita.hosting.embedded import AgentHomeError, HostActiveError
-from daita.hosting.execution_governor import WorkloadClass
-from daita.llm.models import (
-    FinishReason,
-    ModelProfile,
-    ModelRequest,
-    ModelResponse,
-    TextBlock,
-)
+from daita.llm.models import FinishReason, ModelProfile, ModelRequest, ModelResponse
 from daita.storage.sqlite_records import SourceReadMode
 from tests.support.workspace import workspace_for
 
@@ -74,9 +67,6 @@ async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path
             ]
         )
     )
-    diagnostics = agent._embedded._admission_coordinator.diagnostics()
-    assert diagnostics.active_leases == 1
-    assert diagnostics.active_permits == 1
     closing = asyncio.create_task(agent.close())
     await asyncio.sleep(0)
 
@@ -146,106 +136,6 @@ async def test_close_rejects_a_queued_run_before_releasing_writer_ownership(tmp_
         workspace=workspace_for(tmp_path),
     )
     await reopened.close()
-
-
-async def test_close_drains_admission_before_store_and_writer_lock_close(
-    tmp_path,
-    monkeypatch,
-):
-    provider = _BlockingProvider()
-    agent = await Agent.create(
-        "close-dependency-order",
-        root=tmp_path,
-        model=provider,
-        model_profile=provider.model_profile,
-        workspace=workspace_for(tmp_path),
-    )
-    embedded = agent._embedded
-    lease = await embedded._admission_coordinator.admit_execution(
-        WorkloadClass.SYSTEM,
-        "held-test-lease",
-        absolute_deadline=asyncio.get_running_loop().time() + 1,
-    )
-    events: list[str] = []
-    original_store_close = embedded._store.close
-    original_writer_release = embedded._writer_lock.release
-
-    async def close_store():
-        events.append("store")
-        await original_store_close()
-
-    def release_writer():
-        events.append("writer")
-        original_writer_release()
-
-    monkeypatch.setattr(embedded._store, "close", close_store)
-    monkeypatch.setattr(embedded._writer_lock, "release", release_writer)
-    closing = asyncio.create_task(agent.close())
-    await asyncio.sleep(0)
-
-    assert events == []
-    assert not closing.done()
-    await lease.release()
-    await asyncio.wait_for(closing, timeout=1)
-    assert events[-2:] == ["store", "writer"]
-
-
-async def test_same_conversation_turns_bind_predecessor_and_include_prior_result(
-    tmp_path,
-):
-    class OrderedProvider(_BlockingProvider):
-        def __init__(self) -> None:
-            super().__init__()
-            self.requests: list[ModelRequest] = []
-
-        async def generate(self, request: ModelRequest) -> ModelResponse:
-            self.requests.append(request)
-            if len(self.requests) == 1:
-                return ModelResponse(finish_reason=FinishReason.STOP, text="seed")
-            if len(self.requests) == 2:
-                self.started.set()
-                await self.release.wait()
-                return ModelResponse(
-                    finish_reason=FinishReason.STOP,
-                    text="first result",
-                )
-            return ModelResponse(finish_reason=FinishReason.STOP, text="second result")
-
-    provider = OrderedProvider()
-    agent = await Agent.create(
-        "same-conversation-order",
-        root=tmp_path,
-        model=provider,
-        model_profile=provider.model_profile,
-        workspace=workspace_for(tmp_path),
-    )
-    try:
-        seed = await agent.run("seed question")
-        first = asyncio.create_task(
-            agent.run("first follow-up", conversation_id=seed.conversation_id)
-        )
-        await provider.started.wait()
-        second = asyncio.create_task(
-            agent.run("second follow-up", conversation_id=seed.conversation_id)
-        )
-        await asyncio.sleep(0)
-        assert (
-            agent._embedded._admission_coordinator.diagnostics().waiting_admissions == 1
-        )
-
-        provider.release.set()
-        first_result, second_result = await asyncio.gather(first, second)
-        assert first_result.final_text == "first result"
-        assert second_result.final_text == "second result"
-        assert any(
-            isinstance(block, TextBlock) and block.text == "first result"
-            for message in provider.requests[2].messages
-            for block in message.content
-        )
-        conversation = await agent.conversation_runs(seed.conversation_id)
-        assert tuple(item.turn_index for item in conversation) == (0, 1, 2)
-    finally:
-        await agent.close()
 
 
 @pytest.mark.parametrize(

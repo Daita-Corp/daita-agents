@@ -28,7 +28,6 @@ from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..domains.learning import LearningCandidateGuard
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput, RunOrigin
-from ..loop.session import RunSession
 from .store import (
     SKILL_DESCRIPTION_MAX_CHARACTERS,
     SKILL_INSTRUCTIONS_MAX_CHARACTERS,
@@ -112,16 +111,13 @@ class SkillSaveExecutor:
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
         name, description, instructions, expected_sha256 = _save_arguments(request)
         try:
-            (
-                exists,
-                document_digest,
-                state_digest,
-                index_digest,
-            ) = await self._store.preflight_save(
-                name,
-                description,
-                instructions,
-                sensitivity=request.request_sensitivity,
+            exists, document_digest, state_digest, index_digest = (
+                await self._store.preflight_save(
+                    name,
+                    description,
+                    instructions,
+                    sensitivity=request.request_sensitivity,
+                )
             )
         except SkillValidationError as error:
             raise CapabilityInputError(
@@ -174,12 +170,9 @@ class SkillDeleteExecutor:
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
         name = _delete_arguments(request)
         try:
-            (
-                exists,
-                document_digest,
-                state_digest,
-                index_digest,
-            ) = await self._store.preflight_delete(name)
+            exists, document_digest, state_digest, index_digest = (
+                await self._store.preflight_delete(name)
+            )
         except SkillNotFoundError:
             raise
         except SkillValidationError as error:
@@ -394,21 +387,36 @@ class SkillCapabilityDomain:
         self._learning = learning
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
+        self._scheduled_bindings: dict[str, dict[str, str]] = {}
+
+    def select_scheduled_bindings(
+        self,
+        run_id: str,
+        bindings: tuple[tuple[str, str], ...],
+    ) -> None:
+        if run_id in self._scheduled_bindings:
+            raise RuntimeError("scheduled skill bindings are already selected")
+        selected = dict(bindings)
+        if len(selected) != len(bindings):
+            raise ValueError("scheduled skill bindings cannot duplicate a name")
+        self._scheduled_bindings[run_id] = selected
+
+    def clear_scheduled_bindings(self, run_id: str) -> None:
+        self._scheduled_bindings.pop(run_id, None)
+
+    def scheduled_bindings(self, run_id: str) -> tuple[tuple[str, str], ...]:
+        return tuple(sorted(self._scheduled_bindings.get(run_id, {}).items()))
 
     @property
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
 
-    async def project(
-        self,
-        run: RunInput,
-        session: RunSession | None = None,
-    ) -> tuple[str, ...]:
+    async def project(self, run: RunInput) -> tuple[str, ...]:
         return tuple(
             view.name
             for view in self._views
             if self._learning.allows(
-                session,
+                run.id,
                 view.name,
                 effectful=(
                     self._capabilities[view.capability_id].operational_effect
@@ -416,8 +424,6 @@ class SkillCapabilityDomain:
                 ),
             )
         )
-
-    project_session = project
 
     def normalize_arguments(
         self,
@@ -434,11 +440,10 @@ class SkillCapabilityDomain:
         arguments: FrozenJsonObject,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> FrozenJsonObject:
         del request_sensitivity
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.validate_effect(session, call)
+            self._learning.validate_effect(run.id, call)
         if capability.id == SKILL_VIEW_CAPABILITY_ID:
             name = arguments.get("name")
             try:
@@ -452,11 +457,7 @@ class SkillCapabilityDomain:
                 ) from error
             content_digest = arguments.get("content_digest")
             if run.origin is RunOrigin.SCHEDULED_ROUTINE:
-                selected = (
-                    {}
-                    if session is None
-                    else dict(session.options.retained_skill_bindings)
-                )
+                selected = self._scheduled_bindings.get(run.id)
                 if (
                     selected is None
                     or selected.get(name) != content_digest
@@ -472,8 +473,6 @@ class SkillCapabilityDomain:
                     "Foreground skill reads use the current named skill.",
                 )
         return arguments
-
-    prepare_session_call = prepare_call
 
     async def prepare_automation_grant(
         self,
@@ -506,10 +505,9 @@ class SkillCapabilityDomain:
         output: ToolOutput,
         *,
         request_sensitivity: ModelSensitivity,
-        session: RunSession | None = None,
     ) -> ToolOutput:
         if capability.operational_effect is not OperationalEffect.NONE:
-            self._learning.mark_effect_succeeded(session, call.id)
+            self._learning.mark_effect_succeeded(run.id)
         if output.sensitivity is not None:
             return output
         return replace(
@@ -520,8 +518,6 @@ class SkillCapabilityDomain:
                 "capability_id": capability.id,
             },
         )
-
-    finalize_session_output = finalize_output
 
     def normalize_error(
         self,

@@ -4,13 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import random
-from collections.abc import (
-    AsyncIterator,
-    Awaitable,
-    Callable,
-    Iterable,
-)
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import cast
@@ -51,68 +45,6 @@ from .protocols import (
     provider_supports_request_policy,
 )
 
-ProviderAdmission = Callable[
-    [str, float | None],
-    Awaitable[AbstractAsyncContextManager[object]],
-]
-
-
-@asynccontextmanager
-async def _unadmitted_provider_attempt() -> AsyncIterator[None]:
-    yield None
-
-
-class AdmittedModelProvider:
-    """Place one non-router provider behind the host attempt permit boundary."""
-
-    def __init__(
-        self,
-        provider: ModelProvider,
-        *,
-        concurrency_key: str,
-        admission: ProviderAdmission,
-    ) -> None:
-        if not isinstance(concurrency_key, str) or not concurrency_key:
-            raise ValueError("provider concurrency key must be non-empty text")
-        if not callable(admission):
-            raise TypeError("provider admission must be callable")
-        self._provider = provider
-        self._concurrency_key = concurrency_key
-        self._admission = admission
-
-    @property
-    def provider_id(self) -> str:
-        return self._provider.provider_id
-
-    def supports_request_policy(self, request: ModelRequest) -> bool:
-        return provider_supports_request_policy(self._provider, request)
-
-    def has_complete_pricing(self, request: ModelRequest) -> bool:
-        return provider_has_complete_pricing(self._provider, request)
-
-    async def generate(self, request: ModelRequest) -> ModelResponse:
-        permit = await self._admission(self._concurrency_key, request.deadline)
-        async with permit:
-            return await self._provider.generate(request)
-
-    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelStreamEvent]:
-        provider = self._provider
-        if not isinstance(provider, StreamingModelProvider):
-            permit = await self._admission(self._concurrency_key, request.deadline)
-            async with permit:
-                response = await provider.generate(request)
-            yield ModelStreamCompleted(response)
-            return
-        permit = await self._admission(self._concurrency_key, request.deadline)
-        async with permit:
-            async with closing_stream(provider.stream(request)) as events:
-                async for event in events:
-                    yield event
-
-    async def close(self, *, deadline: float | None = None) -> None:
-        if isinstance(self._provider, ManagedModelProvider):
-            await self._provider.close(deadline=deadline)
-
 
 @dataclass(frozen=True, slots=True)
 class RetryPolicy:
@@ -149,7 +81,6 @@ class ModelProviderRegistration:
         {ModelSensitivity.PUBLIC, ModelSensitivity.INTERNAL}
     )
     close_with_router: bool = False
-    concurrency_key: str | None = None
 
     def __post_init__(self) -> None:
         if self.provider.provider_id != self.profile.id:
@@ -160,12 +91,6 @@ class ModelProviderRegistration:
             self.provider, ManagedModelProvider
         ):
             raise TypeError("a router-owned provider must support managed close")
-        if self.concurrency_key is not None and (
-            not isinstance(self.concurrency_key, str)
-            or not self.concurrency_key
-            or any(character in self.concurrency_key for character in "\r\n\x00")
-        ):
-            raise ValueError("provider concurrency key must be bounded text or None")
         allowed = frozenset(self.allowed_sensitivities)
         if not allowed or any(
             not isinstance(item, ModelSensitivity) for item in allowed
@@ -291,23 +216,6 @@ class ModelRouter:
         self._sleep = sleep
         self._close_task: asyncio.Task[None] | None = None
         self._native_owner = NativeOwner()
-        self._provider_admission: ProviderAdmission | None = None
-
-    def bind_provider_admission(
-        self,
-        admission: ProviderAdmission,
-    ) -> None:
-        """Bind the one host-owned candidate-attempt permit boundary."""
-
-        if not callable(admission):
-            raise TypeError("provider admission must be callable")
-        if self._provider_admission is not None:
-            raise RuntimeError("provider admission is already bound")
-        self._provider_admission = admission
-
-    @property
-    def provider_admission_bound(self) -> bool:
-        return self._provider_admission is not None
 
     @property
     def provider_id(self) -> str:
@@ -449,14 +357,7 @@ class ModelRouter:
                     total_attempts += 1
                     in_flight = True
                     try:
-                        permit = await self._admit_provider(
-                            registration,
-                            attempt_request,
-                        )
-                        async with permit:
-                            response = await registration.provider.generate(
-                                attempt_request
-                            )
+                        response = await registration.provider.generate(attempt_request)
                     except ModelProviderError as error:
                         if error.provider_id is None:
                             error.provider_id = registration.provider.provider_id
@@ -554,29 +455,24 @@ class ModelRouter:
                     completed = False
                     in_flight = True
                     try:
-                        permit = await self._admit_provider(
-                            registration,
-                            attempt_request,
-                        )
-                        async with permit:
-                            async with closing_stream(
-                                registration.provider.stream(attempt_request)
-                            ) as events:
-                                async for event in events:
-                                    # Completion is visible progress. The permit is
-                                    # retained through stream cleanup, then released
-                                    # before any retry backoff or route change.
-                                    emitted = True
-                                    if isinstance(event, ModelStreamCompleted):
-                                        completed = True
-                                        in_flight = False
-                                        attempt_usage.append(event.response.usage)
-                                        terminal = replace(
-                                            event.response,
-                                            usage=_aggregate_usage(attempt_usage),
-                                        )
-                                        break
-                                    yield event
+                        async with closing_stream(
+                            registration.provider.stream(attempt_request)
+                        ) as events:
+                            async for event in events:
+                                # A completion is visible progress too. Close the
+                                # request on its first terminal event, without
+                                # reading or retrying any subsequent generation.
+                                emitted = True
+                                if isinstance(event, ModelStreamCompleted):
+                                    completed = True
+                                    in_flight = False
+                                    attempt_usage.append(event.response.usage)
+                                    terminal = replace(
+                                        event.response,
+                                        usage=_aggregate_usage(attempt_usage),
+                                    )
+                                    break
+                                yield event
                         if completed:
                             if route is not None:
                                 route.selected_provider_id = (
@@ -638,31 +534,6 @@ class ModelRouter:
             "no configured provider can stream this request",
             usage=_aggregate_usage(attempt_usage),
         )
-
-    async def _admit_provider(
-        self,
-        registration: ModelProviderRegistration,
-        request: ModelRequest,
-    ) -> AbstractAsyncContextManager[object]:
-        admission = self._provider_admission
-        if admission is None:
-            return _unadmitted_provider_attempt()
-        key = registration.concurrency_key or (
-            f"provider:{registration.provider.provider_id}"
-        )
-        try:
-            return await admission(key, request.deadline)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            raise before_generation(
-                ModelProviderError(
-                    ProviderErrorCode.PROVIDER_UNAVAILABLE,
-                    "model provider admission is unavailable",
-                    provider_id=registration.provider.provider_id,
-                ),
-                code="provider_admission_unavailable",
-            ) from error
 
     def _admit_attempt(self, request, usage, total_attempts, last_error):
         if total_attempts >= self._retry_policy.max_total_attempts:
@@ -849,7 +720,6 @@ def _aggregate_usage(items: Iterable[ModelUsage]) -> ModelUsage:
 
 
 __all__ = [
-    "AdmittedModelProvider",
     "ModelProviderRegistration",
     "ModelRoute",
     "ModelRouteCandidate",

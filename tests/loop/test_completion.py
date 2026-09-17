@@ -110,9 +110,9 @@ async def test_in_memory_completion_is_one_atomic_store_operation():
             super().__init__()
             self.actions: list[str] = []
 
-        async def append_at(self, run_id, position, message):
+        async def append(self, run_id, message):
             self.actions.append(f"append:{message.role.value}")
-            await super().append_at(run_id, position, message)
+            await super().append(run_id, message)
 
         async def complete(self, result, final_message):
             self.actions.append("complete")
