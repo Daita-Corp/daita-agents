@@ -977,6 +977,20 @@ class CapabilityRuntime:
                     capability
                 ):
                     continue
+                if run.origin is RunOrigin.JOB_TASK:
+                    from .jobs.graph.execution import task_role_allows_capability
+
+                    context = None if session is None else session.options.task_context
+                    binding = getattr(context, "binding", None)
+                    if not isinstance(binding, GraphTaskBinding):
+                        raise CapabilityInputError(
+                            "task_context_invalid",
+                            "The code-owned graph task binding is unavailable.",
+                        )
+                    if not task_role_allows_capability(
+                        binding.task_role, capability.id
+                    ):
+                        continue
                 if (
                     run.origin is RunOrigin.SCHEDULED_ROUTINE
                     and capability.automation_eligibility
@@ -2091,7 +2105,15 @@ class CapabilityRuntime:
                 request_sensitivity=sensitivity,
                 session=session,
             )
-            _validate_graph_task_arguments(session, capability.id, arguments)
+            if run.origin is RunOrigin.JOB_TASK:
+                from .jobs.graph.execution import validate_graph_task_arguments
+
+                validate_graph_task_arguments(
+                    origin=run.origin,
+                    context=(None if session is None else session.options.task_context),
+                    capability_id=capability.id,
+                    arguments=arguments,
+                )
             await _guard_attempt(guard, capability.id, "after_binding")
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id
@@ -4299,46 +4321,6 @@ async def _guard_attempt(
 ) -> None:
     if guard is not None:
         await guard.revalidate(capability_id=capability_id, point=point)
-
-
-def _validate_graph_task_arguments(
-    session: RunSession | None,
-    capability_id: str,
-    arguments: FrozenJsonObject,
-) -> None:
-    """Keep the Phase 4 planner-free work call equal to its frozen proposal."""
-
-    if session is None or session.run.origin is not RunOrigin.JOB_TASK:
-        return
-    context = session.options.task_context
-    specification = getattr(context, "task_specification", None)
-    if not isinstance(specification, Mapping):
-        raise CapabilityInputError(
-            "task_context_invalid", "The code-owned task specification is unavailable."
-        )
-    expected = specification.get("expected_result_contract")
-    if not isinstance(expected, Mapping):
-        raise CapabilityInputError(
-            "task_context_invalid",
-            "The code-owned task result contract is unavailable.",
-        )
-    initial_call = expected.get("initial_call")
-    if initial_call is None:
-        return
-    if not isinstance(initial_call, Mapping):
-        raise CapabilityInputError(
-            "task_context_invalid", "The frozen initial call is malformed."
-        )
-    if capability_id.startswith("jobs.graph.task_"):
-        return
-    if (
-        initial_call.get("capability_id") != capability_id
-        or initial_call.get("arguments") != arguments
-    ):
-        raise CapabilityInputError(
-            "task_call_differs_from_proposal",
-            "The graph work call differs from its exact admitted proposal.",
-        )
 
 
 def _with_execution_lineage(

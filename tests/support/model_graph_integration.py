@@ -180,6 +180,7 @@ class ModelGraphIntegration:
         script: tuple[ModelResponse | Exception, ...] | None = None,
         namespace: str = "model-graph",
         clock: Callable[[], datetime] | None = None,
+        loop_max_total_tokens: int = 10_000,
     ) -> ModelGraphIntegration:
         resolved_clock = clock or (lambda: datetime.now(UTC))
         ids = DeterministicIds(namespace)
@@ -278,8 +279,8 @@ class ModelGraphIntegration:
             transcripts=store,
             limits=LoopLimits(
                 max_steps=6,
-                max_total_tokens=10_000,
-                max_estimated_cost_usd=Decimal("1"),
+                max_total_tokens=loop_max_total_tokens,
+                max_estimated_cost_usd=Decimal(1),
             ),
             clock=resolved_clock,
         )
@@ -329,7 +330,8 @@ class ModelGraphIntegration:
         *,
         resource_count: int = 5,
         model_route_id: str = MODEL_ROUTE_ID,
-        per_run_max_cost_usd: Decimal = Decimal("1"),
+        per_run_max_tokens: int = 10_000,
+        per_run_max_cost_usd: Decimal = Decimal(1),
     ) -> InitialTaskProposal:
         resource_ids = tuple(f"resource-{index}" for index in range(resource_count))
         capability_ids = _MODEL_CAPABILITY_IDS
@@ -357,7 +359,7 @@ class ModelGraphIntegration:
             execution_policy=policy,
             max_steps=6,
             max_wall_time_seconds=300,
-            per_run_max_tokens=10_000,
+            per_run_max_tokens=per_run_max_tokens,
             per_run_max_cost_usd=per_run_max_cost_usd,
         )
 
@@ -366,7 +368,8 @@ class ModelGraphIntegration:
         *,
         resource_count: int = 5,
         model_route_id: str = MODEL_ROUTE_ID,
-        per_run_max_cost_usd: Decimal = Decimal("1"),
+        per_run_max_tokens: int = 10_000,
+        per_run_max_cost_usd: Decimal = Decimal(1),
     ) -> GraphAdmission:
         return self.builder.build(
             run_id="run-" + "a" * 32,
@@ -378,6 +381,7 @@ class ModelGraphIntegration:
             proposal=self.proposal(
                 resource_count=resource_count,
                 model_route_id=model_route_id,
+                per_run_max_tokens=per_run_max_tokens,
                 per_run_max_cost_usd=per_run_max_cost_usd,
             ),
         )
@@ -415,7 +419,7 @@ class ModelGraphIntegration:
 
 
 def _successful_script() -> tuple[ModelResponse, ...]:
-    usage = ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0")))
+    usage = ModelUsage(cost_estimate=CostEstimate.complete(Decimal(0)))
     return (
         ModelResponse(
             finish_reason=FinishReason.TOOL_CALLS,

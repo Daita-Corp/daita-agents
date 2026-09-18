@@ -15,6 +15,7 @@ MAX_PARENT_RESULTS = 16
 MAX_PRIOR_ATTEMPTS = 2
 MAX_CONTEXT_CHECKPOINTS = 8
 MAX_CONTEXT_COMMENTS = 16
+MAX_CONTEXT_CONTROLS = 16
 
 
 def _frozen_records(
@@ -43,6 +44,7 @@ class TaskContextBundle:
     prior_attempts: tuple[Mapping[str, object], ...] = ()
     checkpoints: tuple[Mapping[str, object], ...] = ()
     comments: tuple[Mapping[str, object], ...] = ()
+    controls: tuple[Mapping[str, object], ...] = ()
     created_at: datetime | None = None
 
     def __post_init__(self) -> None:
@@ -74,6 +76,7 @@ class TaskContextBundle:
             ("prior_attempts", MAX_PRIOR_ATTEMPTS),
             ("checkpoints", MAX_CONTEXT_CHECKPOINTS),
             ("comments", MAX_CONTEXT_COMMENTS),
+            ("controls", MAX_CONTEXT_CONTROLS),
         ):
             object.__setattr__(
                 self,
@@ -100,6 +103,7 @@ class TaskContextBundle:
             "untrusted_prior_attempts": self.prior_attempts,
             "untrusted_checkpoints": self.checkpoints,
             "untrusted_comments": self.comments,
+            "untrusted_controls": self.controls,
             "created_at": (
                 None if self.created_at is None else self.created_at.isoformat()
             ),

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol
 
@@ -21,6 +21,7 @@ from ...capabilities import (
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
+    ExecutionContractBindings,
     Executor,
     MachineRunDirectiveKind,
     TaskAttemptGuard,
@@ -38,15 +39,24 @@ from ...llm.models import ModelSensitivity, ToolCall
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ..owner import JobError, JobOwner
 from .models import (
+    BudgetAmount,
     ControlKind,
     ControlState,
+    EdgeKind,
+    GraphAuthority,
     GraphInspection,
+    GraphMutationRequest,
     GraphTask,
+    GraphTaskSpecification,
     TaskAttempt,
     TaskCheckpoint,
     TaskComment,
     TaskControl,
+    TaskDependency,
+    TaskExecutionKind,
     TaskResult,
+    TaskRole,
+    TaskState,
     canonical_digest,
 )
 
@@ -57,12 +67,32 @@ TASK_COMPLETE_CAPABILITY_ID = "jobs.graph.task_complete"
 TASK_BLOCK_CAPABILITY_ID = "jobs.graph.task_block"
 TASK_REQUEST_REVIEW_CAPABILITY_ID = "jobs.graph.task_request_review"
 GRAPH_RESULT_FINALIZE_CAPABILITY_ID = "jobs.graph.result_finalize"
+PLANNER_LIST_TASKS_CAPABILITY_ID = "jobs.graph.planner_list_tasks"
+PLANNER_INSPECT_TASK_CAPABILITY_ID = "jobs.graph.planner_inspect_task"
+PLANNER_CREATE_CHILDREN_CAPABILITY_ID = "jobs.graph.planner_create_children"
+PLANNER_ADD_DEPENDENCIES_CAPABILITY_ID = "jobs.graph.planner_add_dependencies"
+PLANNER_SUPERSEDE_CAPABILITY_ID = "jobs.graph.planner_supersede_unstarted"
+PLANNER_REQUEST_INPUT_CAPABILITY_ID = "jobs.graph.planner_request_input"
+PLANNER_CAPABILITY_IDS = (
+    PLANNER_ADD_DEPENDENCIES_CAPABILITY_ID,
+    PLANNER_CREATE_CHILDREN_CAPABILITY_ID,
+    PLANNER_INSPECT_TASK_CAPABILITY_ID,
+    PLANNER_LIST_TASKS_CAPABILITY_ID,
+    PLANNER_REQUEST_INPUT_CAPABILITY_ID,
+    PLANNER_SUPERSEDE_CAPABILITY_ID,
+)
 
 TASK_CHECKPOINT_TOOL_NAME = "task_checkpoint"
 TASK_COMMENT_TOOL_NAME = "task_comment"
 TASK_COMPLETE_TOOL_NAME = "task_complete"
 TASK_BLOCK_TOOL_NAME = "task_block"
 TASK_REQUEST_REVIEW_TOOL_NAME = "task_request_review"
+PLANNER_LIST_TASKS_TOOL_NAME = "graph_list_tasks"
+PLANNER_INSPECT_TASK_TOOL_NAME = "graph_inspect_task"
+PLANNER_CREATE_CHILDREN_TOOL_NAME = "graph_create_children"
+PLANNER_ADD_DEPENDENCIES_TOOL_NAME = "graph_add_dependencies"
+PLANNER_SUPERSEDE_TOOL_NAME = "graph_supersede_unstarted"
+PLANNER_REQUEST_INPUT_TOOL_NAME = "graph_request_input"
 
 
 class TaskTranscriptReader(Protocol):
@@ -167,7 +197,7 @@ class TaskCommentExecutor(_LifecycleExecutor):
     executor_id = "jobs.graph.task_comment.executor"
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        await self._current(request)
+        _inspection, _task, _attempt = await self._current(request)
         guard = request.task_attempt_guard
         assert guard is not None
         body = request.arguments["body"]
@@ -206,7 +236,7 @@ class TaskCompleteExecutor(_LifecycleExecutor):
     executor_id = "jobs.graph.task_complete.executor"
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        _inspection, task, attempt = await self._current(request)
+        _inspection, task, _attempt = await self._current(request)
         guard = request.task_attempt_guard
         assert guard is not None
         transcript = await self._transcripts.load(request.run_id)
@@ -330,18 +360,42 @@ class _TaskControlExecutor(_LifecycleExecutor):
     output_kind: str
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        await self._current(request)
-        guard = request.task_attempt_guard
-        assert guard is not None
-        message = request.arguments["message"]
-        details = request.arguments.get("details", {})
-        assert isinstance(message, str) and isinstance(details, Mapping)
         kind = self.control_kind
         if self.control_kind is not ControlKind.REVIEW_REQUESTED:
             raw_kind = request.arguments["kind"]
             assert isinstance(raw_kind, str)
             kind = ControlKind(raw_kind)
-        payload = {"message": message, "details": details}
+        return await self._execute_kind(request, kind)
+
+    async def _execute_kind(
+        self, request: ToolExecution, kind: ControlKind
+    ) -> ToolOutput:
+        inspection, _task, _attempt = await self._current(request)
+        guard = request.task_attempt_guard
+        assert guard is not None
+        message = request.arguments["message"]
+        details = request.arguments.get("details", {})
+        assert isinstance(message, str) and isinstance(details, Mapping)
+        payload: dict[str, object] = {"message": message, "details": details}
+        if kind is ControlKind.NEEDS_INPUT:
+            payload.update(
+                {
+                    "question": message,
+                    "response_schema": details.get(
+                        "response_schema",
+                        {"type": "object", "additionalProperties": True},
+                    ),
+                    "choices": details.get("choices", ()),
+                    "why_blocked": details.get("why_blocked", message),
+                    "affected_downstream_task_ids": details.get(
+                        "affected_downstream_task_ids", ()
+                    ),
+                    "sensitivity": request.request_sensitivity.value,
+                    "evidence_references": details.get("evidence_references", ()),
+                    "expires_at": inspection.job.deadline_at.isoformat(),
+                    "default_behavior": "remain_blocked",
+                }
+            )
         control = TaskControl(
             agent_id=guard.binding.agent_id,
             job_id=guard.binding.job_id,
@@ -384,6 +438,15 @@ class TaskRequestReviewExecutor(_TaskControlExecutor):
     output_kind = "graph.task_review_request"
 
 
+class PlannerRequestInputExecutor(_TaskControlExecutor):
+    executor_id = "jobs.graph.planner_request_input.executor"
+    control_kind = ControlKind.NEEDS_INPUT
+    output_kind = "graph.planner_input_request"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        return await self._execute_kind(request, ControlKind.NEEDS_INPUT)
+
+
 class GraphResultFinalizeExecutor:
     executor_id = "jobs.graph.result_finalize.executor"
 
@@ -418,6 +481,528 @@ class GraphResultFinalizeExecutor:
                 "job_id": job_id,
             },
         )
+
+
+class _PlannerExecutor(_LifecycleExecutor):
+    async def _planner_current(
+        self, request: ToolExecution
+    ) -> tuple[GraphInspection, GraphTask, TaskAttempt]:
+        inspection, task, attempt = await self._current(request)
+        if task.role is not TaskRole.PLANNER:
+            raise CapabilityInputError(
+                "planner_role_required", "This graph operation requires a planner task."
+            )
+        return inspection, task, attempt
+
+
+class PlannerListTasksExecutor(_PlannerExecutor):
+    executor_id = "jobs.graph.planner_list_tasks.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        inspection, _task, _attempt = await self._planner_current(request)
+        tasks = tuple(
+            {
+                "task_id": item.task_id,
+                "role": item.role.value,
+                "state": item.state.value,
+                "title": item.specification.title,
+                "task_revision": item.task_revision,
+                "attempt_count": item.attempt_count,
+                "failure_streak": item.failure_streak,
+                "superseded_by_task_id": item.superseded_by_task_id,
+                "latest_control_id": item.latest_control_id,
+                "latest_result_id": item.latest_result_id,
+            }
+            for item in inspection.tasks[:64]
+        )
+        return _planner_output(
+            "graph.task_list",
+            {"graph_revision": inspection.graph.revision, "tasks": tasks},
+            request,
+        )
+
+
+class PlannerInspectTaskExecutor(_PlannerExecutor):
+    executor_id = "jobs.graph.planner_inspect_task.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        inspection, _task, _attempt = await self._planner_current(request)
+        task_id = request.arguments["task_id"]
+        assert isinstance(task_id, str)
+        task = next(
+            (item for item in inspection.tasks if item.task_id == task_id), None
+        )
+        if task is None:
+            raise CapabilityInputError(
+                "unknown_graph_task", "The requested task is not in this graph."
+            )
+        results = tuple(
+            {
+                "result_id": item.result_id,
+                "result_kind": item.result_kind,
+                "summary": item.summary,
+                "result_digest": item.result_digest,
+                "artifact_ids": item.artifact_ids,
+            }
+            for item in inspection.results
+            if item.task_id == task_id
+        )
+        controls = tuple(
+            {
+                "control_id": item.control_id,
+                "kind": item.kind.value,
+                "state": item.state.value,
+                "payload": item.payload,
+                "payload_digest": item.payload_digest,
+            }
+            for item in inspection.controls
+            if item.task_id == task_id
+        )[-16:]
+        return _planner_output(
+            "graph.task_inspection",
+            {
+                "graph_revision": inspection.graph.revision,
+                "task": {
+                    "task_id": task.task_id,
+                    "role": task.role.value,
+                    "state": task.state.value,
+                    "specification": task.specification.digest_material(),
+                    "attempt_count": task.attempt_count,
+                    "failure_streak": task.failure_streak,
+                    "latest_checkpoint_id": task.latest_checkpoint_id,
+                },
+                "results": results,
+                "controls": controls,
+            },
+            request,
+        )
+
+
+class _PlannerMutationExecutor(_PlannerExecutor):
+    async def _commit(
+        self,
+        request: ToolExecution,
+        inspection: GraphInspection,
+        task: GraphTask,
+        attempt: TaskAttempt,
+        *,
+        tasks: tuple[GraphTask, ...] = (),
+        dependencies: tuple[TaskDependency, ...] = (),
+        supersessions: tuple[tuple[str, str], ...] = (),
+    ) -> ToolOutput:
+        guard = request.task_attempt_guard
+        assert guard is not None
+        idempotency_key = request.arguments["idempotency_key"]
+        expected_revision = request.arguments["expected_revision"]
+        assert isinstance(idempotency_key, str) and isinstance(expected_revision, int)
+        mutation = GraphMutationRequest(
+            agent_id=task.agent_id,
+            job_id=task.job_id,
+            mutation_id=_stable_graph_id(
+                "mutation",
+                job_id=task.job_id,
+                actor_key=task.task_id,
+                idempotency_key=idempotency_key,
+                discriminator="mutation",
+            ),
+            actor_kind="planner_attempt",
+            actor_key=task.task_id,
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+            created_at=self._clock(),
+            tasks=tasks,
+            dependencies=dependencies,
+            supersessions=supersessions,
+            creator_task_id=task.task_id,
+            creator_attempt_id=attempt.attempt_id,
+            claim_token=guard.claim_token,
+            fencing_epoch=attempt.fencing_epoch,
+        )
+        await guard.revalidate(
+            capability_id=request.capability_id,
+            point="before_graph_mutation_commit",
+        )
+        committed = await self._owner.mutate_graph(mutation)
+        return _planner_output(
+            "graph.mutation",
+            {
+                "record_id": committed.mutation_id,
+                "decision": committed.decision.value,
+                "failure_code": committed.failure_code,
+                "expected_revision": committed.expected_revision,
+                "committed_revision": committed.committed_revision,
+                "task_ids": committed.resulting_task_ids,
+                "edges": committed.resulting_edges,
+            },
+            request,
+        )
+
+
+class PlannerCreateChildrenExecutor(_PlannerMutationExecutor):
+    executor_id = "jobs.graph.planner_create_children.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        inspection, planner, attempt = await self._planner_current(request)
+        raw_children = request.arguments["children"]
+        idempotency_key = request.arguments["idempotency_key"]
+        assert isinstance(raw_children, tuple)
+        assert isinstance(idempotency_key, str)
+        created_at = self._clock()
+        tasks: list[GraphTask] = []
+        edges: list[TaskDependency] = []
+        client_ids: dict[str, str] = {}
+        for raw in raw_children:
+            if not isinstance(raw, Mapping):
+                raise CapabilityInputError(
+                    "planner_child_invalid", "A planner child proposal is malformed."
+                )
+            client_key = raw["client_key"]
+            assert isinstance(client_key, str)
+            if client_key in client_ids:
+                raise CapabilityInputError(
+                    "planner_child_invalid", "Planner child keys must be unique."
+                )
+            child_id = _stable_graph_id(
+                "task",
+                job_id=planner.job_id,
+                actor_key=planner.task_id,
+                idempotency_key=idempotency_key,
+                discriminator=f"child:{client_key}",
+            )
+            client_ids[client_key] = child_id
+            child = _planner_child_task(
+                inspection,
+                planner,
+                raw,
+                task_id=child_id,
+                created_at=created_at,
+            )
+            tasks.append(child)
+            parent_ids = raw.get("parent_task_ids", ())
+            assert isinstance(parent_ids, tuple)
+            edges.extend(
+                TaskDependency(
+                    agent_id=planner.agent_id,
+                    job_id=planner.job_id,
+                    upstream_task_id=str(parent_id),
+                    downstream_task_id=child_id,
+                    edge_kind=EdgeKind.REQUIRES_ACCEPTED_SUCCESS,
+                    created_at=created_at,
+                    creator_key=planner.task_id,
+                )
+                for parent_id in parent_ids
+            )
+        output = await self._commit(
+            request,
+            inspection,
+            planner,
+            attempt,
+            tasks=tuple(tasks),
+            dependencies=tuple(edges),
+        )
+        return ToolOutput(
+            kind=output.kind,
+            data={**dict(output.data), "client_task_ids": client_ids},
+            sensitivity=output.sensitivity,
+            sensitivity_provenance=output.sensitivity_provenance,
+        )
+
+
+class PlannerAddDependenciesExecutor(_PlannerMutationExecutor):
+    executor_id = "jobs.graph.planner_add_dependencies.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        inspection, planner, attempt = await self._planner_current(request)
+        raw_edges = request.arguments["dependencies"]
+        assert isinstance(raw_edges, tuple)
+        created_at = self._clock()
+        edges = tuple(
+            TaskDependency(
+                agent_id=planner.agent_id,
+                job_id=planner.job_id,
+                upstream_task_id=str(raw["upstream_task_id"]),
+                downstream_task_id=str(raw["downstream_task_id"]),
+                edge_kind=EdgeKind.REQUIRES_ACCEPTED_SUCCESS,
+                created_at=created_at,
+                creator_key=planner.task_id,
+            )
+            for raw in raw_edges
+            if isinstance(raw, Mapping)
+        )
+        if len(edges) != len(raw_edges):
+            raise CapabilityInputError(
+                "planner_dependency_invalid", "A dependency proposal is malformed."
+            )
+        return await self._commit(
+            request, inspection, planner, attempt, dependencies=edges
+        )
+
+
+class PlannerSupersedeExecutor(_PlannerMutationExecutor):
+    executor_id = "jobs.graph.planner_supersede_unstarted.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        inspection, planner, attempt = await self._planner_current(request)
+        replaced_id = request.arguments["task_id"]
+        raw = request.arguments["replacement"]
+        idempotency_key = request.arguments["idempotency_key"]
+        assert isinstance(replaced_id, str) and isinstance(raw, Mapping)
+        assert isinstance(idempotency_key, str)
+        created_at = self._clock()
+        replacement_id = _stable_graph_id(
+            "task",
+            job_id=planner.job_id,
+            actor_key=planner.task_id,
+            idempotency_key=idempotency_key,
+            discriminator=f"supersede:{replaced_id}",
+        )
+        original_parent_ids = {
+            edge.upstream_task_id
+            for edge in inspection.dependencies
+            if edge.downstream_task_id == replaced_id
+        }
+        proposed_parent_ids = raw.get("parent_task_ids", ())
+        assert isinstance(proposed_parent_ids, tuple)
+        parent_ids = tuple(sorted(original_parent_ids | set(proposed_parent_ids)))
+        replacement_input = {**dict(raw), "parent_task_ids": parent_ids}
+        replacement = _planner_child_task(
+            inspection,
+            planner,
+            replacement_input,
+            task_id=replacement_id,
+            created_at=created_at,
+        )
+        replacement = replace(replacement, supersedes_task_id=replaced_id)
+        edges = tuple(
+            TaskDependency(
+                agent_id=planner.agent_id,
+                job_id=planner.job_id,
+                upstream_task_id=str(parent_id),
+                downstream_task_id=replacement_id,
+                edge_kind=EdgeKind.REQUIRES_ACCEPTED_SUCCESS,
+                created_at=created_at,
+                creator_key=planner.task_id,
+            )
+            for parent_id in parent_ids
+        )
+        return await self._commit(
+            request,
+            inspection,
+            planner,
+            attempt,
+            tasks=(replacement,),
+            dependencies=edges,
+            supersessions=((replaced_id, replacement_id),),
+        )
+
+
+def _planner_output(
+    kind: str,
+    data: Mapping[str, object],
+    request: ToolExecution,
+) -> ToolOutput:
+    guard = request.task_attempt_guard
+    assert guard is not None
+    return ToolOutput(
+        kind=kind,
+        data=data,
+        sensitivity=request.request_sensitivity,
+        sensitivity_provenance={
+            "authority": "fenced_graph_planner",
+            "task_binding_digest": guard.binding.digest,
+        },
+    )
+
+
+def _stable_graph_id(
+    prefix: str,
+    *,
+    job_id: str,
+    actor_key: str,
+    idempotency_key: str,
+    discriminator: str,
+) -> str:
+    digest = canonical_digest(
+        {
+            "job_id": job_id,
+            "actor_key": actor_key,
+            "idempotency_key": idempotency_key,
+            "discriminator": discriminator,
+        }
+    )
+    return f"{prefix}-{digest.removeprefix('sha256:')[:32]}"
+
+
+def _planner_child_task(
+    inspection: GraphInspection,
+    planner: GraphTask,
+    raw: Mapping[str, object],
+    *,
+    task_id: str,
+    created_at: datetime,
+) -> GraphTask:
+    title = raw.get("title")
+    description = raw.get("description")
+    result_kind = raw.get("result_kind")
+    reduction = raw.get("reduction", False)
+    capability_id = raw.get("capability_id")
+    arguments = raw.get("arguments", {})
+    input_result_ids = raw.get("input_result_ids", ())
+    parent_ids = raw.get("parent_task_ids", ())
+    if (
+        not isinstance(title, str)
+        or not isinstance(description, str)
+        or not isinstance(result_kind, str)
+        or not isinstance(reduction, bool)
+        or not isinstance(arguments, Mapping)
+        or not isinstance(input_result_ids, tuple)
+        or any(not isinstance(item, str) for item in input_result_ids)
+        or not isinstance(parent_ids, tuple)
+        or any(not isinstance(item, str) for item in parent_ids)
+    ):
+        raise CapabilityInputError(
+            "planner_child_invalid", "A planner child proposal is malformed."
+        )
+    if len(parent_ids) > inspection.job.specification.limits.max_direct_parents:
+        raise CapabilityInputError(
+            "parent_limit", "The proposed task exceeds the direct-parent bound."
+        )
+    lifecycle_ids = tuple(
+        capability_id
+        for capability_id in (
+            TASK_CHECKPOINT_CAPABILITY_ID,
+            TASK_COMMENT_CAPABILITY_ID,
+            TASK_COMPLETE_CAPABILITY_ID,
+            TASK_BLOCK_CAPABILITY_ID,
+            TASK_REQUEST_REVIEW_CAPABILITY_ID,
+        )
+        if capability_id in planner.specification.authority.capability_ids
+    )
+    if reduction:
+        if capability_id is not None or len(parent_ids) < 2:
+            raise CapabilityInputError(
+                "planner_reduction_invalid",
+                "A reduction task needs at least two parents and no executor call.",
+            )
+        child_capability_ids = lifecycle_ids
+    else:
+        if (
+            not isinstance(capability_id, str)
+            or capability_id.startswith("jobs.graph.")
+            or capability_id not in planner.specification.authority.capability_ids
+        ):
+            raise CapabilityInputError(
+                "planner_capability_invalid",
+                "The child capability is outside the planner's immutable ceiling.",
+            )
+        child_capability_ids = tuple(sorted((*lifecycle_ids, capability_id)))
+    planner_authority = planner.specification.authority
+    material = planner_authority.contract_bindings
+    raw_capabilities = material.get("capability_contracts", {})
+    raw_resources = material.get("resource_revisions", {})
+    raw_routes = material.get("model_routes", {})
+    raw_origins = material.get("tool_origins", {})
+    if not isinstance(raw_capabilities, Mapping):
+        raise CapabilityInputError(
+            "planner_contract_invalid", "The planner contract ceiling is malformed."
+        )
+    if not isinstance(raw_resources, Mapping):
+        raise CapabilityInputError(
+            "planner_contract_invalid", "The planner contract ceiling is malformed."
+        )
+    if not isinstance(raw_routes, Mapping):
+        raise CapabilityInputError(
+            "planner_contract_invalid", "The planner contract ceiling is malformed."
+        )
+    if not isinstance(raw_origins, Mapping):
+        raise CapabilityInputError(
+            "planner_contract_invalid", "The planner contract ceiling is malformed."
+        )
+    if not planner_authority.model_route_ids:
+        raise CapabilityInputError(
+            "planner_contract_invalid", "The planner has no admitted model route."
+        )
+    route_id = planner_authority.model_route_ids[0]
+    missing_capabilities = tuple(
+        item for item in child_capability_ids if item not in raw_capabilities
+    )
+    if missing_capabilities or route_id not in raw_routes:
+        raise CapabilityInputError(
+            "planner_contract_invalid",
+            "The proposed child is not covered by the planner contract ceiling.",
+        )
+    bindings = ExecutionContractBindings(
+        capability_contracts={
+            item: str(raw_capabilities[item]) for item in child_capability_ids
+        },
+        resource_revisions=dict(raw_resources),
+        model_routes={route_id: str(raw_routes[route_id])},
+        tool_origins={
+            item: str(value)
+            for item, value in raw_origins.items()
+            if item in child_capability_ids
+        },
+    )
+    authority = GraphAuthority(
+        source_ids=planner_authority.source_ids,
+        resource_ids=planner_authority.resource_ids,
+        connector_ids=planner_authority.connector_ids,
+        capability_ids=child_capability_ids,
+        access_modes=planner_authority.access_modes,
+        operational_effects=("none",),
+        model_route_ids=(route_id,),
+        sensitivity=planner_authority.sensitivity,
+        contract_bindings=bindings.material(),
+    )
+    expected: dict[str, object] = {
+        "kind": "model_task",
+        "result_kind": result_kind,
+        "model_route_id": route_id,
+        "per_run_max_tokens": planner.specification.expected_result_contract[
+            "per_run_max_tokens"
+        ],
+        "per_run_max_cost_usd": planner.specification.expected_result_contract[
+            "per_run_max_cost_usd"
+        ],
+        "attempt_budgets": {"work_units": 1},
+        "input_result_ids": input_result_ids,
+        "reduction": reduction,
+    }
+    if not reduction:
+        expected["initial_call"] = {
+            "capability_id": capability_id,
+            "arguments": arguments,
+        }
+    spec = GraphTaskSpecification(
+        title=title,
+        description=description,
+        expected_result_contract=expected,
+        authority=authority,
+        budgets=(BudgetAmount("work_units", 3),),
+        max_steps=planner.specification.max_steps,
+        max_wall_time_seconds=planner.specification.max_wall_time_seconds,
+        created_by=planner.task_id,
+    )
+    return GraphTask(
+        agent_id=planner.agent_id,
+        job_id=planner.job_id,
+        task_id=task_id,
+        state=TaskState.PENDING if parent_ids else TaskState.READY,
+        role=TaskRole.WORKER,
+        execution_kind=TaskExecutionKind.MODEL,
+        priority=100,
+        not_before=None,
+        current_attempt_id=None,
+        task_revision=1,
+        specification=spec,
+        task_spec_digest=spec.digest,
+        task_scope_digest=authority.digest,
+        attempt_count=0,
+        failure_streak=0,
+        fencing_epoch=0,
+        created_at=created_at,
+        updated_at=created_at,
+    )
 
 
 class GraphTaskCapabilityDomain:
@@ -683,7 +1268,189 @@ def graph_task_capability_declarations(
             max_total_bytes_per_call=1024 * 1024,
         ),
     )
-    capabilities = (checkpoint, comment, complete, block, review, finalizer)
+    planner_read_output = {"type": "object", "additionalProperties": True}
+    planner_list = Capability(
+        id=PLANNER_LIST_TASKS_CAPABILITY_ID,
+        description="List the bounded tasks in this planner's own graph.",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_kind="graph.task_list",
+        output_schema=planner_read_output,
+        executor_id=PlannerListTasksExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+    )
+    planner_inspect = Capability(
+        id=PLANNER_INSPECT_TASK_CAPABILITY_ID,
+        description="Inspect one exact task in this planner's own graph.",
+        input_schema={
+            "type": "object",
+            "properties": {"task_id": {"type": "string", "minLength": 1}},
+            "required": ["task_id"],
+            "additionalProperties": False,
+        },
+        output_kind="graph.task_inspection",
+        output_schema=planner_read_output,
+        executor_id=PlannerInspectTaskExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+    )
+    child_schema = {
+        "type": "object",
+        "properties": {
+            "client_key": {"type": "string", "minLength": 1, "maxLength": 128},
+            "title": {"type": "string", "minLength": 1, "maxLength": 512},
+            "description": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 16384,
+            },
+            "result_kind": {"type": "string", "minLength": 1, "maxLength": 256},
+            "capability_id": {"type": ["string", "null"], "minLength": 1},
+            "arguments": {"type": "object"},
+            "parent_task_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "maxItems": 16,
+                "uniqueItems": True,
+            },
+            "input_result_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "maxItems": 16,
+                "uniqueItems": True,
+            },
+            "reduction": {"type": "boolean"},
+        },
+        "required": [
+            "client_key",
+            "title",
+            "description",
+            "result_kind",
+            "arguments",
+            "parent_task_ids",
+            "input_result_ids",
+            "reduction",
+        ],
+        "additionalProperties": False,
+    }
+    mutation_common = {
+        "expected_revision": {"type": "integer", "minimum": 0},
+        "idempotency_key": {"type": "string", "minLength": 1, "maxLength": 256},
+    }
+    planner_create = Capability(
+        id=PLANNER_CREATE_CHILDREN_CAPABILITY_ID,
+        description="Atomically create a bounded batch of child tasks and dependencies.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                **mutation_common,
+                "children": {
+                    "type": "array",
+                    "items": child_schema,
+                    "minItems": 1,
+                    "maxItems": 16,
+                },
+            },
+            "required": ["expected_revision", "idempotency_key", "children"],
+            "additionalProperties": False,
+        },
+        output_kind="graph.mutation",
+        output_schema=planner_read_output,
+        executor_id=PlannerCreateChildrenExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+    )
+    planner_dependencies = Capability(
+        id=PLANNER_ADD_DEPENDENCIES_CAPABILITY_ID,
+        description="Atomically add bounded same-graph dependencies to pending work.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                **mutation_common,
+                "dependencies": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "upstream_task_id": {"type": "string", "minLength": 1},
+                            "downstream_task_id": {
+                                "type": "string",
+                                "minLength": 1,
+                            },
+                        },
+                        "required": ["upstream_task_id", "downstream_task_id"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["expected_revision", "idempotency_key", "dependencies"],
+            "additionalProperties": False,
+        },
+        output_kind="graph.mutation",
+        output_schema=planner_read_output,
+        executor_id=PlannerAddDependenciesExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+    )
+    planner_supersede = Capability(
+        id=PLANNER_SUPERSEDE_CAPABILITY_ID,
+        description="Replace one non-running task without rewriting its specification.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                **mutation_common,
+                "task_id": {"type": "string", "minLength": 1},
+                "replacement": child_schema,
+            },
+            "required": [
+                "expected_revision",
+                "idempotency_key",
+                "task_id",
+                "replacement",
+            ],
+            "additionalProperties": False,
+        },
+        output_kind="graph.mutation",
+        output_schema=planner_read_output,
+        executor_id=PlannerSupersedeExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+    )
+    planner_input = Capability(
+        id=PLANNER_REQUEST_INPUT_CAPABILITY_ID,
+        description="Request bounded human input for this exact planner attempt.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "minLength": 1, "maxLength": 16384},
+                "details": {"type": "object"},
+            },
+            "required": ["message", "details"],
+            "additionalProperties": False,
+        },
+        output_kind="graph.planner_input_request",
+        output_schema=common_output,
+        executor_id=PlannerRequestInputExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        machine_run_directive_kind=MachineRunDirectiveKind.BLOCK,
+    )
+    capabilities = (
+        checkpoint,
+        comment,
+        complete,
+        block,
+        review,
+        finalizer,
+        planner_list,
+        planner_inspect,
+        planner_create,
+        planner_dependencies,
+        planner_supersede,
+        planner_input,
+    )
     # The owner is deliberately shared by all executors; each command still
     # crosses JobOwner before reaching the graph store.
     owner_value = owner
@@ -702,6 +1469,24 @@ def graph_task_capability_declarations(
             owner_value, transcripts, clock=clock, id_factory=id_factory
         ),
         GraphResultFinalizeExecutor(),
+        PlannerListTasksExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        PlannerInspectTaskExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        PlannerCreateChildrenExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        PlannerAddDependenciesExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        PlannerSupersedeExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        PlannerRequestInputExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
     )
     names = {
         TASK_CHECKPOINT_CAPABILITY_ID: TASK_CHECKPOINT_TOOL_NAME,
@@ -709,6 +1494,12 @@ def graph_task_capability_declarations(
         TASK_COMPLETE_CAPABILITY_ID: TASK_COMPLETE_TOOL_NAME,
         TASK_BLOCK_CAPABILITY_ID: TASK_BLOCK_TOOL_NAME,
         TASK_REQUEST_REVIEW_CAPABILITY_ID: TASK_REQUEST_REVIEW_TOOL_NAME,
+        PLANNER_LIST_TASKS_CAPABILITY_ID: PLANNER_LIST_TASKS_TOOL_NAME,
+        PLANNER_INSPECT_TASK_CAPABILITY_ID: PLANNER_INSPECT_TASK_TOOL_NAME,
+        PLANNER_CREATE_CHILDREN_CAPABILITY_ID: PLANNER_CREATE_CHILDREN_TOOL_NAME,
+        PLANNER_ADD_DEPENDENCIES_CAPABILITY_ID: PLANNER_ADD_DEPENDENCIES_TOOL_NAME,
+        PLANNER_SUPERSEDE_CAPABILITY_ID: PLANNER_SUPERSEDE_TOOL_NAME,
+        PLANNER_REQUEST_INPUT_CAPABILITY_ID: PLANNER_REQUEST_INPUT_TOOL_NAME,
     }
     views = tuple(
         ToolView(
@@ -721,7 +1512,7 @@ def graph_task_capability_declarations(
                 text_trust=ToolTextTrust.CODE,
                 summary=item.description,
                 when_to_use="Use only for the current exact graph task attempt.",
-                keywords=("task", "lifecycle", item.id.rsplit("_", 1)[-1]),
+                keywords=("task", "lifecycle", item.id),
             ),
         )
         for item in capabilities
@@ -839,14 +1630,15 @@ async def _termination_output(
 
 
 __all__ = [
-    "GRAPH_TASK_DOMAIN_OWNER_ID",
     "GRAPH_RESULT_FINALIZE_CAPABILITY_ID",
-    "GraphTaskCapabilityDeclarations",
-    "GraphTaskCapabilityDomain",
+    "GRAPH_TASK_DOMAIN_OWNER_ID",
+    "PLANNER_CAPABILITY_IDS",
     "TASK_BLOCK_CAPABILITY_ID",
     "TASK_CHECKPOINT_CAPABILITY_ID",
     "TASK_COMMENT_CAPABILITY_ID",
     "TASK_COMPLETE_CAPABILITY_ID",
     "TASK_REQUEST_REVIEW_CAPABILITY_ID",
+    "GraphTaskCapabilityDeclarations",
+    "GraphTaskCapabilityDomain",
     "graph_task_capability_declarations",
 ]

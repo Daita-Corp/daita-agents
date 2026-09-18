@@ -980,6 +980,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "routines",
         "effects",
         "inbox",
+        "jobs",
     }
     assert _surface(commands["detach"]) == (
         ("name", "source_id"),

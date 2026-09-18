@@ -7,6 +7,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
 from ..artifacts.models import ArtifactRef, artifact_ref_from_mapping
 from ..distribution.models import GraphJobDelivery
@@ -15,6 +16,7 @@ from ..jobs.graph.models import (
     CONTROL_BUDGET_ROLES,
     MAX_GRAPH_EVENTS,
     MAX_GRAPH_INSPECTION_EVENTS,
+    TERMINAL_TASK_STATES,
     AttemptBudgetReservation,
     AttemptState,
     BudgetAmount,
@@ -22,6 +24,7 @@ from ..jobs.graph.models import (
     ControlKind,
     ControlState,
     GraphAdmission,
+    GraphAuthority,
     GraphDesiredState,
     GraphEventPage,
     GraphInspection,
@@ -40,9 +43,11 @@ from ..jobs.graph.models import (
     TaskResult,
     TaskRole,
     TaskState,
+    canonical_digest,
     reserved_artifact_id,
     topology_digest,
 )
+from ..jobs.graph.reduction import reduce_attempt_failure
 from ..jobs.graph.validation import (
     GraphValidationError,
     require_attempt_transition,
@@ -873,29 +878,21 @@ def list_ready_tasks(
                  AND (t.not_before_us IS NULL OR t.not_before_us <= ?)
                  AND j.state IN ('queued','active') AND j.desired_state = 'run'
                  AND j.deadline_at_us > ?
-                 AND NOT EXISTS (
-                     SELECT 1 FROM job_task_dependencies AS d
-                     JOIN job_tasks AS p
-                       ON p.agent_id = d.agent_id AND p.job_id = d.job_id
-                      AND p.task_id = d.upstream_task_id
-                     LEFT JOIN job_task_results AS r
-                       ON r.agent_id = p.agent_id AND r.job_id = p.job_id
-                      AND r.task_id = p.task_id
-                     WHERE d.agent_id = t.agent_id AND d.job_id = t.job_id
-                       AND d.downstream_task_id = t.task_id
-                       AND (p.state <> 'succeeded' OR r.task_id IS NULL)
-                 )
                ORDER BY t.priority DESC, COALESCE(t.not_before_us, t.updated_at_us),
                         t.task_id
-               LIMIT ?""",
-            (agent_id, now_us, now_us, limit),
+               LIMIT 64""",
+            (agent_id, now_us, now_us),
         )
     )
     tasks = []
     for job_id, task_id in rows:
         loaded = _load_task(connection, agent_id, str(job_id), str(task_id))
-        if loaded is not None:
+        if loaded is not None and _dependencies_satisfied(
+            connection, agent_id, str(job_id), str(task_id)
+        ):
             tasks.append(loaded[0])
+            if len(tasks) == limit:
+                break
     return tuple(tasks)
 
 
@@ -1059,7 +1056,7 @@ def _load_graph_delivery(
         state=_required_text(row[5], "graph delivery state"),
     )
     if not isinstance(decoded, GraphJobDelivery):
-        raise ValueError("migrated delivery cannot be a live graph finalization")
+        raise TypeError("migrated delivery cannot be a live graph finalization")
     return decoded
 
 
@@ -1134,11 +1131,11 @@ def list_graph_artifact_refs(
         result = decode_task_result(_required_text(data, "task result payload"))
         raw_refs = result.provenance.get("artifact_refs", ())
         if not isinstance(raw_refs, tuple):
-            raise ValueError("graph task result artifact references are malformed")
+            raise TypeError("graph task result artifact references are malformed")
         decoded: list[ArtifactRef] = []
         for raw in raw_refs:
             if not isinstance(raw, Mapping):
-                raise ValueError("graph task result artifact reference is malformed")
+                raise TypeError("graph task result artifact reference is malformed")
             decoded.append(artifact_ref_from_mapping(raw))
         if tuple(sorted(item.artifact_id for item in decoded)) != result.artifact_ids:
             raise ValueError("graph task result artifact identities differ")
@@ -1171,9 +1168,9 @@ def list_graph_reserved_artifact_ids(
 
 def _attempt_binding_is_current(
     connection: sqlite3.Connection, request: GraphMutationRequest
-) -> None:
+) -> GraphAuthority | None:
     if request.creator_task_id is None:
-        return
+        return None
     assert request.creator_attempt_id is not None
     assert request.claim_token is not None
     assert request.fencing_epoch is not None
@@ -1199,6 +1196,130 @@ def _attempt_binding_is_current(
         attempt=loaded_attempt[0],
         claim_token=request.claim_token,
         fencing_epoch=request.fencing_epoch,
+    )
+    return task.specification.authority
+
+
+def _resolve_superseded_control(
+    connection: sqlite3.Connection,
+    *,
+    task: GraphTask,
+    resolved_at: datetime,
+    actor_kind: str,
+    actor_key: str,
+    replacement_task_id: str,
+) -> None:
+    if task.latest_control_id is None:
+        return
+    row = connection.execute(
+        """SELECT data FROM job_task_controls
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?""",
+        (task.agent_id, task.job_id, task.task_id, task.latest_control_id),
+    ).fetchone()
+    if row is None:
+        raise GraphStoreConflictError("superseded task control disappeared")
+    current_data = _required_text(row[0], "task control payload")
+    current = decode_task_control(current_data)
+    if current.state is not ControlState.OPEN:
+        return
+    resolved = replace(
+        current,
+        state=ControlState.RESOLVED,
+        resolved_at=resolved_at,
+        resolved_by_kind=actor_kind,
+        resolved_by_id=actor_key,
+        resolution={"replacement_task_id": replacement_task_id},
+    )
+    changed = connection.execute(
+        """UPDATE job_task_controls
+           SET state = ?, resolved_at_us = ?, resolved_by_kind = ?,
+               resolved_by_id = ?, data = ?
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?
+             AND data = ?""",
+        (
+            resolved.state.value,
+            datetime_to_us(resolved_at),
+            actor_kind,
+            actor_key,
+            encode_task_control(resolved),
+            task.agent_id,
+            task.job_id,
+            task.task_id,
+            task.latest_control_id,
+            current_data,
+        ),
+    )
+    if changed.rowcount != 1:
+        raise GraphStoreConflictError("task control changed during supersession")
+
+
+def _release_finalizer_replan_after_mutation(
+    connection: sqlite3.Connection,
+    *,
+    job: GraphJob,
+    request: GraphMutationRequest,
+) -> None:
+    if request.actor_kind != "planner_attempt":
+        return
+    loaded = _load_task(connection, job.agent_id, job.job_id, job.finalizer_task_id)
+    if loaded is None:
+        raise GraphStoreConflictError("reserved finalizer disappeared")
+    finalizer, finalizer_data = loaded
+    if finalizer.state is not TaskState.BLOCKED or finalizer.latest_control_id is None:
+        return
+    row = connection.execute(
+        """SELECT data FROM job_task_controls
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?""",
+        (job.agent_id, job.job_id, finalizer.task_id, finalizer.latest_control_id),
+    ).fetchone()
+    if row is None:
+        raise GraphStoreConflictError("finalizer replan control disappeared")
+    current_data = _required_text(row[0], "finalizer replan control")
+    control = decode_task_control(current_data)
+    if (
+        control.state is not ControlState.OPEN
+        or control.kind is not ControlKind.NEEDS_REPLAN
+    ):
+        return
+    resolved = replace(
+        control,
+        state=ControlState.RESOLVED,
+        resolved_at=request.created_at,
+        resolved_by_kind="planner_attempt",
+        resolved_by_id=request.actor_key,
+        resolution={"mutation_id": request.mutation_id},
+    )
+    changed = connection.execute(
+        """UPDATE job_task_controls
+           SET state = ?, resolved_at_us = ?, resolved_by_kind = ?,
+               resolved_by_id = ?, data = ?
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?
+             AND data = ?""",
+        (
+            resolved.state.value,
+            datetime_to_us(request.created_at),
+            resolved.resolved_by_kind,
+            resolved.resolved_by_id,
+            encode_task_control(resolved),
+            job.agent_id,
+            job.job_id,
+            finalizer.task_id,
+            finalizer.latest_control_id,
+            current_data,
+        ),
+    )
+    if changed.rowcount != 1:
+        raise GraphStoreConflictError("finalizer replan control changed")
+    require_task_transition(finalizer.state, TaskState.READY)
+    _replace_task(
+        connection,
+        finalizer_data,
+        replace(
+            finalizer,
+            state=TaskState.READY,
+            task_revision=finalizer.task_revision + 1,
+            updated_at=request.created_at,
+        ),
     )
 
 
@@ -1257,9 +1378,25 @@ def apply_mutation(
     graph, graph_data = loaded_graph
     if job.terminal or job.desired_state is GraphDesiredState.CANCEL:
         raise GraphValidationError("terminal_graph", "terminal graph cannot mutate")
-    _attempt_binding_is_current(connection, request)
+    creator_authority = _attempt_binding_is_current(connection, request)
     tasks = _load_tasks(connection, request.agent_id, request.job_id)
     edges = _load_dependencies(connection, request.agent_id, request.job_id)
+    results = tuple(
+        decode_task_result(_required_text(row[0], "task result payload"))
+        for row in connection.execute(
+            """SELECT data FROM job_task_results
+               WHERE agent_id = ? AND job_id = ? ORDER BY task_id""",
+            (request.agent_id, request.job_id),
+        )
+    )
+    controls = tuple(
+        decode_task_control(_required_text(row[0], "task control payload"))
+        for row in connection.execute(
+            """SELECT data FROM job_task_controls
+               WHERE agent_id = ? AND job_id = ? ORDER BY task_id, created_at_us""",
+            (request.agent_id, request.job_id),
+        )
+    )
     limits = job.specification.limits
     if graph.mutation_count >= limits.max_mutations:
         raise GraphValidationError("mutation_limit", "graph mutation limit exceeded")
@@ -1269,14 +1406,26 @@ def apply_mutation(
             graph=graph,
             existing_tasks=tasks,
             existing_dependencies=edges,
+            existing_results=results,
+            existing_controls=controls,
             request=request,
+            creator_authority=creator_authority,
             max_tasks=limits.max_tasks,
             max_edges=limits.max_edges,
             max_depth=limits.max_depth,
             max_direct_parents=limits.max_direct_parents,
             max_fan_out=limits.max_fan_out,
         )
-        _validate_budget_envelope(job, all_tasks)
+        replaced_task_ids = {item[0] for item in request.supersessions}
+        _validate_budget_envelope(
+            job,
+            tuple(
+                task
+                for task in all_tasks
+                if task.task_id not in replaced_task_ids
+                and task.state not in {TaskState.SUPERSEDED, TaskState.SKIPPED}
+            ),
+        )
     except GraphValidationError as error:
         rejected = GraphMutation(
             agent_id=request.agent_id,
@@ -1361,6 +1510,9 @@ def apply_mutation(
             raise GraphStoreConflictError("supersession task disappeared")
         replaced_task, replaced_data = replaced_loaded
         replacement_task, replacement_data = replacement_loaded
+        inherited_failure_streak = max(
+            replacement_task.failure_streak, replaced_task.failure_streak
+        )
         _replace_task(
             connection,
             replaced_data,
@@ -1379,6 +1531,7 @@ def apply_mutation(
             replace(
                 replacement_task,
                 supersedes_task_id=replaced_id,
+                failure_streak=inherited_failure_streak,
                 task_revision=replacement_task.task_revision + 1,
                 updated_at=request.created_at,
             ),
@@ -1391,6 +1544,15 @@ def apply_mutation(
             updated_at=request.created_at,
             terminal_at=request.created_at,
         )
+        _resolve_superseded_control(
+            connection,
+            task=replaced_task,
+            resolved_at=request.created_at,
+            actor_kind=request.actor_kind,
+            actor_key=request.actor_key,
+            replacement_task_id=replacement_id,
+        )
+    _release_finalizer_replan_after_mutation(connection, job=job, request=request)
     final_tasks = _load_tasks(connection, request.agent_id, request.job_id)
     final_edges = _load_dependencies(connection, request.agent_id, request.job_id)
     committed_revision = graph.revision + 1
@@ -1450,20 +1612,41 @@ def apply_mutation(
 def _dependencies_satisfied(
     connection: sqlite3.Connection, agent_id: str, job_id: str, task_id: str
 ) -> bool:
-    missing = connection.execute(
-        """SELECT 1 FROM job_task_dependencies AS d
-           JOIN job_tasks AS p
-             ON p.agent_id = d.agent_id AND p.job_id = d.job_id
-            AND p.task_id = d.upstream_task_id
-           LEFT JOIN job_task_results AS r
-             ON r.agent_id = p.agent_id AND r.job_id = p.job_id
-            AND r.task_id = p.task_id
-           WHERE d.agent_id = ? AND d.job_id = ? AND d.downstream_task_id = ?
-             AND (p.state <> 'succeeded' OR r.task_id IS NULL)
-           LIMIT 1""",
-        (agent_id, job_id, task_id),
-    ).fetchone()
-    return missing is None
+    parent_rows = tuple(
+        connection.execute(
+            """SELECT upstream_task_id FROM job_task_dependencies
+               WHERE agent_id = ? AND job_id = ? AND downstream_task_id = ?""",
+            (agent_id, job_id, task_id),
+        )
+    )
+    for (parent_id_raw,) in parent_rows:
+        parent_id = str(parent_id_raw)
+        seen: set[str] = set()
+        while parent_id not in seen:
+            seen.add(parent_id)
+            loaded = _load_task(connection, agent_id, job_id, parent_id)
+            if loaded is None:
+                return False
+            parent = loaded[0]
+            if parent.state is TaskState.SUCCEEDED:
+                result = connection.execute(
+                    """SELECT 1 FROM job_task_results
+                       WHERE agent_id = ? AND job_id = ? AND task_id = ?""",
+                    (agent_id, job_id, parent_id),
+                ).fetchone()
+                if result is None:
+                    return False
+                break
+            if (
+                parent.state is TaskState.SUPERSEDED
+                and parent.superseded_by_task_id is not None
+            ):
+                parent_id = parent.superseded_by_task_id
+                continue
+            return False
+        else:
+            return False
+    return True
 
 
 def _finalizer_barrier_satisfied(
@@ -2379,30 +2562,46 @@ def fence_attempt(
         measured_usage=measured_usage,
     )
     _replace_attempt(connection, attempt_data, fenced)
-    can_retry = (
-        requeue
-        and job.desired_state is GraphDesiredState.RUN
-        and task.attempt_count < job.specification.limits.max_attempts_per_task
-        and job.deadline_at > fenced_at
+    reduction = reduce_attempt_failure(
+        task,
+        failed_at=fenced_at,
+        retryable=requeue and job.desired_state is GraphDesiredState.RUN,
+        attempt_state=AttemptState.FENCED,
+        maximum_attempts=job.specification.limits.max_attempts_per_task,
+        deadline_at=job.deadline_at,
     )
-    next_state = TaskState.READY if can_retry else TaskState.FAILED
+    next_state = reduction.task_state
     require_task_transition(task.state, next_state)
     updated_task = replace(
         task,
         state=next_state,
         current_attempt_id=None,
         fencing_epoch=fencing_epoch + 1,
-        failure_streak=task.failure_streak + 1,
+        failure_streak=reduction.failure_streak,
         task_revision=task.task_revision + 1,
-        not_before=(
-            (fenced_at + timedelta(seconds=1 if task.attempt_count == 1 else 5))
-            if can_retry
-            else task.not_before
-        ),
+        not_before=reduction.not_before,
         updated_at=fenced_at,
-        terminal_at=None if can_retry else fenced_at,
+        terminal_at=None if next_state is not TaskState.FAILED else fenced_at,
     )
     _replace_task(connection, task_data, updated_task)
+    updated_job = job
+    if reduction.circuit_open:
+        _insert_retry_circuit_control(
+            connection,
+            job=job,
+            task=updated_task,
+            attempt=attempt,
+            opened_at=fenced_at,
+            failure_code=reason_code,
+        )
+        if job.state is not GraphState.NEEDS_ATTENTION:
+            require_graph_transition(job.state, GraphState.NEEDS_ATTENTION)
+            updated_job = replace(
+                job,
+                state=GraphState.NEEDS_ATTENTION,
+                updated_at=fenced_at,
+            )
+            _replace_job(connection, loaded_job[1], updated_job)
     tasks = tuple(
         updated_task if item.task_id == task_id else item
         for item in _load_tasks(connection, agent_id, job_id)
@@ -2432,8 +2631,12 @@ def fence_attempt(
         attempt_id=attempt_id,
         kind="task_attempt_fenced",
         created_at=fenced_at,
-        payload={"fencing_epoch": fencing_epoch, "requeued": can_retry},
-        maximum=job.specification.limits.max_events,
+        payload={
+            "fencing_epoch": fencing_epoch,
+            "requeued": reduction.retry,
+            "circuit_open": reduction.circuit_open,
+        },
+        maximum=updated_job.specification.limits.max_events,
     )
     return fenced
 
@@ -2495,34 +2698,46 @@ def fail_attempt(
         measured_usage=measured_usage,
     )
     _replace_attempt(connection, attempt_data, failed_attempt)
-    can_retry = (
-        retryable
-        and (
-            attempt_state is not AttemptState.PROTOCOL_VIOLATION or attempt.ordinal < 2
-        )
-        and job.desired_state is GraphDesiredState.RUN
-        and task.attempt_count < job.specification.limits.max_attempts_per_task
-        and job.deadline_at > failed_at
+    reduction = reduce_attempt_failure(
+        task,
+        failed_at=failed_at,
+        retryable=retryable and job.desired_state is GraphDesiredState.RUN,
+        attempt_state=attempt_state,
+        maximum_attempts=job.specification.limits.max_attempts_per_task,
+        deadline_at=job.deadline_at,
     )
-    next_state = TaskState.READY if can_retry else TaskState.FAILED
+    next_state = reduction.task_state
     require_task_transition(task.state, next_state)
     updated_task = replace(
         task,
         state=next_state,
         current_attempt_id=None,
-        failure_streak=task.failure_streak + 1,
+        failure_streak=reduction.failure_streak,
         task_revision=task.task_revision + 1,
-        not_before=(
-            failed_at + timedelta(seconds=1 if task.attempt_count == 1 else 5)
-            if can_retry
-            else task.not_before
-        ),
+        not_before=reduction.not_before,
         updated_at=failed_at,
-        terminal_at=None if can_retry else failed_at,
+        terminal_at=None if next_state is not TaskState.FAILED else failed_at,
     )
     _replace_task(connection, task_data, updated_task)
     updated_job = job
-    if not can_retry:
+    if reduction.circuit_open:
+        _insert_retry_circuit_control(
+            connection,
+            job=job,
+            task=updated_task,
+            attempt=attempt,
+            opened_at=failed_at,
+            failure_code=reason_code,
+        )
+        if job.state is not GraphState.NEEDS_ATTENTION:
+            require_graph_transition(job.state, GraphState.NEEDS_ATTENTION)
+            updated_job = replace(
+                job,
+                state=GraphState.NEEDS_ATTENTION,
+                updated_at=failed_at,
+            )
+            _replace_job(connection, job_data, updated_job)
+    elif not reduction.retry:
         require_graph_transition(job.state, GraphState.FAILED)
         updated_job = replace(
             job,
@@ -2561,10 +2776,95 @@ def fail_attempt(
         attempt_id=attempt_id,
         kind="task_attempt_failed",
         created_at=failed_at,
-        payload={"reason_code": reason_code, "requeued": can_retry},
+        payload={
+            "reason_code": reason_code,
+            "requeued": reduction.retry,
+            "circuit_open": reduction.circuit_open,
+        },
         maximum=updated_job.specification.limits.max_events,
     )
     return failed_attempt
+
+
+def _insert_retry_circuit_control(
+    connection: sqlite3.Connection,
+    *,
+    job: GraphJob,
+    task: GraphTask,
+    attempt: TaskAttempt,
+    opened_at: datetime,
+    failure_code: str,
+) -> TaskControl:
+    """Persist deterministic attention when three compatible failures open a circuit."""
+
+    control_id = (
+        "control-"
+        + sha256(f"{attempt.attempt_id}:retry-circuit".encode()).hexdigest()[:32]
+    )
+    payload = {
+        "message": "This task stopped after three compatible failures.",
+        "details": {
+            "failure_code": failure_code,
+            "failure_streak": task.failure_streak,
+            "retry_is_task_local": True,
+        },
+    }
+    control = TaskControl(
+        agent_id=task.agent_id,
+        job_id=task.job_id,
+        task_id=task.task_id,
+        control_id=control_id,
+        kind=ControlKind.RETRY_CIRCUIT_OPEN,
+        state=ControlState.OPEN,
+        requesting_attempt_id=attempt.attempt_id,
+        payload=payload,
+        created_at=opened_at,
+        payload_digest=canonical_digest(payload),
+    )
+    connection.execute(
+        """INSERT INTO job_task_controls(
+               agent_id, job_id, task_id, control_id, kind, state,
+               requesting_attempt_id, created_at_us, resolved_at_us,
+               resolved_by_kind, resolved_by_id, payload_digest, data
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
+        (
+            control.agent_id,
+            control.job_id,
+            control.task_id,
+            control.control_id,
+            control.kind.value,
+            control.state.value,
+            control.requesting_attempt_id,
+            datetime_to_us(control.created_at),
+            control.payload_digest,
+            encode_task_control(control),
+        ),
+    )
+    current_task = _load_task(connection, task.agent_id, task.job_id, task.task_id)
+    if current_task is None:
+        raise GraphStoreConflictError("retry circuit task disappeared")
+    _replace_task(
+        connection,
+        current_task[1],
+        replace(
+            current_task[0],
+            latest_control_id=control_id,
+            task_revision=current_task[0].task_revision + 1,
+            updated_at=opened_at,
+        ),
+    )
+    _insert_event(
+        connection,
+        agent_id=task.agent_id,
+        job_id=task.job_id,
+        task_id=task.task_id,
+        attempt_id=attempt.attempt_id,
+        kind="task_retry_circuit_opened",
+        created_at=opened_at,
+        payload={"control_id": control_id, "failure_code": failure_code},
+        maximum=job.specification.limits.max_events,
+    )
+    return control
 
 
 def open_control(
@@ -2573,6 +2873,7 @@ def open_control(
     *,
     claim_token: str,
     fencing_epoch: int,
+    replan_task: GraphTask | None = None,
 ) -> TaskControl:
     if control.state is not ControlState.OPEN or control.requesting_attempt_id is None:
         raise ValueError("new task control must be open and attempt-bound")
@@ -2609,6 +2910,51 @@ def open_control(
         raise GraphValidationError(
             "attempt_not_running", "control requires running attempt"
         )
+    if (control.kind is ControlKind.NEEDS_REPLAN) != (replan_task is not None):
+        raise GraphValidationError(
+            "replan_task_required",
+            "needs_replan requires exactly one policy-owned planner task",
+        )
+    if replan_task is not None:
+        planner_count = sum(
+            item.role is TaskRole.PLANNER
+            for item in _load_tasks(connection, control.agent_id, control.job_id)
+        )
+        if planner_count >= 8:
+            raise GraphValidationError(
+                "planner_task_limit", "graph planner/replan task limit exceeded"
+            )
+        validation_graph = replace(
+            graph,
+            finalization_attempt_id=None,
+            finalization_started_revision=None,
+        )
+        synthetic = GraphMutationRequest(
+            agent_id=control.agent_id,
+            job_id=control.job_id,
+            mutation_id=f"replan-{control.control_id}",
+            actor_kind="supervisor",
+            actor_key="supervisor_replan",
+            idempotency_key=f"replan-{control.control_id}",
+            expected_revision=graph.revision,
+            created_at=control.created_at,
+            tasks=(replan_task,),
+        )
+        all_tasks = validate_mutation(
+            job_authority=job.specification.authority,
+            graph=validation_graph,
+            existing_tasks=_load_tasks(connection, control.agent_id, control.job_id),
+            existing_dependencies=_load_dependencies(
+                connection, control.agent_id, control.job_id
+            ),
+            request=synthetic,
+            max_tasks=job.specification.limits.max_tasks,
+            max_edges=job.specification.limits.max_edges,
+            max_depth=job.specification.limits.max_depth,
+            max_direct_parents=job.specification.limits.max_direct_parents,
+            max_fan_out=1,
+        )
+        _validate_budget_envelope(job, all_tasks)
     count = connection.execute(
         """SELECT COUNT(*) FROM job_task_controls
            WHERE agent_id = ? AND job_id = ? AND task_id = ?""",
@@ -2642,7 +2988,10 @@ def open_control(
     )
     require_attempt_transition(attempt.state, attempt_state)
     measured_usage = _settle_budgets(
-        connection, attempt=attempt, usage=None, settled_at=control.created_at
+        connection,
+        attempt=attempt,
+        usage=None,
+        settled_at=control.created_at,
     )
     _replace_attempt(
         connection,
@@ -2674,16 +3023,37 @@ def open_control(
             updated_at=control.created_at,
         ),
     )
+    if replan_task is not None:
+        _insert_task(connection, replan_task)
+        for budget in replan_task.specification.budgets:
+            connection.execute(
+                """INSERT INTO job_task_budget_ledger(
+                       agent_id, job_id, task_id, dimension, ceiling,
+                       settled, reserved, updated_at_us
+                   ) VALUES (?, ?, ?, ?, ?, 0, 0, ?)""",
+                (
+                    replan_task.agent_id,
+                    replan_task.job_id,
+                    replan_task.task_id,
+                    budget.dimension,
+                    budget.amount,
+                    datetime_to_us(control.created_at),
+                ),
+            )
     target_graph_state = (
-        GraphState.NEEDS_ATTENTION
-        if control.kind
-        in {
-            ControlKind.NEEDS_AUTHORIZATION,
-            ControlKind.EFFECT_UNCERTAIN,
-            ControlKind.SOURCE_OR_CONTRACT_DRIFT,
-            ControlKind.RETRY_CIRCUIT_OPEN,
-        }
-        else GraphState.BLOCKED
+        GraphState.ACTIVE
+        if control.kind is ControlKind.NEEDS_REPLAN
+        else (
+            GraphState.NEEDS_ATTENTION
+            if control.kind
+            in {
+                ControlKind.NEEDS_AUTHORIZATION,
+                ControlKind.EFFECT_UNCERTAIN,
+                ControlKind.SOURCE_OR_CONTRACT_DRIFT,
+                ControlKind.RETRY_CIRCUIT_OPEN,
+            }
+            else GraphState.BLOCKED
+        )
     )
     if job.state is not target_graph_state:
         require_graph_transition(job.state, target_graph_state)
@@ -2692,8 +3062,16 @@ def open_control(
             job_data,
             replace(job, state=target_graph_state, updated_at=control.created_at),
         )
+    graph_tasks = _load_tasks(connection, control.agent_id, control.job_id)
+    graph_edges = _load_dependencies(connection, control.agent_id, control.job_id)
     updated_graph = replace(
         graph,
+        revision=(
+            graph.revision + 1
+            if control.kind is ControlKind.NEEDS_REPLAN
+            else graph.revision
+        ),
+        task_count=len(graph_tasks),
         active_attempt_count=graph.active_attempt_count - 1,
         finalization_attempt_id=(
             None
@@ -2705,8 +3083,9 @@ def open_control(
             if graph.finalization_attempt_id == attempt.attempt_id
             else graph.finalization_started_revision
         ),
-        next_ready_at=None,
+        next_ready_at=_next_ready_at(graph_tasks),
         updated_at=control.created_at,
+        topology_digest=topology_digest(graph_tasks, graph_edges),
     )
     _replace_graph(connection, graph_data, updated_graph)
     _insert_event(
@@ -2717,7 +3096,12 @@ def open_control(
         attempt_id=control.requesting_attempt_id,
         kind="task_control_opened",
         created_at=control.created_at,
-        payload={"control_id": control.control_id, "kind": control.kind.value},
+        payload={
+            "control_id": control.control_id,
+            "kind": control.kind.value,
+            "replan_task_id": (None if replan_task is None else replan_task.task_id),
+            "graph_revision": updated_graph.revision,
+        },
         maximum=job.specification.limits.max_events,
     )
     return control
@@ -2750,6 +3134,15 @@ def resolve_control(
         return current
     if state is ControlState.OPEN:
         raise ValueError("control resolution must be terminal")
+    loaded_job_before_resolution = _load_job(connection, agent_id, job_id)
+    if loaded_job_before_resolution is None:
+        raise GraphStoreConflictError("control owner disappeared")
+    if resolved_at > loaded_job_before_resolution[0].deadline_at:
+        state = ControlState.EXPIRED
+        make_ready = False
+        resolution = {"reason": "control_expired"}
+        resolved_by_kind = "system"
+        resolved_by_id = "control_expiry"
     resolved = replace(
         current,
         state=state,
@@ -2836,6 +3229,164 @@ def resolve_control(
     return resolved
 
 
+def request_cancel(
+    connection: sqlite3.Connection,
+    *,
+    agent_id: str,
+    job_id: str,
+    requested_at: datetime,
+    requested_by_id: str,
+) -> GraphJob | None:
+    if not isinstance(requested_by_id, str) or not requested_by_id:
+        raise ValueError("graph cancellation principal must be non-empty text")
+    loaded_job = _load_job(connection, agent_id, job_id)
+    loaded_graph = _load_graph(connection, agent_id, job_id)
+    if loaded_job is None or loaded_graph is None:
+        return None
+    job, job_data = loaded_job
+    graph, graph_data = loaded_graph
+    if job.terminal:
+        return job
+    if job.state is not GraphState.CANCEL_REQUESTED:
+        require_graph_transition(job.state, GraphState.CANCEL_REQUESTED)
+        job = replace(
+            job,
+            state=GraphState.CANCEL_REQUESTED,
+            desired_state=GraphDesiredState.CANCEL,
+            updated_at=requested_at,
+        )
+        _replace_job(connection, job_data, job)
+        loaded_job = _load_job(connection, agent_id, job_id)
+        if loaded_job is None:
+            raise GraphStoreConflictError("cancelled graph disappeared")
+        job, job_data = loaded_job
+    for row in connection.execute(
+        """SELECT data FROM job_task_controls
+           WHERE agent_id = ? AND job_id = ? AND state = 'open'
+           ORDER BY task_id, created_at_us""",
+        (agent_id, job_id),
+    ):
+        current_data = _required_text(row[0], "task control payload")
+        current = decode_task_control(current_data)
+        rejected = replace(
+            current,
+            state=ControlState.REJECTED,
+            resolved_at=requested_at,
+            resolved_by_kind="principal",
+            resolved_by_id=requested_by_id,
+            resolution={"reason": "graph_cancelled"},
+        )
+        changed = connection.execute(
+            """UPDATE job_task_controls
+               SET state = ?, resolved_at_us = ?, resolved_by_kind = ?,
+                   resolved_by_id = ?, data = ?
+               WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?
+                 AND data = ?""",
+            (
+                rejected.state.value,
+                datetime_to_us(requested_at),
+                rejected.resolved_by_kind,
+                rejected.resolved_by_id,
+                encode_task_control(rejected),
+                rejected.agent_id,
+                rejected.job_id,
+                rejected.task_id,
+                rejected.control_id,
+                current_data,
+            ),
+        )
+        if changed.rowcount != 1:
+            raise GraphStoreConflictError("task control changed during cancellation")
+    for task in _load_tasks(connection, agent_id, job_id):
+        loaded_task = _load_task(connection, agent_id, job_id, task.task_id)
+        if loaded_task is None:
+            raise GraphStoreConflictError("cancelled graph task disappeared")
+        if task.state is TaskState.RUNNING:
+            assert task.current_attempt_id is not None
+            loaded_attempt = _load_attempt(
+                connection,
+                agent_id,
+                job_id,
+                task.task_id,
+                task.current_attempt_id,
+            )
+            if loaded_attempt is None:
+                raise GraphStoreConflictError("cancelled graph attempt disappeared")
+            attempt, attempt_data = loaded_attempt
+            measured = _settle_budgets(
+                connection,
+                attempt=attempt,
+                usage=None,
+                settled_at=requested_at,
+            )
+            require_attempt_transition(attempt.state, AttemptState.CANCELLED)
+            _replace_attempt(
+                connection,
+                attempt_data,
+                replace(
+                    attempt,
+                    state=AttemptState.CANCELLED,
+                    lease_expires_at=None,
+                    ended_at=requested_at,
+                    measured_usage=measured,
+                    error_code="job_cancelled",
+                ),
+            )
+        if task.state not in TERMINAL_TASK_STATES:
+            require_task_transition(task.state, TaskState.CANCELLED)
+            _replace_task(
+                connection,
+                loaded_task[1],
+                replace(
+                    task,
+                    state=TaskState.CANCELLED,
+                    current_attempt_id=None,
+                    fencing_epoch=task.fencing_epoch + 1,
+                    task_revision=task.task_revision + 1,
+                    updated_at=requested_at,
+                    terminal_at=requested_at,
+                ),
+            )
+    require_graph_transition(job.state, GraphState.CANCELLED)
+    terminal = replace(
+        job,
+        state=GraphState.CANCELLED,
+        updated_at=requested_at,
+        terminal_at=requested_at,
+        failure_code="cancelled_by_principal",
+    )
+    _replace_job(connection, job_data, terminal)
+    final_tasks = _load_tasks(connection, agent_id, job_id)
+    _replace_graph(
+        connection,
+        graph_data,
+        replace(
+            graph,
+            active_attempt_count=0,
+            next_ready_at=None,
+            finalization_attempt_id=None,
+            finalization_started_revision=None,
+            updated_at=requested_at,
+            topology_digest=topology_digest(
+                final_tasks, _load_dependencies(connection, agent_id, job_id)
+            ),
+        ),
+    )
+    _insert_event(
+        connection,
+        agent_id=agent_id,
+        job_id=job_id,
+        kind="graph_cancelled",
+        created_at=requested_at,
+        payload={
+            "reason": "principal_request",
+            "requested_by_id": requested_by_id,
+        },
+        maximum=job.specification.limits.max_events,
+    )
+    return terminal
+
+
 def list_budget_ledgers(
     connection: sqlite3.Connection, agent_id: str, job_id: str
 ) -> tuple[BudgetLedger, ...]:
@@ -2920,6 +3471,7 @@ __all__ = [
     "list_ready_tasks",
     "list_stale_attempts",
     "open_control",
+    "request_cancel",
     "resolve_control",
     "start_attempt",
 ]

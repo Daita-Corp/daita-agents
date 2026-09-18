@@ -40,12 +40,14 @@ from ...scope import EffectiveSourceScope
 from ..owner import JobError, JobOwner
 from .capabilities import (
     GRAPH_RESULT_FINALIZE_CAPABILITY_ID,
+    PLANNER_CAPABILITY_IDS,
     TASK_BLOCK_CAPABILITY_ID,
     TASK_CHECKPOINT_CAPABILITY_ID,
     TASK_COMMENT_CAPABILITY_ID,
     TASK_COMPLETE_CAPABILITY_ID,
     TASK_REQUEST_REVIEW_CAPABILITY_ID,
 )
+from .execution import PLANNER_CATALOG_CAPABILITY_IDS
 from .models import (
     BudgetAmount,
     BudgetLimit,
@@ -365,6 +367,40 @@ class GraphAdmissionBuilder:
         finalizer_digest = self._registry.contract_digest(finalizer.id)
         if finalizer.operational_effect is not OperationalEffect.NONE:
             raise ValueError("graph finalizer must be effect-free")
+        planner_catalog_ids: list[str] = []
+        for capability_id in sorted(PLANNER_CATALOG_CAPABILITY_IDS):
+            try:
+                self._registry.capability(capability_id)
+            except KeyError:
+                continue
+            planner_catalog_ids.append(capability_id)
+        planner_capability_ids = tuple(
+            sorted((*PLANNER_CAPABILITY_IDS, *planner_catalog_ids))
+        )
+        planner_capabilities = tuple(
+            self._registry.capability(capability_id)
+            for capability_id in planner_capability_ids
+        )
+        if any(
+            capability.operational_effect is not OperationalEffect.NONE
+            or capability.effect_receipt_policy is not None
+            or capability.automation_grant_policy is not None
+            for capability in planner_capabilities
+        ):
+            raise ValueError("graph planner capability must be effect-free")
+        root_access_modes = tuple(
+            sorted(
+                {
+                    AccessMode.NONE.value,
+                    proposal.access_mode.value,
+                    *(item.access_mode.value for item in planner_capabilities),
+                }
+            )
+        )
+        planner_contracts = {
+            capability_id: self._registry.contract_digest(capability_id)
+            for capability_id in planner_capability_ids
+        }
         callable_tool_names = tuple(
             sorted(
                 name
@@ -417,6 +453,7 @@ class GraphAdmissionBuilder:
             capability_contracts={
                 **dict(proposal.contract_bindings.capability_contracts),
                 finalizer.id: finalizer_digest,
+                **planner_contracts,
             },
             tool_origins=proposal.contract_bindings.tool_origins,
             resource_revisions=proposal.contract_bindings.resource_revisions,
@@ -426,8 +463,12 @@ class GraphAdmissionBuilder:
             source_ids=proposal.source_ids,
             resource_ids=proposal.resource_ids,
             connector_ids=proposal.connector_binding_ids,
-            capability_ids=tuple(sorted((*proposal.capability_ids, finalizer.id))),
-            access_modes=worker_authority.access_modes,
+            capability_ids=tuple(
+                sorted(
+                    (*proposal.capability_ids, finalizer.id, *planner_capability_ids)
+                )
+            ),
+            access_modes=root_access_modes,
             operational_effects=(OperationalEffect.NONE.value,),
             model_route_ids=(proposal.model_route_id,),
             sensitivity=proposal.sensitivity,
@@ -439,11 +480,62 @@ class GraphAdmissionBuilder:
             outcome_contract=outcome_contract,
             authority=root_authority,
             distribution_plan_digest=plan.plan_digest,
-            budgets=(BudgetLimit("work_units", 5, control_reserved=3),),
+            budgets=(BudgetLimit("work_units", 50, control_reserved=27),),
             deadline_at=deadline,
-            limits=GraphLimits(max_tasks=2, max_edges=1, max_parallelism=1),
-            retry_policy={"max_attempts": 2, "protocol_violation_attempts": 2},
+            limits=GraphLimits(max_tasks=64, max_edges=192, max_parallelism=4),
+            retry_policy={"max_attempts": 3, "protocol_violation_attempts": 2},
             cancellation_policy={"preserve_evidence": True},
+            planner_task_template={
+                "role": TaskRole.PLANNER.value,
+                "execution_kind": TaskExecutionKind.MODEL.value,
+                "priority": 900,
+                "specification": {
+                    "title": "Replan blocked graph work",
+                    "description": (
+                        "Inspect durable graph evidence and make only bounded typed "
+                        "topology mutations inside the immutable root authority."
+                    ),
+                    "expected_result_contract": {
+                        "kind": "model_task",
+                        "result_kind": "graph.plan",
+                        "model_route_id": proposal.model_route_id,
+                        "per_run_max_tokens": proposal.per_run_max_tokens,
+                        "per_run_max_cost_usd": str(proposal.per_run_max_cost_usd),
+                        "attempt_budgets": {"work_units": 1},
+                    },
+                    "authority": GraphAuthority(
+                        source_ids=root_authority.source_ids,
+                        resource_ids=root_authority.resource_ids,
+                        connector_ids=root_authority.connector_ids,
+                        capability_ids=tuple(
+                            sorted((*proposal.capability_ids, *planner_capability_ids))
+                        ),
+                        access_modes=root_authority.access_modes,
+                        operational_effects=(OperationalEffect.NONE.value,),
+                        model_route_ids=root_authority.model_route_ids,
+                        sensitivity=root_authority.sensitivity,
+                        contract_bindings=ExecutionContractBindings(
+                            capability_contracts={
+                                capability_id: root_bindings.capability_contracts[
+                                    capability_id
+                                ]
+                                for capability_id in sorted(
+                                    (*proposal.capability_ids, *planner_capability_ids)
+                                )
+                            },
+                            tool_origins=root_bindings.tool_origins,
+                            resource_revisions=root_bindings.resource_revisions,
+                            model_routes=root_bindings.model_routes,
+                        ).material(),
+                    ).digest_material(),
+                    "budgets": ({"dimension": "work_units", "amount": 3},),
+                    "max_steps": proposal.max_steps,
+                    "max_wall_time_seconds": min(
+                        proposal.max_wall_time_seconds, deadline_seconds
+                    ),
+                    "created_by": "supervisor_replan",
+                },
+            },
             finalizer_task_template={
                 "kind": "graph_result_finalizer",
                 "capability_id": finalizer.id,
@@ -471,7 +563,7 @@ class GraphAdmissionBuilder:
                 "attempt_budgets": {"work_units": 1},
             },
             authority=worker_authority,
-            budgets=(BudgetAmount("work_units", 2),),
+            budgets=(BudgetAmount("work_units", 3),),
             max_steps=proposal.max_steps,
             max_wall_time_seconds=min(proposal.max_wall_time_seconds, deadline_seconds),
             created_by="job_owner",
@@ -489,7 +581,7 @@ class GraphAdmissionBuilder:
                 "attempt_budgets": {"work_units": 1},
             },
             authority=finalizer_authority,
-            budgets=(BudgetAmount("work_units", 1),),
+            budgets=(BudgetAmount("work_units", 3),),
             max_steps=1,
             max_wall_time_seconds=min(300, deadline_seconds),
             created_by="job_owner",

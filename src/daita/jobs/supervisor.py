@@ -6,8 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
-from datetime import datetime, timedelta
-from decimal import Decimal
+from datetime import datetime
 from functools import partial
 from hashlib import sha256
 from typing import TypeVar
@@ -27,15 +26,7 @@ from ..artifacts.models import (
     artifact_ref_to_mapping,
 )
 from ..artifacts.store import AgentHomeArtifactStore
-from ..capabilities import (
-    AccessMode,
-    CapabilityInputError,
-    ExecutionContractBindings,
-    ExecutionScope,
-    ExecutionScopeKind,
-    GraphTaskBinding,
-    OperationalEffect,
-)
+from ..capabilities import CapabilityInputError
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
 from ..distribution.models import (
     ArtifactRequirement,
@@ -57,7 +48,19 @@ from ..loop.models import (
 from ..loop.session import RunCancellationToken, RunSession, RunSessionOptions
 from ..loop.transcripts import RunSessionWriter
 from ..storage.sqlite import SQLiteStateStore
-from .graph.context import TaskContextBundle
+from .graph.execution import (
+    GRAPH_RESULT_FINALIZER_KIND,
+    PROFILE_WORK_KIND,
+    effective_task_ids,
+    graph_task_binding,
+    inspection_task,
+    internal_task_contract,
+    model_task_contract,
+    model_task_execution_scope,
+    prepare_graph_attempt,
+    task_context_bundle,
+    task_conversation_id,
+)
 from .graph.guard import SQLiteTaskAttemptGuard
 from .graph.models import (
     AttemptState,
@@ -73,6 +76,7 @@ from .graph.models import (
     canonical_digest,
     reserved_artifact_id,
 )
+from .graph.reduction import fair_graph_dispatch_order
 from .models import (
     MAX_JOB_EXTERNAL_OBSERVATIONS,
     MAX_RUNNING_JOBS_GLOBAL,
@@ -94,10 +98,10 @@ from .owner import JobError, JobOwner
 _ARTIFACT_ID = re.compile(r"artifact-[0-9a-f]{32}\Z")
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
 _DEFAULT_POLL_SECONDS = 0.05
-_PROFILE_WORK_KIND = "data_profile_work"
-_PROFILE_FINALIZER_KIND = "data_profile_finalizer"
-_GRAPH_RESULT_FINALIZER_KIND = "graph_result_finalizer"
 _T = TypeVar("_T")
+
+# Temporary private compatibility name for the existing deterministic tests.
+_fair_graph_dispatch_order = fair_graph_dispatch_order
 
 
 class JobSupervisor:
@@ -312,9 +316,24 @@ class JobSupervisor:
             )
             if inspection is None:
                 continue
-            task = _inspection_task(inspection, attempt.task_id)
+            task = inspection_task(inspection, attempt.task_id)
+            if task.execution_kind is TaskExecutionKind.MODEL:
+                await self._graph_store_call(
+                    partial(
+                        self._store.fence_graph_attempt,
+                        attempt.agent_id,
+                        attempt.job_id,
+                        attempt.task_id,
+                        attempt.attempt_id,
+                        fencing_epoch=attempt.fencing_epoch,
+                        fenced_at=self._clock(),
+                        requeue=True,
+                        reason_code="host_restarted",
+                    )
+                )
+                continue
             try:
-                _internal_task_contract(task)
+                internal_task_contract(task)
                 payload = await self._artifacts.read_reserved(
                     attempt.run_id,
                     reserved_artifact_id(attempt.attempt_id),
@@ -459,7 +478,7 @@ class JobSupervisor:
                 limit=64,
             )
         )
-        ready = _fair_graph_dispatch_order(
+        ready = fair_graph_dispatch_order(
             ready,
             last_job_id=self._last_graph_dispatch_job_id,
             consecutive=self._consecutive_graph_dispatches,
@@ -502,8 +521,7 @@ class JobSupervisor:
             )
             if inspection is None:
                 return
-            current_task = _inspection_task(inspection, selected.task_id)
-            contract = _graph_task_contract(current_task)
+            current_task = inspection_task(inspection, selected.task_id)
             attempt_id = self._id_factory("attempt")
             claim_token = self._id_factory("claim")
             run_id = _required_generated_id(
@@ -512,10 +530,8 @@ class JobSupervisor:
                 "graph execution run",
             )
             claimed_at = self._clock()
-            absolute_deadline = min(
-                inspection.job.deadline_at,
-                claimed_at
-                + timedelta(seconds=current_task.specification.max_wall_time_seconds),
+            preparation = prepare_graph_attempt(
+                inspection, current_task, claimed_at=claimed_at
             )
             try:
                 attempt = await self._graph_store_call(
@@ -526,11 +542,11 @@ class JobSupervisor:
                         attempt_id=attempt_id,
                         claim_token=claim_token,
                         run_id=run_id,
-                        executor_id=str(contract["executor_id"]),
+                        executor_id=preparation.executor_id,
                         claimed_at=claimed_at,
                         lease_seconds=30,
-                        absolute_deadline_at=absolute_deadline,
-                        budget_reservations=_attempt_budget_reservations(current_task),
+                        absolute_deadline_at=preparation.absolute_deadline_at,
+                        budget_reservations=preparation.budget_reservations,
                     )
                 )
             except Exception:
@@ -574,7 +590,7 @@ class JobSupervisor:
                 )
                 if (
                     current is not None
-                    and _inspection_task(current, current_task.task_id).state
+                    and inspection_task(current, current_task.task_id).state
                     is TaskState.SUCCEEDED
                 ):
                     return
@@ -702,7 +718,7 @@ class JobSupervisor:
         if task.execution_kind is TaskExecutionKind.MODEL:
             await self._execute_model_graph_attempt(inspection, task, attempt)
             return
-        contract = _internal_task_contract(task)
+        contract = internal_task_contract(task)
         reservation = reserved_artifact_id(attempt.attempt_id)
         recovered = await self._artifacts.read_reserved(attempt.run_id, reservation)
         if recovered is not None:
@@ -798,7 +814,7 @@ class JobSupervisor:
             raise CapabilityInputError(
                 "stale_task_attempt", "The graph task disappeared before execution."
             )
-        current_task = _inspection_task(current, task.task_id)
+        current_task = inspection_task(current, task.task_id)
         current_attempt = next(
             (
                 item
@@ -812,7 +828,7 @@ class JobSupervisor:
             raise CapabilityInputError(
                 "stale_task_attempt", "The graph task attempt is unavailable."
             )
-        contract = _model_task_contract(current_task)
+        contract = model_task_contract(current_task)
         guard = _graph_attempt_guard(
             self._store,
             current,
@@ -820,14 +836,14 @@ class JobSupervisor:
             current_attempt,
             clock=self._clock,
         )
-        scope = _model_task_execution_scope(
+        scope = model_task_execution_scope(
             current,
             current_task,
             current_attempt,
             guard.binding,
             contract,
         )
-        context = _task_context_bundle(
+        context = task_context_bundle(
             current,
             current_task,
             current_attempt,
@@ -855,7 +871,7 @@ class JobSupervisor:
             agent_id=current_attempt.agent_id,
             message=instruction,
             created_at=current_attempt.started_at or self._clock(),
-            conversation_id=_task_conversation_id(
+            conversation_id=task_conversation_id(
                 current_attempt.job_id, current_attempt.attempt_id
             ),
             source_scope_ids=current_task.specification.authority.source_ids,
@@ -953,7 +969,7 @@ class JobSupervisor:
             ),
             None,
         )
-        stored_task = _inspection_task(inspection, original_task.task_id)
+        stored_task = inspection_task(inspection, original_task.task_id)
         transcript = await self._store.load(attempt.run_id)
         pairs = transcript.tool_pairs
         if not pairs or pairs[-1][1] is None or pairs[-1][1].is_error:
@@ -1009,7 +1025,7 @@ class JobSupervisor:
         task: GraphTask,
         contract: Mapping[str, object],
     ) -> Mapping[str, object]:
-        if contract["kind"] == _PROFILE_WORK_KIND:
+        if contract["kind"] == PROFILE_WORK_KIND:
             arguments = contract.get("arguments")
             if not isinstance(arguments, Mapping):
                 raise ValueError("graph work arguments are malformed")
@@ -1023,6 +1039,19 @@ class JobSupervisor:
                 if edge.downstream_task_id == task.task_id
             )
         )
+        if contract["kind"] == GRAPH_RESULT_FINALIZER_KIND:
+            required_task_ids = tuple(
+                sorted(
+                    item.task_id
+                    for item in inspection.tasks
+                    if item.role is not TaskRole.FINALIZER
+                    and item.state is TaskState.SUCCEEDED
+                )
+            )
+        else:
+            required_task_ids = tuple(
+                sorted(effective_task_ids(inspection, set(required_task_ids)))
+            )
         accepted = {item.task_id: item for item in inspection.results}
         if set(accepted) - {item.task_id for item in inspection.tasks}:
             raise ValueError("graph accepted results reference unknown tasks")
@@ -1031,7 +1060,7 @@ class JobSupervisor:
             result = accepted.get(task_id)
             if result is None:
                 raise ValueError("the finalizer barrier has an incomplete result")
-            if contract["kind"] == _GRAPH_RESULT_FINALIZER_KIND:
+            if contract["kind"] == GRAPH_RESULT_FINALIZER_KIND:
                 work_results.append(
                     {
                         "task_id": task_id,
@@ -1058,7 +1087,7 @@ class JobSupervisor:
                     "artifact_ref": raw_refs[0],
                 }
             )
-        if contract["kind"] == _GRAPH_RESULT_FINALIZER_KIND:
+        if contract["kind"] == GRAPH_RESULT_FINALIZER_KIND:
             return {
                 "job_id": inspection.job.job_id,
                 "work_results": tuple(work_results),
@@ -1082,7 +1111,7 @@ class JobSupervisor:
         artifact: ArtifactRef,
         content: bytes,
     ) -> TaskResult:
-        contract = _internal_task_contract(task)
+        contract = internal_task_contract(task)
         _validate_graph_artifact(
             inspection,
             task,
@@ -1091,7 +1120,7 @@ class JobSupervisor:
             content,
             capability_id=str(contract["capability_id"]),
         )
-        if contract["kind"] == _GRAPH_RESULT_FINALIZER_KIND:
+        if contract["kind"] == GRAPH_RESULT_FINALIZER_KIND:
             payload = _generic_graph_result_payload(
                 content,
                 job_id=inspection.job.job_id,
@@ -1106,7 +1135,7 @@ class JobSupervisor:
                 job_id=inspection.job.job_id,
                 expected_resource_ids=(
                     task.specification.authority.resource_ids
-                    if contract["kind"] == _PROFILE_WORK_KIND
+                    if contract["kind"] == PROFILE_WORK_KIND
                     else _contract_resource_ids(contract)
                 ),
             )
@@ -1164,10 +1193,8 @@ class JobSupervisor:
         result: TaskResult,
         artifact: ArtifactRef,
     ) -> None:
-        contract = _internal_task_contract(
-            _inspection_task(inspection, attempt.task_id)
-        )
-        generic_result = contract["kind"] == _GRAPH_RESULT_FINALIZER_KIND
+        contract = internal_task_contract(inspection_task(inspection, attempt.task_id))
+        generic_result = contract["kind"] == GRAPH_RESULT_FINALIZER_KIND
         requirement = ArtifactRequirement(
             required=True,
             minimum_count=1,
@@ -1867,89 +1894,6 @@ def _claimed_attempt(job: JobRun) -> JobAttempt:
     return attempt
 
 
-def _inspection_task(inspection: GraphInspection, task_id: str) -> GraphTask:
-    task = next((item for item in inspection.tasks if item.task_id == task_id), None)
-    if task is None:
-        raise ValueError("graph task is absent from its inspection")
-    return task
-
-
-def _internal_task_contract(task: GraphTask) -> Mapping[str, object]:
-    if task.execution_kind is not TaskExecutionKind.INTERNAL_CAPABILITY:
-        raise ValueError("the Phase 3 graph slice admits only internal tasks")
-    contract = task.specification.expected_result_contract
-    kind = contract.get("kind")
-    capability_id = contract.get("capability_id")
-    contract_digest = contract.get("contract_digest")
-    output_kind = contract.get("output_kind")
-    if kind not in {
-        _PROFILE_WORK_KIND,
-        _PROFILE_FINALIZER_KIND,
-        _GRAPH_RESULT_FINALIZER_KIND,
-    }:
-        raise ValueError("the graph task kind is outside the static slice")
-    if any(
-        not isinstance(value, str) or not value
-        for value in (capability_id, contract_digest, output_kind)
-    ):
-        raise ValueError("the internal graph task contract is malformed")
-    assert isinstance(capability_id, str)
-    assert isinstance(contract_digest, str)
-    if (
-        kind
-        in {
-            _PROFILE_FINALIZER_KIND,
-            _GRAPH_RESULT_FINALIZER_KIND,
-        }
-        and task.role is not TaskRole.FINALIZER
-    ):
-        raise ValueError("the profile finalizer contract is not reserved")
-    if kind == _PROFILE_WORK_KIND and task.role is TaskRole.FINALIZER:
-        raise ValueError("the reserved finalizer cannot execute work")
-    if capability_id not in task.specification.authority.capability_ids:
-        raise ValueError("the task capability exceeds its immutable authority")
-    binding = _execution_contract_bindings(
-        task.specification.authority
-    ).capability_contracts.get(capability_id)
-    if binding != contract_digest:
-        raise ValueError("the task capability digest differs from its authority")
-    return contract
-
-
-def _model_task_contract(task: GraphTask) -> Mapping[str, object]:
-    if task.execution_kind is not TaskExecutionKind.MODEL:
-        raise ValueError("the graph task is not model-driven")
-    contract = task.specification.expected_result_contract
-    if contract.get("kind") != "model_task":
-        raise ValueError("the model graph task contract is malformed")
-    route_id = contract.get("model_route_id")
-    max_tokens = contract.get("per_run_max_tokens")
-    max_cost = contract.get("per_run_max_cost_usd")
-    if (
-        not isinstance(route_id, str)
-        or route_id not in task.specification.authority.model_route_ids
-        or not isinstance(max_tokens, int)
-        or isinstance(max_tokens, bool)
-        or max_tokens < 1
-        or not isinstance(max_cost, str)
-    ):
-        raise ValueError("the model graph task route or budget is malformed")
-    try:
-        cost = Decimal(max_cost)
-    except Exception as error:
-        raise ValueError("the model graph task cost budget is malformed") from error
-    if not cost.is_finite() or cost < 0:
-        raise ValueError("the model graph task cost budget is malformed")
-    return {**contract, "executor_id": route_id}
-
-
-def _graph_task_contract(task: GraphTask) -> Mapping[str, object]:
-    if task.execution_kind is TaskExecutionKind.MODEL:
-        return _model_task_contract(task)
-    contract = _internal_task_contract(task)
-    return {**contract, "executor_id": str(contract["capability_id"])}
-
-
 def _graph_attempt_guard(
     store: SQLiteStateStore,
     inspection: GraphInspection,
@@ -1958,35 +1902,7 @@ def _graph_attempt_guard(
     *,
     clock: Callable[[], datetime],
 ) -> SQLiteTaskAttemptGuard:
-    binding = GraphTaskBinding(
-        agent_id=attempt.agent_id,
-        job_id=attempt.job_id,
-        root_authority_digest=inspection.job.specification.authority.digest,
-        task_id=attempt.task_id,
-        task_revision=task.task_revision,
-        task_spec_digest=task.task_spec_digest,
-        task_scope_digest=task.task_scope_digest,
-        attempt_id=attempt.attempt_id,
-        claim_token_digest="sha256:"
-        + sha256(attempt.claim_token.encode("utf-8")).hexdigest(),
-        fencing_epoch=attempt.fencing_epoch,
-        graph_revision_at_claim=inspection.graph.revision,
-        task_role=task.role.value,
-        task_deadline_at=attempt.absolute_deadline_at,
-        job_deadline_at=inspection.job.deadline_at,
-        budget_reservation_identity=canonical_digest(
-            {
-                "attempt_id": attempt.attempt_id,
-                "reservations": tuple(
-                    {
-                        "dimension": item.dimension,
-                        "amount": item.amount,
-                    }
-                    for item in attempt.reserved_budgets
-                ),
-            }
-        ),
-    )
+    binding = graph_task_binding(inspection, task, attempt)
     return SQLiteTaskAttemptGuard(
         store=store,
         binding=binding,
@@ -1994,224 +1910,6 @@ def _graph_attempt_guard(
         run_id=attempt.run_id,
         clock=clock,
     )
-
-
-def _model_task_execution_scope(
-    inspection: GraphInspection,
-    task: GraphTask,
-    attempt: TaskAttempt,
-    binding: GraphTaskBinding,
-    contract: Mapping[str, object],
-) -> ExecutionScope:
-    authority = task.specification.authority
-    bindings = _execution_contract_bindings(authority)
-    max_tokens = contract["per_run_max_tokens"]
-    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool):
-        raise ValueError("the model graph task token budget is malformed")
-    access_modes = frozenset(
-        AccessMode(item) for item in authority.access_modes
-    ) | frozenset({AccessMode.NONE})
-    return ExecutionScope(
-        scope_id=f"graph-scope:{attempt.attempt_id}",
-        revision=1,
-        agent_id=attempt.agent_id,
-        principal_id=inspection.job.specification.principal_id,
-        grant_id=f"graph-attempt:{attempt.attempt_id}",
-        job_id=attempt.job_id,
-        job_revision=inspection.graph.revision + 1,
-        allowed_source_ids=authority.source_ids,
-        allowed_resource_ids=authority.resource_ids,
-        allowed_capability_ids=authority.capability_ids,
-        allowed_access_modes=access_modes,
-        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
-        sensitivity_ceiling=authority.sensitivity,
-        eligible_model_routes=authority.model_route_ids,
-        per_run_max_cost_usd=Decimal(str(contract["per_run_max_cost_usd"])),
-        per_run_max_tokens=max_tokens,
-        distribution_plan_digest=inspection.job.specification.distribution_plan_digest,
-        contract_bindings=bindings,
-        allowed_connector_binding_ids=authority.connector_ids,
-        scope_kind=ExecutionScopeKind.GRAPH_TASK,
-        graph_task_binding=binding,
-    )
-
-
-def _execution_contract_bindings(authority) -> ExecutionContractBindings:
-    material = authority.contract_bindings
-    nested = material.get("capability_contracts")
-    if isinstance(nested, Mapping):
-        capability_contracts = dict(nested)
-        raw_resources = material.get("resource_revisions", {})
-        raw_routes = material.get("model_routes", {})
-        raw_origins = material.get("tool_origins", {})
-        if not all(
-            isinstance(item, Mapping)
-            for item in (raw_resources, raw_routes, raw_origins)
-        ):
-            raise ValueError("graph execution contract bindings are malformed")
-        return ExecutionContractBindings(
-            capability_contracts=capability_contracts,
-            resource_revisions=dict(raw_resources),
-            model_routes=dict(raw_routes),
-            tool_origins=dict(raw_origins),
-        )
-    capabilities: dict[str, str] = {}
-    for capability_id in authority.capability_ids:
-        value = material.get(capability_id)
-        if not isinstance(value, str):
-            raise ValueError("graph capability contract binding is unavailable")
-        capabilities[capability_id] = value
-    resources: dict[str, str] = {}
-    for resource_id in authority.resource_ids:
-        value = material.get(resource_id)
-        if not isinstance(value, Mapping):
-            raise ValueError("graph resource contract binding is unavailable")
-        revision = value.get("resource_revision")
-        if not isinstance(revision, str):
-            raise ValueError("graph resource revision binding is unavailable")
-        resources[resource_id] = revision
-    routes: dict[str, str] = {}
-    for route_id in authority.model_route_ids:
-        value = material.get(route_id)
-        if not isinstance(value, str):
-            raise ValueError("graph model route contract binding is unavailable")
-        routes[route_id] = value
-    return ExecutionContractBindings(
-        capability_contracts=capabilities,
-        resource_revisions=resources,
-        model_routes=routes,
-    )
-
-
-def _task_context_bundle(
-    inspection: GraphInspection,
-    task: GraphTask,
-    attempt: TaskAttempt,
-    binding: GraphTaskBinding,
-    *,
-    created_at: datetime,
-) -> TaskContextBundle:
-    parent_ids = {
-        edge.upstream_task_id
-        for edge in inspection.dependencies
-        if edge.downstream_task_id == task.task_id
-    }
-    parents = tuple(
-        {
-            "task_id": result.task_id,
-            "result_id": result.result_id,
-            "result_kind": result.result_kind,
-            "summary": result.summary,
-            "payload": result.payload,
-            "result_digest": result.result_digest,
-            "sensitivity": result.sensitivity.value,
-            "artifact_ids": result.artifact_ids,
-            "provenance": result.provenance,
-        }
-        for result in inspection.results
-        if result.task_id in parent_ids
-    )
-    prior = tuple(
-        {
-            "attempt_id": item.attempt_id,
-            "ordinal": item.ordinal,
-            "state": item.state.value,
-            "error_code": item.error_code,
-            "diagnostic": item.diagnostic,
-            "checkpoint_ids": item.checkpoint_ids,
-            "measured_usage": tuple(
-                {"dimension": usage.dimension, "amount": usage.amount}
-                for usage in item.measured_usage
-            ),
-        }
-        for item in sorted(
-            (
-                value
-                for value in inspection.attempts
-                if value.task_id == task.task_id
-                and value.attempt_id != attempt.attempt_id
-            ),
-            key=lambda value: value.ordinal,
-        )[-2:]
-    )
-    checkpoints = tuple(
-        {
-            "attempt_id": item.attempt_id,
-            "checkpoint_id": item.checkpoint_id,
-            "ordinal": item.ordinal,
-            "milestone": item.milestone,
-            "payload": item.payload,
-            "payload_digest": item.payload_digest,
-        }
-        for item in inspection.checkpoints
-        if item.task_id == task.task_id
-    )[-8:]
-    comments = tuple(
-        {
-            "comment_id": item.comment_id,
-            "author_kind": item.author_kind,
-            "body": item.body,
-            "body_digest": item.body_digest,
-            "sensitivity": item.sensitivity.value,
-        }
-        for item in inspection.comments
-        if item.task_id == task.task_id
-    )[-16:]
-    try:
-        return TaskContextBundle(
-            binding=binding,
-            root_objective=inspection.job.specification.objective,
-            outcome_contract=inspection.job.specification.outcome_contract,
-            task_specification=task.specification.digest_material(),
-            parent_results=parents,
-            prior_attempts=prior,
-            checkpoints=checkpoints,
-            comments=comments,
-            created_at=created_at,
-        )
-    except ValueError as error:
-        if "aggregate byte bound" not in str(error):
-            raise
-        bounded_parents = tuple(
-            {
-                key: value
-                for key, value in parent.items()
-                if key not in {"payload", "provenance"}
-            }
-            | {"omitted_payload_digest": parent["result_digest"]}
-            for parent in parents
-        )
-        return TaskContextBundle(
-            binding=binding,
-            root_objective=inspection.job.specification.objective,
-            outcome_contract=inspection.job.specification.outcome_contract,
-            task_specification=task.specification.digest_material(),
-            parent_results=bounded_parents,
-            prior_attempts=prior,
-            checkpoints=checkpoints,
-            comments=comments,
-            created_at=created_at,
-        )
-
-
-def _task_conversation_id(job_id: str, attempt_id: str) -> str:
-    digest = sha256(f"{job_id}:{attempt_id}".encode("utf-8")).hexdigest()[:32]
-    return f"graph-task-{digest}"
-
-
-def _attempt_budget_reservations(task: GraphTask) -> tuple[BudgetAmount, ...]:
-    raw = task.specification.expected_result_contract.get("attempt_budgets")
-    if not isinstance(raw, Mapping) or not raw:
-        raise ValueError("the internal task attempt budget is malformed")
-    task_limits = {item.dimension: item.amount for item in task.specification.budgets}
-    reservations: list[BudgetAmount] = []
-    for dimension, amount in raw.items():
-        if not isinstance(dimension, str) or not isinstance(amount, int):
-            raise ValueError("the internal task attempt budget is malformed")
-        if dimension not in task_limits or amount > task_limits[dimension]:
-            raise ValueError("the attempt budget exceeds the immutable task budget")
-        reservations.append(BudgetAmount(dimension, amount))
-    return tuple(sorted(reservations))
 
 
 def _contract_resource_ids(contract: Mapping[str, object]) -> tuple[str, ...]:
@@ -2428,49 +2126,6 @@ def _graph_failure_is_retryable(error: BaseException) -> bool:
         error,
         (ArtifactError, CapabilityInputError, TypeError, ValueError),
     )
-
-
-def _fair_graph_dispatch_order(
-    ready: tuple[GraphTask, ...],
-    *,
-    last_job_id: str | None,
-    consecutive: int,
-) -> tuple[GraphTask, ...]:
-    """Preserve task ordering while bounding one ready graph to two dispatches."""
-
-    remaining = list(ready)
-    ordered: list[GraphTask] = []
-    current_job_id = last_job_id
-    current_consecutive = consecutive
-    while remaining:
-        index = 0
-        if current_job_id is not None:
-            if current_consecutive < 2:
-                index = next(
-                    (
-                        candidate_index
-                        for candidate_index, candidate in enumerate(remaining)
-                        if candidate.job_id == current_job_id
-                    ),
-                    0,
-                )
-            else:
-                index = next(
-                    (
-                        candidate_index
-                        for candidate_index, candidate in enumerate(remaining)
-                        if candidate.job_id != current_job_id
-                    ),
-                    0,
-                )
-        selected = remaining.pop(index)
-        ordered.append(selected)
-        if selected.job_id == current_job_id:
-            current_consecutive += 1
-        else:
-            current_job_id = selected.job_id
-            current_consecutive = 1
-    return tuple(ordered)
 
 
 def _resource_binding_payload(value) -> dict[str, object]:

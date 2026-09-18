@@ -60,6 +60,12 @@ from .hosting.embedded import (
     SourceEditResult,
 )
 from .hosting.home_upgrade import AgentHomeStatus
+from .jobs.graph.models import (
+    GraphAdmission,
+    GraphJob,
+    GraphMutation,
+    TaskControl,
+)
 from .jobs.models import (
     JobExecutionMode,
     JobInspection,
@@ -67,6 +73,7 @@ from .jobs.models import (
     JobStatus,
     JobSummary,
 )
+from .jobs.owner import GraphBlockerProjection
 from .learning_candidates import (
     LearningCandidateContent,
     LearningCandidateRejectionReason,
@@ -465,6 +472,92 @@ class Agent:
 
     async def cancel_job(self, job_id: str) -> JobInspection | None:
         return await self._embedded.cancel_job(job_id)
+
+    async def graph_blockers(self, job_id: str) -> GraphBlockerProjection | None:
+        """Return the bounded current blockers for one exact graph job."""
+
+        return await self._embedded.graph_blockers(job_id)
+
+    async def answer_task_input(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        answer: Mapping[str, object],
+    ) -> TaskControl | None:
+        """Resolve one exact open graph input request with typed principal input."""
+
+        return await self._embedded.answer_task_input(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            answer=answer,
+        )
+
+    async def reject_task_control(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        reason: str,
+    ) -> TaskControl | None:
+        """Reject one exact open graph control without creating executable work."""
+
+        return await self._embedded.reject_task_control(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            reason=reason,
+        )
+
+    async def cancel_graph_job(
+        self, job_id: str, *, principal_id: str
+    ) -> GraphJob | None:
+        """Cancel one exact graph and conservatively settle active attempts."""
+
+        return await self._embedded.cancel_graph_job(job_id, principal_id=principal_id)
+
+    async def replace_graph_task_by_policy(
+        self,
+        job_id: str,
+        task_id: str,
+        *,
+        principal_id: str,
+        advisory_note: str,
+        idempotency_key: str,
+        expected_revision: int,
+    ) -> GraphMutation:
+        """Create only the policy-derived replacement for blocked graph work."""
+
+        return await self._embedded.replace_graph_task_by_policy(
+            job_id,
+            task_id,
+            principal_id=principal_id,
+            advisory_note=advisory_note,
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+        )
+
+    async def start_authorized_replacement_job(
+        self,
+        admission: GraphAdmission,
+        *,
+        replaces_job_id: str,
+        principal_id: str,
+    ) -> GraphJob:
+        """Admit a separate already-authorized replacement without widening a job."""
+
+        return await self._embedded.start_authorized_replacement_job(
+            admission,
+            replaces_job_id=replaces_job_id,
+            principal_id=principal_id,
+        )
 
     async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
         return await self._embedded.propose_routine(draft)

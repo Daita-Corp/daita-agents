@@ -71,6 +71,7 @@ from .distribution import (
 )
 from .errors import StateCompatibilityError
 from .jobs.graph.models import GraphInspection
+from .jobs.owner import GraphBlockerProjection
 from .learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
     learning_candidate_content_to_mapping,
@@ -167,6 +168,20 @@ def _graph_inspection_mapping(inspection: GraphInspection) -> dict[str, object]:
             for item in inspection.events
         ],
         "delivery_ids": inspection.delivery_ids,
+    }
+
+
+def _graph_blockers_mapping(
+    projection: GraphBlockerProjection,
+) -> dict[str, object]:
+    """Project the bounded typed blocker view without adding graph state ownership."""
+
+    if not isinstance(projection, GraphBlockerProjection):
+        raise TypeError("graph blocker projection requires GraphBlockerProjection")
+    return {
+        "job_id": projection.job_id,
+        "graph_state": projection.graph_state.value,
+        "blockers": projection.blockers,
     }
 
 
@@ -509,6 +524,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="hold one agent open so scheduled routines can make progress",
     )
     host.add_argument("--agent", dest="host_agent", required=True)
+
+    jobs = commands.add_parser(
+        "jobs",
+        help="inspect and resolve bounded durable-job controls",
+    )
+    job_commands = jobs.add_subparsers(dest="jobs_command", required=True)
+    job_blockers = job_commands.add_parser("blockers")
+    job_blockers.add_argument("name")
+    job_blockers.add_argument("job_id")
+    job_answer = job_commands.add_parser("answer")
+    job_answer.add_argument("name")
+    job_answer.add_argument("job_id")
+    job_answer.add_argument("task_id")
+    job_answer.add_argument("control_id")
+    job_answer.add_argument("--principal-id", required=True)
+    job_answer.add_argument("--answer-json", required=True)
+    job_reject = job_commands.add_parser("reject")
+    job_reject.add_argument("name")
+    job_reject.add_argument("job_id")
+    job_reject.add_argument("task_id")
+    job_reject.add_argument("control_id")
+    job_reject.add_argument("--principal-id", required=True)
+    job_reject.add_argument("--reason", required=True)
+    job_cancel = job_commands.add_parser("cancel-graph")
+    job_cancel.add_argument("name")
+    job_cancel.add_argument("job_id")
+    job_cancel.add_argument("--principal-id", required=True)
+    job_replace = job_commands.add_parser("replace-task")
+    job_replace.add_argument("name")
+    job_replace.add_argument("job_id")
+    job_replace.add_argument("task_id")
+    job_replace.add_argument("expected_revision", type=int)
+    job_replace.add_argument("--principal-id", required=True)
+    job_replace.add_argument("--idempotency-key", required=True)
+    job_replace.add_argument("--note", required=True)
 
     memory = commands.add_parser("memory", help="manage agent memory")
     memory_commands = memory.add_subparsers(dest="memory_command", required=True)
@@ -1285,6 +1335,84 @@ async def _execute(args: argparse.Namespace) -> object:
             on_ready=_write_resident_ready,
         )
         return {"agent": args.host_agent, "host": "stopped"}
+    if args.command == "jobs":
+        agent = await Agent.open(
+            args.name,
+            workspace=workspace,
+            root=args.root,
+            config=AgentConfig(),
+        )
+        try:
+            if args.jobs_command == "blockers":
+                blockers = await agent.graph_blockers(args.job_id)
+                return None if blockers is None else _graph_blockers_mapping(blockers)
+            if args.jobs_command == "answer":
+                answer = _object_mapping(
+                    json.loads(args.answer_json), "task input answer"
+                )
+                control = await agent.answer_task_input(
+                    args.job_id,
+                    args.task_id,
+                    args.control_id,
+                    principal_id=args.principal_id,
+                    answer=answer,
+                )
+                return (
+                    None
+                    if control is None
+                    else {
+                        "control_id": control.control_id,
+                        "state": control.state.value,
+                        "resolved_by_id": control.resolved_by_id,
+                    }
+                )
+            if args.jobs_command == "reject":
+                control = await agent.reject_task_control(
+                    args.job_id,
+                    args.task_id,
+                    args.control_id,
+                    principal_id=args.principal_id,
+                    reason=args.reason,
+                )
+                return (
+                    None
+                    if control is None
+                    else {
+                        "control_id": control.control_id,
+                        "state": control.state.value,
+                        "resolved_by_id": control.resolved_by_id,
+                    }
+                )
+            if args.jobs_command == "cancel-graph":
+                job = await agent.cancel_graph_job(
+                    args.job_id, principal_id=args.principal_id
+                )
+                return (
+                    None
+                    if job is None
+                    else {
+                        "job_id": job.job_id,
+                        "state": job.state.value,
+                        "desired_state": job.desired_state.value,
+                    }
+                )
+            mutation = await agent.replace_graph_task_by_policy(
+                args.job_id,
+                args.task_id,
+                principal_id=args.principal_id,
+                advisory_note=args.note,
+                idempotency_key=args.idempotency_key,
+                expected_revision=args.expected_revision,
+            )
+            return {
+                "mutation_id": mutation.mutation_id,
+                "decision": mutation.decision.value,
+                "failure_code": mutation.failure_code,
+                "committed_revision": mutation.committed_revision,
+                "task_ids": mutation.resulting_task_ids,
+            }
+        finally:
+            await agent.close()
     if args.command == "detach":
         if not args.yes:
             raise ValueError("detach requires --yes")
@@ -1753,14 +1881,14 @@ async def _execute(args: argparse.Namespace) -> object:
                         confirmation_handler=_prompt_for_exact_approval,
                     )
                 )
-            control = {
+            routine_control = {
                 "pause": agent.pause_routine,
                 "resume": agent.resume_routine,
                 "run-now": agent.run_routine_now,
                 "disable": agent.disable_routine,
             }[args.routines_command]
             return routine_projection(
-                await control(
+                await routine_control(
                     args.routine_id,
                     expected_revision=args.expected_revision,
                 )

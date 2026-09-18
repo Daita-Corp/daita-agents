@@ -1232,6 +1232,11 @@ class GraphMutationRequest:
 
     def payload_material(self) -> dict[str, object]:
         return {
+            "actor_kind": self.actor_kind,
+            "actor_key": self.actor_key,
+            "expected_revision": self.expected_revision,
+            "creator_task_id": self.creator_task_id,
+            "creator_attempt_id": self.creator_attempt_id,
             "tasks": [
                 {
                     "task_id": task.task_id,

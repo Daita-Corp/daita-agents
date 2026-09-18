@@ -17,7 +17,10 @@ from .models import (
     GraphTask,
     JobGraph,
     TaskAttempt,
+    TaskControl,
     TaskDependency,
+    TaskExecutionKind,
+    TaskResult,
     TaskRole,
     TaskState,
     topology_digest,
@@ -402,13 +405,20 @@ def validate_mutation(
     graph: JobGraph,
     existing_tasks: tuple[GraphTask, ...],
     existing_dependencies: tuple[TaskDependency, ...],
+    existing_results: tuple[TaskResult, ...] = (),
+    existing_controls: tuple[TaskControl, ...] = (),
     request: GraphMutationRequest,
+    creator_authority: GraphAuthority | None = None,
     max_tasks: int,
     max_edges: int,
     max_depth: int,
     max_direct_parents: int,
     max_fan_out: int,
 ) -> tuple[GraphTask, ...]:
+    if not (request.tasks or request.dependencies or request.supersessions):
+        raise GraphValidationError(
+            "empty_mutation", "graph mutation must make one bounded topology change"
+        )
     if graph.finalization_attempt_id is not None:
         raise GraphValidationError(
             "finalization_sealed", "topology mutation is sealed by finalization"
@@ -419,6 +429,30 @@ def validate_mutation(
         )
     if len(request.tasks) > max_fan_out:
         raise GraphValidationError("fan_out_limit", "mutation fan-out exceeded")
+    if request.creator_task_id is not None and request.actor_kind != "planner_attempt":
+        raise GraphValidationError(
+            "mutation_actor", "attempt-bound topology mutation requires planner actor"
+        )
+    if request.creator_task_id is None and request.actor_kind not in {
+        "job_owner",
+        "human_policy",
+        "owner",
+        "supervisor",
+    }:
+        raise GraphValidationError(
+            "mutation_actor", "unbound graph mutation actor is not admitted"
+        )
+    if request.actor_kind == "supervisor" and (
+        len(request.tasks) != 1
+        or request.tasks[0].role is not TaskRole.PLANNER
+        or request.dependencies
+        or request.supersessions
+        or request.actor_key != "supervisor_replan"
+    ):
+        raise GraphValidationError(
+            "supervisor_mutation_not_allowed",
+            "supervisor mutation is limited to one policy-owned replan task",
+        )
     existing_ids = {task.task_id for task in existing_tasks}
     if any(task.task_id in existing_ids for task in request.tasks):
         raise GraphValidationError("duplicate_task", "mutation task already exists")
@@ -434,6 +468,16 @@ def validate_mutation(
                 "mutation_task_state", "new mutation task must be pending or ready"
             )
         require_authority_subset(task.specification.authority, job_authority)
+        if creator_authority is not None:
+            require_authority_subset(task.specification.authority, creator_authority)
+        if (
+            request.actor_kind != "owner"
+            and task.specification.created_by != request.actor_key
+        ):
+            raise GraphValidationError(
+                "mutation_actor", "new task creator differs from mutation actor"
+            )
+        _validate_contract_binding_coverage(task)
     all_tasks = (*existing_tasks, *request.tasks)
     all_ids = {task.task_id for task in all_tasks}
     existing_pairs = {
@@ -443,6 +487,12 @@ def validate_mutation(
     for edge in request.dependencies:
         if edge.agent_id != graph.agent_id or edge.job_id != graph.job_id:
             raise GraphValidationError("ownership", "mutation edge is foreign")
+        if (
+            request.actor_kind != "owner" and edge.creator_key != request.actor_key
+        ) or edge.mutation_id not in {None, request.mutation_id}:
+            raise GraphValidationError(
+                "mutation_actor", "dependency creator differs from mutation actor"
+            )
         pair = (edge.upstream_task_id, edge.downstream_task_id)
         if pair in existing_pairs:
             raise GraphValidationError("duplicate_edge", "mutation edge already exists")
@@ -451,15 +501,31 @@ def validate_mutation(
                 "foreign_edge_endpoint", "mutation edge endpoint is unavailable"
             )
         downstream = next(task for task in all_tasks if task.task_id == pair[1])
-        if downstream.attempt_count or downstream.state not in {
-            TaskState.PENDING,
-            TaskState.READY,
-        }:
+        new_ids = {item.task_id for item in request.tasks}
+        allowed_states = (
+            {TaskState.PENDING, TaskState.READY}
+            if downstream.task_id in new_ids
+            else {TaskState.PENDING}
+        )
+        if downstream.attempt_count or downstream.state not in allowed_states:
             raise GraphValidationError(
                 "dependency_after_claim",
-                "dependencies target only unclaimed pending/ready tasks",
+                "dependencies target only unclaimed pending tasks",
             )
     by_id = {task.task_id: task for task in all_tasks}
+    incoming: dict[str, set[str]] = defaultdict(set)
+    for edge in (*existing_dependencies, *request.dependencies):
+        incoming[edge.downstream_task_id].add(edge.upstream_task_id)
+    controls_by_id = {control.control_id: control for control in existing_controls}
+    if request.actor_kind == "human_policy" and (
+        len(request.tasks) != 1
+        or len(request.supersessions) != 1
+        or request.supersessions[0][1] != request.tasks[0].task_id
+    ):
+        raise GraphValidationError(
+            "human_mutation_not_allowed",
+            "human policy may create only one derived replacement task",
+        )
     for replaced_id, replacement_id in request.supersessions:
         if replaced_id not in by_id or replacement_id not in by_id:
             raise GraphValidationError(
@@ -467,18 +533,88 @@ def validate_mutation(
             )
         replaced = by_id[replaced_id]
         replacement = by_id[replacement_id]
-        if replaced.attempt_count or replaced.state not in {
+        if replaced.role is TaskRole.FINALIZER:
+            raise GraphValidationError(
+                "finalizer_immutable", "the reserved finalizer cannot be superseded"
+            )
+        if replaced.state not in {
             TaskState.PENDING,
             TaskState.READY,
             TaskState.BLOCKED,
+            TaskState.REVIEW,
         }:
             raise GraphValidationError(
-                "supersession_after_claim", "claimed task cannot be superseded"
+                "supersession_after_claim",
+                "running or terminal task cannot be superseded",
             )
-        if replacement.state not in {TaskState.PENDING, TaskState.READY}:
+        if replacement_id not in {item.task_id for item in request.tasks} or (
+            replacement.attempt_count
+            or replacement.state not in {TaskState.PENDING, TaskState.READY}
+        ):
             raise GraphValidationError(
                 "supersession_replacement", "replacement task is not unstarted"
             )
+        if replacement.supersedes_task_id not in {None, replaced_id}:
+            raise GraphValidationError(
+                "supersession_replacement", "replacement link differs from request"
+            )
+        if not incoming[replaced_id] <= incoming[replacement_id]:
+            raise GraphValidationError(
+                "supersession_dependency_loss",
+                "replacement task must preserve every incoming dependency",
+            )
+        if request.actor_kind == "human_policy" and replaced.state not in {
+            TaskState.BLOCKED,
+            TaskState.REVIEW,
+        }:
+            raise GraphValidationError(
+                "human_replacement_not_allowed",
+                "human policy replaces only blocked or review-waiting work",
+            )
+        if request.actor_kind == "human_policy":
+            expected_prefix = (
+                replaced.specification.description + "\n\nUntrusted human advisory: "
+            )
+            replacement_spec = replacement.specification
+            if (
+                replacement.role is not replaced.role
+                or replacement.execution_kind is not replaced.execution_kind
+                or replacement.priority != replaced.priority
+                or replacement_spec.title != replaced.specification.title
+                or not replacement_spec.description.startswith(expected_prefix)
+                or not replacement_spec.description.removeprefix(expected_prefix)
+                or replacement_spec.expected_result_contract
+                != replaced.specification.expected_result_contract
+                or replacement_spec.authority != replaced.specification.authority
+                or replacement_spec.budgets != replaced.specification.budgets
+                or replacement_spec.max_steps != replaced.specification.max_steps
+                or replacement_spec.max_wall_time_seconds
+                != replaced.specification.max_wall_time_seconds
+                or replacement_spec.created_by != request.actor_key
+            ):
+                raise GraphValidationError(
+                    "human_mutation_not_allowed",
+                    "human replacement must be derived from the immutable task policy",
+                )
+        if replaced.state in {TaskState.BLOCKED, TaskState.REVIEW}:
+            control = (
+                None
+                if replaced.latest_control_id is None
+                else controls_by_id.get(replaced.latest_control_id)
+            )
+            if control is None or control.state.value != "open":
+                raise GraphValidationError(
+                    "supersession_control_missing",
+                    "blocked replacement requires its exact open control",
+                )
+            if (
+                request.actor_kind == "planner_attempt"
+                and control.kind.value != "needs_replan"
+            ):
+                raise GraphValidationError(
+                    "control_requires_principal",
+                    "planner replacement cannot bypass a human-owned control",
+                )
     provisional_graph = JobGraph(
         agent_id=graph.agent_id,
         job_id=graph.job_id,
@@ -505,7 +641,119 @@ def validate_mutation(
         max_depth=max_depth,
         max_direct_parents=max_direct_parents,
     )
+    _validate_model_finalizer_join(
+        tuple(all_tasks), (*existing_dependencies, *request.dependencies)
+    )
+    _validate_task_input_references(
+        tuple(request.tasks),
+        (*existing_dependencies, *request.dependencies),
+        existing_results,
+    )
     return tuple(all_tasks)
+
+
+def _validate_contract_binding_coverage(task: GraphTask) -> None:
+    authority = task.specification.authority
+    material = authority.contract_bindings
+    nested_capabilities = material.get("capability_contracts")
+    nested_resources = material.get("resource_revisions")
+    nested_routes = material.get("model_routes")
+    if isinstance(nested_capabilities, Mapping):
+        capabilities = nested_capabilities
+        resources = nested_resources if isinstance(nested_resources, Mapping) else {}
+        routes = nested_routes if isinstance(nested_routes, Mapping) else {}
+    else:
+        capabilities = material
+        resources = material
+        routes = material
+    if any(
+        not isinstance(capabilities.get(item), str) for item in authority.capability_ids
+    ):
+        raise GraphValidationError(
+            "contract_binding_missing",
+            "task capability contract coverage is incomplete",
+        )
+    for resource_id in authority.resource_ids:
+        value = resources.get(resource_id)
+        if isinstance(value, Mapping):
+            value = value.get("resource_revision")
+        if not isinstance(value, str):
+            raise GraphValidationError(
+                "contract_binding_missing",
+                "task resource contract coverage is incomplete",
+            )
+    if any(not isinstance(routes.get(item), str) for item in authority.model_route_ids):
+        raise GraphValidationError(
+            "contract_binding_missing", "task model-route coverage is incomplete"
+        )
+
+
+def _validate_model_finalizer_join(
+    tasks: tuple[GraphTask, ...], dependencies: tuple[TaskDependency, ...]
+) -> None:
+    finalizer = next(task for task in tasks if task.role is TaskRole.FINALIZER)
+    if finalizer.execution_kind is not TaskExecutionKind.MODEL:
+        return
+    direct = {
+        edge.upstream_task_id
+        for edge in dependencies
+        if edge.downstream_task_id == finalizer.task_id
+    }
+    reduction_roots = {
+        task.task_id
+        for task in tasks
+        if task.task_id in direct
+        and task.specification.expected_result_contract.get("reduction") is True
+    }
+    parents: dict[str, set[str]] = defaultdict(set)
+    for edge in dependencies:
+        parents[edge.downstream_task_id].add(edge.upstream_task_id)
+
+    covered = set(direct)
+    frontier = list(reduction_roots)
+    while frontier:
+        current = frontier.pop()
+        for parent in parents[current]:
+            if parent not in covered:
+                covered.add(parent)
+                frontier.append(parent)
+    required = {
+        task.task_id
+        for task in tasks
+        if task.role is not TaskRole.FINALIZER
+        and task.state not in {TaskState.SUPERSEDED, TaskState.SKIPPED}
+    }
+    if not required <= covered:
+        raise GraphValidationError(
+            "finalizer_join_unbounded",
+            "model finalizer requires explicit bounded reduction ancestry",
+        )
+
+
+def _validate_task_input_references(
+    tasks: tuple[GraphTask, ...],
+    dependencies: tuple[TaskDependency, ...],
+    results: tuple[TaskResult, ...],
+) -> None:
+    accepted = {result.result_id: result.task_id for result in results}
+    parents: dict[str, set[str]] = defaultdict(set)
+    for edge in dependencies:
+        parents[edge.downstream_task_id].add(edge.upstream_task_id)
+    for task in tasks:
+        raw = task.specification.expected_result_contract.get("input_result_ids", ())
+        if not isinstance(raw, tuple) or any(not isinstance(item, str) for item in raw):
+            raise GraphValidationError(
+                "input_reference_invalid", "task input result references are malformed"
+            )
+        if any(
+            result_id not in accepted
+            or accepted[result_id] not in parents[task.task_id]
+            for result_id in raw
+        ):
+            raise GraphValidationError(
+                "input_reference_invalid",
+                "task input reference is not an accepted direct upstream result",
+            )
 
 
 def require_current_attempt(

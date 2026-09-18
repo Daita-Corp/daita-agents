@@ -792,6 +792,25 @@ class SQLiteStateStore:
             lambda connection: _draft_graph_store.apply_mutation(connection, request),
         )
 
+    async def request_graph_cancel(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        requested_at: datetime,
+        requested_by_id: str,
+    ) -> GraphJob | None:
+        return await _run_cancellation_safe_draft_transaction(
+            self.path,
+            lambda connection: _draft_graph_store.request_cancel(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                requested_at=requested_at,
+                requested_by_id=requested_by_id,
+            ),
+        )
+
     async def list_ready_graph_tasks(
         self,
         agent_id: str,
@@ -1085,6 +1104,7 @@ class SQLiteStateStore:
         *,
         claim_token: str,
         fencing_epoch: int,
+        replan_task: GraphTask | None = None,
     ) -> TaskControl:
         return await _run_cancellation_safe_draft_transaction(
             self.path,
@@ -1093,6 +1113,7 @@ class SQLiteStateStore:
                 control,
                 claim_token=claim_token,
                 fencing_epoch=fencing_epoch,
+                replan_task=replan_task,
             ),
         )
 

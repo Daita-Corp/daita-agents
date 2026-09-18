@@ -152,6 +152,12 @@ from ..jobs.capabilities import (
     JobCapabilityDomain,
     job_capability_declarations,
 )
+from ..jobs.graph.models import (
+    GraphAdmission,
+    GraphJob,
+    GraphMutation,
+    TaskControl,
+)
 from ..jobs.models import (
     JobCompletionOwnerKind,
     JobExecutionMode,
@@ -160,7 +166,7 @@ from ..jobs.models import (
     JobStatus,
     JobSummary,
 )
-from ..jobs.owner import JobOwner
+from ..jobs.owner import GraphBlockerProjection, JobOwner
 from ..jobs.supervisor import JobSupervisor
 from ..learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
@@ -3047,6 +3053,86 @@ class EmbeddedAgent:
     async def cancel_job(self, job_id: str) -> JobInspection | None:
         self._require_open()
         return await self._job_owner.cancel(job_id)
+
+    async def graph_blockers(self, job_id: str) -> GraphBlockerProjection | None:
+        self._require_open()
+        return await self._job_owner.graph_blockers(job_id)
+
+    async def answer_task_input(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        answer: Mapping[str, object],
+    ) -> TaskControl | None:
+        self._require_open()
+        return await self._job_owner.answer_graph_task_input(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            answer=answer,
+        )
+
+    async def reject_task_control(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        reason: str,
+    ) -> TaskControl | None:
+        self._require_open()
+        return await self._job_owner.reject_graph_task_control(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            reason=reason,
+        )
+
+    async def cancel_graph_job(
+        self, job_id: str, *, principal_id: str
+    ) -> GraphJob | None:
+        self._require_open()
+        return await self._job_owner.cancel_graph_job(job_id, principal_id=principal_id)
+
+    async def replace_graph_task_by_policy(
+        self,
+        job_id: str,
+        task_id: str,
+        *,
+        principal_id: str,
+        advisory_note: str,
+        idempotency_key: str,
+        expected_revision: int,
+    ) -> GraphMutation:
+        self._require_open()
+        return await self._job_owner.replace_graph_task_by_policy(
+            job_id,
+            task_id,
+            principal_id=principal_id,
+            advisory_note=advisory_note,
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+        )
+
+    async def start_authorized_replacement_job(
+        self,
+        admission: GraphAdmission,
+        *,
+        replaces_job_id: str,
+        principal_id: str,
+    ) -> GraphJob:
+        self._require_open()
+        return await self._job_owner.admit_authorized_replacement_graph(
+            admission,
+            replaces_job_id=replaces_job_id,
+            principal_id=principal_id,
+        )
 
     async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
         """Build and revalidate one non-persisted exact routine proposal."""

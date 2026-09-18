@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Protocol, cast
 
@@ -12,15 +13,23 @@ from ..llm.models import ModelSensitivity
 from ..loop.models import RunInput
 from .graph.models import (
     BudgetAmount,
+    ControlState,
     GraphAdmission,
     GraphEventPage,
     GraphInspection,
     GraphJob,
+    GraphMutation,
+    GraphMutationRequest,
+    GraphState,
+    GraphTask,
     TaskCheckpoint,
     TaskComment,
     TaskControl,
     TaskResult,
+    TaskState,
+    canonical_digest,
 )
+from .graph.planning import planner_task_from_template
 from .models import (
     MAX_JOB_DEADLINE_SECONDS,
     MAX_JOB_LIST_PAGE_SIZE,
@@ -79,6 +88,10 @@ class DraftGraphJobStore(Protocol):
         self, agent_id: str, job_id: str
     ) -> GraphInspection | None: ...
 
+    async def apply_graph_mutation(
+        self, request: GraphMutationRequest
+    ) -> GraphMutation: ...
+
     async def list_graph_events(
         self,
         agent_id: str,
@@ -116,7 +129,39 @@ class DraftGraphJobStore(Protocol):
         *,
         claim_token: str,
         fencing_epoch: int,
+        replan_task: GraphTask | None = None,
     ) -> TaskControl: ...
+
+    async def resolve_graph_control(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        state: ControlState,
+        resolved_at: datetime,
+        resolved_by_kind: str,
+        resolved_by_id: str,
+        resolution: dict[str, object],
+        make_ready: bool,
+    ) -> TaskControl | None: ...
+
+    async def request_graph_cancel(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        requested_at: datetime,
+        requested_by_id: str,
+    ) -> GraphJob | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class GraphBlockerProjection:
+    job_id: str
+    graph_state: GraphState
+    blockers: tuple[Mapping[str, object], ...]
 
 
 class JobOwner:
@@ -346,10 +391,302 @@ class JobOwner:
         self._notify(stored.job_id)
         return stored
 
+    async def admit_authorized_replacement_graph(
+        self,
+        admission: GraphAdmission,
+        *,
+        replaces_job_id: str,
+        principal_id: str,
+    ) -> GraphJob:
+        """Start a separately authorized job; never widen an existing root."""
+
+        prior = await self.inspect_graph(replaces_job_id)
+        if prior is None:
+            raise JobError("unknown_graph", "The replaced graph job is unavailable.")
+        if (
+            prior.job.specification.principal_id != principal_id
+            or admission.job.specification.principal_id != principal_id
+        ):
+            raise JobError(
+                "replacement_principal_mismatch",
+                "The replacement job principal differs from its authorization.",
+            )
+        job = replace(
+            admission.job,
+            migration_provenance={
+                **dict(admission.job.migration_provenance),
+                "replaces_job_id": replaces_job_id,
+                "authorized_by_principal": principal_id,
+            },
+        )
+        return await self.admit_static_graph(replace(admission, job=job))
+
     async def inspect_graph(self, job_id: str) -> GraphInspection | None:
         if not isinstance(job_id, str) or not job_id:
             raise ValueError("job_id must be non-empty text")
         return await self._graph_store().inspect_graph(self.agent_id, job_id)
+
+    async def mutate_graph(self, request: GraphMutationRequest) -> GraphMutation:
+        self._require_graph_record_owner(request.agent_id)
+        mutation = await self._graph_store().apply_graph_mutation(request)
+        self._notify(request.job_id)
+        return mutation
+
+    async def graph_blockers(self, job_id: str) -> GraphBlockerProjection | None:
+        inspection = await self.inspect_graph(job_id)
+        if inspection is None:
+            return None
+        open_controls: tuple[Mapping[str, object], ...] = tuple(
+            {
+                "control_id": control.control_id,
+                "task_id": control.task_id,
+                "kind": control.kind.value,
+                "created_at": control.created_at.isoformat(),
+                "payload_digest": control.payload_digest,
+                "payload": control.payload,
+            }
+            for control in inspection.controls
+            if control.state.value == "open"
+        )[:32]
+        failed: tuple[Mapping[str, object], ...] = tuple(
+            {
+                "task_id": task.task_id,
+                "kind": "failed_task",
+                "failure_streak": task.failure_streak,
+            }
+            for task in inspection.tasks
+            if task.state is TaskState.FAILED
+        )[:32]
+        return GraphBlockerProjection(
+            job_id=job_id,
+            graph_state=inspection.job.state,
+            blockers=(*open_controls, *failed)[:32],
+        )
+
+    async def answer_graph_task_input(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        answer: Mapping[str, object],
+    ) -> TaskControl | None:
+        inspection = await self.inspect_graph(job_id)
+        control = (
+            None
+            if inspection is None
+            else next(
+                (
+                    item
+                    for item in inspection.controls
+                    if item.task_id == task_id and item.control_id == control_id
+                ),
+                None,
+            )
+        )
+        if (
+            control is None
+            or control.state is not ControlState.OPEN
+            or control.kind.value != "needs_input"
+        ):
+            raise JobError(
+                "task_input_unavailable",
+                "The exact open human-input control is unavailable.",
+            )
+        assert inspection is not None
+        self._require_graph_principal(inspection, principal_id)
+        response_schema = control.payload.get("response_schema")
+        if isinstance(response_schema, Mapping):
+            from ..capabilities import (
+                ToolOutputValidationError,
+                validate_tool_schema_value,
+            )
+
+            try:
+                validate_tool_schema_value(response_schema, answer)
+            except (TypeError, ValueError, ToolOutputValidationError) as error:
+                raise JobError(
+                    "task_input_invalid",
+                    "The answer does not match the control's bounded response schema.",
+                ) from error
+        resolved = await self._graph_store().resolve_graph_control(
+            self.agent_id,
+            job_id,
+            task_id,
+            control_id,
+            state=ControlState.RESOLVED,
+            resolved_at=self._clock(),
+            resolved_by_kind="principal",
+            resolved_by_id=principal_id,
+            resolution={"answer": dict(answer)},
+            make_ready=True,
+        )
+        if resolved is not None:
+            self._notify(job_id)
+        return resolved
+
+    async def reject_graph_task_control(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        reason: str,
+    ) -> TaskControl | None:
+        inspection = await self.inspect_graph(job_id)
+        if inspection is None:
+            raise JobError("unknown_graph", "The graph job is unavailable.")
+        self._require_graph_principal(inspection, principal_id)
+        resolved = await self._graph_store().resolve_graph_control(
+            self.agent_id,
+            job_id,
+            task_id,
+            control_id,
+            state=ControlState.REJECTED,
+            resolved_at=self._clock(),
+            resolved_by_kind="principal",
+            resolved_by_id=principal_id,
+            resolution={"reason": reason},
+            make_ready=False,
+        )
+        if resolved is not None:
+            self._notify(job_id)
+        return resolved
+
+    async def cancel_graph_job(
+        self, job_id: str, *, principal_id: str
+    ) -> GraphJob | None:
+        inspection = await self.inspect_graph(job_id)
+        if inspection is None:
+            return None
+        self._require_graph_principal(inspection, principal_id)
+        cancelled = await self._graph_store().request_graph_cancel(
+            self.agent_id,
+            job_id,
+            requested_at=self._clock(),
+            requested_by_id=principal_id,
+        )
+        if cancelled is not None:
+            self._notify(job_id)
+        return cancelled
+
+    async def replace_graph_task_by_policy(
+        self,
+        job_id: str,
+        task_id: str,
+        *,
+        principal_id: str,
+        advisory_note: str,
+        idempotency_key: str,
+        expected_revision: int,
+    ) -> GraphMutation:
+        inspection = await self.inspect_graph(job_id)
+        if inspection is None:
+            raise JobError("unknown_graph", "The graph job is unavailable.")
+        self._require_graph_principal(inspection, principal_id)
+        if (
+            not isinstance(expected_revision, int)
+            or isinstance(expected_revision, bool)
+            or expected_revision < 0
+        ):
+            raise ValueError("replacement expected_revision must be non-negative")
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("replacement idempotency key must be non-empty text")
+        if (
+            not isinstance(advisory_note, str)
+            or not advisory_note.strip()
+            or len(advisory_note.encode("utf-8")) > 4096
+        ):
+            raise ValueError("replacement advisory note is outside its bound")
+        task = next(
+            (item for item in inspection.tasks if item.task_id == task_id), None
+        )
+        actor_key = principal_id
+        replacement_id = _stable_graph_id(
+            "task",
+            job_id=job_id,
+            actor_key=actor_key,
+            idempotency_key=idempotency_key,
+            discriminator=f"policy-replacement:{task_id}",
+        )
+        retrying_committed = (
+            task is not None
+            and task.state is TaskState.SUPERSEDED
+            and task.superseded_by_task_id == replacement_id
+        )
+        if task is None or (
+            task.state not in {TaskState.BLOCKED, TaskState.REVIEW}
+            and not retrying_committed
+        ):
+            raise JobError(
+                "replacement_not_allowed",
+                "Only blocked or review-waiting work has a policy replacement.",
+            )
+        now = self._clock()
+        replacement_spec = replace(
+            task.specification,
+            description=(
+                task.specification.description
+                + "\n\nUntrusted human advisory: "
+                + advisory_note
+            ),
+            created_by=actor_key,
+        )
+        replacement = replace(
+            task,
+            task_id=replacement_id,
+            state=TaskState.READY,
+            not_before=None,
+            current_attempt_id=None,
+            task_revision=1,
+            specification=replacement_spec,
+            task_spec_digest=replacement_spec.digest,
+            task_scope_digest=replacement_spec.authority.digest,
+            attempt_count=0,
+            fencing_epoch=0,
+            created_at=now,
+            updated_at=now,
+            terminal_at=None,
+            supersedes_task_id=task_id,
+            superseded_by_task_id=None,
+            latest_result_id=None,
+            latest_control_id=None,
+            latest_checkpoint_id=None,
+        )
+        mutation_id = _stable_graph_id(
+            "mutation",
+            job_id=job_id,
+            actor_key=actor_key,
+            idempotency_key=idempotency_key,
+            discriminator="policy-replacement",
+        )
+        dependencies = tuple(
+            replace(
+                edge,
+                downstream_task_id=replacement_id,
+                created_at=now,
+                creator_key=actor_key,
+                mutation_id=mutation_id,
+            )
+            for edge in inspection.dependencies
+            if edge.downstream_task_id == task_id
+        )
+        request = GraphMutationRequest(
+            agent_id=self.agent_id,
+            job_id=job_id,
+            mutation_id=mutation_id,
+            actor_kind="human_policy",
+            actor_key=actor_key,
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+            created_at=now,
+            tasks=(replacement,),
+            dependencies=dependencies,
+            supersessions=((task_id, replacement_id),),
+        )
+        return await self.mutate_graph(request)
 
     async def graph_events(
         self,
@@ -417,10 +754,21 @@ class JobOwner:
         fencing_epoch: int,
     ) -> TaskControl:
         self._require_graph_record_owner(control.agent_id)
+        replan_task = None
+        if control.kind.value == "needs_replan":
+            inspection = await self.inspect_graph(control.job_id)
+            if inspection is None:
+                raise JobError("unknown_graph", "The graph job is unavailable.")
+            replan_task = planner_task_from_template(
+                inspection,
+                task_id=self._id_factory("task"),
+                created_at=control.created_at,
+            )
         stored = await self._graph_store().open_graph_control(
             control,
             claim_token=claim_token,
             fencing_epoch=fencing_epoch,
+            replan_task=replan_task,
         )
         self._notify(control.job_id)
         return stored
@@ -428,6 +776,20 @@ class JobOwner:
     def _require_graph_record_owner(self, agent_id: str) -> None:
         if agent_id != self.agent_id:
             raise JobError("job_owner_mismatch", "The graph owner identity changed.")
+
+    @staticmethod
+    def _require_graph_principal(
+        inspection: GraphInspection, principal_id: str
+    ) -> None:
+        if (
+            not isinstance(principal_id, str)
+            or not principal_id
+            or inspection.job.specification.principal_id != principal_id
+        ):
+            raise JobError(
+                "graph_principal_mismatch",
+                "The graph principal identity differs from this command.",
+            )
 
     async def _load_owned(self, job_id: str) -> JobRun | None:
         if not isinstance(job_id, str) or not job_id:
@@ -442,14 +804,17 @@ class JobOwner:
         for method in (
             "admit_graph",
             "inspect_graph",
+            "apply_graph_mutation",
             "list_graph_events",
             "checkpoint_graph_attempt",
             "add_graph_comment",
             "complete_graph_attempt",
             "open_graph_control",
+            "resolve_graph_control",
+            "request_graph_cancel",
         ):
             if not callable(getattr(self._store, method, None)):
-                raise RuntimeError("draft graph store is unavailable")
+                raise TypeError("draft graph store is unavailable")
         return cast(DraftGraphJobStore, self._store)
 
 
@@ -462,4 +827,29 @@ def _sensitivity_rank(value: ModelSensitivity) -> int:
     }[value]
 
 
-__all__ = ["DraftGraphJobStore", "JobError", "JobOwner", "JobStore"]
+def _stable_graph_id(
+    prefix: str,
+    *,
+    job_id: str,
+    actor_key: str,
+    idempotency_key: str,
+    discriminator: str,
+) -> str:
+    digest = canonical_digest(
+        {
+            "job_id": job_id,
+            "actor_key": actor_key,
+            "idempotency_key": idempotency_key,
+            "discriminator": discriminator,
+        }
+    )
+    return f"{prefix}-{digest.removeprefix('sha256:')[:32]}"
+
+
+__all__ = [
+    "DraftGraphJobStore",
+    "GraphBlockerProjection",
+    "JobError",
+    "JobOwner",
+    "JobStore",
+]
