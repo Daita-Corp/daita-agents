@@ -43,6 +43,11 @@ from daita.capability_runtime import (
     InternalCapabilityRequest,
 )
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
+from daita.hosting.execution_governor import (
+    AdmissionLease,
+    RunAdmissionCoordinator,
+    WorkloadClass,
+)
 from daita.jobs.capabilities import (
     JOB_CANCEL_TOOL_NAME,
     JOB_DOMAIN_OWNER_ID,
@@ -80,7 +85,6 @@ from daita.jobs.models import (
     JobSpecification,
 )
 from daita.jobs.owner import JobOwner
-from daita.jobs.supervisor import _ProcessJobCapacity
 from daita.llm.models import (
     FinishReason,
     ModelResponse,
@@ -99,6 +103,19 @@ from tests.support.toolbox_model import (
 from tests.support.workspace import workspace_for
 
 EAGER_LIMITS = LoopLimits()
+
+
+async def _hold_background_execution_capacity(agent: Agent) -> list[AdmissionLease]:
+    coordinator = agent._embedded._admission_coordinator
+    return [
+        await coordinator.admit_execution(WorkloadClass.SYSTEM, f"held-job-{index}")
+        for index in range(4)
+    ]
+
+
+async def _release_execution_capacity(leases: list[AdmissionLease]) -> None:
+    while leases:
+        await leases.pop().release()
 
 
 class _OversizedInternalExecutor:
@@ -1114,10 +1131,6 @@ async def test_revoked_read_scope_is_rechecked_before_internal_executor_io(
 ) -> None:
     source_id, resource_id = await _seed_agent(tmp_path, "stage-b-scope-recheck")
     provider = MockModelProvider((_call(resource_id), _stop()))
-    held_capacity = 0
-    for _ in range(MAX_RUNNING_JOBS_GLOBAL):
-        assert _ProcessJobCapacity.acquire() is True
-        held_capacity += 1
     agent = await Agent.open(
         "stage-b-scope-recheck",
         root=tmp_path,
@@ -1126,6 +1139,7 @@ async def test_revoked_read_scope_is_rechecked_before_internal_executor_io(
         limits=EAGER_LIMITS,
         workspace=workspace_for(tmp_path),
     )
+    held_capacity = await _hold_background_execution_capacity(agent)
     _, executor = agent._embedded._capabilities.resolve_execution(
         DATA_PROFILE_EXECUTION_CAPABILITY_ID
     )
@@ -1145,7 +1159,10 @@ async def test_revoked_read_scope_is_rechecked_before_internal_executor_io(
         )
         job_id = _job_id(provider)
         queued = await agent.inspect_job(job_id)
-        assert queued is not None and queued.summary.status is JobStatus.QUEUED
+        assert queued is not None and queued.summary.status in {
+            JobStatus.QUEUED,
+            JobStatus.RUNNING,
+        }
         await agent._embedded._store.replace_source_permission_scopes(
             SourceReadScope(
                 agent_id=agent.id,
@@ -1154,9 +1171,7 @@ async def test_revoked_read_scope_is_rechecked_before_internal_executor_io(
             ),
             (),
         )
-        for _ in range(held_capacity):
-            _ProcessJobCapacity.release()
-        held_capacity = 0
+        await _release_execution_capacity(held_capacity)
         agent._embedded._job_supervisor.wake()
         terminal = await _terminal(agent, job_id)
         assert terminal.summary.status is JobStatus.NEEDS_ATTENTION
@@ -1164,8 +1179,7 @@ async def test_revoked_read_scope_is_rechecked_before_internal_executor_io(
         assert executor_calls == 0
         assert await agent.read_job_result(job_id) is None
     finally:
-        for _ in range(held_capacity):
-            _ProcessJobCapacity.release()
+        await _release_execution_capacity(held_capacity)
         await agent.close()
 
 
@@ -1175,10 +1189,6 @@ async def test_external_start_revalidates_current_scope_after_persisting_intent(
     source_id, resource_id = await _seed_agent(tmp_path, "stage-b-external-scope")
     profile = _OfflineProfile()
     provider = MockModelProvider((_call(resource_id), _stop()))
-    held_capacity = 0
-    for _ in range(MAX_RUNNING_JOBS_GLOBAL):
-        assert _ProcessJobCapacity.acquire() is True
-        held_capacity += 1
     agent = await Agent.open(
         "stage-b-external-scope",
         root=tmp_path,
@@ -1188,6 +1198,7 @@ async def test_external_start_revalidates_current_scope_after_persisting_intent(
         connected_job_profiles=(profile,),
         workspace=workspace_for(tmp_path),
     )
+    held_capacity = await _hold_background_execution_capacity(agent)
     try:
         await agent.run(
             "Queue selected external work before scope revocation.",
@@ -1203,9 +1214,7 @@ async def test_external_start_revalidates_current_scope_after_persisting_intent(
             ),
             (),
         )
-        for _ in range(held_capacity):
-            _ProcessJobCapacity.release()
-        held_capacity = 0
+        await _release_execution_capacity(held_capacity)
         agent._embedded._job_supervisor.wake()
         terminal = await _terminal(agent, job_id)
         assert terminal.summary.status is JobStatus.NEEDS_ATTENTION
@@ -1216,8 +1225,7 @@ async def test_external_start_revalidates_current_scope_after_persisting_intent(
         assert intent.disposition is ExternalIntentDisposition.REJECTED
         assert intent.reason_code == "resource_read_not_allowed"
     finally:
-        for _ in range(held_capacity):
-            _ProcessJobCapacity.release()
+        await _release_execution_capacity(held_capacity)
         await agent.close()
 
 
@@ -1326,7 +1334,7 @@ async def test_internal_runtime_reuses_result_bounds_and_failure_observation() -
     assert events[-1].data["error_code"] == "tool_result_too_large"
 
 
-def test_job_pressure_constants_and_process_global_boundary_are_exact() -> None:
+async def test_job_pressure_constants_and_host_admission_boundary_are_exact() -> None:
     assert (
         MAX_JOBS_PER_AGENT,
         MAX_ACTIVE_JOBS_PER_AGENT,
@@ -1342,10 +1350,28 @@ def test_job_pressure_constants_and_process_global_boundary_are_exact() -> None:
         MAX_JOB_LIST_PAGE_SIZE,
     ) == (256, 52, 48, 4, 8, 2, 64 * 1024, 3, 32, 300.0, 3_600.0, 50)
 
-    acquired = tuple(_ProcessJobCapacity.acquire() for _ in range(9))
-    assert acquired == (True,) * 8 + (False,)
-    for _ in range(8):
-        _ProcessJobCapacity.release()
+    coordinator = RunAdmissionCoordinator(
+        execution_capacity=5,
+        foreground_execution_reserve=1,
+    )
+    background = [
+        await coordinator.admit_execution(WorkloadClass.SYSTEM, f"job-{index}")
+        for index in range(4)
+    ]
+    with pytest.raises(TimeoutError):
+        await coordinator.admit_execution(
+            WorkloadClass.SYSTEM,
+            "job-overflow",
+            absolute_deadline=asyncio.get_running_loop().time() + 0.01,
+        )
+    foreground = await coordinator.admit_execution(
+        WorkloadClass.FOREGROUND,
+        "foreground",
+        conversation_id="conversation",
+    )
+    await foreground.release()
+    await _release_execution_capacity(background)
+    await coordinator.close(deadline=asyncio.get_running_loop().time() + 1)
 
 
 async def test_queue_limit_is_inclusive_and_overflow_fails_before_claim(

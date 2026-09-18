@@ -1445,6 +1445,8 @@ class GraphInspection:
     attempts: tuple[TaskAttempt, ...]
     results: tuple[TaskResult, ...]
     controls: tuple[TaskControl, ...]
+    checkpoints: tuple[TaskCheckpoint, ...] = ()
+    comments: tuple[TaskComment, ...] = ()
     budget_ledgers: tuple[BudgetLedger, ...] = ()
     events: tuple[GraphEvent, ...] = ()
     delivery_ids: tuple[str, ...] = ()

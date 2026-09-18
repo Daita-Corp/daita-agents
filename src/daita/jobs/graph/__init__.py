@@ -1,5 +1,8 @@
 """Jobs-owned records and validation for the unregistered draft task graph."""
 
+from .admission import InitialTaskProposal
+from .context import TaskContextBundle
+from .guard import SQLiteTaskAttemptGuard
 from .models import (
     AttemptBudgetReservation,
     AttemptState,
@@ -70,16 +73,19 @@ __all__ = [
     "GraphTaskSpecification",
     "GraphValidationError",
     "JobGraph",
+    "InitialTaskProposal",
     "MutationDecision",
     "TaskAttempt",
     "TaskCheckpoint",
     "TaskComment",
+    "TaskContextBundle",
     "TaskControl",
     "TaskDependency",
     "TaskExecutionKind",
     "TaskResult",
     "TaskRole",
     "TaskState",
+    "SQLiteTaskAttemptGuard",
     "require_attempt_transition",
     "require_graph_transition",
     "require_task_transition",

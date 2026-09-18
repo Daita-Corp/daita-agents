@@ -16,6 +16,7 @@ from ...capabilities import (
     EffectEvidenceBasis,
     EffectObservation,
     EffectReceiptPolicy,
+    ExecutionAdmissionPolicy,
     Executor,
     OperationalEffect,
     ToolboxId,
@@ -934,6 +935,14 @@ def _query_declarations(
         executor_id=DATA_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        execution_admission_policy=ExecutionAdmissionPolicy(
+            shape="relational_read",
+            inline_eligible=True,
+            graph_v1_eligible=True,
+            target_count_argument="resource_ids",
+            inline_max_targets=4,
+            graph_max_targets=16,
+        ),
     )
     view = ToolView(
         name=DATA_QUERY_TOOL_NAME,

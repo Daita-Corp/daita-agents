@@ -184,7 +184,10 @@ def test_phase_one_removed_global_run_state_without_graph_cutover():
 
     assert "self._run_lock" not in embedded
     assert "def _run_locked" not in embedded
-    assert "execution_capacity=1" in embedded
+    assert "execution_capacity=5" in embedded
+    assert "foreground_execution_reserve=1" in embedded
+    assert "provider_capacity=2" in embedded
+    assert "foreground_provider_reserve=1" in embedded
     assert "_files_only_runs" not in _python_text(PACKAGE)
     assert "_selected_learning_candidates" not in context
     assert "self._selected" not in learning
@@ -196,7 +199,7 @@ def test_phase_one_removed_global_run_state_without_graph_cutover():
     assert "_source_permission_lock" in embedded
     assert "HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1,)" in migrations
     assert "CREATE TABLE graph_" not in schema
-    assert "JOB_TASK" not in _python_text(PACKAGE)
+    assert "REVISION_2" not in migrations
 
 
 def test_draft_graph_kernel_is_unregistered_and_unreachable_from_composition():
@@ -226,7 +229,8 @@ def test_draft_graph_kernel_is_unregistered_and_unreachable_from_composition():
     assert "claim_graph_task" not in production_roots
     assert "start_graph_integration" not in production_roots
     assert "start_graph_integration" in graph_supervisor
-    assert "RunOrigin.JOB_TASK" not in _python_text(PACKAGE)
+    assert "RunOrigin.JOB_TASK" in graph_supervisor
+    assert "start_graph_job" not in production_roots
 
 
 def test_common_runtime_has_one_owner_and_no_domain_dependencies():
@@ -1002,8 +1006,6 @@ def test_semantics_use_existing_storage_context_and_runtime_owners():
     schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
-    terminal = (PACKAGE / "terminal.py").read_text(encoding="utf-8")
-
     assert _class_owners("SemanticAnnotation") == {"semantics.py"}
     assert _class_owners("SemanticSubject") == {"semantics.py"}
     assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
@@ -1015,7 +1017,12 @@ def test_semantics_use_existing_storage_context_and_runtime_owners():
     assert "_bind_current_evidence" in semantics
     assert "render_semantic_recall" in context
     assert "semantic_declarations(identity.id, store)" in embedded
-    assert "mutation_lock=mutation_lock" in embedded
+    assert "owner_management_locks" in embedded
+    assert "MEMORY_DOMAIN_OWNER_ID: memory_lock" in embedded
+    assert "SKILL_DOMAIN_OWNER_ID: skill_lock" in embedded
+    assert "_mutation_lock" not in (PACKAGE / "capability_runtime.py").read_text(
+        encoding="utf-8"
+    )
     controller = (PACKAGE / "tui" / "controller.py").read_text(encoding="utf-8")
     assert "/memory [list|show <id>|edit [id]|accept <id>|" in controller
     assert "/knowledge" not in _python_text(PACKAGE)

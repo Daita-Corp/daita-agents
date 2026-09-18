@@ -60,6 +60,8 @@ from .draft_graph_codecs import (
     decode_graph_task,
     decode_job_graph,
     decode_task_attempt,
+    decode_task_checkpoint,
+    decode_task_comment,
     decode_task_control,
     decode_task_dependency,
     decode_task_result,
@@ -754,6 +756,24 @@ def inspect_graph(
             (agent_id, job_id),
         )
     )
+    checkpoints = tuple(
+        decode_task_checkpoint(_required_text(row[0], "task checkpoint payload"))
+        for row in connection.execute(
+            """SELECT data FROM job_task_checkpoints
+               WHERE agent_id = ? AND job_id = ?
+               ORDER BY created_at_us, checkpoint_id""",
+            (agent_id, job_id),
+        )
+    )
+    comments = tuple(
+        decode_task_comment(_required_text(row[0], "task comment payload"))
+        for row in connection.execute(
+            """SELECT data FROM job_task_comments
+               WHERE agent_id = ? AND job_id = ?
+               ORDER BY created_at_us, comment_id""",
+            (agent_id, job_id),
+        )
+    )
     graph = loaded_graph[0]
     _require_projection(graph.task_count == len(tasks), "inspection task count")
     _require_projection(graph.edge_count == len(dependencies), "inspection edge count")
@@ -769,6 +789,8 @@ def inspect_graph(
         attempts=attempts,
         results=results,
         controls=controls,
+        checkpoints=checkpoints,
+        comments=comments,
         budget_ledgers=list_budget_ledgers(connection, agent_id, job_id),
         events=list_graph_events(
             connection,
@@ -2008,14 +2030,48 @@ def checkpoint_attempt(
     return checkpoint
 
 
-def add_comment(connection: sqlite3.Connection, comment: TaskComment) -> TaskComment:
+def add_comment(
+    connection: sqlite3.Connection,
+    comment: TaskComment,
+    *,
+    attempt_id: str | None = None,
+    claim_token: str | None = None,
+    fencing_epoch: int | None = None,
+) -> TaskComment:
     loaded_job = _load_job(connection, comment.agent_id, comment.job_id)
-    if (
-        loaded_job is None
-        or _load_task(connection, comment.agent_id, comment.job_id, comment.task_id)
-        is None
-    ):
+    loaded_task = _load_task(
+        connection, comment.agent_id, comment.job_id, comment.task_id
+    )
+    if loaded_job is None or loaded_task is None:
         raise GraphValidationError("unknown_task", "comment task is unavailable")
+    guarded = (attempt_id, claim_token, fencing_epoch)
+    if any(item is not None for item in guarded):
+        if any(item is None for item in guarded):
+            raise ValueError("attempt-guarded comment identity must be complete")
+        assert attempt_id is not None
+        assert claim_token is not None
+        assert fencing_epoch is not None
+        loaded_attempt = _load_attempt(
+            connection,
+            comment.agent_id,
+            comment.job_id,
+            comment.task_id,
+            attempt_id,
+        )
+        if loaded_attempt is None:
+            raise GraphValidationError(
+                "stale_attempt", "comment attempt is unavailable"
+            )
+        require_current_attempt(
+            task=loaded_task[0],
+            attempt=loaded_attempt[0],
+            claim_token=claim_token,
+            fencing_epoch=fencing_epoch,
+        )
+        if loaded_attempt[0].state is not AttemptState.RUNNING:
+            raise GraphValidationError(
+                "attempt_not_running", "only a running attempt may comment"
+            )
     count = connection.execute(
         """SELECT COUNT(*) FROM job_task_comments
            WHERE agent_id = ? AND job_id = ? AND task_id = ?""",
@@ -2394,6 +2450,7 @@ def fail_attempt(
     failed_at: datetime,
     retryable: bool,
     reason_code: str,
+    attempt_state: AttemptState = AttemptState.FAILED,
 ) -> TaskAttempt | None:
     loaded_job = _load_job(connection, agent_id, job_id)
     loaded_graph = _load_graph(connection, agent_id, job_id)
@@ -2421,10 +2478,16 @@ def fail_attempt(
     measured_usage = _settle_budgets(
         connection, attempt=attempt, usage=None, settled_at=failed_at
     )
-    require_attempt_transition(attempt.state, AttemptState.FAILED)
+    if attempt_state not in {
+        AttemptState.FAILED,
+        AttemptState.PROTOCOL_VIOLATION,
+        AttemptState.TIMED_OUT,
+    }:
+        raise ValueError("failure settlement attempt state is invalid")
+    require_attempt_transition(attempt.state, attempt_state)
     failed_attempt = replace(
         attempt,
-        state=AttemptState.FAILED,
+        state=attempt_state,
         lease_expires_at=None,
         ended_at=failed_at,
         error_code=reason_code,
@@ -2434,6 +2497,9 @@ def fail_attempt(
     _replace_attempt(connection, attempt_data, failed_attempt)
     can_retry = (
         retryable
+        and (
+            attempt_state is not AttemptState.PROTOCOL_VIOLATION or attempt.ordinal < 2
+        )
         and job.desired_state is GraphDesiredState.RUN
         and task.attempt_count < job.specification.limits.max_attempts_per_task
         and job.deadline_at > failed_at

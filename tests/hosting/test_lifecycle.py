@@ -124,6 +124,15 @@ async def test_close_rejects_a_queued_run_before_releasing_writer_ownership(tmp_
         model_profile=provider.model_profile,
         workspace=workspace_for(tmp_path),
     )
+    coordinator = agent._embedded._admission_coordinator
+    background_leases = [
+        await coordinator.admit_execution(
+            WorkloadClass.SYSTEM,
+            f"saturating-background-{index}",
+            absolute_deadline=asyncio.get_running_loop().time() + 2,
+        )
+        for index in range(4)
+    ]
     active = asyncio.create_task(agent.run("active run"))
     await asyncio.wait_for(provider.started.wait(), timeout=1)
     queued = asyncio.create_task(agent.run("queued run"))
@@ -135,6 +144,8 @@ async def test_close_rejects_a_queued_run_before_releasing_writer_ownership(tmp_
     await asyncio.wait_for(active, timeout=1)
     with pytest.raises(AgentHomeError, match="closed"):
         await asyncio.wait_for(queued, timeout=1)
+    for lease in background_leases:
+        await lease.release()
     await asyncio.wait_for(closing, timeout=1)
 
     reopened_provider = _BlockingProvider()
@@ -252,7 +263,7 @@ async def test_same_conversation_turns_bind_predecessor_and_include_prior_result
     "operation",
     ("detach", "refresh", "apply_permissions", "candidate_review"),
 )
-async def test_foreground_run_serializes_owned_host_mutations_but_not_inspection(
+async def test_foreground_run_does_not_hold_a_broad_host_mutation_lock(
     tmp_path,
     operation: str,
 ):
@@ -297,15 +308,17 @@ async def test_foreground_run_serializes_owned_host_mutations_but_not_inspection
         )
     else:
         mutation = asyncio.create_task(agent.review_learning_candidates())
-    await asyncio.sleep(0)
-
-    assert not mutation.done()
-    assert await asyncio.wait_for(agent.list_sources(), timeout=1) == (source,)
+    mutation_result = await asyncio.wait_for(mutation, timeout=1)
+    listed_sources = await asyncio.wait_for(agent.list_sources(), timeout=1)
+    if operation == "detach":
+        assert listed_sources == (mutation_result,)
+        assert not listed_sources[0].active
+    else:
+        assert listed_sources == (source,)
     assert await asyncio.wait_for(
         agent.list_catalog_resources(source_id=source.id), timeout=1
     )
 
     provider.release.set()
     await asyncio.wait_for(run, timeout=1)
-    await asyncio.wait_for(mutation, timeout=1)
     await asyncio.wait_for(agent.close(), timeout=1)

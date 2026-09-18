@@ -34,6 +34,7 @@ from ..capabilities import (
     EffectObservation,
     EffectOutcome,
     EffectReceiptPolicy,
+    ExecutionAdmissionPolicy,
     Executor,
     OperationalEffect,
     ToolExecution,
@@ -945,6 +946,16 @@ async def activate_mcp_domain(
                 and tool.automation_eligibility
                 is AutomationEligibility.AUTOMATION_DIRECT
                 else None
+            ),
+            execution_admission_policy=ExecutionAdmissionPolicy(
+                shape="read_only_mcp",
+                inline_eligible=True,
+                graph_v1_eligible=(tool.operational_effect is OperationalEffect.NONE),
+                target_count_argument=None,
+                inline_max_targets=1,
+                graph_max_targets=(
+                    1 if tool.operational_effect is OperationalEffect.NONE else 0
+                ),
             ),
         )
         for item in activated

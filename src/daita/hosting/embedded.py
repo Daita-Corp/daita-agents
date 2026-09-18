@@ -779,7 +779,6 @@ class EmbeddedAgent:
         artifact_store: AgentHomeArtifactStore,
         artifact_delivery: LocalArtifactDelivery | None,
         candidate_acceptance_supported: bool,
-        mutation_lock: asyncio.Lock,
         admission_coordinator: RunAdmissionCoordinator,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
@@ -844,10 +843,17 @@ class EmbeddedAgent:
         self._candidate_acceptance_supported = candidate_acceptance_supported
         self._clock = clock
         self._id_factory = id_factory
-        self._mutation_lock = mutation_lock
         self._admission_coordinator = admission_coordinator
+        self._model_management_lock = asyncio.Lock()
+        self._effect_resolution_lock = asyncio.Lock()
+        self._routine_management_lock = asyncio.Lock()
+        self._artifact_publication_lock = asyncio.Lock()
+        self._semantic_management_lock = asyncio.Lock()
+        self._credential_management_lock = asyncio.Lock()
         self._mcp_management_lock = asyncio.Lock()
+        self._mcp_commit_lock = asyncio.Lock()
         self._source_management_lock = asyncio.Lock()
+        self._source_commit_lock = asyncio.Lock()
         self._source_permission_lock = asyncio.Lock()
         self._source_permission_confirmation_key = secrets.token_bytes(32)
         self._source_permission_previews: dict[str, SourcePermissionsPreview] = {}
@@ -1422,8 +1428,23 @@ class EmbeddedAgent:
             if workspace_backend is None
             else local_file_declarations(workspace_backend)
         )
-        mutation_lock = asyncio.Lock()
-        admission_coordinator = RunAdmissionCoordinator(execution_capacity=1)
+        memory_lock = asyncio.Lock()
+        skill_lock = asyncio.Lock()
+        source_capacities = {
+            f"source:{registration.id}": (
+                2 if registration.adapter_id == "postgresql" else 1
+            )
+            for registration in await store.list_sources(identity.id)
+            if registration.active
+        }
+        admission_coordinator = RunAdmissionCoordinator(
+            execution_capacity=5,
+            foreground_execution_reserve=1,
+            provider_capacity=2,
+            foreground_provider_reserve=1,
+            source_resource_capacities=source_capacities,
+            sqlite_pressure_capacity=4,
+        )
         model = _admit_host_model(
             model,
             admission_coordinator,
@@ -1438,8 +1459,8 @@ class EmbeddedAgent:
             identity=identity.id,
             home=home,
         )
-        memory_store = MemoryStore(home, mutation_lock)
-        skill_store = SkillStore(home, mutation_lock)
+        memory_store = MemoryStore(home, memory_lock)
+        skill_store = SkillStore(home, skill_lock)
         resolved_reviewer_model = reviewer_model
         resolved_reviewer_profile = reviewer_profile
         owned_reviewer_model: ManagedModelProvider | None = None
@@ -1808,7 +1829,12 @@ class EmbeddedAgent:
             effect_receipts=store,
             execution_contract_reader=read_execution_contracts,
             approval_handler=approval_handler,
-            mutation_lock=mutation_lock,
+            admission_coordinator=admission_coordinator,
+            effect_coordinator=admission_coordinator.effect_coordinator,
+            owner_management_locks={
+                MEMORY_DOMAIN_OWNER_ID: memory_lock,
+                SKILL_DOMAIN_OWNER_ID: skill_lock,
+            },
             source_scope_resolver=resolve_run_sources,
             observer=observer,
             clock=clock,
@@ -1831,6 +1857,7 @@ class EmbeddedAgent:
                 if job.specification.execution_mode is JobExecutionMode.DAITA
                 else None
             ),
+            admission_coordinator=admission_coordinator,
         )
         job_owner.bind_wake(job_supervisor.wake)
         resolved_context = context_builder
@@ -2021,7 +2048,6 @@ class EmbeddedAgent:
                 isinstance(resolved_context, AgentContextBuilder)
                 and resolved_tools is capability_runtime
             ),
-            mutation_lock=mutation_lock,
             admission_coordinator=admission_coordinator,
             model_profile=model_profile,
             model_route=model_route,
@@ -2132,7 +2158,7 @@ class EmbeddedAgent:
             raise ValueError("provider credential exceeds its 64 KiB bound")
 
         async with self._admit_owned_system_work(
-            "model-validation", self._mutation_lock
+            "model-validation", self._model_management_lock
         ):
             self._require_open()
             try:
@@ -2969,7 +2995,7 @@ class EmbeddedAgent:
                 )
             if await self._approval_handler(request) is not ApprovalDecision.APPROVE:
                 raise PermissionError("the effect recovery decision was denied")
-            async with self._mutation_lock:
+            async with self._effect_resolution_lock:
                 self._require_open()
                 current = await self.inspect_effect(receipt_id)
                 if (
@@ -3069,7 +3095,7 @@ class EmbeddedAgent:
                 or await confirmation_handler(request) is not ApprovalDecision.APPROVE
             ):
                 raise PermissionError("the routine creation was not approved")
-        async with self._mutation_lock:
+        async with self._routine_management_lock:
             self._require_open()
             if (
                 await self._routine_owner.proposal_authority_snapshot(proposal)
@@ -3132,7 +3158,7 @@ class EmbeddedAgent:
                 or await confirmation_handler(request) is not ApprovalDecision.APPROVE
             ):
                 raise PermissionError("the routine revision was not approved")
-        async with self._mutation_lock:
+        async with self._routine_management_lock:
             self._require_open()
             if (
                 await self._routine_owner.proposal_authority_snapshot(proposal)
@@ -3251,7 +3277,7 @@ class EmbeddedAgent:
         expected_revision: int,
         action: RoutineControlAction,
     ) -> ScheduledRoutine:
-        async with self._mutation_lock:
+        async with self._routine_management_lock:
             self._require_open()
             return await self._routine_owner.control(
                 routine_id,
@@ -3298,7 +3324,7 @@ class EmbeddedAgent:
         *,
         filename: str | None = None,
     ) -> ArtifactDeliveryReceipt:
-        async with self._mutation_lock:
+        async with self._artifact_publication_lock:
             self._require_open()
             return await self._require_artifact_delivery().save_public(
                 artifact_id,
@@ -3307,7 +3333,7 @@ class EmbeddedAgent:
             )
 
     async def export_destination(self) -> ArtifactDestination:
-        async with self._mutation_lock:
+        async with self._artifact_publication_lock:
             self._require_open()
             return await self._require_artifact_delivery().export_destination()
 
@@ -3315,14 +3341,14 @@ class EmbeddedAgent:
         self,
         directory: Path,
     ) -> ArtifactDestination:
-        async with self._mutation_lock:
+        async with self._artifact_publication_lock:
             self._require_open()
             return await self._require_artifact_delivery().set_export_destination(
                 directory
             )
 
     async def reset_export_destination(self) -> ArtifactDestination:
-        async with self._mutation_lock:
+        async with self._artifact_publication_lock:
             self._require_open()
             return await self._require_artifact_delivery().reset_export_destination()
 
@@ -3579,7 +3605,7 @@ class EmbeddedAgent:
     ) -> bool:
         if not isinstance(annotation, SemanticAnnotation):
             raise TypeError("annotation must be SemanticAnnotation")
-        async with self._mutation_lock:
+        async with self._semantic_management_lock:
             self._require_open()
             if annotation.agent_id != self.identity.id:
                 raise ValueError("semantic annotation belongs to another agent")
@@ -3599,7 +3625,7 @@ class EmbeddedAgent:
         *,
         expected_sha256: str,
     ) -> bool:
-        async with self._mutation_lock:
+        async with self._semantic_management_lock:
             self._require_open()
             return await self._store.delete_semantic_annotation(
                 self.identity.id,
@@ -3657,7 +3683,7 @@ class EmbeddedAgent:
     ) -> MCPServerInspection:
         """Inspect one exact endpoint without persisting execution authority."""
 
-        async with self._mutation_lock:
+        async with self._mcp_commit_lock:
             self._require_open()
             return await self._inspect_mcp_endpoint(
                 endpoint=endpoint,
@@ -3684,7 +3710,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "mcp-attach", self._mcp_management_lock
         ):
-            async with self._mutation_lock:
+            async with self._mcp_commit_lock:
                 self._require_open()
                 current = await self._store.load_mcp_binding(
                     self.identity.id,
@@ -3722,7 +3748,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "mcp-discovery", self._mcp_management_lock
         ):
-            async with self._mutation_lock:
+            async with self._mcp_commit_lock:
                 self._require_open()
                 return await self._store.update_mcp_discovery(
                     self.identity.id,
@@ -3743,7 +3769,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-discovery", self._source_management_lock
         ):
-            async with self._mutation_lock:
+            async with self._source_commit_lock:
                 self._require_open()
                 return await self._store.update_source_discovery(
                     self.identity.id,
@@ -3775,7 +3801,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "mcp-refresh", self._mcp_management_lock
         ):
-            async with self._mutation_lock:
+            async with self._mcp_commit_lock:
                 self._require_open()
                 current = await self._store.load_mcp_binding(
                     self.identity.id,
@@ -3805,7 +3831,7 @@ class EmbeddedAgent:
     async def revoke_mcp_server(self, binding_id: str) -> MCPBindingStatus:
         """Make one binding immediately unavailable without affecting siblings."""
 
-        async with self._mutation_lock:
+        async with self._mcp_commit_lock:
             self._require_open()
             activated = self._mcp_activated_bindings.get(binding_id)
             if activated is None:
@@ -3877,7 +3903,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-attach", self._source_management_lock
         ):
-            async with self._mutation_lock:
+            async with self._source_commit_lock:
                 self._require_open()
                 return await self._attach_source_locked(
                     source,
@@ -3936,6 +3962,10 @@ class EmbeddedAgent:
                 discovery.snapshot,
                 registration=registration,
             )
+            self._admission_coordinator.configure_source_resource_capacity(
+                f"source:{registration.id}",
+                2 if registration.adapter_id == "postgresql" else 1,
+            )
             return registration
         except BaseException as error:
             if isinstance(error, ResourceAdapterError):
@@ -3980,7 +4010,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-edit", self._source_management_lock
         ):
-            async with self._mutation_lock:
+            async with self._source_commit_lock:
                 self._require_open()
                 current = await self._store.load_source(self.identity.id, source_id)
                 if current is None or not current.active:
@@ -4136,7 +4166,7 @@ class EmbeddedAgent:
             or len(password.encode("utf-8")) > 64 * 1_024
         ):
             raise ValueError("PostgreSQL password must be non-empty and at most 64 KiB")
-        async with self._mutation_lock:
+        async with self._credential_management_lock:
             self._require_open()
             reference = SecretReference.keychain(
                 _credential_account(
@@ -4175,7 +4205,7 @@ class EmbeddedAgent:
             raise ValueError(
                 "credential does not belong to this agent's PostgreSQL setup"
             )
-        async with self._mutation_lock:
+        async with self._credential_management_lock:
             self._require_open()
             await self._keychain.delete(reference)
 
@@ -4276,7 +4306,7 @@ class EmbeddedAgent:
     ) -> SourcePermissionsInspection:
         """Inspect exact scopes against complete trusted current catalog truth."""
 
-        async with self._mutation_lock:
+        async with self._source_commit_lock:
             self._require_open()
             return await self._inspect_source_permissions_locked(source_id)
 
@@ -4293,7 +4323,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-permission-preview", self._source_permission_lock
         ):
-            async with self._mutation_lock:
+            async with self._source_commit_lock:
                 self._require_open()
                 inspection = await self._inspect_source_permissions_locked(source_id)
                 preview = await self._build_source_permissions_preview(
@@ -4316,7 +4346,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-permission-apply", self._source_permission_lock
         ):
-            async with self._mutation_lock:
+            async with self._source_commit_lock:
                 self._require_open()
                 preview = self._source_permission_previews.get(source_id)
                 if preview is None or not hmac.compare_digest(
@@ -4731,7 +4761,7 @@ class EmbeddedAgent:
     async def relational_upsert_readiness(
         self, source_id: str, resource_id: str
     ) -> FrozenJsonObject:
-        async with self._mutation_lock:
+        async with self._source_commit_lock:
             self._require_open()
             permission = await self._data_view.load_relational_write_scope(
                 self.identity.id, source_id, resource_id
@@ -4769,7 +4799,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-detach", self._source_management_lock
         ):
-            async with self._mutation_lock:
+            async with self._source_commit_lock:
                 self._require_open()
                 detached = await self._store.detach_source(
                     self.identity.id, source_id, self._clock()
@@ -4796,7 +4826,7 @@ class EmbeddedAgent:
         async with self._admit_owned_system_work(
             "source-refresh", self._source_management_lock
         ):
-            async with self._mutation_lock:
+            async with self._source_commit_lock:
                 self._require_open()
                 registration = await self._store.load_source(
                     self.identity.id, source_id
@@ -4828,7 +4858,7 @@ class EmbeddedAgent:
     async def catalog_summary(self) -> CatalogSummary:
         """Return current committed catalog facts as one consistent projection."""
 
-        async with self._mutation_lock:
+        async with self._source_commit_lock:
             self._require_open()
             return await self._catalog_service.summary(self.identity.id)
 
@@ -4839,7 +4869,7 @@ class EmbeddedAgent:
     ) -> tuple[CatalogResource, ...]:
         """Return a bounded deterministic preview from current catalog truth."""
 
-        async with self._mutation_lock:
+        async with self._source_commit_lock:
             self._require_open()
             return await self._catalog_service.preview(
                 self.identity.id,
@@ -4942,8 +4972,6 @@ class EmbeddedAgent:
             if first_error is not None:
                 raise error from first_error
             raise
-        async with self._mutation_lock:
-            pass
         owned_model_provider = self._owned_model_provider
         model_shutdown_deadline = (
             asyncio.get_running_loop().time()

@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import threading
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime, timedelta
+from decimal import Decimal
 from functools import partial
 from hashlib import sha256
 from typing import TypeVar
@@ -27,7 +27,15 @@ from ..artifacts.models import (
     artifact_ref_to_mapping,
 )
 from ..artifacts.store import AgentHomeArtifactStore
-from ..capabilities import CapabilityInputError
+from ..capabilities import (
+    AccessMode,
+    CapabilityInputError,
+    ExecutionContractBindings,
+    ExecutionScope,
+    ExecutionScopeKind,
+    GraphTaskBinding,
+    OperationalEffect,
+)
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
 from ..distribution.models import (
     ArtifactRequirement,
@@ -38,9 +46,21 @@ from ..distribution.models import (
 from ..distribution.owner import DistributionOwner, construct_graph_job_delivery
 from ..hosting.execution_governor import RunAdmissionCoordinator, WorkloadClass
 from ..llm.models import ModelSensitivity
-from ..loop.models import RunInput
+from ..loop.driver import AgentLoop
+from ..loop.models import (
+    InstructionAuthority,
+    LoopExitKind,
+    RunInput,
+    RunOrigin,
+    RunStartEnvelope,
+)
+from ..loop.session import RunCancellationToken, RunSession, RunSessionOptions
+from ..loop.transcripts import RunSessionWriter
 from ..storage.sqlite import SQLiteStateStore
+from .graph.context import TaskContextBundle
+from .graph.guard import SQLiteTaskAttemptGuard
 from .graph.models import (
+    AttemptState,
     BudgetAmount,
     GraphInspection,
     GraphTask,
@@ -76,29 +96,8 @@ _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
 _DEFAULT_POLL_SECONDS = 0.05
 _PROFILE_WORK_KIND = "data_profile_work"
 _PROFILE_FINALIZER_KIND = "data_profile_finalizer"
+_GRAPH_RESULT_FINALIZER_KIND = "graph_result_finalizer"
 _T = TypeVar("_T")
-
-
-class _ProcessJobCapacity:
-    """The exact process-local global running-job bound."""
-
-    _lock = threading.Lock()
-    _in_use = 0
-
-    @classmethod
-    def acquire(cls) -> bool:
-        with cls._lock:
-            if cls._in_use >= MAX_RUNNING_JOBS_GLOBAL:
-                return False
-            cls._in_use += 1
-            return True
-
-    @classmethod
-    def release(cls) -> None:
-        with cls._lock:
-            if cls._in_use < 1:
-                raise RuntimeError("global job capacity was released without a claim")
-            cls._in_use -= 1
 
 
 class JobSupervisor:
@@ -120,6 +119,7 @@ class JobSupervisor:
         distribution: DistributionOwner | None = None,
         graph_parallelism: int = 1,
         graph_heartbeat_seconds: float = 10.0,
+        graph_model_loop: AgentLoop | None = None,
         poll_seconds: float = _DEFAULT_POLL_SECONDS,
     ) -> None:
         if not isinstance(agent_id, str) or not agent_id:
@@ -160,6 +160,10 @@ class JobSupervisor:
         self._admission_coordinator = admission_coordinator
         self._distribution = distribution
         self._graph_parallelism = graph_parallelism
+        if graph_model_loop is not None and not isinstance(graph_model_loop, AgentLoop):
+            raise TypeError("graph model loop must be AgentLoop or None")
+        self._graph_model_loop = graph_model_loop
+        self._graph_model_gate = asyncio.Semaphore(2)
         self._graph_heartbeat_seconds = float(graph_heartbeat_seconds)
         self._poll_seconds = float(poll_seconds)
         self._wake = asyncio.Event()
@@ -170,6 +174,8 @@ class JobSupervisor:
         self._graph_driver: asyncio.Task[None] | None = None
         self._graph_workers: dict[tuple[str, str], asyncio.Task[None]] = {}
         self._graph_wake = asyncio.Event()
+        self._last_graph_dispatch_job_id: str | None = None
+        self._consecutive_graph_dispatches = 0
         self._closing = False
 
     async def start(self) -> None:
@@ -453,6 +459,11 @@ class JobSupervisor:
                 limit=64,
             )
         )
+        ready = _fair_graph_dispatch_order(
+            ready,
+            last_job_id=self._last_graph_dispatch_job_id,
+            consecutive=self._consecutive_graph_dispatches,
+        )
         for task in ready:
             key = (task.job_id, task.task_id)
             if key in self._graph_workers:
@@ -462,6 +473,11 @@ class JobSupervisor:
                 name=f"daita-graph-task:{task.job_id}:{task.task_id}",
             )
             self._graph_workers[key] = worker
+            if task.job_id == self._last_graph_dispatch_job_id:
+                self._consecutive_graph_dispatches += 1
+            else:
+                self._last_graph_dispatch_job_id = task.job_id
+                self._consecutive_graph_dispatches = 1
 
             def done(completed: asyncio.Task[None], *, key=key) -> None:
                 self._graph_workers.pop(key, None)
@@ -487,7 +503,7 @@ class JobSupervisor:
             if inspection is None:
                 return
             current_task = _inspection_task(inspection, selected.task_id)
-            contract = _internal_task_contract(current_task)
+            contract = _graph_task_contract(current_task)
             attempt_id = self._id_factory("attempt")
             claim_token = self._id_factory("claim")
             run_id = _required_generated_id(
@@ -510,7 +526,7 @@ class JobSupervisor:
                         attempt_id=attempt_id,
                         claim_token=claim_token,
                         run_id=run_id,
-                        executor_id=str(contract["capability_id"]),
+                        executor_id=str(contract["executor_id"]),
                         claimed_at=claimed_at,
                         lease_seconds=30,
                         absolute_deadline_at=absolute_deadline,
@@ -550,6 +566,7 @@ class JobSupervisor:
             except asyncio.CancelledError:
                 raise
             except Exception as error:
+                failure = error
                 current = await self._graph_store_call(
                     lambda: self._store.inspect_graph(
                         self._agent_id, current_task.job_id
@@ -570,8 +587,16 @@ class JobSupervisor:
                         claim_token=started.claim_token,
                         fencing_epoch=started.fencing_epoch,
                         failed_at=self._clock(),
-                        retryable=_graph_failure_is_retryable(error),
-                        reason_code=_safe_graph_failure_code(error),
+                        retryable=(
+                            getattr(failure, "code", None) == "protocol_violation"
+                            or _graph_failure_is_retryable(failure)
+                        ),
+                        reason_code=_safe_graph_failure_code(failure),
+                        attempt_state=(
+                            AttemptState.PROTOCOL_VIOLATION
+                            if getattr(failure, "code", None) == "protocol_violation"
+                            else AttemptState.FAILED
+                        ),
                     )
                 )
             finally:
@@ -674,6 +699,9 @@ class JobSupervisor:
         task: GraphTask,
         attempt: TaskAttempt,
     ) -> None:
+        if task.execution_kind is TaskExecutionKind.MODEL:
+            await self._execute_model_graph_attempt(inspection, task, attempt)
+            return
         contract = _internal_task_contract(task)
         reservation = reserved_artifact_id(attempt.attempt_id)
         recovered = await self._artifacts.read_reserved(attempt.run_id, reservation)
@@ -703,6 +731,13 @@ class JobSupervisor:
             arguments=arguments,
             sensitivity=task.specification.authority.sensitivity,
             reserved_artifact_id=reservation,
+            task_attempt_guard=_graph_attempt_guard(
+                self._store,
+                inspection,
+                task,
+                attempt,
+                clock=self._clock,
+            ),
         )
         permit_key = contract.get("source_permit_key")
         try:
@@ -745,6 +780,229 @@ class JobSupervisor:
             payload.content,
         )
 
+    async def _execute_model_graph_attempt(
+        self,
+        inspection: GraphInspection,
+        task: GraphTask,
+        attempt: TaskAttempt,
+    ) -> None:
+        if self._graph_model_loop is None:
+            raise CapabilityInputError(
+                "graph_model_executor_unavailable",
+                "The explicit graph integration has no model-task executor.",
+            )
+        current = await self._graph_store_call(
+            lambda: self._store.inspect_graph(self._agent_id, task.job_id)
+        )
+        if current is None:
+            raise CapabilityInputError(
+                "stale_task_attempt", "The graph task disappeared before execution."
+            )
+        current_task = _inspection_task(current, task.task_id)
+        current_attempt = next(
+            (
+                item
+                for item in current.attempts
+                if item.task_id == task.task_id
+                and item.attempt_id == attempt.attempt_id
+            ),
+            None,
+        )
+        if current_attempt is None:
+            raise CapabilityInputError(
+                "stale_task_attempt", "The graph task attempt is unavailable."
+            )
+        contract = _model_task_contract(current_task)
+        guard = _graph_attempt_guard(
+            self._store,
+            current,
+            current_task,
+            current_attempt,
+            clock=self._clock,
+        )
+        scope = _model_task_execution_scope(
+            current,
+            current_task,
+            current_attempt,
+            guard.binding,
+            contract,
+        )
+        context = _task_context_bundle(
+            current,
+            current_task,
+            current_attempt,
+            guard.binding,
+            created_at=self._clock(),
+        )
+        instruction = (
+            "Execute the exact frozen graph task from the code-owned task context. "
+            "Use one exclusive lifecycle terminator to finish."
+        )
+        payload = {"task_context_digest": context.digest}
+        start = RunStartEnvelope(
+            origin=RunOrigin.JOB_TASK,
+            instruction_authority=InstructionAuthority.CODE_OWNED,
+            trusted_instruction_id=f"graph-task:{current_attempt.attempt_id}",
+            trusted_instruction=instruction,
+            instruction_digest="sha256:"
+            + sha256(instruction.encode("utf-8")).hexdigest(),
+            untrusted_payload=payload,
+            payload_digest=canonical_digest(payload),
+            execution_scope=scope,
+        )
+        run = RunInput(
+            id=current_attempt.run_id,
+            agent_id=current_attempt.agent_id,
+            message=instruction,
+            created_at=current_attempt.started_at or self._clock(),
+            conversation_id=_task_conversation_id(
+                current_attempt.job_id, current_attempt.attempt_id
+            ),
+            source_scope_ids=current_task.specification.authority.source_ids,
+            start=start,
+            history_sensitivity=current_task.specification.authority.sensitivity,
+        )
+        remaining = max(
+            0.001,
+            (current_attempt.absolute_deadline_at - self._clock()).total_seconds(),
+        )
+        session = RunSession(
+            run=run,
+            writer=RunSessionWriter(self._store, run, bind_predecessor=False),
+            absolute_deadline=asyncio.get_running_loop().time() + remaining,
+            cancellation=RunCancellationToken(),
+            options=RunSessionOptions(
+                task_context=context,
+                task_attempt_guard=guard,
+            ),
+            admission_lease=None,
+            budget_reservations=current_attempt.reserved_budgets,
+        )
+        async with self._graph_model_gate:
+            exit = await self._graph_model_loop.run(session, prior_messages=())
+        if exit.kind is LoopExitKind.MACHINE_TERMINATED:
+            settled = await self._graph_store_call(
+                lambda: self._store.inspect_graph(
+                    self._agent_id, current_attempt.job_id
+                )
+            )
+            if settled is None:
+                raise CapabilityInputError(
+                    "stale_task_attempt", "The terminated task cannot be authenticated."
+                )
+            stored_attempt = next(
+                (
+                    item
+                    for item in settled.attempts
+                    if item.attempt_id == current_attempt.attempt_id
+                ),
+                None,
+            )
+            if stored_attempt is None or stored_attempt.state not in {
+                AttemptState.SUCCEEDED,
+                AttemptState.BLOCKED,
+                AttemptState.REVIEW_REQUESTED,
+            }:
+                raise CapabilityInputError(
+                    "task_termination_not_committed",
+                    "The machine lifecycle termination has no matching durable transition.",
+                )
+            await self._reauthenticate_machine_termination(
+                settled,
+                current_task,
+                current_attempt,
+                exit.reason,
+            )
+            return
+        if exit.reason == "protocol_violation":
+            error = CapabilityInputError(
+                "protocol_violation",
+                "A graph task returned normal text instead of a lifecycle terminator.",
+            )
+            raise error
+        raise CapabilityInputError(
+            exit.reason,
+            "The graph model task did not reach an authenticated lifecycle transition.",
+        )
+
+    async def _reauthenticate_machine_termination(
+        self,
+        inspection: GraphInspection,
+        original_task: GraphTask,
+        attempt: TaskAttempt,
+        directive_kind: str,
+    ) -> None:
+        """Bind the terminal transcript result to the exact durable transition."""
+
+        expected_states = {
+            "task_completed": AttemptState.SUCCEEDED,
+            "task_blocked": AttemptState.BLOCKED,
+            "task_review_requested": AttemptState.REVIEW_REQUESTED,
+        }
+        expected_state = expected_states.get(directive_kind)
+        if expected_state is None:
+            raise CapabilityInputError(
+                "task_termination_not_committed",
+                "The machine termination kind is not a graph lifecycle directive.",
+            )
+        stored_attempt = next(
+            (
+                item
+                for item in inspection.attempts
+                if item.attempt_id == attempt.attempt_id
+            ),
+            None,
+        )
+        stored_task = _inspection_task(inspection, original_task.task_id)
+        transcript = await self._store.load(attempt.run_id)
+        pairs = transcript.tool_pairs
+        if not pairs or pairs[-1][1] is None or pairs[-1][1].is_error:
+            raise CapabilityInputError(
+                "task_termination_not_committed",
+                "The machine termination lacks its authenticated tool result.",
+            )
+        terminal = pairs[-1][1]
+        assert terminal is not None
+        data = terminal.output.get("data")
+        if not isinstance(data, Mapping):
+            raise CapabilityInputError(
+                "task_termination_not_committed",
+                "The machine termination output is malformed.",
+            )
+        record_id = data.get("record_id")
+        result_matches = any(
+            item.result_id == record_id
+            and item.task_id == stored_task.task_id
+            and item.attempt_id == attempt.attempt_id
+            and item.run_id == attempt.run_id
+            for item in inspection.results
+        )
+        control_matches = any(
+            item.control_id == record_id
+            and item.task_id == stored_task.task_id
+            and item.requesting_attempt_id == attempt.attempt_id
+            for item in inspection.controls
+        )
+        record_matches = (
+            result_matches
+            if expected_state is AttemptState.SUCCEEDED
+            else control_matches
+        )
+        if (
+            stored_attempt is None
+            or stored_attempt.state is not expected_state
+            or data.get("job_id") != attempt.job_id
+            or data.get("task_id") != attempt.task_id
+            or data.get("attempt_id") != attempt.attempt_id
+            or data.get("fencing_epoch") != attempt.fencing_epoch
+            or data.get("committed_task_revision") != stored_task.task_revision
+            or not record_matches
+        ):
+            raise CapabilityInputError(
+                "task_termination_not_committed",
+                "The machine directive differs from its exact durable lifecycle record.",
+            )
+
     def _graph_execution_arguments(
         self,
         inspection: GraphInspection,
@@ -771,7 +1029,23 @@ class JobSupervisor:
         work_results: list[dict[str, object]] = []
         for task_id in required_task_ids:
             result = accepted.get(task_id)
-            if result is None or len(result.artifact_ids) != 1:
+            if result is None:
+                raise ValueError("the finalizer barrier has an incomplete result")
+            if contract["kind"] == _GRAPH_RESULT_FINALIZER_KIND:
+                work_results.append(
+                    {
+                        "task_id": task_id,
+                        "result_id": result.result_id,
+                        "result_digest": result.result_digest,
+                        "result_kind": result.result_kind,
+                        "summary": result.summary,
+                        "payload": result.payload,
+                        "artifact_ids": result.artifact_ids,
+                        "sensitivity": result.sensitivity.value,
+                    }
+                )
+                continue
+            if len(result.artifact_ids) != 1:
                 raise ValueError("the finalizer barrier has an incomplete result")
             raw_refs = result.provenance.get("artifact_refs")
             if not isinstance(raw_refs, tuple) or len(raw_refs) != 1:
@@ -784,6 +1058,11 @@ class JobSupervisor:
                     "artifact_ref": raw_refs[0],
                 }
             )
+        if contract["kind"] == _GRAPH_RESULT_FINALIZER_KIND:
+            return {
+                "job_id": inspection.job.job_id,
+                "work_results": tuple(work_results),
+            }
         resource_ids = contract.get("resource_ids")
         sample_rows = contract.get("sample_rows")
         if not isinstance(resource_ids, tuple) or not isinstance(sample_rows, int):
@@ -812,15 +1091,29 @@ class JobSupervisor:
             content,
             capability_id=str(contract["capability_id"]),
         )
-        payload = _profile_result_payload(
-            content,
-            job_id=inspection.job.job_id,
-            expected_resource_ids=(
-                task.specification.authority.resource_ids
-                if contract["kind"] == _PROFILE_WORK_KIND
-                else _contract_resource_ids(contract)
-            ),
-        )
+        if contract["kind"] == _GRAPH_RESULT_FINALIZER_KIND:
+            payload = _generic_graph_result_payload(
+                content,
+                job_id=inspection.job.job_id,
+            )
+            summary = (
+                f"Aggregated {payload['accepted_result_count']} authenticated "
+                "graph task result(s)."
+            )
+        else:
+            payload = _profile_result_payload(
+                content,
+                job_id=inspection.job.job_id,
+                expected_resource_ids=(
+                    task.specification.authority.resource_ids
+                    if contract["kind"] == _PROFILE_WORK_KIND
+                    else _contract_resource_ids(contract)
+                ),
+            )
+            summary = (
+                f"Profiled {payload['profiled_resources']} exact resource(s) with "
+                f"{payload['sampled_rows']} sampled row(s)."
+            )
         completed_at = self._clock()
         result = _graph_task_result(
             task=task,
@@ -830,6 +1123,7 @@ class JobSupervisor:
             payload=payload,
             artifact=artifact,
             completed_at=completed_at,
+            summary=summary,
         )
         if task.role is TaskRole.FINALIZER:
             await self._finalize_graph_result(inspection, attempt, result, artifact)
@@ -873,12 +1167,19 @@ class JobSupervisor:
         contract = _internal_task_contract(
             _inspection_task(inspection, attempt.task_id)
         )
+        generic_result = contract["kind"] == _GRAPH_RESULT_FINALIZER_KIND
         requirement = ArtifactRequirement(
             required=True,
             minimum_count=1,
             maximum_count=1,
             allowed_media_types=("application/json",),
-            allowed_authorships=(ArtifactAuthorship.EXACT_SOURCE_DATA,),
+            allowed_authorships=(
+                (
+                    ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
+                    if generic_result
+                    else ArtifactAuthorship.EXACT_SOURCE_DATA
+                ),
+            ),
             allowed_producer_capability_ids=(str(contract["capability_id"]),),
             maximum_artifact_bytes=1 * 1024 * 1024,
             maximum_total_bytes=1 * 1024 * 1024,
@@ -892,7 +1193,7 @@ class JobSupervisor:
                 inspection.job.specification.authority.sensitivity
             ),
             require_current_run_provenance=True,
-            require_exact_source_bindings=True,
+            require_exact_source_bindings=not generic_result,
         )
         artifact_references = validate_outcome_artifact_references(
             (outcome_artifact_reference(artifact),),
@@ -1003,7 +1304,7 @@ class JobSupervisor:
                 is not JobExecutionMode.CONNECTED_EXECUTOR
             ):
                 continue
-            if not _ProcessJobCapacity.acquire():
+            if len(self._workers) >= MAX_RUNNING_JOBS_GLOBAL:
                 return
             self._launch(job)
 
@@ -1014,7 +1315,7 @@ class JobSupervisor:
                 statuses=frozenset({JobStatus.QUEUED}),
                 limit=1,
             )
-            if not queued or not _ProcessJobCapacity.acquire():
+            if not queued or len(self._workers) >= MAX_RUNNING_JOBS_GLOBAL:
                 return
             claimed: JobRun | None = None
             try:
@@ -1035,10 +1336,8 @@ class JobSupervisor:
                     lease_seconds=300.0,
                 )
             except BaseException:
-                _ProcessJobCapacity.release()
                 raise
             if claimed is None:
-                _ProcessJobCapacity.release()
                 return
             self._launch(claimed)
 
@@ -1056,7 +1355,6 @@ class JobSupervisor:
             self._workers.pop(job.job_id, None)
             self._worker_modes.pop(job.job_id, None)
             self._cancel_events.pop(job.job_id, None)
-            _ProcessJobCapacity.release()
             if not completed.cancelled():
                 completed.exception()
             self._wake.set()
@@ -1064,6 +1362,22 @@ class JobSupervisor:
         task.add_done_callback(done)
 
     async def _run_claimed(
+        self,
+        job: JobRun,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        coordinator = self._admission_coordinator
+        if coordinator is None:
+            await self._run_claimed_admitted(job, cancel_event)
+            return
+        lease = await coordinator.admit_execution(
+            WorkloadClass.SYSTEM,
+            f"legacy-job:{job.job_id}",
+        )
+        async with lease:
+            await self._run_claimed_admitted(job, cancel_event)
+
+    async def _run_claimed_admitted(
         self,
         job: JobRun,
         cancel_event: asyncio.Event,
@@ -1568,7 +1882,11 @@ def _internal_task_contract(task: GraphTask) -> Mapping[str, object]:
     capability_id = contract.get("capability_id")
     contract_digest = contract.get("contract_digest")
     output_kind = contract.get("output_kind")
-    if kind not in {_PROFILE_WORK_KIND, _PROFILE_FINALIZER_KIND}:
+    if kind not in {
+        _PROFILE_WORK_KIND,
+        _PROFILE_FINALIZER_KIND,
+        _GRAPH_RESULT_FINALIZER_KIND,
+    }:
         raise ValueError("the graph task kind is outside the static slice")
     if any(
         not isinstance(value, str) or not value
@@ -1577,16 +1895,308 @@ def _internal_task_contract(task: GraphTask) -> Mapping[str, object]:
         raise ValueError("the internal graph task contract is malformed")
     assert isinstance(capability_id, str)
     assert isinstance(contract_digest, str)
-    if kind == _PROFILE_FINALIZER_KIND and task.role is not TaskRole.FINALIZER:
+    if (
+        kind
+        in {
+            _PROFILE_FINALIZER_KIND,
+            _GRAPH_RESULT_FINALIZER_KIND,
+        }
+        and task.role is not TaskRole.FINALIZER
+    ):
         raise ValueError("the profile finalizer contract is not reserved")
     if kind == _PROFILE_WORK_KIND and task.role is TaskRole.FINALIZER:
         raise ValueError("the reserved finalizer cannot execute work")
     if capability_id not in task.specification.authority.capability_ids:
         raise ValueError("the task capability exceeds its immutable authority")
-    binding = task.specification.authority.contract_bindings.get(capability_id)
+    binding = _execution_contract_bindings(
+        task.specification.authority
+    ).capability_contracts.get(capability_id)
     if binding != contract_digest:
         raise ValueError("the task capability digest differs from its authority")
     return contract
+
+
+def _model_task_contract(task: GraphTask) -> Mapping[str, object]:
+    if task.execution_kind is not TaskExecutionKind.MODEL:
+        raise ValueError("the graph task is not model-driven")
+    contract = task.specification.expected_result_contract
+    if contract.get("kind") != "model_task":
+        raise ValueError("the model graph task contract is malformed")
+    route_id = contract.get("model_route_id")
+    max_tokens = contract.get("per_run_max_tokens")
+    max_cost = contract.get("per_run_max_cost_usd")
+    if (
+        not isinstance(route_id, str)
+        or route_id not in task.specification.authority.model_route_ids
+        or not isinstance(max_tokens, int)
+        or isinstance(max_tokens, bool)
+        or max_tokens < 1
+        or not isinstance(max_cost, str)
+    ):
+        raise ValueError("the model graph task route or budget is malformed")
+    try:
+        cost = Decimal(max_cost)
+    except Exception as error:
+        raise ValueError("the model graph task cost budget is malformed") from error
+    if not cost.is_finite() or cost < 0:
+        raise ValueError("the model graph task cost budget is malformed")
+    return {**contract, "executor_id": route_id}
+
+
+def _graph_task_contract(task: GraphTask) -> Mapping[str, object]:
+    if task.execution_kind is TaskExecutionKind.MODEL:
+        return _model_task_contract(task)
+    contract = _internal_task_contract(task)
+    return {**contract, "executor_id": str(contract["capability_id"])}
+
+
+def _graph_attempt_guard(
+    store: SQLiteStateStore,
+    inspection: GraphInspection,
+    task: GraphTask,
+    attempt: TaskAttempt,
+    *,
+    clock: Callable[[], datetime],
+) -> SQLiteTaskAttemptGuard:
+    binding = GraphTaskBinding(
+        agent_id=attempt.agent_id,
+        job_id=attempt.job_id,
+        root_authority_digest=inspection.job.specification.authority.digest,
+        task_id=attempt.task_id,
+        task_revision=task.task_revision,
+        task_spec_digest=task.task_spec_digest,
+        task_scope_digest=task.task_scope_digest,
+        attempt_id=attempt.attempt_id,
+        claim_token_digest="sha256:"
+        + sha256(attempt.claim_token.encode("utf-8")).hexdigest(),
+        fencing_epoch=attempt.fencing_epoch,
+        graph_revision_at_claim=inspection.graph.revision,
+        task_role=task.role.value,
+        task_deadline_at=attempt.absolute_deadline_at,
+        job_deadline_at=inspection.job.deadline_at,
+        budget_reservation_identity=canonical_digest(
+            {
+                "attempt_id": attempt.attempt_id,
+                "reservations": tuple(
+                    {
+                        "dimension": item.dimension,
+                        "amount": item.amount,
+                    }
+                    for item in attempt.reserved_budgets
+                ),
+            }
+        ),
+    )
+    return SQLiteTaskAttemptGuard(
+        store=store,
+        binding=binding,
+        claim_token=attempt.claim_token,
+        run_id=attempt.run_id,
+        clock=clock,
+    )
+
+
+def _model_task_execution_scope(
+    inspection: GraphInspection,
+    task: GraphTask,
+    attempt: TaskAttempt,
+    binding: GraphTaskBinding,
+    contract: Mapping[str, object],
+) -> ExecutionScope:
+    authority = task.specification.authority
+    bindings = _execution_contract_bindings(authority)
+    max_tokens = contract["per_run_max_tokens"]
+    if not isinstance(max_tokens, int) or isinstance(max_tokens, bool):
+        raise ValueError("the model graph task token budget is malformed")
+    access_modes = frozenset(
+        AccessMode(item) for item in authority.access_modes
+    ) | frozenset({AccessMode.NONE})
+    return ExecutionScope(
+        scope_id=f"graph-scope:{attempt.attempt_id}",
+        revision=1,
+        agent_id=attempt.agent_id,
+        principal_id=inspection.job.specification.principal_id,
+        grant_id=f"graph-attempt:{attempt.attempt_id}",
+        job_id=attempt.job_id,
+        job_revision=inspection.graph.revision + 1,
+        allowed_source_ids=authority.source_ids,
+        allowed_resource_ids=authority.resource_ids,
+        allowed_capability_ids=authority.capability_ids,
+        allowed_access_modes=access_modes,
+        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
+        sensitivity_ceiling=authority.sensitivity,
+        eligible_model_routes=authority.model_route_ids,
+        per_run_max_cost_usd=Decimal(str(contract["per_run_max_cost_usd"])),
+        per_run_max_tokens=max_tokens,
+        distribution_plan_digest=inspection.job.specification.distribution_plan_digest,
+        contract_bindings=bindings,
+        allowed_connector_binding_ids=authority.connector_ids,
+        scope_kind=ExecutionScopeKind.GRAPH_TASK,
+        graph_task_binding=binding,
+    )
+
+
+def _execution_contract_bindings(authority) -> ExecutionContractBindings:
+    material = authority.contract_bindings
+    nested = material.get("capability_contracts")
+    if isinstance(nested, Mapping):
+        capability_contracts = dict(nested)
+        raw_resources = material.get("resource_revisions", {})
+        raw_routes = material.get("model_routes", {})
+        raw_origins = material.get("tool_origins", {})
+        if not all(
+            isinstance(item, Mapping)
+            for item in (raw_resources, raw_routes, raw_origins)
+        ):
+            raise ValueError("graph execution contract bindings are malformed")
+        return ExecutionContractBindings(
+            capability_contracts=capability_contracts,
+            resource_revisions=dict(raw_resources),
+            model_routes=dict(raw_routes),
+            tool_origins=dict(raw_origins),
+        )
+    capabilities: dict[str, str] = {}
+    for capability_id in authority.capability_ids:
+        value = material.get(capability_id)
+        if not isinstance(value, str):
+            raise ValueError("graph capability contract binding is unavailable")
+        capabilities[capability_id] = value
+    resources: dict[str, str] = {}
+    for resource_id in authority.resource_ids:
+        value = material.get(resource_id)
+        if not isinstance(value, Mapping):
+            raise ValueError("graph resource contract binding is unavailable")
+        revision = value.get("resource_revision")
+        if not isinstance(revision, str):
+            raise ValueError("graph resource revision binding is unavailable")
+        resources[resource_id] = revision
+    routes: dict[str, str] = {}
+    for route_id in authority.model_route_ids:
+        value = material.get(route_id)
+        if not isinstance(value, str):
+            raise ValueError("graph model route contract binding is unavailable")
+        routes[route_id] = value
+    return ExecutionContractBindings(
+        capability_contracts=capabilities,
+        resource_revisions=resources,
+        model_routes=routes,
+    )
+
+
+def _task_context_bundle(
+    inspection: GraphInspection,
+    task: GraphTask,
+    attempt: TaskAttempt,
+    binding: GraphTaskBinding,
+    *,
+    created_at: datetime,
+) -> TaskContextBundle:
+    parent_ids = {
+        edge.upstream_task_id
+        for edge in inspection.dependencies
+        if edge.downstream_task_id == task.task_id
+    }
+    parents = tuple(
+        {
+            "task_id": result.task_id,
+            "result_id": result.result_id,
+            "result_kind": result.result_kind,
+            "summary": result.summary,
+            "payload": result.payload,
+            "result_digest": result.result_digest,
+            "sensitivity": result.sensitivity.value,
+            "artifact_ids": result.artifact_ids,
+            "provenance": result.provenance,
+        }
+        for result in inspection.results
+        if result.task_id in parent_ids
+    )
+    prior = tuple(
+        {
+            "attempt_id": item.attempt_id,
+            "ordinal": item.ordinal,
+            "state": item.state.value,
+            "error_code": item.error_code,
+            "diagnostic": item.diagnostic,
+            "checkpoint_ids": item.checkpoint_ids,
+            "measured_usage": tuple(
+                {"dimension": usage.dimension, "amount": usage.amount}
+                for usage in item.measured_usage
+            ),
+        }
+        for item in sorted(
+            (
+                value
+                for value in inspection.attempts
+                if value.task_id == task.task_id
+                and value.attempt_id != attempt.attempt_id
+            ),
+            key=lambda value: value.ordinal,
+        )[-2:]
+    )
+    checkpoints = tuple(
+        {
+            "attempt_id": item.attempt_id,
+            "checkpoint_id": item.checkpoint_id,
+            "ordinal": item.ordinal,
+            "milestone": item.milestone,
+            "payload": item.payload,
+            "payload_digest": item.payload_digest,
+        }
+        for item in inspection.checkpoints
+        if item.task_id == task.task_id
+    )[-8:]
+    comments = tuple(
+        {
+            "comment_id": item.comment_id,
+            "author_kind": item.author_kind,
+            "body": item.body,
+            "body_digest": item.body_digest,
+            "sensitivity": item.sensitivity.value,
+        }
+        for item in inspection.comments
+        if item.task_id == task.task_id
+    )[-16:]
+    try:
+        return TaskContextBundle(
+            binding=binding,
+            root_objective=inspection.job.specification.objective,
+            outcome_contract=inspection.job.specification.outcome_contract,
+            task_specification=task.specification.digest_material(),
+            parent_results=parents,
+            prior_attempts=prior,
+            checkpoints=checkpoints,
+            comments=comments,
+            created_at=created_at,
+        )
+    except ValueError as error:
+        if "aggregate byte bound" not in str(error):
+            raise
+        bounded_parents = tuple(
+            {
+                key: value
+                for key, value in parent.items()
+                if key not in {"payload", "provenance"}
+            }
+            | {"omitted_payload_digest": parent["result_digest"]}
+            for parent in parents
+        )
+        return TaskContextBundle(
+            binding=binding,
+            root_objective=inspection.job.specification.objective,
+            outcome_contract=inspection.job.specification.outcome_contract,
+            task_specification=task.specification.digest_material(),
+            parent_results=bounded_parents,
+            prior_attempts=prior,
+            checkpoints=checkpoints,
+            comments=comments,
+            created_at=created_at,
+        )
+
+
+def _task_conversation_id(job_id: str, attempt_id: str) -> str:
+    digest = sha256(f"{job_id}:{attempt_id}".encode("utf-8")).hexdigest()[:32]
+    return f"graph-task-{digest}"
 
 
 def _attempt_budget_reservations(task: GraphTask) -> tuple[BudgetAmount, ...]:
@@ -1620,6 +2230,7 @@ def _validate_graph_artifact(
     *,
     capability_id: str,
 ) -> None:
+    generic_finalizer = capability_id == "jobs.graph.result_finalize"
     if (
         artifact.run_id != attempt.run_id
         or artifact.conversation_id != inspection.job.conversation_id
@@ -1627,7 +2238,12 @@ def _validate_graph_artifact(
         or artifact.capability_id != capability_id
         or artifact.artifact_id != reserved_artifact_id(attempt.attempt_id)
         or artifact.media_type != "application/json"
-        or artifact.provenance.authorship is not ArtifactAuthorship.EXACT_SOURCE_DATA
+        or artifact.provenance.authorship
+        is not (
+            ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
+            if generic_finalizer
+            else ArtifactAuthorship.EXACT_SOURCE_DATA
+        )
         or artifact.byte_size != len(content)
     ):
         raise ValueError("the internal graph artifact differs from its attempt")
@@ -1637,8 +2253,10 @@ def _validate_graph_artifact(
     }
     if expected_resources and actual_resources != expected_resources:
         raise ValueError("the internal graph artifact differs from its task scope")
-    if task.role is TaskRole.FINALIZER and actual_resources != set(
-        inspection.job.specification.authority.resource_ids
+    if (
+        task.role is TaskRole.FINALIZER
+        and not generic_finalizer
+        and actual_resources != set(inspection.job.specification.authority.resource_ids)
     ):
         raise ValueError("the finalizer artifact lacks exact root resource bindings")
 
@@ -1693,6 +2311,36 @@ def _profile_result_payload(
     }
 
 
+def _generic_graph_result_payload(
+    content: bytes,
+    *,
+    job_id: str,
+) -> Mapping[str, object]:
+    try:
+        document = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("the graph finalizer artifact is not valid JSON") from error
+    accepted = document.get("accepted_results") if isinstance(document, dict) else None
+    if (
+        not isinstance(document, dict)
+        or document.get("kind") != "graph_result"
+        or document.get("job_id") != job_id
+        or not isinstance(accepted, list)
+        or any(not isinstance(item, dict) for item in accepted)
+    ):
+        raise ValueError("the graph finalizer artifact has the wrong result contract")
+    result_ids = tuple(item.get("result_id") for item in accepted)
+    if any(not isinstance(item, str) for item in result_ids) or len(result_ids) != len(
+        set(result_ids)
+    ):
+        raise ValueError("the graph finalizer accepted-result set is invalid")
+    return {
+        "job_id": job_id,
+        "accepted_result_count": len(accepted),
+        "accepted_result_ids": result_ids,
+    }
+
+
 def _graph_task_result(
     *,
     task: GraphTask,
@@ -1702,6 +2350,7 @@ def _graph_task_result(
     payload: Mapping[str, object],
     artifact: ArtifactRef,
     completed_at: datetime,
+    summary: str,
 ) -> TaskResult:
     schema_digest = canonical_digest(
         {
@@ -1730,10 +2379,7 @@ def _graph_task_result(
         "result_kind": result_kind,
         "schema_digest": schema_digest,
         "payload": payload,
-        "summary": (
-            f"Profiled {payload['profiled_resources']} exact resource(s) with "
-            f"{payload['sampled_rows']} sampled row(s)."
-        ),
+        "summary": summary,
         "sensitivity": sensitivity.value,
         "provenance": provenance,
         "artifact_ids": (artifact.artifact_id,),
@@ -1782,6 +2428,49 @@ def _graph_failure_is_retryable(error: BaseException) -> bool:
         error,
         (ArtifactError, CapabilityInputError, TypeError, ValueError),
     )
+
+
+def _fair_graph_dispatch_order(
+    ready: tuple[GraphTask, ...],
+    *,
+    last_job_id: str | None,
+    consecutive: int,
+) -> tuple[GraphTask, ...]:
+    """Preserve task ordering while bounding one ready graph to two dispatches."""
+
+    remaining = list(ready)
+    ordered: list[GraphTask] = []
+    current_job_id = last_job_id
+    current_consecutive = consecutive
+    while remaining:
+        index = 0
+        if current_job_id is not None:
+            if current_consecutive < 2:
+                index = next(
+                    (
+                        candidate_index
+                        for candidate_index, candidate in enumerate(remaining)
+                        if candidate.job_id == current_job_id
+                    ),
+                    0,
+                )
+            else:
+                index = next(
+                    (
+                        candidate_index
+                        for candidate_index, candidate in enumerate(remaining)
+                        if candidate.job_id != current_job_id
+                    ),
+                    0,
+                )
+        selected = remaining.pop(index)
+        ordered.append(selected)
+        if selected.job_id == current_job_id:
+            current_consecutive += 1
+        else:
+            current_job_id = selected.job_id
+            current_consecutive = 1
+    return tuple(ordered)
 
 
 def _resource_binding_payload(value) -> dict[str, object]:

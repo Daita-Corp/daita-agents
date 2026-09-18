@@ -65,6 +65,251 @@ class AutomationEligibility(str, Enum):
     AUTOMATION_DIRECT = "automation_direct"
 
 
+class ExecutionScopeKind(str, Enum):
+    """Code-owned machine-run scope family."""
+
+    JOB_EVENT = "job_event"
+    SCHEDULED_ROUTINE = "scheduled_routine"
+    GRAPH_TASK = "graph_task"
+
+
+class MachineRunDirectiveKind(str, Enum):
+    """Exclusive terminal transition emitted by a machine lifecycle tool."""
+
+    COMPLETE = "task_completed"
+    BLOCK = "task_blocked"
+    REQUEST_REVIEW = "task_review_requested"
+
+
+class ExecutionPreference(str, Enum):
+    """Foreground choice between ordinary inline and durable admission."""
+
+    AUTO = "auto"
+    DURABLE = "durable"
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionAdmissionPolicy:
+    """Immutable capability facts used for deterministic execution admission."""
+
+    shape: str
+    inline_eligible: bool
+    graph_v1_eligible: bool
+    target_count_argument: str | None
+    inline_max_targets: int
+    graph_max_targets: int
+    inline_max_wall_seconds: int = 30
+    graph_max_wall_seconds: int = 300
+    inline_max_result_bytes: int = 64 * 1024
+    graph_max_result_bytes: int = 64 * 1024
+    synchronous_only: bool = True
+
+    def __post_init__(self) -> None:
+        _text(self.shape, "execution admission shape")
+        if not isinstance(self.inline_eligible, bool) or not isinstance(
+            self.graph_v1_eligible, bool
+        ):
+            raise TypeError("execution admission eligibility must be bool")
+        if self.target_count_argument is not None:
+            _text(self.target_count_argument, "execution target-count argument")
+        for value, name in (
+            (self.inline_max_targets, "inline target ceiling"),
+            (self.graph_max_targets, "graph target ceiling"),
+            (self.inline_max_wall_seconds, "inline wall-time ceiling"),
+            (self.graph_max_wall_seconds, "graph wall-time ceiling"),
+            (self.inline_max_result_bytes, "inline result ceiling"),
+            (self.graph_max_result_bytes, "graph result ceiling"),
+        ):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"{name} is invalid")
+        if self.inline_eligible and self.inline_max_targets < 1:
+            raise ValueError("inline-eligible policy needs a positive target ceiling")
+        if self.graph_v1_eligible and self.graph_max_targets < 1:
+            raise ValueError("graph-eligible policy needs a positive target ceiling")
+        if self.inline_max_targets > self.graph_max_targets and self.graph_v1_eligible:
+            raise ValueError("graph target ceiling cannot be below inline")
+        if not isinstance(self.synchronous_only, bool):
+            raise TypeError("execution synchronous_only must be bool")
+
+    def target_count(self, arguments: Mapping[str, object]) -> int:
+        if self.target_count_argument is None:
+            return 1
+        value = arguments.get(self.target_count_argument)
+        if isinstance(value, (tuple, list)):
+            return len(value)
+        return 0
+
+    def admission_error(
+        self,
+        arguments: Mapping[str, object],
+        preference: ExecutionPreference,
+    ) -> str | None:
+        if not isinstance(preference, ExecutionPreference):
+            raise TypeError("execution preference is invalid")
+        targets = self.target_count(arguments)
+        if targets < 1:
+            return "execution_not_supported_for_requested_shape"
+        fits_inline = self.inline_eligible and targets <= self.inline_max_targets
+        fits_graph = (
+            self.graph_v1_eligible
+            and self.synchronous_only
+            and targets <= self.graph_max_targets
+        )
+        if preference is ExecutionPreference.AUTO and fits_inline:
+            return None
+        if fits_graph:
+            return "durable_execution_required"
+        return "execution_not_supported_for_requested_shape"
+
+
+@dataclass(frozen=True, slots=True)
+class GraphTaskBinding:
+    """Exact immutable identity of one fenced graph task attempt."""
+
+    agent_id: str
+    job_id: str
+    root_authority_digest: str
+    task_id: str
+    task_revision: int
+    task_spec_digest: str
+    task_scope_digest: str
+    attempt_id: str
+    claim_token_digest: str
+    fencing_epoch: int
+    graph_revision_at_claim: int
+    task_role: str
+    task_deadline_at: datetime
+    job_deadline_at: datetime
+    budget_reservation_identity: str
+
+    def __post_init__(self) -> None:
+        for value, name in (
+            (self.agent_id, "graph binding agent_id"),
+            (self.job_id, "graph binding job_id"),
+            (self.task_id, "graph binding task_id"),
+            (self.attempt_id, "graph binding attempt_id"),
+            (self.task_role, "graph binding task_role"),
+        ):
+            _text(value, name)
+            if len(value) > 512 or any(character in "\r\n\x00" for character in value):
+                raise ValueError(f"{name} must be bounded single-line text")
+        for value, name in (
+            (self.root_authority_digest, "graph binding root authority digest"),
+            (self.task_spec_digest, "graph binding task spec digest"),
+            (self.task_scope_digest, "graph binding task scope digest"),
+            (self.claim_token_digest, "graph binding claim token digest"),
+            (
+                self.budget_reservation_identity,
+                "graph binding budget reservation identity",
+            ),
+        ):
+            if re.fullmatch(r"sha256:[0-9a-f]{64}", value) is None:
+                raise ValueError(f"{name} is invalid")
+        for revision_value, revision_name, allow_zero in (
+            (self.task_revision, "graph binding task revision", False),
+            (self.fencing_epoch, "graph binding fencing epoch", False),
+            (self.graph_revision_at_claim, "graph binding graph revision", True),
+        ):
+            if (
+                not isinstance(revision_value, int)
+                or isinstance(revision_value, bool)
+                or revision_value < (0 if allow_zero else 1)
+            ):
+                raise ValueError(f"{revision_name} is invalid")
+        for deadline_value, deadline_name in (
+            (self.task_deadline_at, "graph binding task deadline"),
+            (self.job_deadline_at, "graph binding job deadline"),
+        ):
+            if (
+                not isinstance(deadline_value, datetime)
+                or deadline_value.utcoffset() is None
+            ):
+                raise ValueError(f"{deadline_name} must be timezone-aware")
+        if self.task_deadline_at > self.job_deadline_at:
+            raise ValueError("graph task deadline cannot exceed the job deadline")
+
+    @property
+    def digest(self) -> str:
+        return (
+            "sha256:"
+            + sha256(
+                canonical_json(
+                    {
+                        "agent_id": self.agent_id,
+                        "job_id": self.job_id,
+                        "root_authority_digest": self.root_authority_digest,
+                        "task_id": self.task_id,
+                        "task_revision": self.task_revision,
+                        "task_spec_digest": self.task_spec_digest,
+                        "task_scope_digest": self.task_scope_digest,
+                        "attempt_id": self.attempt_id,
+                        "claim_token_digest": self.claim_token_digest,
+                        "fencing_epoch": self.fencing_epoch,
+                        "graph_revision_at_claim": self.graph_revision_at_claim,
+                        "task_role": self.task_role,
+                        "task_deadline_at": self.task_deadline_at.isoformat(),
+                        "job_deadline_at": self.job_deadline_at.isoformat(),
+                        "budget_reservation_identity": self.budget_reservation_identity,
+                    }
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class MachineRunDirective:
+    """Authenticated exclusive termination from one lifecycle capability."""
+
+    kind: MachineRunDirectiveKind
+    tool_call_id: str
+    binding_digest: str
+    record_id: str
+    job_id: str
+    task_id: str
+    attempt_id: str
+    fencing_epoch: int
+    committed_task_revision: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, MachineRunDirectiveKind):
+            raise TypeError("machine run directive kind is invalid")
+        for value, name in (
+            (self.tool_call_id, "machine directive tool call_id"),
+            (self.record_id, "machine directive record_id"),
+            (self.job_id, "machine directive job_id"),
+            (self.task_id, "machine directive task_id"),
+            (self.attempt_id, "machine directive attempt_id"),
+        ):
+            _text(value, name)
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", self.binding_digest) is None:
+            raise ValueError("machine directive binding digest is invalid")
+        for numeric_value, name in (
+            (self.fencing_epoch, "machine directive fencing epoch"),
+            (self.committed_task_revision, "machine directive task revision"),
+        ):
+            if (
+                not isinstance(numeric_value, int)
+                or isinstance(numeric_value, bool)
+                or numeric_value < 1
+            ):
+                raise ValueError(f"{name} is invalid")
+
+
+class TaskAttemptGuard(Protocol):
+    """Revalidate one exact graph attempt immediately before meaningful work."""
+
+    @property
+    def binding(self) -> GraphTaskBinding: ...
+
+    @property
+    def claim_token(self) -> str: ...
+
+    @property
+    def run_id(self) -> str: ...
+
+    async def revalidate(self, *, capability_id: str, point: str) -> None: ...
+
+
 class EffectOutcome(str, Enum):
     STARTED = "started"
     SUCCEEDED = "succeeded"
@@ -380,6 +625,8 @@ class ExecutionScope:
     occurrence_id: str | None = None
     allowed_connector_binding_ids: tuple[str, ...] = ()
     capability_grants: tuple[CapabilityGrant, ...] = ()
+    scope_kind: ExecutionScopeKind | None = None
+    graph_task_binding: GraphTaskBinding | None = None
 
     def __post_init__(self) -> None:
         for identity_value, identity_name in (
@@ -456,23 +703,50 @@ class ExecutionScope:
             self.eligible_model_routes,
             "eligible_model_routes",
         )
+        access_modes = frozenset(self.allowed_access_modes)
+        effects = frozenset(self.allowed_operational_effects)
         if not capabilities or not routes:
             raise ValueError(
                 "execution scope capability and route ceilings cannot be empty"
             )
-        if self.routine_id is None:
+        inferred_kind = self.scope_kind
+        if inferred_kind is None:
+            inferred_kind = (
+                ExecutionScopeKind.SCHEDULED_ROUTINE
+                if self.routine_id is not None
+                else ExecutionScopeKind.JOB_EVENT
+            )
+        if not isinstance(inferred_kind, ExecutionScopeKind):
+            raise TypeError("execution scope kind is invalid")
+        if inferred_kind is ExecutionScopeKind.GRAPH_TASK:
+            if self.routine_id is not None or self.graph_task_binding is None:
+                raise ValueError("graph-task scope requires only its task binding")
+            if self.job_id is None or self.job_id != self.graph_task_binding.job_id:
+                raise ValueError("graph-task scope job differs from its task binding")
+            if self.agent_id != self.graph_task_binding.agent_id:
+                raise ValueError("graph-task scope agent differs from its task binding")
+            if effects != frozenset({OperationalEffect.NONE}):
+                raise ValueError(
+                    "graph V1 task scopes must be structurally effect-free"
+                )
+        elif self.graph_task_binding is not None:
+            raise ValueError("only a graph-task scope may carry a task binding")
+        elif inferred_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
+            if self.routine_id is None:
+                raise ValueError("scheduled scope requires routine identity")
+        elif self.routine_id is not None:
+            raise ValueError("routine identity requires a scheduled scope")
+        if inferred_kind is ExecutionScopeKind.JOB_EVENT:
             if not sources or not resources or connector_bindings:
                 raise ValueError(
                     "non-routine execution scope requires source/resource ceilings "
                     "and cannot contain connector bindings"
                 )
-        else:
+        elif inferred_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
             if bool(sources) != bool(resources):
                 raise ValueError(
                     "scheduled source and resource ceilings must be present together"
                 )
-        access_modes = frozenset(self.allowed_access_modes)
-        effects = frozenset(self.allowed_operational_effects)
         if not isinstance(self.contract_bindings, ExecutionContractBindings):
             raise TypeError(
                 "execution scope requires frozen execution contract bindings"
@@ -580,6 +854,17 @@ class ExecutionScope:
                         "contract_bindings": self.contract_bindings.material(),
                         "capability_grants": tuple(
                             grant.material() for grant in self.capability_grants
+                        ),
+                        **(
+                            {
+                                "scope_kind": self.scope_kind.value,
+                                "graph_task_binding": {
+                                    "digest": self.graph_task_binding.digest,
+                                },
+                            }
+                            if self.scope_kind is ExecutionScopeKind.GRAPH_TASK
+                            and self.graph_task_binding is not None
+                            else {}
                         ),
                     }
                 ).encode("utf-8")
@@ -916,6 +1201,9 @@ class Capability:
     artifact_policy: ArtifactPolicy | None = None
     automation_grant_policy: AutomationGrantPolicy | None = None
     effect_receipt_policy: EffectReceiptPolicy | None = None
+    machine_run_directive_kind: MachineRunDirectiveKind | None = None
+    execution_admission_policy: ExecutionAdmissionPolicy | None = None
+    durable_foreground_entrypoint: bool = False
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -967,6 +1255,28 @@ class Capability:
             self.artifact_policy, ArtifactPolicy
         ):
             raise TypeError("artifact_policy must be ArtifactPolicy or None")
+        if self.machine_run_directive_kind is not None:
+            if not isinstance(self.machine_run_directive_kind, MachineRunDirectiveKind):
+                raise TypeError("machine_run_directive_kind is invalid")
+            if (
+                self.operational_effect is not OperationalEffect.NONE
+                or self.access_mode is not AccessMode.NONE
+            ):
+                raise ValueError(
+                    "machine-run termination capabilities must be effect-free management operations"
+                )
+        if self.execution_admission_policy is not None:
+            if not isinstance(
+                self.execution_admission_policy, ExecutionAdmissionPolicy
+            ):
+                raise TypeError("execution_admission_policy is invalid")
+            if (
+                self.execution_admission_policy.graph_v1_eligible
+                and self.operational_effect is not OperationalEffect.NONE
+            ):
+                raise ValueError("graph V1 admission is structurally effect-free")
+        if not isinstance(self.durable_foreground_entrypoint, bool):
+            raise TypeError("durable_foreground_entrypoint must be bool")
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)
         output_schema = FrozenJsonObject.from_mapping(self.output_schema)
         _check_schema(input_schema)
@@ -1034,6 +1344,39 @@ def capability_contract_digest(
                     capability.artifact_policy.max_total_bytes_per_call
                 ),
             }
+        ),
+        **(
+            {
+                "machine_run_directive_kind": (
+                    capability.machine_run_directive_kind.value
+                )
+            }
+            if capability.machine_run_directive_kind is not None
+            else {}
+        ),
+        **(
+            {
+                "execution_admission_policy": {
+                    "shape": capability.execution_admission_policy.shape,
+                    "inline_eligible": capability.execution_admission_policy.inline_eligible,
+                    "graph_v1_eligible": capability.execution_admission_policy.graph_v1_eligible,
+                    "target_count_argument": capability.execution_admission_policy.target_count_argument,
+                    "inline_max_targets": capability.execution_admission_policy.inline_max_targets,
+                    "graph_max_targets": capability.execution_admission_policy.graph_max_targets,
+                    "inline_max_wall_seconds": capability.execution_admission_policy.inline_max_wall_seconds,
+                    "graph_max_wall_seconds": capability.execution_admission_policy.graph_max_wall_seconds,
+                    "inline_max_result_bytes": capability.execution_admission_policy.inline_max_result_bytes,
+                    "graph_max_result_bytes": capability.execution_admission_policy.graph_max_result_bytes,
+                    "synchronous_only": capability.execution_admission_policy.synchronous_only,
+                }
+            }
+            if capability.execution_admission_policy is not None
+            else {}
+        ),
+        **(
+            {"durable_foreground_entrypoint": True}
+            if capability.durable_foreground_entrypoint
+            else {}
         ),
     }
     return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
@@ -1129,6 +1472,7 @@ class ToolExecution:
     request_sensitivity: ModelSensitivity = ModelSensitivity.RESTRICTED
     effect_receipt_id: str | None = None
     one_time_artifact_destinations: tuple[object, ...] = ()
+    task_attempt_guard: TaskAttemptGuard | None = None
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
@@ -1146,6 +1490,10 @@ class ToolExecution:
             is None
         ):
             raise ValueError("tool effect receipt ID is invalid")
+        if self.task_attempt_guard is not None:
+            binding = getattr(self.task_attempt_guard, "binding", None)
+            if not isinstance(binding, GraphTaskBinding):
+                raise TypeError("tool task-attempt guard is invalid")
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )

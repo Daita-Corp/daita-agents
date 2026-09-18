@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from collections.abc import Mapping
 
 from ...llm.models import ModelSensitivity
 from .models import (
@@ -206,7 +207,16 @@ def require_authority_subset(child: GraphAuthority, parent: GraphAuthority) -> N
         )
     parent_bindings = dict(parent.contract_bindings)
     for key, value in child.contract_bindings.items():
-        if key not in parent_bindings or parent_bindings[key] != value:
+        parent_value = parent_bindings.get(key)
+        if isinstance(value, Mapping) and isinstance(parent_value, Mapping):
+            differs = any(
+                nested_key not in parent_value
+                or parent_value[nested_key] != nested_value
+                for nested_key, nested_value in value.items()
+            )
+        else:
+            differs = key not in parent_bindings or parent_value != value
+        if differs:
             raise GraphValidationError(
                 "contract_binding_expansion",
                 "task contract binding is not an exact root subset",

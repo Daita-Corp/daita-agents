@@ -67,6 +67,7 @@ from .models import (
     LoopExitKind,
     LoopLimits,
     RunInput,
+    RunOrigin,
     ToolBatchCertainty,
     ToolBatchInterruption,
     ToolBatchOutcome,
@@ -90,6 +91,18 @@ _EXPECTED_LOOP_FAILURE_REASONS: dict[type[Exception], str] = {
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _task_checkpoint_warning_due(
+    step: int,
+    usage: ModelUsage,
+    limits: LoopLimits,
+) -> bool:
+    """Warn before a later request can cross a hard task-attempt limit."""
+
+    step_pressure = step * 5 >= limits.max_steps * 4
+    token_pressure = usage.total_tokens * 5 >= limits.max_total_tokens * 4
+    return step_pressure or token_pressure
 
 
 def _expected_loop_failure_reason(error: Exception) -> str:
@@ -323,6 +336,56 @@ def _effective_run_limits(configured: LoopLimits, run: RunInput) -> LoopLimits:
     )
 
 
+def _normalize_run_invocation(
+    invocation: RunInput | RunSession,
+    *,
+    prior_messages: tuple[CanonicalMessage, ...],
+    prepared: PreparedLoopRun | None,
+    transcripts: TranscriptStore,
+    configured_limits: LoopLimits,
+) -> tuple[RunInput, RunSession, RunSession | None, PreparedLoopRun | None]:
+    """Create or validate the isolated single-use session for one loop run."""
+
+    if isinstance(invocation, RunSession):
+        session = invocation
+        runtime_session: RunSession | None = session
+        run = session.run
+        if run.conversation_id is None:
+            raise ValueError("run session requires a resolved conversation_id")
+        if prepared is None and isinstance(session.prepared, PreparedLoopRun):
+            prepared = session.prepared
+    elif isinstance(invocation, RunInput):
+        runtime_session = None
+        run = invocation
+        if run.conversation_id is None:
+            run = replace(run, conversation_id=run.id)
+        limits = _effective_run_limits(configured_limits, run)
+        session = RunSession(
+            run=run,
+            # Compatibility-only direct callers have no preparation-time
+            # predecessor token. Production host origins always construct an
+            # admitted session with an exact predecessor binding.
+            writer=RunSessionWriter(transcripts, run, bind_predecessor=False),
+            absolute_deadline=(
+                asyncio.get_running_loop().time() + limits.max_wall_time_seconds
+            ),
+            cancellation=RunCancellationToken(),
+        )
+    else:
+        raise TypeError("run must be RunInput or RunSession")
+    if any(not isinstance(message, CanonicalMessage) for message in prior_messages):
+        raise TypeError("prior_messages must contain CanonicalMessage records")
+    if run.origin is RunOrigin.JOB_TASK and prior_messages:
+        raise ValueError("graph task attempts cannot import conversation history")
+    if prepared is not None and (
+        prepared.run != run
+        or prepared.prior_messages != prior_messages
+        or prepared.session_options != session.options
+    ):
+        raise ValueError("prepared loop run differs from its execution input")
+    return run, session, runtime_session, prepared
+
+
 class AgentLoop:
     """Own only cognitive progression; tools and persistence keep their own data."""
 
@@ -376,6 +439,8 @@ class AgentLoop:
         if not isinstance(run_input, RunInput):
             raise TypeError("run must be RunInput or RunSession")
         run = run_input
+        if run.origin is RunOrigin.JOB_TASK and prior_messages:
+            raise ValueError("graph task attempts cannot import conversation history")
         if run.conversation_id is None:
             run = replace(run, conversation_id=run.id)
         start_message = run.start_message()
@@ -439,44 +504,13 @@ class AgentLoop:
         prior_messages: tuple[CanonicalMessage, ...] = (),
         prepared: PreparedLoopRun | None = None,
     ) -> LoopExit:
-        if isinstance(run, RunSession):
-            session = run
-            runtime_session: RunSession | None = session
-            run = session.run
-            if run.conversation_id is None:
-                raise ValueError("run session requires a resolved conversation_id")
-            if prepared is None and isinstance(session.prepared, PreparedLoopRun):
-                prepared = session.prepared
-        elif isinstance(run, RunInput):
-            runtime_session = None
-            if run.conversation_id is None:
-                run = replace(run, conversation_id=run.id)
-            limits = _effective_run_limits(self._limits, run)
-            session = RunSession(
-                run=run,
-                # Compatibility-only direct callers have no preparation-time
-                # predecessor token. Production host origins always construct an
-                # admitted session with an exact predecessor binding.
-                writer=RunSessionWriter(
-                    self._transcripts,
-                    run,
-                    bind_predecessor=False,
-                ),
-                absolute_deadline=(
-                    asyncio.get_running_loop().time() + limits.max_wall_time_seconds
-                ),
-                cancellation=RunCancellationToken(),
-            )
-        else:
-            raise TypeError("run must be RunInput or RunSession")
-        if any(not isinstance(message, CanonicalMessage) for message in prior_messages):
-            raise TypeError("prior_messages must contain CanonicalMessage records")
-        if prepared is not None and (
-            prepared.run != run
-            or prepared.prior_messages != prior_messages
-            or prepared.session_options != session.options
-        ):
-            raise ValueError("prepared loop run differs from its execution input")
+        run, session, runtime_session, prepared = _normalize_run_invocation(
+            run,
+            prior_messages=prior_messages,
+            prepared=prepared,
+            transcripts=self._transcripts,
+            configured_limits=self._limits,
+        )
         session.consume()
         session.cancellation.raise_if_cancelled()
         writer = session.writer
@@ -496,6 +530,7 @@ class AgentLoop:
         sensitivity = run.history_sensitivity
         previous_request_input_tokens: int | None = None
         request_input_growth_tokens: int | None = None
+        checkpoint_warning_emitted = False
         tool_call_count = 0
         run_route: object | None = None if prepared is None else prepared.run_route
         limits = (
@@ -744,38 +779,20 @@ class AgentLoop:
                         sensitivity=sensitivity,
                     )
 
-                if response.finish_reason is FinishReason.STOP:
-                    assert response.text is not None and not response.tool_calls
-                    return await self._finish(
-                        run,
-                        writer,
-                        LoopExitKind.COMPLETED,
-                        "completed",
-                        step,
-                        usage,
-                        run_started,
-                        final_text=response.text,
-                        final_message=assistant,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
-
-                if response.finish_reason is not FinishReason.TOOL_CALLS:
-                    await writer.append(assistant, position=writer.next_position)
-                    messages = (*messages, assistant)
-                    return await self._finish(
-                        run,
-                        writer,
-                        LoopExitKind.FAILED,
-                        _finish_reason_failure(response.finish_reason),
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
+                terminal_response = await self._finish_terminal_model_response(
+                    response=response,
+                    assistant=assistant,
+                    run=run,
+                    writer=writer,
+                    step=step,
+                    usage=usage,
+                    run_started=run_started,
+                    artifacts=tuple(artifacts),
+                    artifact_deliveries=tuple(artifact_deliveries),
+                    sensitivity=sensitivity,
+                )
+                if terminal_response is not None:
+                    return terminal_response
 
                 assert response.tool_calls
                 tool_call_count += len(response.tool_calls)
@@ -838,6 +855,20 @@ class AgentLoop:
                     if receipt is not None:
                         artifact_deliveries.append(receipt)
 
+                if outcome.machine_run_directive is not None:
+                    return await self._finish(
+                        run,
+                        writer,
+                        LoopExitKind.MACHINE_TERMINATED,
+                        outcome.machine_run_directive.kind.value,
+                        step,
+                        usage,
+                        run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
+                    )
+
                 if outcome.interruption_kind is not None:
                     if cancellation_requested:
                         raise asyncio.CancelledError
@@ -866,6 +897,27 @@ class AgentLoop:
                         artifact_deliveries=tuple(artifact_deliveries),
                         sensitivity=sensitivity,
                     )
+
+                if (
+                    run.origin is RunOrigin.JOB_TASK
+                    and not checkpoint_warning_emitted
+                    and step < limits.max_steps
+                    and _task_checkpoint_warning_due(step, usage, limits)
+                ):
+                    warning = CanonicalMessage(
+                        role=MessageRole.SYSTEM,
+                        content=(
+                            TextBlock(
+                                "Code-owned task budget warning: the attempt is nearing "
+                                "a hard step or token limit. Persist a bounded checkpoint "
+                                "before continuing, then finish with exactly one lifecycle "
+                                "terminator. This warning grants no additional authority."
+                            ),
+                        ),
+                    )
+                    await writer.append(warning, position=writer.next_position)
+                    messages = (*messages, warning)
+                    checkpoint_warning_emitted = True
 
             return await self._finish(
                 run,
@@ -1086,6 +1138,69 @@ class AgentLoop:
                 "context_input_tokens": response.request_input_tokens,
                 "output_tokens": response.usage.output_tokens,
             },
+        )
+
+    async def _finish_terminal_model_response(
+        self,
+        *,
+        response: ModelResponse,
+        assistant: CanonicalMessage,
+        run: RunInput,
+        writer: RunSessionWriter,
+        step: int,
+        usage: ModelUsage,
+        run_started: float,
+        artifacts: tuple[ArtifactRef, ...],
+        artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
+        sensitivity: ModelSensitivity,
+    ) -> LoopExit | None:
+        """Finalize a terminal provider response, including task protocol failure."""
+
+        if response.finish_reason is FinishReason.STOP:
+            assert response.text is not None and not response.tool_calls
+            if run.origin is RunOrigin.JOB_TASK:
+                await writer.append(assistant, position=writer.next_position)
+                return await self._finish(
+                    run,
+                    writer,
+                    LoopExitKind.FAILED,
+                    "protocol_violation",
+                    step,
+                    usage,
+                    run_started,
+                    final_text=response.text,
+                    artifacts=artifacts,
+                    artifact_deliveries=artifact_deliveries,
+                    sensitivity=sensitivity,
+                )
+            return await self._finish(
+                run,
+                writer,
+                LoopExitKind.COMPLETED,
+                "completed",
+                step,
+                usage,
+                run_started,
+                final_text=response.text,
+                final_message=assistant,
+                artifacts=artifacts,
+                artifact_deliveries=artifact_deliveries,
+                sensitivity=sensitivity,
+            )
+        if response.finish_reason is FinishReason.TOOL_CALLS:
+            return None
+        await writer.append(assistant, position=writer.next_position)
+        return await self._finish(
+            run,
+            writer,
+            LoopExitKind.FAILED,
+            _finish_reason_failure(response.finish_reason),
+            step,
+            usage,
+            run_started,
+            artifacts=artifacts,
+            artifact_deliveries=artifact_deliveries,
+            sensitivity=sensitivity,
         )
 
     async def _model_response(

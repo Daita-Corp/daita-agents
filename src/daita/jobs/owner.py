@@ -11,10 +11,15 @@ from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
 from ..loop.models import RunInput
 from .graph.models import (
+    BudgetAmount,
     GraphAdmission,
     GraphEventPage,
     GraphInspection,
     GraphJob,
+    TaskCheckpoint,
+    TaskComment,
+    TaskControl,
+    TaskResult,
 )
 from .models import (
     MAX_JOB_DEADLINE_SECONDS,
@@ -82,6 +87,36 @@ class DraftGraphJobStore(Protocol):
         after_event_id: int = 0,
         limit: int = 100,
     ) -> GraphEventPage: ...
+
+    async def checkpoint_graph_attempt(
+        self, checkpoint: TaskCheckpoint, *, claim_token: str
+    ) -> TaskCheckpoint: ...
+
+    async def add_graph_comment(
+        self,
+        comment: TaskComment,
+        *,
+        attempt_id: str | None = None,
+        claim_token: str | None = None,
+        fencing_epoch: int | None = None,
+    ) -> TaskComment: ...
+
+    async def complete_graph_attempt(
+        self,
+        result: TaskResult,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        usage: tuple[BudgetAmount, ...] | None,
+    ) -> TaskResult: ...
+
+    async def open_graph_control(
+        self,
+        control: TaskControl,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+    ) -> TaskControl: ...
 
 
 class JobOwner:
@@ -332,6 +367,68 @@ class JobOwner:
             limit=limit,
         )
 
+    async def checkpoint_graph_task(
+        self, checkpoint: TaskCheckpoint, *, claim_token: str
+    ) -> TaskCheckpoint:
+        self._require_graph_record_owner(checkpoint.agent_id)
+        return await self._graph_store().checkpoint_graph_attempt(
+            checkpoint, claim_token=claim_token
+        )
+
+    async def comment_graph_task(
+        self,
+        comment: TaskComment,
+        *,
+        attempt_id: str,
+        claim_token: str,
+        fencing_epoch: int,
+    ) -> TaskComment:
+        self._require_graph_record_owner(comment.agent_id)
+        return await self._graph_store().add_graph_comment(
+            comment,
+            attempt_id=attempt_id,
+            claim_token=claim_token,
+            fencing_epoch=fencing_epoch,
+        )
+
+    async def complete_graph_task(
+        self,
+        result: TaskResult,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        usage: tuple[BudgetAmount, ...] | None,
+    ) -> TaskResult:
+        self._require_graph_record_owner(result.agent_id)
+        stored = await self._graph_store().complete_graph_attempt(
+            result,
+            claim_token=claim_token,
+            fencing_epoch=fencing_epoch,
+            usage=usage,
+        )
+        self._notify(result.job_id)
+        return stored
+
+    async def open_graph_task_control(
+        self,
+        control: TaskControl,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+    ) -> TaskControl:
+        self._require_graph_record_owner(control.agent_id)
+        stored = await self._graph_store().open_graph_control(
+            control,
+            claim_token=claim_token,
+            fencing_epoch=fencing_epoch,
+        )
+        self._notify(control.job_id)
+        return stored
+
+    def _require_graph_record_owner(self, agent_id: str) -> None:
+        if agent_id != self.agent_id:
+            raise JobError("job_owner_mismatch", "The graph owner identity changed.")
+
     async def _load_owned(self, job_id: str) -> JobRun | None:
         if not isinstance(job_id, str) or not job_id:
             raise ValueError("job_id must be non-empty text")
@@ -342,7 +439,15 @@ class JobOwner:
             self._wake(job_id)
 
     def _graph_store(self) -> DraftGraphJobStore:
-        for method in ("admit_graph", "inspect_graph", "list_graph_events"):
+        for method in (
+            "admit_graph",
+            "inspect_graph",
+            "list_graph_events",
+            "checkpoint_graph_attempt",
+            "add_graph_comment",
+            "complete_graph_attempt",
+            "open_graph_control",
+        ):
             if not callable(getattr(self._store, method, None)):
                 raise RuntimeError("draft graph store is unavailable")
         return cast(DraftGraphJobStore, self._store)

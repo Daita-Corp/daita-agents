@@ -77,6 +77,7 @@ from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..jobs.graph.models import (
     AttemptBudgetReservation,
+    AttemptState,
     BudgetAmount,
     BudgetLedger,
     ControlState,
@@ -944,10 +945,23 @@ class SQLiteStateStore:
             ),
         )
 
-    async def add_graph_comment(self, comment: TaskComment) -> TaskComment:
+    async def add_graph_comment(
+        self,
+        comment: TaskComment,
+        *,
+        attempt_id: str | None = None,
+        claim_token: str | None = None,
+        fencing_epoch: int | None = None,
+    ) -> TaskComment:
         return await _run_cancellation_safe_draft_transaction(
             self.path,
-            lambda connection: _draft_graph_store.add_comment(connection, comment),
+            lambda connection: _draft_graph_store.add_comment(
+                connection,
+                comment,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+            ),
         )
 
     async def complete_graph_attempt(
@@ -1046,6 +1060,7 @@ class SQLiteStateStore:
         failed_at: datetime,
         retryable: bool,
         reason_code: str,
+        attempt_state: AttemptState = AttemptState.FAILED,
     ) -> TaskAttempt | None:
         return await _run_cancellation_safe_draft_transaction(
             self.path,
@@ -1060,6 +1075,7 @@ class SQLiteStateStore:
                 failed_at=failed_at,
                 retryable=retryable,
                 reason_code=reason_code,
+                attempt_state=attempt_state,
             ),
         )
 

@@ -27,6 +27,10 @@ from .common import (
 def encode_execution_scope(value: ExecutionScope):
     if not isinstance(value, ExecutionScope):
         raise TypeError("execution scope codec requires ExecutionScope")
+    if value.graph_task_binding is not None:
+        from ..draft_graph_codecs import encode_graph_task_execution_scope
+
+        return encode_graph_task_execution_scope(value)
     return record(
         "ExecutionScope",
         {
@@ -66,6 +70,13 @@ def encode_execution_scope(value: ExecutionScope):
 
 
 def decode_execution_scope(value) -> ExecutionScope:
+    if (
+        isinstance(value, dict)
+        and value.get("__record__") == "DraftGraphTaskExecutionScope"
+    ):
+        from ..draft_graph_codecs import decode_graph_task_execution_scope
+
+        return decode_graph_task_execution_scope(value)
     fields = record_fields(
         value,
         "ExecutionScope",
