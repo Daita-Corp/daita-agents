@@ -563,13 +563,14 @@ def validate_mutation(
                 "supersession_dependency_loss",
                 "replacement task must preserve every incoming dependency",
             )
-        if request.actor_kind == "human_policy" and replaced.state not in {
-            TaskState.BLOCKED,
-            TaskState.REVIEW,
-        }:
+        if (
+            request.actor_kind == "human_policy"
+            and replaced.state is not TaskState.BLOCKED
+        ):
             raise GraphValidationError(
                 "human_replacement_not_allowed",
-                "human policy replaces only blocked or review-waiting work",
+                "human policy replaces only blocked work; review requires a typed "
+                "decision",
             )
         if request.actor_kind == "human_policy":
             expected_prefix = (

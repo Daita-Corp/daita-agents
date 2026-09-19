@@ -161,10 +161,16 @@ from ..jobs.graph.models import (
     GraphJob,
     GraphMutation,
     GraphState,
+    GraphTask,
+    TaskAttempt,
+    TaskCheckpoint,
     TaskControl,
+    TaskDependency,
     TaskResult,
+    TaskState,
 )
 from ..jobs.owner import GraphBlockerProjection, JobOwner
+from ..jobs.projections import GraphBoardProjection, GraphTimelinePage
 from ..jobs.supervisor import JobSupervisor
 from ..learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
@@ -2696,6 +2702,78 @@ class EmbeddedAgent:
         self._require_open()
         return await self._job_owner.inspect(job_id)
 
+    async def list_job_tasks(
+        self,
+        job_id: str,
+        *,
+        states: frozenset[TaskState] = frozenset(),
+        limit: int = 64,
+    ) -> tuple[GraphTask, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_tasks(
+            job_id, states=states, limit=limit
+        )
+
+    async def inspect_job_task(self, job_id: str, task_id: str) -> GraphTask | None:
+        self._require_open()
+        return await self._job_owner.inspect_graph_task(job_id, task_id)
+
+    async def list_job_dependencies(
+        self, job_id: str, *, task_id: str | None = None, limit: int = 100
+    ) -> tuple[TaskDependency, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_dependencies(
+            job_id, task_id=task_id, limit=limit
+        )
+
+    async def list_task_attempts(
+        self, job_id: str, task_id: str, *, limit: int = 3
+    ) -> tuple[TaskAttempt, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_task_attempts(
+            job_id, task_id, limit=limit
+        )
+
+    async def read_task_result(self, job_id: str, task_id: str) -> TaskResult | None:
+        self._require_open()
+        return await self._job_owner.read_graph_task_result(job_id, task_id)
+
+    async def list_task_checkpoints(
+        self, job_id: str, task_id: str, *, limit: int = 8
+    ) -> tuple[TaskCheckpoint, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_task_checkpoints(
+            job_id, task_id, limit=limit
+        )
+
+    async def list_task_artifacts(
+        self, job_id: str, *, task_id: str | None = None, limit: int = 64
+    ) -> tuple[str, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_task_artifacts(
+            job_id, task_id=task_id, limit=limit
+        )
+
+    async def job_timeline(
+        self,
+        job_id: str,
+        *,
+        after_event_id: int = 0,
+        limit: int = 100,
+        task_id: str | None = None,
+    ) -> GraphTimelinePage | None:
+        self._require_open()
+        return await self._job_owner.graph_timeline(
+            job_id,
+            after_event_id=after_event_id,
+            limit=limit,
+            task_id=task_id,
+        )
+
+    async def job_board(self, job_id: str) -> GraphBoardProjection | None:
+        self._require_open()
+        return await self._job_owner.graph_board(job_id)
+
     async def read_job_result(self, job_id: str) -> TaskResult | None:
         self._require_open()
         return await self._job_owner.read_result(job_id)
@@ -2716,6 +2794,7 @@ class EmbeddedAgent:
         *,
         principal_id: str,
         answer: Mapping[str, object],
+        idempotency_key: str | None = None,
     ) -> TaskControl | None:
         self._require_open()
         return await self._job_owner.answer_graph_task_input(
@@ -2724,6 +2803,69 @@ class EmbeddedAgent:
             control_id,
             principal_id=principal_id,
             answer=answer,
+            idempotency_key=idempotency_key,
+        )
+
+    async def accept_task_review(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        rationale: str,
+        idempotency_key: str,
+    ) -> TaskResult:
+        self._require_open()
+        return await self._job_owner.accept_graph_task_review_by_principal(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            rationale=rationale,
+            idempotency_key=idempotency_key,
+        )
+
+    async def request_task_review_changes(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        rationale: str,
+        replacement_guidance: str,
+        idempotency_key: str,
+    ) -> TaskControl:
+        self._require_open()
+        return await self._job_owner.request_graph_task_review_changes_by_principal(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            rationale=rationale,
+            replacement_guidance=replacement_guidance,
+            idempotency_key=idempotency_key,
+        )
+
+    async def retry_task_control(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        advisory_note: str,
+        idempotency_key: str,
+    ) -> TaskControl | None:
+        self._require_open()
+        return await self._job_owner.retry_graph_task_control(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            advisory_note=advisory_note,
+            idempotency_key=idempotency_key,
         )
 
     async def reject_task_control(
@@ -2734,6 +2876,7 @@ class EmbeddedAgent:
         *,
         principal_id: str,
         reason: str,
+        idempotency_key: str | None = None,
     ) -> TaskControl | None:
         self._require_open()
         return await self._job_owner.reject_graph_task_control(
@@ -2742,6 +2885,7 @@ class EmbeddedAgent:
             control_id,
             principal_id=principal_id,
             reason=reason,
+            idempotency_key=idempotency_key,
         )
 
     async def cancel_graph_job(
@@ -2776,12 +2920,18 @@ class EmbeddedAgent:
         *,
         replaces_job_id: str,
         principal_id: str,
+        replaces_task_id: str | None = None,
+        control_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> GraphJob:
         self._require_open()
         return await self._job_owner.admit_authorized_replacement_graph(
             admission,
             replaces_job_id=replaces_job_id,
             principal_id=principal_id,
+            replaces_task_id=replaces_task_id,
+            control_id=control_id,
+            idempotency_key=idempotency_key,
         )
 
     async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:

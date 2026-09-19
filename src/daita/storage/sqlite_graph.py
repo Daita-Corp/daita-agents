@@ -8,9 +8,22 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from typing import cast
 
 from ..artifacts.models import ArtifactRef, artifact_ref_from_mapping
-from ..distribution.models import GraphJobDelivery, OutcomeArtifactReference
+from ..distribution.models import (
+    CONVERSATION_INBOX_DESTINATION_REVISION,
+    MAX_DELIVERIES_PER_AGENT,
+    ConversationInboxTarget,
+    Delivery,
+    DeliveryState,
+    GraphJobDelivery,
+    OutcomeArtifactReference,
+    conversation_inbox_destination_id,
+    distribution_plan_digest,
+    target_fingerprint,
+)
+from ..distribution.owner import construct_graph_attention_delivery
 from ..jobs.graph.models import (
     ACTIVE_ATTEMPT_STATES,
     CONTROL_BUDGET_ROLES,
@@ -58,6 +71,7 @@ from ..jobs.graph.validation import (
     validate_mutation,
 )
 from ..llm.models import MessageRole, ToolResultBlock
+from .sqlite_codecs.distribution import decode_delivery, encode_delivery
 from .sqlite_codecs.graph import (
     decode_graph_event,
     decode_graph_job,
@@ -569,6 +583,129 @@ def _insert_event(
     return int(cursor)
 
 
+def _insert_graph_attention(
+    connection: sqlite3.Connection,
+    *,
+    job: GraphJob,
+    event_id: int,
+    transition_kind: str,
+    transition_identity: str,
+    preview: str,
+    observed_at: datetime,
+) -> Delivery:
+    """Atomically publish one transition-scoped notice with its graph mutation."""
+
+    sensitivity = job.specification.authority.sensitivity
+    destination_id = conversation_inbox_destination_id(job.conversation_id)
+    fingerprint = target_fingerprint(
+        conversation_id=job.conversation_id,
+        destination_id=destination_id,
+        destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+        sensitivity_ceiling=sensitivity,
+    )
+    target = ConversationInboxTarget(
+        conversation_id=job.conversation_id,
+        destination_id=destination_id,
+        destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+        sensitivity_ceiling=sensitivity,
+        target_fingerprint=fingerprint,
+    )
+    if job.specification.distribution_plan_digest != distribution_plan_digest(
+        targets=(target,), required_target_count=1
+    ):
+        raise GraphValidationError(
+            "attention_destination_changed",
+            "the graph attention destination differs from its frozen plan",
+        )
+    subject_id = (
+        f"{job.job_id}/event/{event_id}/{transition_kind}/{transition_identity}"
+    )
+    transition_digest = canonical_digest(
+        {
+            "job_id": job.job_id,
+            "event_id": event_id,
+            "transition_kind": transition_kind,
+            "transition_identity": transition_identity,
+        }
+    )
+    delivery_id = "delivery-" + sha256(subject_id.encode()).hexdigest()[:32]
+    delivery = construct_graph_attention_delivery(
+        delivery_id=delivery_id,
+        agent_id=job.agent_id,
+        conversation_id=job.conversation_id,
+        transition_subject_id=subject_id,
+        target=target,
+        preview=preview,
+        transition_digest=transition_digest,
+        effective_sensitivity=sensitivity,
+        observed_at=observed_at,
+    )
+    existing = connection.execute(
+        """SELECT delivery_id, data FROM deliveries
+           WHERE agent_id = ? AND logical_key = ?""",
+        (delivery.agent_id, delivery.logical_key),
+    ).fetchone()
+    if existing is not None:
+        decoded = decode_delivery(
+            _required_text(existing[1], "attention delivery payload"),
+            agent_id=delivery.agent_id,
+            delivery_id=_required_text(existing[0], "attention delivery id"),
+        )
+        if decoded != delivery:
+            raise GraphStoreConflictError("attention delivery key changed content")
+        return decoded
+    count = connection.execute(
+        "SELECT COUNT(*) FROM deliveries WHERE agent_id = ?",
+        (delivery.agent_id,),
+    ).fetchone()
+    if count is None:
+        raise GraphStoreConflictError("attention delivery count is unavailable")
+    if int(count[0]) >= MAX_DELIVERIES_PER_AGENT:
+        acknowledged = connection.execute(
+            """SELECT delivery_id FROM deliveries
+               WHERE agent_id = ? AND state = ?
+               ORDER BY created_at_us, delivery_id LIMIT 1""",
+            (delivery.agent_id, DeliveryState.ACKNOWLEDGED.value),
+        ).fetchone()
+        if acknowledged is None:
+            raise GraphValidationError(
+                "delivery_retention_limit",
+                "the inbox has no reclaimable acknowledged delivery",
+            )
+        deleted = connection.execute(
+            """DELETE FROM deliveries
+               WHERE agent_id = ? AND delivery_id = ? AND state = ?""",
+            (
+                delivery.agent_id,
+                acknowledged[0],
+                DeliveryState.ACKNOWLEDGED.value,
+            ),
+        )
+        if deleted.rowcount != 1:
+            raise GraphStoreConflictError("acknowledged delivery changed")
+    connection.execute(
+        """INSERT INTO deliveries(
+               agent_id, delivery_id, conversation_id, subject_kind, subject_id,
+               logical_key, target_kind, target_fingerprint, state,
+               created_at_us, data
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            delivery.agent_id,
+            delivery.delivery_id,
+            delivery.conversation_id,
+            delivery.subject_kind.value,
+            delivery.subject_id,
+            delivery.logical_key,
+            "conversation_inbox",
+            delivery.target.target_fingerprint,
+            delivery.visibility_state.value,
+            datetime_to_us(delivery.created_at),
+            encode_delivery(delivery),
+        ),
+    )
+    return delivery
+
+
 def _next_ready_at(tasks: tuple[GraphTask, ...]) -> datetime | None:
     ready = tuple(
         task.not_before or task.updated_at
@@ -711,6 +848,139 @@ def admit_graph(connection: sqlite3.Connection, admission: GraphAdmission) -> Gr
     return job
 
 
+def admit_replacement_graph(
+    connection: sqlite3.Connection,
+    admission: GraphAdmission,
+    *,
+    replaced_job_id: str,
+    replaced_task_id: str,
+    control_id: str,
+    principal_id: str,
+    idempotency_key: str,
+    resolved_at: datetime,
+    expected_control_digest: str,
+    expected_task_revision: int,
+) -> GraphJob:
+    """Atomically admit a separately authorized job and settle its exact control."""
+
+    validate_graph_admission(admission)
+    replacement_job = admission.job
+    if replacement_job.job_id == replaced_job_id:
+        raise GraphValidationError(
+            "replacement_job_identity_reused",
+            "a replacement must be a separate graph job",
+        )
+    if (
+        not principal_id
+        or not idempotency_key
+        or replacement_job.specification.principal_id != principal_id
+    ):
+        raise GraphValidationError(
+            "replacement_principal_mismatch",
+            "the replacement job principal differs from its authorization",
+        )
+    resolution: dict[str, object] = {
+        "action": "authorize_replacement_job",
+        "replacement_job_id": replacement_job.job_id,
+        "idempotency_key": idempotency_key,
+    }
+    existing_replacement = _load_job(
+        connection, replacement_job.agent_id, replacement_job.job_id
+    )
+    control_row = connection.execute(
+        """SELECT data FROM job_task_controls
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?""",
+        (
+            replacement_job.agent_id,
+            replaced_job_id,
+            replaced_task_id,
+            control_id,
+        ),
+    ).fetchone()
+    if control_row is None:
+        raise GraphStoreConflictError("replacement authorization control disappeared")
+    control = decode_task_control(
+        _required_text(control_row[0], "replacement control payload")
+    )
+    if existing_replacement is not None:
+        existing = existing_replacement[0]
+        if (
+            existing.origin_run_id == replacement_job.origin_run_id
+            and existing.origin_call_id == replacement_job.origin_call_id
+            and existing.specification_digest == replacement_job.specification_digest
+            and dict(existing.migration_provenance)
+            == dict(replacement_job.migration_provenance)
+            and control.state is ControlState.RESOLVED
+            and control.resolved_by_kind == "principal"
+            and control.resolved_by_id == principal_id
+            and isinstance(control.resolution, Mapping)
+            and dict(control.resolution) == resolution
+        ):
+            return existing
+        raise GraphStoreConflictError("replacement job idempotency key changed content")
+    replaced_job = _load_job(connection, replacement_job.agent_id, replaced_job_id)
+    replaced_task = _load_task(
+        connection,
+        replacement_job.agent_id,
+        replaced_job_id,
+        replaced_task_id,
+    )
+    if replaced_job is None or replaced_task is None:
+        raise GraphStoreConflictError("replacement authorization owner disappeared")
+    if (
+        replaced_job[0].specification.principal_id != principal_id
+        or control.kind is not ControlKind.NEEDS_AUTHORIZATION
+        or control.state is not ControlState.OPEN
+        or control.payload_digest != expected_control_digest
+        or replaced_task[0].task_revision != expected_task_revision
+    ):
+        raise GraphStoreConflictError("replacement authorization fence is stale")
+    expiry = replaced_job[0].deadline_at
+    declared_expiry = control.payload.get("expires_at")
+    if isinstance(declared_expiry, str):
+        try:
+            parsed_expiry = datetime.fromisoformat(declared_expiry)
+        except ValueError:
+            raise GraphValidationError(
+                "control_expiry_invalid", "the control expiry is malformed"
+            ) from None
+        if parsed_expiry.utcoffset() is None:
+            raise GraphValidationError(
+                "control_expiry_invalid", "the control expiry is malformed"
+            )
+        expiry = min(expiry, parsed_expiry)
+    if resolved_at > expiry:
+        raise GraphStoreConflictError("replacement authorization control expired")
+    admitted = admit_graph(connection, admission)
+    settled = resolve_control(
+        connection,
+        agent_id=replacement_job.agent_id,
+        job_id=replaced_job_id,
+        task_id=replaced_task_id,
+        control_id=control_id,
+        state=ControlState.RESOLVED,
+        resolved_at=resolved_at,
+        resolved_by_kind="principal",
+        resolved_by_id=principal_id,
+        resolution=resolution,
+        make_ready=False,
+        expected_control_digest=expected_control_digest,
+        expected_task_revision=expected_task_revision,
+    )
+    if settled is None:
+        raise GraphStoreConflictError("replacement authorization control disappeared")
+    cancelled = request_cancel(
+        connection,
+        agent_id=replacement_job.agent_id,
+        job_id=replaced_job_id,
+        requested_at=resolved_at,
+        requested_by_id=principal_id,
+    )
+    if cancelled is None:
+        raise GraphStoreConflictError("replaced graph disappeared")
+    return admitted
+
+
 def _insert_graph_delivery(
     connection: sqlite3.Connection,
     delivery: GraphJobDelivery,
@@ -798,7 +1068,10 @@ def inspect_graph(
         controls=controls,
         checkpoints=checkpoints,
         comments=comments,
-        budget_ledgers=list_budget_ledgers(connection, agent_id, job_id),
+        budget_ledgers=(
+            *list_budget_ledgers(connection, agent_id, job_id),
+            *_list_task_budget_ledgers(connection, agent_id, job_id),
+        ),
         events=list_graph_events(
             connection,
             agent_id,
@@ -806,12 +1079,16 @@ def inspect_graph(
             limit=MAX_GRAPH_INSPECTION_EVENTS,
         ).events,
         delivery_ids=tuple(
-            item.delivery_id
-            for item in list_graph_deliveries(
-                connection,
-                agent_id,
-                job_id=job_id,
-                limit=2,
+            str(row[0])
+            for row in connection.execute(
+                """SELECT delivery_id FROM deliveries
+                   WHERE agent_id = ? AND (
+                       (subject_kind = 'graph_job' AND subject_id = ?)
+                       OR (subject_kind = 'graph_attention'
+                           AND substr(subject_id, 1, length(?) + 1) = ? || '/')
+                   )
+                   ORDER BY created_at_us, delivery_id LIMIT 64""",
+                (agent_id, job_id, job_id, job_id),
             )
         ),
     )
@@ -861,6 +1138,7 @@ def list_graph_events(
     *,
     after_event_id: int = 0,
     limit: int = MAX_GRAPH_INSPECTION_EVENTS,
+    task_id: str | None = None,
 ) -> GraphEventPage:
     if not 1 <= limit <= MAX_GRAPH_INSPECTION_EVENTS:
         raise ValueError("graph event page limit is outside its bound")
@@ -868,13 +1146,18 @@ def list_graph_events(
         raise ValueError("graph event cursor must be non-negative")
     if _load_job(connection, agent_id, job_id) is None:
         return GraphEventPage(events=(), next_cursor=None)
+    task_clause = "" if task_id is None else " AND task_id = ?"
+    parameters: tuple[object, ...] = (agent_id, job_id, after_event_id)
+    if task_id is not None:
+        parameters = (*parameters, task_id)
     rows = tuple(
         connection.execute(
             """SELECT event_id, task_id, attempt_id, kind, created_at_us, data
                FROM job_graph_events
-               WHERE agent_id = ? AND job_id = ? AND event_id > ?
-               ORDER BY event_id LIMIT ?""",
-            (agent_id, job_id, after_event_id, limit + 1),
+               WHERE agent_id = ? AND job_id = ? AND event_id > ?"""
+            + task_clause
+            + " ORDER BY event_id LIMIT ?",
+            (*parameters, limit + 1),
         )
     )
     page_rows = rows[:limit]
@@ -1541,6 +1824,10 @@ def apply_mutation(
     if graph.mutation_count >= limits.max_mutations:
         raise GraphValidationError("mutation_limit", "graph mutation limit exceeded")
     try:
+        if request.created_at > job.deadline_at:
+            raise GraphValidationError(
+                "job_deadline_expired", "expired graph authority cannot mutate"
+            )
         all_tasks = validate_mutation(
             job_authority=job.specification.authority,
             graph=graph,
@@ -2993,7 +3280,7 @@ def _insert_retry_circuit_control(
             updated_at=opened_at,
         ),
     )
-    _insert_event(
+    event_id = _insert_event(
         connection,
         agent_id=task.agent_id,
         job_id=task.job_id,
@@ -3003,6 +3290,18 @@ def _insert_retry_circuit_control(
         created_at=opened_at,
         payload={"control_id": control_id, "failure_code": failure_code},
         maximum=job.specification.limits.max_events,
+    )
+    _insert_graph_attention(
+        connection,
+        job=job,
+        event_id=event_id,
+        transition_kind="retry_circuit_open",
+        transition_identity=control.control_id,
+        preview=(
+            f"Graph job {job.job_id} requires attention: retry circuit opened "
+            f"for task {task.task_id}."
+        ),
+        observed_at=opened_at,
     )
     return control
 
@@ -3014,6 +3313,7 @@ def open_control(
     claim_token: str,
     fencing_epoch: int,
     replan_task: GraphTask | None = None,
+    reviewer_task: GraphTask | None = None,
 ) -> TaskControl:
     if control.state is not ControlState.OPEN or control.requesting_attempt_id is None:
         raise ValueError("new task control must be open and attempt-bound")
@@ -3055,6 +3355,15 @@ def open_control(
             "replan_task_required",
             "needs_replan requires exactly one policy-owned planner task",
         )
+    if (control.kind is ControlKind.REVIEW_REQUESTED) != (reviewer_task is not None):
+        raise GraphValidationError(
+            "reviewer_task_required",
+            "review_requested requires exactly one separate reviewer task",
+        )
+    if replan_task is not None and reviewer_task is not None:
+        raise GraphValidationError(
+            "control_task_conflict", "a control cannot create two policy tasks"
+        )
     if replan_task is not None:
         planner_count = sum(
             item.role is TaskRole.PLANNER
@@ -3079,6 +3388,78 @@ def open_control(
             expected_revision=graph.revision,
             created_at=control.created_at,
             tasks=(replan_task,),
+        )
+        all_tasks = validate_mutation(
+            job_authority=job.specification.authority,
+            graph=validation_graph,
+            existing_tasks=_load_tasks(connection, control.agent_id, control.job_id),
+            existing_dependencies=_load_dependencies(
+                connection, control.agent_id, control.job_id
+            ),
+            request=synthetic,
+            max_tasks=job.specification.limits.max_tasks,
+            max_edges=job.specification.limits.max_edges,
+            max_depth=job.specification.limits.max_depth,
+            max_direct_parents=job.specification.limits.max_direct_parents,
+            max_fan_out=1,
+        )
+        _validate_budget_envelope(job, all_tasks)
+    if reviewer_task is not None:
+        if (
+            reviewer_task.role is not TaskRole.REVIEWER
+            or reviewer_task.state is not TaskState.READY
+            or reviewer_task.specification.expected_result_contract.get(
+                "review_control_id"
+            )
+            != control.control_id
+            or reviewer_task.specification.expected_result_contract.get(
+                "subject_task_id"
+            )
+            != control.task_id
+            or reviewer_task.specification.expected_result_contract.get(
+                "candidate_digest"
+            )
+            != control.payload.get("candidate_digest")
+        ):
+            raise GraphValidationError(
+                "reviewer_task_invalid", "the separate reviewer task is malformed"
+            )
+        candidate = control.payload.get("candidate")
+        if not isinstance(candidate, Mapping):
+            raise GraphValidationError(
+                "review_candidate_invalid", "the review candidate is malformed"
+            )
+        try:
+            candidate_result = TaskResult.from_candidate_material(candidate)
+        except (TypeError, ValueError) as error:
+            raise GraphValidationError(
+                "review_candidate_invalid", "the review candidate is malformed"
+            ) from error
+        if (
+            candidate_result.agent_id != control.agent_id
+            or candidate_result.job_id != control.job_id
+            or candidate_result.task_id != control.task_id
+            or candidate_result.attempt_id != control.requesting_attempt_id
+            or candidate_result.result_digest != control.payload.get("candidate_digest")
+        ):
+            raise GraphValidationError(
+                "review_candidate_invalid", "the review candidate binding differs"
+            )
+        validation_graph = replace(
+            graph,
+            finalization_attempt_id=None,
+            finalization_started_revision=None,
+        )
+        synthetic = GraphMutationRequest(
+            agent_id=control.agent_id,
+            job_id=control.job_id,
+            mutation_id=f"review-{control.control_id}",
+            actor_kind="owner",
+            actor_key="review_owner",
+            idempotency_key=f"review-{control.control_id}",
+            expected_revision=graph.revision,
+            created_at=control.created_at,
+            tasks=(reviewer_task,),
         )
         all_tasks = validate_mutation(
             job_authority=job.specification.authority,
@@ -3180,9 +3561,26 @@ def open_control(
                     datetime_to_us(control.created_at),
                 ),
             )
+    if reviewer_task is not None:
+        _insert_task(connection, reviewer_task)
+        for budget in reviewer_task.specification.budgets:
+            connection.execute(
+                """INSERT INTO job_task_budget_ledger(
+                       agent_id, job_id, task_id, dimension, ceiling,
+                       settled, reserved, updated_at_us
+                   ) VALUES (?, ?, ?, ?, ?, 0, 0, ?)""",
+                (
+                    reviewer_task.agent_id,
+                    reviewer_task.job_id,
+                    reviewer_task.task_id,
+                    budget.dimension,
+                    budget.amount,
+                    datetime_to_us(control.created_at),
+                ),
+            )
     target_graph_state = (
         GraphState.ACTIVE
-        if control.kind is ControlKind.NEEDS_REPLAN
+        if control.kind in {ControlKind.NEEDS_REPLAN, ControlKind.REVIEW_REQUESTED}
         else (
             GraphState.NEEDS_ATTENTION
             if control.kind
@@ -3208,7 +3606,7 @@ def open_control(
         graph,
         revision=(
             graph.revision + 1
-            if control.kind is ControlKind.NEEDS_REPLAN
+            if control.kind in {ControlKind.NEEDS_REPLAN, ControlKind.REVIEW_REQUESTED}
             else graph.revision
         ),
         task_count=len(graph_tasks),
@@ -3228,7 +3626,7 @@ def open_control(
         topology_digest=topology_digest(graph_tasks, graph_edges),
     )
     _replace_graph(connection, graph_data, updated_graph)
-    _insert_event(
+    event_id = _insert_event(
         connection,
         agent_id=control.agent_id,
         job_id=control.job_id,
@@ -3240,11 +3638,673 @@ def open_control(
             "control_id": control.control_id,
             "kind": control.kind.value,
             "replan_task_id": (None if replan_task is None else replan_task.task_id),
+            "reviewer_task_id": (
+                None if reviewer_task is None else reviewer_task.task_id
+            ),
             "graph_revision": updated_graph.revision,
         },
         maximum=job.specification.limits.max_events,
     )
+    if control.kind not in {
+        ControlKind.NEEDS_REPLAN,
+        ControlKind.REVIEW_REQUESTED,
+    }:
+        _insert_graph_attention(
+            connection,
+            job=job,
+            event_id=event_id,
+            transition_kind="control_opened",
+            transition_identity=control.control_id,
+            preview=(
+                f"Graph job {job.job_id} requires attention: "
+                f"{control.kind.value} on task {control.task_id}."
+            ),
+            observed_at=control.created_at,
+        )
     return control
+
+
+def _review_candidate(
+    control: TaskControl,
+    *,
+    agent_id: str,
+    job_id: str,
+    task_id: str,
+) -> TaskResult:
+    candidate = control.payload.get("candidate")
+    if not isinstance(candidate, Mapping):
+        raise GraphValidationError(
+            "review_candidate_invalid", "the review candidate is malformed"
+        )
+    try:
+        result = TaskResult.from_candidate_material(candidate)
+    except (TypeError, ValueError) as error:
+        raise GraphValidationError(
+            "review_candidate_invalid", "the review candidate is malformed"
+        ) from error
+    if (
+        result.agent_id != agent_id
+        or result.job_id != job_id
+        or result.task_id != task_id
+        or result.attempt_id != control.requesting_attempt_id
+        or result.result_digest != control.payload.get("candidate_digest")
+    ):
+        raise GraphValidationError(
+            "review_candidate_invalid", "the review candidate binding differs"
+        )
+    return result
+
+
+def _insert_result(connection: sqlite3.Connection, result: TaskResult) -> None:
+    connection.execute(
+        """INSERT INTO job_task_results(
+               agent_id, job_id, task_id, result_id, attempt_id, completed_at_us,
+               sensitivity, result_digest, data
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            result.agent_id,
+            result.job_id,
+            result.task_id,
+            result.result_id,
+            result.attempt_id,
+            datetime_to_us(result.completed_at),
+            result.sensitivity.value,
+            result.result_digest,
+            encode_task_result(result),
+        ),
+    )
+
+
+def _settle_reviewer(
+    connection: sqlite3.Connection,
+    *,
+    job: GraphJob,
+    reviewer_task_id: str,
+    review_control_id: str,
+    settled_at: datetime,
+    reviewer_result: TaskResult | None,
+    claim_token: str | None,
+    fencing_epoch: int | None,
+) -> int:
+    loaded_task = _load_task(connection, job.agent_id, job.job_id, reviewer_task_id)
+    if loaded_task is None:
+        raise GraphValidationError(
+            "reviewer_task_unavailable", "the separate reviewer task is unavailable"
+        )
+    reviewer, reviewer_data = loaded_task
+    contract = reviewer.specification.expected_result_contract
+    if (
+        reviewer.role is not TaskRole.REVIEWER
+        or contract.get("review_control_id") != review_control_id
+    ):
+        raise GraphValidationError(
+            "reviewer_task_invalid", "the reviewer task binding differs"
+        )
+    if reviewer_result is not None:
+        if claim_token is None or fencing_epoch is None:
+            raise GraphValidationError(
+                "reviewer_fence_missing", "reviewer settlement requires its fence"
+            )
+        loaded_attempt = _load_attempt(
+            connection,
+            job.agent_id,
+            job.job_id,
+            reviewer.task_id,
+            reviewer_result.attempt_id,
+        )
+        if loaded_attempt is None:
+            raise GraphValidationError(
+                "stale_attempt", "the reviewer attempt is unavailable"
+            )
+        attempt, attempt_data = loaded_attempt
+        require_current_attempt(
+            task=reviewer,
+            attempt=attempt,
+            claim_token=claim_token,
+            fencing_epoch=fencing_epoch,
+        )
+        if (
+            attempt.state is not AttemptState.RUNNING
+            or reviewer_result.agent_id != job.agent_id
+            or reviewer_result.job_id != job.job_id
+            or reviewer_result.task_id != reviewer.task_id
+            or reviewer_result.run_id != attempt.run_id
+            or reviewer_result.result_kind != "graph.review_decision"
+            or reviewer_result.completed_at != settled_at
+        ):
+            raise GraphValidationError(
+                "reviewer_result_invalid", "the reviewer result binding differs"
+            )
+        _insert_result(connection, reviewer_result)
+        measured = _settle_budgets(
+            connection, attempt=attempt, usage=None, settled_at=settled_at
+        )
+        require_attempt_transition(attempt.state, AttemptState.SUCCEEDED)
+        _replace_attempt(
+            connection,
+            attempt_data,
+            replace(
+                attempt,
+                state=AttemptState.SUCCEEDED,
+                lease_expires_at=None,
+                ended_at=settled_at,
+                measured_usage=measured,
+                result_id=reviewer_result.result_id,
+            ),
+        )
+        require_task_transition(reviewer.state, TaskState.SUCCEEDED)
+        _replace_task(
+            connection,
+            reviewer_data,
+            replace(
+                reviewer,
+                state=TaskState.SUCCEEDED,
+                current_attempt_id=None,
+                latest_result_id=reviewer_result.result_id,
+                task_revision=reviewer.task_revision + 1,
+                updated_at=settled_at,
+                terminal_at=settled_at,
+            ),
+        )
+        return 1
+    if claim_token is not None or fencing_epoch is not None:
+        raise GraphValidationError(
+            "reviewer_fence_invalid", "human review cannot supply a partial fence"
+        )
+    active = 0
+    if reviewer.state is TaskState.RUNNING:
+        if reviewer.current_attempt_id is None:
+            raise GraphStoreConflictError("running reviewer omitted its attempt")
+        loaded_attempt = _load_attempt(
+            connection,
+            job.agent_id,
+            job.job_id,
+            reviewer.task_id,
+            reviewer.current_attempt_id,
+        )
+        if loaded_attempt is None:
+            raise GraphStoreConflictError("running reviewer attempt disappeared")
+        attempt, attempt_data = loaded_attempt
+        measured = _settle_budgets(
+            connection, attempt=attempt, usage=None, settled_at=settled_at
+        )
+        require_attempt_transition(attempt.state, AttemptState.CANCELLED)
+        _replace_attempt(
+            connection,
+            attempt_data,
+            replace(
+                attempt,
+                state=AttemptState.CANCELLED,
+                lease_expires_at=None,
+                ended_at=settled_at,
+                measured_usage=measured,
+                error_code="principal_review_resolution",
+                diagnostic="The principal resolved the bound review control.",
+            ),
+        )
+        require_task_transition(TaskState.RUNNING, TaskState.READY)
+        active = 1
+    elif reviewer.state is TaskState.BLOCKED:
+        require_task_transition(TaskState.BLOCKED, TaskState.READY)
+        rows = tuple(
+            connection.execute(
+                """SELECT control_id, data FROM job_task_controls
+                   WHERE agent_id = ? AND job_id = ? AND task_id = ? AND state = 'open'""",
+                (job.agent_id, job.job_id, reviewer.task_id),
+            )
+        )
+        for control_id, data in rows:
+            current = decode_task_control(
+                _required_text(data, "reviewer control payload")
+            )
+            resolved = replace(
+                current,
+                state=ControlState.REJECTED,
+                resolved_at=settled_at,
+                resolved_by_kind="system",
+                resolved_by_id="review_resolution",
+                resolution={"reason": "review_resolved_by_principal"},
+            )
+            changed = connection.execute(
+                """UPDATE job_task_controls
+                   SET state = ?, resolved_at_us = ?, resolved_by_kind = ?,
+                       resolved_by_id = ?, data = ?
+                   WHERE agent_id = ? AND job_id = ? AND task_id = ?
+                     AND control_id = ? AND data = ?""",
+                (
+                    resolved.state.value,
+                    datetime_to_us(settled_at),
+                    resolved.resolved_by_kind,
+                    resolved.resolved_by_id,
+                    encode_task_control(resolved),
+                    job.agent_id,
+                    job.job_id,
+                    reviewer.task_id,
+                    str(control_id),
+                    data,
+                ),
+            )
+            if changed.rowcount != 1:
+                raise GraphStoreConflictError("reviewer control changed")
+    elif reviewer.state not in {TaskState.READY, TaskState.PENDING}:
+        raise GraphValidationError(
+            "reviewer_task_settled", "the reviewer task is already settled"
+        )
+    require_task_transition(TaskState.READY, TaskState.SKIPPED)
+    _replace_task(
+        connection,
+        reviewer_data,
+        replace(
+            reviewer,
+            state=TaskState.SKIPPED,
+            current_attempt_id=None,
+            task_revision=reviewer.task_revision + 1,
+            updated_at=settled_at,
+            terminal_at=settled_at,
+        ),
+    )
+    return active
+
+
+def _resolved_review_replay(
+    control: TaskControl,
+    *,
+    decision: str,
+    idempotency_key: str,
+    resolved_by_kind: str,
+    resolved_by_id: str,
+) -> bool:
+    resolution = control.resolution
+    return bool(
+        control.state is not ControlState.OPEN
+        and isinstance(resolution, Mapping)
+        and resolution.get("decision") == decision
+        and resolution.get("idempotency_key") == idempotency_key
+        and control.resolved_by_kind == resolved_by_kind
+        and control.resolved_by_id == resolved_by_id
+    )
+
+
+def accept_review(
+    connection: sqlite3.Connection,
+    *,
+    agent_id: str,
+    job_id: str,
+    subject_task_id: str,
+    control_id: str,
+    reviewer_task_id: str,
+    resolved_at: datetime,
+    resolved_by_kind: str,
+    resolved_by_id: str,
+    rationale: str,
+    idempotency_key: str,
+    expected_control_digest: str,
+    expected_subject_revision: int,
+    reviewer_result: TaskResult | None = None,
+    claim_token: str | None = None,
+    fencing_epoch: int | None = None,
+) -> TaskResult:
+    row = connection.execute(
+        """SELECT data FROM job_task_controls
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?""",
+        (agent_id, job_id, subject_task_id, control_id),
+    ).fetchone()
+    if row is None:
+        raise GraphValidationError(
+            "review_control_unavailable", "the review control is unavailable"
+        )
+    control_data = _required_text(row[0], "review control payload")
+    control = decode_task_control(control_data)
+    candidate = _review_candidate(
+        control, agent_id=agent_id, job_id=job_id, task_id=subject_task_id
+    )
+    if control.state is not ControlState.OPEN:
+        if _resolved_review_replay(
+            control,
+            decision="accepted",
+            idempotency_key=idempotency_key,
+            resolved_by_kind=resolved_by_kind,
+            resolved_by_id=resolved_by_id,
+        ):
+            existing = connection.execute(
+                """SELECT data FROM job_task_results
+                   WHERE agent_id = ? AND job_id = ? AND task_id = ?""",
+                (agent_id, job_id, subject_task_id),
+            ).fetchone()
+            if existing is not None:
+                result = decode_task_result(
+                    _required_text(existing[0], "accepted review result")
+                )
+                if result == candidate:
+                    return result
+        raise GraphStoreConflictError("review control was resolved differently")
+    loaded_job = _load_job(connection, agent_id, job_id)
+    loaded_graph = _load_graph(connection, agent_id, job_id)
+    loaded_subject = _load_task(connection, agent_id, job_id, subject_task_id)
+    if loaded_job is None or loaded_graph is None or loaded_subject is None:
+        raise GraphValidationError("review_stale", "the review subject is unavailable")
+    job, job_data = loaded_job
+    graph, graph_data = loaded_graph
+    subject, subject_data = loaded_subject
+    if (
+        control.kind is not ControlKind.REVIEW_REQUESTED
+        or control.payload_digest != expected_control_digest
+        or subject.state is not TaskState.REVIEW
+        or subject.task_revision != expected_subject_revision
+        or subject.latest_control_id != control_id
+    ):
+        raise GraphStoreConflictError("review fence is stale")
+    if resolved_at > job.deadline_at:
+        raise GraphValidationError("control_expired", "the review control expired")
+    existing = connection.execute(
+        """SELECT 1 FROM job_task_results
+           WHERE agent_id = ? AND job_id = ? AND task_id = ?""",
+        (agent_id, job_id, subject_task_id),
+    ).fetchone()
+    if existing is not None:
+        raise GraphStoreConflictError("the review subject already has a result")
+    active_delta = _settle_reviewer(
+        connection,
+        job=job,
+        reviewer_task_id=reviewer_task_id,
+        review_control_id=control_id,
+        settled_at=resolved_at,
+        reviewer_result=reviewer_result,
+        claim_token=claim_token,
+        fencing_epoch=fencing_epoch,
+    )
+    _insert_result(connection, candidate)
+    resolution = {
+        "decision": "accepted",
+        "rationale": rationale,
+        "candidate_digest": candidate.result_digest,
+        "reviewer_task_id": reviewer_task_id,
+        "idempotency_key": idempotency_key,
+    }
+    resolved = replace(
+        control,
+        state=ControlState.RESOLVED,
+        resolved_at=resolved_at,
+        resolved_by_kind=resolved_by_kind,
+        resolved_by_id=resolved_by_id,
+        resolution=resolution,
+    )
+    changed = connection.execute(
+        """UPDATE job_task_controls
+           SET state = ?, resolved_at_us = ?, resolved_by_kind = ?,
+               resolved_by_id = ?, data = ?
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?
+             AND data = ?""",
+        (
+            resolved.state.value,
+            datetime_to_us(resolved_at),
+            resolved_by_kind,
+            resolved_by_id,
+            encode_task_control(resolved),
+            agent_id,
+            job_id,
+            subject_task_id,
+            control_id,
+            control_data,
+        ),
+    )
+    if changed.rowcount != 1:
+        raise GraphStoreConflictError("review control changed during acceptance")
+    require_task_transition(subject.state, TaskState.SUCCEEDED)
+    accepted_subject = replace(
+        subject,
+        state=TaskState.SUCCEEDED,
+        latest_result_id=candidate.result_id,
+        task_revision=subject.task_revision + 1,
+        updated_at=resolved_at,
+        terminal_at=resolved_at,
+    )
+    _replace_task(connection, subject_data, accepted_subject)
+    if job.state is not GraphState.ACTIVE:
+        require_graph_transition(job.state, GraphState.ACTIVE)
+        _replace_job(
+            connection,
+            job_data,
+            replace(job, state=GraphState.ACTIVE, updated_at=resolved_at),
+        )
+    _promote_ready(connection, job=job, changed_at=resolved_at)
+    tasks = _load_tasks(connection, agent_id, job_id)
+    _replace_graph(
+        connection,
+        graph_data,
+        replace(
+            graph,
+            active_attempt_count=graph.active_attempt_count - active_delta,
+            next_ready_at=_next_ready_at(tasks),
+            updated_at=resolved_at,
+        ),
+    )
+    _insert_event(
+        connection,
+        agent_id=agent_id,
+        job_id=job_id,
+        task_id=subject_task_id,
+        attempt_id=control.requesting_attempt_id,
+        kind="task_review_accepted",
+        created_at=resolved_at,
+        payload={
+            "control_id": control_id,
+            "candidate_result_id": candidate.result_id,
+            "candidate_digest": candidate.result_digest,
+            "reviewer_task_id": reviewer_task_id,
+            "resolved_by_kind": resolved_by_kind,
+            "resolved_by_id": resolved_by_id,
+        },
+        maximum=job.specification.limits.max_events,
+    )
+    return candidate
+
+
+def request_review_changes(
+    connection: sqlite3.Connection,
+    *,
+    changes_control: TaskControl,
+    review_control_id: str,
+    reviewer_task_id: str,
+    resolved_at: datetime,
+    resolved_by_kind: str,
+    resolved_by_id: str,
+    rationale: str,
+    idempotency_key: str,
+    expected_control_digest: str,
+    expected_subject_revision: int,
+    reviewer_result: TaskResult | None = None,
+    claim_token: str | None = None,
+    fencing_epoch: int | None = None,
+) -> TaskControl:
+    agent_id = changes_control.agent_id
+    job_id = changes_control.job_id
+    subject_task_id = changes_control.task_id
+    row = connection.execute(
+        """SELECT data FROM job_task_controls
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?""",
+        (agent_id, job_id, subject_task_id, review_control_id),
+    ).fetchone()
+    if row is None:
+        raise GraphValidationError(
+            "review_control_unavailable", "the review control is unavailable"
+        )
+    review_data = _required_text(row[0], "review control payload")
+    review = decode_task_control(review_data)
+    _review_candidate(review, agent_id=agent_id, job_id=job_id, task_id=subject_task_id)
+    if review.state is not ControlState.OPEN:
+        if _resolved_review_replay(
+            review,
+            decision="changes_requested",
+            idempotency_key=idempotency_key,
+            resolved_by_kind=resolved_by_kind,
+            resolved_by_id=resolved_by_id,
+        ):
+            resolution = review.resolution
+            assert isinstance(resolution, Mapping)
+            stored_id = resolution.get("changes_control_id")
+            if isinstance(stored_id, str):
+                existing = connection.execute(
+                    """SELECT data FROM job_task_controls
+                       WHERE agent_id = ? AND job_id = ? AND task_id = ?
+                         AND control_id = ?""",
+                    (agent_id, job_id, subject_task_id, stored_id),
+                ).fetchone()
+                if existing is not None:
+                    return decode_task_control(
+                        _required_text(existing[0], "changes control payload")
+                    )
+        raise GraphStoreConflictError("review control was resolved differently")
+    loaded_job = _load_job(connection, agent_id, job_id)
+    loaded_graph = _load_graph(connection, agent_id, job_id)
+    loaded_subject = _load_task(connection, agent_id, job_id, subject_task_id)
+    if loaded_job is None or loaded_graph is None or loaded_subject is None:
+        raise GraphValidationError("review_stale", "the review subject is unavailable")
+    job, job_data = loaded_job
+    graph, graph_data = loaded_graph
+    subject, subject_data = loaded_subject
+    if (
+        review.kind is not ControlKind.REVIEW_REQUESTED
+        or review.payload_digest != expected_control_digest
+        or subject.state is not TaskState.REVIEW
+        or subject.task_revision != expected_subject_revision
+        or subject.latest_control_id != review_control_id
+        or changes_control.kind is not ControlKind.CHANGES_REQUESTED
+        or changes_control.state is not ControlState.OPEN
+    ):
+        raise GraphStoreConflictError("review fence is stale")
+    if resolved_at > job.deadline_at:
+        raise GraphValidationError("control_expired", "the review control expired")
+    count = connection.execute(
+        """SELECT COUNT(*) FROM job_task_controls
+           WHERE agent_id = ? AND job_id = ? AND task_id = ?""",
+        (agent_id, job_id, subject_task_id),
+    ).fetchone()
+    if count is None or int(count[0]) >= job.specification.limits.max_controls_per_task:
+        raise GraphValidationError("control_limit", "task control limit exceeded")
+    active_delta = _settle_reviewer(
+        connection,
+        job=job,
+        reviewer_task_id=reviewer_task_id,
+        review_control_id=review_control_id,
+        settled_at=resolved_at,
+        reviewer_result=reviewer_result,
+        claim_token=claim_token,
+        fencing_epoch=fencing_epoch,
+    )
+    connection.execute(
+        """INSERT INTO job_task_controls(
+               agent_id, job_id, task_id, control_id, kind, state,
+               requesting_attempt_id, created_at_us, resolved_at_us,
+               resolved_by_kind, resolved_by_id, payload_digest, data
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)""",
+        (
+            changes_control.agent_id,
+            changes_control.job_id,
+            changes_control.task_id,
+            changes_control.control_id,
+            changes_control.kind.value,
+            changes_control.state.value,
+            changes_control.requesting_attempt_id,
+            datetime_to_us(changes_control.created_at),
+            changes_control.payload_digest,
+            encode_task_control(changes_control),
+        ),
+    )
+    resolution = {
+        "decision": "changes_requested",
+        "rationale": rationale,
+        "candidate_digest": review.payload["candidate_digest"],
+        "reviewer_task_id": reviewer_task_id,
+        "changes_control_id": changes_control.control_id,
+        "idempotency_key": idempotency_key,
+    }
+    resolved = replace(
+        review,
+        state=ControlState.REJECTED,
+        resolved_at=resolved_at,
+        resolved_by_kind=resolved_by_kind,
+        resolved_by_id=resolved_by_id,
+        resolution=resolution,
+    )
+    changed = connection.execute(
+        """UPDATE job_task_controls
+           SET state = ?, resolved_at_us = ?, resolved_by_kind = ?,
+               resolved_by_id = ?, data = ?
+           WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?
+             AND data = ?""",
+        (
+            resolved.state.value,
+            datetime_to_us(resolved_at),
+            resolved_by_kind,
+            resolved_by_id,
+            encode_task_control(resolved),
+            agent_id,
+            job_id,
+            subject_task_id,
+            review_control_id,
+            review_data,
+        ),
+    )
+    if changed.rowcount != 1:
+        raise GraphStoreConflictError("review control changed during resolution")
+    require_task_transition(subject.state, TaskState.BLOCKED)
+    blocked_subject = replace(
+        subject,
+        state=TaskState.BLOCKED,
+        latest_control_id=changes_control.control_id,
+        task_revision=subject.task_revision + 1,
+        updated_at=resolved_at,
+    )
+    _replace_task(connection, subject_data, blocked_subject)
+    if job.state is not GraphState.BLOCKED:
+        require_graph_transition(job.state, GraphState.BLOCKED)
+        _replace_job(
+            connection,
+            job_data,
+            replace(job, state=GraphState.BLOCKED, updated_at=resolved_at),
+        )
+    tasks = _load_tasks(connection, agent_id, job_id)
+    _replace_graph(
+        connection,
+        graph_data,
+        replace(
+            graph,
+            active_attempt_count=graph.active_attempt_count - active_delta,
+            next_ready_at=_next_ready_at(tasks),
+            updated_at=resolved_at,
+        ),
+    )
+    event_id = _insert_event(
+        connection,
+        agent_id=agent_id,
+        job_id=job_id,
+        task_id=subject_task_id,
+        attempt_id=review.requesting_attempt_id,
+        kind="task_review_changes_requested",
+        created_at=resolved_at,
+        payload={
+            "review_control_id": review_control_id,
+            "changes_control_id": changes_control.control_id,
+            "reviewer_task_id": reviewer_task_id,
+            "resolved_by_kind": resolved_by_kind,
+            "resolved_by_id": resolved_by_id,
+        },
+        maximum=job.specification.limits.max_events,
+    )
+    _insert_graph_attention(
+        connection,
+        job=job,
+        event_id=event_id,
+        transition_kind="review_changes_requested",
+        transition_identity=changes_control.control_id,
+        preview=(
+            f"Graph job {job.job_id} requires attention: review changes were "
+            f"requested for task {subject_task_id}."
+        ),
+        observed_at=resolved_at,
+    )
+    return changes_control
 
 
 def resolve_control(
@@ -3260,6 +4320,8 @@ def resolve_control(
     resolved_by_id: str,
     resolution: dict[str, object],
     make_ready: bool,
+    expected_control_digest: str | None = None,
+    expected_task_revision: int | None = None,
 ) -> TaskControl | None:
     row = connection.execute(
         """SELECT data FROM job_task_controls
@@ -3271,16 +4333,79 @@ def resolve_control(
     current_data = _required_text(row[0], "task control payload")
     current = decode_task_control(current_data)
     if current.state is not ControlState.OPEN:
-        return current
+        if (
+            current.state is state
+            and current.resolved_by_kind == resolved_by_kind
+            and current.resolved_by_id == resolved_by_id
+            and isinstance(current.resolution, Mapping)
+            and canonical_digest(current.resolution) == canonical_digest(resolution)
+        ):
+            return current
+        if (
+            current.state is ControlState.EXPIRED
+            and current.resolved_by_kind == "system"
+            and current.resolved_by_id == "control_expiry"
+            and isinstance(current.resolution, Mapping)
+            and current.resolution.get("reason") == "control_expired"
+            and isinstance(current.resolution.get("requested_resolution"), Mapping)
+            and canonical_digest(
+                cast(Mapping[str, object], current.resolution["requested_resolution"])
+            )
+            == canonical_digest(resolution)
+            and current.resolution.get("requested_by_kind") == resolved_by_kind
+            and current.resolution.get("requested_by_id") == resolved_by_id
+        ):
+            return current
+        raise GraphStoreConflictError("control was resolved differently")
     if state is ControlState.OPEN:
         raise ValueError("control resolution must be terminal")
+    if current.kind is ControlKind.REVIEW_REQUESTED:
+        raise GraphValidationError(
+            "typed_review_required",
+            "review controls require the typed review decision transaction",
+        )
+    if current.kind is ControlKind.CHANGES_REQUESTED and make_ready:
+        raise GraphValidationError(
+            "replacement_required",
+            "requested review changes require a validated replacement",
+        )
     loaded_job_before_resolution = _load_job(connection, agent_id, job_id)
     if loaded_job_before_resolution is None:
         raise GraphStoreConflictError("control owner disappeared")
-    if resolved_at > loaded_job_before_resolution[0].deadline_at:
+    loaded_task_before_resolution = _load_task(connection, agent_id, job_id, task_id)
+    if loaded_task_before_resolution is None:
+        raise GraphStoreConflictError("control task disappeared")
+    if (
+        expected_control_digest is not None
+        and current.payload_digest != expected_control_digest
+    ) or (
+        expected_task_revision is not None
+        and loaded_task_before_resolution[0].task_revision != expected_task_revision
+    ):
+        raise GraphStoreConflictError("control fence is stale")
+    expires_at = current.payload.get("expires_at")
+    expiry = loaded_job_before_resolution[0].deadline_at
+    if isinstance(expires_at, str):
+        try:
+            declared_expiry = datetime.fromisoformat(expires_at)
+        except ValueError:
+            raise GraphValidationError(
+                "control_expiry_invalid", "the control expiry is malformed"
+            ) from None
+        if declared_expiry.utcoffset() is None:
+            raise GraphValidationError(
+                "control_expiry_invalid", "the control expiry is malformed"
+            )
+        expiry = min(expiry, declared_expiry)
+    if resolved_at > expiry:
         state = ControlState.EXPIRED
         make_ready = False
-        resolution = {"reason": "control_expired"}
+        resolution = {
+            "reason": "control_expired",
+            "requested_resolution": resolution,
+            "requested_by_kind": resolved_by_kind,
+            "requested_by_id": resolved_by_id,
+        }
         resolved_by_kind = "system"
         resolved_by_id = "control_expiry"
     resolved = replace(
@@ -3554,6 +4679,34 @@ def list_budget_ledgers(
     )
 
 
+def _list_task_budget_ledgers(
+    connection: sqlite3.Connection, agent_id: str, job_id: str
+) -> tuple[BudgetLedger, ...]:
+    rows = tuple(
+        connection.execute(
+            """SELECT task_id, dimension, ceiling, settled, reserved, updated_at_us
+               FROM job_task_budget_ledger
+               WHERE agent_id = ? AND job_id = ?
+               ORDER BY task_id, dimension""",
+            (agent_id, job_id),
+        )
+    )
+    return tuple(
+        BudgetLedger(
+            agent_id=agent_id,
+            job_id=job_id,
+            task_id=_required_text(task_id, "task budget task ID"),
+            dimension=_required_text(dimension, "task budget dimension"),
+            ceiling=_required_int(ceiling, "task budget ceiling"),
+            settled=_required_int(settled, "task budget settled"),
+            reserved=_required_int(reserved, "task budget reserved"),
+            control_reserved=0,
+            updated_at=datetime_from_us(updated_at_us, "task budget"),
+        )
+        for task_id, dimension, ceiling, settled, reserved, updated_at_us in rows
+    )
+
+
 def list_attempt_reservations(
     connection: sqlite3.Connection,
     agent_id: str,
@@ -3588,8 +4741,10 @@ def list_attempt_reservations(
 __all__ = [
     "GraphBudgetError",
     "GraphStoreConflictError",
+    "accept_review",
     "add_comment",
     "admit_graph",
+    "admit_replacement_graph",
     "apply_mutation",
     "checkpoint_attempt",
     "claim_task",
@@ -3604,8 +4759,8 @@ __all__ = [
     "list_active_attempts",
     "list_attempt_reservations",
     "list_budget_ledgers",
-    "list_graph_artifact_refs",
     "list_current_delivery_artifact_references",
+    "list_graph_artifact_refs",
     "list_graph_deliveries",
     "list_graph_events",
     "list_graph_reserved_artifact_ids",
@@ -3613,6 +4768,7 @@ __all__ = [
     "list_stale_attempts",
     "open_control",
     "request_cancel",
+    "request_review_changes",
     "resolve_control",
     "start_attempt",
 ]

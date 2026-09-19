@@ -5,6 +5,13 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+from daita.distribution.models import (
+    CONVERSATION_INBOX_DESTINATION_REVISION,
+    ConversationInboxTarget,
+    conversation_inbox_destination_id,
+    distribution_plan_digest,
+    target_fingerprint,
+)
 from daita.jobs.graph.models import (
     BudgetAmount,
     BudgetLimit,
@@ -45,12 +52,27 @@ def graph_admission(
         contract_bindings={"capability.read": "sha256:" + "1" * 64},
     )
     deadline = GRAPH_NOW + timedelta(hours=1)
+    destination_id = conversation_inbox_destination_id("conversation-1")
+    target = ConversationInboxTarget(
+        conversation_id="conversation-1",
+        destination_id=destination_id,
+        destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+        sensitivity_ceiling=ModelSensitivity.RESTRICTED,
+        target_fingerprint=target_fingerprint(
+            conversation_id="conversation-1",
+            destination_id=destination_id,
+            destination_revision=CONVERSATION_INBOX_DESTINATION_REVISION,
+            sensitivity_ceiling=ModelSensitivity.RESTRICTED,
+        ),
+    )
     specification = GraphJobSpecification(
         principal_id=agent_id,
         objective="Complete the deterministic graph test.",
         outcome_contract={"kind": "test"},
         authority=authority,
-        distribution_plan_digest=canonical_digest({"destination": "inbox"}),
+        distribution_plan_digest=distribution_plan_digest(
+            targets=(target,), required_target_count=1
+        ),
         budgets=(BudgetLimit("work_units", 4, 1),),
         deadline_at=deadline,
         retry_policy={"max_attempts": 3},

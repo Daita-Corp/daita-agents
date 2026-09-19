@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
+from typing import cast
 
 from ..._json import FrozenJsonObject, canonical_json
 from ...llm.models import ModelSensitivity
@@ -1015,6 +1016,106 @@ class TaskResult:
             "downstream_constraints": self.downstream_constraints,
             "completed_at": self.completed_at.isoformat(),
         }
+
+    def candidate_material(self) -> dict[str, object]:
+        """Return the complete immutable material retained by a review control."""
+
+        return {**self.digest_material(), "result_digest": self.result_digest}
+
+    @classmethod
+    def from_candidate_material(cls, value: Mapping[str, object]) -> TaskResult:
+        """Reconstruct and revalidate one candidate without trusting its container."""
+
+        required = {
+            "agent_id",
+            "job_id",
+            "task_id",
+            "result_id",
+            "attempt_id",
+            "run_id",
+            "result_kind",
+            "schema_digest",
+            "payload",
+            "summary",
+            "sensitivity",
+            "provenance",
+            "artifact_ids",
+            "effect_receipt_ids",
+            "verification",
+            "residual_risk",
+            "downstream_constraints",
+            "completed_at",
+            "result_digest",
+        }
+        if set(value) != required:
+            raise ValueError("review candidate fields are invalid")
+        mappings = {
+            name: value[name]
+            for name in (
+                "payload",
+                "provenance",
+                "verification",
+                "downstream_constraints",
+            )
+        }
+        if any(not isinstance(item, Mapping) for item in mappings.values()):
+            raise TypeError("review candidate mappings are invalid")
+        raw_artifacts = value["artifact_ids"]
+        raw_effects = value["effect_receipt_ids"]
+        if not isinstance(raw_artifacts, (tuple, list)) or not isinstance(
+            raw_effects, (tuple, list)
+        ):
+            raise TypeError("review candidate references are invalid")
+        text_fields = {
+            name: value[name]
+            for name in (
+                "agent_id",
+                "job_id",
+                "task_id",
+                "result_id",
+                "attempt_id",
+                "run_id",
+                "result_kind",
+                "schema_digest",
+                "summary",
+                "sensitivity",
+                "completed_at",
+                "result_digest",
+            )
+        }
+        if any(not isinstance(item, str) for item in text_fields.values()):
+            raise TypeError("review candidate text fields are invalid")
+        residual_risk = value["residual_risk"]
+        if residual_risk is not None and not isinstance(residual_risk, str):
+            raise TypeError("review candidate residual risk is invalid")
+        try:
+            completed_at = datetime.fromisoformat(str(value["completed_at"]))
+            sensitivity = ModelSensitivity(str(value["sensitivity"]))
+        except ValueError:
+            raise ValueError("review candidate typed fields are invalid") from None
+        return cls(
+            agent_id=str(value["agent_id"]),
+            job_id=str(value["job_id"]),
+            task_id=str(value["task_id"]),
+            result_id=str(value["result_id"]),
+            attempt_id=str(value["attempt_id"]),
+            run_id=str(value["run_id"]),
+            result_kind=str(value["result_kind"]),
+            schema_digest=str(value["schema_digest"]),
+            payload=cast(Mapping[str, object], mappings["payload"]),
+            summary=str(value["summary"]),
+            sensitivity=sensitivity,
+            provenance=cast(Mapping[str, object], mappings["provenance"]),
+            artifact_ids=tuple(str(item) for item in raw_artifacts),
+            effect_receipt_ids=tuple(str(item) for item in raw_effects),
+            verification=cast(Mapping[str, object], mappings["verification"]),
+            residual_risk=residual_risk,
+            downstream_constraints=cast(
+                Mapping[str, object], mappings["downstream_constraints"]
+            ),
+            completed_at=completed_at,
+            result_digest=str(value["result_digest"]),
+        )
 
 
 @dataclass(frozen=True, slots=True)

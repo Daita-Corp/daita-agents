@@ -60,6 +60,7 @@ from ..distribution.models import (
     OutcomeConclusionKind,
     OutcomeState,
     conclusion_preview_projection,
+    distribution_plan_digest,
     outcome_artifact_reference,
     validate_outcome_artifact_references,
 )
@@ -72,6 +73,7 @@ from ..jobs.graph.models import (
     AttemptState,
     BudgetAmount,
     BudgetLedger,
+    ControlKind,
     ControlState,
     GraphAdmission,
     GraphEventPage,
@@ -86,6 +88,7 @@ from ..jobs.graph.models import (
     TaskComment,
     TaskControl,
     TaskResult,
+    canonical_digest,
 )
 from ..learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
@@ -194,7 +197,7 @@ from .sqlite_codecs import (
     encode_source,
     encode_source_read_scope,
 )
-from .sqlite_codecs.graph import decode_graph_job_delivery
+from .sqlite_codecs.graph import decode_graph_event, decode_graph_job_delivery
 from .sqlite_records import (
     EffectOutcome,
     EffectReceipt,
@@ -623,6 +626,37 @@ class SQLiteStateStore:
             lambda connection: _graph_store.admit_graph(connection, admission),
         )
 
+    async def admit_replacement_graph(
+        self,
+        admission: GraphAdmission,
+        *,
+        replaced_job_id: str,
+        replaced_task_id: str,
+        control_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        resolved_at: datetime,
+        expected_control_digest: str,
+        expected_task_revision: int,
+    ) -> GraphJob:
+        if not isinstance(admission, GraphAdmission):
+            raise TypeError("replacement graph admission must be GraphAdmission")
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.admit_replacement_graph(
+                connection,
+                admission,
+                replaced_job_id=replaced_job_id,
+                replaced_task_id=replaced_task_id,
+                control_id=control_id,
+                principal_id=principal_id,
+                idempotency_key=idempotency_key,
+                resolved_at=resolved_at,
+                expected_control_digest=expected_control_digest,
+                expected_task_revision=expected_task_revision,
+            ),
+        )
+
     async def inspect_graph(self, agent_id: str, job_id: str) -> GraphInspection | None:
         return await _run_graph_read(
             self.path,
@@ -969,6 +1003,7 @@ class SQLiteStateStore:
         claim_token: str,
         fencing_epoch: int,
         replan_task: GraphTask | None = None,
+        reviewer_task: GraphTask | None = None,
     ) -> TaskControl:
         return await _run_cancellation_safe_graph_transaction(
             self.path,
@@ -978,6 +1013,7 @@ class SQLiteStateStore:
                 claim_token=claim_token,
                 fencing_epoch=fencing_epoch,
                 replan_task=replan_task,
+                reviewer_task=reviewer_task,
             ),
         )
 
@@ -994,6 +1030,8 @@ class SQLiteStateStore:
         resolved_by_id: str,
         resolution: dict[str, object],
         make_ready: bool,
+        expected_control_digest: str | None = None,
+        expected_task_revision: int | None = None,
     ) -> TaskControl | None:
         return await _run_cancellation_safe_graph_transaction(
             self.path,
@@ -1009,6 +1047,86 @@ class SQLiteStateStore:
                 resolved_by_id=resolved_by_id,
                 resolution=resolution,
                 make_ready=make_ready,
+                expected_control_digest=expected_control_digest,
+                expected_task_revision=expected_task_revision,
+            ),
+        )
+
+    async def accept_graph_review(
+        self,
+        *,
+        agent_id: str,
+        job_id: str,
+        subject_task_id: str,
+        control_id: str,
+        reviewer_task_id: str,
+        resolved_at: datetime,
+        resolved_by_kind: str,
+        resolved_by_id: str,
+        rationale: str,
+        idempotency_key: str,
+        expected_control_digest: str,
+        expected_subject_revision: int,
+        reviewer_result: TaskResult | None = None,
+        claim_token: str | None = None,
+        fencing_epoch: int | None = None,
+    ) -> TaskResult:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.accept_review(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                subject_task_id=subject_task_id,
+                control_id=control_id,
+                reviewer_task_id=reviewer_task_id,
+                resolved_at=resolved_at,
+                resolved_by_kind=resolved_by_kind,
+                resolved_by_id=resolved_by_id,
+                rationale=rationale,
+                idempotency_key=idempotency_key,
+                expected_control_digest=expected_control_digest,
+                expected_subject_revision=expected_subject_revision,
+                reviewer_result=reviewer_result,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+            ),
+        )
+
+    async def request_graph_review_changes(
+        self,
+        *,
+        changes_control: TaskControl,
+        review_control_id: str,
+        reviewer_task_id: str,
+        resolved_at: datetime,
+        resolved_by_kind: str,
+        resolved_by_id: str,
+        rationale: str,
+        idempotency_key: str,
+        expected_control_digest: str,
+        expected_subject_revision: int,
+        reviewer_result: TaskResult | None = None,
+        claim_token: str | None = None,
+        fencing_epoch: int | None = None,
+    ) -> TaskControl:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.request_review_changes(
+                connection,
+                changes_control=changes_control,
+                review_control_id=review_control_id,
+                reviewer_task_id=reviewer_task_id,
+                resolved_at=resolved_at,
+                resolved_by_kind=resolved_by_kind,
+                resolved_by_id=resolved_by_id,
+                rationale=rationale,
+                idempotency_key=idempotency_key,
+                expected_control_digest=expected_control_digest,
+                expected_subject_revision=expected_subject_revision,
+                reviewer_result=reviewer_result,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
             ),
         )
 
@@ -1019,6 +1137,7 @@ class SQLiteStateStore:
         *,
         after_event_id: int = 0,
         limit: int = 100,
+        task_id: str | None = None,
     ) -> GraphEventPage:
         return await _run_graph_read(
             self.path,
@@ -1028,6 +1147,7 @@ class SQLiteStateStore:
                 job_id,
                 after_event_id=after_event_id,
                 limit=limit,
+                task_id=task_id,
             ),
         )
 
@@ -2820,7 +2940,7 @@ class SQLiteStateStore:
             raise ValueError("delivery list limit is outside its bound")
 
         def read() -> tuple[Delivery, ...]:
-            clauses = ["agent_id = ?"]
+            clauses = ["agent_id = ?", "subject_kind != 'graph_job'"]
             parameters: list[object] = [agent_id]
             if conversation_id is not None:
                 clauses.append("conversation_id = ?")
@@ -6186,6 +6306,80 @@ def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity |
         if job_counts[agent_id] > MAX_GRAPH_JOBS_PER_AGENT:
             raise ValueError("stored graph job count exceeds its fixed bound")
 
+    graph_attention_producers: dict[tuple[str, str], tuple[GraphJob, str, datetime]] = (
+        {}
+    )
+    for (
+        event_id,
+        agent_id,
+        job_id,
+        task_id,
+        attempt_id,
+        kind,
+        created_at_us,
+        data,
+    ) in connection.execute(
+        """SELECT event_id, agent_id, job_id, task_id, attempt_id, kind,
+                  created_at_us, data
+           FROM job_graph_events
+           WHERE kind IN (
+               'task_control_opened',
+               'task_retry_circuit_opened',
+               'task_review_changes_requested'
+           )"""
+    ):
+        inspection = graph_jobs.get((agent_id, job_id))
+        if inspection is None:
+            raise ValueError("stored graph attention event has no owned job")
+        created_at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
+            microseconds=int(created_at_us)
+        )
+        event = decode_graph_event(
+            data,
+            event_id=int(event_id),
+            agent_id=agent_id,
+            job_id=job_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            kind=kind,
+            created_at=created_at,
+        )
+        transition_kind: str
+        transition_identity: object
+        if event.kind == "task_control_opened":
+            control_kind = event.payload.get("kind")
+            if control_kind in {
+                ControlKind.NEEDS_REPLAN.value,
+                ControlKind.REVIEW_REQUESTED.value,
+            }:
+                continue
+            transition_kind = "control_opened"
+            transition_identity = event.payload.get("control_id")
+        elif event.kind == "task_retry_circuit_opened":
+            transition_kind = "retry_circuit_open"
+            transition_identity = event.payload.get("control_id")
+        else:
+            transition_kind = "review_changes_requested"
+            transition_identity = event.payload.get("changes_control_id")
+        if not isinstance(transition_identity, str) or not transition_identity:
+            raise ValueError("stored graph attention event identity is invalid")
+        subject = (
+            f"{event.job_id}/event/{event.event_id}/{transition_kind}/"
+            f"{transition_identity}"
+        )
+        digest = canonical_digest(
+            {
+                "job_id": event.job_id,
+                "event_id": event.event_id,
+                "transition_kind": transition_kind,
+                "transition_identity": transition_identity,
+            }
+        )
+        key = (event.agent_id, subject)
+        if key in graph_attention_producers:
+            raise ValueError("stored graph attention producer identity is duplicated")
+        graph_attention_producers[key] = (inspection.job, digest, created_at)
+
     routines: dict[tuple[str, str], ScheduledRoutine] = {}
     routine_counts: dict[str, int] = {}
     active_routine_counts: dict[str, int] = {}
@@ -6332,12 +6526,34 @@ def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity |
             raise ValueError("stored delivery projection is invalid")
         if identity is not None and delivery.agent_id != identity.id:
             raise ValueError("stored delivery belongs to another agent")
-        if delivery.subject_kind is not DeliverySubjectKind.ROUTINE_OCCURRENCE:
+        if delivery.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE:
+            producer = occurrences.get((agent_id, subject_id))
+            producer_references_delivery = (
+                producer is not None and delivery_id in producer.delivery_ids
+            )
+        elif delivery.subject_kind is DeliverySubjectKind.GRAPH_ATTENTION:
+            attention = graph_attention_producers.get((agent_id, subject_id))
+            if attention is None:
+                raise ValueError("stored graph attention producer is invalid")
+            attention_job, transition_digest, transition_at = attention
+            producer_references_delivery = (
+                delivery.conversation_id == attention_job.conversation_id
+                and delivery.outcome.conclusion_id == subject_id
+                and delivery.outcome.conclusion_digest == transition_digest
+                and delivery.outcome.provenance_digest == transition_digest
+                and delivery.outcome.observed_at == transition_at
+                and delivery.outcome.resulting_run_id is None
+                and not delivery.outcome.artifact_references
+                and not delivery.outcome.effect_receipt_ids
+                and delivery.delivery_id
+                == "delivery-" + sha256(subject_id.encode()).hexdigest()[:32]
+                and attention_job.specification.distribution_plan_digest
+                == distribution_plan_digest(
+                    targets=(delivery.target,), required_target_count=1
+                )
+            )
+        else:
             raise ValueError("stored delivery retained a legacy producer")
-        producer = occurrences.get((agent_id, subject_id))
-        producer_references_delivery = (
-            producer is not None and delivery_id in producer.delivery_ids
-        )
         if not producer_references_delivery:
             raise ValueError("stored delivery producer reference is invalid")
         delivery_counts[agent_id] = delivery_counts.get(agent_id, 0) + 1

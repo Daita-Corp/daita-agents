@@ -446,7 +446,16 @@ async def test_checkpoint_comment_and_prelimit_warning_remain_bounded(
         ),
         (
             "task_request_review",
-            {"message": "Review this bounded candidate.", "details": {}},
+            {
+                "result_kind": "test.graph.read",
+                "summary": "Review this bounded candidate.",
+                "payload": {"candidate": True},
+                "evidence_call_ids": (),
+                "artifact_ids": (),
+                "residual_risk": None,
+                "downstream_constraints": {},
+                "message": "Review this bounded candidate.",
+            },
             AttemptState.REVIEW_REQUESTED,
             "task_review_requested",
         ),

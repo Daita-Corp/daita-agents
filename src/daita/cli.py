@@ -70,7 +70,7 @@ from .distribution import (
     inbox_view_projection,
 )
 from .errors import StateCompatibilityError
-from .jobs.graph.models import GraphInspection
+from .jobs.graph.models import GraphInspection, GraphState, TaskState
 from .jobs.owner import GraphBlockerProjection
 from .learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
@@ -145,6 +145,49 @@ def _graph_inspection_mapping(inspection: GraphInspection) -> dict[str, object]:
                 ),
             }
             for task in inspection.tasks
+        ],
+        "dependencies": [
+            {
+                "upstream_task_id": edge.upstream_task_id,
+                "downstream_task_id": edge.downstream_task_id,
+                "edge_kind": edge.edge_kind.value,
+            }
+            for edge in inspection.dependencies
+        ],
+        "controls": [
+            {
+                "control_id": control.control_id,
+                "task_id": control.task_id,
+                "kind": control.kind.value,
+                "state": control.state.value,
+                "payload_digest": control.payload_digest,
+                "payload": control.payload,
+                "resolution": control.resolution,
+                "resolved_by_kind": control.resolved_by_kind,
+                "resolved_by_id": control.resolved_by_id,
+            }
+            for control in inspection.controls
+        ],
+        "checkpoints": [
+            {
+                "checkpoint_id": checkpoint.checkpoint_id,
+                "task_id": checkpoint.task_id,
+                "attempt_id": checkpoint.attempt_id,
+                "ordinal": checkpoint.ordinal,
+                "milestone": checkpoint.milestone,
+                "payload_digest": checkpoint.payload_digest,
+            }
+            for checkpoint in inspection.checkpoints
+        ],
+        "comments": [
+            {
+                "comment_id": comment.comment_id,
+                "task_id": comment.task_id,
+                "author_kind": comment.author_kind,
+                "author_id": comment.author_id,
+                "body_digest": comment.body_digest,
+            }
+            for comment in inspection.comments
         ],
         "budgets": [
             {
@@ -530,6 +573,55 @@ def build_parser() -> argparse.ArgumentParser:
         help="inspect and resolve bounded durable-job controls",
     )
     job_commands = jobs.add_subparsers(dest="jobs_command", required=True)
+    job_list = job_commands.add_parser("list")
+    job_list.add_argument("name")
+    job_list.add_argument(
+        "--state", action="append", choices=tuple(item.value for item in GraphState)
+    )
+    job_list.add_argument("--limit", type=int, default=50)
+    job_inspect = job_commands.add_parser("inspect")
+    job_inspect.add_argument("name")
+    job_inspect.add_argument("job_id")
+    job_tasks = job_commands.add_parser("tasks")
+    job_tasks.add_argument("name")
+    job_tasks.add_argument("job_id")
+    job_tasks.add_argument(
+        "--state", action="append", choices=tuple(item.value for item in TaskState)
+    )
+    job_tasks.add_argument("--limit", type=int, default=64)
+    job_dependencies = job_commands.add_parser("dependencies")
+    job_dependencies.add_argument("name")
+    job_dependencies.add_argument("job_id")
+    job_dependencies.add_argument("--task-id")
+    job_dependencies.add_argument("--limit", type=int, default=100)
+    job_attempts = job_commands.add_parser("attempts")
+    job_attempts.add_argument("name")
+    job_attempts.add_argument("job_id")
+    job_attempts.add_argument("task_id")
+    job_attempts.add_argument("--limit", type=int, default=3)
+    job_result = job_commands.add_parser("result")
+    job_result.add_argument("name")
+    job_result.add_argument("job_id")
+    job_result.add_argument("task_id")
+    job_checkpoints = job_commands.add_parser("checkpoints")
+    job_checkpoints.add_argument("name")
+    job_checkpoints.add_argument("job_id")
+    job_checkpoints.add_argument("task_id")
+    job_checkpoints.add_argument("--limit", type=int, default=8)
+    job_artifacts = job_commands.add_parser("artifacts")
+    job_artifacts.add_argument("name")
+    job_artifacts.add_argument("job_id")
+    job_artifacts.add_argument("--task-id")
+    job_artifacts.add_argument("--limit", type=int, default=64)
+    job_timeline = job_commands.add_parser("timeline")
+    job_timeline.add_argument("name")
+    job_timeline.add_argument("job_id")
+    job_timeline.add_argument("--task-id")
+    job_timeline.add_argument("--after", type=int, default=0)
+    job_timeline.add_argument("--limit", type=int, default=100)
+    job_board = job_commands.add_parser("board")
+    job_board.add_argument("name")
+    job_board.add_argument("job_id")
     job_blockers = job_commands.add_parser("blockers")
     job_blockers.add_argument("name")
     job_blockers.add_argument("job_id")
@@ -540,6 +632,32 @@ def build_parser() -> argparse.ArgumentParser:
     job_answer.add_argument("control_id")
     job_answer.add_argument("--principal-id", required=True)
     job_answer.add_argument("--answer-json", required=True)
+    job_answer.add_argument("--idempotency-key")
+    job_accept = job_commands.add_parser("accept-review")
+    job_accept.add_argument("name")
+    job_accept.add_argument("job_id")
+    job_accept.add_argument("task_id")
+    job_accept.add_argument("control_id")
+    job_accept.add_argument("--principal-id", required=True)
+    job_accept.add_argument("--rationale", required=True)
+    job_accept.add_argument("--idempotency-key", required=True)
+    job_changes = job_commands.add_parser("request-changes")
+    job_changes.add_argument("name")
+    job_changes.add_argument("job_id")
+    job_changes.add_argument("task_id")
+    job_changes.add_argument("control_id")
+    job_changes.add_argument("--principal-id", required=True)
+    job_changes.add_argument("--rationale", required=True)
+    job_changes.add_argument("--guidance", required=True)
+    job_changes.add_argument("--idempotency-key", required=True)
+    job_retry = job_commands.add_parser("retry-control")
+    job_retry.add_argument("name")
+    job_retry.add_argument("job_id")
+    job_retry.add_argument("task_id")
+    job_retry.add_argument("control_id")
+    job_retry.add_argument("--principal-id", required=True)
+    job_retry.add_argument("--note", required=True)
+    job_retry.add_argument("--idempotency-key", required=True)
     job_reject = job_commands.add_parser("reject")
     job_reject.add_argument("name")
     job_reject.add_argument("job_id")
@@ -547,6 +665,7 @@ def build_parser() -> argparse.ArgumentParser:
     job_reject.add_argument("control_id")
     job_reject.add_argument("--principal-id", required=True)
     job_reject.add_argument("--reason", required=True)
+    job_reject.add_argument("--idempotency-key")
     job_cancel = job_commands.add_parser("cancel-graph")
     job_cancel.add_argument("name")
     job_cancel.add_argument("job_id")
@@ -1343,6 +1462,161 @@ async def _execute(args: argparse.Namespace) -> object:
             config=AgentConfig(),
         )
         try:
+            if args.jobs_command == "list":
+                job_states = frozenset(GraphState(item) for item in (args.state or ()))
+                jobs = await agent.list_jobs(states=job_states, limit=args.limit)
+                return [
+                    {
+                        "job_id": job.job_id,
+                        "state": job.state.value,
+                        "desired_state": job.desired_state.value,
+                        "updated_at": job.updated_at.isoformat(),
+                        "deadline_at": job.deadline_at.isoformat(),
+                    }
+                    for job in jobs
+                ]
+            if args.jobs_command == "inspect":
+                job_inspection = await agent.inspect_job(args.job_id)
+                return (
+                    None
+                    if job_inspection is None
+                    else _graph_inspection_mapping(job_inspection)
+                )
+            if args.jobs_command == "tasks":
+                task_states = frozenset(TaskState(item) for item in (args.state or ()))
+                tasks = await agent.list_job_tasks(
+                    args.job_id, states=task_states, limit=args.limit
+                )
+                return [
+                    {
+                        "task_id": task.task_id,
+                        "role": task.role.value,
+                        "state": task.state.value,
+                        "task_revision": task.task_revision,
+                        "current_attempt_id": task.current_attempt_id,
+                        "latest_result_id": task.latest_result_id,
+                        "latest_control_id": task.latest_control_id,
+                    }
+                    for task in tasks
+                ]
+            if args.jobs_command == "dependencies":
+                edges = await agent.list_job_dependencies(
+                    args.job_id, task_id=args.task_id, limit=args.limit
+                )
+                return [
+                    {
+                        "upstream_task_id": edge.upstream_task_id,
+                        "downstream_task_id": edge.downstream_task_id,
+                        "edge_kind": edge.edge_kind.value,
+                    }
+                    for edge in edges
+                ]
+            if args.jobs_command == "attempts":
+                attempts = await agent.list_task_attempts(
+                    args.job_id, args.task_id, limit=args.limit
+                )
+                return [
+                    {
+                        "attempt_id": attempt.attempt_id,
+                        "ordinal": attempt.ordinal,
+                        "state": attempt.state.value,
+                        "fencing_epoch": attempt.fencing_epoch,
+                        "run_id": attempt.run_id,
+                        "checkpoint_ids": attempt.checkpoint_ids,
+                        "artifact_ids": attempt.artifact_ids,
+                        "error_code": attempt.error_code,
+                    }
+                    for attempt in attempts
+                ]
+            if args.jobs_command == "result":
+                task_result = await agent.read_task_result(args.job_id, args.task_id)
+                return (
+                    None
+                    if task_result is None
+                    else {
+                        **task_result.candidate_material(),
+                        "completed_at": task_result.completed_at.isoformat(),
+                    }
+                )
+            if args.jobs_command == "checkpoints":
+                checkpoints = await agent.list_task_checkpoints(
+                    args.job_id, args.task_id, limit=args.limit
+                )
+                return [
+                    {
+                        "checkpoint_id": item.checkpoint_id,
+                        "attempt_id": item.attempt_id,
+                        "ordinal": item.ordinal,
+                        "milestone": item.milestone,
+                        "payload": item.payload,
+                        "payload_digest": item.payload_digest,
+                    }
+                    for item in checkpoints
+                ]
+            if args.jobs_command == "artifacts":
+                return await agent.list_task_artifacts(
+                    args.job_id, task_id=args.task_id, limit=args.limit
+                )
+            if args.jobs_command == "timeline":
+                timeline = await agent.job_timeline(
+                    args.job_id,
+                    after_event_id=args.after,
+                    limit=args.limit,
+                    task_id=args.task_id,
+                )
+                if timeline is None:
+                    return None
+                return {
+                    "job_id": timeline.job_id,
+                    "graph_state": timeline.graph_state.value,
+                    "graph_revision": timeline.graph_revision,
+                    "events": [
+                        {
+                            "event_id": item.event_id,
+                            "kind": item.kind,
+                            "task_id": item.task_id,
+                            "attempt_id": item.attempt_id,
+                            "created_at": item.created_at.isoformat(),
+                            "payload": item.payload,
+                        }
+                        for item in timeline.events
+                    ],
+                    "next_cursor": timeline.next_cursor,
+                    "diagnostics": {
+                        "blockers": timeline.diagnostics.blockers,
+                        "exhausted_budgets": timeline.diagnostics.exhausted_budgets,
+                        "deadlocked": timeline.diagnostics.deadlocked,
+                        "deadlock_reason": timeline.diagnostics.deadlock_reason,
+                    },
+                }
+            if args.jobs_command == "board":
+                board = await agent.job_board(args.job_id)
+                if board is None:
+                    return None
+                return {
+                    "job_id": board.job_id,
+                    "graph_state": board.graph_state.value,
+                    "graph_revision": board.graph_revision,
+                    "columns": [
+                        {"name": item.name, "task_ids": item.task_ids}
+                        for item in board.columns
+                    ],
+                    "dependencies": [
+                        {
+                            "upstream_task_id": item.upstream_task_id,
+                            "downstream_task_id": item.downstream_task_id,
+                            "edge_kind": item.edge_kind,
+                            "satisfied": item.satisfied,
+                        }
+                        for item in board.dependencies
+                    ],
+                    "diagnostics": {
+                        "blockers": board.diagnostics.blockers,
+                        "exhausted_budgets": board.diagnostics.exhausted_budgets,
+                        "deadlocked": board.diagnostics.deadlocked,
+                        "deadlock_reason": board.diagnostics.deadlock_reason,
+                    },
+                }
             if args.jobs_command == "blockers":
                 blockers = await agent.graph_blockers(args.job_id)
                 return None if blockers is None else _graph_blockers_mapping(blockers)
@@ -1356,6 +1630,7 @@ async def _execute(args: argparse.Namespace) -> object:
                     args.control_id,
                     principal_id=args.principal_id,
                     answer=answer,
+                    idempotency_key=args.idempotency_key,
                 )
                 return (
                     None
@@ -1366,6 +1641,52 @@ async def _execute(args: argparse.Namespace) -> object:
                         "resolved_by_id": control.resolved_by_id,
                     }
                 )
+            if args.jobs_command == "accept-review":
+                reviewed_task_result = await agent.accept_task_review(
+                    args.job_id,
+                    args.task_id,
+                    args.control_id,
+                    principal_id=args.principal_id,
+                    rationale=args.rationale,
+                    idempotency_key=args.idempotency_key,
+                )
+                return {
+                    "result_id": reviewed_task_result.result_id,
+                    "result_digest": reviewed_task_result.result_digest,
+                    "task_id": reviewed_task_result.task_id,
+                }
+            if args.jobs_command == "request-changes":
+                control = await agent.request_task_review_changes(
+                    args.job_id,
+                    args.task_id,
+                    args.control_id,
+                    principal_id=args.principal_id,
+                    rationale=args.rationale,
+                    replacement_guidance=args.guidance,
+                    idempotency_key=args.idempotency_key,
+                )
+                return {
+                    "control_id": control.control_id,
+                    "kind": control.kind.value,
+                    "state": control.state.value,
+                }
+            if args.jobs_command == "retry-control":
+                control = await agent.retry_task_control(
+                    args.job_id,
+                    args.task_id,
+                    args.control_id,
+                    principal_id=args.principal_id,
+                    advisory_note=args.note,
+                    idempotency_key=args.idempotency_key,
+                )
+                return (
+                    None
+                    if control is None
+                    else {
+                        "control_id": control.control_id,
+                        "state": control.state.value,
+                    }
+                )
             if args.jobs_command == "reject":
                 control = await agent.reject_task_control(
                     args.job_id,
@@ -1373,6 +1694,7 @@ async def _execute(args: argparse.Namespace) -> object:
                     args.control_id,
                     principal_id=args.principal_id,
                     reason=args.reason,
+                    idempotency_key=args.idempotency_key,
                 )
                 return (
                     None

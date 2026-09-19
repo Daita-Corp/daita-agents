@@ -41,6 +41,7 @@ from ..owner import JobError, JobOwner
 from .capabilities import (
     GRAPH_RESULT_FINALIZE_CAPABILITY_ID,
     PLANNER_CAPABILITY_IDS,
+    REVIEW_CAPABILITY_IDS,
     TASK_BLOCK_CAPABILITY_ID,
     TASK_CHECKPOINT_CAPABILITY_ID,
     TASK_COMMENT_CAPABILITY_ID,
@@ -377,6 +378,7 @@ class GraphAdmissionBuilder:
         planner_capability_ids = tuple(
             sorted((*PLANNER_CAPABILITY_IDS, *planner_catalog_ids))
         )
+        reviewer_capability_ids = tuple(sorted(REVIEW_CAPABILITY_IDS))
         planner_capabilities = tuple(
             self._registry.capability(capability_id)
             for capability_id in planner_capability_ids
@@ -401,6 +403,22 @@ class GraphAdmissionBuilder:
             capability_id: self._registry.contract_digest(capability_id)
             for capability_id in planner_capability_ids
         }
+        reviewer_contracts = {
+            capability_id: self._registry.contract_digest(capability_id)
+            for capability_id in reviewer_capability_ids
+        }
+        reviewer_capabilities = tuple(
+            self._registry.capability(capability_id)
+            for capability_id in reviewer_capability_ids
+        )
+        if any(
+            capability.operational_effect is not OperationalEffect.NONE
+            or capability.access_mode is not AccessMode.NONE
+            or capability.effect_receipt_policy is not None
+            or capability.automation_grant_policy is not None
+            for capability in reviewer_capabilities
+        ):
+            raise ValueError("graph reviewer capability must be effect-free and local")
         callable_tool_names = tuple(
             sorted(
                 name
@@ -454,6 +472,7 @@ class GraphAdmissionBuilder:
                 **dict(proposal.contract_bindings.capability_contracts),
                 finalizer.id: finalizer_digest,
                 **planner_contracts,
+                **reviewer_contracts,
             },
             tool_origins=proposal.contract_bindings.tool_origins,
             resource_revisions=proposal.contract_bindings.resource_revisions,
@@ -465,7 +484,12 @@ class GraphAdmissionBuilder:
             connector_ids=proposal.connector_binding_ids,
             capability_ids=tuple(
                 sorted(
-                    (*proposal.capability_ids, finalizer.id, *planner_capability_ids)
+                    (
+                        *proposal.capability_ids,
+                        finalizer.id,
+                        *planner_capability_ids,
+                        *reviewer_capability_ids,
+                    )
                 )
             ),
             access_modes=root_access_modes,

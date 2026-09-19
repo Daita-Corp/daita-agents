@@ -189,6 +189,42 @@ def construct_graph_job_delivery(
     )
 
 
+def construct_graph_attention_delivery(
+    *,
+    delivery_id: str,
+    agent_id: str,
+    conversation_id: str,
+    transition_subject_id: str,
+    target: ConversationInboxTarget,
+    preview: str,
+    transition_digest: str,
+    effective_sensitivity: ModelSensitivity,
+    observed_at: datetime,
+) -> Delivery:
+    """Construct one code-owned, transition-scoped graph attention notice."""
+
+    return construct_logical_delivery(
+        delivery_id=delivery_id,
+        agent_id=agent_id,
+        conversation_id=conversation_id,
+        subject_kind=DeliverySubjectKind.GRAPH_ATTENTION,
+        subject_id=transition_subject_id,
+        target=target,
+        conclusion_kind=OutcomeConclusionKind.NO_MODEL_OCCURRENCE,
+        conclusion_state=OutcomeState.SUCCEEDED,
+        conclusion_id=transition_subject_id,
+        conclusion_digest=transition_digest,
+        conclusion_preview=preview,
+        conclusion_preview_truncated=False,
+        resulting_run_id=None,
+        artifact_references=(),
+        effective_sensitivity=effective_sensitivity,
+        provenance_digest=transition_digest,
+        failure_code=None,
+        observed_at=observed_at,
+    )
+
+
 class DistributionStore(Protocol):
     async def conversation_exists(
         self,
@@ -418,6 +454,7 @@ __all__ = [
     "DistributionOwner",
     "DistributionStore",
     "OutcomeArtifactReader",
-    "construct_logical_delivery",
+    "construct_graph_attention_delivery",
     "construct_graph_job_delivery",
+    "construct_logical_delivery",
 ]

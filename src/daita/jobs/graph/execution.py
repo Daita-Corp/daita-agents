@@ -24,6 +24,7 @@ from ...capabilities import (
     OperationalEffect,
 )
 from ...loop.models import RunOrigin
+from .capabilities import REVIEW_CAPABILITY_IDS
 from .context import TaskContextBundle
 from .models import (
     BudgetAmount,
@@ -381,6 +382,11 @@ def task_context_bundle(
         for item in inspection.comments
         if item.task_id == task.task_id
     )[-16:]
+    review_control_id = (
+        task.specification.expected_result_contract.get("review_control_id")
+        if task.role is TaskRole.REVIEWER
+        else None
+    )
     controls = tuple(
         {
             "control_id": item.control_id,
@@ -393,6 +399,7 @@ def task_context_bundle(
         }
         for item in inspection.controls
         if item.task_id == task.task_id
+        or (isinstance(review_control_id, str) and item.control_id == review_control_id)
     )[-16:]
     try:
         return TaskContextBundle(
@@ -480,7 +487,7 @@ def task_role_allows_capability(role: str, capability_id: str) -> bool:
             or capability_id.startswith(TASK_LIFECYCLE_CAPABILITY_PREFIX)
         )
     if role == TaskRole.REVIEWER.value:
-        return capability_id.startswith(TASK_LIFECYCLE_CAPABILITY_PREFIX)
+        return capability_id in REVIEW_CAPABILITY_IDS
     if role == TaskRole.WORKER.value:
         return not capability_id.startswith(PLANNER_CAPABILITY_PREFIX)
     return False

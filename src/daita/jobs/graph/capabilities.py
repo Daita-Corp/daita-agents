@@ -66,6 +66,16 @@ TASK_COMMENT_CAPABILITY_ID = "jobs.graph.task_comment"
 TASK_COMPLETE_CAPABILITY_ID = "jobs.graph.task_complete"
 TASK_BLOCK_CAPABILITY_ID = "jobs.graph.task_block"
 TASK_REQUEST_REVIEW_CAPABILITY_ID = "jobs.graph.task_request_review"
+REVIEW_INSPECT_CANDIDATE_CAPABILITY_ID = "jobs.graph.review_inspect_candidate"
+REVIEW_ACCEPT_CAPABILITY_ID = "jobs.graph.review_accept"
+REVIEW_REQUEST_CHANGES_CAPABILITY_ID = "jobs.graph.review_request_changes"
+REVIEW_BLOCK_CAPABILITY_ID = "jobs.graph.review_block"
+REVIEW_CAPABILITY_IDS = (
+    REVIEW_ACCEPT_CAPABILITY_ID,
+    REVIEW_BLOCK_CAPABILITY_ID,
+    REVIEW_INSPECT_CANDIDATE_CAPABILITY_ID,
+    REVIEW_REQUEST_CHANGES_CAPABILITY_ID,
+)
 GRAPH_RESULT_FINALIZE_CAPABILITY_ID = "jobs.graph.result_finalize"
 PLANNER_LIST_TASKS_CAPABILITY_ID = "jobs.graph.planner_list_tasks"
 PLANNER_INSPECT_TASK_CAPABILITY_ID = "jobs.graph.planner_inspect_task"
@@ -87,6 +97,10 @@ TASK_COMMENT_TOOL_NAME = "task_comment"
 TASK_COMPLETE_TOOL_NAME = "task_complete"
 TASK_BLOCK_TOOL_NAME = "task_block"
 TASK_REQUEST_REVIEW_TOOL_NAME = "task_request_review"
+REVIEW_INSPECT_CANDIDATE_TOOL_NAME = "review_inspect_candidate"
+REVIEW_ACCEPT_TOOL_NAME = "review_accept"
+REVIEW_REQUEST_CHANGES_TOOL_NAME = "review_request_changes"
+REVIEW_BLOCK_TOOL_NAME = "review_block"
 PLANNER_LIST_TASKS_TOOL_NAME = "graph_list_tasks"
 PLANNER_INSPECT_TASK_TOOL_NAME = "graph_inspect_task"
 PLANNER_CREATE_CHILDREN_TOOL_NAME = "graph_create_children"
@@ -240,101 +254,13 @@ class TaskCompleteExecutor(_LifecycleExecutor):
         guard = request.task_attempt_guard
         assert guard is not None
         transcript = await self._transcripts.load(request.run_id)
-        raw_evidence_ids = request.arguments.get("evidence_call_ids")
-        raw_artifact_ids = request.arguments.get("artifact_ids")
-        if not isinstance(raw_evidence_ids, tuple) or not isinstance(
-            raw_artifact_ids, tuple
-        ):
-            raise CapabilityInputError(
-                "task_result_evidence_invalid", "Task evidence references are invalid."
-            )
-        evidence_ids: tuple[object, ...] = raw_evidence_ids
-        artifacts = tuple(sorted(str(item) for item in raw_artifact_ids))
-        authenticated, evidence_sensitivity, authenticated_artifacts = (
-            _authenticate_evidence(transcript, evidence_ids)
-        )
-        if not set(artifacts) <= authenticated_artifacts:
-            raise CapabilityInputError(
-                "task_result_artifact_unverified",
-                "A task result artifact is not authenticated by its cited tool evidence.",
-            )
-        result_kind = request.arguments["result_kind"]
-        summary = request.arguments["summary"]
-        payload = request.arguments["payload"]
-        residual_risk = request.arguments.get("residual_risk")
-        downstream = request.arguments.get("downstream_constraints", {})
-        assert isinstance(result_kind, str)
-        assert isinstance(summary, str)
-        assert isinstance(payload, Mapping)
-        assert residual_risk is None or isinstance(residual_risk, str)
-        assert isinstance(downstream, Mapping)
-        expected_kind = task.specification.expected_result_contract.get("result_kind")
-        if isinstance(expected_kind, str) and result_kind != expected_kind:
-            raise CapabilityInputError(
-                "task_result_contract_mismatch",
-                "The proposed result kind differs from the frozen task contract.",
-            )
         completed_at = self._clock()
-        result_id = self._id_factory("result")
-        sensitivity = max(
-            request.request_sensitivity,
-            task.specification.authority.sensitivity,
-            evidence_sensitivity,
-            key=lambda item: item.routing_rank,
-        )
-        schema_digest = canonical_digest(task.specification.expected_result_contract)
-        provenance = {
-            "authority": "authenticated_graph_task_transcript",
-            "task_binding_digest": guard.binding.digest,
-            "evidence": authenticated,
-            "model_authored_payload": True,
-        }
-        verification = {
-            "transcript_run_id": request.run_id,
-            "evidence_call_ids": evidence_ids,
-            "evidence_authenticated": True,
-            "artifact_ids_authenticated": artifacts,
-        }
-        material = {
-            "agent_id": guard.binding.agent_id,
-            "job_id": guard.binding.job_id,
-            "task_id": guard.binding.task_id,
-            "result_id": result_id,
-            "attempt_id": guard.binding.attempt_id,
-            "run_id": request.run_id,
-            "result_kind": result_kind,
-            "schema_digest": schema_digest,
-            "payload": payload,
-            "summary": summary,
-            "sensitivity": sensitivity.value,
-            "provenance": provenance,
-            "artifact_ids": artifacts,
-            "effect_receipt_ids": (),
-            "verification": verification,
-            "residual_risk": residual_risk,
-            "downstream_constraints": downstream,
-            "completed_at": completed_at.isoformat(),
-        }
-        result = TaskResult(
-            agent_id=guard.binding.agent_id,
-            job_id=guard.binding.job_id,
-            task_id=guard.binding.task_id,
-            result_id=result_id,
-            attempt_id=guard.binding.attempt_id,
-            run_id=request.run_id,
-            result_kind=result_kind,
-            schema_digest=schema_digest,
-            payload=payload,
-            summary=summary,
-            sensitivity=sensitivity,
-            provenance=provenance,
-            artifact_ids=artifacts,
-            effect_receipt_ids=(),
-            verification=verification,
-            residual_risk=residual_risk,
-            downstream_constraints=downstream,
+        result = _task_result_from_arguments(
+            request,
+            task,
+            transcript,
+            result_id=self._id_factory("result"),
             completed_at=completed_at,
-            result_digest=canonical_digest(material),
         )
         await guard.revalidate(
             capability_id=request.capability_id,
@@ -350,7 +276,7 @@ class TaskCompleteExecutor(_LifecycleExecutor):
             self._owner,
             "graph.task_complete",
             stored.result_id,
-            sensitivity,
+            result.sensitivity,
             guard,
         )
 
@@ -436,6 +362,289 @@ class TaskRequestReviewExecutor(_TaskControlExecutor):
     executor_id = "jobs.graph.task_request_review.executor"
     control_kind = ControlKind.REVIEW_REQUESTED
     output_kind = "graph.task_review_request"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        inspection, task, _attempt = await self._current(request)
+        guard = request.task_attempt_guard
+        assert guard is not None
+        transcript = await self._transcripts.load(request.run_id)
+        created_at = self._clock()
+        candidate = _task_result_from_arguments(
+            request,
+            task,
+            transcript,
+            result_id=self._id_factory("result"),
+            completed_at=created_at,
+        )
+        message = request.arguments["message"]
+        assert isinstance(message, str)
+        payload = {
+            "message": message,
+            "candidate": candidate.candidate_material(),
+            "candidate_digest": candidate.result_digest,
+            "subject_task_revision": task.task_revision,
+            "expires_at": inspection.job.deadline_at.isoformat(),
+            "default_behavior": "remain_in_review",
+        }
+        try:
+            control = TaskControl(
+                agent_id=guard.binding.agent_id,
+                job_id=guard.binding.job_id,
+                task_id=guard.binding.task_id,
+                control_id=self._id_factory("control"),
+                kind=ControlKind.REVIEW_REQUESTED,
+                state=ControlState.OPEN,
+                requesting_attempt_id=guard.binding.attempt_id,
+                payload=payload,
+                created_at=created_at,
+                payload_digest=canonical_digest(payload),
+            )
+        except (TypeError, ValueError) as error:
+            raise CapabilityInputError(
+                "review_candidate_too_large",
+                "The immutable review candidate exceeds the bounded control record.",
+            ) from error
+        await guard.revalidate(
+            capability_id=request.capability_id,
+            point="before_control_commit",
+        )
+        stored = await self._owner.open_graph_task_control(
+            control,
+            claim_token=guard.claim_token,
+            fencing_epoch=guard.binding.fencing_epoch,
+        )
+        return await _termination_output(
+            self._owner,
+            self.output_kind,
+            stored.control_id,
+            candidate.sensitivity,
+            guard,
+        )
+
+
+class _ReviewerExecutor(_LifecycleExecutor):
+    async def _review_current(
+        self, request: ToolExecution
+    ) -> tuple[GraphInspection, GraphTask, TaskAttempt, TaskControl]:
+        inspection, task, attempt = await self._current(request)
+        if task.role is not TaskRole.REVIEWER:
+            raise CapabilityInputError(
+                "reviewer_role_required", "This operation requires a reviewer task."
+            )
+        control_id = task.specification.expected_result_contract.get(
+            "review_control_id"
+        )
+        subject_task_id = task.specification.expected_result_contract.get(
+            "subject_task_id"
+        )
+        if not isinstance(control_id, str) or not isinstance(subject_task_id, str):
+            raise CapabilityInputError(
+                "review_binding_invalid", "The reviewer binding is malformed."
+            )
+        control = next(
+            (
+                item
+                for item in inspection.controls
+                if item.control_id == control_id and item.task_id == subject_task_id
+            ),
+            None,
+        )
+        if (
+            control is None
+            or control.kind is not ControlKind.REVIEW_REQUESTED
+            or control.state is not ControlState.OPEN
+        ):
+            raise CapabilityInputError(
+                "review_candidate_unavailable",
+                "The exact immutable review candidate is no longer open.",
+            )
+        candidate = control.payload.get("candidate")
+        expected_digest = control.payload.get("candidate_digest")
+        if not isinstance(candidate, Mapping):
+            raise CapabilityInputError(
+                "review_candidate_invalid", "The review candidate is malformed."
+            )
+        try:
+            result = TaskResult.from_candidate_material(candidate)
+        except (TypeError, ValueError) as error:
+            raise CapabilityInputError(
+                "review_candidate_invalid", "The review candidate is malformed."
+            ) from error
+        if (
+            expected_digest != result.result_digest
+            or task.specification.expected_result_contract.get("candidate_digest")
+            != result.result_digest
+        ):
+            raise CapabilityInputError(
+                "review_candidate_changed", "The bound review candidate changed."
+            )
+        return inspection, task, attempt, control
+
+
+class ReviewInspectCandidateExecutor(_ReviewerExecutor):
+    executor_id = "jobs.graph.review_inspect_candidate.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        _inspection, task, _attempt, control = await self._review_current(request)
+        candidate = control.payload["candidate"]
+        assert isinstance(candidate, Mapping)
+        return ToolOutput(
+            kind="graph.review_candidate",
+            data={
+                "subject_task_id": control.task_id,
+                "review_control_id": control.control_id,
+                "candidate_digest": control.payload["candidate_digest"],
+                "candidate": candidate,
+            },
+            sensitivity=task.specification.authority.sensitivity,
+            sensitivity_provenance={
+                "authority": "immutable_graph_review_control",
+                "control_id": control.control_id,
+            },
+        )
+
+
+class ReviewAcceptExecutor(_ReviewerExecutor):
+    executor_id = "jobs.graph.review_accept.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        _inspection, task, _attempt, control = await self._review_current(request)
+        guard = request.task_attempt_guard
+        assert guard is not None
+        rationale = request.arguments["rationale"]
+        assert isinstance(rationale, str)
+        decided_at = self._clock()
+        reviewer_result = _review_decision_result(
+            request,
+            task,
+            control,
+            result_id=self._id_factory("result"),
+            decision="accepted",
+            rationale=rationale,
+            completed_at=decided_at,
+        )
+        await guard.revalidate(
+            capability_id=request.capability_id,
+            point="before_review_accept_commit",
+        )
+        await self._owner.accept_graph_task_review(
+            control.job_id,
+            control.task_id,
+            control.control_id,
+            reviewer_result=reviewer_result,
+            reviewer_task_id=task.task_id,
+            claim_token=guard.claim_token,
+            fencing_epoch=guard.binding.fencing_epoch,
+            resolved_at=decided_at,
+            resolved_by_kind="reviewer_attempt",
+            resolved_by_id=guard.binding.attempt_id,
+            rationale=rationale,
+            idempotency_key=request.call_id,
+        )
+        return await _termination_output(
+            self._owner,
+            "graph.review_accepted",
+            reviewer_result.result_id,
+            reviewer_result.sensitivity,
+            guard,
+        )
+
+
+class ReviewRequestChangesExecutor(_ReviewerExecutor):
+    executor_id = "jobs.graph.review_request_changes.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        _inspection, task, _attempt, control = await self._review_current(request)
+        guard = request.task_attempt_guard
+        assert guard is not None
+        rationale = request.arguments["rationale"]
+        guidance = request.arguments["replacement_guidance"]
+        assert isinstance(rationale, str) and isinstance(guidance, str)
+        decided_at = self._clock()
+        reviewer_result = _review_decision_result(
+            request,
+            task,
+            control,
+            result_id=self._id_factory("result"),
+            decision="changes_requested",
+            rationale=rationale,
+            completed_at=decided_at,
+        )
+        await guard.revalidate(
+            capability_id=request.capability_id,
+            point="before_review_changes_commit",
+        )
+        await self._owner.request_graph_task_review_changes(
+            control.job_id,
+            control.task_id,
+            control.control_id,
+            reviewer_result=reviewer_result,
+            reviewer_task_id=task.task_id,
+            claim_token=guard.claim_token,
+            fencing_epoch=guard.binding.fencing_epoch,
+            resolved_at=decided_at,
+            resolved_by_kind="reviewer_attempt",
+            resolved_by_id=guard.binding.attempt_id,
+            rationale=rationale,
+            replacement_guidance=guidance,
+            idempotency_key=request.call_id,
+            changes_control_id=self._id_factory("control"),
+        )
+        return await _termination_output(
+            self._owner,
+            "graph.review_changes_requested",
+            reviewer_result.result_id,
+            reviewer_result.sensitivity,
+            guard,
+        )
+
+
+class ReviewBlockExecutor(_ReviewerExecutor):
+    executor_id = "jobs.graph.review_block.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        inspection, task, _attempt, review_control = await self._review_current(request)
+        guard = request.task_attempt_guard
+        assert guard is not None
+        message = request.arguments["message"]
+        details = request.arguments.get("details", {})
+        assert isinstance(message, str) and isinstance(details, Mapping)
+        payload = {
+            "message": message,
+            "details": details,
+            "review_control_id": review_control.control_id,
+            "subject_task_id": review_control.task_id,
+            "expires_at": inspection.job.deadline_at.isoformat(),
+            "default_behavior": "remain_blocked",
+        }
+        control = TaskControl(
+            agent_id=task.agent_id,
+            job_id=task.job_id,
+            task_id=task.task_id,
+            control_id=self._id_factory("control"),
+            kind=ControlKind.NEEDS_INPUT,
+            state=ControlState.OPEN,
+            requesting_attempt_id=guard.binding.attempt_id,
+            payload=payload,
+            created_at=self._clock(),
+            payload_digest=canonical_digest(payload),
+        )
+        await guard.revalidate(
+            capability_id=request.capability_id,
+            point="before_review_block_commit",
+        )
+        stored = await self._owner.open_graph_task_control(
+            control,
+            claim_token=guard.claim_token,
+            fencing_epoch=guard.binding.fencing_epoch,
+        )
+        return await _termination_output(
+            self._owner,
+            "graph.review_blocked",
+            stored.control_id,
+            task.specification.authority.sensitivity,
+            guard,
+        )
 
 
 class PlannerRequestInputExecutor(_TaskControlExecutor):
@@ -1152,37 +1361,39 @@ def graph_task_capability_declarations(
         access_mode=AccessMode.NONE,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
     )
+    task_result_properties = {
+        "result_kind": {"type": "string", "minLength": 1, "maxLength": 256},
+        "summary": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "payload": {"type": "object"},
+        "evidence_call_ids": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "maxItems": 64,
+            "uniqueItems": True,
+        },
+        "artifact_ids": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+            "maxItems": 64,
+            "uniqueItems": True,
+        },
+        "residual_risk": {"type": ["string", "null"], "maxLength": 8192},
+        "downstream_constraints": {"type": "object"},
+    }
+    task_result_required = [
+        "result_kind",
+        "summary",
+        "payload",
+        "evidence_call_ids",
+        "artifact_ids",
+    ]
     complete = Capability(
         id=TASK_COMPLETE_CAPABILITY_ID,
         description="Accept one authenticated result and complete this exact task attempt.",
         input_schema={
             "type": "object",
-            "properties": {
-                "result_kind": {"type": "string", "minLength": 1, "maxLength": 256},
-                "summary": {"type": "string", "minLength": 1, "maxLength": 16384},
-                "payload": {"type": "object"},
-                "evidence_call_ids": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1},
-                    "maxItems": 64,
-                    "uniqueItems": True,
-                },
-                "artifact_ids": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1},
-                    "maxItems": 64,
-                    "uniqueItems": True,
-                },
-                "residual_risk": {"type": ["string", "null"], "maxLength": 16384},
-                "downstream_constraints": {"type": "object"},
-            },
-            "required": [
-                "result_kind",
-                "summary",
-                "payload",
-                "evidence_call_ids",
-                "artifact_ids",
-            ],
+            "properties": task_result_properties,
+            "required": task_result_required,
             "additionalProperties": False,
         },
         output_kind="graph.task_complete",
@@ -1224,14 +1435,17 @@ def graph_task_capability_declarations(
     )
     review = Capability(
         id=TASK_REQUEST_REVIEW_CAPABILITY_ID,
-        description="Request bounded human review and terminate this exact task attempt.",
+        description=(
+            "Freeze one authenticated candidate in a review control and create a "
+            "separate reviewer task."
+        ),
         input_schema={
             "type": "object",
             "properties": {
-                "message": {"type": "string", "minLength": 1, "maxLength": 16384},
-                "details": {"type": "object"},
+                **task_result_properties,
+                "message": {"type": "string", "minLength": 1, "maxLength": 4096},
             },
-            "required": ["message", "details"],
+            "required": [*task_result_required, "message"],
             "additionalProperties": False,
         },
         output_kind="graph.task_review_request",
@@ -1240,6 +1454,78 @@ def graph_task_capability_declarations(
         access_mode=AccessMode.NONE,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
         machine_run_directive_kind=MachineRunDirectiveKind.REQUEST_REVIEW,
+    )
+    review_inspect = Capability(
+        id=REVIEW_INSPECT_CANDIDATE_CAPABILITY_ID,
+        description="Inspect only the immutable candidate bound to this reviewer task.",
+        input_schema={"type": "object", "additionalProperties": False},
+        output_kind="graph.review_candidate",
+        output_schema={"type": "object", "additionalProperties": True},
+        executor_id=ReviewInspectCandidateExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+    )
+    review_accept = Capability(
+        id=REVIEW_ACCEPT_CAPABILITY_ID,
+        description="Accept the exact bound candidate without changing its authority.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "rationale": {"type": "string", "minLength": 1, "maxLength": 4096}
+            },
+            "required": ["rationale"],
+            "additionalProperties": False,
+        },
+        output_kind="graph.review_accepted",
+        output_schema=common_output,
+        executor_id=ReviewAcceptExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        machine_run_directive_kind=MachineRunDirectiveKind.COMPLETE,
+    )
+    review_changes = Capability(
+        id=REVIEW_REQUEST_CHANGES_CAPABILITY_ID,
+        description=(
+            "Reject the exact candidate and request a validated policy replacement."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "rationale": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "replacement_guidance": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
+                },
+            },
+            "required": ["rationale", "replacement_guidance"],
+            "additionalProperties": False,
+        },
+        output_kind="graph.review_changes_requested",
+        output_schema=common_output,
+        executor_id=ReviewRequestChangesExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        machine_run_directive_kind=MachineRunDirectiveKind.COMPLETE,
+    )
+    review_block = Capability(
+        id=REVIEW_BLOCK_CAPABILITY_ID,
+        description="Block this reviewer task with a typed human-input control.",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "details": {"type": "object"},
+            },
+            "required": ["message", "details"],
+            "additionalProperties": False,
+        },
+        output_kind="graph.review_blocked",
+        output_schema=common_output,
+        executor_id=ReviewBlockExecutor.executor_id,
+        access_mode=AccessMode.NONE,
+        automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        machine_run_directive_kind=MachineRunDirectiveKind.BLOCK,
     )
     finalizer = Capability(
         id=GRAPH_RESULT_FINALIZE_CAPABILITY_ID,
@@ -1443,6 +1729,10 @@ def graph_task_capability_declarations(
         complete,
         block,
         review,
+        review_inspect,
+        review_accept,
+        review_changes,
+        review_block,
         finalizer,
         planner_list,
         planner_inspect,
@@ -1466,6 +1756,18 @@ def graph_task_capability_declarations(
         ),
         TaskBlockExecutor(owner_value, transcripts, clock=clock, id_factory=id_factory),
         TaskRequestReviewExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        ReviewInspectCandidateExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        ReviewAcceptExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        ReviewRequestChangesExecutor(
+            owner_value, transcripts, clock=clock, id_factory=id_factory
+        ),
+        ReviewBlockExecutor(
             owner_value, transcripts, clock=clock, id_factory=id_factory
         ),
         GraphResultFinalizeExecutor(),
@@ -1494,6 +1796,10 @@ def graph_task_capability_declarations(
         TASK_COMPLETE_CAPABILITY_ID: TASK_COMPLETE_TOOL_NAME,
         TASK_BLOCK_CAPABILITY_ID: TASK_BLOCK_TOOL_NAME,
         TASK_REQUEST_REVIEW_CAPABILITY_ID: TASK_REQUEST_REVIEW_TOOL_NAME,
+        REVIEW_INSPECT_CANDIDATE_CAPABILITY_ID: REVIEW_INSPECT_CANDIDATE_TOOL_NAME,
+        REVIEW_ACCEPT_CAPABILITY_ID: REVIEW_ACCEPT_TOOL_NAME,
+        REVIEW_REQUEST_CHANGES_CAPABILITY_ID: REVIEW_REQUEST_CHANGES_TOOL_NAME,
+        REVIEW_BLOCK_CAPABILITY_ID: REVIEW_BLOCK_TOOL_NAME,
         PLANNER_LIST_TASKS_CAPABILITY_ID: PLANNER_LIST_TASKS_TOOL_NAME,
         PLANNER_INSPECT_TASK_CAPABILITY_ID: PLANNER_INSPECT_TASK_TOOL_NAME,
         PLANNER_CREATE_CHILDREN_CAPABILITY_ID: PLANNER_CREATE_CHILDREN_TOOL_NAME,
@@ -1569,6 +1875,193 @@ def _authenticate_evidence(
     return tuple(authenticated), sensitivity, artifact_ids
 
 
+def _task_result_from_arguments(
+    request: ToolExecution,
+    task: GraphTask,
+    transcript: Transcript,
+    *,
+    result_id: str,
+    completed_at: datetime,
+) -> TaskResult:
+    guard = request.task_attempt_guard
+    if guard is None:
+        raise CapabilityInputError(
+            "task_attempt_binding_missing",
+            "The result lacks its exact task-attempt binding.",
+        )
+    raw_evidence_ids = request.arguments.get("evidence_call_ids")
+    raw_artifact_ids = request.arguments.get("artifact_ids")
+    if not isinstance(raw_evidence_ids, tuple) or not isinstance(
+        raw_artifact_ids, tuple
+    ):
+        raise CapabilityInputError(
+            "task_result_evidence_invalid", "Task evidence references are invalid."
+        )
+    evidence_ids: tuple[object, ...] = raw_evidence_ids
+    artifacts = tuple(sorted(str(item) for item in raw_artifact_ids))
+    authenticated, evidence_sensitivity, authenticated_artifacts = (
+        _authenticate_evidence(transcript, evidence_ids)
+    )
+    if not set(artifacts) <= authenticated_artifacts:
+        raise CapabilityInputError(
+            "task_result_artifact_unverified",
+            "A task result artifact is not authenticated by its cited tool evidence.",
+        )
+    result_kind = request.arguments["result_kind"]
+    summary = request.arguments["summary"]
+    payload = request.arguments["payload"]
+    residual_risk = request.arguments.get("residual_risk")
+    downstream = request.arguments.get("downstream_constraints", {})
+    assert isinstance(result_kind, str)
+    assert isinstance(summary, str)
+    assert isinstance(payload, Mapping)
+    assert residual_risk is None or isinstance(residual_risk, str)
+    assert isinstance(downstream, Mapping)
+    expected_kind = task.specification.expected_result_contract.get("result_kind")
+    if isinstance(expected_kind, str) and result_kind != expected_kind:
+        raise CapabilityInputError(
+            "task_result_contract_mismatch",
+            "The proposed result kind differs from the frozen task contract.",
+        )
+    sensitivity = max(
+        request.request_sensitivity,
+        task.specification.authority.sensitivity,
+        evidence_sensitivity,
+        key=lambda item: item.routing_rank,
+    )
+    schema_digest = canonical_digest(task.specification.expected_result_contract)
+    provenance = {
+        "authority": "authenticated_graph_task_transcript",
+        "task_binding_digest": guard.binding.digest,
+        "evidence": authenticated,
+        "model_authored_payload": True,
+    }
+    verification = {
+        "transcript_run_id": request.run_id,
+        "evidence_call_ids": evidence_ids,
+        "evidence_authenticated": True,
+        "artifact_ids_authenticated": artifacts,
+    }
+    material = {
+        "agent_id": guard.binding.agent_id,
+        "job_id": guard.binding.job_id,
+        "task_id": guard.binding.task_id,
+        "result_id": result_id,
+        "attempt_id": guard.binding.attempt_id,
+        "run_id": request.run_id,
+        "result_kind": result_kind,
+        "schema_digest": schema_digest,
+        "payload": payload,
+        "summary": summary,
+        "sensitivity": sensitivity.value,
+        "provenance": provenance,
+        "artifact_ids": artifacts,
+        "effect_receipt_ids": (),
+        "verification": verification,
+        "residual_risk": residual_risk,
+        "downstream_constraints": downstream,
+        "completed_at": completed_at.isoformat(),
+    }
+    return TaskResult(
+        agent_id=guard.binding.agent_id,
+        job_id=guard.binding.job_id,
+        task_id=guard.binding.task_id,
+        result_id=result_id,
+        attempt_id=guard.binding.attempt_id,
+        run_id=request.run_id,
+        result_kind=result_kind,
+        schema_digest=schema_digest,
+        payload=payload,
+        summary=summary,
+        sensitivity=sensitivity,
+        provenance=provenance,
+        artifact_ids=artifacts,
+        effect_receipt_ids=(),
+        verification=verification,
+        residual_risk=residual_risk,
+        downstream_constraints=downstream,
+        completed_at=completed_at,
+        result_digest=canonical_digest(material),
+    )
+
+
+def _review_decision_result(
+    request: ToolExecution,
+    task: GraphTask,
+    control: TaskControl,
+    *,
+    result_id: str,
+    decision: str,
+    rationale: str,
+    completed_at: datetime,
+) -> TaskResult:
+    guard = request.task_attempt_guard
+    if guard is None:
+        raise CapabilityInputError(
+            "task_attempt_binding_missing",
+            "The review decision lacks its exact task-attempt binding.",
+        )
+    payload = {
+        "decision": decision,
+        "review_control_id": control.control_id,
+        "subject_task_id": control.task_id,
+        "candidate_digest": control.payload["candidate_digest"],
+        "rationale": rationale,
+    }
+    provenance = {
+        "authority": "fenced_graph_reviewer_attempt",
+        "task_binding_digest": guard.binding.digest,
+        "review_control_digest": control.payload_digest,
+        "model_authored_rationale": True,
+    }
+    verification = {
+        "review_control_id": control.control_id,
+        "review_control_digest": control.payload_digest,
+        "candidate_digest": control.payload["candidate_digest"],
+    }
+    material = {
+        "agent_id": task.agent_id,
+        "job_id": task.job_id,
+        "task_id": task.task_id,
+        "result_id": result_id,
+        "attempt_id": guard.binding.attempt_id,
+        "run_id": request.run_id,
+        "result_kind": "graph.review_decision",
+        "schema_digest": canonical_digest(task.specification.expected_result_contract),
+        "payload": payload,
+        "summary": f"Review decision: {decision}.",
+        "sensitivity": task.specification.authority.sensitivity.value,
+        "provenance": provenance,
+        "artifact_ids": (),
+        "effect_receipt_ids": (),
+        "verification": verification,
+        "residual_risk": None,
+        "downstream_constraints": {},
+        "completed_at": completed_at.isoformat(),
+    }
+    return TaskResult(
+        agent_id=task.agent_id,
+        job_id=task.job_id,
+        task_id=task.task_id,
+        result_id=result_id,
+        attempt_id=guard.binding.attempt_id,
+        run_id=request.run_id,
+        result_kind="graph.review_decision",
+        schema_digest=str(material["schema_digest"]),
+        payload=payload,
+        summary=f"Review decision: {decision}.",
+        sensitivity=task.specification.authority.sensitivity,
+        provenance=provenance,
+        artifact_ids=(),
+        effect_receipt_ids=(),
+        verification=verification,
+        residual_risk=None,
+        downstream_constraints={},
+        completed_at=completed_at,
+        result_digest=canonical_digest(material),
+    )
+
+
 def _lifecycle_output(
     kind: str,
     record_id: str,
@@ -1633,6 +2126,11 @@ __all__ = [
     "GRAPH_RESULT_FINALIZE_CAPABILITY_ID",
     "GRAPH_TASK_DOMAIN_OWNER_ID",
     "PLANNER_CAPABILITY_IDS",
+    "REVIEW_ACCEPT_CAPABILITY_ID",
+    "REVIEW_BLOCK_CAPABILITY_ID",
+    "REVIEW_CAPABILITY_IDS",
+    "REVIEW_INSPECT_CANDIDATE_CAPABILITY_ID",
+    "REVIEW_REQUEST_CHANGES_CAPABILITY_ID",
     "TASK_BLOCK_CAPABILITY_ID",
     "TASK_CHECKPOINT_CAPABILITY_ID",
     "TASK_COMMENT_CAPABILITY_ID",
