@@ -57,16 +57,8 @@ from ...jobs.graph.models import (
     TaskExecutionKind,
     TaskRole,
     TaskState,
+    canonical_digest,
     topology_digest,
-)
-from ...jobs.models import (
-    MAX_JOB_DEADLINE_SECONDS,
-    MAX_JOB_RESOURCE_BINDINGS,
-    MAX_JOB_WALL_TIME_SECONDS,
-    JobExecutionMode,
-    JobResourceBinding,
-    JobRun,
-    JobSpecification,
 )
 from ...jobs.owner import JobError, JobOwner
 from ...llm.models import ModelSensitivity, ToolCall
@@ -93,6 +85,9 @@ DATA_PROFILE_FINALIZE_OUTPUT_KIND = "job.data_profile.final_result"
 _MAX_PROFILE_SAMPLE_ROWS = 100
 _MAX_PROFILE_READ_BYTES = 256 * 1024
 _MAX_PROFILE_ARTIFACT_BYTES = 1 * 1024 * 1024
+MAX_JOB_RESOURCE_BINDINGS = 16
+MAX_JOB_WALL_TIME_SECONDS = 300.0
+MAX_JOB_DEADLINE_SECONDS = 3_600.0
 
 
 class DataProfileCatalog(Protocol):
@@ -130,6 +125,57 @@ class DataProfileDeclarations:
     tool_views: tuple[ToolView, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class ProfileResourceBinding:
+    source_id: str
+    source_revision: str
+    resource_id: str
+    resource_revision: str
+    adapter_id: str
+    sensitivity: ModelSensitivity
+
+    def __post_init__(self) -> None:
+        for value, label in (
+            (self.source_id, "source_id"),
+            (self.source_revision, "source_revision"),
+            (self.resource_id, "resource_id"),
+            (self.resource_revision, "resource_revision"),
+            (self.adapter_id, "adapter_id"),
+        ):
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"profile resource {label} must be non-empty text")
+        if not isinstance(self.sensitivity, ModelSensitivity):
+            raise TypeError("profile resource sensitivity is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class DataProfileSpecification:
+    arguments: FrozenJsonObject
+    resource_bindings: tuple[ProfileResourceBinding, ...]
+    execution_capability_id: str
+    execution_contract_digest: str
+    sensitivity: ModelSensitivity
+    deadline_at: datetime
+    max_wall_time_seconds: float
+
+    @property
+    def digest(self) -> str:
+        return canonical_digest(
+            {
+                "kind": "data_profile",
+                "arguments": self.arguments,
+                "resource_bindings": tuple(
+                    _binding_payload(binding) for binding in self.resource_bindings
+                ),
+                "execution_capability_id": self.execution_capability_id,
+                "execution_contract_digest": self.execution_contract_digest,
+                "sensitivity": self.sensitivity.value,
+                "deadline_at": self.deadline_at.isoformat(),
+                "max_wall_time_seconds": self.max_wall_time_seconds,
+            }
+        )
+
+
 class DataProfileAdmission:
     """Resolve exact current resource facts for one frozen profile specification."""
 
@@ -153,12 +199,11 @@ class DataProfileAdmission:
     async def build_specification(
         self,
         arguments: Mapping[str, object],
-    ) -> JobSpecification:
+    ) -> DataProfileSpecification:
         resource_ids = arguments.get("resource_ids")
         sample_rows = arguments.get("sample_rows", _MAX_PROFILE_SAMPLE_ROWS)
         deadline_raw = arguments.get("_deadline_at")
         wall_time = arguments.get("_max_wall_time_seconds")
-        selected_profile = arguments.get("_connected_profile_id")
         if not isinstance(resource_ids, tuple):
             raise CapabilityInputError(
                 "data_profile_invalid",
@@ -188,34 +233,16 @@ class DataProfileAdmission:
             ) from None
         bindings = await self._current_bindings(resource_ids)
         sensitivity = _maximum_sensitivity(tuple(item.sensitivity for item in bindings))
-        external = None
-        mode = JobExecutionMode.DAITA
-        if selected_profile is not None:
-            if not isinstance(selected_profile, str):
-                raise CapabilityInputError(
-                    "external_executor_not_admitted",
-                    "The connected executor selection is malformed.",
-                )
-            external = self._owner.resolve_external_selection(
-                selected_profile,
-                job_kind="data_profile",
-                sensitivity=sensitivity,
-            )
-            mode = JobExecutionMode.CONNECTED_EXECUTOR
-        return JobSpecification(
-            job_kind="data_profile",
-            arguments={
-                "resource_ids": resource_ids,
-                "sample_rows": sample_rows,
-            },
+        return DataProfileSpecification(
+            arguments=FrozenJsonObject.from_mapping(
+                {"resource_ids": resource_ids, "sample_rows": sample_rows}
+            ),
             resource_bindings=bindings,
             execution_capability_id=self._execution_capability.id,
             execution_contract_digest=self._execution_contract_digest,
-            execution_mode=mode,
             sensitivity=sensitivity,
             deadline_at=deadline.astimezone(UTC),
             max_wall_time_seconds=float(wall_time),
-            external_executor=external,
         )
 
     async def build_static_graph_admission(
@@ -229,7 +256,7 @@ class DataProfileAdmission:
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> GraphAdmission:
-        """Build the explicit integration-only static profile graph."""
+        """Build the current code-authored static profile graph."""
 
         if run.agent_id != self._agent_id or run.conversation_id is None:
             raise CapabilityInputError(
@@ -258,11 +285,6 @@ class DataProfileAdmission:
         if not isinstance(profile_sample_rows, int):
             raise CapabilityInputError(
                 "data_profile_invalid", "The frozen sample bound is malformed."
-            )
-        if profile.execution_mode is not JobExecutionMode.DAITA:
-            raise CapabilityInputError(
-                "graph_external_executor_forbidden",
-                "The static graph slice admits only Daita-owned internal work.",
             )
         finalizer_digest = capability_contract_digest(
             finalizer_capability,
@@ -515,59 +537,10 @@ class DataProfileAdmission:
                 "The current resource identity or admission no longer matches the frozen job.",
             )
 
-    async def revalidate_external(self, job: JobRun) -> None:
-        """Recheck the concrete data-profile authority immediately before I/O."""
-
-        if job.specification.execution_mode is not JobExecutionMode.CONNECTED_EXECUTOR:
-            raise CapabilityInputError(
-                "job_contract_revalidation_failed",
-                "The external data-profile execution mode is no longer current.",
-            )
-        await self.revalidate_job(job)
-
-    async def revalidate_job(self, job: JobRun) -> None:
-        """Recheck the exact data-profile contract and current read scope."""
-
-        specification = job.specification
-        if (
-            specification.job_kind != "data_profile"
-            or specification.execution_capability_id != self._execution_capability.id
-            or specification.execution_contract_digest
-            != self._execution_contract_digest
-        ):
-            raise CapabilityInputError(
-                "job_contract_revalidation_failed",
-                "The external data-profile execution contract is no longer current.",
-            )
-        await self.validate_internal(
-            {
-                "resource_ids": specification.arguments.get("resource_ids"),
-                "resource_bindings": tuple(
-                    {
-                        "source_id": item.source_id,
-                        "source_revision": item.source_revision,
-                        "resource_id": item.resource_id,
-                        "resource_revision": item.resource_revision,
-                        "adapter_id": item.adapter_id,
-                        "sensitivity": item.sensitivity.value,
-                    }
-                    for item in specification.resource_bindings
-                ),
-            }
-        )
-        current_sensitivity = _maximum_sensitivity(
-            tuple(item.sensitivity for item in specification.resource_bindings)
-        )
-        if current_sensitivity is not specification.sensitivity:
-            raise CapabilityInputError(
-                "job_sensitivity_stale",
-                "The external data-profile sensitivity no longer matches its scope.",
-            )
-
     async def _current_bindings(
         self,
         resource_ids: tuple[object, ...],
-    ) -> tuple[JobResourceBinding, ...]:
+    ) -> tuple[ProfileResourceBinding, ...]:
         if (
             not 1 <= len(resource_ids) <= MAX_JOB_RESOURCE_BINDINGS
             or len(set(resource_ids)) != len(resource_ids)
@@ -638,7 +611,7 @@ class DataProfileAdmission:
                     "One requested data-profile resource changed during admission.",
                 )
             bindings.append(
-                JobResourceBinding(
+                ProfileResourceBinding(
                     source_id=source_id,
                     source_revision=schema.source_revision,
                     resource_id=resource_id,
@@ -652,78 +625,8 @@ class DataProfileAdmission:
         )
 
 
-class StartDataProfileExecutor:
-    executor_id = START_DATA_PROFILE_EXECUTOR_ID
-
-    def __init__(
-        self,
-        *,
-        owner: JobOwner,
-        admission: DataProfileAdmission,
-        clock,
-    ) -> None:
-        self._owner = owner
-        self._admission = admission
-        self._clock = clock
-
-    async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
-        specification = await self._admission.build_specification(request.arguments)
-        return FrozenJsonObject.from_mapping(
-            {
-                "specification_digest": specification.digest,
-                "execution_mode": specification.execution_mode.value,
-                "execution_capability_id": specification.execution_capability_id,
-                "execution_contract_digest": specification.execution_contract_digest,
-                "resource_ids": tuple(
-                    item.resource_id for item in specification.resource_bindings
-                ),
-            }
-        )
-
-    async def execute(self, request: ToolExecution) -> ToolOutput:
-        specification = await self._admission.build_specification(request.arguments)
-        run = RunInput(
-            id=request.run_id,
-            agent_id=self._owner.agent_id,
-            message="Start the exact admitted data profile job.",
-            created_at=self._clock(),
-            conversation_id=request.conversation_id,
-            source_scope_ids=tuple(
-                sorted({item.source_id for item in specification.resource_bindings})
-            ),
-            resolved_source_scope=request.source_scope,
-        )
-        job = await self._owner.admit(
-            run=run,
-            call_id=request.call_id,
-            specification=specification,
-        )
-        return ToolOutput(
-            kind=START_DATA_PROFILE_OUTPUT_KIND,
-            data={
-                "job_id": job.job_id,
-                "job_kind": job.specification.job_kind,
-                "status": job.status.value,
-                "execution_mode": job.specification.execution_mode.value,
-                "specification_digest": job.specification_digest,
-                "execution_capability_id": (job.specification.execution_capability_id),
-                "execution_contract_digest": (
-                    job.specification.execution_contract_digest
-                ),
-            },
-            sensitivity=job.specification.sensitivity,
-            sensitivity_provenance={
-                "authority": "frozen_job_resource_scope",
-                "job_id": job.job_id,
-                "resource_ids": tuple(
-                    item.resource_id for item in job.specification.resource_bindings
-                ),
-            },
-        )
-
-
-class StartStaticDataProfileGraphExecutor:
-    """Integration-only starter for the draft static graph vertical slice."""
+class StartDataProfileGraphExecutor:
+    """Start the current code-authored static data-profile graph."""
 
     executor_id = START_DATA_PROFILE_EXECUTOR_ID
 
@@ -746,17 +649,18 @@ class StartStaticDataProfileGraphExecutor:
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
         prepared = dict(request.arguments)
-        deadline_seconds = prepared.get("deadline_seconds", 300)
-        if not isinstance(deadline_seconds, int) or isinstance(deadline_seconds, bool):
+        if not isinstance(prepared.get("_deadline_at"), str):
             raise CapabilityInputError(
-                "data_profile_invalid", "The data-profile deadline is malformed."
+                "data_profile_invalid", "The frozen data-profile deadline is missing."
             )
-        prepared["_deadline_at"] = (
-            self._clock() + timedelta(seconds=deadline_seconds)
-        ).isoformat()
-        prepared["_max_wall_time_seconds"] = min(
-            float(deadline_seconds), MAX_JOB_WALL_TIME_SECONDS
-        )
+        max_wall_time = prepared.get("_max_wall_time_seconds")
+        if not isinstance(max_wall_time, (int, float)) or isinstance(
+            max_wall_time, bool
+        ):
+            raise CapabilityInputError(
+                "data_profile_invalid",
+                "The frozen data-profile wall-time limit is missing.",
+            )
         specification = await self._admission.build_specification(prepared)
         return FrozenJsonObject.from_mapping(
             {
@@ -795,7 +699,7 @@ class StartStaticDataProfileGraphExecutor:
             clock=self._clock,
             id_factory=self._id_factory,
         )
-        job = await self._owner.admit_static_graph(admission)
+        job = await self._owner.admit(admission)
         work_capability_id = DATA_PROFILE_EXECUTION_CAPABILITY_ID
         work_contract = job.specification.authority.contract_bindings.get(
             work_capability_id
@@ -807,7 +711,7 @@ class StartStaticDataProfileGraphExecutor:
                 "job_id": job.job_id,
                 "job_kind": "data_profile",
                 "status": job.state.value,
-                "execution_mode": JobExecutionMode.DAITA.value,
+                "execution_kind": "graph",
                 "specification_digest": job.specification_digest,
                 "execution_capability_id": work_capability_id,
                 "execution_contract_digest": work_contract,
@@ -941,7 +845,7 @@ class DataProfileExecutor:
 
     async def _read(
         self,
-        binding: JobResourceBinding,
+        binding: ProfileResourceBinding,
         schema: ResourceSchema,
         sample_rows: int,
     ) -> SqlReadResult:
@@ -1199,13 +1103,6 @@ class DataProfileCapabilityDomain:
                 float(deadline_seconds),
                 MAX_JOB_WALL_TIME_SECONDS,
             )
-            selected = (
-                None
-                if session is None
-                else session.options.selected_executor_profile_id
-            )
-            if selected is not None:
-                prepared["_connected_profile_id"] = selected
             specification = await self._admission.build_specification(prepared)
             scope = await resolve_effective_source_scope(
                 run,
@@ -1294,11 +1191,16 @@ def data_profile_declarations(
     owner: JobOwner,
     sqlite_backend: SqlReadBackend,
     postgresql_backend: SqlReadBackend,
-    clock,
+    artifacts: AgentHomeArtifactStore,
+    distribution: DistributionOwner,
+    clock: Callable[[], datetime],
+    id_factory: Callable[[str], str],
 ) -> tuple[DataProfileDeclarations, DataProfileAdmission]:
+    """Compose the current static data-profile graph entrypoint and executors."""
+
     internal = Capability(
         id=DATA_PROFILE_EXECUTION_CAPABILITY_ID,
-        description="Execute one exact frozen read-only data profile internally.",
+        description="Execute one exact frozen read-only data-profile graph task.",
         input_schema=_internal_input_schema(),
         output_kind=DATA_PROFILE_EXECUTION_OUTPUT_KIND,
         output_schema=_internal_output_schema(),
@@ -1325,8 +1227,8 @@ def data_profile_declarations(
     start = Capability(
         id=START_DATA_PROFILE_CAPABILITY_ID,
         description=(
-            "Start one bounded durable read-only data profile over exact current resources. "
-            "The job is inspectable and cancellable after this run completes."
+            "Start one bounded durable read-only data-profile graph over exact "
+            "current resources."
         ),
         input_schema=_start_input_schema(),
         output_kind=START_DATA_PROFILE_OUTPUT_KIND,
@@ -1335,61 +1237,6 @@ def data_profile_declarations(
         access_mode=AccessMode.READ,
         operational_effect=OperationalEffect.START_JOB,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
-    )
-    executors: tuple[Executor, ...] = (
-        StartDataProfileExecutor(owner=owner, admission=admission, clock=clock),
-        DataProfileExecutor(
-            agent_id=agent_id,
-            catalog=catalog,
-            sqlite_backend=sqlite_backend,
-            postgresql_backend=postgresql_backend,
-        ),
-    )
-    return (
-        DataProfileDeclarations(
-            capabilities=(start, internal),
-            executors=executors,
-            tool_views=(
-                ToolView(
-                    name=START_DATA_PROFILE_TOOL_NAME,
-                    capability_id=start.id,
-                    description=start.description,
-                    presentation=ToolPresentation(
-                        toolbox_id=ToolboxId.JOBS,
-                        load_mode=ToolLoadMode.ON_DEMAND,
-                        text_trust=ToolTextTrust.CODE,
-                        summary="Start a bounded durable profile over exact data resources.",
-                        when_to_use="Use when profiling should continue after this reasoning run.",
-                        keywords=("data", "profile", "job", "durable"),
-                    ),
-                ),
-            ),
-        ),
-        admission,
-    )
-
-
-def data_profile_graph_integration_declarations(
-    *,
-    agent_id: str,
-    catalog: DataProfileCatalog,
-    owner: JobOwner,
-    sqlite_backend: SqlReadBackend,
-    postgresql_backend: SqlReadBackend,
-    artifacts: AgentHomeArtifactStore,
-    distribution: DistributionOwner,
-    clock,
-    id_factory: Callable[[str], str],
-) -> tuple[DataProfileDeclarations, DataProfileAdmission]:
-    """Extend the profile domain only for explicit draft-graph integration tests."""
-
-    base, admission = data_profile_declarations(
-        agent_id=agent_id,
-        catalog=catalog,
-        owner=owner,
-        sqlite_backend=sqlite_backend,
-        postgresql_backend=postgresql_backend,
-        clock=clock,
     )
     finalizer = Capability(
         id=DATA_PROFILE_FINALIZE_CAPABILITY_ID,
@@ -1413,9 +1260,9 @@ def data_profile_graph_integration_declarations(
     )
     return (
         DataProfileDeclarations(
-            capabilities=(*base.capabilities, finalizer),
+            capabilities=(start, internal, finalizer),
             executors=(
-                StartStaticDataProfileGraphExecutor(
+                StartDataProfileGraphExecutor(
                     owner=owner,
                     admission=admission,
                     finalizer_capability=finalizer,
@@ -1423,10 +1270,35 @@ def data_profile_graph_integration_declarations(
                     clock=clock,
                     id_factory=id_factory,
                 ),
-                base.executors[1],
+                DataProfileExecutor(
+                    agent_id=agent_id,
+                    catalog=catalog,
+                    sqlite_backend=sqlite_backend,
+                    postgresql_backend=postgresql_backend,
+                ),
                 DataProfileFinalizerExecutor(artifacts),
             ),
-            tool_views=base.tool_views,
+            tool_views=(
+                ToolView(
+                    name=START_DATA_PROFILE_TOOL_NAME,
+                    capability_id=start.id,
+                    description=start.description,
+                    presentation=ToolPresentation(
+                        toolbox_id=ToolboxId.JOBS,
+                        load_mode=ToolLoadMode.ON_DEMAND,
+                        text_trust=ToolTextTrust.CODE,
+                        summary=(
+                            "Start a bounded durable profile graph over exact data "
+                            "resources."
+                        ),
+                        when_to_use=(
+                            "Use when profiling should continue after this reasoning "
+                            "run."
+                        ),
+                        keywords=("data", "profile", "job", "durable", "graph"),
+                    ),
+                ),
+            ),
         ),
         admission,
     )
@@ -1519,7 +1391,7 @@ def _start_output_schema() -> dict[str, object]:
         "job_id": {"type": "string"},
         "job_kind": {"type": "string"},
         "status": {"type": "string"},
-        "execution_mode": {"type": "string"},
+        "execution_kind": {"type": "string", "const": "graph"},
         "specification_digest": {"type": "string"},
         "execution_capability_id": {"type": "string"},
         "execution_contract_digest": {"type": "string"},
@@ -1602,14 +1474,14 @@ def _finalizer_output_schema() -> dict[str, object]:
     }
 
 
-def _binding_from_mapping(value: object) -> JobResourceBinding:
+def _binding_from_mapping(value: object) -> ProfileResourceBinding:
     if not isinstance(value, Mapping):
         raise CapabilityInputError(
             "job_specification_invalid",
             "A frozen job resource binding is malformed.",
         )
     try:
-        return JobResourceBinding(
+        return ProfileResourceBinding(
             source_id=str(value["source_id"]),
             source_revision=str(value["source_revision"]),
             resource_id=str(value["resource_id"]),
@@ -1625,7 +1497,7 @@ def _binding_from_mapping(value: object) -> JobResourceBinding:
 
 
 def job_resource_bindings_payload(
-    values: tuple[JobResourceBinding, ...],
+    values: tuple[ProfileResourceBinding, ...],
 ) -> tuple[dict[str, object], ...]:
     return tuple(
         {
@@ -1640,7 +1512,7 @@ def job_resource_bindings_payload(
     )
 
 
-def _binding_payload(value: JobResourceBinding) -> dict[str, object]:
+def _binding_payload(value: ProfileResourceBinding) -> dict[str, object]:
     return {
         "source_id": value.source_id,
         "source_revision": value.source_revision,
@@ -1722,11 +1594,12 @@ __all__ = [
     "DataProfileAdmission",
     "DataProfileCapabilityDomain",
     "DataProfileDeclarations",
-    "StartStaticDataProfileGraphExecutor",
+    "DataProfileSpecification",
+    "ProfileResourceBinding",
+    "StartDataProfileGraphExecutor",
     "START_DATA_PROFILE_CAPABILITY_ID",
     "START_DATA_PROFILE_EXECUTOR_ID",
     "START_DATA_PROFILE_TOOL_NAME",
     "data_profile_declarations",
-    "data_profile_graph_integration_declarations",
     "job_resource_bindings_payload",
 ]

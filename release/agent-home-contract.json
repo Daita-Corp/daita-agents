@@ -109,6 +109,15 @@
         "definition": "First production agent-home format. Replaces the mutable SQLite-only development ledger with the sole home revision ledger, canonicalizes model configuration, removes redundant record codec discriminators, and admits the three complete preproduction schemas observed before freeze.",
         "migration_id": "agent_home_revision_1",
         "revision": 1
+      },
+      {
+        "affected_paths": [
+          "state.db"
+        ],
+        "checksum": "cb98e978fcb6db71cc1cb3ee5532d92ce99117db7359a008a98a4651df1c20e2",
+        "definition": "Atomically replace revision-1 single-job and autonomous-follow-up state with the ratified durable adaptive task graph, preserving terminal evidence and converting only provably safe queued profiles to runnable graph work.",
+        "migration_id": "0002_durable_adaptive_task_graph",
+        "revision": 2
       }
     ],
     "sqlite_record_fields": {
@@ -207,37 +216,14 @@
         "bytes_added",
         "description"
       ],
-      "AutonomousFollowup": [
-        "conversation_id",
-        "event_id",
-        "observation_source",
-        "job_id",
-        "job_terminal_revision",
-        "event_type",
-        "event_payload",
-        "payload_digest",
-        "received_at",
-        "grant",
-        "execution_scope",
-        "disposition",
-        "created_at",
-        "updated_at",
-        "revision",
-        "attempt_count",
-        "claim_token",
-        "lease_expires_at",
-        "reserved_run_id",
-        "reserved_cost_usd",
-        "reserved_tokens",
-        "charged_cost_usd",
-        "charged_tokens",
-        "run_bound_at",
-        "run_terminal_at",
-        "audit_context",
-        "grant_consumed_at",
-        "conclusion_evidence",
-        "delivery_id",
-        "failure_code"
+      "BudgetAmount": [
+        "dimension",
+        "amount"
+      ],
+      "BudgetLimit": [
+        "dimension",
+        "ceiling",
+        "control_reserved"
       ],
       "CalendarSchedule": [
         "timezone",
@@ -325,14 +311,6 @@
         "relationship_count",
         "error_code"
       ],
-      "ConnectedExecutorBinding": [
-        "profile_id",
-        "binding_id",
-        "execution_identity",
-        "contract_digest",
-        "revision",
-        "maximum_sensitivity"
-      ],
       "ConversationInboxTarget": [
         "conversation_id",
         "destination_id",
@@ -372,7 +350,8 @@
         "acknowledged_at",
         "blocked_reason_code",
         "created_at",
-        "updated_at"
+        "updated_at",
+        "migration_provenance"
       ],
       "DistributionPlan": [
         "targets",
@@ -450,133 +429,165 @@
         "per_run_max_tokens",
         "distribution_plan_digest",
         "contract_bindings",
-        "capability_grants"
+        "capability_grants",
+        "scope_kind",
+        "graph_task_binding"
       ],
-      "ExternalIntent": [
+      "GraphAuthority": [
+        "source_ids",
+        "resource_ids",
+        "connector_ids",
+        "capability_ids",
+        "access_modes",
+        "operational_effects",
+        "model_route_ids",
+        "sensitivity",
+        "contract_bindings"
+      ],
+      "GraphEventPayload": [
         "kind",
-        "idempotency_key",
-        "requested_at",
-        "disposition",
-        "completed_at",
-        "external_job_id",
-        "reason_code"
+        "payload"
       ],
-      "ExternalObservation": [
-        "sequence",
-        "observed_at",
-        "status",
-        "observation_digest",
-        "external_job_id"
-      ],
-      "FollowupConclusionEvidence": [
-        "run_id",
-        "job_id",
-        "job_revision",
-        "inspection_call_id",
-        "inspection_result_digest",
-        "result_call_id",
-        "result_result_digest",
-        "job_result_id",
-        "report_digest"
-      ],
-      "FollowupGrant": [
-        "grant_id",
-        "job_id",
+      "GraphJob": [
         "agent_id",
+        "job_id",
         "conversation_id",
-        "authorizing_principal",
-        "allowed_terminal_job_observation",
-        "allowed_source_ids",
-        "allowed_resource_ids",
-        "allowed_capability_ids",
-        "allowed_access_modes",
-        "allowed_operational_effects",
-        "instruction_id",
-        "instruction_digest",
-        "sensitivity_ceiling",
+        "origin_run_id",
+        "origin_call_id",
+        "state",
+        "desired_state",
+        "created_at",
+        "updated_at",
+        "deadline_at",
+        "specification",
+        "specification_digest",
+        "finalizer_task_id",
+        "terminal_at",
+        "terminal_result_id",
+        "failure_code",
+        "migration_provenance"
+      ],
+      "GraphJobSpecification": [
+        "principal_id",
+        "objective",
         "outcome_contract",
-        "distribution_plan",
-        "eligible_model_routes",
-        "max_successful_runs",
-        "max_attempts",
-        "per_run_max_cost_usd",
-        "per_run_max_tokens",
-        "cumulative_max_cost_usd",
-        "cumulative_max_tokens",
-        "expires_at"
+        "authority",
+        "distribution_plan_digest",
+        "budgets",
+        "deadline_at",
+        "limits",
+        "retry_policy",
+        "cancellation_policy",
+        "effect_mode",
+        "planner_task_template",
+        "finalizer_task_template"
+      ],
+      "GraphLimits": [
+        "max_tasks",
+        "max_edges",
+        "max_depth",
+        "max_direct_parents",
+        "max_fan_out",
+        "max_attempts_per_task",
+        "max_parallelism",
+        "max_mutations",
+        "max_events",
+        "max_controls_per_task",
+        "max_checkpoints_per_attempt",
+        "max_comments_per_task",
+        "max_artifacts",
+        "max_artifact_bytes",
+        "max_total_artifact_bytes"
+      ],
+      "GraphMutation": [
+        "agent_id",
+        "job_id",
+        "mutation_id",
+        "actor_kind",
+        "actor_key",
+        "idempotency_key",
+        "payload_digest",
+        "expected_revision",
+        "committed_revision",
+        "decision",
+        "created_at",
+        "resulting_task_ids",
+        "resulting_edges",
+        "failure_code",
+        "creator_task_id",
+        "creator_attempt_id"
+      ],
+      "GraphTask": [
+        "agent_id",
+        "job_id",
+        "task_id",
+        "state",
+        "role",
+        "execution_kind",
+        "priority",
+        "not_before",
+        "current_attempt_id",
+        "task_revision",
+        "specification",
+        "task_spec_digest",
+        "task_scope_digest",
+        "attempt_count",
+        "failure_streak",
+        "fencing_epoch",
+        "created_at",
+        "updated_at",
+        "terminal_at",
+        "supersedes_task_id",
+        "superseded_by_task_id",
+        "latest_result_id",
+        "latest_control_id",
+        "latest_checkpoint_id"
+      ],
+      "GraphTaskBinding": [
+        "agent_id",
+        "job_id",
+        "root_authority_digest",
+        "task_id",
+        "task_revision",
+        "task_spec_digest",
+        "task_scope_digest",
+        "attempt_id",
+        "claim_token_digest",
+        "fencing_epoch",
+        "graph_revision_at_claim",
+        "task_role",
+        "task_deadline_at",
+        "job_deadline_at",
+        "budget_reservation_identity"
+      ],
+      "GraphTaskSpecification": [
+        "title",
+        "description",
+        "expected_result_contract",
+        "authority",
+        "budgets",
+        "max_steps",
+        "max_wall_time_seconds",
+        "created_by"
       ],
       "IntervalSchedule": [
         "interval_seconds",
         "anchor_at"
       ],
-      "JobAttempt": [
-        "number",
-        "fencing_epoch",
-        "claim_token",
-        "execution_run_id",
-        "reserved_artifact_id",
-        "status",
-        "claimed_at",
-        "lease_expires_at",
-        "renewals",
-        "completed_at",
-        "error_code",
-        "external_intents",
-        "external_observations"
-      ],
-      "JobCompletionBinding": [
-        "owner_kind",
-        "owner_id",
-        "terminal_event_id",
-        "bound_at"
-      ],
-      "JobResourceBinding": [
-        "source_id",
-        "source_revision",
-        "resource_id",
-        "resource_revision",
-        "adapter_id",
-        "sensitivity"
-      ],
-      "JobResult": [
-        "result_id",
-        "summary",
-        "sensitivity",
-        "provenance",
-        "artifact_refs",
-        "completed_at"
-      ],
-      "JobRun": [
-        "conversation_id",
-        "origin_run_id",
-        "origin_call_id",
-        "specification",
-        "specification_digest",
-        "status",
-        "desired_state",
+      "JobGraph": [
+        "agent_id",
+        "job_id",
+        "revision",
+        "task_count",
+        "edge_count",
+        "mutation_count",
+        "active_attempt_count",
+        "next_ready_at",
+        "finalization_attempt_id",
+        "finalization_started_revision",
         "created_at",
         "updated_at",
-        "revision",
-        "fencing_epoch",
-        "attempts",
-        "cancel_requested_at",
-        "terminal_at",
-        "terminal_observed_at",
-        "completion_binding",
-        "result",
-        "failure_code"
-      ],
-      "JobSpecification": [
-        "job_kind",
-        "arguments",
-        "resource_bindings",
-        "execution_capability_id",
-        "execution_contract_digest",
-        "execution_mode",
-        "sensitivity",
-        "deadline_at",
-        "max_wall_time_seconds",
-        "external_executor"
+        "topology_digest"
       ],
       "LearningCandidate": [
         "id",
@@ -949,6 +960,106 @@
         "keywords",
         "presentation_sensitivity"
       ],
+      "TaskAttempt": [
+        "agent_id",
+        "job_id",
+        "task_id",
+        "attempt_id",
+        "ordinal",
+        "fencing_epoch",
+        "state",
+        "claim_token",
+        "run_id",
+        "lease_expires_at",
+        "absolute_deadline_at",
+        "started_at",
+        "heartbeat_at",
+        "ended_at",
+        "execution_scope_digest",
+        "executor_id",
+        "error_code",
+        "diagnostic",
+        "reserved_budgets",
+        "measured_usage",
+        "loop_exit_id",
+        "checkpoint_ids",
+        "result_id",
+        "control_ids",
+        "artifact_ids",
+        "effect_receipt_ids"
+      ],
+      "TaskCheckpoint": [
+        "agent_id",
+        "job_id",
+        "task_id",
+        "attempt_id",
+        "checkpoint_id",
+        "fencing_epoch",
+        "ordinal",
+        "milestone",
+        "payload",
+        "created_at",
+        "payload_digest"
+      ],
+      "TaskComment": [
+        "agent_id",
+        "job_id",
+        "task_id",
+        "comment_id",
+        "author_kind",
+        "author_id",
+        "sensitivity",
+        "body",
+        "created_at",
+        "body_digest"
+      ],
+      "TaskControl": [
+        "agent_id",
+        "job_id",
+        "task_id",
+        "control_id",
+        "kind",
+        "state",
+        "requesting_attempt_id",
+        "payload",
+        "created_at",
+        "payload_digest",
+        "resolved_at",
+        "resolved_by_kind",
+        "resolved_by_id",
+        "resolution"
+      ],
+      "TaskDependency": [
+        "agent_id",
+        "job_id",
+        "upstream_task_id",
+        "downstream_task_id",
+        "edge_kind",
+        "created_at",
+        "creator_key",
+        "mutation_id"
+      ],
+      "TaskResult": [
+        "agent_id",
+        "job_id",
+        "task_id",
+        "result_id",
+        "attempt_id",
+        "run_id",
+        "result_kind",
+        "schema_digest",
+        "payload",
+        "summary",
+        "sensitivity",
+        "provenance",
+        "artifact_ids",
+        "effect_receipt_ids",
+        "verification",
+        "residual_risk",
+        "downstream_constraints",
+        "completed_at",
+        "result_digest"
+      ],
       "TextBlock": [
         "text"
       ],
@@ -971,6 +1082,602 @@
     },
     "sqlite_schema": {
       "foreign_keys": {
+        "effect_receipts": [
+          [
+            "job_task_attempts",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "task_attempt_id",
+            "attempt_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_attempt_budget_reservations": [
+          [
+            "job_task_attempts",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "attempt_id",
+            "attempt_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_budget_ledger": [
+          [
+            "job_graphs",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_graphs",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_graph_events": [
+          [
+            "job_task_attempts",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "attempt_id",
+            "attempt_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_graphs",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_graphs",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_graph_mutations": [
+          [
+            "job_task_attempts",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "creator_task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "creator_attempt_id",
+            "attempt_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "creator_task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_graphs",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_graphs",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_graphs": [
+          [
+            "job_runs",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_runs",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_task_attempts": [
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_task_budget_ledger": [
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_task_checkpoints": [
+          [
+            "job_task_attempts",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "attempt_id",
+            "attempt_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_task_comments": [
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_task_controls": [
+          [
+            "job_task_attempts",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "requesting_attempt_id",
+            "attempt_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_task_dependencies": [
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "downstream_task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "upstream_task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_task_results": [
+          [
+            "job_task_attempts",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_task_attempts",
+            "attempt_id",
+            "attempt_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
+        "job_tasks": [
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "superseded_by_task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_tasks",
+            "supersedes_task_id",
+            "task_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_graphs",
+            "agent_id",
+            "agent_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ],
+          [
+            "job_graphs",
+            "job_id",
+            "job_id",
+            "NO ACTION",
+            "RESTRICT",
+            "NONE"
+          ]
+        ],
         "messages": [
           [
             "runs",
@@ -1056,6 +1763,16 @@
             "grant_digest"
           ]
         ],
+        "effect_receipts_graph_attempt": [
+          "effect_receipts",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "task_id",
+            "task_attempt_id"
+          ]
+        ],
         "effect_receipts_unresolved": [
           "effect_receipts",
           false,
@@ -1064,6 +1781,149 @@
             "unresolved",
             "routine_id",
             "run_id"
+          ]
+        ],
+        "job_graph_events_job": [
+          "job_graph_events",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "event_id"
+          ]
+        ],
+        "job_graph_events_kind": [
+          "job_graph_events",
+          false,
+          [
+            "agent_id",
+            "kind",
+            "event_id"
+          ]
+        ],
+        "job_graph_events_task": [
+          "job_graph_events",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "task_id",
+            "event_id"
+          ]
+        ],
+        "job_graphs_ready": [
+          "job_graphs",
+          false,
+          [
+            "agent_id",
+            "next_ready_at_us",
+            "updated_at_us"
+          ]
+        ],
+        "job_runs_conversation_created": [
+          "job_runs",
+          false,
+          [
+            "agent_id",
+            "conversation_id",
+            "created_at_us"
+          ]
+        ],
+        "job_runs_state_deadline": [
+          "job_runs",
+          false,
+          [
+            "agent_id",
+            "state",
+            "deadline_at_us"
+          ]
+        ],
+        "job_runs_updated": [
+          "job_runs",
+          false,
+          [
+            "agent_id",
+            "updated_at_us"
+          ]
+        ],
+        "job_task_attempts_by_task": [
+          "job_task_attempts",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "task_id",
+            "ordinal"
+          ]
+        ],
+        "job_task_attempts_deadline": [
+          "job_task_attempts",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "state",
+            "absolute_deadline_at_us"
+          ]
+        ],
+        "job_task_attempts_stale": [
+          "job_task_attempts",
+          false,
+          [
+            "agent_id",
+            "state",
+            "lease_expires_at_us"
+          ]
+        ],
+        "job_task_controls_open": [
+          "job_task_controls",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "state",
+            "created_at_us"
+          ]
+        ],
+        "job_task_dependencies_reverse": [
+          "job_task_dependencies",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "downstream_task_id",
+            "upstream_task_id"
+          ]
+        ],
+        "job_tasks_by_job": [
+          "job_tasks",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "state",
+            "priority",
+            "created_at_us"
+          ]
+        ],
+        "job_tasks_current_attempt": [
+          "job_tasks",
+          false,
+          [
+            "agent_id",
+            "job_id",
+            "current_attempt_id"
+          ]
+        ],
+        "job_tasks_ready": [
+          "job_tasks",
+          false,
+          [
+            "agent_id",
+            "state",
+            "not_before_us",
+            "priority",
+            "updated_at_us"
           ]
         ],
         "routine_occurrences_stale": [
@@ -1100,6 +1960,88 @@
         "deliveries": [
           "CHECK (json_valid(data))"
         ],
+        "effect_receipts": [
+          "CHECK ( (job_id IS NULL AND task_id IS NULL AND task_attempt_id IS NULL AND fencing_epoch IS NULL AND task_spec_digest IS NULL) OR (job_id IS NOT NULL AND task_id IS NOT NULL AND task_attempt_id IS NOT NULL AND fencing_epoch IS NOT NULL AND task_spec_digest IS NOT NULL) )"
+        ],
+        "job_attempt_budget_reservations": [
+          "CHECK (reserved >= 0)",
+          "CHECK (settled IS NULL OR settled >= 0)"
+        ],
+        "job_budget_ledger": [
+          "CHECK (ceiling >= 0)",
+          "CHECK (settled >= 0)",
+          "CHECK (reserved >= 0)",
+          "CHECK (control_reserved >= 0)",
+          "CHECK (settled + reserved <= ceiling)",
+          "CHECK (control_reserved <= ceiling)"
+        ],
+        "job_graph_events": [
+          "CHECK (json_valid(data))",
+          "CHECK (attempt_id IS NULL OR task_id IS NOT NULL)"
+        ],
+        "job_graph_mutations": [
+          "CHECK (expected_revision >= 0)",
+          "CHECK (committed_revision >= 0)",
+          "CHECK (decision IN ('committed','rejected'))",
+          "CHECK (json_valid(data))"
+        ],
+        "job_graphs": [
+          "CHECK (revision >= 0)",
+          "CHECK (task_count >= 0)",
+          "CHECK (edge_count >= 0)",
+          "CHECK (mutation_count >= 0)",
+          "CHECK (active_attempt_count >= 0)",
+          "CHECK (json_valid(data))",
+          "CHECK ( (finalization_attempt_id IS NULL AND finalization_started_revision IS NULL) OR (finalization_attempt_id IS NOT NULL AND finalization_started_revision IS NOT NULL) )"
+        ],
+        "job_runs": [
+          "CHECK (state IN ( 'queued','active','blocked','needs_attention','cancel_requested', 'succeeded','failed','cancelled' ))",
+          "CHECK (desired_state IN ('run','cancel'))",
+          "CHECK (json_valid(data))"
+        ],
+        "job_task_attempts": [
+          "CHECK (ordinal > 0)",
+          "CHECK (fencing_epoch > 0)",
+          "CHECK (state IN ( 'claimed','running','succeeded','failed','cancelled','blocked', 'review_requested','timed_out','protocol_violation','fenced' ))",
+          "CHECK (json_valid(data))",
+          "CHECK ( (state IN ('claimed','running') AND active_slot = 1 AND lease_expires_at_us IS NOT NULL AND ended_at_us IS NULL) OR (state NOT IN ('claimed','running') AND active_slot IS NULL AND lease_expires_at_us IS NULL AND ended_at_us IS NOT NULL) )"
+        ],
+        "job_task_budget_ledger": [
+          "CHECK (ceiling >= 0)",
+          "CHECK (settled >= 0)",
+          "CHECK (reserved >= 0)",
+          "CHECK (settled + reserved <= ceiling)"
+        ],
+        "job_task_checkpoints": [
+          "CHECK (ordinal > 0)",
+          "CHECK (json_valid(data))"
+        ],
+        "job_task_comments": [
+          "CHECK (json_valid(data))"
+        ],
+        "job_task_controls": [
+          "CHECK (kind IN ( 'needs_input','needs_authorization','needs_replan','review_requested', 'changes_requested','effect_uncertain','capability_unavailable', 'source_or_contract_drift','budget_exhausted','retry_circuit_open' ))",
+          "CHECK (state IN ('open','resolved','rejected','expired'))",
+          "CHECK (json_valid(data))",
+          "CHECK ( (state = 'open' AND resolved_at_us IS NULL AND resolved_by_kind IS NULL AND resolved_by_id IS NULL) OR (state <> 'open' AND resolved_at_us IS NOT NULL AND resolved_by_kind IS NOT NULL AND resolved_by_id IS NOT NULL) )"
+        ],
+        "job_task_dependencies": [
+          "CHECK (edge_kind = 'requires_accepted_success')",
+          "CHECK (json_valid(data))",
+          "CHECK (upstream_task_id <> downstream_task_id)"
+        ],
+        "job_task_results": [
+          "CHECK (json_valid(data))"
+        ],
+        "job_tasks": [
+          "CHECK (state IN ( 'pending','ready','running','blocked','review','succeeded','failed', 'cancelled','skipped','superseded' ))",
+          "CHECK (role IN ( 'planner','worker','reviewer','finalizer','internal' ))",
+          "CHECK (task_kind IN ('model','internal_capability'))",
+          "CHECK (task_revision > 0)",
+          "CHECK (json_valid(data))",
+          "CHECK (supersedes_task_id IS NULL OR supersedes_task_id <> task_id)",
+          "CHECK (superseded_by_task_id IS NULL OR superseded_by_task_id <> task_id)"
+        ],
         "mcp_server_bindings": [
           "CHECK (json_valid(data))"
         ],
@@ -1128,43 +2070,6 @@
           ],
           [
             "checksum",
-            "TEXT",
-            1,
-            null,
-            0
-          ]
-        ],
-        "autonomous_followups": [
-          [
-            "agent_id",
-            "TEXT",
-            1,
-            null,
-            1
-          ],
-          [
-            "followup_id",
-            "TEXT",
-            1,
-            null,
-            2
-          ],
-          [
-            "job_id",
-            "TEXT",
-            1,
-            null,
-            0
-          ],
-          [
-            "event_id",
-            "TEXT",
-            1,
-            null,
-            0
-          ],
-          [
-            "data",
             "TEXT",
             1,
             null,
@@ -1315,6 +2220,408 @@
             0
           ],
           [
+            "job_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "task_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "task_attempt_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "fencing_epoch",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "task_spec_digest",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_attempt_budget_reservations": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "attempt_id",
+            "TEXT",
+            1,
+            null,
+            4
+          ],
+          [
+            "dimension",
+            "TEXT",
+            1,
+            null,
+            5
+          ],
+          [
+            "reserved",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "settled",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "updated_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_budget_ledger": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "dimension",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "ceiling",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "settled",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "reserved",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "control_reserved",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "updated_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_graph_events": [
+          [
+            "event_id",
+            "INTEGER",
+            0,
+            null,
+            1
+          ],
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "task_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "attempt_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_graph_mutations": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "mutation_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "actor_kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "actor_key",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "creator_task_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "creator_attempt_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "idempotency_key",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "payload_digest",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "expected_revision",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "committed_revision",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "decision",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_graphs": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "revision",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "task_count",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "edge_count",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "mutation_count",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "active_attempt_count",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "next_ready_at_us",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "finalization_attempt_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "finalization_started_revision",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "updated_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
             "data",
             "TEXT",
             1,
@@ -1336,6 +2643,743 @@
             1,
             null,
             2
+          ],
+          [
+            "conversation_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "origin_run_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "origin_call_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "state",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "desired_state",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "updated_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "deadline_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "terminal_at_us",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "finalizer_task_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_task_attempts": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "attempt_id",
+            "TEXT",
+            1,
+            null,
+            4
+          ],
+          [
+            "ordinal",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "fencing_epoch",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "state",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "claim_token",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "run_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "lease_expires_at_us",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "absolute_deadline_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "started_at_us",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "heartbeat_at_us",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "ended_at_us",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "active_slot",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_task_budget_ledger": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "dimension",
+            "TEXT",
+            1,
+            null,
+            4
+          ],
+          [
+            "ceiling",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "settled",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "reserved",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "updated_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_task_checkpoints": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "attempt_id",
+            "TEXT",
+            1,
+            null,
+            4
+          ],
+          [
+            "checkpoint_id",
+            "TEXT",
+            1,
+            null,
+            5
+          ],
+          [
+            "ordinal",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "payload_digest",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_task_comments": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "comment_id",
+            "TEXT",
+            1,
+            null,
+            4
+          ],
+          [
+            "author_kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "author_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "sensitivity",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "body_digest",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_task_controls": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "control_id",
+            "TEXT",
+            1,
+            null,
+            4
+          ],
+          [
+            "kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "state",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "requesting_attempt_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "resolved_at_us",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "resolved_by_kind",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "resolved_by_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "payload_digest",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_task_dependencies": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "upstream_task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "downstream_task_id",
+            "TEXT",
+            1,
+            null,
+            4
+          ],
+          [
+            "edge_kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_task_results": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "result_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "attempt_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "completed_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "sensitivity",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "result_digest",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "job_tasks": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "job_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "task_id",
+            "TEXT",
+            1,
+            null,
+            3
+          ],
+          [
+            "state",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "role",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "task_kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "priority",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "not_before_us",
+            "INTEGER",
+            0,
+            null,
+            0
+          ],
+          [
+            "current_attempt_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "task_revision",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "task_spec_digest",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "task_scope_digest",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "supersedes_task_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "superseded_by_task_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "latest_result_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "latest_control_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "latest_checkpoint_id",
+            "TEXT",
+            0,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "updated_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "terminal_at_us",
+            "INTEGER",
+            0,
+            null,
+            0
           ],
           [
             "data",
@@ -1756,16 +3800,6 @@
             "migration_id"
           ]
         ],
-        "autonomous_followups": [
-          [
-            "agent_id",
-            "event_id"
-          ],
-          [
-            "agent_id",
-            "job_id"
-          ]
-        ],
         "deliveries": [
           [
             "agent_id",
@@ -1789,6 +3823,61 @@
             "call_id"
           ]
         ],
+        "job_graph_mutations": [
+          [
+            "agent_id",
+            "job_id",
+            "actor_key",
+            "idempotency_key"
+          ]
+        ],
+        "job_runs": [
+          [
+            "agent_id",
+            "origin_run_id",
+            "origin_call_id"
+          ]
+        ],
+        "job_task_attempts": [
+          [
+            "agent_id",
+            "job_id",
+            "task_id",
+            "active_slot"
+          ],
+          [
+            "agent_id",
+            "job_id",
+            "task_id",
+            "fencing_epoch"
+          ],
+          [
+            "agent_id",
+            "job_id",
+            "task_id",
+            "ordinal"
+          ],
+          [
+            "agent_id",
+            "run_id"
+          ]
+        ],
+        "job_task_checkpoints": [
+          [
+            "agent_id",
+            "job_id",
+            "task_id",
+            "attempt_id",
+            "ordinal"
+          ]
+        ],
+        "job_task_results": [
+          [
+            "agent_id",
+            "job_id",
+            "result_id"
+          ]
+        ],
         "routine_occurrences": [
           [
             "agent_id",
@@ -1804,8 +3893,8 @@
       }
     }
   },
-  "contract_sha256": "54ebf7f6fbf3498a3912691d3cc639452d0f459cd7c576df1c290893dd5ad954",
-  "home_revision": 1,
+  "contract_sha256": "950510639b534b3a58c74369c7ad3b1e2b66c9dcc67a44204a770720f99a3660",
+  "home_revision": 2,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1
 }

@@ -20,22 +20,15 @@ Use this order of authority when repository material disagrees:
 Preserve unrelated working-tree changes. Historical code and documents can
 explain intent, but they do not define current behavior.
 
-## Architecture status: current revision 1 and ratified target
+## Architecture status: current revision 2
 
 The production code, current schema, tests and all ordinary statements in this file
-describe **current agent-home revision 1** unless a paragraph is explicitly labeled
-as the ratified target. Revision 1 remains the only runnable/current home format and
-the existing single-job behavior remains authoritative until the atomic revision-2
-cutover. Do not infer that a target type, table, tool or concurrency behavior exists
-before its implementation phase and cutover gate.
+describe **current agent-home revision 2**. Revision 2 is the sole runnable/current
+format. Revision-1 records and decoders exist only inside the immutable revision-2
+migration and its fixtures; they are not runtime compatibility paths. There is no
+feature flag, fallback or dual-runtime interval selecting legacy or draft execution.
 
-The revision-2 target rules below are normative for graph implementation. They do
-not imply that target behavior is currently implemented. In particular, do not
-create or register revision 2, change current job behavior, compose a graph runtime,
-delete legacy code, or add a feature flag/fallback selecting a draft graph path
-before the atomic cutover prerequisites are satisfied.
-
-The ratified revision-2 target has these non-negotiable boundaries:
+The current revision-2 graph has these non-negotiable boundaries:
 
 - the adaptive task graph is owned inside `jobs`; `JobOwner` owns commands and one
   graph-aware `JobSupervisor` owns graph-local selection, claims and recovery;
@@ -63,7 +56,7 @@ The ratified revision-2 target has these non-negotiable boundaries:
   single-job, connected-executor and autonomous-follow-up paths are deleted at the
   specified gates rather than retained as a selectable compatibility engine.
 
-## Current production architecture (revision 1)
+## Current production architecture (revision 2)
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
 explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL,
@@ -250,10 +243,12 @@ are foreground-authorized content; job-event instructions are code-owned.
 Untrusted payloads and model text cannot enlarge the scope. `contract_bindings`
 retains exact capability, MCP-origin, resource-structure and model-configuration
 digests. The composition supplies one bound current-contract reader to routine
-admission, runtime checks and code-owned follow-up construction; it cannot execute
-work. Revalidation compares retained references, never accepts replacement current
-contracts implicitly. Local hints and refresh timestamps are presentation/freshness
-facts, not execution authority.
+admission, runtime checks and code-owned graph-task construction; it cannot execute
+work. Every current scope states `JOB_EVENT`, `SCHEDULED_ROUTINE` or `GRAPH_TASK`;
+only the revision-1 migration decoder may infer an omitted legacy kind. Revalidation
+compares retained references, never accepts replacement current contracts implicitly.
+Local hints and refresh timestamps are presentation/freshness facts, not execution
+authority.
 
 ## Capabilities and execution
 
@@ -471,21 +466,20 @@ completion cannot execute or enter an unattended proposal. No task polling, cust
 remote receipts, status/idempotency extension, per-server action adapter or replay
 exists. Current MCP output/capability identities are `mcp.tool.result` / `mcp.tool`.
 
-## Durable jobs and follow-ups
+## Durable graph jobs
 
-`JobRun` is the single durable job aggregate. It embeds the frozen job
-specification, attempts, claims, fencing, cancellation intent, receipts,
-external observations, validated results and artifact references, and terminal
-observation state. `JobOwner` implements admission and bounded lifecycle
-operations. `JobSupervisor` claims independent jobs within global, per-agent,
-and per-source limits, fences stale claims, and resumes safe progress when the
-agent reopens.
+`GraphJob`, `JobGraph`, normalized tasks, dependencies, attempts, accepted results,
+controls, mutations, bounded events and budget ledgers are the sole current durable
+job records. `JobOwner` owns admission and bounded lifecycle commands. One
+graph-aware `JobSupervisor` owns graph-local selection, claims, fencing, recovery,
+fairness and finalization; all capability work still executes through the one
+`CapabilityRuntime`, and every model task uses the one `AgentLoop` implementation.
 
-`start_data_profile` is the only model-facing job starter. It freezes the exact
-non-secret read-only specification, execution capability ID, and immutable
-registry contract digest before persistence. The internal `data_profile`
-capability executes through `CapabilityRuntime` and produces a bounded result
-and verified artifact.
+`start_data_profile` admits the static effect-free profile graph. `start_graph_job`
+admits one code-resolved graph-eligible initial task and internal finalizer when a
+model route and finite cost ceiling are configured. Planner-created work is a
+validated immutable-authority subset. Unmappable migrated work is
+`needs_attention`; no legacy executor can run it.
 
 Agent identity is the job authorization boundary. The originating
 conversation and run are immutable provenance, not access gates. Bounded list,
@@ -493,15 +487,11 @@ inspect, result-read, and cancellation operations can address any job owned by
 the agent. Cross-agent lookup fails without exposing metadata. Work pauses
 when no `EmbeddedAgent` host is open.
 
-Daita execution is the only connected job mode. External-executor behavior has
-deterministic offline conformance coverage, but no real external profile ships
-and no external service is selected or used as a fallback.
-
-Terminal Daita profile jobs can produce one bounded code-authored follow-up.
-The follow-up has a frozen execution scope, exact budgets, one-success limit,
-and the originating conversation inbox as its only distribution target. It
-uses the ordinary loop and runtime and cannot start or cancel jobs, mutate
-data, expand scope, or create another continuation.
+There is no current connected-executor mode, embedded single-job attempt/result
+state, autonomous-follow-up driver or selectable legacy supervisor. Finalizers
+authenticate accepted task results and publish through the existing delivery
+boundary. Revision-1 terminal follow-up/delivery provenance is preserved only by
+migration-owned conversion.
 
 ## Scheduled routines and deliveries
 
@@ -589,7 +579,7 @@ database, persisted records, model configuration, memory, user profile, skills,
 artifacts, and other durable files that must change together. It is independent
 of the package version and Git tag.
 
-Production home revision 1 is frozen. The registry is ordered and append-only;
+Production home revisions 1 and 2 are frozen. The registry is ordered and append-only;
 released migration IDs, checksums, implementations, target schemas, historical
 decoders, and golden fixtures never change. `CURRENT_HOME_REVISION` derives from
 the last registry entry. A format change appends one owner-local home migration
@@ -648,12 +638,11 @@ authority exists only in `relational_write_scopes`. Connection JSON never
 owns either permission. Reconstruction fails closed, refresh preserves exact
 scopes, and detach revokes both scope families atomically.
 
-In current revision 1, all state mutation must be atomic and cancellation-safe. Do
-not add event sourcing, replay projections, graph/task checkpoints, another state
-abstraction, or a second writer around SQLite. The ratified revision-2 target permits
-only the normalized graph records, bounded task checkpoints/comments and audit event
-cursor defined by its schema contract; those records are not an event-sourced replay
-system and remain behind `SQLiteStateStore`.
+In current revision 2, all state mutation must be atomic and cancellation-safe. Do
+not add event sourcing, replay projections, another state abstraction or a second
+writer around SQLite. Only the normalized graph records, bounded task checkpoints/
+comments and audit event cursor defined by the current schema are permitted; those
+records are not an event-sourced replay system and remain behind `SQLiteStateStore`.
 
 ## Models and providers
 
@@ -672,7 +661,7 @@ prices remain in `profiles.py` and `pricing.py`.
 
 One immutable `ModelCallPolicy` in `AgentConfig` and `ModelRequest` governs
 configured and conforming injected providers, both delivery modes, foreground,
-routines, follow-ups, validation and candidate review. Defaults are 180 seconds
+routines, graph tasks, validation and candidate review. Defaults are 180 seconds
 per logical request, 120 per attempt, 60 to first substantive progress, 30 idle,
 15 counting, 5 connect, 120 read, 30 write, 5 pool and 5 cleanup. Every logical
 request intersects its caller/run deadline before setup; retries retain that
@@ -770,14 +759,11 @@ Do not add provider branches to `AgentLoop`.
 
 ## Architectural constraints
 
-Current revision 1 has one `AgentLoop`, one `CapabilityRuntime`, one capability
-registry, one catalog, one artifact store, one jobs supervisor, one routines
-supervisor, one SQLite state boundary, and one writer per agent home. Until the
-atomic cutover, do not make draft graph code reachable from production composition
-or change current job semantics.
-
-The ratified target replaces the current jobs implementation with a graph coordinator
-inside `jobs`; it does not add a second execution runtime. Do not add a second
+Current revision 2 has one `AgentLoop`, one `CapabilityRuntime`, one capability
+registry, one catalog, one artifact store, one graph-aware jobs supervisor, one
+routines supervisor, one SQLite state boundary, and one writer per agent home. The
+graph coordinator is inside `jobs`; it does not add a second execution runtime. Do
+not add a second
 AgentLoop implementation, capability runtime, state store, transcript path, jobs
 supervisor, agent-home writer, generic workflow engine, graph engine outside `jobs`,
 dynamic executor/plugin registry, event bus, completion router, parallel recovery

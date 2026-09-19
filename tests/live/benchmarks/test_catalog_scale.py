@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import JobStatus
+from daita import GraphState
 from tests.support.job_benchmarks import (
     DEFAULT_MODEL_ID,
     IMMEDIATE_AMOUNT,
@@ -96,13 +96,13 @@ async def test_profile_target_survives_catalog_distractors(
         assert_on_demand_invocation(capture, "start_data_profile")
         job_id = job_id_from_start(capture.transcript)
         terminal = await wait_for_terminal(fixture.agent, job_id)
-        assert terminal.summary.status is JobStatus.SUCCEEDED
-        assert terminal.summary.resource_ids == (
+        assert terminal.job.state is GraphState.SUCCEEDED
+        assert terminal.job.specification.authority.resource_ids == (
             fixture.resource_ids[TARGET_PROFILE_TABLE],
         )
         result = await fixture.agent.read_job_result(job_id)
         assert result is not None
-        assert result.summary["sampled_rows"] == PROFILE_SAMPLE_ROWS
+        assert result.payload["sampled_rows"] == PROFILE_SAMPLE_ROWS
         await assert_profile_result(fixture.agent, job_id)
     finally:
         await fixture.close()

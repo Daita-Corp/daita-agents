@@ -1,19 +1,21 @@
-"""Authorized live-model smoke test for the unreleased Phase 4 task path."""
+"""Cost-bounded live smoke through the revision-2 public composition."""
 
 from __future__ import annotations
 
+import asyncio
 import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pytest
 
-from daita import create_llm_provider
-from daita.context import AgentContextBuilder
-from daita.jobs.graph.models import AttemptState, GraphState, TaskRole
+from daita import Agent, GraphState, LoopLimits, create_llm_provider
+from daita.domains.data import DATA_QUERY_EVIDENCE_KIND
+from daita.jobs.graph.models import AttemptState, TaskExecutionKind, TaskRole
 from daita.llm.profiles import reviewed_model_profile
-from tests.support.conversations import CatalogSpy
-from tests.support.model_graph_integration import ModelGraphIntegration
+from daita.loop.models import LoopExitKind
+from tests.support.job_benchmarks import create_probe_home
+from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_GRAPH_TASK"
 _MODEL_ID = "DAITA_GRAPH_TASK_LIVE_MODEL_ID"
@@ -30,7 +32,7 @@ pytestmark = [
         os.environ.get(_AUTHORIZATION) != "1",
         reason=(
             f"set {_AUTHORIZATION}=1 only after explicitly authorizing one bounded "
-            "live graph-model-task run"
+            "live production graph smoke"
         ),
     ),
 ]
@@ -47,7 +49,24 @@ def _cost_limit() -> Decimal:
     return value
 
 
-async def test_live_model_completes_exact_graph_task_with_lifecycle_terminator(
+async def _wait_terminal(agent: Agent, job_id: str) -> None:
+    deadline = asyncio.get_running_loop().time() + 120
+    while asyncio.get_running_loop().time() < deadline:
+        inspection = await agent.inspect_job(job_id)
+        assert inspection is not None
+        if inspection.job.state in {
+            GraphState.SUCCEEDED,
+            GraphState.FAILED,
+            GraphState.CANCELLED,
+            GraphState.NEEDS_ATTENTION,
+        }:
+            assert inspection.job.state is GraphState.SUCCEEDED
+            return
+        await asyncio.sleep(0.1)
+    raise AssertionError("live production graph did not reach a terminal state")
+
+
+async def test_live_model_task_uses_public_revision_2_composition(
     tmp_path: Path,
 ) -> None:
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
@@ -59,38 +78,65 @@ async def test_live_model_completes_exact_graph_task_with_lifecycle_terminator(
         pytest.fail(f"{_MODEL_ID} must name a reviewed tool-capable model")
     api_key = os.environ.get(_MODEL_KEY)
     if api_key is None or not api_key.strip():
-        pytest.fail(f"{_MODEL_KEY} must be set for the authorized live test")
+        pytest.skip(f"{_MODEL_KEY} is unavailable for the authorized live smoke")
     provider = create_llm_provider(
         model_id,
         api_key=api_key,
         max_output_tokens=min(profile.max_output_tokens, 2_048),
     )
-    integration = await ModelGraphIntegration.open(tmp_path)
-    loop = integration.supervisor._graph_model_loop
-    assert loop is not None
-    loop._model = provider
-    loop._context_builder = AgentContextBuilder(
-        CatalogSpy(),
-        profile=profile,
+    home = await create_probe_home(
+        tmp_path,
+        "live-production-graph",
+        distractor_tables=3,
+    )
+    resources = tuple(sorted(home.resource_ids.items()))
+    resource_ids = tuple(resource_id for _name, resource_id in resources)
+    sql = "SELECT " + ", ".join(
+        f"(SELECT COUNT(*) FROM {name}) AS count_{index}"
+        for index, (name, _resource_id) in enumerate(resources)
+    )
+    agent = await Agent.open(
+        home.name,
+        root=home.root,
+        model=provider,
+        model_profile=profile,
+        limits=LoopLimits(
+            max_steps=8,
+            max_total_tokens=40_000,
+            max_estimated_cost_usd=_cost_limit(),
+        ),
+        workspace=workspace_for(home.root),
     )
     try:
-        admission = integration.build(
-            model_route_id=provider.provider_id,
-            per_run_max_cost_usd=_cost_limit(),
+        status = await Agent.inspect_home(home.name, root=home.root)
+        assert status.found_revision == status.current_revision == 2
+        foreground = await agent.run(
+            "Start exactly one durable graph. Load start_graph_job, then call it "
+            "with objective 'Run the exact admitted relational read', outcome_contract "
+            f"{{'required_result_kind':'{DATA_QUERY_EVIDENCE_KIND}'}}, deadline_seconds "
+            "300, and initial_task containing capability_id 'data.query', arguments "
+            f"source_id={home.source_id!r}, resource_ids={resource_ids!r}, "
+            f"sql={sql!r}, parameters=(). Use expected_result_contract "
+            f"{{'result_kind':'{DATA_QUERY_EVIDENCE_KIND}'}} and retained_references "
+            f"source_ids=({home.source_id!r},), resource_ids={resource_ids!r}, "
+            "connector_binding_ids=(). After the durable receipt, stop.",
+            source_scope_ids=(home.source_id,),
         )
-        await integration.admit_and_start(admission)
-        terminal = await integration.wait_terminal(admission.job.job_id, timeout=120)
-        assert terminal.job.state is GraphState.SUCCEEDED
-        worker = next(task for task in terminal.tasks if task.role is TaskRole.WORKER)
+        assert foreground.kind is LoopExitKind.COMPLETED
+        jobs = await agent.list_jobs()
+        assert len(jobs) == 1
+        await _wait_terminal(agent, jobs[0].job_id)
+        inspection = await agent.inspect_job(jobs[0].job_id)
+        result = await agent.read_job_result(jobs[0].job_id)
+        assert inspection is not None
+        worker = next(task for task in inspection.tasks if task.role is TaskRole.WORKER)
         attempt = next(
-            item for item in terminal.attempts if item.task_id == worker.task_id
+            item for item in inspection.attempts if item.task_id == worker.task_id
         )
+        assert worker.execution_kind is TaskExecutionKind.MODEL
         assert attempt.state is AttemptState.SUCCEEDED
-        exit = await integration.store.result(attempt.run_id)
-        assert exit is not None
-        assert exit.kind.value == "machine_terminated"
-        assert exit.reason == "task_completed"
-        assert len(integration.reader.calls) == 1
+        assert result is not None and result.result_kind == "graph.result_finalized"
+        assert len(inspection.delivery_ids) == 1
     finally:
-        await integration.close()
+        await agent.close()
         await provider.close()

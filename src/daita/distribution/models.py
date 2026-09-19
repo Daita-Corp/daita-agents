@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 from typing import TypeAlias
 
-from .._json import canonical_json
+from .._json import FrozenJsonObject, canonical_json
 from ..artifacts.models import (
     ArtifactAuthorship,
     ArtifactRef,
@@ -671,7 +671,6 @@ class OutcomeReference:
 
 
 class DeliverySubjectKind(str, Enum):
-    AUTONOMOUS_FOLLOWUP = "autonomous_followup"
     ROUTINE_OCCURRENCE = "routine_occurrence"
 
 
@@ -704,7 +703,7 @@ def logical_delivery_key(
 
 
 def graph_job_delivery_key(*, job_id: str, outcome_digest: str) -> str:
-    """Return the draft graph-job logical key without changing revision-1 enums."""
+    """Return the current graph-job logical key."""
 
     _text(job_id, "graph-job delivery job_id")
     _digest(outcome_digest, "graph-job delivery outcome digest")
@@ -754,11 +753,6 @@ class Delivery:
             raise ValueError("delivery logical key does not match its identities")
         if not isinstance(self.outcome, OutcomeReference):
             raise TypeError("delivery outcome is invalid")
-        if (
-            self.subject_kind is DeliverySubjectKind.AUTONOMOUS_FOLLOWUP
-            and self.outcome.conclusion_kind is not OutcomeConclusionKind.TERMINAL_RUN
-        ):
-            raise ValueError("autonomous follow-up delivery requires a terminal run")
         if not isinstance(self.visibility_state, DeliveryState):
             raise TypeError("delivery visibility state is invalid")
         _optional_utc(self.acknowledged_at, "delivery acknowledged_at")
@@ -791,11 +785,7 @@ class Delivery:
 
 @dataclass(frozen=True, slots=True)
 class GraphJobDelivery:
-    """Integration-only revision-2 graph-job delivery projection.
-
-    The current revision-1 :class:`Delivery` enum deliberately remains unchanged.
-    This record is encoded only by the unregistered draft graph codec.
-    """
+    """One current graph-job delivery, including immutable migration provenance."""
 
     delivery_id: str
     agent_id: str
@@ -808,6 +798,9 @@ class GraphJobDelivery:
     blocked_reason_code: str | None
     created_at: datetime
     updated_at: datetime
+    migration_provenance: FrozenJsonObject = field(
+        default_factory=lambda: FrozenJsonObject.from_mapping({})
+    )
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -823,17 +816,33 @@ class GraphJobDelivery:
             raise ValueError("graph delivery target conversation differs")
         if not isinstance(self.outcome, OutcomeReference):
             raise TypeError("graph delivery outcome is invalid")
-        expected_key = graph_job_delivery_key(
-            job_id=self.job_id,
-            outcome_digest=self.outcome.conclusion_digest,
+        if not isinstance(self.migration_provenance, FrozenJsonObject):
+            object.__setattr__(
+                self,
+                "migration_provenance",
+                FrozenJsonObject.from_mapping(self.migration_provenance),
+            )
+        expected_key = (
+            f"graph_job/{self.job_id}"
+            if self.migration_provenance
+            else graph_job_delivery_key(
+                job_id=self.job_id,
+                outcome_digest=self.outcome.conclusion_digest,
+            )
         )
         if self.logical_key != expected_key:
             raise ValueError("graph delivery logical key is invalid")
-        if self.outcome.conclusion_state is not OutcomeState.SUCCEEDED:
+        if (
+            not self.migration_provenance
+            and self.outcome.conclusion_state is not OutcomeState.SUCCEEDED
+        ):
             raise ValueError("graph job delivery requires a successful outcome")
         if not isinstance(self.visibility_state, DeliveryState):
             raise TypeError("graph delivery visibility state is invalid")
-        if self.visibility_state is DeliveryState.ACKNOWLEDGED:
+        if (
+            not self.migration_provenance
+            and self.visibility_state is DeliveryState.ACKNOWLEDGED
+        ):
             raise ValueError("new graph delivery cannot start acknowledged")
         if self.visibility_state is DeliveryState.BLOCKED:
             if (

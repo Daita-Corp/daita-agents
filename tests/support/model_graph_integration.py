@@ -184,9 +184,7 @@ class ModelGraphIntegration:
     ) -> ModelGraphIntegration:
         resolved_clock = clock or (lambda: datetime.now(UTC))
         ids = DeterministicIds(namespace)
-        store = await SQLiteStateStore.open_draft_graph(
-            root / "state.sqlite", initialize=True, clock=resolved_clock
-        )
+        store = await SQLiteStateStore.open(root / "state.sqlite", clock=resolved_clock)
         artifacts = await AgentHomeArtifactStore.open(
             agent_id=AGENT_ID,
             agent_home=root,
@@ -289,7 +287,6 @@ class ModelGraphIntegration:
             store=store,
             owner=owner,
             runtime=runtime,
-            revalidate_external=_unused_external_revalidation,
             artifacts=artifacts,
             clock=resolved_clock,
             id_factory=ids,
@@ -387,8 +384,8 @@ class ModelGraphIntegration:
         )
 
     async def admit_and_start(self, admission: GraphAdmission) -> None:
-        await self.owner.admit_static_graph(admission)
-        await self.supervisor.start_graph_integration()
+        await self.owner.admit(admission)
+        await self.supervisor.start()
 
     async def wait_terminal(
         self, job_id: str, *, timeout: float = 5.0
@@ -406,7 +403,7 @@ class ModelGraphIntegration:
             }:
                 return inspection
             await asyncio.sleep(0.005)
-        driver = self.supervisor._graph_driver
+        driver = self.supervisor._driver
         error = None if driver is None or not driver.done() else driver.exception()
         raise AssertionError(
             f"graph did not terminate: {inspection!r}; driver={error!r}"

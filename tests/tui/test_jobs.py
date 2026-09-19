@@ -15,10 +15,10 @@ from tests.tui._support import (
     DeliveryState,
     DeliverySubjectKind,
     FrozenJsonObject,
+    GraphState,
     InboxScreen,
     InboxView,
     JobsScreen,
-    JobStatus,
     ModelSensitivity,
     ObserverEvent,
     OptionList,
@@ -131,7 +131,7 @@ async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
         detail = str(manager.query_one("#inbox-detail", Static).content)
         assert "Ready?[31m @everyone" in detail
         assert "\x1b" not in detail
-        assert "Result run: run-followup" in detail
+        assert "Result run: run-routine" in detail
         assert manager.query_one("#inbox-acknowledge", Button).disabled is False
 
         assert await pilot.click("#inbox-acknowledge") is True
@@ -197,7 +197,7 @@ async def test_background_status_notifies_once_and_remains_outside_transcript(
     )
     app.controller.agent = opened
     running = _tui_job_summary(
-        "job-running-status", JobStatus.RUNNING, result_available=False
+        "job-running-status", GraphState.ACTIVE, result_available=False
     )
     current_inbox: list[InboxView] = []
     notifications: list[tuple[str, str | None]] = []
@@ -334,10 +334,10 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
 async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     running = _tui_job_summary(
-        "job-running-0123456789", JobStatus.RUNNING, result_available=False
+        "job-running-0123456789", GraphState.ACTIVE, result_available=False
     )
     succeeded = _tui_job_summary(
-        "job-succeeded-0123456789", JobStatus.SUCCEEDED, result_available=True
+        "job-succeeded-0123456789", GraphState.SUCCEEDED, result_available=True
     )
     jobs = [running, succeeded]
     list_calls = 0
@@ -365,12 +365,14 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
         return SimpleNamespace(
             job_id=job_id,
             result_id="result-profile",
-            summary=FrozenJsonObject.from_mapping({"profiled_resources": 1}),
+            result_kind="data_profile.finalized",
+            summary="Profiled one resource.",
+            payload=FrozenJsonObject.from_mapping({"profiled_resources": 1}),
             sensitivity=SimpleNamespace(value="internal"),
             provenance=FrozenJsonObject.from_mapping(
                 {"authority": "job_owner_agent_scope"}
             ),
-            artifact_refs=(),
+            artifact_ids=(),
             completed_at=observed,
         )
 
@@ -379,10 +381,10 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
         if job_id != running.job_id:
             return None
         cancelled = _tui_job_summary(
-            running.job_id, JobStatus.CANCEL_REQUESTED, result_available=False
+            running.job_id, GraphState.CANCEL_REQUESTED, result_available=False
         )
         jobs[0] = cancelled
-        return _tui_job_inspection(cancelled)
+        return cancelled
 
     monkeypatch.setattr(app.controller, "list_jobs", list_jobs)
     monkeypatch.setattr(app.controller, "inspect_job", inspect_job)
@@ -405,13 +407,13 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
         assert listing.has_focus is True
         first_prompt = listing.get_option_at_index(0).prompt
         assert isinstance(first_prompt, Text)
-        assert "RUNNING" in first_prompt.plain
+        assert "ACTIVE" in first_prompt.plain
         assert manager.query_one("#jobs-cancel", Button).disabled is False
         assert manager.query_one("#jobs-results", Button).disabled is True
 
         assert await pilot.click("#jobs-details") is True
         await pilot.pause()
-        assert "Lifecycle" in str(manager.query_one("#jobs-detail", Static).content)
+        assert "Graph" in str(manager.query_one("#jobs-detail", Static).content)
 
         assert await pilot.click("#jobs-cancel") is True
         for _ in range(20):

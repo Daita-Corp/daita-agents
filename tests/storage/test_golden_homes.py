@@ -32,6 +32,10 @@ def _materialize_fixture(fixture: Path, home: Path) -> None:
         if source.name == "state.sql":
             with sqlite3.connect(home / "state.db") as connection:
                 connection.executescript(source.read_text(encoding="utf-8"))
+                if fixture.name == "revision-2":
+                    assert connection.execute(
+                        "PRAGMA journal_mode = WAL"
+                    ).fetchone() == ("wal",)
         elif source.is_dir():
             shutil.copytree(source, home / source.name)
         else:
@@ -44,7 +48,7 @@ def test_every_production_home_revision_has_one_golden_fixture() -> None:
     }
 
 
-async def test_revision_1_golden_whole_home_opens_without_rewrite(
+async def test_revision_1_golden_whole_home_upgrades_once_and_preserves_content(
     tmp_path: Path,
 ) -> None:
     fixture = FIXTURES / "revision-1"
@@ -53,10 +57,10 @@ async def test_revision_1_golden_whole_home_opens_without_rewrite(
     before = _sha256(home / "state.db")
 
     status = await Agent.inspect_home("golden", root=tmp_path)
-    assert status.current_revision == 1
+    assert status.current_revision == 2
     assert status.found_revision == 1
     assert status.minimum_supported_revision == 1
-    assert not status.upgrade_required
+    assert status.upgrade_required
     assert not status.recovery_required
 
     agent = await Agent.open(
@@ -77,7 +81,17 @@ async def test_revision_1_golden_whole_home_opens_without_rewrite(
     finally:
         await agent.close()
 
-    assert _sha256(home / "state.db") == before
+    assert _sha256(home / "state.db") != before
+    assert len(tuple((home / ".home-rollbacks").iterdir())) == 1
+    upgraded = _sha256(home / "state.db")
+    reopened = await Agent.open(
+        "golden",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
+    await reopened.close()
+    assert _sha256(home / "state.db") == upgraded
+    assert len(tuple((home / ".home-rollbacks").iterdir())) == 1
 
 
 @pytest.mark.parametrize(

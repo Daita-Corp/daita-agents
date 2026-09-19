@@ -4,8 +4,10 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
@@ -32,7 +34,13 @@ from daita.storage.home_migrations import (
     registry as migration_registry,
 )
 from daita.storage.home_migrations.revision_0001 import REVISION_1
-from daita.storage.sqlite import SQLiteStateStore, validate_current_state_database
+from daita.storage.home_migrations.revision_0001_schema import (
+    REVISION_1_DATABASE_SQL,
+    SCHEMA_REVISION_1,
+)
+from daita.storage.home_migrations.revision_0002 import REVISION_2
+from daita.storage.schema_contract import require_healthy, require_schema
+from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.paths import REPO_ROOT
 from tests.support.workspace import workspace_for
@@ -64,18 +72,30 @@ def _validate_synthetic_home(
 ) -> None:
     state_home = candidate_home if "state.db" in affected_paths else source_home
     memory_home = candidate_home if "MEMORY.md" in affected_paths else source_home
-    assert validate_current_state_database(state_home / "state.db") is not None
+    with sqlite3.connect(state_home / "state.db") as connection:
+        require_schema(connection, CURRENT_SCHEMA)
+        require_healthy(connection)
+        assert sqlite_store._validate_current_records(connection) is not None
+        assert tuple(
+            connection.execute(
+                "SELECT revision, migration_id, checksum "
+                "FROM agent_home_migrations ORDER BY revision"
+            )
+        ) == tuple(
+            (item.revision, item.migration_id, item.checksum)
+            for item in migration_registry.HOME_MIGRATIONS
+        )
     assert (
         (memory_home / "MEMORY.md")
         .read_text(encoding="utf-8")
-        .endswith("revision two\n")
+        .endswith("revision three\n")
     )
 
 
 def _synthetic_next_apply(staged_home: Path, source_shape: str | None) -> None:
     assert source_shape is None
     with (staged_home / "MEMORY.md").open("a", encoding="utf-8") as file:
-        file.write("revision two\n")
+        file.write("revision three\n")
 
 
 def _synthetic_failure(staged_home: Path, source_shape: str | None) -> None:
@@ -85,8 +105,8 @@ def _synthetic_failure(staged_home: Path, source_shape: str | None) -> None:
 
 def _synthetic_next_migration(*, apply=_synthetic_next_apply) -> HomeMigration:
     return HomeMigration(
-        revision=2,
-        migration_id="test_only_agent_home_revision_2",
+        revision=3,
+        migration_id="test_only_agent_home_revision_3",
         definition="test-only whole-home revision",
         affected_paths=("state.db", "MEMORY.md"),
         target_schema=CURRENT_SCHEMA,
@@ -99,13 +119,13 @@ def _patch_next_migration(
     monkeypatch: pytest.MonkeyPatch,
     migration: HomeMigration,
 ) -> None:
-    migrations = (REVISION_1, migration)
+    migrations = (REVISION_1, REVISION_2, migration)
     monkeypatch.setattr(migration_registry, "HOME_MIGRATIONS", migrations)
-    monkeypatch.setattr(migration_registry, "CURRENT_HOME_REVISION", 2)
+    monkeypatch.setattr(migration_registry, "CURRENT_HOME_REVISION", 3)
     monkeypatch.setattr(coordinator, "HOME_MIGRATIONS", migrations)
-    monkeypatch.setattr(coordinator, "CURRENT_HOME_REVISION", 2)
-    monkeypatch.setattr(sqlite_store, "CURRENT_HOME_REVISION", 2)
-    monkeypatch.setattr(SQLiteStateStore, "current_revision", "2")
+    monkeypatch.setattr(coordinator, "CURRENT_HOME_REVISION", 3)
+    monkeypatch.setattr(sqlite_store, "CURRENT_HOME_REVISION", 3)
+    monkeypatch.setattr(SQLiteStateStore, "current_revision", "3")
 
 
 async def _create_rich_home(tmp_path: Path, name: str = "atlas") -> tuple[Path, str]:
@@ -197,6 +217,39 @@ def _durable_snapshot(home: Path) -> dict[str, object]:
 
 
 def _make_preproduction_home(home: Path, shape: str) -> None:
+    current_path = home / "state.db"
+    revision_1_path = home / ".revision-1-source.db"
+    with (
+        sqlite3.connect(current_path) as source,
+        sqlite3.connect(revision_1_path) as target,
+    ):
+        target.executescript(REVISION_1_DATABASE_SQL)
+        source_tables = {
+            str(row[0])
+            for row in source.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+            )
+        }
+        for table, definitions in SCHEMA_REVISION_1.tables.items():
+            if table not in source_tables or table == "agent_home_migrations":
+                continue
+            columns = tuple(str(column[0]) for column in definitions)
+            projection = ", ".join(f'"{column}"' for column in columns)
+            rows = tuple(source.execute(f'SELECT {projection} FROM "{table}"'))
+            if rows:
+                placeholders = ", ".join("?" for _ in columns)
+                target.executemany(
+                    f'INSERT INTO "{table}" ({projection}) VALUES ({placeholders})',
+                    rows,
+                )
+        target.execute(
+            "INSERT INTO agent_home_migrations VALUES (?, ?, ?)",
+            (REVISION_1.revision, REVISION_1.migration_id, REVISION_1.checksum),
+        )
+    revision_1_path.replace(current_path)
+    current_path.with_name(current_path.name + "-wal").unlink(missing_ok=True)
+    current_path.with_name(current_path.name + "-shm").unlink(missing_ok=True)
     config_path = home / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     route = _model_route(
@@ -307,15 +360,16 @@ async def test_generic_engine_upgrades_database_and_owned_file_together(
         validate_home=_validate_synthetic_home,
     )
 
-    assert result.source_revision == 1
-    assert result.target_revision == 2
+    assert result.source_revision == 2
+    assert result.target_revision == 3
     assert result.upgraded
     assert _journal(home / "state.db") == (
         (1, REVISION_1.migration_id, REVISION_1.checksum),
-        (2, migration.migration_id, migration.checksum),
+        (2, REVISION_2.migration_id, REVISION_2.checksum),
+        (3, migration.migration_id, migration.checksum),
     )
     assert (home / "MEMORY.md").read_text(encoding="utf-8") == (
-        before_memory + "revision two\n"
+        before_memory + "revision three\n"
     )
     assert result.rollback_path is not None
     assert (result.rollback_path / "state.db").is_file()
@@ -398,7 +452,7 @@ async def test_publish_failure_restores_the_complete_source_then_recovers(
     )
     assert result.recovered
     assert result.upgraded
-    assert _journal(home / "state.db")[-1][0] == 2
+    assert _journal(home / "state.db")[-1][0] == 3
 
 
 @pytest.mark.parametrize("phase", ("prepared", "committing", "committed"))
@@ -430,7 +484,7 @@ async def test_upgrade_recovers_after_each_durable_commit_boundary(
 
     assert recovered.recovered
     assert _journal(home / "state.db")[-1] == (
-        2,
+        3,
         migration.migration_id,
         migration.checksum,
     )
@@ -472,7 +526,7 @@ async def test_recovery_finishes_a_partially_published_whole_home(
     )
 
     assert result.recovered
-    assert _journal(home / "state.db")[-1][0] == 2
+    assert _journal(home / "state.db")[-1][0] == 3
     assert not upgrade.exists()
 
 
@@ -491,8 +545,8 @@ async def test_recovery_finishes_a_partially_published_whole_home(
             "unknown",
         ),
         (
-            "UPDATE agent_home_migrations SET revision = 2 WHERE revision = 1",
-            "2",
+            "UPDATE agent_home_migrations SET revision = 3 WHERE revision = 2",
+            "3",
         ),
     ),
 )
@@ -522,7 +576,7 @@ async def test_newer_home_revision_is_a_downgrade_refusal_without_write(
     path = home / "state.db"
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "INSERT INTO agent_home_migrations VALUES (2, 'future_revision', ?)",
+            "INSERT INTO agent_home_migrations VALUES (3, 'future_revision', ?)",
             ("f" * 64,),
         )
     before = _sha256(path)
@@ -531,7 +585,7 @@ async def test_newer_home_revision_is_a_downgrade_refusal_without_write(
         await Agent.open("atlas", root=tmp_path, workspace=workspace_for(tmp_path))
 
     assert raised.value.code is StateCompatibilityCode.NEWER_REVISION
-    assert raised.value.found_revision == "2"
+    assert raised.value.found_revision == "3"
     assert _sha256(path) == before
 
 
@@ -598,8 +652,8 @@ async def test_newer_unfinished_upgrade_is_refused_without_write(
         "operation_id": "a" * 32,
         "phase": "staging",
         "source_kind": "production",
-        "source_revision": 1,
-        "target_revision": 2,
+        "source_revision": 2,
+        "target_revision": 3,
     }
     (upgrade / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
     before = _sha256(home / "state.db")
@@ -667,6 +721,7 @@ async def test_revision_1_bridge_preserves_complete_observed_preproduction_homes
     assert _durable_snapshot(home) == expected
     assert _journal(home / "state.db") == (
         (1, REVISION_1.migration_id, REVISION_1.checksum),
+        (2, REVISION_2.migration_id, REVISION_2.checksum),
     )
     assert not (home / ".home-upgrade").exists()
     assert len(tuple((home / ".home-rollbacks").iterdir())) == 1
@@ -688,8 +743,8 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     assert stderr.getvalue() == ""
     status = json.loads(stdout.getvalue())
     assert status == {
-        "current_revision": 1,
-        "found_revision": 1,
+        "current_revision": 2,
+        "found_revision": 2,
         "minimum_supported_revision": 1,
         "recovery_required": False,
         "source_kind": "production",
@@ -710,7 +765,7 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     assert stdout.getvalue() == ""
     error = json.loads(stderr.getvalue())["error"]
     assert error["code"] == "state_revision_unsupported"
-    assert error["current_revision"] == "1"
+    assert error["current_revision"] == "2"
     assert error["found_revision"] == "unknown"
     assert error["state_changed"] is False
     assert error["state_path"] == str(path)
@@ -777,8 +832,16 @@ def test_runtime_has_one_home_revision_owner_and_no_legacy_version_gates() -> No
         "models.py",
         "registry.py",
         "revision_0001.py",
+        "revision_0001_schema.py",
+        "revision_0002.py",
+        "revision_0002_conversion.py",
+        "revision_0002_legacy_autonomy.py",
+        "revision_0002_legacy_autonomy_codecs.py",
+        "revision_0002_legacy_delivery.py",
+        "revision_0002_legacy_job_codecs.py",
+        "revision_0002_legacy_jobs.py",
     }
-    assert HOME_MIGRATIONS == (REVISION_1,)
+    assert HOME_MIGRATIONS == (REVISION_1, REVISION_2)
     current_code = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (production / "storage/sqlite_codecs").glob("*.py")
@@ -790,3 +853,48 @@ def test_runtime_has_one_home_revision_owner_and_no_legacy_version_gates() -> No
     )
     assert "development_baseline" in historical
     assert 'fields["version"]' in historical
+
+
+def test_revision_2_home_reopens_without_importing_revision_1_job_decoders(
+    tmp_path: Path,
+) -> None:
+    agent = asyncio.run(
+        Agent.create("current-home", root=tmp_path, workspace=workspace_for(tmp_path))
+    )
+    asyncio.run(agent.close())
+    code = """
+import asyncio
+import sys
+from pathlib import Path
+from daita import Agent
+from tests.support.workspace import workspace_for
+
+async def main():
+    root = Path(sys.argv[1])
+    agent = await Agent.open(
+        "current-home", root=root, workspace=workspace_for(root)
+    )
+    await agent.close()
+    forbidden = sorted(
+        name for name in sys.modules
+        if name.endswith("revision_0002_conversion")
+        or ".revision_0002_legacy" in name
+    )
+    if forbidden:
+        raise AssertionError(forbidden)
+
+asyncio.run(main())
+"""
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(REPO_ROOT / "src"), str(REPO_ROOT))
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path)],
+        cwd=REPO_ROOT,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr

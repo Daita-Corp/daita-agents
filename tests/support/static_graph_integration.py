@@ -25,8 +25,8 @@ from daita.domains.data.profile_jobs import (
     DATA_PROFILE_FINALIZE_CAPABILITY_ID,
     DataProfileAdmission,
     DataProfileCapabilityDomain,
-    StartStaticDataProfileGraphExecutor,
-    data_profile_graph_integration_declarations,
+    StartDataProfileGraphExecutor,
+    data_profile_declarations,
 )
 from daita.domains.data.results import project_result_rows
 from daita.domains.data.sql import ResourceSchema
@@ -212,7 +212,7 @@ class StaticGraphIntegration:
     supervisor: JobSupervisor
     admission: DataProfileAdmission
     finalizer_capability: Capability
-    starter: StartStaticDataProfileGraphExecutor
+    starter: StartDataProfileGraphExecutor
     catalog: StaticProfileCatalog
     backend: ObservedReadBackend
     clock: Callable[[], datetime]
@@ -234,9 +234,10 @@ class StaticGraphIntegration:
     ) -> StaticGraphIntegration:
         resolved_clock = clock or (lambda: datetime.now(UTC))
         ids = DeterministicIds(namespace)
-        store = await SQLiteStateStore.open_draft_graph(
+        if not initialize and not (root / "state.sqlite").is_file():
+            raise FileNotFoundError(root / "state.sqlite")
+        store = await SQLiteStateStore.open(
             root / "state.sqlite",
-            initialize=initialize,
             clock=resolved_clock,
         )
         artifacts = await AgentHomeArtifactStore.open(
@@ -255,7 +256,7 @@ class StaticGraphIntegration:
         distribution = DistributionOwner(agent_id=AGENT_ID, store=store)
         catalog = StaticProfileCatalog(resources)
         resolved_backend = backend or ObservedReadBackend(catalog)
-        declarations, admission = data_profile_graph_integration_declarations(
+        declarations, admission = data_profile_declarations(
             agent_id=AGENT_ID,
             catalog=catalog,
             owner=owner,
@@ -297,7 +298,6 @@ class StaticGraphIntegration:
             store=store,
             owner=owner,
             runtime=runtime,
-            revalidate_external=admission.revalidate_external,
             artifacts=artifacts,
             clock=resolved_clock,
             id_factory=ids,
@@ -315,7 +315,7 @@ class StaticGraphIntegration:
         starter = next(
             item
             for item in declarations.executors
-            if isinstance(item, StartStaticDataProfileGraphExecutor)
+            if isinstance(item, StartDataProfileGraphExecutor)
         )
         return cls(
             store=store,
@@ -370,8 +370,8 @@ class StaticGraphIntegration:
         )
 
     async def admit_and_start(self, admission: GraphAdmission) -> None:
-        await self.owner.admit_static_graph(admission)
-        await self.supervisor.start_graph_integration()
+        await self.owner.admit(admission)
+        await self.supervisor.start()
 
     async def start_profile(
         self,
@@ -394,7 +394,7 @@ class StaticGraphIntegration:
         )
         job_id = output.data["job_id"]
         assert isinstance(job_id, str)
-        await self.supervisor.start_graph_integration()
+        await self.supervisor.start()
         return job_id
 
     async def wait_terminal(
@@ -408,7 +408,7 @@ class StaticGraphIntegration:
             if inspection.job.state in {GraphState.SUCCEEDED, GraphState.FAILED}:
                 return inspection
             await asyncio.sleep(0.005)
-        driver = self.supervisor._graph_driver
+        driver = self.supervisor._driver
         error = None if driver is None or not driver.done() else driver.exception()
         raise AssertionError(
             f"graph did not terminate: {inspection!r}; driver={error!r}; "

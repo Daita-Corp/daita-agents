@@ -1,4 +1,4 @@
-"""Pure invariant validation for the jobs-owned draft graph model."""
+"""Pure invariant validation for the jobs-owned current graph model."""
 
 from __future__ import annotations
 

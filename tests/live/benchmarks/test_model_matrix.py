@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import JobStatus
+from daita import GraphState
 from daita._json import canonical_json
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
 from tests.support.job_benchmarks import (
@@ -146,7 +146,7 @@ async def test_model_certification_start_and_cancel(
         job_id = job_id_from_start(started.transcript)
         inspection = await fixture.agent.inspect_job(job_id)
         assert inspection is not None
-        assert inspection.summary.resource_ids == (
+        assert inspection.job.specification.authority.resource_ids == (
             fixture.resource_ids[TARGET_PROFILE_TABLE],
         )
         await asyncio.wait_for(execution_started.wait(), timeout=5)
@@ -164,7 +164,7 @@ async def test_model_certification_start_and_cancel(
         assert len(cancel_results) == 1
         assert job_id in canonical_json(cancel_results[0].output)
         terminal = await wait_for_terminal(fixture.agent, job_id)
-        assert terminal.summary.status is JobStatus.CANCELLED
+        assert terminal.job.state is GraphState.CANCELLED
     finally:
         release.set()
         await fixture.close()

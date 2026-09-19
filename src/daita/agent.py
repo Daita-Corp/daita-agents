@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     from .adapters.mcp import MCPServerBinding
 
 from ._json import FrozenJsonObject
-from .adapters.job_profiles import ConnectedJobProfile
 from .adapters.mcp import (
     MCPAuthentication,
     MCPBindingStatus,
@@ -62,16 +61,12 @@ from .hosting.embedded import (
 from .hosting.home_upgrade import AgentHomeStatus
 from .jobs.graph.models import (
     GraphAdmission,
+    GraphInspection,
     GraphJob,
     GraphMutation,
+    GraphState,
     TaskControl,
-)
-from .jobs.models import (
-    JobExecutionMode,
-    JobInspection,
-    JobResultView,
-    JobStatus,
-    JobSummary,
+    TaskResult,
 )
 from .jobs.owner import GraphBlockerProjection
 from .learning_candidates import (
@@ -175,7 +170,6 @@ class Agent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
-        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         """Create an agent; injected model providers remain caller-owned."""
 
@@ -202,7 +196,6 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
-                connected_job_profiles=connected_job_profiles,
             )
         )
 
@@ -230,7 +223,6 @@ class Agent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
-        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         """Open an agent; injected model providers remain caller-owned."""
 
@@ -257,7 +249,6 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
-                connected_job_profiles=connected_job_profiles,
             )
         )
 
@@ -346,14 +337,12 @@ class Agent:
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
         files_only: bool = False,
-        job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
             message,
             conversation_id=conversation_id,
             source_scope_ids=source_scope_ids,
             files_only=files_only,
-            job_executor_profile_id=job_executor_profile_id,
         )
 
     async def learn(
@@ -429,10 +418,10 @@ class Agent:
     async def list_jobs(
         self,
         *,
-        statuses: frozenset[JobStatus] = frozenset(),
+        states: frozenset[GraphState] = frozenset(),
         limit: int = 50,
-    ) -> tuple[JobSummary, ...]:
-        return await self._embedded.list_jobs(statuses=statuses, limit=limit)
+    ) -> tuple[GraphJob, ...]:
+        return await self._embedded.list_jobs(states=states, limit=limit)
 
     async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
         """Inspect one exact agent-owned external-effect receipt."""
@@ -464,13 +453,13 @@ class Agent:
             evidence_references=evidence_references,
         )
 
-    async def inspect_job(self, job_id: str) -> JobInspection | None:
+    async def inspect_job(self, job_id: str) -> GraphInspection | None:
         return await self._embedded.inspect_job(job_id)
 
-    async def read_job_result(self, job_id: str) -> JobResultView | None:
+    async def read_job_result(self, job_id: str) -> TaskResult | None:
         return await self._embedded.read_job_result(job_id)
 
-    async def cancel_job(self, job_id: str) -> JobInspection | None:
+    async def cancel_job(self, job_id: str) -> GraphJob | None:
         return await self._embedded.cancel_job(job_id)
 
     async def graph_blockers(self, job_id: str) -> GraphBlockerProjection | None:
@@ -1204,11 +1193,10 @@ __all__ = [
     "AgentNotFoundError",
     "HostActiveError",
     "InboxView",
-    "JobExecutionMode",
-    "JobInspection",
-    "JobResultView",
-    "JobStatus",
-    "JobSummary",
+    "GraphInspection",
+    "GraphJob",
+    "GraphState",
+    "TaskResult",
     "PostgreSQLProbeResult",
     "PostgreSQLSourceError",
     "SourceRefreshError",

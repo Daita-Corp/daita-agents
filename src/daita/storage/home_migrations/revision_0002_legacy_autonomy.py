@@ -1,4 +1,4 @@
-"""Define bounded durable-job follow-ups and conversation-inbox values."""
+"""Immutable revision-1 follow-up records used only by migration revision 2."""
 
 from __future__ import annotations
 
@@ -10,14 +10,15 @@ from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 
-from ._json import FrozenJsonObject, canonical_json
-from .capabilities import (
+from ..._json import FrozenJsonObject, canonical_json
+from ...capabilities import (
     AccessMode,
     ExecutionContractBindings,
     ExecutionScope,
+    ExecutionScopeKind,
     OperationalEffect,
 )
-from .distribution.models import (
+from ...distribution.models import (
     CONVERSATION_INBOX_DESTINATION_REVISION,
     ConversationInboxTarget,
     DistributionPlan,
@@ -26,14 +27,14 @@ from .distribution.models import (
     distribution_plan_digest,
     target_fingerprint,
 )
-from .jobs.models import JobExecutionMode, JobRun
-from .llm.models import (
+from ...llm.models import (
     MessageRole,
     ModelSensitivity,
     ToolCall,
     ToolResultBlock,
 )
-from .loop.models import LoopExit, LoopExitKind, LoopLimits, RunOrigin, Transcript
+from ...loop.models import LoopExit, LoopExitKind, LoopLimits, RunOrigin, Transcript
+from .revision_0002_legacy_jobs import JobExecutionMode, JobRun
 
 MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT = 256
 MAX_FOLLOWUP_ATTEMPTS = 3
@@ -782,6 +783,7 @@ def create_terminal_job_followup(
         per_run_max_cost_usd=limits.max_estimated_cost_usd,
         per_run_max_tokens=limits.max_total_tokens,
         distribution_plan_digest=grant.distribution_plan.plan_digest,
+        scope_kind=ExecutionScopeKind.JOB_EVENT,
     )
     return AutonomousFollowup(
         followup_id=followup_id,

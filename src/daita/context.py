@@ -2864,8 +2864,7 @@ def _tool_guidance(
         )
     elif job_tools_available:
         instructions.append(
-            "job_list is agent-scoped across conversations; origin_conversation_id "
-            "is provenance."
+            "job_list is agent-wide; origin_conversation_id is provenance."
         )
     if START_DATA_PROFILE_CAPABILITY_ID in capability_ids:
         instructions.append(

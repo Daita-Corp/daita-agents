@@ -1,8 +1,4 @@
-"""Unregistered revision-2 SQLite DDL for isolated Phase-2 draft homes.
-
-Nothing in this module is imported by the current schema or migration registry.
-Revision 1 therefore remains the only production home format.
-"""
+"""Frozen revision-2 SQLite DDL and connection policy."""
 
 from __future__ import annotations
 
@@ -11,7 +7,7 @@ import sqlite3
 from pathlib import Path
 from urllib.parse import quote
 
-from .sqlite_schema import (
+from .home_migrations.revision_0001_schema import (
     AGENT_HOME_MIGRATION_TABLE_SQL,
     BASE_TABLE_SQL,
     DELIVERY_TABLE_SQL,
@@ -22,7 +18,7 @@ from .sqlite_schema import (
     SOURCE_READ_SCOPE_TABLE_SQL,
 )
 
-DRAFT_GRAPH_TABLE_NAMES = frozenset(
+GRAPH_TABLE_NAMES = frozenset(
     {
         "metadata",
         "sources",
@@ -57,7 +53,7 @@ DRAFT_GRAPH_TABLE_NAMES = frozenset(
     }
 )
 
-_DRAFT_RECEIPT_SQL = """
+GRAPH_RECEIPT_SQL = """
 CREATE TABLE effect_receipts (
     agent_id TEXT NOT NULL,
     id TEXT NOT NULL,
@@ -96,7 +92,7 @@ CREATE INDEX effect_receipts_graph_attempt
     ON effect_receipts(agent_id, job_id, task_id, task_attempt_id)
 """
 
-_DRAFT_GRAPH_SQL = """
+GRAPH_TABLE_SQL = """
 CREATE TABLE job_runs (
     agent_id TEXT NOT NULL,
     job_id TEXT NOT NULL,
@@ -442,9 +438,9 @@ CREATE TABLE job_attempt_budget_reservations (
 )
 """
 
-DRAFT_REVISION_2_DATABASE_SQL = (
+REVISION_2_DATABASE_SQL = (
     BASE_TABLE_SQL
-    + _DRAFT_RECEIPT_SQL
+    + GRAPH_RECEIPT_SQL
     + ";\n"
     + AGENT_HOME_MIGRATION_TABLE_SQL
     + ";\n"
@@ -454,7 +450,7 @@ DRAFT_REVISION_2_DATABASE_SQL = (
     + ";\n"
     + MCP_SERVER_BINDING_TABLE_SQL
     + ";\n"
-    + _DRAFT_GRAPH_SQL
+    + GRAPH_TABLE_SQL
     + ";\n"
     + DELIVERY_TABLE_SQL
     + ";\n"
@@ -464,7 +460,7 @@ DRAFT_REVISION_2_DATABASE_SQL = (
     + ";\n"
 )
 
-DRAFT_GRAPH_NAMED_INDEXES: dict[str, tuple[str, ...]] = {
+GRAPH_NAMED_INDEXES: dict[str, tuple[str, ...]] = {
     "runs_conversation_turn": ("agent_id", "conversation_id", "turn_index"),
     "effect_receipts_unresolved": (
         "agent_id",
@@ -550,20 +546,20 @@ DRAFT_GRAPH_NAMED_INDEXES: dict[str, tuple[str, ...]] = {
 }
 
 
-def configure_draft_graph_connection(connection: sqlite3.Connection) -> None:
+def configure_graph_connection(connection: sqlite3.Connection) -> None:
     """Apply the frozen local revision-2 connection policy."""
 
     connection.execute("PRAGMA foreign_keys = ON")
     mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]).lower()
     if mode != "wal":
-        raise ValueError("draft graph database requires WAL journal mode")
+        raise ValueError("graph database requires WAL journal mode")
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.execute("PRAGMA wal_autocheckpoint = 1000")
 
 
-def create_draft_graph_database(connection: sqlite3.Connection) -> None:
-    """Create one empty, unstamped draft target database."""
+def create_graph_database(connection: sqlite3.Connection) -> None:
+    """Create one empty, unstamped revision-2 target database."""
 
     if (
         connection.execute(
@@ -571,30 +567,30 @@ def create_draft_graph_database(connection: sqlite3.Connection) -> None:
         ).fetchone()
         is not None
     ):
-        raise ValueError("draft graph database builder requires an empty database")
-    configure_draft_graph_connection(connection)
-    connection.executescript("BEGIN IMMEDIATE;\n" + DRAFT_REVISION_2_DATABASE_SQL)
+        raise ValueError("graph database builder requires an empty database")
+    configure_graph_connection(connection)
+    connection.executescript("BEGIN IMMEDIATE;\n" + REVISION_2_DATABASE_SQL)
     connection.commit()
-    require_draft_graph_schema(connection)
+    require_graph_schema(connection)
 
 
-def initialize_draft_graph_database(path: Path) -> None:
-    """Create a test-only draft database without a revision-2 home stamp."""
+def initialize_graph_database(path: Path) -> None:
+    """Create a revision-2 database without a home migration stamp."""
 
     if not isinstance(path, Path):
-        raise TypeError("draft graph database path must be Path")
+        raise TypeError("graph database path must be Path")
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists():
         raise FileExistsError(path)
     connection = sqlite3.connect(path)
     try:
-        create_draft_graph_database(connection)
+        create_graph_database(connection)
     finally:
         connection.close()
     os.chmod(path, 0o600)
 
 
-def connect_draft_graph(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+def connect_graph(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
         connection = sqlite3.connect(
             f"file:{quote(os.fspath(path))}?mode=ro", uri=True, timeout=5
@@ -602,12 +598,12 @@ def connect_draft_graph(path: Path, *, read_only: bool = False) -> sqlite3.Conne
         connection.execute("PRAGMA query_only = ON")
     else:
         connection = sqlite3.connect(path, timeout=5)
-    configure_draft_graph_connection(connection)
-    require_draft_graph_schema(connection)
+    configure_graph_connection(connection)
+    require_graph_schema(connection)
     return connection
 
 
-def require_draft_wal(connection: sqlite3.Connection) -> None:
+def require_graph_wal(connection: sqlite3.Connection) -> None:
     expected = {
         "journal_mode": "wal",
         "synchronous": 2,
@@ -618,15 +614,15 @@ def require_draft_wal(connection: sqlite3.Connection) -> None:
     for name, value in expected.items():
         observed = connection.execute(f"PRAGMA {name}").fetchone()
         if observed is None:
-            raise ValueError(f"draft graph pragma is unavailable: {name}")
+            raise ValueError(f"graph pragma is unavailable: {name}")
         actual = (
             str(observed[0]).lower() if name == "journal_mode" else int(observed[0])
         )
         if actual != value:
-            raise ValueError(f"draft graph pragma is invalid: {name}")
+            raise ValueError(f"graph pragma is invalid: {name}")
 
 
-def require_draft_graph_schema(connection: sqlite3.Connection) -> None:
+def require_graph_schema(connection: sqlite3.Connection) -> None:
     tables = {
         str(row[0])
         for row in connection.execute(
@@ -634,10 +630,10 @@ def require_draft_graph_schema(connection: sqlite3.Connection) -> None:
             "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
         )
     }
-    if tables != DRAFT_GRAPH_TABLE_NAMES:
-        raise ValueError("draft graph tables do not match the frozen target")
+    if tables != GRAPH_TABLE_NAMES:
+        raise ValueError("graph tables do not match the frozen target")
     if "autonomous_followups" in tables:
-        raise ValueError("draft graph target cannot contain autonomous follow-ups")
+        raise ValueError("graph target cannot contain autonomous follow-ups")
     indexes = {
         str(row[0]): str(row[1])
         for row in connection.execute(
@@ -645,14 +641,14 @@ def require_draft_graph_schema(connection: sqlite3.Connection) -> None:
             "WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
         )
     }
-    if set(indexes) != set(DRAFT_GRAPH_NAMED_INDEXES):
-        raise ValueError("draft graph indexes do not match the frozen target")
-    for name, columns in DRAFT_GRAPH_NAMED_INDEXES.items():
+    if set(indexes) != set(GRAPH_NAMED_INDEXES):
+        raise ValueError("graph indexes do not match the frozen target")
+    for name, columns in GRAPH_NAMED_INDEXES.items():
         actual = tuple(
             str(row[2]) for row in connection.execute(f'PRAGMA index_info("{name}")')
         )
         if actual != columns:
-            raise ValueError(f"draft graph index columns are invalid: {name}")
+            raise ValueError(f"graph index columns are invalid: {name}")
     for table in (
         "job_runs",
         "job_graphs",
@@ -673,22 +669,24 @@ def require_draft_graph_schema(connection: sqlite3.Connection) -> None:
         if row is None or "CHECK (json_valid(data))" not in " ".join(
             str(row[0]).split()
         ):
-            raise ValueError(f"draft graph JSON check is absent: {table}")
+            raise ValueError(f"graph JSON check is absent: {table}")
     if connection.execute("PRAGMA quick_check(1)").fetchone() != ("ok",):
-        raise ValueError("draft graph database integrity check failed")
+        raise ValueError("graph database integrity check failed")
     if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-        raise ValueError("draft graph database foreign keys are invalid")
-    require_draft_wal(connection)
+        raise ValueError("graph database foreign keys are invalid")
+    require_graph_wal(connection)
 
 
 __all__ = [
-    "DRAFT_GRAPH_NAMED_INDEXES",
-    "DRAFT_GRAPH_TABLE_NAMES",
-    "DRAFT_REVISION_2_DATABASE_SQL",
-    "configure_draft_graph_connection",
-    "connect_draft_graph",
-    "create_draft_graph_database",
-    "initialize_draft_graph_database",
-    "require_draft_graph_schema",
-    "require_draft_wal",
+    "GRAPH_NAMED_INDEXES",
+    "GRAPH_TABLE_NAMES",
+    "GRAPH_RECEIPT_SQL",
+    "GRAPH_TABLE_SQL",
+    "REVISION_2_DATABASE_SQL",
+    "configure_graph_connection",
+    "connect_graph",
+    "create_graph_database",
+    "initialize_graph_database",
+    "require_graph_schema",
+    "require_graph_wal",
 ]

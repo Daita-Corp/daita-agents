@@ -1,17 +1,15 @@
-"""Encode the current canonical follow-up and shared delivery families."""
+"""Immutable revision-1 follow-up codecs used only by migration revision 2."""
 
 from __future__ import annotations
 
-from ...autonomy import (
-    AutonomousFollowup,
-    FollowupConclusionEvidence,
-    FollowupDisposition,
-    FollowupGrant,
-    FollowupObservationSource,
+from ...capabilities import (
+    AccessMode,
+    ExecutionScope,
+    ExecutionScopeKind,
+    OperationalEffect,
 )
-from ...capabilities import AccessMode, OperationalEffect
 from ...llm.models import ModelSensitivity
-from .common import (
+from ..sqlite_codecs.common import (
     datetime_decode,
     datetime_encode,
     decimal_decode,
@@ -29,13 +27,164 @@ from .common import (
     sequence,
     text,
 )
-from .distribution import (
+from ..sqlite_codecs.distribution import (
     decode_distribution_plan,
     decode_outcome_contract,
     encode_distribution_plan,
     encode_outcome_contract,
 )
-from .execution_scope import decode_execution_scope, encode_execution_scope
+from ..sqlite_codecs.execution_scope import (
+    decode_capability_grant,
+    decode_execution_contract_bindings,
+    decode_execution_scope as decode_current_execution_scope,
+    encode_execution_scope,
+)
+from .revision_0002_legacy_autonomy import (
+    AutonomousFollowup,
+    FollowupConclusionEvidence,
+    FollowupDisposition,
+    FollowupGrant,
+    FollowupObservationSource,
+)
+
+
+def decode_revision_1_execution_scope(value) -> ExecutionScope:
+    """Decode the sole legacy omission and emit the explicit current shape."""
+
+    try:
+        return decode_current_execution_scope(value)
+    except (KeyError, TypeError, ValueError):
+        pass
+    fields = record_fields(
+        value,
+        "ExecutionScope",
+        (
+            "scope_id",
+            "revision",
+            "agent_id",
+            "principal_id",
+            "grant_id",
+            "job_id",
+            "job_revision",
+            "routine_id",
+            "routine_revision",
+            "occurrence_id",
+            "allowed_source_ids",
+            "allowed_connector_binding_ids",
+            "allowed_resource_ids",
+            "allowed_capability_ids",
+            "allowed_access_modes",
+            "allowed_operational_effects",
+            "sensitivity_ceiling",
+            "eligible_model_routes",
+            "per_run_max_cost_usd",
+            "per_run_max_tokens",
+            "distribution_plan_digest",
+            "contract_bindings",
+            "capability_grants",
+        ),
+    )
+    try:
+        access_modes = frozenset(
+            AccessMode(text(item, "execution scope access mode"))
+            for item in sequence(
+                fields["allowed_access_modes"], "execution scope access modes"
+            )
+        )
+        effects = frozenset(
+            OperationalEffect(text(item, "execution scope operational effect"))
+            for item in sequence(
+                fields["allowed_operational_effects"],
+                "execution scope operational effects",
+            )
+        )
+        sensitivity = ModelSensitivity(
+            text(fields["sensitivity_ceiling"], "execution scope sensitivity")
+        )
+    except ValueError:
+        raise ValueError("stored revision-1 execution scope enum is invalid") from None
+    job_id = optional_text(fields["job_id"], "execution scope job id")
+    routine_id = optional_text(fields["routine_id"], "execution scope routine id")
+    if (job_id is None) == (routine_id is None):
+        raise ValueError("revision-1 execution scope kind cannot be inferred")
+    scope_kind = (
+        ExecutionScopeKind.JOB_EVENT
+        if job_id is not None
+        else ExecutionScopeKind.SCHEDULED_ROUTINE
+    )
+    return ExecutionScope(
+        scope_id=text(fields["scope_id"], "execution scope id"),
+        revision=integer(fields["revision"], "execution scope revision"),
+        agent_id=text(fields["agent_id"], "execution scope agent id"),
+        principal_id=text(fields["principal_id"], "execution scope principal id"),
+        grant_id=text(fields["grant_id"], "execution scope grant id"),
+        job_id=job_id,
+        job_revision=(
+            None
+            if fields["job_revision"] is None
+            else integer(fields["job_revision"], "execution scope job revision")
+        ),
+        routine_id=routine_id,
+        routine_revision=(
+            None
+            if fields["routine_revision"] is None
+            else integer(fields["routine_revision"], "execution scope routine revision")
+        ),
+        occurrence_id=optional_text(
+            fields["occurrence_id"], "execution scope occurrence id"
+        ),
+        allowed_source_ids=tuple(
+            text(item, "execution scope source id")
+            for item in sequence(
+                fields["allowed_source_ids"], "execution scope source ids"
+            )
+        ),
+        allowed_connector_binding_ids=tuple(
+            text(item, "execution scope connector binding id")
+            for item in sequence(
+                fields["allowed_connector_binding_ids"],
+                "execution scope connector binding ids",
+            )
+        ),
+        allowed_resource_ids=tuple(
+            text(item, "execution scope resource id")
+            for item in sequence(
+                fields["allowed_resource_ids"], "execution scope resource ids"
+            )
+        ),
+        allowed_capability_ids=tuple(
+            text(item, "execution scope capability id")
+            for item in sequence(
+                fields["allowed_capability_ids"],
+                "execution scope capability ids",
+            )
+        ),
+        allowed_access_modes=access_modes,
+        allowed_operational_effects=effects,
+        sensitivity_ceiling=sensitivity,
+        eligible_model_routes=tuple(
+            text(item, "execution scope model route")
+            for item in sequence(
+                fields["eligible_model_routes"], "execution scope model routes"
+            )
+        ),
+        per_run_max_cost_usd=decimal_decode(fields["per_run_max_cost_usd"]),
+        per_run_max_tokens=integer(
+            fields["per_run_max_tokens"], "execution scope per-run tokens"
+        ),
+        distribution_plan_digest=text(
+            fields["distribution_plan_digest"],
+            "execution scope distribution plan digest",
+        ),
+        contract_bindings=decode_execution_contract_bindings(
+            fields["contract_bindings"]
+        ),
+        capability_grants=tuple(
+            decode_capability_grant(item)
+            for item in sequence(fields["capability_grants"], "scope capability grants")
+        ),
+        scope_kind=scope_kind,
+    )
 
 
 def encode_autonomous_followup(value: AutonomousFollowup) -> str:
@@ -155,7 +304,7 @@ def decode_autonomous_followup(
         payload_digest=text(fields["payload_digest"], "follow-up payload digest"),
         received_at=datetime_decode(fields["received_at"]),
         grant=_decode_grant(fields["grant"]),
-        execution_scope=decode_execution_scope(fields["execution_scope"]),
+        execution_scope=decode_revision_1_execution_scope(fields["execution_scope"]),
         disposition=disposition,
         created_at=datetime_decode(fields["created_at"]),
         updated_at=datetime_decode(fields["updated_at"]),

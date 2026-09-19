@@ -332,9 +332,7 @@ async def test_unexpected_discovery_replans_with_immutable_replacement(
 async def test_adversarial_mutations_reject_foreign_authority_stale_and_cycles(
     tmp_path: Path,
 ) -> None:
-    store = await SQLiteStateStore.open_draft_graph(
-        tmp_path / "adversarial.sqlite", initialize=True
-    )
+    store = await SQLiteStateStore.open(tmp_path / "adversarial.sqlite")
     try:
         admission = graph_admission()
         await store.admit_graph(admission)
@@ -476,7 +474,7 @@ async def test_finalizer_seal_releases_for_replan_and_mutation_replays(
     integration = await ModelGraphIntegration.open(tmp_path)
     try:
         admission = integration.build()
-        await integration.owner.admit_static_graph(admission)
+        await integration.owner.admit(admission)
         worker = next(item for item in admission.tasks if item.role.value == "worker")
         finalizer = next(
             item for item in admission.tasks if item.role.value == "finalizer"
@@ -669,9 +667,7 @@ async def test_finalizer_seal_releases_for_replan_and_mutation_replays(
 async def test_retry_backoff_circuit_and_protocol_limit_are_persisted(
     tmp_path: Path,
 ) -> None:
-    store = await SQLiteStateStore.open_draft_graph(
-        tmp_path / "retry.sqlite", initialize=True
-    )
+    store = await SQLiteStateStore.open(tmp_path / "retry.sqlite")
     try:
         await store.admit_graph(graph_admission())
         for ordinal, at in enumerate(
@@ -756,9 +752,7 @@ async def test_human_controls_require_principal_and_derive_only_policy_replaceme
     tmp_path: Path,
 ) -> None:
     now = [GRAPH_NOW]
-    store = await SQLiteStateStore.open_draft_graph(
-        tmp_path / "human.sqlite", initialize=True, clock=lambda: now[0]
-    )
+    store = await SQLiteStateStore.open(tmp_path / "human.sqlite", clock=lambda: now[0])
     owner = JobOwner(
         agent_id="agent-1",
         store=store,
@@ -766,7 +760,7 @@ async def test_human_controls_require_principal_and_derive_only_policy_replaceme
         id_factory=lambda prefix: f"{prefix}-human",
     )
     try:
-        await owner.admit_static_graph(graph_admission())
+        await owner.admit(graph_admission())
         attempt = await _claim_and_start(
             store,
             agent_id="agent-1",

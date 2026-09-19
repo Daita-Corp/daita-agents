@@ -1,19 +1,15 @@
-"""Export durable job records, capabilities, lifecycle ownership, and supervision."""
+"""Export the current durable adaptive task-graph records."""
 
-from .models import (
-    ConnectedExecutorBinding,
-    JobExecutionMode,
-    JobInspection,
-    JobResultView,
-    JobStatus,
-    JobSummary,
+from .graph.models import (
+    GraphInspection,
+    GraphJob,
+    GraphState,
+    TaskResult,
 )
 
 __all__ = [
-    "ConnectedExecutorBinding",
-    "JobExecutionMode",
-    "JobInspection",
-    "JobResultView",
-    "JobStatus",
-    "JobSummary",
+    "GraphInspection",
+    "GraphJob",
+    "GraphState",
+    "TaskResult",
 ]

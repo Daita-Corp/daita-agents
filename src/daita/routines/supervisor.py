@@ -11,7 +11,7 @@ from hashlib import sha256
 from .._json import canonical_json
 from ..artifacts.models import ArtifactError
 from ..artifacts.store import AgentHomeArtifactStore
-from ..capabilities import ExecutionScope
+from ..capabilities import ExecutionScope, ExecutionScopeKind
 from ..capability_runtime import CapabilityRuntime, InternalCapabilityRequest
 from ..distribution import DistributionOwner, OutcomeArtifactReference
 from ..loop.models import (
@@ -445,6 +445,7 @@ def _execution_scope(
         per_run_max_cost_usd=routine.per_run_max_cost_usd,
         per_run_max_tokens=routine.per_run_max_tokens,
         distribution_plan_digest=routine.distribution_plan.plan_digest,
+        scope_kind=ExecutionScopeKind.SCHEDULED_ROUTINE,
     )
 
 

@@ -73,7 +73,7 @@ async def test_multi_resource_static_profile_graph_completes_once(
         assert all(item.state is TaskState.SUCCEEDED for item in terminal.tasks)
         assert len(terminal.results) == 4
         assert len(await integration.artifacts.list_refs()) == 4
-        deliveries = await integration.store.list_draft_graph_deliveries(
+        deliveries = await integration.store.list_graph_deliveries(
             AGENT_ID,
             job_id=admission.job.job_id,
         )
@@ -100,8 +100,8 @@ async def test_integration_start_data_profile_emits_only_graph_work(
         job_id = await integration.start_profile(("resource-a",))
         terminal = await integration.wait_terminal(job_id)
         assert terminal.job.state is GraphState.SUCCEEDED
-        assert integration.supervisor._driver is None
-        assert integration.supervisor._workers == {}
+        assert integration.supervisor._driver is not None
+        assert integration.supervisor._graph_workers == {}
         assert len(terminal.tasks) == 2
         assert all(
             item.specification.created_by == "job_owner" for item in terminal.tasks
@@ -119,7 +119,7 @@ async def test_finalizer_barrier_rejects_early_claim(tmp_path: Path) -> None:
     integration = await StaticGraphIntegration.open(tmp_path, resources)
     try:
         admission = await integration.build(("resource-a", "resource-b"))
-        await integration.owner.admit_static_graph(admission)
+        await integration.owner.admit(admission)
         claimed = await integration.store.claim_graph_task(
             AGENT_ID,
             admission.job.job_id,
@@ -156,9 +156,9 @@ async def test_expired_graph_fails_without_launching_work(tmp_path: Path) -> Non
     )
     try:
         admission = await integration.build(("resource-a",))
-        await integration.owner.admit_static_graph(admission)
+        await integration.owner.admit(admission)
         current[0] += timedelta(seconds=301)
-        await integration.supervisor.start_graph_integration()
+        await integration.supervisor.start()
         terminal = await integration.wait_terminal(admission.job.job_id)
         assert terminal.job.state is GraphState.FAILED
         assert terminal.job.failure_code == "deadline_exceeded"
@@ -201,13 +201,13 @@ async def test_restart_never_reruns_successful_work(tmp_path: Path) -> None:
         backend=backend,
     )
     try:
-        await second.supervisor.start_graph_integration()
-        assert second.supervisor._graph_driver is not None
+        await second.supervisor.start()
+        assert second.supervisor._driver is not None
         await asyncio.sleep(1.2)
-        assert second.supervisor._graph_driver is not None
+        assert second.supervisor._driver is not None
         assert (
-            not second.supervisor._graph_driver.done()
-        ), second.supervisor._graph_driver.exception()
+            not second.supervisor._driver.done()
+        ), second.supervisor._driver.exception()
         terminal = await second.wait_terminal(admission.job.job_id, timeout=8)
         assert terminal.job.state is GraphState.SUCCEEDED
         for resource_id, completed in successful_before.items():
@@ -373,7 +373,7 @@ async def test_claim_artifact_result_finalization_and_delivery_are_response_loss
         assert len(await integration.artifacts.list_refs()) == 2
         assert (
             len(
-                await integration.store.list_draft_graph_deliveries(
+                await integration.store.list_graph_deliveries(
                     AGENT_ID, job_id=admission.job.job_id
                 )
             )
@@ -499,7 +499,7 @@ async def test_stale_finalizer_cannot_settle_or_publish(tmp_path: Path) -> None:
         release.set()
         await asyncio.sleep(0.05)
         assert (
-            await integration.store.list_draft_graph_deliveries(
+            await integration.store.list_graph_deliveries(
                 AGENT_ID, job_id=admission.job.job_id
             )
             == ()

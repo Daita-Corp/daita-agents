@@ -1,27 +1,16 @@
-"""Strict codecs for the unregistered revision-2 graph persistence draft.
-
-This module is intentionally absent from ``sqlite_codecs.__init__`` so revision 1
-remains the only current runtime record composition.
-"""
+"""Strict current codecs for revision-2 adaptive task-graph records."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from datetime import datetime
 
-from ..capabilities import (
-    AccessMode,
-    ExecutionScope,
-    ExecutionScopeKind,
-    GraphTaskBinding,
-    OperationalEffect,
-)
-from ..distribution.models import (
+from ..._json import FrozenJsonObject
+from ...distribution.models import (
     DeliveryState,
     GraphJobDelivery,
-    graph_job_delivery_key,
 )
-from ..jobs.graph.models import (
+from ...jobs.graph.models import (
     AttemptState,
     BudgetAmount,
     BudgetLimit,
@@ -50,13 +39,11 @@ from ..jobs.graph.models import (
     TaskRole,
     TaskState,
 )
-from ..llm.models import ModelSensitivity
-from .sqlite_codecs.common import (
+from ...llm.models import ModelSensitivity
+from .common import (
     JsonValue,
     datetime_decode,
     datetime_encode,
-    decimal_decode,
-    decimal_encode,
     dump_payload,
     integer,
     load_payload,
@@ -71,17 +58,29 @@ from .sqlite_codecs.common import (
     sequence,
     text,
 )
-from .sqlite_codecs.distribution import (
+from .distribution import (
     decode_conversation_inbox_target,
     decode_outcome_reference,
     encode_conversation_inbox_target,
     encode_outcome_reference,
 )
-from .sqlite_codecs.execution_scope import (
-    decode_capability_grant,
-    decode_execution_contract_bindings,
-    encode_capability_grant,
-    encode_execution_contract_bindings,
+
+_GRAPH_LIMIT_FIELDS = (
+    "max_tasks",
+    "max_edges",
+    "max_depth",
+    "max_direct_parents",
+    "max_fan_out",
+    "max_attempts_per_task",
+    "max_parallelism",
+    "max_mutations",
+    "max_events",
+    "max_controls_per_task",
+    "max_checkpoints_per_attempt",
+    "max_comments_per_task",
+    "max_artifacts",
+    "max_artifact_bytes",
+    "max_total_artifact_bytes",
 )
 
 
@@ -111,245 +110,6 @@ def _pair_tuple(value: JsonValue, label: str) -> tuple[tuple[str, str], ...]:
             raise ValueError(f"stored {label} pair is invalid")
         pairs.append((text(raw[0], label), text(raw[1], label)))
     return tuple(pairs)
-
-
-def _encode_graph_task_binding(value: GraphTaskBinding) -> JsonValue:
-    if not isinstance(value, GraphTaskBinding):
-        raise TypeError("graph task binding codec requires GraphTaskBinding")
-    return record(
-        "GraphTaskBinding",
-        {
-            "agent_id": value.agent_id,
-            "job_id": value.job_id,
-            "root_authority_digest": value.root_authority_digest,
-            "task_id": value.task_id,
-            "task_revision": value.task_revision,
-            "task_spec_digest": value.task_spec_digest,
-            "task_scope_digest": value.task_scope_digest,
-            "attempt_id": value.attempt_id,
-            "claim_token_digest": value.claim_token_digest,
-            "fencing_epoch": value.fencing_epoch,
-            "graph_revision_at_claim": value.graph_revision_at_claim,
-            "task_role": value.task_role,
-            "task_deadline_at": datetime_encode(value.task_deadline_at),
-            "job_deadline_at": datetime_encode(value.job_deadline_at),
-            "budget_reservation_identity": value.budget_reservation_identity,
-        },
-    )
-
-
-def _decode_graph_task_binding(value: JsonValue) -> GraphTaskBinding:
-    fields = record_fields(
-        value,
-        "GraphTaskBinding",
-        (
-            "agent_id",
-            "job_id",
-            "root_authority_digest",
-            "task_id",
-            "task_revision",
-            "task_spec_digest",
-            "task_scope_digest",
-            "attempt_id",
-            "claim_token_digest",
-            "fencing_epoch",
-            "graph_revision_at_claim",
-            "task_role",
-            "task_deadline_at",
-            "job_deadline_at",
-            "budget_reservation_identity",
-        ),
-    )
-    return GraphTaskBinding(
-        agent_id=text(fields["agent_id"], "graph binding agent id"),
-        job_id=text(fields["job_id"], "graph binding job id"),
-        root_authority_digest=text(
-            fields["root_authority_digest"], "graph binding root authority digest"
-        ),
-        task_id=text(fields["task_id"], "graph binding task id"),
-        task_revision=integer(fields["task_revision"], "graph binding task revision"),
-        task_spec_digest=text(
-            fields["task_spec_digest"], "graph binding task spec digest"
-        ),
-        task_scope_digest=text(
-            fields["task_scope_digest"], "graph binding task scope digest"
-        ),
-        attempt_id=text(fields["attempt_id"], "graph binding attempt id"),
-        claim_token_digest=text(
-            fields["claim_token_digest"], "graph binding claim digest"
-        ),
-        fencing_epoch=integer(fields["fencing_epoch"], "graph binding fencing epoch"),
-        graph_revision_at_claim=integer(
-            fields["graph_revision_at_claim"], "graph binding graph revision"
-        ),
-        task_role=text(fields["task_role"], "graph binding task role"),
-        task_deadline_at=datetime_decode(fields["task_deadline_at"]),
-        job_deadline_at=datetime_decode(fields["job_deadline_at"]),
-        budget_reservation_identity=text(
-            fields["budget_reservation_identity"],
-            "graph binding budget reservation identity",
-        ),
-    )
-
-
-def encode_graph_task_execution_scope(value: ExecutionScope) -> JsonValue:
-    """Encode a graph-only draft scope outside the revision-1 codec registry."""
-
-    if (
-        not isinstance(value, ExecutionScope)
-        or value.scope_kind is not ExecutionScopeKind.GRAPH_TASK
-        or value.graph_task_binding is None
-    ):
-        raise TypeError("draft graph scope codec requires a graph-task scope")
-    return record(
-        "DraftGraphTaskExecutionScope",
-        {
-            "scope_id": value.scope_id,
-            "revision": value.revision,
-            "agent_id": value.agent_id,
-            "principal_id": value.principal_id,
-            "grant_id": value.grant_id,
-            "job_id": value.job_id,
-            "job_revision": value.job_revision,
-            "routine_id": value.routine_id,
-            "routine_revision": value.routine_revision,
-            "occurrence_id": value.occurrence_id,
-            "allowed_source_ids": list(value.allowed_source_ids),
-            "allowed_connector_binding_ids": list(value.allowed_connector_binding_ids),
-            "allowed_resource_ids": list(value.allowed_resource_ids),
-            "allowed_capability_ids": list(value.allowed_capability_ids),
-            "allowed_access_modes": plain_encode(
-                tuple(sorted(item.value for item in value.allowed_access_modes))
-            ),
-            "allowed_operational_effects": plain_encode(
-                tuple(sorted(item.value for item in value.allowed_operational_effects))
-            ),
-            "sensitivity_ceiling": value.sensitivity_ceiling.value,
-            "eligible_model_routes": list(value.eligible_model_routes),
-            "per_run_max_cost_usd": decimal_encode(value.per_run_max_cost_usd),
-            "per_run_max_tokens": value.per_run_max_tokens,
-            "distribution_plan_digest": value.distribution_plan_digest,
-            "contract_bindings": encode_execution_contract_bindings(
-                value.contract_bindings
-            ),
-            "capability_grants": [
-                encode_capability_grant(grant) for grant in value.capability_grants
-            ],
-            "graph_task_binding": _encode_graph_task_binding(value.graph_task_binding),
-        },
-    )
-
-
-def decode_graph_task_execution_scope(value: JsonValue) -> ExecutionScope:
-    """Decode the unregistered draft graph-task execution scope."""
-
-    fields = record_fields(
-        value,
-        "DraftGraphTaskExecutionScope",
-        (
-            "scope_id",
-            "revision",
-            "agent_id",
-            "principal_id",
-            "grant_id",
-            "job_id",
-            "job_revision",
-            "routine_id",
-            "routine_revision",
-            "occurrence_id",
-            "allowed_source_ids",
-            "allowed_connector_binding_ids",
-            "allowed_resource_ids",
-            "allowed_capability_ids",
-            "allowed_access_modes",
-            "allowed_operational_effects",
-            "sensitivity_ceiling",
-            "eligible_model_routes",
-            "per_run_max_cost_usd",
-            "per_run_max_tokens",
-            "distribution_plan_digest",
-            "contract_bindings",
-            "capability_grants",
-            "graph_task_binding",
-        ),
-    )
-    try:
-        access_modes = frozenset(
-            AccessMode(text(item, "execution scope access mode"))
-            for item in sequence(
-                fields["allowed_access_modes"], "execution scope access modes"
-            )
-        )
-        effects = frozenset(
-            OperationalEffect(text(item, "execution scope operational effect"))
-            for item in sequence(
-                fields["allowed_operational_effects"],
-                "execution scope operational effects",
-            )
-        )
-        sensitivity = ModelSensitivity(
-            text(fields["sensitivity_ceiling"], "execution scope sensitivity")
-        )
-    except ValueError:
-        raise ValueError("stored execution scope enum is invalid") from None
-    return ExecutionScope(
-        contract_bindings=decode_execution_contract_bindings(
-            fields["contract_bindings"]
-        ),
-        capability_grants=tuple(
-            decode_capability_grant(item)
-            for item in sequence(fields["capability_grants"], "scope capability grants")
-        ),
-        scope_id=text(fields["scope_id"], "execution scope id"),
-        revision=integer(fields["revision"], "execution scope revision"),
-        agent_id=text(fields["agent_id"], "execution scope agent id"),
-        principal_id=text(fields["principal_id"], "execution scope principal id"),
-        grant_id=text(fields["grant_id"], "execution scope grant id"),
-        job_id=optional_text(fields["job_id"], "execution scope job id"),
-        job_revision=(
-            None
-            if fields["job_revision"] is None
-            else integer(fields["job_revision"], "execution scope job revision")
-        ),
-        routine_id=optional_text(fields["routine_id"], "execution scope routine id"),
-        routine_revision=(
-            None
-            if fields["routine_revision"] is None
-            else integer(fields["routine_revision"], "execution scope routine revision")
-        ),
-        occurrence_id=optional_text(
-            fields["occurrence_id"], "execution scope occurrence id"
-        ),
-        allowed_source_ids=_text_tuple(
-            fields["allowed_source_ids"], "execution scope source ids"
-        ),
-        allowed_connector_binding_ids=_text_tuple(
-            fields["allowed_connector_binding_ids"],
-            "execution scope connector binding ids",
-        ),
-        allowed_resource_ids=_text_tuple(
-            fields["allowed_resource_ids"], "execution scope resource ids"
-        ),
-        allowed_capability_ids=_text_tuple(
-            fields["allowed_capability_ids"], "execution scope capability ids"
-        ),
-        allowed_access_modes=access_modes,
-        allowed_operational_effects=effects,
-        sensitivity_ceiling=sensitivity,
-        eligible_model_routes=_text_tuple(
-            fields["eligible_model_routes"], "execution scope model routes"
-        ),
-        per_run_max_cost_usd=decimal_decode(fields["per_run_max_cost_usd"]),
-        per_run_max_tokens=integer(
-            fields["per_run_max_tokens"], "execution scope per-run tokens"
-        ),
-        distribution_plan_digest=text(
-            fields["distribution_plan_digest"],
-            "execution scope distribution plan digest",
-        ),
-        scope_kind=ExecutionScopeKind.GRAPH_TASK,
-        graph_task_binding=_decode_graph_task_binding(fields["graph_task_binding"]),
-    )
 
 
 def _encode_authority(value: GraphAuthority) -> JsonValue:
@@ -411,15 +171,17 @@ def _decode_authority(value: JsonValue) -> GraphAuthority:
 def _encode_limits(value: GraphLimits) -> JsonValue:
     return record(
         "GraphLimits",
-        {name: getattr(value, name) for name in value.__dataclass_fields__},
+        {name: getattr(value, name) for name in _GRAPH_LIMIT_FIELDS},
     )
 
 
 def _decode_limits(value: JsonValue) -> GraphLimits:
-    names = tuple(GraphLimits.__dataclass_fields__)
-    fields = record_fields(value, "GraphLimits", names)
+    fields = record_fields(value, "GraphLimits", _GRAPH_LIMIT_FIELDS)
     return GraphLimits(
-        **{name: integer(fields[name], f"graph limit {name}") for name in names}
+        **{
+            name: integer(fields[name], f"graph limit {name}")
+            for name in _GRAPH_LIMIT_FIELDS
+        }
     )
 
 
@@ -1379,7 +1141,7 @@ def decode_graph_event(
 
 def encode_graph_job_delivery(value: GraphJobDelivery) -> str:
     if not isinstance(value, GraphJobDelivery):
-        raise TypeError("draft graph delivery codec requires GraphJobDelivery")
+        raise TypeError("graph delivery codec requires GraphJobDelivery")
     return dump_payload(
         record(
             "Delivery",
@@ -1395,13 +1157,13 @@ def encode_graph_job_delivery(value: GraphJobDelivery) -> str:
                 "blocked_reason_code": value.blocked_reason_code,
                 "created_at": datetime_encode(value.created_at),
                 "updated_at": datetime_encode(value.updated_at),
-                "migration_provenance": {},
+                "migration_provenance": plain_encode(value.migration_provenance),
             },
         )
     )
 
 
-def decode_draft_delivery(
+def decode_graph_job_delivery(
     value: str,
     *,
     agent_id: str,
@@ -1412,7 +1174,7 @@ def decode_draft_delivery(
     logical_key: str,
     state: str,
 ) -> GraphJobDelivery | dict[str, object]:
-    """Strictly validate the draft revision-2 delivery record shape."""
+    """Strictly validate the current revision-2 delivery record shape."""
 
     fields = record_fields(
         load_payload(value),
@@ -1444,16 +1206,16 @@ def decode_draft_delivery(
         or decoded_logical_key != logical_key
         or decoded_state.value != state
     ):
-        raise ValueError("draft delivery projection differs from its payload")
+        raise ValueError("graph delivery projection differs from its payload")
     if decoded_subject_kind not in {
         "routine_occurrence",
         "graph_job",
         "graph_attention",
     }:
-        raise ValueError("draft delivery subject kind is invalid")
+        raise ValueError("graph delivery subject kind is invalid")
     target = decode_conversation_inbox_target(fields["target"])
     if target.conversation_id != conversation_id:
-        raise ValueError("draft delivery target conversation differs")
+        raise ValueError("graph delivery target conversation differs")
     outcome = decode_outcome_reference(fields["outcome"])
     optional_datetime_decode(fields["acknowledged_at"])
     optional_text(fields["blocked_reason_code"], "delivery blocked reason")
@@ -1462,12 +1224,7 @@ def decode_draft_delivery(
     provenance = _mapping(
         fields["migration_provenance"], "delivery migration provenance"
     )
-    if decoded_subject_kind == "graph_job" and not provenance:
-        if decoded_logical_key != graph_job_delivery_key(
-            job_id=decoded_subject_id,
-            outcome_digest=outcome.conclusion_digest,
-        ):
-            raise ValueError("draft graph-job delivery key is invalid")
+    if decoded_subject_kind == "graph_job":
         return GraphJobDelivery(
             delivery_id=delivery_id,
             agent_id=agent_id,
@@ -1482,11 +1239,8 @@ def decode_draft_delivery(
             ),
             created_at=created_at,
             updated_at=updated_at,
+            migration_provenance=FrozenJsonObject.from_mapping(provenance),
         )
-    if decoded_subject_kind == "graph_job" and decoded_logical_key != (
-        f"graph_job/{decoded_subject_id}"
-    ):
-        raise ValueError("migrated draft graph-job delivery key is invalid")
     return {
         "agent_id": agent_id,
         "delivery_id": delivery_id,
@@ -1499,9 +1253,8 @@ def decode_draft_delivery(
 
 
 __all__ = [
-    "decode_graph_task_execution_scope",
     "decode_graph_event",
-    "decode_draft_delivery",
+    "decode_graph_job_delivery",
     "decode_graph_job",
     "decode_graph_mutation",
     "decode_graph_task",
@@ -1513,7 +1266,6 @@ __all__ = [
     "decode_task_dependency",
     "decode_task_result",
     "encode_graph_event_payload",
-    "encode_graph_task_execution_scope",
     "encode_graph_job",
     "encode_graph_job_delivery",
     "encode_graph_mutation",

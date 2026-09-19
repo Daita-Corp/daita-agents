@@ -1,4 +1,4 @@
-"""Private SQL implementation for draft graph methods on ``SQLiteStateStore``."""
+"""Private SQL implementation for current graph methods on ``SQLiteStateStore``."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 
 from ..artifacts.models import ArtifactRef, artifact_ref_from_mapping
-from ..distribution.models import GraphJobDelivery
+from ..distribution.models import GraphJobDelivery, OutcomeArtifactReference
 from ..jobs.graph.models import (
     ACTIVE_ATTEMPT_STATES,
     CONTROL_BUDGET_ROLES,
@@ -57,10 +57,11 @@ from ..jobs.graph.validation import (
     validate_graph_admission,
     validate_mutation,
 )
-from .draft_graph_codecs import (
-    decode_draft_delivery,
+from ..llm.models import MessageRole, ToolResultBlock
+from .sqlite_codecs.graph import (
     decode_graph_event,
     decode_graph_job,
+    decode_graph_job_delivery,
     decode_graph_mutation,
     decode_graph_task,
     decode_job_graph,
@@ -83,6 +84,7 @@ from .draft_graph_codecs import (
     encode_task_dependency,
     encode_task_result,
 )
+from .sqlite_codecs.transcripts import decode_message
 
 
 class GraphStoreConflictError(RuntimeError):
@@ -815,6 +817,43 @@ def inspect_graph(
     )
 
 
+def list_graph_jobs(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    states: frozenset[GraphState] = frozenset(),
+    limit: int = 50,
+) -> tuple[GraphJob, ...]:
+    if not isinstance(agent_id, str) or not agent_id:
+        raise ValueError("agent_id must be non-empty text")
+    if not 1 <= limit <= 100:
+        raise ValueError("graph job list limit must be between one and one hundred")
+    if any(not isinstance(state, GraphState) for state in states):
+        raise TypeError("graph job state filter must contain GraphState values")
+    parameters: list[object] = [agent_id]
+    state_clause = ""
+    if states:
+        ordered_states = tuple(sorted(state.value for state in states))
+        state_clause = " AND state IN (" + ",".join("?" for _ in ordered_states) + ")"
+        parameters.extend(ordered_states)
+    parameters.append(limit)
+    rows = tuple(
+        connection.execute(
+            "SELECT job_id FROM job_runs WHERE agent_id = ?"
+            + state_clause
+            + " ORDER BY updated_at_us DESC, job_id LIMIT ?",
+            tuple(parameters),
+        )
+    )
+    jobs: list[GraphJob] = []
+    for (job_id,) in rows:
+        loaded = _load_job(connection, agent_id, _required_text(job_id, "job ID"))
+        if loaded is None:
+            raise ValueError("stored graph job disappeared during projection")
+        jobs.append(loaded[0])
+    return tuple(jobs)
+
+
 def list_graph_events(
     connection: sqlite3.Connection,
     agent_id: str,
@@ -1045,7 +1084,7 @@ def _load_graph_delivery(
     ).fetchone()
     if row is None:
         return None
-    decoded = decode_draft_delivery(
+    decoded = decode_graph_job_delivery(
         _required_text(row[6], "graph delivery payload"),
         agent_id=agent_id,
         delivery_id=_required_text(row[0], "graph delivery ID"),
@@ -1087,7 +1126,7 @@ def list_graph_deliveries(
     )
     deliveries: list[GraphJobDelivery] = []
     for row in rows:
-        decoded = decode_draft_delivery(
+        decoded = decode_graph_job_delivery(
             _required_text(row[6], "graph delivery payload"),
             agent_id=agent_id,
             delivery_id=_required_text(row[0], "graph delivery ID"),
@@ -1109,6 +1148,22 @@ def list_graph_artifact_refs(
     run_id: str | None = None,
     conversation_id: str | None = None,
 ) -> tuple[ArtifactRef, ...]:
+    run_clauses = ["r.agent_id = ?"]
+    run_parameters: list[object] = [agent_id]
+    if run_id is not None:
+        run_clauses.append("r.id = ?")
+        run_parameters.append(run_id)
+    if conversation_id is not None:
+        run_clauses.append("r.conversation_id = ?")
+        run_parameters.append(conversation_id)
+    message_rows = tuple(
+        connection.execute(
+            """SELECT r.id, r.conversation_id, m.data
+               FROM runs AS r JOIN messages AS m ON m.run_id = r.id
+               WHERE """ + " AND ".join(run_clauses) + " ORDER BY r.id, m.position",
+            tuple(run_parameters),
+        )
+    )
     clauses = ["r.agent_id = ?"]
     parameters: list[object] = [agent_id]
     if conversation_id is not None:
@@ -1127,6 +1182,29 @@ def list_graph_artifact_refs(
         )
     )
     refs: dict[str, ArtifactRef] = {}
+    for stored_run_id, stored_conversation_id, data in message_rows:
+        message = decode_message(_required_text(data, "message payload"))
+        if message.role is not MessageRole.TOOL:
+            continue
+        for block in message.content:
+            if not isinstance(block, ToolResultBlock) or block.is_error:
+                continue
+            value = block.output.get("artifact")
+            if not isinstance(value, Mapping):
+                continue
+            ref = artifact_ref_from_mapping(value)
+            if (
+                ref.run_id != stored_run_id
+                or ref.conversation_id != stored_conversation_id
+                or ref.call_id != block.call_id
+            ):
+                raise ValueError(
+                    "stored artifact reference identity differs from its run"
+                )
+            current = refs.get(ref.artifact_id)
+            if current is not None and current != ref:
+                raise ValueError("stored artifact identity is ambiguous")
+            refs[ref.artifact_id] = ref
     for data, stored_conversation_id in rows:
         result = decode_task_result(_required_text(data, "task result payload"))
         raw_refs = result.provenance.get("artifact_refs", ())
@@ -1152,6 +1230,68 @@ def list_graph_artifact_refs(
             refs[ref.artifact_id] = ref
     return tuple(
         sorted(refs.values(), key=lambda item: (item.created_at, item.artifact_id))
+    )
+
+
+def list_current_delivery_artifact_references(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    *,
+    run_id: str | None = None,
+    conversation_id: str | None = None,
+) -> tuple[OutcomeArtifactReference, ...]:
+    clauses = ["agent_id = ?"]
+    parameters: list[object] = [agent_id]
+    if conversation_id is not None:
+        clauses.append("conversation_id = ?")
+        parameters.append(conversation_id)
+    rows = tuple(
+        connection.execute(
+            """SELECT delivery_id, conversation_id, subject_kind, subject_id,
+                      logical_key, state, data
+               FROM deliveries WHERE """
+            + " AND ".join(clauses)
+            + " ORDER BY created_at_us, delivery_id",
+            tuple(parameters),
+        )
+    )
+    references: dict[str, OutcomeArtifactReference] = {}
+    from .sqlite_codecs.distribution import decode_delivery
+
+    for row in rows:
+        if row[2] == "graph_job":
+            graph_delivery = decode_graph_job_delivery(
+                _required_text(row[6], "graph delivery payload"),
+                agent_id=agent_id,
+                delivery_id=_required_text(row[0], "graph delivery ID"),
+                conversation_id=_required_text(row[1], "graph delivery conversation"),
+                subject_kind=_required_text(row[2], "graph delivery subject kind"),
+                subject_id=_required_text(row[3], "graph delivery subject ID"),
+                logical_key=_required_text(row[4], "graph delivery logical key"),
+                state=_required_text(row[5], "graph delivery state"),
+            )
+            if not isinstance(graph_delivery, GraphJobDelivery):
+                raise TypeError("current graph delivery did not decode to its record")
+            artifact_references = graph_delivery.outcome.artifact_references
+        else:
+            routine_delivery = decode_delivery(
+                _required_text(row[6], "routine delivery payload"),
+                agent_id=agent_id,
+                delivery_id=_required_text(row[0], "routine delivery ID"),
+            )
+            artifact_references = routine_delivery.outcome.artifact_references
+        for reference in artifact_references:
+            if run_id is not None and reference.producing_run_id != run_id:
+                continue
+            current = references.get(reference.artifact_id)
+            if current is not None and current != reference:
+                raise ValueError("stored delivery artifact identity is ambiguous")
+            references[reference.artifact_id] = reference
+    return tuple(
+        sorted(
+            references.values(),
+            key=lambda item: (item.producing_run_id, item.artifact_id),
+        )
     )
 
 
@@ -3465,6 +3605,7 @@ __all__ = [
     "list_attempt_reservations",
     "list_budget_ledgers",
     "list_graph_artifact_refs",
+    "list_current_delivery_artifact_references",
     "list_graph_deliveries",
     "list_graph_events",
     "list_graph_reserved_artifact_ids",

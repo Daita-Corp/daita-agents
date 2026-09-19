@@ -2071,6 +2071,15 @@ class CapabilityRuntime:
                 )
             else:
                 arguments = validated_arguments
+            if run.origin is RunOrigin.JOB_TASK:
+                from .jobs.graph.execution import validate_graph_task_arguments
+
+                validate_graph_task_arguments(
+                    origin=run.origin,
+                    context=(None if session is None else session.options.task_context),
+                    capability_id=capability.id,
+                    arguments=arguments,
+                )
             preference = (
                 ExecutionPreference.AUTO
                 if session is None
@@ -2105,15 +2114,6 @@ class CapabilityRuntime:
                 request_sensitivity=sensitivity,
                 session=session,
             )
-            if run.origin is RunOrigin.JOB_TASK:
-                from .jobs.graph.execution import validate_graph_task_arguments
-
-                validate_graph_task_arguments(
-                    origin=run.origin,
-                    context=(None if session is None else session.options.task_context),
-                    capability_id=capability.id,
-                    arguments=arguments,
-                )
             await _guard_attempt(guard, capability.id, "after_binding")
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id

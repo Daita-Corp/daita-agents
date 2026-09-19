@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import JobStatus
+from daita import GraphState
 from daita._json import canonical_json
 from daita.domains.data.profile_jobs import DATA_PROFILE_EXECUTION_CAPABILITY_ID
 from tests.support.job_benchmarks import (
@@ -196,8 +196,8 @@ async def test_paraphrased_background_requests_admit_one_exact_job(
         jobs = await fixture.agent.list_jobs()
         assert len(jobs) == 1 and jobs[0].job_id == job_id
         inspection = await wait_for_terminal(fixture.agent, job_id)
-        assert inspection.summary.status is JobStatus.SUCCEEDED
-        assert inspection.summary.resource_ids == (
+        assert inspection.job.state is GraphState.SUCCEEDED
+        assert inspection.job.specification.authority.resource_ids == (
             fixture.resource_ids[TARGET_PROFILE_TABLE],
         )
         await assert_profile_result(fixture.agent, job_id)
@@ -267,8 +267,8 @@ async def test_paraphrased_result_questions_recover_exact_artifacts(
         result_reads = results_for(capture.transcript, "job_read_results")
         assert result_reads and job_id in canonical_json(result_reads[-1].output)
         result = await fixture.agent.read_job_result(job_id)
-        assert result is not None and len(result.artifact_refs) == 1
-        artifact_id = result.artifact_refs[0].artifact_id
+        assert result is not None and len(result.artifact_ids) == 1
+        artifact_id = result.artifact_ids[0]
         artifact_reads = results_for(capture.transcript, "artifact_read")
         assert artifact_reads
         assert artifact_id in canonical_json(artifact_reads[-1].output)
@@ -336,7 +336,7 @@ async def test_paraphrased_cancellation_targets_one_running_job(
         assert len(cancel_results) == 1
         assert job_id in canonical_json(cancel_results[0].output)
         terminal = await wait_for_terminal(fixture.agent, job_id)
-        assert terminal.summary.status is JobStatus.CANCELLED
+        assert terminal.job.state is GraphState.CANCELLED
         assert await fixture.agent.read_job_result(job_id) is None
     finally:
         release.set()

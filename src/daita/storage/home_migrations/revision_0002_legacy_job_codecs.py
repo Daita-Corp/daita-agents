@@ -1,9 +1,27 @@
-"""Encode and decode the current canonical durable JobRun aggregate."""
+"""Immutable revision-1 job codecs used only by migration revision 2."""
 
 from __future__ import annotations
 
 from ...artifacts.models import artifact_ref_from_mapping, artifact_ref_to_mapping
-from ...jobs.models import (
+from ...llm.models import ModelSensitivity
+from ..sqlite_codecs.common import (
+    datetime_decode,
+    datetime_encode,
+    dump_payload,
+    integer,
+    load_payload,
+    number,
+    optional_datetime_decode,
+    optional_datetime_encode,
+    optional_text,
+    plain_decode,
+    plain_encode,
+    record,
+    record_fields,
+    sequence,
+    text,
+)
+from .revision_0002_legacy_jobs import (
     ConnectedExecutorBinding,
     ExternalIntent,
     ExternalIntentDisposition,
@@ -21,24 +39,6 @@ from ...jobs.models import (
     JobRun,
     JobSpecification,
     JobStatus,
-)
-from ...llm.models import ModelSensitivity
-from .common import (
-    datetime_decode,
-    datetime_encode,
-    dump_payload,
-    integer,
-    load_payload,
-    number,
-    optional_datetime_decode,
-    optional_datetime_encode,
-    optional_text,
-    plain_decode,
-    plain_encode,
-    record,
-    record_fields,
-    sequence,
-    text,
 )
 
 

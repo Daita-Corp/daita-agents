@@ -190,11 +190,22 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
             "distribution_destination_list",
             "file_read",
             "file_search",
+            "graph_add_dependencies",
+            "graph_create_children",
+            "graph_inspect_task",
+            "graph_list_tasks",
+            "graph_request_input",
+            "graph_supersede_unstarted",
             "job_inspect",
             "job_list",
             "job_read_results",
             "routine_list",
             "skill_view",
+            "task_block",
+            "task_checkpoint",
+            "task_comment",
+            "task_complete",
+            "task_request_review",
         }
         for name in registry.tool_names:
             view, capability, owner = registry.resolve_tool_owner(name)

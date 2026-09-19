@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, JobStatus
+from daita import Agent, GraphState
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.models import ModelStreamCompleted, ModelTextDelta, ModelUsage
 from daita.llm.pricing import CostEstimate
@@ -98,10 +98,10 @@ async def _assert_one_independent_success(agent: Agent, run_id: str) -> str:
     assert len(jobs) == 1
     job_id = jobs[0].job_id
     terminal = await wait_for_terminal(agent, job_id)
-    assert terminal.summary.status is JobStatus.SUCCEEDED
-    assert terminal.origin_run_id == run_id
+    assert terminal.job.state is GraphState.SUCCEEDED
+    assert terminal.job.origin_run_id == run_id
     result = await agent.read_job_result(job_id)
-    assert result is not None and result.summary["sampled_rows"] == 5
+    assert result is not None and result.payload["sampled_rows"] == 5
     return job_id
 
 

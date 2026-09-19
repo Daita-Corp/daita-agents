@@ -117,7 +117,7 @@ async def test_live_planner_uses_typed_replacement_without_production_cutover(
                 specification_digest=job_specification.digest,
             ),
         )
-        await integration.owner.admit_static_graph(admission)
+        await integration.owner.admit(admission)
         worker = next(task for task in admission.tasks if task.role is TaskRole.WORKER)
         claimed_at = integration.clock()
         attempt = await integration.store.claim_graph_task(
@@ -166,7 +166,7 @@ async def test_live_planner_uses_typed_replacement_without_production_cutover(
             fencing_epoch=attempt.fencing_epoch,
         )
 
-        await integration.supervisor.start_graph_integration()
+        await integration.supervisor.start()
         terminal = await integration.wait_terminal(admission.job.job_id, timeout=180)
         assert terminal.job.state is GraphState.SUCCEEDED
         original = next(

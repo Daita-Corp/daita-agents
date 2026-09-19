@@ -19,10 +19,9 @@ from daita import (
     ConversationRun,
     DeliveryInspection,
     DistributionDestination,
+    GraphInspection,
+    GraphJob,
     InboxView,
-    JobInspection,
-    JobResultView,
-    JobSummary,
     LearningCandidateRejectionReason,
     LearningCandidateStatus,
     LearningReviewStatus,
@@ -36,6 +35,7 @@ from daita import (
     ScheduledRoutine,
     ScheduledRoutineInspection,
     ScheduledRoutineSummary,
+    TaskResult,
     Transcript,
 )
 from daita.agent import (
@@ -641,7 +641,7 @@ class PresentationController:
     async def list_sources(self) -> tuple[Any, ...]:
         return await self.require_agent().list_sources()
 
-    async def list_jobs(self) -> tuple[JobSummary, ...]:
+    async def list_jobs(self) -> tuple[GraphJob, ...]:
         return await self.require_agent().list_jobs(limit=50)
 
     async def list_inbox(self) -> tuple[InboxView, ...]:
@@ -667,13 +667,13 @@ class PresentationController:
     async def acknowledge_inbox(self, delivery_id: str) -> InboxView | None:
         return await self.require_agent().acknowledge_inbox(delivery_id)
 
-    async def inspect_job(self, job_id: str) -> JobInspection | None:
+    async def inspect_job(self, job_id: str) -> GraphInspection | None:
         return await self.require_agent().inspect_job(job_id)
 
-    async def read_job_result(self, job_id: str) -> JobResultView | None:
+    async def read_job_result(self, job_id: str) -> TaskResult | None:
         return await self.require_agent().read_job_result(job_id)
 
-    async def cancel_job(self, job_id: str) -> JobInspection | None:
+    async def cancel_job(self, job_id: str) -> GraphJob | None:
         return await self.require_agent().cancel_job(job_id)
 
     async def list_routines(self) -> tuple[ScheduledRoutineSummary, ...]:

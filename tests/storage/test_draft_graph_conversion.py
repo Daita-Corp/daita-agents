@@ -11,24 +11,52 @@ from pathlib import Path
 
 import pytest
 
-from daita.autonomy import FollowupConclusionEvidence, create_terminal_job_followup
 from daita.capabilities import ExecutionContractBindings
 from daita.distribution.models import (
     ConversationInboxTarget,
-    Delivery,
     DeliveryState,
-    DeliverySubjectKind,
     OutcomeConclusionKind,
     OutcomeReference,
     OutcomeState,
-    logical_delivery_key,
 )
 from daita.jobs.graph.models import GraphState
-from daita.jobs.models import (
+from daita.llm.models import ModelSensitivity
+from daita.loop.models import LoopLimits
+from daita.storage.graph_schema import (
+    GRAPH_TABLE_NAMES,
+    connect_graph,
+)
+from daita.storage.home_migrations.revision_0001 import REVISION_1
+from daita.storage.home_migrations.revision_0001_schema import (
+    REVISION_1_DATABASE_SQL,
+)
+from daita.storage.home_migrations.revision_0002_conversion import (
+    publish_revision_2_for_test,
+    stage_revision_2_home,
+    validate_revision_2_home,
+)
+from daita.storage.home_migrations.revision_0002_legacy_autonomy import (
+    FollowupConclusionEvidence,
+    create_terminal_job_followup,
+)
+from daita.storage.home_migrations.revision_0002_legacy_autonomy_codecs import (
+    encode_autonomous_followup,
+)
+from daita.storage.home_migrations.revision_0002_legacy_delivery import (
+    Revision1Delivery,
+    Revision1DeliverySubjectKind,
+    encode_revision_1_delivery,
+    revision_1_logical_delivery_key,
+)
+from daita.storage.home_migrations.revision_0002_legacy_job_codecs import (
+    encode_job_run,
+)
+from daita.storage.home_migrations.revision_0002_legacy_jobs import (
     ConnectedExecutorBinding,
     ExternalIntent,
     ExternalIntentDisposition,
     ExternalIntentKind,
+    JobAttempt,
     JobAttemptStatus,
     JobDesiredState,
     JobExecutionMode,
@@ -38,21 +66,7 @@ from daita.jobs.models import (
     JobSpecification,
     JobStatus,
 )
-from daita.llm.models import ModelSensitivity
-from daita.loop.models import LoopLimits
-from daita.storage.draft_graph_conversion import (
-    publish_draft_revision_2_for_test,
-    stage_draft_revision_2_home,
-    validate_draft_revision_2_home,
-)
-from daita.storage.draft_graph_schema import (
-    DRAFT_GRAPH_TABLE_NAMES,
-    connect_draft_graph,
-)
 from daita.storage.sqlite import SQLiteStateStore
-from daita.storage.sqlite_codecs.autonomy import encode_autonomous_followup
-from daita.storage.sqlite_codecs.distribution import encode_delivery
-from daita.storage.sqlite_codecs.jobs import encode_job_run
 from tests.support.graph import GRAPH_NOW
 
 pytestmark = pytest.mark.integration
@@ -85,6 +99,16 @@ def _create_revision_1_golden(target: Path) -> None:
         )
     finally:
         connection.close()
+
+
+def _create_empty_revision_1_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(REVISION_1_DATABASE_SQL)
+        connection.execute(
+            "INSERT INTO agent_home_migrations(revision, migration_id, checksum) "
+            "VALUES (1, ?, ?)",
+            (REVISION_1.migration_id, REVISION_1.checksum),
+        )
 
 
 def _specification(
@@ -148,21 +172,18 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
     source = tmp_path / "source"
     source.mkdir()
     (source / "USER.md").write_text("owner data\n", encoding="utf-8")
-    store = await SQLiteStateStore.open(source / "state.db")
-    await store.admit_job(_job("queued"))
-    await store.admit_job(
-        _job("connected", execution_mode=JobExecutionMode.CONNECTED_EXECUTOR)
-    )
-    await store.admit_job(_job("a-succeeded"))
-    claimed = await store.claim_next_job(
-        "agent-1",
+    _create_empty_revision_1_database(source / "state.db")
+    succeeded_attempt = JobAttempt(
+        number=1,
+        fencing_epoch=1,
         claim_token="claim-1",
         execution_run_id="run-1",
         reserved_artifact_id="artifact-1",
+        status=JobAttemptStatus.SUCCEEDED,
         claimed_at=GRAPH_NOW + timedelta(seconds=1),
-        lease_seconds=30,
+        lease_expires_at=GRAPH_NOW + timedelta(seconds=31),
+        completed_at=GRAPH_NOW + timedelta(seconds=2),
     )
-    assert claimed is not None and claimed.job_id == "a-succeeded"
     result = JobResult(
         result_id="job-result-1",
         summary={"profiled_resources": 1},
@@ -171,26 +192,28 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
         artifact_refs=(),
         completed_at=GRAPH_NOW + timedelta(seconds=2),
     )
-    settled = await store.finalize_job_attempt(
-        "agent-1",
-        "a-succeeded",
-        claim_token="claim-1",
-        fencing_epoch=claimed.fencing_epoch,
-        attempt_status=JobAttemptStatus.SUCCEEDED,
-        completed_at=GRAPH_NOW + timedelta(seconds=2),
+    succeeded = replace(
+        _job("a-succeeded"),
+        status=JobStatus.SUCCEEDED,
+        updated_at=GRAPH_NOW + timedelta(seconds=2),
+        revision=3,
+        fencing_epoch=1,
+        attempts=(succeeded_attempt,),
+        terminal_at=GRAPH_NOW + timedelta(seconds=2),
         result=result,
     )
-    connected_claimed = await store.claim_next_job(
-        "agent-1",
+    connected_attempt = JobAttempt(
+        number=1,
+        fencing_epoch=1,
         claim_token="claim-2",
         execution_run_id="run-2",
         reserved_artifact_id="artifact-2",
+        status=JobAttemptStatus.CLAIMED,
         claimed_at=GRAPH_NOW + timedelta(seconds=2),
-        lease_seconds=30,
+        lease_expires_at=GRAPH_NOW + timedelta(seconds=32),
     )
-    assert connected_claimed is not None and connected_claimed.job_id == "connected"
     connected_attempt = replace(
-        connected_claimed.attempts[0],
+        connected_attempt,
         external_intents=(
             ExternalIntent(
                 kind=ExternalIntentKind.START,
@@ -203,22 +226,33 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
         ),
     )
     connected_with_evidence = replace(
-        connected_claimed,
+        _job("connected", execution_mode=JobExecutionMode.CONNECTED_EXECUTOR),
+        status=JobStatus.RUNNING,
         attempts=(connected_attempt,),
-        revision=connected_claimed.revision + 1,
+        revision=3,
+        fencing_epoch=1,
+        updated_at=GRAPH_NOW + timedelta(seconds=2),
     )
     # The connected job intentionally remains nonterminal and maps to attention.
-    claimed = await store.claim_next_job(
-        "agent-1",
+    queued_attempt = JobAttempt(
+        number=1,
+        fencing_epoch=1,
         claim_token="claim-3",
         execution_run_id="run-3",
         reserved_artifact_id="artifact-3",
+        status=JobAttemptStatus.CLAIMED,
         claimed_at=GRAPH_NOW + timedelta(seconds=3),
-        lease_seconds=30,
+        lease_expires_at=GRAPH_NOW + timedelta(seconds=33),
     )
-    assert claimed is not None and claimed.job_id == "queued"
+    queued = replace(
+        _job("queued"),
+        status=JobStatus.RUNNING,
+        updated_at=GRAPH_NOW + timedelta(seconds=3),
+        revision=2,
+        fencing_epoch=1,
+        attempts=(queued_attempt,),
+    )
     # Running native work has exact restart-safe evidence and remains runnable.
-    await store.close()
 
     terminal_time = GRAPH_NOW + timedelta(seconds=5)
     failed = replace(
@@ -342,17 +376,17 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
         failure_code="test_completed_followup_failure",
         observed_at=terminal_time + timedelta(seconds=2),
     )
-    old_logical_key = logical_delivery_key(
+    old_logical_key = revision_1_logical_delivery_key(
         agent_id="agent-1",
-        subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
+        subject_kind=Revision1DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
         subject_id=completed_followup.followup_id,
         target_fingerprint=target_binding.target_fingerprint,
     )
-    delivery = Delivery(
+    delivery = Revision1Delivery(
         delivery_id="delivery-1",
         agent_id="agent-1",
         conversation_id="conversation-1",
-        subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
+        subject_kind=Revision1DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
         subject_id=completed_followup.followup_id,
         logical_key=old_logical_key,
         target=target_binding,
@@ -364,19 +398,14 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
         updated_at=terminal_time + timedelta(seconds=2),
     )
     with sqlite3.connect(source / "state.db") as connection:
-        connection.execute(
-            "UPDATE job_runs SET data = ? WHERE agent_id = ? AND job_id = ?",
-            (
-                encode_job_run(connected_with_evidence),
-                connected_with_evidence.agent_id,
-                connected_with_evidence.job_id,
-            ),
-        )
         connection.executemany(
             "INSERT INTO job_runs(agent_id, job_id, data) VALUES (?, ?, ?)",
             (
                 (job.agent_id, job.job_id, encode_job_run(job))
                 for job in (
+                    succeeded,
+                    connected_with_evidence,
+                    queued,
                     failed,
                     cancelled,
                     attention,
@@ -428,14 +457,12 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
                 delivery.target.target_fingerprint,
                 delivery.visibility_state.value,
                 int(delivery.created_at.timestamp() * 1_000_000),
-                encode_delivery(delivery),
+                encode_revision_1_delivery(delivery),
             ),
         )
 
     target = tmp_path / "target"
-    report = stage_draft_revision_2_home(
-        source, target, now=GRAPH_NOW + timedelta(minutes=1)
-    )
+    report = stage_revision_2_home(source, target, now=GRAPH_NOW + timedelta(minutes=1))
 
     assert len(report.entries) == 12
     entries = {item.source_id: item for item in report.entries}
@@ -464,17 +491,19 @@ async def test_revision_one_jobs_convert_with_complete_executability_ledger(
     )
     assert completed_entry.evidence_classification == "delivered_followup"
     assert (target / "USER.md").read_bytes() == (source / "USER.md").read_bytes()
-    validate_draft_revision_2_home(source, target, report=report)
+    validate_revision_2_home(source, target, report=report)
 
-    draft_store = await SQLiteStateStore.open_draft_graph(target / "state.db")
-    succeeded = await draft_store.inspect_graph("agent-1", "a-succeeded")
-    assert succeeded is not None
-    assert succeeded.job.terminal_result_id == "a-succeeded:final-result"
-    assert len(succeeded.results) == 2
+    draft_store = await SQLiteStateStore.open(
+        target / "state.db", current_home_validated=True
+    )
+    succeeded_graph = await draft_store.inspect_graph("agent-1", "a-succeeded")
+    assert succeeded_graph is not None
+    assert succeeded_graph.job.terminal_result_id == "a-succeeded:final-result"
+    assert len(succeeded_graph.results) == 2
     connected = await draft_store.inspect_graph("agent-1", "connected")
     assert connected is not None
     assert "remote-job-1" in str(connected.job.migration_provenance["attempt_evidence"])
-    with connect_draft_graph(target / "state.db", read_only=True) as connection:
+    with connect_graph(target / "state.db", read_only=True) as connection:
         migrated_delivery = connection.execute(
             "SELECT subject_kind, subject_id, logical_key, data "
             "FROM deliveries WHERE delivery_id = 'delivery-1'"
@@ -496,14 +525,14 @@ def test_revision_one_golden_whole_home_converts_to_frozen_draft_manifest(
     _create_revision_1_golden(source)
     expected = json.loads((DRAFT_GOLDEN / "expected.json").read_text())
 
-    report = stage_draft_revision_2_home(source, target, now=GRAPH_NOW)
+    report = stage_revision_2_home(source, target, now=GRAPH_NOW)
     files = sorted(
         path.relative_to(target).as_posix()
         for path in target.rglob("*")
         if path.is_file()
         and path.name not in {"state.db", "state.db-wal", "state.db-shm"}
     )
-    with connect_draft_graph(target / "state.db", read_only=True) as connection:
+    with connect_graph(target / "state.db", read_only=True) as connection:
         table_count = len(
             tuple(
                 connection.execute(
@@ -521,7 +550,7 @@ def test_revision_one_golden_whole_home_converts_to_frozen_draft_manifest(
         "table_count": table_count,
         "non_database_paths": files,
     } == expected
-    assert table_count == len(DRAFT_GRAPH_TABLE_NAMES)
+    assert table_count == len(GRAPH_TABLE_NAMES)
 
 
 @pytest.mark.parametrize(
@@ -554,7 +583,7 @@ def test_interrupted_publication_restores_exact_revision_one_state(
             raise RuntimeError(f"interrupted at {phase}")
 
     with pytest.raises(RuntimeError, match="interrupted"):
-        publish_draft_revision_2_for_test(
+        publish_revision_2_for_test(
             active,
             now=GRAPH_NOW,
             phase_hook=interrupt,

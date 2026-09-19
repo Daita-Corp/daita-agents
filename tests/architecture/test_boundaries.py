@@ -5,6 +5,7 @@ from pathlib import Path
 
 import daita
 from daita.capabilities import AccessMode, OperationalEffect
+from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.workspace import workspace_for
 
 PACKAGE = Path(daita.__file__).parent
@@ -137,16 +138,19 @@ def test_ratified_graph_target_has_one_execution_path_and_closed_model_origins()
     }
 
 
-def test_phase_one_model_origins_use_admission_and_run_sessions():
+def test_all_current_model_origins_use_admission_and_run_sessions():
     embedded_path = PACKAGE / "hosting" / "embedded.py"
     embedded = embedded_path.read_text(encoding="utf-8")
     routing = (PACKAGE / "llm" / "routing.py").read_text(encoding="utf-8")
 
-    for origin in ("_run", "execute_routine_run", "_execute_followup"):
+    for origin in ("_run", "execute_routine_run"):
         body = _function_text(embedded_path, origin)
         assert "admit_execution" in body
         assert "RunSession(" in body
         assert "RunSessionWriter(" in body
+    supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
+    assert "RunSession(" in supervisor
+    assert "RunSessionWriter(" in supervisor
     assert "return await self._run(" in _function_text(embedded_path, "learn")
     assert "return await self._run(" in _function_text(
         embedded_path, "accept_learning_candidate"
@@ -167,7 +171,7 @@ def test_phase_one_model_origins_use_admission_and_run_sessions():
     assert "async with permit" in routing
 
 
-def test_phase_one_removed_global_run_state_without_graph_cutover():
+def test_cutover_removed_global_run_state_and_registered_only_revision_two():
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
@@ -180,7 +184,6 @@ def test_phase_one_removed_global_run_state_without_graph_cutover():
     migrations = (PACKAGE / "storage" / "home_migrations" / "registry.py").read_text(
         encoding="utf-8"
     )
-    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
 
     assert "self._run_lock" not in embedded
     assert "def _run_locked" not in embedded
@@ -197,16 +200,19 @@ def test_phase_one_removed_global_run_state_without_graph_cutover():
     assert "_scheduled_bindings" not in skills
     assert "self._one_time" not in delivery
     assert "_source_permission_lock" in embedded
-    assert "HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1,)" in migrations
-    assert "CREATE TABLE graph_" not in schema
-    assert "REVISION_2" not in migrations
+    assert (
+        "HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2)"
+        in migrations
+    )
+    assert "job_graphs" in CURRENT_SCHEMA.tables
+    assert "autonomous_followups" not in CURRENT_SCHEMA.tables
+    assert "REVISION_2" in migrations
 
 
-def test_draft_graph_kernel_is_unregistered_and_unreachable_from_composition():
+def test_current_graph_kernel_is_registered_and_legacy_runtime_is_unreachable():
     registry = (PACKAGE / "storage" / "home_migrations" / "registry.py").read_text(
         encoding="utf-8"
     )
-    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     codec_exports = (PACKAGE / "storage" / "sqlite_codecs" / "__init__.py").read_text(
         encoding="utf-8"
     )
@@ -221,16 +227,17 @@ def test_draft_graph_kernel_is_unregistered_and_unreachable_from_composition():
     graph_supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
 
     assert "draft_revision_0002" not in registry
-    assert "REVISION_2" not in registry
-    assert "job_graphs" not in schema
+    assert "REVISION_2" in registry
+    assert "job_graphs" in CURRENT_SCHEMA.tables
     assert "draft_graph" not in codec_exports
     assert "open_draft_graph" not in production_roots
-    assert "admit_graph" not in production_roots
-    assert "claim_graph_task" not in production_roots
-    assert "start_graph_integration" not in production_roots
-    assert "start_graph_integration" in graph_supervisor
+    assert "GraphAdmissionCapabilityDomain" in production_roots
+    assert "await job_supervisor.start()" in production_roots
     assert "RunOrigin.JOB_TASK" in graph_supervisor
-    assert "start_graph_job" not in production_roots
+    assert "_ProcessJobCapacity" not in graph_supervisor
+    assert "start_graph_integration" not in graph_supervisor
+    assert not (PACKAGE / "autonomy.py").exists()
+    assert not (PACKAGE / "jobs" / "models.py").exists()
 
 
 def test_common_runtime_has_one_owner_and_no_domain_dependencies():
@@ -431,9 +438,7 @@ def test_mcp_is_server_neutral_lazy_and_uses_existing_runtime_owners():
     assert "MCP_RECEIPT_POLICY" in domain
     assert "activate_mcp_domain" in embedded
     assert "mcp_domain" in embedded
-    assert "mcp_server_bindings" in (
-        PACKAGE / "storage" / "sqlite_schema.py"
-    ).read_text(encoding="utf-8")
+    assert "mcp_server_bindings" in CURRENT_SCHEMA.tables
 
     for fixture_only in (
         "alpha.fixture.test",
@@ -527,6 +532,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
             "data_profile_jobs",
             "distribution",
             "jobs",
+            "jobs.graph_task",
             "memory",
             "routines",
             "semantics",
@@ -632,19 +638,18 @@ def test_public_surface_is_focused():
         "LearningCandidateView",
         "LearningReviewResult",
         "LearningReviewStatus",
-        "JobExecutionMode",
+        "GraphInspection",
+        "GraphJob",
+        "GraphState",
         "InboxView",
         "IntervalSchedule",
-        "JobInspection",
-        "JobResultView",
-        "JobStatus",
-        "JobSummary",
         "LocalFileAccess",
         "LocalWorkspace",
         "LoopExit",
         "LoopExitKind",
         "LoopLimits",
         "TOOLBOX_DEFINITIONS",
+        "TaskResult",
         "ToolLoadMode",
         "ToolPresentation",
         "ToolboxDefinition",
@@ -756,14 +761,15 @@ def test_confirmed_dead_error_and_learning_candidate_apis_do_not_return():
     }.isdisjoint(daita.__all__)
 
 
-def test_jobs_have_one_aggregate_and_no_parallel_execution_system():
-    assert _class_owners("JobRun") == {"jobs/models.py"}
+def test_jobs_have_one_graph_aggregate_and_no_parallel_execution_system():
+    assert _class_owners("GraphJob") == {"jobs/graph/models.py"}
     assert _class_owners("JobOwner") == {"jobs/owner.py"}
     assert _class_owners("JobSupervisor") == {"jobs/supervisor.py"}
     assert _class_owners("InternalCapabilityRequest") == {"capability_runtime.py"}
 
-    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
-    assert "CREATE TABLE job_runs" in schema
+    assert "job_runs" in CURRENT_SCHEMA.tables
+    assert "job_graphs" in CURRENT_SCHEMA.tables
+    assert "job_task_attempts" in CURRENT_SCHEMA.tables
     for parallel_table in (
         "job_attempts",
         "job_results",
@@ -772,21 +778,22 @@ def test_jobs_have_one_aggregate_and_no_parallel_execution_system():
         "job_events",
         "job_schedules",
     ):
-        assert f"CREATE TABLE {parallel_table}" not in schema
+        assert parallel_table not in CURRENT_SCHEMA.tables
 
 
-def test_followups_and_distribution_have_single_owners_without_parallel_runtime():
-    assert _class_owners("AutonomousFollowup") == {"autonomy.py"}
+def test_graph_finalization_and_distribution_have_single_current_owners():
+    assert _class_owners("AutonomousFollowup") == {
+        "storage/home_migrations/revision_0002_legacy_autonomy.py"
+    }
     assert _class_owners("Delivery") == {"distribution/models.py"}
     assert _class_owners("DistributionOwner") == {"distribution/owner.py"}
     assert _class_owners("RunStartEnvelope") == {"loop/models.py"}
     assert _class_owners("InboxScreen") == {"tui/screens/inbox.py"}
-    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
-    assert "CREATE TABLE autonomous_followups" in schema
-    assert "CREATE TABLE deliveries" in schema
+    assert "autonomous_followups" not in CURRENT_SCHEMA.tables
+    assert "deliveries" in CURRENT_SCHEMA.tables
     production = _python_text(PACKAGE)
     assert "InboxItem" not in production
-    assert "conversation_inbox" not in schema
+    assert "conversation_inbox" not in CURRENT_SCHEMA.tables
     assert "allowed_read_capabilities" not in production
     assert "mark_job_terminal_observed" not in production
     sqlite = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
@@ -804,7 +811,7 @@ def test_followups_and_distribution_have_single_owners_without_parallel_runtime(
         "delivery_attempts",
         "completion_routes",
     ):
-        assert f"CREATE TABLE {table}" not in schema
+        assert table not in CURRENT_SCHEMA.tables
 
     runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     supervisor = (PACKAGE / "jobs" / "supervisor.py").read_text(encoding="utf-8")
@@ -1003,14 +1010,13 @@ def test_skills_extend_the_advisory_owner_with_two_writes():
 
 def test_semantics_use_existing_storage_context_and_runtime_owners():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
-    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
     assert _class_owners("SemanticAnnotation") == {"semantics.py"}
     assert _class_owners("SemanticSubject") == {"semantics.py"}
     assert 'SEMANTIC_SAVE_TOOL_NAME = "semantic_save"' in semantics
     assert 'SEMANTIC_DELETE_TOOL_NAME = "semantic_delete"' in semantics
-    assert "CREATE TABLE semantic_annotations" in schema
+    assert "semantic_annotations" in CURRENT_SCHEMA.tables
     assert "class SemanticCapabilityDomain" in semantics
     assert "semantic_resource_facts" in semantics
     assert "_annotation_issue" in semantics
@@ -1055,7 +1061,6 @@ def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
     runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
     storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
-    schema = (PACKAGE / "storage" / "sqlite_schema.py").read_text(encoding="utf-8")
     evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
     candidates = (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
     package_text = _python_text(PACKAGE)
@@ -1082,7 +1087,7 @@ def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
     ):
         assert capability_id not in runtime
     assert "semantic_annotations" in storage
-    assert "CREATE TABLE learning_candidates" in schema
+    assert "learning_candidates" in CURRENT_SCHEMA.tables
     assert "tools=()" in candidates
     assert "AgentLoop" not in candidates
     assert "CapabilityRuntime" not in candidates
@@ -1327,7 +1332,7 @@ def test_artifact_continuity_uses_current_context_and_export_owners():
 def test_job_scope_has_one_agent_owner_and_no_conversation_gate():
     capabilities = (PACKAGE / "jobs" / "capabilities.py").read_text(encoding="utf-8")
     owner = (PACKAGE / "jobs" / "owner.py").read_text(encoding="utf-8")
-    models = (PACKAGE / "jobs" / "models.py").read_text(encoding="utf-8")
+    models = (PACKAGE / "jobs" / "graph" / "models.py").read_text(encoding="utf-8")
     embedded = (PACKAGE / "hosting" / "embedded.py").read_text(encoding="utf-8")
 
     for obsolete in (
@@ -1338,8 +1343,8 @@ def test_job_scope_has_one_agent_owner_and_no_conversation_gate():
     ):
         assert obsolete not in capabilities + owner
     assert "job_owner_agent_scope" in capabilities
-    assert "origin_conversation_id" in capabilities
-    assert "origin_conversation_id" in models
+    assert "conversation_id" in capabilities
+    assert "conversation_id" in models
     assert (
         "conversation_id: str | None = None"
         not in owner.split("class JobOwner:", 1)[1].split("async def inspect", 1)[1]
@@ -2051,6 +2056,14 @@ def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
         "models.py",
         "registry.py",
         "revision_0001.py",
+        "revision_0001_schema.py",
+        "revision_0002.py",
+        "revision_0002_conversion.py",
+        "revision_0002_legacy_autonomy.py",
+        "revision_0002_legacy_autonomy_codecs.py",
+        "revision_0002_legacy_delivery.py",
+        "revision_0002_legacy_job_codecs.py",
+        "revision_0002_legacy_jobs.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 

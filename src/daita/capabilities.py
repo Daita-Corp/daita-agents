@@ -620,12 +620,12 @@ class ExecutionScope:
     per_run_max_tokens: int
     distribution_plan_digest: str
     contract_bindings: ExecutionContractBindings
+    scope_kind: ExecutionScopeKind
     routine_id: str | None = None
     routine_revision: int | None = None
     occurrence_id: str | None = None
     allowed_connector_binding_ids: tuple[str, ...] = ()
     capability_grants: tuple[CapabilityGrant, ...] = ()
-    scope_kind: ExecutionScopeKind | None = None
     graph_task_binding: GraphTaskBinding | None = None
 
     def __post_init__(self) -> None:
@@ -709,16 +709,9 @@ class ExecutionScope:
             raise ValueError(
                 "execution scope capability and route ceilings cannot be empty"
             )
-        inferred_kind = self.scope_kind
-        if inferred_kind is None:
-            inferred_kind = (
-                ExecutionScopeKind.SCHEDULED_ROUTINE
-                if self.routine_id is not None
-                else ExecutionScopeKind.JOB_EVENT
-            )
-        if not isinstance(inferred_kind, ExecutionScopeKind):
+        if not isinstance(self.scope_kind, ExecutionScopeKind):
             raise TypeError("execution scope kind is invalid")
-        if inferred_kind is ExecutionScopeKind.GRAPH_TASK:
+        if self.scope_kind is ExecutionScopeKind.GRAPH_TASK:
             if self.routine_id is not None or self.graph_task_binding is None:
                 raise ValueError("graph-task scope requires only its task binding")
             if self.job_id is None or self.job_id != self.graph_task_binding.job_id:
@@ -731,18 +724,18 @@ class ExecutionScope:
                 )
         elif self.graph_task_binding is not None:
             raise ValueError("only a graph-task scope may carry a task binding")
-        elif inferred_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
+        elif self.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
             if self.routine_id is None:
                 raise ValueError("scheduled scope requires routine identity")
         elif self.routine_id is not None:
             raise ValueError("routine identity requires a scheduled scope")
-        if inferred_kind is ExecutionScopeKind.JOB_EVENT:
+        if self.scope_kind is ExecutionScopeKind.JOB_EVENT:
             if not sources or not resources or connector_bindings:
                 raise ValueError(
                     "non-routine execution scope requires source/resource ceilings "
                     "and cannot contain connector bindings"
                 )
-        elif inferred_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
+        elif self.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
             if bool(sources) != bool(resources):
                 raise ValueError(
                     "scheduled source and resource ceilings must be present together"
@@ -855,9 +848,9 @@ class ExecutionScope:
                         "capability_grants": tuple(
                             grant.material() for grant in self.capability_grants
                         ),
+                        "scope_kind": self.scope_kind.value,
                         **(
                             {
-                                "scope_kind": self.scope_kind.value,
                                 "graph_task_binding": {
                                     "digest": self.graph_task_binding.digest,
                                 },

@@ -27,7 +27,7 @@ from ..storage.home_migrations import (
 )
 from ..storage.home_migrations.models import HomeMigration
 from ..storage.home_migrations.revision_0001 import detect_preproduction_shape
-from ..storage.sqlite_schema import require_healthy, require_schema
+from ..storage.schema_contract import require_healthy, require_schema
 
 _UPGRADE_DIRECTORY = ".home-upgrade"
 _ROLLBACK_DIRECTORY = ".home-rollbacks"
@@ -567,6 +567,16 @@ def _stage_upgrade(
             insert_migration_row(connection, migration)
             require_schema(connection, migration.target_schema)
             require_healthy(connection)
+            connection.commit()
+            checkpoint = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if (
+                checkpoint is None
+                or int(checkpoint[0]) != 0
+                or int(checkpoint[1]) != int(checkpoint[2])
+            ):
+                raise ValueError("staged migration WAL checkpoint did not complete")
         source_shape = None
     validate_home(home, stage, frozenset(affected_paths))
     for entry in files:
@@ -587,6 +597,9 @@ def _atomic_publish(source: Path, destination: Path) -> None:
     try:
         _copy_regular(source, temporary)
         os.replace(temporary, destination)
+        if destination.name == "state.db":
+            destination.with_name("state.db-wal").unlink(missing_ok=True)
+            destination.with_name("state.db-shm").unlink(missing_ok=True)
         _fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)

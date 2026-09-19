@@ -85,7 +85,6 @@ class RunSessionOptions:
     learning_candidate_id: str | None = None
     learning_candidate_text: str | None = None
     learning_candidate_sensitivity: ModelSensitivity | None = None
-    selected_executor_profile_id: str | None = None
     retained_skill_bindings: tuple[tuple[str, str], ...] = ()
     one_time_artifact_destinations: tuple[object, ...] = ()
     task_context: object | None = None
@@ -129,11 +128,6 @@ class RunSessionOptions:
             is not self.learning_candidate_sensitivity
         ):
             raise ValueError("learning candidate session binding is inconsistent")
-        if self.selected_executor_profile_id is not None and (
-            not isinstance(self.selected_executor_profile_id, str)
-            or not self.selected_executor_profile_id
-        ):
-            raise ValueError("selected executor profile must be non-empty text")
         bindings = tuple(self.retained_skill_bindings)
         if any(
             not isinstance(item, tuple)

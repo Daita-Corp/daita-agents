@@ -11,6 +11,7 @@ from daita.capabilities import (
     AutomationEligibility,
     CapabilityDeclarations,
     ExecutionScope,
+    ExecutionScopeKind,
     Executor,
     OperationalEffect,
     ToolExecution,
@@ -123,12 +124,12 @@ def _delivery(owner: DistributionOwner) -> Delivery:
         delivery_id="delivery-1",
         agent_id="agent-1",
         conversation_id="conversation-1",
-        subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
-        subject_id="followup-1",
+        subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
+        subject_id="occurrence-1",
         logical_key=logical_delivery_key(
             agent_id="agent-1",
-            subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
-            subject_id="followup-1",
+            subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
+            subject_id="occurrence-1",
             target_fingerprint=target.target_fingerprint,
         ),
         target=target,
@@ -210,6 +211,7 @@ async def test_scheduled_scope_cannot_discover_or_inspect_distribution() -> None
         routine_id="routine-1",
         routine_revision=1,
         occurrence_id="occurrence-1",
+        scope_kind=ExecutionScopeKind.SCHEDULED_ROUTINE,
     )
     scheduled = RunInput(
         id="run-scheduled",

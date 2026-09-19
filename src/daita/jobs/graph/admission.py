@@ -725,7 +725,7 @@ class StartGraphJobExecutor:
             deadline_seconds=deadline_seconds,
             proposal=proposal,
         )
-        job = await self._owner.admit_static_graph(admission)
+        job = await self._owner.admit(admission)
         return ToolOutput(
             kind=START_GRAPH_JOB_OUTPUT_KIND,
             data={
@@ -757,7 +757,7 @@ class GraphAdmissionCapabilityDomain:
         return self._declarations
 
     async def project(
-        self, run: RunInput, *, session: RunSession | None = None
+        self, run: RunInput, session: RunSession | None = None
     ) -> tuple[str, ...]:
         del session
         return (START_GRAPH_JOB_TOOL_NAME,) if run.origin is RunOrigin.USER else ()

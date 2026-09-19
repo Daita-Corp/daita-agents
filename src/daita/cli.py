@@ -94,7 +94,7 @@ _CANDIDATE_REVIEW_COST_LIMIT_ENV = "DAITA_CANDIDATE_REVIEW_MAX_COST_USD"
 
 
 def _graph_inspection_mapping(inspection: GraphInspection) -> dict[str, object]:
-    """Project one bounded draft-graph inspection for integration CLI tests."""
+    """Project one bounded current graph inspection for the CLI."""
 
     if not isinstance(inspection, GraphInspection):
         raise TypeError("graph inspection projection requires GraphInspection")

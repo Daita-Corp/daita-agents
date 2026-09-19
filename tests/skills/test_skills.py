@@ -48,6 +48,7 @@ from daita.skills.capabilities import (
     SKILL_VIEW_OUTPUT_KIND,
     SKILL_VIEW_TOOL_NAME,
 )
+from daita.storage.graph_schema import GRAPH_TABLE_NAMES
 from daita.storage.home_migrations import migration_rows
 from tests.support.capability_runtime import execute_projected
 from tests.support.toolbox_model import (
@@ -1048,26 +1049,7 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
                 "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        assert tables == {
-            "autonomous_followups",
-            "deliveries",
-            "effect_receipts",
-            "learning_candidates",
-            "job_runs",
-            "mcp_server_bindings",
-            "messages",
-            "metadata",
-            "relational_write_scopes",
-            "runs",
-            "routine_occurrences",
-            "scheduled_routines",
-            "semantic_annotations",
-            "snapshots",
-            "source_read_scopes",
-            "sources",
-            "agent_home_migrations",
-            "syncs",
-        }
+        assert tables == GRAPH_TABLE_NAMES
         for table in tables:
             expected_rows = 1 if table == "metadata" else 0
             if table == "agent_home_migrations":

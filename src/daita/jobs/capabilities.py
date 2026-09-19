@@ -6,7 +6,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from .._json import FrozenJsonObject
-from ..artifacts.models import artifact_ref_to_mapping
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
@@ -27,13 +26,7 @@ from ..capabilities import (
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput
-from .models import (
-    MAX_JOB_LIST_PAGE_SIZE,
-    JobInspection,
-    JobResultView,
-    JobStatus,
-    JobSummary,
-)
+from .graph.models import GraphInspection, GraphJob, GraphState, TaskResult, TaskState
 from .owner import JobError, JobOwner
 
 JOB_DOMAIN_OWNER_ID = "jobs"
@@ -49,6 +42,7 @@ JOB_READ_RESULTS_TOOL_NAME = "job_read_results"
 JOB_CANCEL_CAPABILITY_ID = "jobs.cancel"
 JOB_CANCEL_EXECUTOR_ID = "jobs.cancel.executor"
 JOB_CANCEL_TOOL_NAME = "job_cancel"
+MAX_JOB_LIST_PAGE_SIZE = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,19 +61,19 @@ class JobListExecutor(_JobExecutor):
     executor_id = JOB_LIST_EXECUTOR_ID
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        raw_statuses = request.arguments.get("statuses", ())
-        assert isinstance(raw_statuses, tuple)
-        statuses = frozenset(JobStatus(item) for item in raw_statuses)
-        summaries = await self._owner.list(
-            statuses=statuses,
+        raw_states = request.arguments.get("states", ())
+        assert isinstance(raw_states, tuple)
+        states = frozenset(GraphState(item) for item in raw_states)
+        jobs = await self._owner.list(
+            states=states,
             limit=MAX_JOB_LIST_PAGE_SIZE,
         )
-        sensitivity = _summary_sensitivity(summaries)
+        sensitivity = _job_sensitivity(jobs)
         return ToolOutput(
             kind="job.list",
             data={
-                "jobs": tuple(_summary_payload(item) for item in summaries),
-                "count": len(summaries),
+                "jobs": tuple(_job_payload(item) for item in jobs),
+                "count": len(jobs),
             },
             sensitivity=sensitivity,
             sensitivity_provenance={
@@ -104,7 +98,7 @@ class JobInspectExecutor(_JobExecutor):
         return ToolOutput(
             kind="job.inspection",
             data=_inspection_payload(inspection),
-            sensitivity=inspection.summary.sensitivity,
+            sensitivity=inspection.job.specification.authority.sensitivity,
             sensitivity_provenance={
                 "authority": "job_owner_agent_scope",
                 "agent_id": self._owner.agent_id,
@@ -130,7 +124,7 @@ class JobReadResultsExecutor(_JobExecutor):
             raise CapabilityInputError(
                 "job_result_not_ready",
                 "The requested job does not have a successful result.",
-                {"status": inspection.summary.status.value},
+                {"state": inspection.job.state.value},
             )
         return ToolOutput(
             kind="job.result",
@@ -160,18 +154,18 @@ class JobCancelExecutor(_JobExecutor):
         return FrozenJsonObject.from_mapping(
             {
                 "job_id": job_id,
-                "status": inspection.summary.status.value,
-                "desired_state": inspection.desired_state.value,
-                "updated_at": inspection.summary.updated_at.isoformat(),
-                "specification_digest": inspection.specification_digest,
+                "state": inspection.job.state.value,
+                "desired_state": inspection.job.desired_state.value,
+                "updated_at": inspection.job.updated_at.isoformat(),
+                "specification_digest": inspection.job.specification_digest,
             }
         )
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         job_id = request.arguments["job_id"]
         assert isinstance(job_id, str)
-        inspection = await self._owner.cancel(job_id)
-        if inspection is None:
+        job = await self._owner.cancel(job_id)
+        if job is None:
             raise CapabilityInputError(
                 "job_not_found",
                 "The requested job is not owned by this agent.",
@@ -180,15 +174,11 @@ class JobCancelExecutor(_JobExecutor):
             kind="job.cancel_receipt",
             data={
                 "job_id": job_id,
-                "status": inspection.summary.status.value,
-                "desired_state": inspection.desired_state.value,
-                "cancel_requested_at": (
-                    None
-                    if inspection.cancel_requested_at is None
-                    else inspection.cancel_requested_at.isoformat()
-                ),
+                "state": job.state.value,
+                "desired_state": job.desired_state.value,
+                "updated_at": job.updated_at.isoformat(),
             },
-            sensitivity=inspection.summary.sensitivity,
+            sensitivity=job.specification.authority.sensitivity,
             sensitivity_provenance={
                 "authority": "job_owner_agent_scope",
                 "agent_id": self._owner.agent_id,
@@ -222,7 +212,14 @@ class JobCapabilityDomain:
         if await self._owner.list(limit=1):
             names.extend((JOB_INSPECT_TOOL_NAME, JOB_READ_RESULTS_TOOL_NAME))
         if await self._owner.list(
-            statuses=frozenset({JobStatus.QUEUED, JobStatus.RUNNING}),
+            states=frozenset(
+                {
+                    GraphState.QUEUED,
+                    GraphState.ACTIVE,
+                    GraphState.BLOCKED,
+                    GraphState.NEEDS_ATTENTION,
+                }
+            ),
             limit=1,
         ):
             names.append(JOB_CANCEL_TOOL_NAME)
@@ -321,13 +318,13 @@ def job_capability_declarations(owner: JobOwner) -> JobCapabilityDeclarations:
         input_schema={
             "type": "object",
             "properties": {
-                "statuses": {
+                "states": {
                     "type": "array",
                     "items": {
                         "type": "string",
-                        "enum": [item.value for item in JobStatus],
+                        "enum": [item.value for item in GraphState],
                     },
-                    "maxItems": len(JobStatus),
+                    "maxItems": len(GraphState),
                     "uniqueItems": True,
                 }
             },
@@ -467,9 +464,9 @@ def _list_schema() -> dict[str, object]:
 def _cancel_schema() -> dict[str, object]:
     properties = {
         "job_id": {"type": "string"},
-        "status": {"type": "string"},
+        "state": {"type": "string"},
         "desired_state": {"type": "string"},
-        "cancel_requested_at": {"type": ["string", "null"]},
+        "updated_at": {"type": "string"},
     }
     return {
         "type": "object",
@@ -479,107 +476,123 @@ def _cancel_schema() -> dict[str, object]:
     }
 
 
-def _summary_payload(value: JobSummary) -> dict[str, object]:
+def _job_payload(value: GraphJob) -> dict[str, object]:
+    authority = value.specification.authority
     return {
         "job_id": value.job_id,
-        "origin_conversation_id": value.origin_conversation_id,
-        "job_kind": value.job_kind,
-        "status": value.status.value,
-        "execution_mode": value.execution_mode.value,
-        "source_ids": value.source_ids,
-        "resource_ids": value.resource_ids,
-        "sensitivity": value.sensitivity.value,
+        "conversation_id": value.conversation_id,
+        "state": value.state.value,
+        "desired_state": value.desired_state.value,
+        "objective": value.specification.objective,
+        "source_ids": authority.source_ids,
+        "resource_ids": authority.resource_ids,
+        "sensitivity": authority.sensitivity.value,
         "created_at": value.created_at.isoformat(),
         "updated_at": value.updated_at.isoformat(),
-        "result_available": value.result_available,
+        "deadline_at": value.deadline_at.isoformat(),
+        "result_available": value.terminal_result_id is not None,
+        "failure_code": value.failure_code,
     }
 
 
-def _inspection_payload(value: JobInspection) -> dict[str, object]:
+def _inspection_payload(value: GraphInspection) -> dict[str, object]:
+    task_counts = {
+        state.value: sum(task.state is state for task in value.tasks)
+        for state in TaskState
+    }
     return {
-        **_summary_payload(value.summary),
-        "origin_run_id": value.origin_run_id,
-        "specification_digest": value.specification_digest,
-        "execution_capability_id": value.execution_capability_id,
-        "execution_contract_digest": value.execution_contract_digest,
-        "desired_state": value.desired_state.value,
-        "deadline_at": value.deadline_at.isoformat(),
+        **_job_payload(value.job),
+        "specification_digest": value.job.specification_digest,
+        "graph_revision": value.graph.revision,
+        "task_count": value.graph.task_count,
+        "edge_count": value.graph.edge_count,
+        "active_attempt_count": value.graph.active_attempt_count,
+        "task_counts": task_counts,
+        "tasks": tuple(
+            {
+                "task_id": task.task_id,
+                "title": task.specification.title,
+                "state": task.state.value,
+                "role": task.role.value,
+                "execution_kind": task.execution_kind.value,
+                "attempt_count": task.attempt_count,
+                "latest_result_id": task.latest_result_id,
+                "latest_control_id": task.latest_control_id,
+            }
+            for task in value.tasks
+        ),
+        "dependencies": tuple(
+            {
+                "upstream_task_id": edge.upstream_task_id,
+                "downstream_task_id": edge.downstream_task_id,
+                "edge_kind": edge.edge_kind.value,
+            }
+            for edge in value.dependencies
+        ),
         "attempts": tuple(
             {
-                "number": item.number,
-                "fencing_epoch": item.fencing_epoch,
-                "status": item.status.value,
-                "claimed_at": item.claimed_at.isoformat(),
-                "completed_at": (
-                    None if item.completed_at is None else item.completed_at.isoformat()
+                "attempt_id": attempt.attempt_id,
+                "task_id": attempt.task_id,
+                "ordinal": attempt.ordinal,
+                "fencing_epoch": attempt.fencing_epoch,
+                "state": attempt.state.value,
+                "run_id": attempt.run_id,
+                "lease_expires_at": (
+                    None
+                    if attempt.lease_expires_at is None
+                    else attempt.lease_expires_at.isoformat()
                 ),
-                "error_code": item.error_code,
-                "external_intents": tuple(
-                    {
-                        "kind": intent.kind.value,
-                        "disposition": intent.disposition.value,
-                        "requested_at": intent.requested_at.isoformat(),
-                        "completed_at": (
-                            None
-                            if intent.completed_at is None
-                            else intent.completed_at.isoformat()
-                        ),
-                        "external_job_id": intent.external_job_id,
-                        "reason_code": intent.reason_code,
-                    }
-                    for intent in item.external_intents
+                "absolute_deadline_at": attempt.absolute_deadline_at.isoformat(),
+                "started_at": (
+                    None
+                    if attempt.started_at is None
+                    else attempt.started_at.isoformat()
                 ),
-                "external_observations": tuple(
-                    {
-                        "sequence": observation.sequence,
-                        "status": observation.status.value,
-                        "observed_at": observation.observed_at.isoformat(),
-                        "observation_digest": observation.observation_digest,
-                        "external_job_id": observation.external_job_id,
-                    }
-                    for observation in item.external_observations
+                "ended_at": (
+                    None if attempt.ended_at is None else attempt.ended_at.isoformat()
                 ),
+                "heartbeat_at": (
+                    None
+                    if attempt.heartbeat_at is None
+                    else attempt.heartbeat_at.isoformat()
+                ),
+                "error_code": attempt.error_code,
             }
-            for item in value.attempts
+            for attempt in value.attempts
         ),
-        "cancel_requested_at": (
-            None
-            if value.cancel_requested_at is None
-            else value.cancel_requested_at.isoformat()
+        "open_controls": tuple(
+            control.control_id
+            for control in value.controls
+            if control.state.value == "open"
         ),
+        "delivery_ids": value.delivery_ids,
         "terminal_at": (
-            None if value.terminal_at is None else value.terminal_at.isoformat()
-        ),
-        "failure_code": value.failure_code,
-        "external_executor": (
-            None
-            if value.external_executor is None
-            else {
-                "profile_id": value.external_executor.profile_id,
-                "binding_id": value.external_executor.binding_id,
-                "execution_identity": value.external_executor.execution_identity,
-                "contract_digest": value.external_executor.contract_digest,
-                "revision": value.external_executor.revision,
-            }
+            None if value.job.terminal_at is None else value.job.terminal_at.isoformat()
         ),
     }
 
 
-def _result_payload(value: JobResultView) -> dict[str, object]:
+def _result_payload(value: TaskResult) -> dict[str, object]:
     return {
         "job_id": value.job_id,
+        "task_id": value.task_id,
         "result_id": value.result_id,
+        "attempt_id": value.attempt_id,
+        "run_id": value.run_id,
+        "result_kind": value.result_kind,
         "summary": value.summary,
+        "payload": value.payload,
         "sensitivity": value.sensitivity.value,
         "provenance": value.provenance,
-        "artifacts": tuple(
-            artifact_ref_to_mapping(item) for item in value.artifact_refs
-        ),
+        "artifact_ids": value.artifact_ids,
+        "verification": value.verification,
+        "residual_risk": value.residual_risk,
         "completed_at": value.completed_at.isoformat(),
+        "result_digest": value.result_digest,
     }
 
 
-def _summary_sensitivity(values: tuple[JobSummary, ...]) -> ModelSensitivity:
+def _job_sensitivity(values: tuple[GraphJob, ...]) -> ModelSensitivity:
     order = {
         ModelSensitivity.PUBLIC: 0,
         ModelSensitivity.INTERNAL: 1,
@@ -587,7 +600,7 @@ def _summary_sensitivity(values: tuple[JobSummary, ...]) -> ModelSensitivity:
         ModelSensitivity.RESTRICTED: 3,
     }
     return max(
-        (item.sensitivity for item in values),
+        (item.specification.authority.sensitivity for item in values),
         default=ModelSensitivity.INTERNAL,
         key=order.__getitem__,
     )

@@ -1,4 +1,4 @@
-"""Jobs-owned records and validation for the unregistered draft task graph."""
+"""Jobs-owned records and validation for the current durable task graph."""
 
 from .admission import InitialTaskProposal
 from .context import TaskContextBundle

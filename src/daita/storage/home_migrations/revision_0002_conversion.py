@@ -1,9 +1,4 @@
-"""Unregistered revision-1 to draft revision-2 conversion harness.
-
-This module is deliberately absent from the migration registry and package exports.
-It exists so Phase 2 can prove the complete conversion before revision 2 is frozen
-or published.
-"""
+"""Migration-owned revision-1 to revision-2 conversion and proof harness."""
 
 from __future__ import annotations
 
@@ -19,8 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from ..autonomy import AutonomousFollowup, FollowupDisposition
-from ..jobs.graph.models import (
+from ...jobs.graph.models import (
     AttemptState,
     BudgetAmount,
     BudgetLimit,
@@ -46,17 +40,15 @@ from ..jobs.graph.models import (
     canonical_digest,
     topology_digest,
 )
-from ..jobs.graph.validation import require_authority_subset, validate_graph_topology
-from ..jobs.models import (
-    JobAttempt,
-    JobAttemptStatus,
-    JobDesiredState,
-    JobExecutionMode,
-    JobRun,
-    JobStatus,
+from ...jobs.graph.validation import require_authority_subset, validate_graph_topology
+from ..graph_schema import (
+    connect_graph,
+    create_graph_database,
+    require_graph_schema,
 )
-from .draft_graph_codecs import (
-    decode_draft_delivery,
+from ..schema_contract import require_healthy, require_schema
+from ..sqlite_codecs.graph import (
+    decode_graph_job_delivery,
     decode_graph_mutation,
     decode_task_checkpoint,
     decode_task_comment,
@@ -68,18 +60,26 @@ from .draft_graph_codecs import (
     encode_task_control,
     encode_task_result,
 )
-from .draft_graph_schema import (
-    connect_draft_graph,
-    create_draft_graph_database,
-    require_draft_graph_schema,
+from ..sqlite_graph import admit_graph, datetime_to_us, inspect_graph
+from .revision_0001 import REVISION_1
+from .revision_0001_schema import SCHEMA_REVISION_1
+from .revision_0002_legacy_autonomy import (
+    AutonomousFollowup,
+    FollowupDisposition,
 )
-from .sqlite import validate_current_state_database
-from .sqlite_codecs.autonomy import decode_autonomous_followup
-from .sqlite_codecs.distribution import decode_delivery
-from .sqlite_codecs.jobs import decode_job_run
-from .sqlite_graph import admit_graph, datetime_to_us, inspect_graph
+from .revision_0002_legacy_autonomy_codecs import decode_autonomous_followup
+from .revision_0002_legacy_delivery import decode_revision_1_delivery
+from .revision_0002_legacy_job_codecs import decode_job_run
+from .revision_0002_legacy_jobs import (
+    JobAttempt,
+    JobAttemptStatus,
+    JobDesiredState,
+    JobExecutionMode,
+    JobRun,
+    JobStatus,
+)
 
-DraftPhaseHook = Callable[[str], None]
+Revision2PhaseHook = Callable[[str], None]
 _DIGEST_ZERO = "sha256:" + "0" * 64
 
 
@@ -112,7 +112,7 @@ class ExecutabilityLedgerEntry:
 
 
 @dataclass(frozen=True, slots=True)
-class DraftConversionReport:
+class Revision2ConversionReport:
     source_revision: int
     target_revision: int
     entries: tuple[ExecutabilityLedgerEntry, ...]
@@ -251,11 +251,18 @@ def _copy_unchanged_state(
         target.execute("SELECT agent_id, delivery_id, data FROM deliveries")
     )
     for agent_id, delivery_id, data in delivery_rows:
-        decode_delivery(str(data), agent_id=str(agent_id), delivery_id=str(delivery_id))
         payload = json.loads(str(data))
         fields = payload.get("fields")
         if not isinstance(fields, dict):
             raise ValueError("stored revision-1 delivery is invalid")
+        if fields.get("subject_kind") != "autonomous_followup":
+            decode_revision_1_delivery(
+                str(data),
+                agent_id=str(agent_id),
+                delivery_id=str(delivery_id),
+            )
+        elif payload.get("__record__") != "Delivery":
+            raise ValueError("stored revision-1 follow-up delivery is invalid")
         fields["migration_provenance"] = {}
         target.execute(
             "UPDATE deliveries SET data = ? WHERE agent_id = ? AND delivery_id = ?",
@@ -1179,20 +1186,38 @@ def _convert_deliveries_and_followups(
     return tuple(entries)
 
 
-def stage_draft_revision_2_home(
+def validate_revision_1_database(path: Path) -> None:
+    """Validate the one immutable source revision without current runtime codecs."""
+
+    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA foreign_keys = ON")
+        require_schema(connection, SCHEMA_REVISION_1)
+        require_healthy(connection)
+        journal = tuple(
+            connection.execute(
+                "SELECT revision, migration_id, checksum "
+                "FROM agent_home_migrations ORDER BY revision"
+            )
+        )
+        if journal != ((1, REVISION_1.migration_id, REVISION_1.checksum),):
+            raise ValueError("revision-1 migration journal is invalid")
+
+
+def stage_revision_2_home(
     source_home: Path,
     target_home: Path,
     *,
     now: datetime,
-    phase_hook: DraftPhaseHook | None = None,
-) -> DraftConversionReport:
+    phase_hook: Revision2PhaseHook | None = None,
+) -> Revision2ConversionReport:
     """Convert one revision-1 home into an isolated, unstamped draft home."""
 
     source_home = source_home.resolve()
     target_home = target_home.resolve()
     if target_home.exists() and any(target_home.iterdir()):
         raise ValueError("draft conversion target must be absent or empty")
-    validate_current_state_database(source_home / "state.db")
+    validate_revision_1_database(source_home / "state.db")
     _copy_home_files(source_home, target_home)
     backup = target_home / ".revision-1-source.db"
     _backup_database(source_home / "state.db", backup)
@@ -1204,7 +1229,7 @@ def stage_draft_revision_2_home(
     try:
         source.execute("PRAGMA query_only = ON")
         source.execute("PRAGMA foreign_keys = ON")
-        create_draft_graph_database(target)
+        create_graph_database(target)
         if phase_hook is not None:
             phase_hook("after_schema")
         target.execute("BEGIN IMMEDIATE")
@@ -1266,7 +1291,7 @@ def stage_draft_revision_2_home(
         target.close()
         backup.unlink(missing_ok=True)
     os.chmod(target_path, 0o600)
-    report = DraftConversionReport(
+    report = Revision2ConversionReport(
         source_revision=1,
         target_revision=2,
         entries=tuple(
@@ -1278,7 +1303,7 @@ def stage_draft_revision_2_home(
         source_database_sha256=_sha256(source_home / "state.db"),
         target_database_sha256=_sha256(target_path),
     )
-    validate_draft_revision_2_home(source_home, target_home, report=report)
+    validate_revision_2_home(source_home, target_home, report=report)
     if phase_hook is not None:
         phase_hook("after_validation")
     return report
@@ -1305,7 +1330,7 @@ def _source_record_keys(path: Path) -> set[tuple[str, str]]:
 def _validate_ledger(
     source_home: Path,
     connection: sqlite3.Connection,
-    report: DraftConversionReport,
+    report: Revision2ConversionReport,
 ) -> None:
     source_keys = _source_record_keys(source_home / "state.db")
     ledger_keys = {(entry.source_kind, entry.source_id) for entry in report.entries}
@@ -1619,7 +1644,7 @@ def _validate_graph_records(connection: sqlite3.Connection) -> None:
                   subject_id, logical_key, state, data
            FROM deliveries"""
     ):
-        decode_draft_delivery(
+        decode_graph_job_delivery(
             str(row[7]),
             agent_id=str(row[0]),
             delivery_id=str(row[1]),
@@ -1646,17 +1671,17 @@ def _validate_home_files(source_home: Path, candidate_home: Path) -> None:
             raise ValueError("draft whole-home non-database content changed")
 
 
-def validate_draft_revision_2_home(
+def validate_revision_2_home(
     source_home: Path,
     candidate_home: Path,
     *,
-    report: DraftConversionReport,
+    report: Revision2ConversionReport,
 ) -> None:
     """Validate the complete staged draft home and its semantic conversion."""
 
     _validate_home_files(source_home, candidate_home)
-    with connect_draft_graph(candidate_home / "state.db", read_only=True) as connection:
-        require_draft_graph_schema(connection)
+    with connect_graph(candidate_home / "state.db", read_only=True) as connection:
+        require_graph_schema(connection)
         journal = tuple(connection.execute("""SELECT revision, migration_id, checksum
                    FROM agent_home_migrations ORDER BY revision"""))
         if len(journal) != 1 or journal[0][0] != 1:
@@ -1681,12 +1706,12 @@ def validate_draft_revision_2_home(
         raise ValueError("draft conversion target changed after validation")
 
 
-def publish_draft_revision_2_for_test(
+def publish_revision_2_for_test(
     active_home: Path,
     *,
     now: datetime,
-    phase_hook: DraftPhaseHook | None = None,
-) -> DraftConversionReport:
+    phase_hook: Revision2PhaseHook | None = None,
+) -> Revision2ConversionReport:
     """Exercise state-last publication and rollback without registering revision 2."""
 
     active_home = active_home.resolve()
@@ -1695,11 +1720,11 @@ def publish_draft_revision_2_for_test(
     stage = work / "stage"
     backup = work / "state.db.before"
     published = False
-    report: DraftConversionReport | None = None
+    report: Revision2ConversionReport | None = None
     try:
         _copy_home_files(active_home, source_snapshot)
         _backup_database(active_home / "state.db", source_snapshot / "state.db")
-        report = stage_draft_revision_2_home(
+        report = stage_revision_2_home(
             source_snapshot, stage, now=now, phase_hook=phase_hook
         )
         shutil.copyfile(active_home / "state.db", backup)
@@ -1711,7 +1736,7 @@ def publish_draft_revision_2_for_test(
         published = True
         if phase_hook is not None:
             phase_hook("after_state_publication")
-        validate_draft_revision_2_home(source_snapshot, active_home, report=report)
+        validate_revision_2_home(source_snapshot, active_home, report=report)
         return report
     except BaseException:
         if published:
@@ -1724,9 +1749,10 @@ def publish_draft_revision_2_for_test(
 
 
 __all__ = [
-    "DraftConversionReport",
+    "Revision2ConversionReport",
     "ExecutabilityLedgerEntry",
-    "publish_draft_revision_2_for_test",
-    "stage_draft_revision_2_home",
-    "validate_draft_revision_2_home",
+    "publish_revision_2_for_test",
+    "stage_revision_2_home",
+    "validate_revision_1_database",
+    "validate_revision_2_home",
 ]

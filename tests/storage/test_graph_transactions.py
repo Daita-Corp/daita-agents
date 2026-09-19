@@ -33,9 +33,7 @@ pytestmark = pytest.mark.integration
 
 
 async def _store(tmp_path: Path) -> SQLiteStateStore:
-    return await SQLiteStateStore.open_draft_graph(
-        tmp_path / "state.db", initialize=True
-    )
+    return await SQLiteStateStore.open(tmp_path / "state.db")
 
 
 async def _claim_and_start(
@@ -254,9 +252,7 @@ async def test_seeded_mutations_preserve_counts_and_acyclic_topology(
 ):
     randomizer = random.Random(seed)
     job_id = f"job-{seed}"
-    store = await SQLiteStateStore.open_draft_graph(
-        tmp_path / f"state-{seed}.db", initialize=True
-    )
+    store = await SQLiteStateStore.open(tmp_path / f"state-{seed}.db")
     admission = graph_admission(job_id=job_id)
     await store.admit_graph(admission)
     task_count = randomizer.randint(1, 8)

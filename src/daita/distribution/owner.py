@@ -142,7 +142,7 @@ def construct_graph_job_delivery(
     provenance_digest: str,
     observed_at: datetime,
 ) -> GraphJobDelivery:
-    """Construct one draft graph-job delivery through distribution types."""
+    """Construct one current graph-job delivery through distribution types."""
 
     if target.conversation_id != conversation_id:
         raise ValueError("graph delivery target conversation identity differs")

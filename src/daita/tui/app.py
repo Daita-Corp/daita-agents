@@ -13,7 +13,7 @@ from textual.theme import Theme
 from daita import (
     ApprovalDecision,
     ApprovalRequest,
-    JobStatus,
+    GraphState,
     LocalWorkspace,
     LoopExit,
     LoopExitKind,
@@ -438,11 +438,13 @@ class DaitaApp(App[int]):
                 pass
             if jobs is not None:
                 self._active_job_count = sum(
-                    item.status
+                    item.state
                     in {
-                        JobStatus.QUEUED,
-                        JobStatus.RUNNING,
-                        JobStatus.CANCEL_REQUESTED,
+                        GraphState.QUEUED,
+                        GraphState.ACTIVE,
+                        GraphState.BLOCKED,
+                        GraphState.NEEDS_ATTENTION,
+                        GraphState.CANCEL_REQUESTED,
                     }
                     for item in jobs
                 )

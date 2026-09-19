@@ -10,15 +10,21 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
-from daita import JobInspection, JobResultView, JobStatus, JobSummary
-from daita.jobs.graph.models import GraphInspection
+from daita import GraphInspection, GraphJob, GraphState, TaskResult
 
 from ..projection import bounded_json_text
 from ..sanitization import safe_display, sanitize_terminal_text
 from .confirm import ConfirmScreen
 
-_CANCELABLE_STATUSES = frozenset({JobStatus.QUEUED, JobStatus.RUNNING})
-_CANCELLATION_STATUSES = frozenset({JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED})
+_CANCELABLE_STATES = frozenset(
+    {
+        GraphState.QUEUED,
+        GraphState.ACTIVE,
+        GraphState.BLOCKED,
+        GraphState.NEEDS_ATTENTION,
+    }
+)
+_CANCELLATION_STATES = frozenset({GraphState.CANCEL_REQUESTED, GraphState.CANCELLED})
 
 
 class JobsScreen(ModalScreen[None]):
@@ -34,7 +40,7 @@ class JobsScreen(ModalScreen[None]):
 
     def __init__(self) -> None:
         super().__init__()
-        self._jobs: tuple[JobSummary, ...] = ()
+        self._jobs: tuple[GraphJob, ...] = ()
         self._notice = ""
         self._busy = False
 
@@ -204,7 +210,7 @@ class JobsScreen(ModalScreen[None]):
                 raise ValueError("No durable job with that ID belongs to this agent.")
             raise ValueError(
                 "Results are not available while this job is "
-                + inspection.summary.status.value
+                + inspection.job.state.value
                 + "."
             )
         self.query_one("#jobs-detail", Static).update(render_job_result(result))
@@ -213,10 +219,10 @@ class JobsScreen(ModalScreen[None]):
         inspection = await self.app.controller.inspect_job(job_id)  # type: ignore[attr-defined]
         if inspection is None:
             raise ValueError("No durable job with that ID belongs to this agent.")
-        if inspection.summary.status not in _CANCELABLE_STATUSES:
+        if inspection.job.state not in _CANCELABLE_STATES:
             raise ValueError(
                 "This job is "
-                + inspection.summary.status.value
+                + inspection.job.state.value
                 + " and cannot be cancelled."
             )
         accepted = await self.app._await_modal(  # type: ignore[attr-defined]
@@ -225,12 +231,12 @@ class JobsScreen(ModalScreen[None]):
                 + safe_display(job_id, fallback="job", maximum=256)
                 + "?\n"
                 + safe_display(
-                    inspection.summary.job_kind,
+                    inspection.job.specification.objective,
                     fallback="job",
                     maximum=128,
                 )
                 + " · "
-                + inspection.summary.status.value
+                + inspection.job.state.value
                 + "\n\nCancellation is requested immediately and cannot be undone."
             )
         )
@@ -239,16 +245,20 @@ class JobsScreen(ModalScreen[None]):
         updated = await self.app.controller.cancel_job(job_id)  # type: ignore[attr-defined]
         if updated is None:
             raise ValueError("The job no longer exists within this agent boundary.")
-        status = updated.summary.status
-        if status in _CANCELLATION_STATUSES:
-            self._notice = f"Cancellation requested · {job_id} · {status.value}"
+        state = updated.state
+        if state in _CANCELLATION_STATES:
+            self._notice = f"Cancellation requested · {job_id} · {state.value}"
         else:
             self._notice = (
-                f"Job became {status.value} before cancellation was applied · {job_id}"
+                f"Job became {state.value} before cancellation was applied · {job_id}"
             )
         self.query_one("#jobs-notice", Static).update(self._notice)
         await self._load_jobs()
-        self.query_one("#jobs-detail", Static).update(render_job_inspection(updated))
+        inspection = await self.app.controller.inspect_job(job_id)  # type: ignore[attr-defined]
+        if inspection is not None:
+            self.query_one("#jobs-detail", Static).update(
+                render_job_inspection(inspection)
+            )
 
     def _selected_job_id(self) -> str | None:
         listing = self.query_one("#jobs-list", OptionList)
@@ -257,34 +267,34 @@ class JobsScreen(ModalScreen[None]):
         option = listing.get_option_at_index(listing.highlighted)
         return str(option.id) if option.id is not None else None
 
-    def _selected_summary(self) -> JobSummary | None:
+    def _selected_summary(self) -> GraphJob | None:
         selected = self._selected_job_id()
         if selected is None:
             return None
         return next((item for item in self._jobs if item.job_id == selected), None)
 
-    def _render_overview(self, summary: JobSummary) -> None:
+    def _render_overview(self, summary: GraphJob) -> None:
         self.query_one("#jobs-detail", Static).update(render_job_summary(summary))
 
     def _summary_text(self) -> str:
         active = sum(
-            item.status
-            in {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
+            item.state
+            in {GraphState.QUEUED, GraphState.ACTIVE, GraphState.CANCEL_REQUESTED}
             for item in self._jobs
         )
-        results = sum(item.result_available for item in self._jobs)
+        results = sum(item.terminal_result_id is not None for item in self._jobs)
         noun = "job" if len(self._jobs) == 1 else "jobs"
         return f"{len(self._jobs)} {noun}  ·  {active} active  ·  {results} results"
 
     @staticmethod
-    def _list_label(summary: JobSummary) -> str:
-        status = summary.status.value.replace("_", " ").upper()
+    def _list_label(summary: GraphJob) -> str:
+        status = summary.state.value.replace("_", " ").upper()
         short_id = (
             summary.job_id if len(summary.job_id) <= 20 else "…" + summary.job_id[-19:]
         )
-        result = " · result" if summary.result_available else ""
+        result = " · result" if summary.terminal_result_id is not None else ""
         return sanitize_terminal_text(
-            f"{status:<16} {summary.job_kind} · {short_id} · "
+            f"{status:<16} graph · {short_id} · "
             f"{summary.updated_at.strftime('%Y-%m-%d %H:%M:%S UTC')}{result}",
             maximum=512,
             preserve_lines=False,
@@ -302,10 +312,10 @@ class JobsScreen(ModalScreen[None]):
         self.query_one("#jobs-refresh", Button).disabled = self._busy
         self.query_one("#jobs-details", Button).disabled = self._busy or summary is None
         self.query_one("#jobs-results", Button).disabled = (
-            self._busy or summary is None or not summary.result_available
+            self._busy or summary is None or summary.terminal_result_id is None
         )
         self.query_one("#jobs-cancel", Button).disabled = (
-            self._busy or summary is None or summary.status not in _CANCELABLE_STATUSES
+            self._busy or summary is None or summary.state not in _CANCELABLE_STATES
         )
         self.query_one("#jobs-close", Button).disabled = self._busy
 
@@ -320,114 +330,36 @@ class JobsScreen(ModalScreen[None]):
         )
 
 
-def render_job_summary(summary: JobSummary) -> str:
-    """Render one bounded summary without treating record text as markup."""
+def render_job_summary(job: GraphJob) -> str:
+    """Render one bounded current graph-job summary."""
 
     return "\n".join(
         (
-            "Job " + safe_display(summary.job_id, fallback="job", maximum=256),
-            safe_display(summary.job_kind, fallback="job", maximum=128)
-            + " · "
-            + summary.status.value
-            + " · "
-            + summary.execution_mode.value,
-            f"Created: {summary.created_at.isoformat()}",
-            f"Updated: {summary.updated_at.isoformat()}",
+            "Job " + safe_display(job.job_id, fallback="job", maximum=256),
+            "graph · " + job.state.value,
+            f"Created: {job.created_at.isoformat()}",
+            f"Updated: {job.updated_at.isoformat()}",
+            f"Deadline: {job.deadline_at.isoformat()}",
             "Origin conversation: "
-            + safe_display(
-                summary.origin_conversation_id,
-                fallback="unknown",
-                maximum=256,
-            ),
-            f"Sources: {len(summary.source_ids)} · Resources: {len(summary.resource_ids)}",
-            "Result: " + ("available" if summary.result_available else "not available"),
-            "\nChoose Details for lifecycle attempts or Results for validated output.",
+            + safe_display(job.conversation_id, fallback="unknown", maximum=256),
+            f"Sources: {len(job.specification.authority.source_ids)} · "
+            f"Resources: {len(job.specification.authority.resource_ids)}",
+            "Result: "
+            + ("available" if job.terminal_result_id is not None else "not available"),
+            "\nChoose Details for graph tasks or Results for validated output.",
         )
     )
 
 
-def render_job_inspection(inspection: JobInspection) -> str:
-    """Render bounded lifecycle facts for one exact owned job."""
+def render_job_inspection(inspection: GraphInspection) -> str:
+    """Render bounded lifecycle facts for one exact owned graph."""
 
-    summary = inspection.summary
-    lines = [
-        render_job_summary(summary),
-        "",
-        "Lifecycle",
-        "Desired state: " + inspection.desired_state.value,
-        f"Deadline: {inspection.deadline_at.isoformat()}",
-        "Execution capability: "
-        + safe_display(
-            inspection.execution_capability_id,
-            fallback="unknown",
-            maximum=256,
-        ),
-        "Specification: "
-        + safe_display(
-            inspection.specification_digest,
-            fallback="unknown",
-            maximum=256,
-        ),
-    ]
-    if inspection.cancel_requested_at is not None:
-        lines.append(
-            f"Cancellation requested: {inspection.cancel_requested_at.isoformat()}"
-        )
-    if inspection.terminal_at is not None:
-        lines.append(f"Terminal: {inspection.terminal_at.isoformat()}")
-    if inspection.failure_code is not None:
-        lines.append(
-            "Failure: "
-            + safe_display(
-                inspection.failure_code,
-                fallback="unknown failure",
-                maximum=256,
-            )
-        )
-    if inspection.external_executor is not None:
-        lines.append(
-            "External executor: "
-            + safe_display(
-                inspection.external_executor.profile_id,
-                fallback="connected executor",
-                maximum=256,
-            )
-        )
-    lines.extend(("", f"Attempts ({len(inspection.attempts)})"))
-    if not inspection.attempts:
-        lines.append("No attempts have been claimed.")
-    for attempt in inspection.attempts:
-        line = (
-            f"{attempt.number}. {attempt.status.value} · claimed "
-            f"{attempt.claimed_at.isoformat()}"
-        )
-        if attempt.completed_at is not None:
-            line += " · completed " + attempt.completed_at.isoformat()
-        if attempt.error_code is not None:
-            line += " · " + safe_display(
-                attempt.error_code,
-                fallback="attempt failed",
-                maximum=256,
-            )
-        if attempt.external_intents or attempt.external_observations:
-            line += (
-                f" · {len(attempt.external_intents)} external intents"
-                f" · {len(attempt.external_observations)} observations"
-            )
-        lines.append(line)
-    return sanitize_terminal_text(
-        "\n".join(lines),
-        maximum=32_768,
-        preserve_lines=True,
-        fallback="Job details unavailable.",
-    )
+    return render_graph_inspection(inspection)
 
 
 def render_graph_inspection(inspection: GraphInspection) -> str:
-    """Render bounded read-only graph state for the explicit integration surface."""
+    """Render bounded read-only current graph state."""
 
-    if not isinstance(inspection, GraphInspection):
-        raise TypeError("graph inspection renderer requires GraphInspection")
     lines = [
         "Graph " + safe_display(inspection.job.job_id, fallback="job", maximum=256),
         "State: " + inspection.job.state.value,
@@ -487,48 +419,30 @@ def render_graph_inspection(inspection: GraphInspection) -> str:
     )
 
 
-def render_job_result(result: JobResultView) -> str:
-    """Render one bounded validated result and its exact artifact references."""
+def render_job_result(result: TaskResult) -> str:
+    """Render one bounded authenticated finalizer result."""
 
     lines = [
         "Result for " + safe_display(result.job_id, fallback="job", maximum=256),
         "Result ID: " + safe_display(result.result_id, fallback="result", maximum=256),
         f"Completed: {result.completed_at.isoformat()}",
         "Sensitivity: " + result.sensitivity.value,
+        "Kind: " + safe_display(result.result_kind, fallback="result", maximum=256),
         "",
-        "Summary",
-        bounded_json_text(result.summary.to_dict()),
+        "Summary: " + safe_display(result.summary, fallback="result", maximum=4096),
+        "",
+        "Payload",
+        bounded_json_text(dict(result.payload)),
         "",
         "Provenance",
-        bounded_json_text(result.provenance.to_dict()),
+        bounded_json_text(dict(result.provenance)),
         "",
-        f"Artifacts ({len(result.artifact_refs)})",
+        f"Artifacts ({len(result.artifact_ids)})",
     ]
-    if not result.artifact_refs:
+    if not result.artifact_ids:
         lines.append("No artifacts were produced.")
-    for artifact in result.artifact_refs:
-        lines.extend(
-            (
-                safe_display(
-                    artifact.artifact_id,
-                    fallback="artifact",
-                    maximum=256,
-                ),
-                "  "
-                + safe_display(
-                    artifact.filename,
-                    fallback="artifact",
-                    maximum=256,
-                )
-                + " · "
-                + safe_display(
-                    artifact.media_type,
-                    fallback="file",
-                    maximum=128,
-                )
-                + f" · {artifact.byte_size} bytes",
-            )
-        )
+    for artifact_id in result.artifact_ids:
+        lines.append(safe_display(artifact_id, fallback="artifact", maximum=256))
     return sanitize_terminal_text(
         "\n".join(lines),
         maximum=40_000,

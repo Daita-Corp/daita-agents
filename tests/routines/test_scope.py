@@ -15,6 +15,7 @@ from daita.capabilities import (
     Capability,
     CapabilityRegistry,
     ExecutionScope,
+    ExecutionScopeKind,
     OperationalEffect,
     ToolExecution,
     ToolLoadMode,
@@ -96,6 +97,7 @@ def _scheduled_scope(
         per_run_max_cost_usd=Decimal("0.05"),
         per_run_max_tokens=5_000,
         distribution_plan_digest=inbox_distribution_plan("conversation-1").plan_digest,
+        scope_kind=ExecutionScopeKind.SCHEDULED_ROUTINE,
         routine_id="routine-1",
         routine_revision=3,
         occurrence_id="routine-occ-1",
@@ -206,6 +208,7 @@ def test_nonroutine_scope_cannot_use_mcp_only_relaxation() -> None:
                 "conversation-1"
             ).plan_digest,
             allowed_connector_binding_ids=("binding-1",),
+            scope_kind=ExecutionScopeKind.JOB_EVENT,
         )
 
 
@@ -388,6 +391,7 @@ async def test_machine_calls_revalidate_retained_contracts_after_preparation(
             job_id="job-1",
             job_revision=1,
             allowed_connector_binding_ids=(),
+            scope_kind=ExecutionScopeKind.JOB_EVENT,
         )
         assert run.start is not None
         run = replace(

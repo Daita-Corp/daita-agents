@@ -1,4 +1,4 @@
-"""Immutable records for the unregistered revision-2 graph persistence draft."""
+"""Immutable records for current revision-2 graph persistence."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from ..._json import FrozenJsonObject, canonical_json
 from ...llm.models import ModelSensitivity
 
 MAX_GRAPH_TASKS = 64
+MAX_GRAPH_JOBS_PER_AGENT = 256
 MAX_GRAPH_EDGES = 192
 MAX_GRAPH_DEPTH = 12
 MAX_DIRECT_PARENTS = 16
@@ -1510,6 +1511,7 @@ __all__ = [
     "MAX_GRAPH_PARALLELISM",
     "MAX_GRAPH_TASKS",
     "MAX_GRAPH_TOTAL_ARTIFACT_BYTES",
+    "MAX_MODEL_REQUESTS_PER_ATTEMPT",
     "MAX_TASK_ATTEMPTS",
     "MAX_TASK_RESULT_BYTES",
     "TERMINAL_ATTEMPT_STATES",
