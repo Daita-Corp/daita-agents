@@ -244,6 +244,7 @@ async def test_independent_reads_obey_coordinator_capacities(tmp_path: Path) -> 
         assert backend.maximum_by_source["source-a"] == 1
         assert backend.maximum_by_source["source-b"] <= 2
         assert backend.maximum_global >= 2
+        await integration.supervisor.close()
         for _ in range(100):
             if integration.coordinator.diagnostics().active_permits == 0:
                 break
@@ -301,6 +302,7 @@ async def test_graph_store_calls_do_not_span_capability_or_source_io(
         await integration.admit_and_start(admission)
         terminal = await integration.wait_terminal(admission.job.job_id)
         assert terminal.job.state is GraphState.SUCCEEDED
+        await integration.supervisor.close()
         for _ in range(100):
             if integration.coordinator.diagnostics().active_permits == 0:
                 break
