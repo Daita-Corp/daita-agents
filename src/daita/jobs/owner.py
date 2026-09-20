@@ -475,6 +475,18 @@ class JobOwner:
             )
         )[:limit]
 
+    async def list_graph_task_controls(
+        self, job_id: str, task_id: str, *, limit: int = 8
+    ) -> tuple[TaskControl, ...]:
+        if not 1 <= limit <= 8:
+            raise ValueError("task control list limit must be between one and eight")
+        inspection = await self.inspect_graph(job_id)
+        if inspection is None:
+            return ()
+        return tuple(item for item in inspection.controls if item.task_id == task_id)[
+            -limit:
+        ]
+
     async def graph_board(self, job_id: str) -> GraphBoardProjection | None:
         inspection = await self.inspect_graph(job_id)
         return None if inspection is None else graph_board(inspection)

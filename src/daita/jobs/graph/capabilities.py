@@ -1370,12 +1370,21 @@ def graph_task_capability_declarations(
             "items": {"type": "string", "minLength": 1},
             "maxItems": 64,
             "uniqueItems": True,
+            "description": (
+                "Successful current-run ToolCall.id values used as supporting "
+                "evidence. Never put receipt, result, or artifact IDs here. The "
+                "runtime automatically binds the sole grant-backed effect call."
+            ),
         },
         "artifact_ids": {
             "type": "array",
             "items": {"type": "string", "minLength": 1},
             "maxItems": 64,
             "uniqueItems": True,
+            "description": (
+                "Artifact IDs returned by cited tool calls. Omit when no artifact "
+                "was created; receipt IDs are never artifact IDs."
+            ),
         },
         "residual_risk": {"type": ["string", "null"], "maxLength": 8192},
         "downstream_constraints": {"type": "object"},
@@ -1384,8 +1393,6 @@ def graph_task_capability_declarations(
         "result_kind",
         "summary",
         "payload",
-        "evidence_call_ids",
-        "artifact_ids",
     ]
     complete = Capability(
         id=TASK_COMPLETE_CAPABILITY_ID,
@@ -1827,9 +1834,49 @@ def graph_task_capability_declarations(
     return GraphTaskCapabilityDeclarations(capabilities, executors, views)
 
 
+def _grant_backed_effect_call_id(
+    transcript: Transcript,
+    graph_grants: object,
+) -> str | None:
+    """Select the sole successful receipt-bearing call without model mediation."""
+
+    if not graph_grants:
+        return None
+    if not isinstance(graph_grants, Mapping):
+        raise CapabilityInputError(
+            "task_result_effect_unverified",
+            "The task's effect-grant contract is malformed.",
+        )
+    granted_capability_ids = frozenset(
+        capability_id
+        for capability_id in graph_grants
+        if isinstance(capability_id, str)
+    )
+    candidates = tuple(
+        call.id
+        for call, result in transcript.tool_pairs
+        if result is not None
+        and not result.is_error
+        and result.capability_id in granted_capability_ids
+        and isinstance(result.output.get("effect_receipt"), Mapping)
+    )
+    if len(candidates) != 1:
+        raise CapabilityInputError(
+            "task_result_effect_unverified",
+            "Effectful graph completion requires exactly one successful current-attempt grant-backed effect call.",
+            details={"matching_effect_call_count": len(candidates)},
+        )
+    return candidates[0]
+
+
 def _authenticate_evidence(
     transcript: Transcript, evidence_call_ids: tuple[object, ...]
-) -> tuple[tuple[dict[str, object], ...], ModelSensitivity, set[str]]:
+) -> tuple[
+    tuple[dict[str, object], ...],
+    ModelSensitivity,
+    set[str],
+    set[str],
+]:
     if any(not isinstance(item, str) for item in evidence_call_ids):
         raise CapabilityInputError(
             "task_result_evidence_invalid", "Task evidence call IDs are invalid."
@@ -1839,12 +1886,14 @@ def _authenticate_evidence(
     authenticated: list[dict[str, object]] = []
     sensitivity = ModelSensitivity.PUBLIC
     artifact_ids: set[str] = set()
+    effect_receipt_ids: set[str] = set()
     for call_id in requested:
         pair = pairs.get(call_id)
         if pair is None or pair[1] is None or pair[1].is_error:
             raise CapabilityInputError(
                 "task_result_evidence_invalid",
-                "A cited task result is missing, failed, or belongs to another run.",
+                "evidence_call_ids must contain successful current-run ToolCall.id values; receipt, result, and artifact IDs are invalid.",
+                details={"expected_reference_kind": "tool_call_id"},
             )
         call, result = pair
         assert result is not None
@@ -1863,6 +1912,36 @@ def _authenticate_evidence(
             artifact_id = artifact.get("artifact_id")
             if isinstance(artifact_id, str):
                 artifact_ids.add(artifact_id)
+        effect_receipt = result.output.get("effect_receipt")
+        completion_evidence: str | None = None
+        if isinstance(effect_receipt, Mapping):
+            receipt_id = effect_receipt.get("receipt_id")
+            outcome = effect_receipt.get("outcome")
+            receipt_digest = effect_receipt.get("receipt_digest")
+            if (
+                not isinstance(receipt_id, str)
+                or outcome != "succeeded"
+                or not isinstance(receipt_digest, str)
+            ):
+                raise CapabilityInputError(
+                    "task_result_effect_unverified",
+                    "A cited effect lacks a successful authenticated receipt reference.",
+                )
+            effect_receipt_ids.add(receipt_id)
+            data = result.output.get("data")
+            provenance = data.get("provenance") if isinstance(data, Mapping) else None
+            completion_evidence = (
+                "adapter_verified"
+                if effect_receipt.get("evidence_basis") == "adapter_verified"
+                else (
+                    "structured_direct_result"
+                    if isinstance(data, Mapping)
+                    and isinstance(data.get("structured"), Mapping)
+                    and isinstance(provenance, Mapping)
+                    and provenance.get("output_schema_digest") != "none"
+                    else "server_reported_invocation_only"
+                )
+            )
         authenticated.append(
             {
                 "call_id": call_id,
@@ -1870,9 +1949,16 @@ def _authenticate_evidence(
                 "capability_id": result.capability_id,
                 "executor_id": result.executor_id,
                 "output_sha256": result.output_sha256,
+                "effect_receipt_id": (
+                    receipt_id
+                    if isinstance(effect_receipt, Mapping)
+                    and isinstance(receipt_id, str)
+                    else None
+                ),
+                "effect_completion_evidence": completion_evidence,
             }
         )
-    return tuple(authenticated), sensitivity, artifact_ids
+    return tuple(authenticated), sensitivity, artifact_ids, effect_receipt_ids
 
 
 def _task_result_from_arguments(
@@ -1890,23 +1976,46 @@ def _task_result_from_arguments(
             "The result lacks its exact task-attempt binding.",
         )
     raw_evidence_ids = request.arguments.get("evidence_call_ids")
-    raw_artifact_ids = request.arguments.get("artifact_ids")
+    raw_artifact_ids = request.arguments.get("artifact_ids", ())
+    if raw_evidence_ids is None:
+        raw_evidence_ids = ()
     if not isinstance(raw_evidence_ids, tuple) or not isinstance(
         raw_artifact_ids, tuple
     ):
         raise CapabilityInputError(
             "task_result_evidence_invalid", "Task evidence references are invalid."
         )
-    evidence_ids: tuple[object, ...] = raw_evidence_ids
-    artifacts = tuple(sorted(str(item) for item in raw_artifact_ids))
-    authenticated, evidence_sensitivity, authenticated_artifacts = (
-        _authenticate_evidence(transcript, evidence_ids)
+    graph_grants = task.specification.authority.contract_bindings.get(
+        "capability_grants"
     )
+    effect_call_id = _grant_backed_effect_call_id(transcript, graph_grants)
+    evidence_ids: tuple[object, ...] = tuple(
+        dict.fromkeys(
+            (
+                *raw_evidence_ids,
+                *((effect_call_id,) if effect_call_id is not None else ()),
+            )
+        )
+    )
+    artifacts = tuple(sorted(str(item) for item in raw_artifact_ids))
+    (
+        authenticated,
+        evidence_sensitivity,
+        authenticated_artifacts,
+        authenticated_effects,
+    ) = _authenticate_evidence(transcript, evidence_ids)
     if not set(artifacts) <= authenticated_artifacts:
         raise CapabilityInputError(
             "task_result_artifact_unverified",
-            "A task result artifact is not authenticated by its cited tool evidence.",
+            "artifact_ids must contain only artifact IDs returned by cited tool calls; receipt IDs are invalid.",
+            details={"expected_reference_kind": "artifact_id"},
         )
+    if bool(graph_grants) != (len(authenticated_effects) == 1):
+        raise CapabilityInputError(
+            "task_result_effect_unverified",
+            "Effectful graph work requires exactly one successful cited receipt; effect-free work permits none.",
+        )
+    effect_receipt_ids = tuple(sorted(authenticated_effects))
     result_kind = request.arguments["result_kind"]
     summary = request.arguments["summary"]
     payload = request.arguments["payload"]
@@ -1917,6 +2026,31 @@ def _task_result_from_arguments(
     assert isinstance(payload, Mapping)
     assert residual_risk is None or isinstance(residual_risk, str)
     assert isinstance(downstream, Mapping)
+    completion_evidence_values: set[str] = set()
+    for item in authenticated:
+        value = item.get("effect_completion_evidence")
+        if isinstance(value, str):
+            completion_evidence_values.add(value)
+    completion_evidence = tuple(sorted(completion_evidence_values))
+    downstream = {
+        **downstream,
+        **(
+            {"effect_completion_evidence": completion_evidence}
+            if completion_evidence
+            else {}
+        ),
+    }
+    summary_authority = "model_authored"
+    if "server_reported_invocation_only" in completion_evidence:
+        summary = (
+            "The MCP server reported that the exact action was invoked. "
+            "Downstream business completion is not verified."
+        )
+        summary_authority = "code_owned_effect_evidence"
+        residual_risk = residual_risk or (
+            "The MCP server reported synchronous invocation only; downstream business "
+            "completion requires structured evidence or a later read verification."
+        )
     expected_kind = task.specification.expected_result_contract.get("result_kind")
     if isinstance(expected_kind, str) and result_kind != expected_kind:
         raise CapabilityInputError(
@@ -1935,6 +2069,7 @@ def _task_result_from_arguments(
         "task_binding_digest": guard.binding.digest,
         "evidence": authenticated,
         "model_authored_payload": True,
+        "summary_authority": summary_authority,
     }
     verification = {
         "transcript_run_id": request.run_id,
@@ -1956,7 +2091,7 @@ def _task_result_from_arguments(
         "sensitivity": sensitivity.value,
         "provenance": provenance,
         "artifact_ids": artifacts,
-        "effect_receipt_ids": (),
+        "effect_receipt_ids": effect_receipt_ids,
         "verification": verification,
         "residual_risk": residual_risk,
         "downstream_constraints": downstream,
@@ -1976,7 +2111,7 @@ def _task_result_from_arguments(
         sensitivity=sensitivity,
         provenance=provenance,
         artifact_ids=artifacts,
-        effect_receipt_ids=(),
+        effect_receipt_ids=effect_receipt_ids,
         verification=verification,
         residual_risk=residual_risk,
         downstream_constraints=downstream,

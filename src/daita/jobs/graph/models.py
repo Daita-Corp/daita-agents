@@ -371,8 +371,28 @@ class GraphAuthority:
                 field_name,
                 _sorted_identifiers(tuple(getattr(self, field_name)), field_name),
             )
-        if self.operational_effects not in ((), ("none",)):
-            raise ValueError("graph V1 authority must be effect-free")
+        if not set(self.operational_effects) <= {
+            "none",
+            "mutate_data",
+            "external_action",
+        }:
+            raise ValueError(
+                "graph authority contains an ineligible effect; ungranted graph work remains effect-free"
+            )
+        effectful = bool(
+            set(self.operational_effects) & {"mutate_data", "external_action"}
+        )
+        grants = self.contract_bindings.get("capability_grants")
+        if grants is not None and (
+            not isinstance(grants, Mapping)
+            or len(grants) > 1
+            or any(key not in self.capability_ids for key in grants)
+        ):
+            raise ValueError("graph authority capability grants are invalid")
+        if effectful != bool(grants):
+            raise ValueError(
+                "graph effect authority and exact capability grants must be present together"
+            )
         if not isinstance(self.sensitivity, ModelSensitivity):
             raise TypeError("graph authority sensitivity must be ModelSensitivity")
         bindings = _bounded_json(
@@ -425,8 +445,13 @@ class GraphJobSpecification:
         _utc(self.deadline_at, "graph deadline")
         if not isinstance(self.limits, GraphLimits):
             raise TypeError("graph limits must be GraphLimits")
-        if self.effect_mode != "disabled":
-            raise ValueError("graph V1 effect mode must be disabled")
+        if self.effect_mode not in {"disabled", "exact_grants"}:
+            raise ValueError("graph effect mode is invalid")
+        effectful = bool(
+            set(self.authority.operational_effects) & {"mutate_data", "external_action"}
+        )
+        if (self.effect_mode == "exact_grants") != effectful:
+            raise ValueError("graph effect mode differs from its root authority")
         budgets = tuple(self.budgets)
         if not budgets or any(not isinstance(item, BudgetLimit) for item in budgets):
             raise ValueError("graph budgets must contain BudgetLimit records")
@@ -910,7 +935,7 @@ class TaskAttempt:
             ("checkpoint_ids", MAX_CHECKPOINTS_PER_ATTEMPT),
             ("control_ids", MAX_CONTROLS_PER_TASK),
             ("artifact_ids", MAX_GRAPH_ARTIFACTS),
-            ("effect_receipt_ids", 0),
+            ("effect_receipt_ids", 1),
         ):
             references = _sorted_identifiers(
                 tuple(getattr(self, field_name)), f"attempt {field_name}"
@@ -967,8 +992,8 @@ class TaskResult:
         )
         if len(artifacts) > MAX_GRAPH_ARTIFACTS:
             raise ValueError("result artifact references exceed their bound")
-        if effects:
-            raise ValueError("graph V1 result cannot reference effects")
+        if len(effects) > 1:
+            raise ValueError("graph result effect references exceed their bound")
         object.__setattr__(self, "artifact_ids", artifacts)
         object.__setattr__(self, "effect_receipt_ids", effects)
         for field_name, maximum in (

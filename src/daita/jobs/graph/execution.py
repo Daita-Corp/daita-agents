@@ -14,8 +14,10 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from hashlib import sha256
 
+from ..._json import FrozenJsonObject
 from ...capabilities import (
     AccessMode,
+    CapabilityGrant,
     CapabilityInputError,
     ExecutionContractBindings,
     ExecutionScope,
@@ -262,6 +264,55 @@ def execution_contract_bindings(
     )
 
 
+def graph_capability_grants(
+    material: Mapping[str, object],
+) -> tuple[CapabilityGrant, ...]:
+    raw = material.get("capability_grants", {})
+    if not isinstance(raw, Mapping):
+        raise TypeError("graph capability grants are malformed")
+    grants: list[CapabilityGrant] = []
+    for capability_id, entry in sorted(raw.items()):
+        if not isinstance(capability_id, str) or not isinstance(entry, Mapping):
+            raise TypeError("graph capability grant entry is malformed")
+        grant_material = entry.get("grant")
+        expected_digest = entry.get("grant_digest")
+        if (
+            set(entry) != {"grant", "grant_digest"}
+            or not isinstance(grant_material, Mapping)
+            or not isinstance(expected_digest, str)
+            or set(grant_material)
+            != {
+                "grant_id",
+                "domain_owner_id",
+                "capability_id",
+                "capability_contract_digest",
+                "constraints_kind",
+                "constraints",
+                "max_calls_per_occurrence",
+            }
+            or not isinstance(grant_material.get("constraints"), Mapping)
+        ):
+            raise TypeError("graph capability grant entry is malformed")
+        grant = CapabilityGrant(
+            grant_id=str(grant_material["grant_id"]),
+            domain_owner_id=str(grant_material["domain_owner_id"]),
+            capability_id=str(grant_material["capability_id"]),
+            capability_contract_digest=str(
+                grant_material["capability_contract_digest"]
+            ),
+            constraints_kind=str(grant_material["constraints_kind"]),
+            constraints=FrozenJsonObject.from_mapping(grant_material["constraints"]),
+            max_calls_per_occurrence=grant_material["max_calls_per_occurrence"],
+        )
+        if (
+            grant.capability_id != capability_id
+            or grant.grant_digest != expected_digest
+        ):
+            raise ValueError("graph capability grant digest is invalid")
+        grants.append(grant)
+    return tuple(grants)
+
+
 def model_task_execution_scope(
     inspection: GraphInspection,
     task: GraphTask,
@@ -282,6 +333,7 @@ def model_task_execution_scope(
     access_modes = frozenset(
         AccessMode(item) for item in authority.access_modes
     ) | frozenset({AccessMode.NONE})
+    grants = graph_capability_grants(authority.contract_bindings)
     return ExecutionScope(
         scope_id=f"graph-scope:{attempt.attempt_id}",
         revision=1,
@@ -294,7 +346,9 @@ def model_task_execution_scope(
         allowed_resource_ids=authority.resource_ids,
         allowed_capability_ids=authority.capability_ids,
         allowed_access_modes=access_modes,
-        allowed_operational_effects=frozenset({OperationalEffect.NONE}),
+        allowed_operational_effects=frozenset(
+            OperationalEffect(item) for item in authority.operational_effects
+        ),
         sensitivity_ceiling=authority.sensitivity,
         eligible_model_routes=authority.model_route_ids,
         per_run_max_cost_usd=Decimal(str(contract["per_run_max_cost_usd"])),
@@ -303,6 +357,7 @@ def model_task_execution_scope(
         contract_bindings=bindings,
         allowed_connector_binding_ids=authority.connector_ids,
         scope_kind=ExecutionScopeKind.GRAPH_TASK,
+        capability_grants=grants,
         graph_task_binding=binding,
     )
 
@@ -534,6 +589,34 @@ def validate_graph_task_arguments(
         )
     if capability_id.startswith("jobs.graph."):
         return
+    effect_call = initial_call.get("effect_call")
+    if effect_call is not None:
+        if not isinstance(effect_call, Mapping):
+            raise CapabilityInputError(
+                "task_context_invalid", "The frozen effect call is malformed."
+            )
+        effect_capability_id = effect_call.get("capability_id")
+        preview_capability_id = effect_call.get("preview_capability_id")
+        intent = effect_call.get("intent_arguments")
+        if not isinstance(effect_capability_id, str) or not isinstance(intent, Mapping):
+            raise CapabilityInputError(
+                "task_context_invalid", "The frozen effect intent is malformed."
+            )
+        if preview_capability_id is None:
+            if capability_id == effect_capability_id and arguments == intent:
+                return
+        elif isinstance(preview_capability_id, str):
+            if capability_id == preview_capability_id and arguments == intent:
+                return
+            if capability_id == effect_capability_id and all(
+                name in arguments and arguments[name] == value
+                for name, value in intent.items()
+            ):
+                return
+        raise CapabilityInputError(
+            "task_call_differs_from_proposal",
+            "The graph effect call differs from its exact admitted intent.",
+        )
     if (
         initial_call.get("capability_id") != capability_id
         or initial_call.get("arguments") != arguments
@@ -553,6 +636,7 @@ __all__ = [
     "attempt_budget_reservations",
     "effective_task_ids",
     "execution_contract_bindings",
+    "graph_capability_grants",
     "graph_task_binding",
     "graph_task_contract",
     "inspection_task",

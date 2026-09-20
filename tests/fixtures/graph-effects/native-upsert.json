@@ -1,0 +1,139 @@
+{
+  "source": {
+    "native_identity": "postgresql:companies",
+    "display_name": "Company research",
+    "configuration": {
+      "database": "research",
+      "host": "db.fixture.test",
+      "port": 5432,
+      "schemas": [
+        "public"
+      ],
+      "ssl_mode": "require",
+      "username": "writer"
+    }
+  },
+  "table": {
+    "schema": "public",
+    "name": "companies",
+    "columns": [
+      {
+        "name": "id",
+        "native_type": "bigint",
+        "native_type_namespace": "pg_catalog",
+        "native_type_name": "int8",
+        "nullable": false,
+        "primary_key_ordinal": 1,
+        "identity": true,
+        "updatable": true,
+        "collation": null
+      },
+      {
+        "name": "domain",
+        "native_type": "text",
+        "native_type_namespace": "pg_catalog",
+        "native_type_name": "text",
+        "nullable": false,
+        "primary_key_ordinal": null,
+        "identity": false,
+        "updatable": true,
+        "collation": "C"
+      },
+      {
+        "name": "name",
+        "native_type": "text",
+        "native_type_namespace": "pg_catalog",
+        "native_type_name": "text",
+        "nullable": false,
+        "primary_key_ordinal": null,
+        "identity": false,
+        "updatable": true,
+        "collation": "C"
+      },
+      {
+        "name": "evidence_url",
+        "native_type": "text",
+        "native_type_namespace": "pg_catalog",
+        "native_type_name": "text",
+        "nullable": false,
+        "primary_key_ordinal": null,
+        "identity": false,
+        "updatable": true,
+        "collation": "C"
+      },
+      {
+        "name": "notes",
+        "native_type": "text",
+        "native_type_namespace": "pg_catalog",
+        "native_type_name": "text",
+        "nullable": true,
+        "primary_key_ordinal": null,
+        "identity": false,
+        "updatable": true,
+        "collation": "C"
+      }
+    ],
+    "indexes": [
+      {
+        "name": "companies_domain_key",
+        "method": "btree",
+        "columns": [
+          "domain"
+        ],
+        "unique": true,
+        "write_conflict_supported": true
+      },
+      {
+        "name": "companies_pkey",
+        "method": "btree",
+        "columns": [
+          "id"
+        ],
+        "unique": true,
+        "write_conflict_supported": true
+      }
+    ]
+  },
+  "write_scope": {
+    "allowed_operations": [
+      "upsert"
+    ],
+    "allowed_insert_columns": [
+      "domain",
+      "name",
+      "evidence_url"
+    ],
+    "allowed_update_columns": [
+      "name",
+      "evidence_url"
+    ],
+    "key_columns": [
+      "domain"
+    ],
+    "generated_identity_columns": [
+      "id"
+    ],
+    "max_rows": 10
+  },
+  "upsert_intent": {
+    "key_columns": [
+      "domain"
+    ],
+    "insert_columns": [
+      "domain",
+      "name",
+      "evidence_url"
+    ],
+    "update_columns": [
+      "name",
+      "evidence_url"
+    ],
+    "rows": [
+      {
+        "domain": "graph-live.test",
+        "name": "Graph Live",
+        "evidence_url": "https://evidence.test/graph-live"
+      }
+    ]
+  }
+}

@@ -501,6 +501,13 @@ class Agent:
             job_id, task_id=task_id, limit=limit
         )
 
+    async def list_task_controls(
+        self, job_id: str, task_id: str, *, limit: int = 8
+    ) -> tuple[TaskControl, ...]:
+        """Return bounded typed controls, including effect uncertainty."""
+
+        return await self._embedded.list_task_controls(job_id, task_id, limit=limit)
+
     async def job_timeline(
         self,
         job_id: str,

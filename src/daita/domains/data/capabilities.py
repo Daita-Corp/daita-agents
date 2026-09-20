@@ -866,6 +866,14 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         effect_receipt_policy=RELATIONAL_UPDATE_RECEIPT_POLICY,
         automation_grant_policy=NATIVE_WRITE_GRANT_POLICY,
+        execution_admission_policy=ExecutionAdmissionPolicy(
+            shape="preview_bound_postgresql_update",
+            inline_eligible=True,
+            graph_v1_eligible=True,
+            target_count_argument=None,
+            inline_max_targets=1,
+            graph_max_targets=1,
+        ),
     )
     view = ToolView(
         name=RELATIONAL_UPDATE_TOOL_NAME,
@@ -1411,6 +1419,14 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
             receipt_kind="data.upsert_rows",
             payload_schema=_UPSERT_RECEIPT_SCHEMA,
             success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
+        ),
+        execution_admission_policy=ExecutionAdmissionPolicy(
+            shape="preview_bound_postgresql_upsert",
+            inline_eligible=True,
+            graph_v1_eligible=True,
+            target_count_argument=None,
+            inline_max_targets=1,
+            graph_max_targets=1,
         ),
     )
     return CapabilityDeclarations(

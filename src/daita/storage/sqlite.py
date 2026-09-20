@@ -35,6 +35,7 @@ from ..capabilities import (
     EffectEvidenceBasis,
     EffectObservation,
     ExecutionScope,
+    TaskAttemptGuard,
 )
 from ..catalog.models import (
     CatalogFacet,
@@ -68,6 +69,7 @@ from ..distribution.owner import construct_logical_delivery
 from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
 from ..jobs.graph.models import (
+    ACTIVE_ATTEMPT_STATES,
     MAX_GRAPH_JOBS_PER_AGENT,
     AttemptBudgetReservation,
     AttemptState,
@@ -76,6 +78,7 @@ from ..jobs.graph.models import (
     ControlKind,
     ControlState,
     GraphAdmission,
+    GraphDesiredState,
     GraphEventPage,
     GraphInspection,
     GraphJob,
@@ -88,6 +91,7 @@ from ..jobs.graph.models import (
     TaskComment,
     TaskControl,
     TaskResult,
+    TaskState,
     canonical_digest,
 )
 from ..learning_candidates import (
@@ -3452,6 +3456,7 @@ class SQLiteStateStore:
         receipt: EffectReceipt,
         *,
         grant: CapabilityGrant | None = None,
+        task_attempt_guard: TaskAttemptGuard | None = None,
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt:
         if (
@@ -3512,12 +3517,109 @@ class SQLiteStateStore:
                     "the run receipt reservation bound is exhausted"
                 )
             scope = run.start.execution_scope if run.start is not None else None
-            if receipt.routine_id is None:
-                if grant is not None or scope is not None:
+            graph_binding = None if scope is None else scope.graph_task_binding
+            if scope is None:
+                if grant is not None or task_attempt_guard is not None:
                     raise EffectReceiptConflictError(
                         "foreground receipt cannot carry machine authorization"
                     )
+            elif graph_binding is not None:
+                if (
+                    receipt.routine_id is not None
+                    or not isinstance(grant, CapabilityGrant)
+                    or grant not in scope.capability_grants
+                    or task_attempt_guard is None
+                    or task_attempt_guard.binding != graph_binding
+                    or task_attempt_guard.claim_token == ""
+                    or task_attempt_guard.run_id != receipt.run_id
+                ):
+                    raise EffectReceiptConflictError(
+                        "graph receipt lacks its exact frozen attempt authorization"
+                    )
+                if (
+                    grant.capability_id != receipt.capability_id
+                    or grant.domain_owner_id != receipt.domain_owner_id
+                    or grant.capability_contract_digest
+                    != receipt.capability_contract_digest
+                    or grant.grant_digest != receipt.capability_grant_digest
+                    or graph_binding.agent_id != receipt.agent_id
+                ):
+                    raise EffectReceiptConflictError(
+                        "graph receipt does not match its exact capability grant"
+                    )
+                loaded_job = _graph_store._load_job(
+                    connection, receipt.agent_id, graph_binding.job_id
+                )
+                loaded_task = _graph_store._load_task(
+                    connection,
+                    receipt.agent_id,
+                    graph_binding.job_id,
+                    graph_binding.task_id,
+                )
+                loaded_attempt = _graph_store._load_attempt(
+                    connection,
+                    receipt.agent_id,
+                    graph_binding.job_id,
+                    graph_binding.task_id,
+                    graph_binding.attempt_id,
+                )
+                if loaded_job is None or loaded_task is None or loaded_attempt is None:
+                    raise EffectReceiptConflictError(
+                        "graph receipt attempt is unavailable"
+                    )
+                job = loaded_job[0]
+                task = loaded_task[0]
+                attempt = loaded_attempt[0]
+                now = self._clock()
+                claim_digest = (
+                    "sha256:" + sha256(attempt.claim_token.encode("utf-8")).hexdigest()
+                )
+                if (
+                    job.specification.authority.digest
+                    != graph_binding.root_authority_digest
+                    or job.state not in {GraphState.QUEUED, GraphState.ACTIVE}
+                    or job.desired_state is not GraphDesiredState.RUN
+                    or job.deadline_at <= now
+                    or task.state is not TaskState.RUNNING
+                    or task.current_attempt_id != graph_binding.attempt_id
+                    or task.task_revision < graph_binding.task_revision
+                    or task.task_spec_digest != graph_binding.task_spec_digest
+                    or task.task_scope_digest != graph_binding.task_scope_digest
+                    or task.fencing_epoch != graph_binding.fencing_epoch
+                    or attempt.state not in ACTIVE_ATTEMPT_STATES
+                    or attempt.run_id != receipt.run_id
+                    or attempt.fencing_epoch != graph_binding.fencing_epoch
+                    or attempt.claim_token != task_attempt_guard.claim_token
+                    or claim_digest != graph_binding.claim_token_digest
+                    or attempt.absolute_deadline_at != graph_binding.task_deadline_at
+                    or attempt.absolute_deadline_at <= now
+                    or (
+                        attempt.lease_expires_at is not None
+                        and attempt.lease_expires_at <= now
+                    )
+                    or receipt.capability_id
+                    not in task.specification.authority.capability_ids
+                ):
+                    raise EffectReceiptConflictError("graph receipt attempt is stale")
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND grant_digest = ?",
+                    (
+                        receipt.agent_id,
+                        graph_binding.job_id,
+                        graph_binding.task_id,
+                        grant.grant_digest,
+                    ),
+                ).fetchone()[0]
+                if count >= grant.max_calls_per_occurrence:
+                    raise EffectReceiptConflictError(
+                        "the graph grant invocation ceiling is exhausted"
+                    )
             else:
+                routine_id = receipt.routine_id
+                if routine_id is None:
+                    raise EffectReceiptConflictError(
+                        "machine receipt lacks routine or graph authorization"
+                    )
                 if (
                     not isinstance(grant, CapabilityGrant)
                     or scope is None
@@ -3542,9 +3644,7 @@ class SQLiteStateStore:
                 occurrence = _load_routine_occurrence_row(
                     connection, receipt.agent_id, receipt.occurrence_id or ""
                 )
-                routine = _load_routine_row(
-                    connection, receipt.agent_id, receipt.routine_id
-                )
+                routine = _load_routine_row(connection, receipt.agent_id, routine_id)
                 if (
                     occurrence is None
                     or routine is None
@@ -3578,7 +3678,7 @@ class SQLiteStateStore:
                         "the grant invocation ceiling is exhausted"
                     )
             connection.execute(
-                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
                 (
                     receipt.agent_id,
                     receipt.receipt_id,
@@ -3588,6 +3688,11 @@ class SQLiteStateStore:
                     receipt.routine_id,
                     receipt.occurrence_id,
                     receipt.capability_grant_digest,
+                    None if graph_binding is None else graph_binding.job_id,
+                    None if graph_binding is None else graph_binding.task_id,
+                    None if graph_binding is None else graph_binding.attempt_id,
+                    None if graph_binding is None else graph_binding.fencing_epoch,
+                    None if graph_binding is None else graph_binding.task_spec_digest,
                     encode_receipt(receipt),
                 ),
             )
@@ -3607,7 +3712,7 @@ class SQLiteStateStore:
 
         def write(connection: sqlite3.Connection) -> EffectReceipt:
             row = connection.execute(
-                "SELECT data FROM effect_receipts WHERE agent_id = ? AND id = ?",
+                "SELECT data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest FROM effect_receipts WHERE agent_id = ? AND id = ?",
                 (receipt.agent_id, receipt.receipt_id),
             ).fetchone()
             if row is None:
@@ -3634,7 +3739,67 @@ class SQLiteStateStore:
                 _pause_effect_routine(
                     connection, receipt, receipt.finished_at or self._clock()
                 )
+                if row[1] is not None:
+                    _open_graph_effect_uncertain_control(
+                        connection,
+                        receipt=receipt,
+                        job_id=str(row[1]),
+                        task_id=str(row[2]),
+                        attempt_id=str(row[3]),
+                        fencing_epoch=int(row[4]),
+                        task_spec_digest=str(row[5]),
+                        opened_at=receipt.finished_at or self._clock(),
+                    )
             return receipt
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def list_effect_receipts_for_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> tuple[EffectReceipt, ...]:
+        def read() -> tuple[EffectReceipt, ...]:
+            with _connect_read_only(self.path) as connection:
+                rows = connection.execute(
+                    "SELECT data FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND task_attempt_id = ? ORDER BY id",
+                    (agent_id, job_id, task_id, attempt_id),
+                )
+                return tuple(decode_receipt(row[0]) for row in rows)
+
+        return await asyncio.to_thread(read)
+
+    async def reconcile_graph_effect_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> bool:
+        def write(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                "SELECT data, fencing_epoch, task_spec_digest FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND task_attempt_id = ? ORDER BY id LIMIT 1",
+                (agent_id, job_id, task_id, attempt_id),
+            ).fetchone()
+            if row is None:
+                return False
+            receipt = decode_receipt(row[0])
+            _open_graph_effect_uncertain_control(
+                connection,
+                receipt=receipt,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                fencing_epoch=int(row[1]),
+                task_spec_digest=str(row[2]),
+                opened_at=max(
+                    receipt.finished_at or receipt.started_at,
+                    self._clock(),
+                ),
+            )
+            return True
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
@@ -6712,6 +6877,86 @@ def _pause_effect_routine(
     )
 
 
+def _open_graph_effect_uncertain_control(
+    connection: sqlite3.Connection,
+    *,
+    receipt: EffectReceipt,
+    job_id: str,
+    task_id: str,
+    attempt_id: str,
+    fencing_epoch: int,
+    task_spec_digest: str,
+    opened_at: datetime,
+) -> TaskControl | None:
+    loaded_task = _graph_store._load_task(connection, receipt.agent_id, job_id, task_id)
+    loaded_attempt = _graph_store._load_attempt(
+        connection, receipt.agent_id, job_id, task_id, attempt_id
+    )
+    if loaded_task is None or loaded_attempt is None:
+        return None
+    task = loaded_task[0]
+    attempt = loaded_attempt[0]
+    if (
+        task.state is not TaskState.RUNNING
+        or task.current_attempt_id != attempt_id
+        or task.task_spec_digest != task_spec_digest
+        or task.fencing_epoch != fencing_epoch
+        or attempt.state not in ACTIVE_ATTEMPT_STATES
+        or attempt.fencing_epoch != fencing_epoch
+    ):
+        return None
+    control_id = (
+        "control-"
+        + sha256(f"{receipt.receipt_id}:effect-uncertain".encode()).hexdigest()[:32]
+    )
+    existing = connection.execute(
+        "SELECT data FROM job_task_controls WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?",
+        (receipt.agent_id, job_id, task_id, control_id),
+    ).fetchone()
+    if existing is not None:
+        return None
+    if receipt.outcome is EffectOutcome.SUCCEEDED:
+        message = (
+            "The external operation succeeded, but its graph result was not committed; "
+            "the operation will not be replayed."
+        )
+    elif receipt.outcome is EffectOutcome.NOT_APPLIED:
+        message = "The reserved external operation was not applied and will not be replayed automatically."
+    else:
+        message = (
+            "The external operation outcome is uncertain and will not be replayed."
+        )
+    payload = {
+        "message": message,
+        "details": {
+            "receipt_id": receipt.receipt_id,
+            "receipt_digest": receipt.receipt_digest,
+            "outcome": receipt.outcome.value,
+            "evidence_basis": receipt.evidence_basis.value,
+            "resolution_does_not_retry": True,
+            "resolution_does_not_mark_success": True,
+        },
+    }
+    control = TaskControl(
+        agent_id=receipt.agent_id,
+        job_id=job_id,
+        task_id=task_id,
+        control_id=control_id,
+        kind=ControlKind.EFFECT_UNCERTAIN,
+        state=ControlState.OPEN,
+        requesting_attempt_id=attempt_id,
+        payload=payload,
+        created_at=opened_at,
+        payload_digest=canonical_digest(payload),
+    )
+    return _graph_store.open_control(
+        connection,
+        control,
+        claim_token=attempt.claim_token,
+        fencing_epoch=fencing_epoch,
+    )
+
+
 def _recover_started_effect_receipts(
     path: Path,
     clock: Callable[[], datetime],
@@ -6719,11 +6964,31 @@ def _recover_started_effect_receipts(
     try:
         with _connect_read_only(path) as connection:
             rows = tuple(
-                connection.execute("SELECT agent_id, id, data FROM effect_receipts")
+                connection.execute(
+                    "SELECT agent_id, id, data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest FROM effect_receipts"
+                )
             )
         started = tuple(
-            (agent_id, receipt_id, receipt)
-            for agent_id, receipt_id, data in rows
+            (
+                agent_id,
+                receipt_id,
+                receipt,
+                job_id,
+                task_id,
+                attempt_id,
+                fencing_epoch,
+                task_spec_digest,
+            )
+            for (
+                agent_id,
+                receipt_id,
+                data,
+                job_id,
+                task_id,
+                attempt_id,
+                fencing_epoch,
+                task_spec_digest,
+            ) in rows
             if (receipt := decode_receipt(data)).outcome is EffectOutcome.STARTED
         )
         if not started:
@@ -6731,7 +6996,16 @@ def _recover_started_effect_receipts(
         completed_at = _effect_receipt_aware(clock(), "receipt recovery completed_at")
         with _connect(path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            for agent_id, receipt_id, receipt in started:
+            for (
+                agent_id,
+                receipt_id,
+                receipt,
+                job_id,
+                task_id,
+                attempt_id,
+                fencing_epoch,
+                task_spec_digest,
+            ) in started:
                 recovered = receipt.finish(
                     EffectObservation(
                         EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN
@@ -6751,6 +7025,17 @@ def _recover_started_effect_receipts(
                 if result.rowcount != 1:
                     raise RuntimeError("effect receipt changed during startup recovery")
                 _pause_effect_routine(connection, recovered, completed_at)
+                if job_id is not None:
+                    _open_graph_effect_uncertain_control(
+                        connection,
+                        receipt=recovered,
+                        job_id=str(job_id),
+                        task_id=str(task_id),
+                        attempt_id=str(attempt_id),
+                        fencing_epoch=int(fencing_epoch),
+                        task_spec_digest=str(task_spec_digest),
+                        opened_at=completed_at,
+                    )
     except RuntimeError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):

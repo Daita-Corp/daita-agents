@@ -27,6 +27,7 @@ from daita.llm.models import (
     ModelUsage,
 )
 from daita.llm.pricing import CostEstimate
+from daita.loop.models import LoopLimits
 from tests.data.writes._upsert_support import Database
 from tests.support.mcp import (
     conformance_identities,
@@ -79,7 +80,13 @@ def response(*calls, text=None):
     )
 
 
-async def create_fixture(tmp_path, monkeypatch, *, sensitivity=Sensitivity.RESTRICTED):
+async def create_fixture(
+    tmp_path,
+    monkeypatch,
+    *,
+    sensitivity=Sensitivity.RESTRICTED,
+    limits: LoopLimits | None = None,
+):
     clock = [NOW]
     db = Database()
     alpha, _ = conformance_identities()
@@ -109,6 +116,7 @@ async def create_fixture(tmp_path, monkeypatch, *, sensitivity=Sensitivity.RESTR
         workspace=workspace_for(tmp_path),
         model=provider,
         model_profile=provider.model_profile,
+        limits=limits,
         clock=lambda: clock[0],
         mcp_client_factory=factory,
         approval_handler=approve,
@@ -228,6 +236,7 @@ async def create_fixture(tmp_path, monkeypatch, *, sensitivity=Sensitivity.RESTR
         workspace=workspace_for(tmp_path),
         model=provider,
         model_profile=provider.model_profile,
+        limits=limits,
         clock=lambda: clock[0],
         mcp_client_factory=factory,
         approval_handler=approve,

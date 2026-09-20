@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -169,6 +170,18 @@ async def test_real_context_builder_uses_only_the_immutable_task_bundle(
         assert '"callable_tool_names":["graph_read"]' in system.text
         assert "untrusted_prior_attempts" in system.text
         assert "unrelated conversation" not in system.text
+        complete = next(
+            tool
+            for tool in integration.provider.requests[0].tools
+            if tool.name == "task_complete"
+        )
+        required = complete.input_schema["required"]
+        properties = complete.input_schema["properties"]
+        assert isinstance(required, tuple) and isinstance(properties, Mapping)
+        assert "evidence_call_ids" not in required
+        assert "artifact_ids" not in required
+        assert "Never put receipt" in properties["evidence_call_ids"]["description"]
+        assert "receipt IDs are never" in properties["artifact_ids"]["description"]
     finally:
         await integration.close()
 

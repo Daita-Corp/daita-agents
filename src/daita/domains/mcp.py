@@ -499,7 +499,6 @@ class MCPCapabilityDomain:
         for capability_id, (binding, _tool) in self._binding_by_capability.items():
             if (
                 run.execution_scope is not None
-                and run.execution_scope.routine_id is not None
                 and binding.binding_id
                 not in run.execution_scope.allowed_connector_binding_ids
             ):
@@ -543,7 +542,6 @@ class MCPCapabilityDomain:
         scope = run.execution_scope
         if (
             scope is not None
-            and scope.routine_id is not None
             and binding.binding_id not in scope.allowed_connector_binding_ids
         ):
             raise CapabilityInputError(
@@ -948,14 +946,25 @@ async def activate_mcp_domain(
                 else None
             ),
             execution_admission_policy=ExecutionAdmissionPolicy(
-                shape="read_only_mcp",
+                shape=(
+                    "read_only_mcp"
+                    if tool.operational_effect is OperationalEffect.NONE
+                    else "exact_grant_mcp_action"
+                ),
                 inline_eligible=True,
-                graph_v1_eligible=(tool.operational_effect is OperationalEffect.NONE),
+                graph_v1_eligible=(
+                    tool.operational_effect is OperationalEffect.NONE
+                    or (
+                        tool.automation_eligibility
+                        is AutomationEligibility.AUTOMATION_DIRECT
+                        and tool.completion_semantics
+                        is MCPCompletionSemantics.DIRECT_RESULT
+                        and tool.task_support != "required"
+                    )
+                ),
                 target_count_argument=None,
                 inline_max_targets=1,
-                graph_max_targets=(
-                    1 if tool.operational_effect is OperationalEffect.NONE else 0
-                ),
+                graph_max_targets=1,
             ),
         )
         for item in activated

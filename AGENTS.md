@@ -41,8 +41,10 @@ The current revision-2 graph has these non-negotiable boundaries:
 - root authority, outcome, distribution, deadlines and total budgets are immutable;
   planner-created task scope is a validated subset and model text never grants
   authority;
-- graph V1 is structurally effect-free. Effectful graph work is a separately gated
-  later phase; the existing receipt boundary remains the only effect truth;
+- graph effects are narrowly released only for preview-bound PostgreSQL update/upsert
+  and specifically admitted synchronous MCP actions under exact code-owned grants;
+  all other graph work remains effect-free and the existing receipt boundary remains
+  the only effect truth;
 - graph transactions are short indexed SQLite CAS operations. Provider, source, MCP,
   artifact and effect I/O never occurs beneath a graph transaction or broad host
   lock;
@@ -326,7 +328,7 @@ External native data effects and admitted external actions declare an
 constraints. Effect-free and local management capabilities cannot use these
 external-effect policies. Unattended effects require concrete native/MCP admission
 and exact standing grants. Generic routine authority and outcome conformance alone
-do not enable them; implementation acceptance is not production release approval.
+do not enable them; eligibility metadata alone is not production authority.
 
 The runtime reserves a unique operation and call identity in SQLite before
 external dispatch, validates the resulting observation and ordinary output, and
@@ -391,7 +393,7 @@ evidence. Full request sensitivity must fit the current target classification.
 Research lineage remains model-derived claims, distinct from transaction facts.
 Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
 insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
-Native implementation acceptance is not production release approval.
+Native graph release is limited to these same PostgreSQL update/upsert contracts.
 
 ## Local computer files and artifacts
 
@@ -480,6 +482,24 @@ admits one code-resolved graph-eligible initial task and internal finalizer when
 model route and finite cost ceiling are configured. Planner-created work is a
 validated immutable-authority subset. Unmappable migrated work is
 `needs_attention`; no legacy executor can run it.
+
+An effectful initial task additionally requires foreground approval and one
+code-normalized exact grant. Native grants bind the exact PostgreSQL source,
+resource revision, operation, columns, keys, identity generation and row ceiling;
+the task must execute its frozen preview before applying it once. MCP grants bind
+the exact active binding revision, remote tool and fixed nested JSON, with only
+explicit top-level scalar variables, `AUTOMATION_DIRECT`, `DIRECT_RESULT`, no
+required asynchronous task support and one call. Effect execution holds the global
+`effect:v1:global` lane plus `relwrite:<source>:<resource>` or
+`mcp:<agent>:<binding>`.
+
+Receipt reservation atomically authenticates the live job, task, attempt, claim,
+fencing epoch, task-spec digest and grant before dispatch. A task result may retain
+only its authenticated successful receipt reference. Any reserved operation that
+cannot be joined to an accepted task result blocks the task and descendants through
+a typed `effect_uncertain` control; startup and cancellation reconciliation never
+replay it. Human receipt resolution remains immutable evidence and does not retry,
+compensate or mark the task successful.
 
 Agent identity is the job authorization boundary. The originating
 conversation and run are immutable provenance, not access gates. Bounded list,

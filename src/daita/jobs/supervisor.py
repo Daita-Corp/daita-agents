@@ -203,6 +203,17 @@ class JobSupervisor:
             lambda: self._store.list_active_graph_attempts(self._agent_id)
         )
         for attempt in attempts:
+            has_effect_reservation = await self._graph_store_call(
+                partial(
+                    self._store.reconcile_graph_effect_attempt,
+                    attempt.agent_id,
+                    attempt.job_id,
+                    attempt.task_id,
+                    attempt.attempt_id,
+                )
+            )
+            if has_effect_reservation:
+                continue
             inspection = await self._graph_store_call(
                 partial(self._store.inspect_graph, self._agent_id, attempt.job_id)
             )
@@ -746,6 +757,29 @@ class JobSupervisor:
             "Execute the exact frozen graph task from the code-owned task context. "
             "Use one exclusive lifecycle terminator to finish."
         )
+        initial_call = current_task.specification.expected_result_contract.get(
+            "initial_call"
+        )
+        if isinstance(initial_call, Mapping) and isinstance(
+            initial_call.get("effect_call"), Mapping
+        ):
+            effect_call = initial_call["effect_call"]
+            assert isinstance(effect_call, Mapping)
+            instruction += (
+                " This is one exact grant-backed effect task."
+                + (
+                    " Call its frozen preview first, then apply only that authenticated preview once."
+                    if effect_call.get("preview_capability_id") is not None
+                    else " Call the exact frozen action at most once."
+                )
+                + (
+                    " The runtime automatically binds the sole successful grant-backed "
+                    "effect call when the task completes. Never copy an effect-receipt "
+                    "ID into task_complete. Use evidence_call_ids only for additional "
+                    "current-run ToolCall.id values and artifact_ids only for actual "
+                    "artifacts; omit both when empty."
+                )
+            )
         payload = {"task_context_digest": context.digest}
         start = RunStartEnvelope(
             origin=RunOrigin.JOB_TASK,
@@ -962,6 +996,7 @@ class JobSupervisor:
                         "summary": result.summary,
                         "payload": result.payload,
                         "artifact_ids": result.artifact_ids,
+                        "effect_receipt_ids": result.effect_receipt_ids,
                         "sensitivity": result.sensitivity.value,
                     }
                 )

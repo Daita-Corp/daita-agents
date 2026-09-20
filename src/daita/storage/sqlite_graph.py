@@ -11,6 +11,7 @@ from hashlib import sha256
 from typing import cast
 
 from ..artifacts.models import ArtifactRef, artifact_ref_from_mapping
+from ..capabilities import EffectOutcome
 from ..distribution.models import (
     CONVERSATION_INBOX_DESTINATION_REVISION,
     MAX_DELIVERIES_PER_AGENT,
@@ -98,6 +99,7 @@ from .sqlite_codecs.graph import (
     encode_task_dependency,
     encode_task_result,
 )
+from .sqlite_codecs.receipts import decode_receipt
 from .sqlite_codecs.transcripts import decode_message
 
 
@@ -2828,6 +2830,71 @@ def complete_attempt(
         raise GraphValidationError(
             "result_sensitivity", "result lowers task sensitivity"
         )
+    raw_grants = task.specification.authority.contract_bindings.get("capability_grants")
+    if raw_grants:
+        if not isinstance(raw_grants, Mapping) or len(raw_grants) != 1:
+            raise GraphValidationError(
+                "effect_grant", "task effect grant binding is malformed"
+            )
+        if len(result.effect_receipt_ids) != 1:
+            raise GraphValidationError(
+                "effect_receipt", "effectful task requires one receipt reference"
+            )
+        capability_id, grant_entry = next(iter(raw_grants.items()))
+        if not isinstance(capability_id, str) or not isinstance(grant_entry, Mapping):
+            raise GraphValidationError(
+                "effect_grant", "task effect grant binding is malformed"
+            )
+        grant_digest = grant_entry.get("grant_digest")
+        row = connection.execute(
+            "SELECT data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest, grant_digest, unresolved FROM effect_receipts WHERE agent_id = ? AND id = ?",
+            (result.agent_id, result.effect_receipt_ids[0]),
+        ).fetchone()
+        if row is None:
+            raise GraphValidationError(
+                "effect_receipt", "task effect receipt is unavailable"
+            )
+        receipt = decode_receipt(_required_text(row[0], "effect receipt payload"))
+        evidence = result.provenance.get("evidence")
+        matching_evidence = (
+            tuple(
+                item
+                for item in evidence
+                if isinstance(item, Mapping)
+                and item.get("call_id") == receipt.call_id
+                and item.get("capability_id") == receipt.capability_id
+                and item.get("effect_receipt_id") == receipt.receipt_id
+            )
+            if isinstance(evidence, tuple)
+            else ()
+        )
+        if (
+            row[1:6]
+            != (
+                result.job_id,
+                result.task_id,
+                result.attempt_id,
+                fencing_epoch,
+                task.task_spec_digest,
+            )
+            or row[6] != grant_digest
+            or row[7] != 0
+            or receipt.run_id != result.run_id
+            or receipt.capability_id != capability_id
+            or receipt.capability_grant_digest != grant_digest
+            or receipt.outcome is not EffectOutcome.SUCCEEDED
+            or receipt.finished_at is None
+            or receipt.finished_at > result.completed_at
+            or len(matching_evidence) != 1
+        ):
+            raise GraphValidationError(
+                "effect_receipt",
+                "task effect receipt does not authenticate this exact attempt result",
+            )
+    elif result.effect_receipt_ids:
+        raise GraphValidationError(
+            "effect_receipt", "effect-free task cannot reference an effect receipt"
+        )
     if task.role is TaskRole.FINALIZER and (
         graph.finalization_attempt_id != attempt.attempt_id
         or graph.finalization_started_revision != graph.revision
@@ -2976,6 +3043,54 @@ def fence_attempt(
         or attempt.state not in ACTIVE_ATTEMPT_STATES
     ):
         return None
+    receipt_row = connection.execute(
+        "SELECT data FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND task_attempt_id = ? ORDER BY id LIMIT 1",
+        (agent_id, job_id, task_id, attempt_id),
+    ).fetchone()
+    if receipt_row is not None and attempt.state is AttemptState.RUNNING:
+        receipt = decode_receipt(
+            _required_text(receipt_row[0], "effect receipt payload")
+        )
+        control_id = (
+            "control-"
+            + sha256(
+                f"{receipt.receipt_id}:effect-uncertain".encode("utf-8")
+            ).hexdigest()[:32]
+        )
+        payload = {
+            "message": (
+                "This attempt reserved an external operation and cannot be fenced "
+                "into replayable work. Reconcile its immutable receipt instead."
+            ),
+            "details": {
+                "receipt_id": receipt.receipt_id,
+                "receipt_digest": receipt.receipt_digest,
+                "outcome": receipt.outcome.value,
+                "evidence_basis": receipt.evidence_basis.value,
+                "fence_reason": reason_code,
+                "no_replay": True,
+            },
+        }
+        control = TaskControl(
+            agent_id=agent_id,
+            job_id=job_id,
+            task_id=task_id,
+            control_id=control_id,
+            kind=ControlKind.EFFECT_UNCERTAIN,
+            state=ControlState.OPEN,
+            requesting_attempt_id=attempt_id,
+            payload=payload,
+            created_at=fenced_at,
+            payload_digest=canonical_digest(payload),
+        )
+        open_control(
+            connection,
+            control,
+            claim_token=attempt.claim_token,
+            fencing_epoch=fencing_epoch,
+        )
+        settled = _load_attempt(connection, agent_id, job_id, task_id, attempt_id)
+        return None if settled is None else settled[0]
     measured_usage = _settle_budgets(
         connection, attempt=attempt, usage=None, settled_at=fenced_at
     )

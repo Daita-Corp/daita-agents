@@ -718,10 +718,12 @@ class ExecutionScope:
                 raise ValueError("graph-task scope job differs from its task binding")
             if self.agent_id != self.graph_task_binding.agent_id:
                 raise ValueError("graph-task scope agent differs from its task binding")
-            if effects != frozenset({OperationalEffect.NONE}):
-                raise ValueError(
-                    "graph V1 task scopes must be structurally effect-free"
-                )
+            if not effects <= {
+                OperationalEffect.NONE,
+                OperationalEffect.MUTATE_DATA,
+                OperationalEffect.EXTERNAL_ACTION,
+            }:
+                raise ValueError("graph-task scope contains an ineligible effect")
         elif self.graph_task_binding is not None:
             raise ValueError("only a graph-task scope may carry a task binding")
         elif self.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE:
@@ -792,10 +794,27 @@ class ExecutionScope:
             raise ValueError("execution scope grants are invalid or exceed their bound")
         if len({grant.capability_id for grant in grants}) != len(grants):
             raise ValueError("execution scope permits only one grant per capability")
-        if any(grant.capability_id not in capabilities for grant in grants) or (
-            grants and self.routine_id is None
+        if any(grant.capability_id not in capabilities for grant in grants):
+            raise ValueError("standing grants must be embedded in their exact scope")
+        if grants and self.scope_kind not in {
+            ExecutionScopeKind.SCHEDULED_ROUTINE,
+            ExecutionScopeKind.GRAPH_TASK,
+        }:
+            raise ValueError("standing grants require a scheduled or graph scope")
+        if self.scope_kind is ExecutionScopeKind.GRAPH_TASK and any(
+            grant.max_calls_per_occurrence != 1 for grant in grants
         ):
-            raise ValueError("standing grants must be embedded in their routine scope")
+            raise ValueError("graph effect grants permit exactly one invocation")
+        granted_effects = {
+            OperationalEffect.MUTATE_DATA,
+            OperationalEffect.EXTERNAL_ACTION,
+        }
+        if self.scope_kind is ExecutionScopeKind.GRAPH_TASK and (
+            bool(effects & granted_effects) != bool(grants)
+        ):
+            raise ValueError(
+                "graph effect authority and exact grants must be present together"
+            )
         if any(
             self.contract_bindings.capability_contracts[grant.capability_id]
             != grant.capability_contract_digest
@@ -1266,8 +1285,21 @@ class Capability:
             if (
                 self.execution_admission_policy.graph_v1_eligible
                 and self.operational_effect is not OperationalEffect.NONE
+                and (
+                    self.operational_effect
+                    not in {
+                        OperationalEffect.MUTATE_DATA,
+                        OperationalEffect.EXTERNAL_ACTION,
+                    }
+                    or self.automation_eligibility
+                    is not AutomationEligibility.AUTOMATION_DIRECT
+                    or self.automation_grant_policy is None
+                    or self.effect_receipt_policy is None
+                )
             ):
-                raise ValueError("graph V1 admission is structurally effect-free")
+                raise ValueError(
+                    "graph effect admission is not structurally effect-free and requires direct automation with exact grant and receipt policies"
+                )
         if not isinstance(self.durable_foreground_entrypoint, bool):
             raise TypeError("durable_foreground_entrypoint must be bool")
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)

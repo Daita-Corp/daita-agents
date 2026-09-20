@@ -1797,6 +1797,7 @@ class EmbeddedAgent:
             *routine_lifecycle.executors,
         )
         graph_routes = _stage_c_model_routes(model, model_route)
+        graph_builder: GraphAdmissionBuilder | None = None
         if graph_routes and limits.max_estimated_cost_usd is not None:
             graph_prerequisite_registry = CapabilityRegistry(
                 declarations=tuple(domain.declarations for domain in domains),
@@ -1889,6 +1890,10 @@ class EmbeddedAgent:
             limits=limits,
         )
         routine_owner.bind_grant_preparer(capability_runtime.prepare_automation_grant)
+        if graph_builder is not None:
+            graph_builder.bind_grant_preparer(
+                capability_runtime.prepare_automation_grant
+            )
         resolved_context = context_builder
         resolved_tools = tools
         if model is not None and resolved_context is None:
@@ -2752,6 +2757,14 @@ class EmbeddedAgent:
         self._require_open()
         return await self._job_owner.list_graph_task_artifacts(
             job_id, task_id=task_id, limit=limit
+        )
+
+    async def list_task_controls(
+        self, job_id: str, task_id: str, *, limit: int = 8
+    ) -> tuple[TaskControl, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_task_controls(
+            job_id, task_id, limit=limit
         )
 
     async def job_timeline(

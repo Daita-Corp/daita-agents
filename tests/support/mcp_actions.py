@@ -42,6 +42,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
+from daita.loop.models import LoopLimits
 from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.mcp import MCPConformanceTransport, MCPFixtureIdentity
 from tests.support.workspace import workspace_for
@@ -126,6 +127,7 @@ class ActionFixture:
         self.model = ActionModel()
         self.approvals = []
         self.decision = ApprovalDecision.APPROVE
+        self.limits: LoopLimits | None = None
         self.server = MCPFixtureIdentity(
             host="actions.fixture.test",
             server_name="ordinary-service",
@@ -181,15 +183,18 @@ class ActionFixture:
         return self.decision
 
     def kwargs(self) -> dict[str, Any]:
-        return dict(
-            root=self.root,
-            workspace=workspace_for(self.root),
-            model=self.model,
-            model_profile=self.model.model_profile,
-            clock=lambda: self.clock,
-            mcp_client_factory=self.factory,
-            approval_handler=self.approve,
-        )
+        values: dict[str, Any] = {
+            "root": self.root,
+            "workspace": workspace_for(self.root),
+            "model": self.model,
+            "model_profile": self.model.model_profile,
+            "clock": lambda: self.clock,
+            "mcp_client_factory": self.factory,
+            "approval_handler": self.approve,
+        }
+        if self.limits is not None:
+            values["limits"] = self.limits
+        return values
 
     async def start(self, *, selection=None, outbound=ModelSensitivity.INTERNAL):
         self.agent = await Agent.create("mcp-actions", **self.kwargs())

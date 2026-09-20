@@ -157,6 +157,7 @@ class EffectReceiptStore(Protocol):
         receipt: EffectReceipt,
         *,
         grant: CapabilityGrant | None = None,
+        task_attempt_guard: TaskAttemptGuard | None = None,
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt: ...
     async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt: ...
@@ -2478,6 +2479,7 @@ class CapabilityRuntime:
             plan,
             domain,
             sensitivity=sensitivity,
+            catalog_entry=catalog_entry,
             session=session,
         )
 
@@ -2494,13 +2496,20 @@ class CapabilityRuntime:
         domain: CapabilityDomain,
         *,
         sensitivity: ModelSensitivity,
+        catalog_entry: RunToolCatalogEntry,
         session: RunSession | None,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
         ToolBatchCertainty,
     ]:
-        async with self._side_effect_lane(capability, session):
+        async with self._side_effect_lane(
+            capability,
+            session,
+            run=run,
+            arguments=arguments,
+            catalog_entry=catalog_entry,
+        ):
             await _guard_attempt(
                 execution.task_attempt_guard,
                 capability.id,
@@ -2638,6 +2647,10 @@ class CapabilityRuntime:
         self,
         capability: Capability,
         session: RunSession | None,
+        *,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        catalog_entry: RunToolCatalogEntry,
     ) -> AsyncIterator[None]:
         if capability.effect_receipt_policy is None:
             owner_id = self._registry.resolve_domain_owner(capability.id)
@@ -2653,7 +2666,51 @@ class CapabilityRuntime:
             cancellation=None if session is None else session.cancellation,
         )
         async with permit:
-            yield
+            conflict_permit = await self._effect_conflict_permit(
+                run,
+                capability,
+                arguments,
+                catalog_entry,
+                session=session,
+            )
+            if conflict_permit is None:
+                yield
+            else:
+                async with conflict_permit:
+                    yield
+
+    async def _effect_conflict_permit(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        catalog_entry: RunToolCatalogEntry,
+        *,
+        session: RunSession | None,
+    ) -> AdmissionPermit | None:
+        coordinator = self._admission_coordinator
+        if coordinator is None or capability.effect_receipt_policy is None:
+            return None
+        deadline = None if session is None else session.absolute_deadline
+        cancellation = None if session is None else session.cancellation
+        presentation = catalog_entry.view.connector_presentation
+        if isinstance(presentation, Mapping):
+            binding_id = presentation.get("id")
+            if isinstance(binding_id, str) and binding_id:
+                return await coordinator.mcp_permit(
+                    f"mcp:{run.agent_id}:{binding_id}",
+                    deadline=deadline,
+                    cancellation=cancellation,
+                )
+        source_id = arguments.get("source_id")
+        resource_id = arguments.get("resource_id")
+        if isinstance(source_id, str) and isinstance(resource_id, str):
+            return await coordinator.source_resource_permit(
+                f"relwrite:{source_id}:{resource_id}",
+                deadline=deadline,
+                cancellation=cancellation,
+            )
+        return None
 
     def _validate_effect_plan(
         self,
@@ -2735,6 +2792,11 @@ class CapabilityRuntime:
                 "routine_id": routine_id,
                 "routine_revision": None if scope is None else scope.routine_revision,
                 "occurrence_id": None if scope is None else scope.occurrence_id,
+                "graph_task_binding": (
+                    None
+                    if scope is None or scope.graph_task_binding is None
+                    else scope.graph_task_binding.digest
+                ),
                 "capability_contract_digest": self._registry.contract_digest(
                     capability.id
                 ),
@@ -2780,13 +2842,28 @@ class CapabilityRuntime:
         await store.start_effect_receipt(
             receipt,
             grant=grant,
+            task_attempt_guard=execution.task_attempt_guard,
             max_receipts_per_run=min(self._limits.max_tool_calls_per_run, 256),
         )
         execution = replace(execution, effect_receipt_id=receipt.receipt_id)
         observation: EffectObservation | None = None
         interruption: ToolBatchInterruption | None = None
         certainty = ToolBatchCertainty.DEFINITE
-        if (
+        reservation_guard_error: CapabilityInputError | None = None
+        try:
+            await _guard_attempt(
+                execution.task_attempt_guard,
+                capability.id,
+                "after_effect_reservation_before_dispatch",
+            )
+        except CapabilityInputError as error:
+            reservation_guard_error = error
+        if reservation_guard_error is not None:
+            observation = EffectObservation(
+                EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+            )
+            result = self._exception_result(call, reservation_guard_error, domain)
+        elif (
             active_task is not None
             and active_task.cancelling() > cancellations_before_reservation
         ):
