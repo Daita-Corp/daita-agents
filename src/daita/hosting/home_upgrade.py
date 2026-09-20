@@ -16,6 +16,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from ..errors import StateCompatibilityCode, StateCompatibilityError
+from ..storage.graph_schema import ClosingSQLiteConnection
 from ..storage.home_migrations import (
     CURRENT_HOME_REVISION,
     HOME_MIGRATIONS,
@@ -60,7 +61,11 @@ class AgentHomeUpgradeResult:
 
 def _connect_read_only(path: Path) -> sqlite3.Connection:
     uri = f"file:{quote(os.fspath(path))}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True)
+    connection = sqlite3.connect(
+        uri,
+        uri=True,
+        factory=ClosingSQLiteConnection,
+    )
     connection.execute("PRAGMA query_only = ON")
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
@@ -563,7 +568,10 @@ def _stage_upgrade(
     source_shape = None if status.source_kind == "production" else status.source_kind
     for migration in migrations:
         migration.apply(stage, source_shape)
-        with sqlite3.connect(stage / "state.db") as connection:
+        with sqlite3.connect(
+            stage / "state.db",
+            factory=ClosingSQLiteConnection,
+        ) as connection:
             insert_migration_row(connection, migration)
             require_schema(connection, migration.target_schema)
             require_healthy(connection)

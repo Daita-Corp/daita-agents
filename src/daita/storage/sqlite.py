@@ -155,7 +155,7 @@ from ..semantics import (
     semantic_annotation_sha256,
 )
 from . import sqlite_graph as _graph_store
-from .graph_schema import connect_graph
+from .graph_schema import ClosingSQLiteConnection, connect_graph
 from .home_migrations import (
     CURRENT_HOME_REVISION,
     HomeMigrationJournalError,
@@ -1182,6 +1182,7 @@ class SQLiteStateStore:
     async def close(self) -> None:
         async with self._decoded_catalog_snapshot_lock:
             self._decoded_catalog_snapshots.clear()
+        await asyncio.to_thread(_checkpoint_wal_for_close, self.path)
 
     async def initialize_identity(self, identity: AgentIdentity) -> AgentIdentity:
         def write() -> AgentIdentity:
@@ -7043,7 +7044,11 @@ def _recover_started_effect_receipts(
 
 
 def _connect(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path, timeout=30)
+    connection = sqlite3.connect(
+        path,
+        timeout=30,
+        factory=ClosingSQLiteConnection,
+    )
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
@@ -7053,10 +7058,25 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
         path.as_uri() + "?mode=ro",
         timeout=30,
         uri=True,
+        factory=ClosingSQLiteConnection,
     )
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA query_only = ON")
     return connection
+
+
+def _checkpoint_wal_for_close(path: Path) -> None:
+    connection = _connect(path)
+    try:
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if (
+            checkpoint is None
+            or int(checkpoint[0]) != 0
+            or int(checkpoint[1]) != int(checkpoint[2])
+        ):
+            raise RuntimeError("state database WAL checkpoint did not complete")
+    finally:
+        connection.close()
 
 
 def _commit_catalog_transaction(connection: sqlite3.Connection) -> None:

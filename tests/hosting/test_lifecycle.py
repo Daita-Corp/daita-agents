@@ -50,6 +50,35 @@ def _sqlite_database(path: Path) -> None:
         connection.execute("INSERT INTO records VALUES (1, 'one')")
 
 
+async def test_read_only_reopen_close_leaves_no_sqlite_sidecars(tmp_path):
+    name = "read-only-close"
+    agent = await Agent.create(
+        name,
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
+    home = agent._embedded.home
+    await agent.close()
+
+    database = home / "state.db"
+    before = database.read_bytes()
+    assert not database.with_name("state.db-wal").exists()
+    assert not database.with_name("state.db-shm").exists()
+
+    reopened = await Agent.open(
+        name,
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+    )
+    await reopened.list_sources()
+    await reopened.catalog_summary()
+    await reopened.close()
+
+    assert database.read_bytes() == before
+    assert not database.with_name("state.db-wal").exists()
+    assert not database.with_name("state.db-shm").exists()
+
+
 async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path):
     provider = _BlockingProvider()
     agent = await Agent.create(

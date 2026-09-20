@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import zipfile
+from contextlib import closing
 from pathlib import Path
 
 from tests.support.paths import REPO_ROOT
@@ -106,7 +107,7 @@ def _without_state_database(values: dict[str, str]) -> dict[str, str]:
 
 
 def _database_rows(path: Path) -> dict[str, tuple[tuple[object, ...], ...]]:
-    with sqlite3.connect(path) as connection:
+    with closing(sqlite3.connect(path)) as connection:
         tables = tuple(
             row[0]
             for row in connection.execute(

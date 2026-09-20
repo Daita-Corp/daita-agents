@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import sqlite3
 from pathlib import Path
+from types import TracebackType
+from typing import Literal
 from urllib.parse import quote
 
 from .home_migrations.revision_0001_schema import (
@@ -17,6 +19,22 @@ from .home_migrations.revision_0001_schema import (
     SCHEDULED_ROUTINE_TABLE_SQL,
     SOURCE_READ_SCOPE_TABLE_SQL,
 )
+
+
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """Close an owned SQLite connection when its transaction context exits."""
+
+    def __exit__(
+        self,
+        exception_type: type[BaseException] | None,
+        exception: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> Literal[False]:
+        try:
+            return super().__exit__(exception_type, exception, traceback)
+        finally:
+            self.close()
+
 
 GRAPH_TABLE_NAMES = frozenset(
     {
@@ -593,11 +611,18 @@ def initialize_graph_database(path: Path) -> None:
 def connect_graph(path: Path, *, read_only: bool = False) -> sqlite3.Connection:
     if read_only:
         connection = sqlite3.connect(
-            f"file:{quote(os.fspath(path))}?mode=ro", uri=True, timeout=5
+            f"file:{quote(os.fspath(path))}?mode=ro",
+            uri=True,
+            timeout=5,
+            factory=ClosingSQLiteConnection,
         )
         connection.execute("PRAGMA query_only = ON")
     else:
-        connection = sqlite3.connect(path, timeout=5)
+        connection = sqlite3.connect(
+            path,
+            timeout=5,
+            factory=ClosingSQLiteConnection,
+        )
     configure_graph_connection(connection)
     require_graph_schema(connection)
     return connection
