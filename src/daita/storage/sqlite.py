@@ -6159,6 +6159,7 @@ async def _run_graph_read(
 ) -> _T:
     def read() -> _T:
         with connect_graph(path, read_only=True) as connection:
+            connection.execute("BEGIN")
             return callback(connection)
 
     return await asyncio.to_thread(read)

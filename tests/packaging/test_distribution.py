@@ -203,6 +203,7 @@ def test_real_wheel_metadata_drives_installed_runtime_cli_tui_and_mcp(
             "pip",
             "install",
             "--disable-pip-version-check",
+            "--force-reinstall",
             "--no-deps",
             str(wheel),
         ],
@@ -232,8 +233,10 @@ def test_real_wheel_metadata_drives_installed_runtime_cli_tui_and_mcp(
     )
     assert surfaces.returncode == 0, surfaces.stderr
     assert surfaces.stdout.splitlines() == [metadata.version] * 3
+    cli_path = runtime / "bin" / "daita"
+    assert cli_path.is_file(), installed.stdout + installed.stderr
     cli = subprocess.run(
-        [str(runtime / "bin" / "daita"), "--version"],
+        [str(cli_path), "--version"],
         check=False,
         capture_output=True,
         text=True,
