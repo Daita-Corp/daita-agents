@@ -858,10 +858,15 @@ def test_runtime_has_one_home_revision_owner_and_no_legacy_version_gates() -> No
 def test_revision_2_home_reopens_without_importing_revision_1_job_decoders(
     tmp_path: Path,
 ) -> None:
-    agent = asyncio.run(
-        Agent.create("current-home", root=tmp_path, workspace=workspace_for(tmp_path))
-    )
-    asyncio.run(agent.close())
+    async def create_current_home() -> None:
+        agent = await Agent.create(
+            "current-home",
+            root=tmp_path,
+            workspace=workspace_for(tmp_path),
+        )
+        await agent.close()
+
+    asyncio.run(create_current_home())
     code = """
 import asyncio
 import sys

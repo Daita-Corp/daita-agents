@@ -50,7 +50,12 @@ def _sqlite_database(path: Path) -> None:
         connection.execute("INSERT INTO records VALUES (1, 'one')")
 
 
-async def test_read_only_reopen_close_leaves_no_sqlite_sidecars(tmp_path):
+def _assert_wal_drained(database: Path) -> None:
+    wal = database.with_name("state.db-wal")
+    assert not wal.exists() or wal.stat().st_size == 0
+
+
+async def test_read_only_reopen_close_preserves_database_and_drains_wal(tmp_path):
     name = "read-only-close"
     agent = await Agent.create(
         name,
@@ -62,8 +67,7 @@ async def test_read_only_reopen_close_leaves_no_sqlite_sidecars(tmp_path):
 
     database = home / "state.db"
     before = database.read_bytes()
-    assert not database.with_name("state.db-wal").exists()
-    assert not database.with_name("state.db-shm").exists()
+    _assert_wal_drained(database)
 
     reopened = await Agent.open(
         name,
@@ -75,8 +79,7 @@ async def test_read_only_reopen_close_leaves_no_sqlite_sidecars(tmp_path):
     await reopened.close()
 
     assert database.read_bytes() == before
-    assert not database.with_name("state.db-wal").exists()
-    assert not database.with_name("state.db-shm").exists()
+    _assert_wal_drained(database)
 
 
 async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path):

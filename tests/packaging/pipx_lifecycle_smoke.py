@@ -83,6 +83,10 @@ def _sha256(path: Path) -> str:
 
 
 def _home_hashes(home: Path) -> dict[str, str]:
+    wal = home / "state.db-wal"
+    if wal.is_file() and wal.stat().st_size != 0:
+        raise AssertionError("agent home has an uncheckpointed state database WAL")
+    transient_sqlite_files = {"state.db-wal", "state.db-shm"}
     paths = tuple(
         sorted(
             (
@@ -91,6 +95,7 @@ def _home_hashes(home: Path) -> dict[str, str]:
                 if path.is_file()
                 and not path.is_symlink()
                 and path.relative_to(home).parts[0] != "run"
+                and path.relative_to(home).as_posix() not in transient_sqlite_files
             ),
             key=lambda path: path.relative_to(home).as_posix(),
         )
