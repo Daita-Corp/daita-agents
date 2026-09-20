@@ -258,6 +258,23 @@ def test_release_workflow_covers_every_reviewed_target_before_publication():
     assert "default: false" in workflow
     assert 'tags:\n      - "v*"' in workflow
     assert "managed-installer-release" in workflow
+    restore_tag_step = "Restore exact annotated tag reference after checkout"
+    assert workflow.count(restore_tag_step) == 2
+    assert workflow.count("if: github.ref_type == 'tag'") == 2
+    assert workflow.count("git fetch --force --no-tags origin") == 2
+    assert (
+        workflow.count('"refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"') == 2
+    )
+    build_restore = workflow.index(restore_tag_step)
+    publish_restore = workflow.index(restore_tag_step, build_restore + 1)
+    assert build_restore < workflow.index(
+        "Validate project, tag, and checkout identity"
+    )
+    assert (
+        workflow.index("  publish:")
+        < publish_restore
+        < workflow.index("Verify propagated project, tag, wheel, and manifest identity")
+    )
     assert (
         "needs:\n      - build\n      - deterministic-and-static\n"
         "      - native-installer-smoke" in workflow
