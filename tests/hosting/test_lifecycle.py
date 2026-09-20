@@ -7,7 +7,7 @@ import pytest
 
 from daita import Agent
 from daita.hosting.embedded import AgentHomeError, HostActiveError
-from daita.hosting.execution_governor import WorkloadClass
+from daita.hosting.execution_governor import PermitKind, WorkloadClass
 from daita.llm.models import (
     FinishReason,
     ModelProfile,
@@ -106,9 +106,15 @@ async def test_close_retains_writer_lock_until_blocked_run_terminalizes(tmp_path
             ]
         )
     )
-    diagnostics = agent._embedded._admission_coordinator.diagnostics()
+    coordinator = agent._embedded._admission_coordinator
+    diagnostics = coordinator.diagnostics()
     assert diagnostics.active_leases == 1
-    assert diagnostics.active_permits == 1
+    provider_permits = sum(
+        active
+        for (kind, _key), active in coordinator._permit_active.items()
+        if kind is PermitKind.PROVIDER
+    )
+    assert provider_permits == 1
     closing = asyncio.create_task(agent.close())
     await asyncio.sleep(0)
 
