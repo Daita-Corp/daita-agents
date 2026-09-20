@@ -32,6 +32,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import LoopLimits, RunInput
+from daita.loop.session import RunSessionOptions
 from daita.semantics import (
     ResourceRevisionBinding,
     SemanticAnnotation,
@@ -40,7 +41,10 @@ from daita.semantics import (
     SemanticKind,
     SemanticSubject,
 )
-from tests.support.capability_runtime import ContextToolProjectionAdapter
+from tests.support.capability_runtime import (
+    ContextToolProjectionAdapter,
+    make_run_session,
+)
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
@@ -302,14 +306,17 @@ async def test_semantic_acceptance_projects_only_its_exact_write_tool(tmp_path):
             source_scope_ids=(source.id,),
         )
         runtime = agent._embedded._capability_runtime
-        guard = agent._embedded._learning_candidate_guard
-        guard.select(run.id, candidate)
-        try:
-            catalog = await runtime.prepare_run(run)
-            names = {entry.view.name for entry in catalog.entries}
-        finally:
-            guard.clear(run.id)
-            guard.clear_outcome(run.id)
+        session = make_run_session(
+            run,
+            RunSessionOptions(
+                learning_candidate=candidate,
+                learning_candidate_id=candidate.id,
+                learning_candidate_text="selected semantic candidate",
+                learning_candidate_sensitivity=candidate.sensitivity,
+            ),
+        )
+        catalog = await runtime.prepare_session(session)
+        names = {entry.view.name for entry in catalog.entries}
 
         write_tools = {
             "memory_set",

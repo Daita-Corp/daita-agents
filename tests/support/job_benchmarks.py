@@ -14,7 +14,7 @@ from time import perf_counter
 
 import pytest
 
-from daita import Agent, JobStatus, LoopLimits, SQLiteSource, create_llm_provider
+from daita import Agent, GraphState, LoopLimits, SQLiteSource, create_llm_provider
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import (
@@ -64,12 +64,12 @@ TARGET_PROFILE_TABLE = "stage_b_profile_probe"
 LIFECYCLE_TOOLS = frozenset(
     {"job_list", "job_inspect", "job_read_results", "job_cancel"}
 )
-TERMINAL_STATUSES = frozenset(
+TERMINAL_STATES = frozenset(
     {
-        JobStatus.SUCCEEDED,
-        JobStatus.FAILED,
-        JobStatus.CANCELLED,
-        JobStatus.NEEDS_ATTENTION,
+        GraphState.SUCCEEDED,
+        GraphState.FAILED,
+        GraphState.CANCELLED,
+        GraphState.NEEDS_ATTENTION,
     }
 )
 
@@ -523,7 +523,7 @@ async def seed_completed_profile_agent(
         assert len(jobs) == 1
         job_id = jobs[0].job_id
         terminal = await wait_for_terminal(agent, job_id)
-        assert terminal.summary.status is JobStatus.SUCCEEDED
+        assert terminal.job.state is GraphState.SUCCEEDED
         await assert_profile_result(agent, job_id)
         # A fresh query must not accidentally answer a historical-result question.
         # Change only this disposable source after the verified snapshot is complete.
@@ -643,7 +643,7 @@ def job_id_from_start(transcript: Transcript) -> str:
     assert len(receipts) == 1
     data = receipts[0].output.get("data")
     assert isinstance(data, Mapping)
-    assert data.get("status") == JobStatus.QUEUED.value
+    assert data.get("status") == GraphState.QUEUED.value
     job_id = data.get("job_id")
     assert isinstance(job_id, str) and job_id
     return job_id
@@ -655,7 +655,7 @@ async def wait_for_terminal(agent: Agent, job_id: str, *, timeout: float = 30.0)
     while asyncio.get_running_loop().time() < deadline:
         latest = await agent.inspect_job(job_id)
         assert latest is not None
-        if latest.summary.status in TERMINAL_STATUSES:
+        if latest.job.state in TERMINAL_STATES:
             return latest
         await asyncio.sleep(0.02)
     pytest.fail(f"job did not reach a terminal state: {latest!r}")
@@ -667,7 +667,7 @@ async def wait_for_running(agent: Agent, job_id: str, *, timeout: float = 5.0):
     while asyncio.get_running_loop().time() < deadline:
         latest = await agent.inspect_job(job_id)
         assert latest is not None
-        if latest.summary.status is JobStatus.RUNNING:
+        if latest.job.state is GraphState.ACTIVE:
             return latest
         await asyncio.sleep(0.01)
     pytest.fail(f"job did not enter the running state: {latest!r}")
@@ -676,9 +676,9 @@ async def wait_for_running(agent: Agent, job_id: str, *, timeout: float = 5.0):
 async def assert_profile_result(agent: Agent, job_id: str) -> Mapping[str, object]:
     result = await agent.read_job_result(job_id)
     assert result is not None
-    assert result.summary["sampled_rows"] == PROFILE_SAMPLE_ROWS
-    assert len(result.artifact_refs) == 1
-    payload = await agent.read_artifact(result.artifact_refs[0].artifact_id)
+    assert result.payload["sampled_rows"] == PROFILE_SAMPLE_ROWS
+    assert len(result.artifact_ids) == 1
+    payload = await agent.read_artifact(result.artifact_ids[0])
     document = json.loads(payload.content)
     assert isinstance(document, Mapping)
     resources = document["resources"]

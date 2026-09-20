@@ -1,9 +1,5 @@
 """Collect serializers for the one current canonical SQLite record shape."""
 
-from .autonomy import (
-    decode_autonomous_followup,
-    encode_autonomous_followup,
-)
 from .catalog import (
     decode_catalog_snapshot,
     decode_catalog_sync,
@@ -28,7 +24,6 @@ from .identity import (
     encode_identifier,
     encode_identity,
 )
-from .jobs import decode_job_run, encode_job_run
 from .learning import (
     decode_learning_candidate,
     decode_review_stamps,
@@ -67,7 +62,6 @@ from .transcripts import (
 
 __all__ = [
     "CurrentSourceAdapterError",
-    "decode_autonomous_followup",
     "decode_catalog_snapshot",
     "decode_catalog_sync",
     "decode_identifier",
@@ -76,7 +70,6 @@ __all__ = [
     "decode_delivery",
     "decode_distribution_plan",
     "decode_learning_candidate",
-    "decode_job_run",
     "decode_loop_exit",
     "decode_mcp_binding",
     "decode_message",
@@ -92,7 +85,6 @@ __all__ = [
     "decode_source_credential_reference_for_deletion",
     "decode_source_read_scope",
     "decode_scheduled_routine",
-    "encode_autonomous_followup",
     "encode_catalog_snapshot",
     "encode_catalog_sync",
     "encode_identifier",
@@ -101,7 +93,6 @@ __all__ = [
     "encode_delivery",
     "encode_distribution_plan",
     "encode_learning_candidate",
-    "encode_job_run",
     "encode_loop_exit",
     "encode_mcp_binding",
     "encode_message",

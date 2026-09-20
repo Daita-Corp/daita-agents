@@ -108,10 +108,16 @@ def _run(
 
 
 def _tree_hashes(root: Path) -> dict[str, str]:
+    for wal in root.rglob("state.db-wal"):
+        if wal.is_file() and wal.stat().st_size != 0:
+            raise AssertionError("agent home has an uncheckpointed state database WAL")
+    transient_sqlite_files = {"state.db-wal", "state.db-shm"}
     return {
         path.relative_to(root).as_posix(): sha256(path)
         for path in sorted(root.rglob("*"), key=lambda item: item.as_posix())
-        if path.is_file() and not path.is_symlink()
+        if path.is_file()
+        and not path.is_symlink()
+        and path.name not in transient_sqlite_files
     }
 
 

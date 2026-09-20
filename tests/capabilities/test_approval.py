@@ -534,7 +534,7 @@ async def test_two_approved_replacements_are_sequential_and_keep_result_order(
         await agent.close()
 
 
-async def test_public_and_model_writes_share_the_exact_composed_mutation_lock(tmp_path):
+async def test_public_and_model_writes_share_the_exact_owner_management_lock(tmp_path):
     async def approve(request):
         del request
         return ApprovalDecision.APPROVE
@@ -542,10 +542,10 @@ async def test_public_and_model_writes_share_the_exact_composed_mutation_lock(tm
     agent = await _agent(tmp_path, "shared-lock", approval_handler=approve)
     try:
         runtime = _runtime(agent)
-        lock = agent._embedded._mutation_lock
-        assert runtime._mutation_lock is lock
-        assert agent._embedded._memory_store._mutation_lock is lock
-        assert agent._embedded._skill_store._mutation_lock is lock
+        lock = agent._embedded._memory_store._mutation_lock
+        assert runtime._owner_management_locks["memory"] is lock
+        assert agent._embedded._skill_store._mutation_lock is not lock
+        assert not hasattr(runtime, "_mutation_lock")
         result = (await _execute(agent, _memory_call(content="model")))[0]
         assert not result.is_error
         await agent.set_memory("direct")
@@ -571,13 +571,14 @@ async def test_locked_revalidation_is_immediately_before_execution(
     original_preflight = executor.preflight
     original_execute = executor.execute
     actions: list[tuple[str, bool]] = []
+    owner_lock = runtime._owner_management_locks["memory"]
 
     async def observed_preflight(request):
-        actions.append(("preflight", runtime._mutation_lock.locked()))
+        actions.append(("preflight", owner_lock.locked()))
         return await original_preflight(request)
 
     async def observed_execute(request):
-        actions.append(("execute", runtime._mutation_lock.locked()))
+        actions.append(("execute", owner_lock.locked()))
         return await original_execute(request)
 
     monkeypatch.setattr(executor, "preflight", observed_preflight)

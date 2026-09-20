@@ -16,6 +16,7 @@ from urllib.parse import quote
 from uuid import uuid4
 
 from ..errors import StateCompatibilityCode, StateCompatibilityError
+from ..storage.graph_schema import ClosingSQLiteConnection
 from ..storage.home_migrations import (
     CURRENT_HOME_REVISION,
     HOME_MIGRATIONS,
@@ -27,7 +28,7 @@ from ..storage.home_migrations import (
 )
 from ..storage.home_migrations.models import HomeMigration
 from ..storage.home_migrations.revision_0001 import detect_preproduction_shape
-from ..storage.sqlite_schema import require_healthy, require_schema
+from ..storage.schema_contract import require_healthy, require_schema
 
 _UPGRADE_DIRECTORY = ".home-upgrade"
 _ROLLBACK_DIRECTORY = ".home-rollbacks"
@@ -60,7 +61,11 @@ class AgentHomeUpgradeResult:
 
 def _connect_read_only(path: Path) -> sqlite3.Connection:
     uri = f"file:{quote(os.fspath(path))}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True)
+    connection = sqlite3.connect(
+        uri,
+        uri=True,
+        factory=ClosingSQLiteConnection,
+    )
     connection.execute("PRAGMA query_only = ON")
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
@@ -563,10 +568,23 @@ def _stage_upgrade(
     source_shape = None if status.source_kind == "production" else status.source_kind
     for migration in migrations:
         migration.apply(stage, source_shape)
-        with sqlite3.connect(stage / "state.db") as connection:
+        with sqlite3.connect(
+            stage / "state.db",
+            factory=ClosingSQLiteConnection,
+        ) as connection:
             insert_migration_row(connection, migration)
             require_schema(connection, migration.target_schema)
             require_healthy(connection)
+            connection.commit()
+            checkpoint = connection.execute(
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            ).fetchone()
+            if (
+                checkpoint is None
+                or int(checkpoint[0]) != 0
+                or int(checkpoint[1]) != int(checkpoint[2])
+            ):
+                raise ValueError("staged migration WAL checkpoint did not complete")
         source_shape = None
     validate_home(home, stage, frozenset(affected_paths))
     for entry in files:
@@ -587,6 +605,9 @@ def _atomic_publish(source: Path, destination: Path) -> None:
     try:
         _copy_regular(source, temporary)
         os.replace(temporary, destination)
+        if destination.name == "state.db":
+            destination.with_name("state.db-wal").unlink(missing_ok=True)
+            destination.with_name("state.db-shm").unlink(missing_ok=True)
         _fsync_directory(destination.parent)
     finally:
         temporary.unlink(missing_ok=True)

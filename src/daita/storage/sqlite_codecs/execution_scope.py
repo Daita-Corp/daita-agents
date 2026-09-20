@@ -8,10 +8,14 @@ from ...capabilities import (
     CapabilityGrant,
     ExecutionContractBindings,
     ExecutionScope,
+    ExecutionScopeKind,
+    GraphTaskBinding,
     OperationalEffect,
 )
 from ...llm.models import ModelSensitivity
 from .common import (
+    datetime_decode,
+    datetime_encode,
     decimal_decode,
     decimal_encode,
     integer,
@@ -61,6 +65,12 @@ def encode_execution_scope(value: ExecutionScope):
             "capability_grants": [
                 encode_capability_grant(grant) for grant in value.capability_grants
             ],
+            "scope_kind": value.scope_kind.value,
+            "graph_task_binding": (
+                None
+                if value.graph_task_binding is None
+                else _encode_graph_task_binding(value.graph_task_binding)
+            ),
         },
     )
 
@@ -93,6 +103,8 @@ def decode_execution_scope(value) -> ExecutionScope:
             "distribution_plan_digest",
             "contract_bindings",
             "capability_grants",
+            "scope_kind",
+            "graph_task_binding",
         ),
     )
     try:
@@ -112,6 +124,9 @@ def decode_execution_scope(value) -> ExecutionScope:
         )
         sensitivity = ModelSensitivity(
             text(fields["sensitivity_ceiling"], "execution scope sensitivity")
+        )
+        scope_kind = ExecutionScopeKind(
+            text(fields["scope_kind"], "execution scope kind")
         )
     except ValueError:
         raise ValueError("stored execution scope enum is invalid") from None
@@ -188,6 +203,91 @@ def decode_execution_scope(value) -> ExecutionScope:
         distribution_plan_digest=text(
             fields["distribution_plan_digest"],
             "execution scope distribution plan digest",
+        ),
+        scope_kind=scope_kind,
+        graph_task_binding=(
+            None
+            if fields["graph_task_binding"] is None
+            else _decode_graph_task_binding(fields["graph_task_binding"])
+        ),
+    )
+
+
+def _encode_graph_task_binding(value: GraphTaskBinding):
+    if not isinstance(value, GraphTaskBinding):
+        raise TypeError("graph task binding codec requires GraphTaskBinding")
+    return record(
+        "GraphTaskBinding",
+        {
+            "agent_id": value.agent_id,
+            "job_id": value.job_id,
+            "root_authority_digest": value.root_authority_digest,
+            "task_id": value.task_id,
+            "task_revision": value.task_revision,
+            "task_spec_digest": value.task_spec_digest,
+            "task_scope_digest": value.task_scope_digest,
+            "attempt_id": value.attempt_id,
+            "claim_token_digest": value.claim_token_digest,
+            "fencing_epoch": value.fencing_epoch,
+            "graph_revision_at_claim": value.graph_revision_at_claim,
+            "task_role": value.task_role,
+            "task_deadline_at": datetime_encode(value.task_deadline_at),
+            "job_deadline_at": datetime_encode(value.job_deadline_at),
+            "budget_reservation_identity": value.budget_reservation_identity,
+        },
+    )
+
+
+def _decode_graph_task_binding(value) -> GraphTaskBinding:
+    fields = record_fields(
+        value,
+        "GraphTaskBinding",
+        (
+            "agent_id",
+            "job_id",
+            "root_authority_digest",
+            "task_id",
+            "task_revision",
+            "task_spec_digest",
+            "task_scope_digest",
+            "attempt_id",
+            "claim_token_digest",
+            "fencing_epoch",
+            "graph_revision_at_claim",
+            "task_role",
+            "task_deadline_at",
+            "job_deadline_at",
+            "budget_reservation_identity",
+        ),
+    )
+    return GraphTaskBinding(
+        agent_id=text(fields["agent_id"], "graph binding agent id"),
+        job_id=text(fields["job_id"], "graph binding job id"),
+        root_authority_digest=text(
+            fields["root_authority_digest"], "graph binding root authority digest"
+        ),
+        task_id=text(fields["task_id"], "graph binding task id"),
+        task_revision=integer(fields["task_revision"], "graph binding task revision"),
+        task_spec_digest=text(
+            fields["task_spec_digest"], "graph binding task spec digest"
+        ),
+        task_scope_digest=text(
+            fields["task_scope_digest"], "graph binding task scope digest"
+        ),
+        attempt_id=text(fields["attempt_id"], "graph binding attempt id"),
+        claim_token_digest=text(
+            fields["claim_token_digest"], "graph binding claim digest"
+        ),
+        fencing_epoch=integer(fields["fencing_epoch"], "graph binding fencing epoch"),
+        graph_revision_at_claim=integer(
+            fields["graph_revision_at_claim"], "graph binding graph revision"
+        ),
+        task_role=text(fields["task_role"], "graph binding task role"),
+        task_deadline_at=datetime_decode(fields["task_deadline_at"]),
+        job_deadline_at=datetime_decode(fields["job_deadline_at"]),
+        budget_reservation_identity=text(
+            fields["budget_reservation_identity"],
+            "graph binding budget reservation identity",
         ),
     )
 

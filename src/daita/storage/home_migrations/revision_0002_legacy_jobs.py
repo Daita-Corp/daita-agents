@@ -1,4 +1,4 @@
-"""Define validated records for durable jobs, attempts, claims, and external state."""
+"""Immutable revision-1 job records used only by migration revision 2."""
 
 from __future__ import annotations
 
@@ -10,9 +10,9 @@ from datetime import datetime
 from enum import Enum
 from hashlib import sha256
 
-from .._json import FrozenJsonObject, canonical_json
-from ..artifacts.models import ArtifactRef
-from ..llm.models import ModelSensitivity
+from ..._json import FrozenJsonObject, canonical_json
+from ...artifacts.models import ArtifactRef
+from ...llm.models import ModelSensitivity
 
 MAX_JOBS_PER_AGENT = 256
 # The active bound must be reachable through the only two nonterminal capacity

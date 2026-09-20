@@ -980,6 +980,7 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
         "routines",
         "effects",
         "inbox",
+        "jobs",
     }
     assert _surface(commands["detach"]) == (
         ("name", "source_id"),
@@ -1101,6 +1102,43 @@ def test_cli_parser_keeps_direct_knowledge_and_confirmed_lifecycle_commands():
             ("name", "delivery_id"),
             frozenset({"-h", "--help"}),
         )
+    jobs = _subcommands(commands["jobs"])
+    assert set(jobs) == {
+        "accept-review",
+        "answer",
+        "artifacts",
+        "attempts",
+        "blockers",
+        "board",
+        "cancel-graph",
+        "checkpoints",
+        "dependencies",
+        "inspect",
+        "list",
+        "reject",
+        "replace-task",
+        "request-changes",
+        "result",
+        "retry-control",
+        "tasks",
+        "timeline",
+    }
+    assert _surface(jobs["timeline"]) == (
+        ("name", "job_id"),
+        frozenset({"-h", "--help", "--after", "--limit", "--task-id"}),
+    )
+    assert _surface(jobs["accept-review"]) == (
+        ("name", "job_id", "task_id", "control_id"),
+        frozenset(
+            {
+                "-h",
+                "--help",
+                "--principal-id",
+                "--rationale",
+                "--idempotency-key",
+            }
+        ),
+    )
 
 
 def test_cli_routine_list_uses_public_agent_surface(tmp_path: Path) -> None:
@@ -1141,6 +1179,102 @@ def test_cli_routine_list_uses_public_agent_surface(tmp_path: Path) -> None:
     ]
     fake.list_routines.assert_awaited_once()
     fake.close.assert_awaited_once()
+
+
+def test_cli_job_board_and_review_use_only_public_agent_surfaces(
+    tmp_path: Path,
+) -> None:
+    diagnostics = SimpleNamespace(
+        blockers=({"kind": "open_control"},),
+        exhausted_budgets=(),
+        deadlocked=False,
+        deadlock_reason=None,
+    )
+    board = SimpleNamespace(
+        job_id="job-1",
+        graph_state=SimpleNamespace(value="blocked"),
+        graph_revision=7,
+        columns=(SimpleNamespace(name="blocked", task_ids=("worker",)),),
+        dependencies=(
+            SimpleNamespace(
+                upstream_task_id="worker",
+                downstream_task_id="finalizer",
+                edge_kind="requires_accepted_success",
+                satisfied=False,
+            ),
+        ),
+        diagnostics=diagnostics,
+    )
+    accepted = SimpleNamespace(
+        result_id="result-reviewed",
+        result_digest="sha256:" + "7" * 64,
+        task_id="worker",
+    )
+    fake = SimpleNamespace(
+        job_board=AsyncMock(return_value=board),
+        accept_task_review=AsyncMock(return_value=accepted),
+        close=AsyncMock(),
+    )
+    board_args = cli.build_parser().parse_args(
+        ["--root", str(tmp_path), "jobs", "board", "atlas", "job-1"]
+    )
+    review_args = cli.build_parser().parse_args(
+        [
+            "--root",
+            str(tmp_path),
+            "jobs",
+            "accept-review",
+            "atlas",
+            "job-1",
+            "worker",
+            "review-control",
+            "--principal-id",
+            "principal-1",
+            "--rationale",
+            "Authenticated candidate accepted.",
+            "--idempotency-key",
+            "accept-once",
+        ]
+    )
+    with patch.object(Agent, "open", new=AsyncMock(return_value=fake)):
+        board_result = asyncio.run(cli._execute(board_args))
+        review_result = asyncio.run(cli._execute(review_args))
+
+    assert board_result == {
+        "job_id": "job-1",
+        "graph_state": "blocked",
+        "graph_revision": 7,
+        "columns": [{"name": "blocked", "task_ids": ("worker",)}],
+        "dependencies": [
+            {
+                "upstream_task_id": "worker",
+                "downstream_task_id": "finalizer",
+                "edge_kind": "requires_accepted_success",
+                "satisfied": False,
+            }
+        ],
+        "diagnostics": {
+            "blockers": ({"kind": "open_control"},),
+            "exhausted_budgets": (),
+            "deadlocked": False,
+            "deadlock_reason": None,
+        },
+    }
+    assert review_result == {
+        "result_id": "result-reviewed",
+        "result_digest": "sha256:" + "7" * 64,
+        "task_id": "worker",
+    }
+    fake.job_board.assert_awaited_once_with("job-1")
+    fake.accept_task_review.assert_awaited_once_with(
+        "job-1",
+        "worker",
+        "review-control",
+        principal_id="principal-1",
+        rationale="Authenticated candidate accepted.",
+        idempotency_key="accept-once",
+    )
+    assert fake.close.await_count == 2
 
 
 def test_cli_host_dispatches_one_resident_composition(tmp_path: Path) -> None:

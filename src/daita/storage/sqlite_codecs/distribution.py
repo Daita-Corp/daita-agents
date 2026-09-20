@@ -54,6 +54,7 @@ def encode_delivery(value: Delivery) -> str:
                 "blocked_reason_code": value.blocked_reason_code,
                 "created_at": datetime_encode(value.created_at),
                 "updated_at": datetime_encode(value.updated_at),
+                "migration_provenance": {},
             },
         )
     )
@@ -80,8 +81,11 @@ def decode_delivery(
             "blocked_reason_code",
             "created_at",
             "updated_at",
+            "migration_provenance",
         ),
     )
+    if fields["migration_provenance"] != {}:
+        raise ValueError("routine delivery cannot carry migration provenance")
     try:
         subject_kind = DeliverySubjectKind(
             text(fields["subject_kind"], "delivery subject kind")

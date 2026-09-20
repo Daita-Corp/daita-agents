@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
 
-from ..sqlite_schema import SQLiteSchema
+from ..schema_contract import SQLiteSchema
 
 HomeMigrationApply = Callable[[Path, str | None], None]
 

@@ -261,7 +261,8 @@ def _seed_paid_margin_database(path: Path) -> None:
             );
             CREATE TABLE customers(
                 customer_id INTEGER PRIMARY KEY,
-                region_code TEXT NOT NULL REFERENCES regions(region_code)
+                region_code TEXT NOT NULL REFERENCES regions(region_code),
+                currency_code TEXT NOT NULL
             );
             CREATE TABLE products(
                 product_id INTEGER PRIMARY KEY,
@@ -281,7 +282,9 @@ def _seed_paid_margin_database(path: Path) -> None:
                 line_total INTEGER NOT NULL
             );
             INSERT INTO regions VALUES ('AMER', 'USD'), ('EMEA', 'EUR');
-            INSERT INTO customers VALUES (1, 'AMER'), (2, 'EMEA');
+            INSERT INTO customers VALUES
+                (1, 'AMER', 'USD'),
+                (2, 'EMEA', 'EUR');
             INSERT INTO products VALUES (1, 30), (2, 50);
             INSERT INTO orders VALUES
                 (1, 1, 'paid', 100),
@@ -451,27 +454,24 @@ async def test_offline_exit_gate_executes_real_learning_lifecycles(tmp_path):
                                 for name in (
                                     "orders",
                                     "customers",
-                                    "regions",
                                     "order_items",
                                     "products",
                                 )
                             ),
                             "sql": (
-                                "SELECT r.region_code, r.currency_code, "
+                                "SELECT c.region_code, c.currency_code, "
                                 "SUM(oi.line_total - "
                                 "(oi.quantity * p.unit_cost)) AS margin "
                                 "FROM orders AS o "
                                 "JOIN customers AS c "
                                 "ON c.customer_id = o.customer_id "
-                                "JOIN regions AS r "
-                                "ON r.region_code = c.region_code "
                                 "JOIN order_items AS oi "
                                 "ON oi.order_id = o.order_id "
                                 "JOIN products AS p "
                                 "ON p.product_id = oi.product_id "
                                 "WHERE o.status = 'paid' "
-                                "GROUP BY r.region_code, r.currency_code "
-                                "ORDER BY r.region_code"
+                                "GROUP BY c.region_code, c.currency_code "
+                                "ORDER BY c.region_code"
                             ),
                         },
                     ),

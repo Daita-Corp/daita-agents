@@ -732,21 +732,22 @@ class EffectReceipt:
             self.routine_id,
             self.routine_revision,
             self.occurrence_id,
-            self.capability_grant_digest,
         )
         if any(item is not None for item in routine_fields):
-            if any(item is None for item in routine_fields):
+            if (
+                any(item is None for item in routine_fields)
+                or self.capability_grant_digest is None
+            ):
                 raise ValueError("receipt routine fields must be present together")
             effect_receipt_text(self.routine_id or "", "receipt routine_id")
             effect_receipt_text(self.occurrence_id or "", "receipt occurrence_id")
             if type(self.routine_revision) is not int or self.routine_revision < 1:
                 raise ValueError("receipt routine revision must be positive")
-            if (
-                not isinstance(self.capability_grant_digest, str)
-                or _SOURCE_PERMISSION_HASH.fullmatch(self.capability_grant_digest)
-                is None
-            ):
-                raise ValueError("receipt grant digest is invalid")
+        if self.capability_grant_digest is not None and (
+            not isinstance(self.capability_grant_digest, str)
+            or _SOURCE_PERMISSION_HASH.fullmatch(self.capability_grant_digest) is None
+        ):
+            raise ValueError("receipt grant digest is invalid")
         if not isinstance(self.sensitivity, ModelSensitivity):
             raise TypeError("receipt sensitivity must be classified")
         effect_receipt_aware(self.started_at, "receipt start time")

@@ -9,7 +9,12 @@ import pytest
 
 from daita._json import canonical_json
 from daita.agent import Agent
-from daita.capabilities import AccessMode, ExecutionScope, OperationalEffect
+from daita.capabilities import (
+    AccessMode,
+    ExecutionScope,
+    ExecutionScopeKind,
+    OperationalEffect,
+)
 from daita.llm.errors import (
     ModelProviderError,
     ProviderErrorCode,
@@ -157,6 +162,7 @@ async def test_machine_execution_scope_narrows_the_ordinary_loop_budgets():
         per_run_max_cost_usd=Decimal("0.25"),
         per_run_max_tokens=123,
         distribution_plan_digest=inbox_distribution_plan("conversation-1").plan_digest,
+        scope_kind=ExecutionScopeKind.JOB_EVENT,
     )
     run = RunInput(
         id="run-scoped-budget",

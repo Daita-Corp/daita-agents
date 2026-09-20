@@ -8,9 +8,11 @@ from tests.support.mcp_actions import (
 
 import asyncio
 import json
+import sqlite3
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal
 
 import pytest
 
@@ -30,11 +32,15 @@ from daita.capabilities import (
     OperationalEffect,
 )
 from daita.distribution.models import OutcomeState
+from daita.jobs.graph.admission import START_GRAPH_JOB_TOOL_NAME
+from daita.jobs.graph.capabilities import TASK_COMPLETE_TOOL_NAME
+from daita.jobs.graph.models import GraphState
 from daita.llm.models import (
     ModelSensitivity,
     ToolCall,
     ToolResultBlock,
 )
+from daita.loop.models import LoopLimits
 from daita.routines.models import RoutineState
 from daita.routines.owner import RoutineError
 from daita.storage.sqlite_records import EffectResolutionDecision
@@ -48,6 +54,134 @@ async def action(tmp_path):
         yield fixture
     finally:
         await fixture.agent.close()
+
+
+async def test_exact_direct_result_action_is_graph_eligible_only_under_its_grant_contract(
+    action,
+):
+    capability = action.agent._embedded._capabilities.capability(
+        action.tool.capability_id
+    )
+    policy = capability.execution_admission_policy
+    assert policy is not None and policy.graph_v1_eligible
+    assert policy.graph_max_targets == 1
+    assert capability.automation_eligibility is AutomationEligibility.AUTOMATION_DIRECT
+    assert capability.automation_grant_policy is not None
+    assert capability.effect_receipt_policy is not None
+
+
+async def test_exact_mcp_action_runs_once_as_a_grant_backed_graph_task(
+    tmp_path,
+) -> None:
+    action = ActionFixture(tmp_path)
+    action.limits = LoopLimits(max_estimated_cost_usd=Decimal("10"))
+    await action.start()
+    arguments = {"destination": "fixed-room", "content": "Graph status"}
+    constraints = {
+        "binding_id": action.binding.binding_id,
+        "binding_revision": action.binding.revision,
+        "remote_tool_name": action.tool.remote_name,
+        "fixed_arguments": arguments,
+        "variable_argument_names": (),
+    }
+    action.model.steps = [
+        response(
+            ToolCall(
+                "load-graph",
+                "toolbox_load",
+                {"tool_names": (START_GRAPH_JOB_TOOL_NAME,)},
+            )
+        ),
+        response(
+            ToolCall(
+                "start-graph",
+                START_GRAPH_JOB_TOOL_NAME,
+                {
+                    "objective": "Invoke the exact admitted notification once.",
+                    "outcome_contract": {"kind": "mcp_action_result"},
+                    "deadline_seconds": 600,
+                    "initial_task": {
+                        "capability_id": action.tool.capability_id,
+                        "arguments": arguments,
+                        "expected_result_contract": {
+                            "result_kind": "mcp_action_result"
+                        },
+                        "retained_references": {
+                            "source_ids": (),
+                            "resource_ids": (),
+                            "connector_binding_ids": (action.binding.binding_id,),
+                        },
+                        "effect_grant": {"constraints": constraints},
+                    },
+                },
+            )
+        ),
+        response(text="The exact grant-backed graph job was admitted."),
+        response(
+            ToolCall(
+                "load-action",
+                "toolbox_load",
+                {"tool_names": (action.tool.local_name,)},
+            )
+        ),
+        response(ToolCall("graph-action", action.tool.local_name, arguments)),
+        response(
+            ToolCall(
+                "complete-effect-task",
+                TASK_COMPLETE_TOOL_NAME,
+                {
+                    "result_kind": "mcp_action_result",
+                    "summary": "The MCP server reported the exact invocation.",
+                    "payload": {"invocation_reported": True},
+                    "downstream_constraints": {},
+                },
+            )
+        ),
+    ]
+    try:
+        await action.agent.run("Run the exact durable graph action.")
+        for _ in range(500):
+            jobs = await action.agent.list_jobs(limit=5)
+            if jobs and jobs[0].state in {
+                GraphState.SUCCEEDED,
+                GraphState.FAILED,
+                GraphState.NEEDS_ATTENTION,
+            }:
+                break
+            await asyncio.sleep(0.01)
+        assert jobs
+        assert jobs[0].state is GraphState.SUCCEEDED
+        inspection = await action.agent.inspect_job(jobs[0].job_id)
+        assert inspection is not None
+        worker = next(
+            item
+            for item in inspection.tasks
+            if item.task_id != jobs[0].finalizer_task_id
+        )
+        result = await action.agent.read_task_result(jobs[0].job_id, worker.task_id)
+        assert result is not None and len(result.effect_receipt_ids) == 1
+        assert result.verification["evidence_call_ids"] == ("graph-action",)
+        assert result.downstream_constraints["effect_completion_evidence"] == (
+            "server_reported_invocation_only",
+        )
+        assert result.summary == (
+            "The MCP server reported that the exact action was invoked. "
+            "Downstream business completion is not verified."
+        )
+        assert result.provenance["summary_authority"] == ("code_owned_effect_evidence")
+        assert result.residual_risk is not None
+        assert len(action.server.calls) == 1
+        with sqlite3.connect(action.agent._embedded._store.path) as connection:
+            linkage = connection.execute(
+                "SELECT job_id, task_id, task_attempt_id FROM effect_receipts WHERE id = ?",
+                (result.effect_receipt_ids[0],),
+            ).fetchone()
+        assert linkage is not None and linkage[:2] == (
+            jobs[0].job_id,
+            worker.task_id,
+        )
+    finally:
+        await action.agent.close()
 
 
 async def test_foreground_plain_text_action_requires_exact_approval_and_deduplicates(
@@ -894,6 +1028,11 @@ async def test_known_completion_semantics_never_enable_unsupported_unattended_ca
     )
     await fixture.start(selection=selection)
     try:
+        capability = fixture.agent._embedded._capabilities.capability(
+            fixture.tool.capability_id
+        )
+        assert capability.execution_admission_policy is not None
+        assert not capability.execution_admission_policy.graph_v1_eligible
         with pytest.raises((ValueError, RuntimeError, RoutineError)):
             await fixture.agent.propose_routine(await fixture.draft())
         fixture.script()

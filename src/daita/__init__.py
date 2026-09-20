@@ -61,11 +61,10 @@ from .distribution import (
 )
 from .hosting.resident import ResidentReady, run_resident_host
 from .jobs import (
-    JobExecutionMode,
-    JobInspection,
-    JobResultView,
-    JobStatus,
-    JobSummary,
+    GraphInspection,
+    GraphJob,
+    GraphState,
+    TaskResult,
 )
 from .learning_candidates import (
     DocumentCandidateContent,
@@ -179,13 +178,12 @@ __all__ = [
     "LearningCandidateView",
     "LearningReviewResult",
     "LearningReviewStatus",
-    "JobExecutionMode",
+    "GraphInspection",
+    "GraphJob",
+    "GraphState",
     "InboxView",
     "IntervalSchedule",
-    "JobInspection",
-    "JobResultView",
-    "JobStatus",
-    "JobSummary",
+    "TaskResult",
     "LoopExit",
     "LoopExitKind",
     "LoopLimits",

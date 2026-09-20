@@ -6,7 +6,8 @@ import asyncio
 import hmac
 import re
 import secrets
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -38,9 +39,14 @@ from .capabilities import (
     EffectObservation,
     EffectOutcome,
     ExecutionContractReader,
+    ExecutionPreference,
     Executor,
+    GraphTaskBinding,
+    MachineRunDirective,
+    MachineRunDirectiveKind,
     OperationalEffect,
     SideEffectExecutor,
+    TaskAttemptGuard,
     ToolboxId,
     ToolExecution,
     ToolLoadMode,
@@ -71,11 +77,69 @@ from .loop.models import (
     ToolBatchInterruption,
     ToolBatchOutcome,
 )
+from .loop.session import RunCancellationToken, RunSession
 from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from .scope import EffectiveSourceScope
 
 if TYPE_CHECKING:
     from .storage.sqlite_records import EffectReceipt
+
+
+class AdmissionPermit(Protocol):
+    async def __aenter__(self) -> object: ...
+
+    async def __aexit__(self, exc_type, exc, traceback) -> None: ...
+
+
+class CapabilityAdmissionCoordinator(Protocol):
+    async def source_resource_permit(
+        self,
+        key: str,
+        *,
+        deadline: float | None = None,
+        cancellation: RunCancellationToken | None = None,
+    ) -> AdmissionPermit: ...
+
+    async def mcp_permit(
+        self,
+        key: str,
+        *,
+        deadline: float | None = None,
+        cancellation: RunCancellationToken | None = None,
+    ) -> AdmissionPermit: ...
+
+
+class CapabilityEffectCoordinator(Protocol):
+    async def acquire(
+        self,
+        *,
+        deadline: float | None = None,
+        cancellation: RunCancellationToken | None = None,
+    ) -> AdmissionPermit: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _ContractValidatingAttemptGuard:
+    """Join current attempt authority with exact current contract authority."""
+
+    delegate: TaskAttemptGuard
+    validate_contracts: Callable[[], Awaitable[None]]
+
+    @property
+    def binding(self) -> GraphTaskBinding:
+        return self.delegate.binding
+
+    @property
+    def claim_token(self) -> str:
+        return self.delegate.claim_token
+
+    @property
+    def run_id(self) -> str:
+        return self.delegate.run_id
+
+    async def revalidate(self, *, capability_id: str, point: str) -> None:
+        await self.delegate.revalidate(capability_id=capability_id, point=point)
+        await self.validate_contracts()
 
 
 class EffectReceiptStore(Protocol):
@@ -93,6 +157,7 @@ class EffectReceiptStore(Protocol):
         receipt: EffectReceipt,
         *,
         grant: CapabilityGrant | None = None,
+        task_attempt_guard: TaskAttemptGuard | None = None,
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt: ...
     async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt: ...
@@ -171,6 +236,7 @@ class InternalCapabilityRequest:
     arguments: Mapping[str, object]
     sensitivity: ModelSensitivity
     reserved_artifact_id: str | None = None
+    task_attempt_guard: TaskAttemptGuard | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.run, RunInput):
@@ -191,6 +257,13 @@ class InternalCapabilityRequest:
             or not self.reserved_artifact_id.strip()
         ):
             raise ValueError("reserved_artifact_id must be non-empty text or None")
+        if self.task_attempt_guard is not None:
+            binding = getattr(self.task_attempt_guard, "binding", None)
+            scope = self.run.execution_scope
+            if scope is not None and scope.graph_task_binding != binding:
+                raise ValueError(
+                    "internal task guard must match the run graph-task binding"
+                )
         object.__setattr__(
             self,
             "arguments",
@@ -319,6 +392,7 @@ class RunToolCatalog:
     manifest_bytes: int
     manifest_token_limit: int
     source_scope: EffectiveSourceScope | None = None
+    session: RunSession | None = field(default=None, repr=False, compare=False)
 
     @property
     def capability_ids(self) -> frozenset[str]:
@@ -355,6 +429,7 @@ class StepToolProjection:
     loaded_entries: tuple[RunToolCatalogEntry, ...]
     loaded_definition_bytes: int
     source_scope: EffectiveSourceScope | None = None
+    session: RunSession | None = field(default=None, repr=False, compare=False)
 
     def require_current(
         self,
@@ -511,7 +586,9 @@ class CapabilityRuntime:
         domains: tuple[CapabilityDomain, ...],
         *,
         approval_handler: ApprovalHandler | None = None,
-        mutation_lock: asyncio.Lock | None = None,
+        admission_coordinator: CapabilityAdmissionCoordinator | None = None,
+        effect_coordinator: CapabilityEffectCoordinator | None = None,
+        owner_management_locks: Mapping[str, asyncio.Lock] | None = None,
         observer: AgentObserver | None = None,
         clock: Callable[[], datetime] | None = None,
         artifacts: AgentHomeArtifactStore | None = None,
@@ -543,8 +620,20 @@ class CapabilityRuntime:
             )
         if approval_handler is not None and not callable(approval_handler):
             raise TypeError("approval_handler must be callable or None")
-        if mutation_lock is not None and not isinstance(mutation_lock, asyncio.Lock):
-            raise TypeError("mutation_lock must be an asyncio.Lock or None")
+        if admission_coordinator is not None and not all(
+            callable(getattr(admission_coordinator, name, None))
+            for name in ("source_resource_permit", "mcp_permit")
+        ):
+            raise TypeError("admission_coordinator is invalid")
+        if effect_coordinator is not None and not callable(
+            getattr(effect_coordinator, "acquire", None)
+        ):
+            raise TypeError("effect_coordinator is invalid")
+        supplied_owner_locks = dict(owner_management_locks or {})
+        if not set(supplied_owner_locks) <= set(owners) or any(
+            not isinstance(lock, asyncio.Lock) for lock in supplied_owner_locks.values()
+        ):
+            raise TypeError("owner management locks are invalid")
         if observer is not None and not callable(observer):
             raise TypeError("observer must be callable or None")
         if clock is not None and not callable(clock):
@@ -569,7 +658,13 @@ class CapabilityRuntime:
         self._search_cursor_key = secrets.token_bytes(32)
         self._domains = owners
         self._approval_handler = approval_handler
-        self._mutation_lock = mutation_lock or asyncio.Lock()
+        self._admission_coordinator = admission_coordinator
+        self._effect_coordinator = effect_coordinator
+        self._local_effect_lock = asyncio.Lock()
+        self._owner_management_locks = {
+            owner_id: supplied_owner_locks.get(owner_id, asyncio.Lock())
+            for owner_id in owners
+        }
         self._observer = observer
         self._clock = clock or (lambda: datetime.now(UTC))
         self._artifacts = artifacts
@@ -739,6 +834,14 @@ class CapabilityRuntime:
                 "internal execution cannot bypass operational-effect governance"
             )
         domain = self._domains[owner_id]
+        attempt_guard = (
+            None
+            if request.task_attempt_guard is None
+            else _ContractValidatingAttemptGuard(
+                request.task_attempt_guard,
+                lambda: self._validate_execution_contracts(request.run),
+            )
+        )
         call = ToolCall(
             id=request.call_id,
             name=f"internal:{capability.id}",
@@ -754,6 +857,11 @@ class CapabilityRuntime:
             catalog_entry=None,
         )
         try:
+            await _guard_attempt(
+                attempt_guard,
+                capability.id,
+                "internal_batch_start",
+            )
             await self._validate_execution_contracts(request.run)
             normalized = domain.normalize_arguments(capability, request.arguments)
             arguments = self._registry.validate_arguments(capability.id, normalized)
@@ -763,6 +871,11 @@ class CapabilityRuntime:
                 capability,
                 arguments,
                 request_sensitivity=request.sensitivity,
+            )
+            await _guard_attempt(
+                attempt_guard,
+                capability.id,
+                "internal_after_binding",
             )
             current, current_executor, current_owner = (
                 self._registry.resolve_internal_execution(
@@ -785,6 +898,7 @@ class CapabilityRuntime:
                 domain,
                 sensitivity=request.sensitivity,
                 reserved_artifact_id=request.reserved_artifact_id,
+                task_attempt_guard=attempt_guard,
             )
             result = _bounded_tool_result(
                 call,
@@ -825,6 +939,23 @@ class CapabilityRuntime:
     async def prepare_run(self, run: RunInput) -> RunToolCatalog:
         """Prepare the complete immutable applicable catalog exactly once."""
 
+        return await self._prepare_run(run, session=None)
+
+    async def prepare_session(self, session: RunSession) -> RunToolCatalog:
+        """Prepare tools from one exact immutable admitted session."""
+
+        if not isinstance(session, RunSession):
+            raise TypeError("session must be RunSession")
+        return await self._prepare_run(session.run, session=session)
+
+    async def _prepare_run(
+        self,
+        run: RunInput,
+        *,
+        session: RunSession | None,
+    ) -> RunToolCatalog:
+        """Prepare the complete immutable applicable catalog exactly once."""
+
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
         await self._validate_execution_contracts(run)
@@ -835,7 +966,7 @@ class CapabilityRuntime:
         projected: dict[str, RunToolCatalogEntry] = {}
         for owner_id in sorted(self._domains):
             domain = self._domains[owner_id]
-            for name in await domain.project(run):
+            for name in await _domain_project(domain, run, session):
                 if name in projected:
                     raise ValueError(f"tool projected by multiple domains: {name}")
                 view, capability, resolved_owner = self._registry.resolve_tool_owner(
@@ -847,6 +978,20 @@ class CapabilityRuntime:
                     capability
                 ):
                     continue
+                if run.origin is RunOrigin.JOB_TASK:
+                    from .jobs.graph.execution import task_role_allows_capability
+
+                    context = None if session is None else session.options.task_context
+                    binding = getattr(context, "binding", None)
+                    if not isinstance(binding, GraphTaskBinding):
+                        raise CapabilityInputError(
+                            "task_context_invalid",
+                            "The code-owned graph task binding is unavailable.",
+                        )
+                    if not task_role_allows_capability(
+                        binding.task_role, capability.id
+                    ):
+                        continue
                 if (
                     run.origin is RunOrigin.SCHEDULED_ROUTINE
                     and capability.automation_eligibility
@@ -949,6 +1094,7 @@ class CapabilityRuntime:
             manifest_bytes=manifest_bytes,
             manifest_token_limit=self._limits.max_toolbox_manifest_tokens,
             source_scope=run.resolved_source_scope,
+            session=session,
         )
 
     def project(
@@ -1015,6 +1161,7 @@ class CapabilityRuntime:
             loaded_entries=loaded,
             loaded_definition_bytes=loaded_definition_bytes,
             source_scope=catalog.source_scope,
+            session=catalog.session,
         )
 
     async def execute_all(
@@ -1026,12 +1173,63 @@ class CapabilityRuntime:
         messages: tuple[CanonicalMessage, ...],
         sensitivity: ModelSensitivity,
     ) -> ToolBatchOutcome:
+        return await self._execute_all(
+            run,
+            calls,
+            projection=projection,
+            messages=messages,
+            sensitivity=sensitivity,
+            session=None,
+        )
+
+    async def execute_session(
+        self,
+        session: RunSession,
+        calls: tuple[ToolCall, ...],
+        *,
+        projection: object,
+        messages: tuple[CanonicalMessage, ...],
+        sensitivity: ModelSensitivity,
+    ) -> ToolBatchOutcome:
+        if not isinstance(session, RunSession):
+            raise TypeError("session must be RunSession")
+        return await self._execute_all(
+            session.run,
+            calls,
+            projection=projection,
+            messages=messages,
+            sensitivity=sensitivity,
+            session=session,
+        )
+
+    async def _execute_all(
+        self,
+        run: RunInput,
+        calls: tuple[ToolCall, ...],
+        *,
+        projection: object,
+        messages: tuple[CanonicalMessage, ...],
+        sensitivity: ModelSensitivity,
+        session: RunSession | None,
+    ) -> ToolBatchOutcome:
         if not isinstance(run, RunInput):
             raise TypeError("run must be RunInput")
         if not isinstance(sensitivity, ModelSensitivity):
             raise TypeError("tool batch sensitivity must be ModelSensitivity")
         if not isinstance(projection, StepToolProjection):
             raise TypeError("projection must be StepToolProjection")
+        prepared_session = projection.session
+        if session is None:
+            if prepared_session is not None:
+                raise ValueError("step projection belongs to an admitted run session")
+        elif (
+            prepared_session is None
+            or prepared_session.run != session.run
+            or prepared_session.writer is not session.writer
+            or prepared_session.options != session.options
+            or prepared_session.evidence is not session.evidence
+        ):
+            raise ValueError("step projection belongs to a different run session")
         projection = projection.require_current(
             run_id=run.id,
             registry_digest=self._registry.digest,
@@ -1066,6 +1264,35 @@ class CapabilityRuntime:
             projection,
             sensitivity=sensitivity,
         )
+        terminators = tuple(
+            resolved
+            for resolved in resolved_calls
+            if resolved.entry is not None
+            and resolved.entry.capability.machine_run_directive_kind is not None
+        )
+        if terminators and (len(terminators) != 1 or len(resolved_calls) != 1):
+            return ToolBatchOutcome(
+                tuple(
+                    _bounded_tool_result(
+                        resolved.outer_call,
+                        _error(
+                            resolved.outer_call,
+                            "machine_termination_not_exclusive",
+                            "A task lifecycle terminator must be the sole call in its tool batch.",
+                        ),
+                        self._limits,
+                    )
+                    for resolved in resolved_calls
+                )
+            )
+        guard = None if session is None else session.options.task_attempt_guard
+        for resolved in resolved_calls:
+            if resolved.entry is not None:
+                await _guard_attempt(
+                    cast(TaskAttemptGuard | None, guard),
+                    resolved.entry.capability.id,
+                    "batch_start",
+                )
         results: list[ToolResultBlock | None] = [None] * len(calls)
         started = [False] * len(calls)
         reads: list[tuple[int, _ResolvedCall]] = []
@@ -1086,6 +1313,7 @@ class CapabilityRuntime:
                         resolved,
                         projection,
                         sensitivity=sensitivity,
+                        session=session,
                     )
 
         async def finish_reads() -> ToolBatchInterruption | None:
@@ -1155,6 +1383,7 @@ class CapabilityRuntime:
                         resolved,
                         projection,
                         sensitivity=sensitivity,
+                        session=session,
                     )
                 except _ToolExecutionInterrupted as interrupted:
                     results[index] = interrupted.result
@@ -1197,16 +1426,64 @@ class CapabilityRuntime:
         if any(result is None for result in results):
             raise RuntimeError("tool result scheduling left an incomplete call")
         ordered = cast(tuple[ToolResultBlock, ...], tuple(results))
-        return ToolBatchOutcome(
-            tuple(
-                _bounded_tool_result(
-                    resolved.outer_call,
-                    result,
-                    self._limits,
-                )
-                for resolved, result in zip(resolved_calls, ordered, strict=True)
+        bounded = tuple(
+            _bounded_tool_result(
+                resolved.outer_call,
+                result,
+                self._limits,
             )
+            for resolved, result in zip(resolved_calls, ordered, strict=True)
         )
+        directive: MachineRunDirective | None = None
+        if terminators and not bounded[0].is_error:
+            binding = (
+                None
+                if run.execution_scope is None
+                else run.execution_scope.graph_task_binding
+            )
+            if binding is None:
+                raise RuntimeError(
+                    "machine terminator executed outside a graph-task scope"
+                )
+            data = bounded[0].output.get("data")
+            record_id = data.get("record_id") if isinstance(data, Mapping) else None
+            if not isinstance(record_id, str) or not record_id:
+                raise ToolOutputValidationError(
+                    "machine lifecycle output omitted its authenticated record identity"
+                )
+            if not isinstance(data, Mapping):
+                raise ToolOutputValidationError(
+                    "machine lifecycle output omitted its committed task identity"
+                )
+            committed_revision = data.get("committed_task_revision")
+            if (
+                data.get("job_id") != binding.job_id
+                or data.get("task_id") != binding.task_id
+                or data.get("attempt_id") != binding.attempt_id
+                or data.get("fencing_epoch") != binding.fencing_epoch
+                or not isinstance(committed_revision, int)
+                or isinstance(committed_revision, bool)
+                or committed_revision < binding.task_revision + 1
+            ):
+                raise ToolOutputValidationError(
+                    "machine lifecycle output differs from its committed task identity"
+                )
+            terminator_entry = terminators[0].entry
+            assert terminator_entry is not None
+            kind = terminator_entry.capability.machine_run_directive_kind
+            assert isinstance(kind, MachineRunDirectiveKind)
+            directive = MachineRunDirective(
+                kind=kind,
+                tool_call_id=bounded[0].call_id,
+                binding_digest=binding.digest,
+                record_id=record_id,
+                job_id=binding.job_id,
+                task_id=binding.task_id,
+                attempt_id=binding.attempt_id,
+                fencing_epoch=binding.fencing_epoch,
+                committed_task_revision=committed_revision,
+            )
+        return ToolBatchOutcome(bounded, machine_run_directive=directive)
 
     def _resolve_calls(
         self,
@@ -1308,6 +1585,7 @@ class CapabilityRuntime:
         projection: StepToolProjection,
         *,
         sensitivity: ModelSensitivity,
+        session: RunSession | None,
     ) -> ToolResultBlock:
         if resolved.failure is not None:
             call = (
@@ -1360,6 +1638,7 @@ class CapabilityRuntime:
             resolved.entry,
             sensitivity=sensitivity,
             validated_arguments=resolved.validated_arguments,
+            session=session,
         )
 
     async def _execute_control(
@@ -1739,6 +2018,7 @@ class CapabilityRuntime:
         *,
         sensitivity: ModelSensitivity,
         validated_arguments: FrozenJsonObject | None,
+        session: RunSession | None,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
@@ -1765,6 +2045,23 @@ class CapabilityRuntime:
                 raise ValueError("tool catalog execution identity changed")
             capability = resolved
             _validate_run_execution_scope(run, capability, sensitivity)
+            raw_guard = (
+                None
+                if session is None
+                else cast(
+                    TaskAttemptGuard | None,
+                    session.options.task_attempt_guard,
+                )
+            )
+            guard = (
+                None
+                if raw_guard is None
+                else _ContractValidatingAttemptGuard(
+                    raw_guard,
+                    lambda: self._validate_execution_contracts(run),
+                )
+            )
+            await _guard_attempt(guard, capability.id, "before_binding")
             await self._validate_execution_contracts(run)
             domain = self._domains[owner_id]
             if validated_arguments is None:
@@ -1775,13 +2072,50 @@ class CapabilityRuntime:
                 )
             else:
                 arguments = validated_arguments
-            arguments = await domain.prepare_call(
+            if run.origin is RunOrigin.JOB_TASK:
+                from .jobs.graph.execution import validate_graph_task_arguments
+
+                validate_graph_task_arguments(
+                    origin=run.origin,
+                    context=(None if session is None else session.options.task_context),
+                    capability_id=capability.id,
+                    arguments=arguments,
+                )
+            preference = (
+                ExecutionPreference.AUTO
+                if session is None
+                else session.options.execution_preference
+            )
+            if run.origin is RunOrigin.USER:
+                policy = capability.execution_admission_policy
+                if policy is not None:
+                    admission_error = policy.admission_error(arguments, preference)
+                    if admission_error is not None:
+                        message = (
+                            "The requested bounded shape requires durable graph execution; "
+                            "submit one typed initial-task proposal with start_graph_job."
+                            if admission_error == "durable_execution_required"
+                            else "The requested execution shape is outside both inline and graph V1 admission."
+                        )
+                        raise CapabilityInputError(admission_error, message)
+                elif (
+                    preference is ExecutionPreference.DURABLE
+                    and not capability.durable_foreground_entrypoint
+                ):
+                    raise CapabilityInputError(
+                        "execution_not_supported_for_requested_shape",
+                        "This capability is direct-only and cannot be forced into graph V1.",
+                    )
+            arguments = await _domain_prepare_call(
+                domain,
                 run,
                 call,
                 capability,
                 arguments,
                 request_sensitivity=sensitivity,
+                session=session,
             )
+            await _guard_attempt(guard, capability.id, "after_binding")
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id
             )
@@ -1799,6 +2133,12 @@ class CapabilityRuntime:
                 conversation_id=run.conversation_id or run.id,
                 source_scope=run.resolved_source_scope,
                 request_sensitivity=sensitivity,
+                one_time_artifact_destinations=(
+                    ()
+                    if session is None
+                    else session.options.one_time_artifact_destinations
+                ),
+                task_attempt_guard=guard,
             )
             if capability.operational_effect is not OperationalEffect.NONE:
                 (
@@ -1815,6 +2155,7 @@ class CapabilityRuntime:
                     domain,
                     sensitivity=sensitivity,
                     catalog_entry=entry,
+                    session=session,
                 )
             else:
                 output, artifact_ref = await self._execute_no_effect(
@@ -1825,6 +2166,9 @@ class CapabilityRuntime:
                     arguments,
                     domain,
                     sensitivity=sensitivity,
+                    session=session,
+                    task_attempt_guard=guard,
+                    catalog_entry=entry,
                 )
                 result = _classified_success(call, output, artifact_ref=artifact_ref)
         except _ToolExecutionInterrupted:
@@ -1862,6 +2206,9 @@ class CapabilityRuntime:
         *,
         sensitivity: ModelSensitivity,
         reserved_artifact_id: str | None = None,
+        session: RunSession | None = None,
+        task_attempt_guard: TaskAttemptGuard | None = None,
+        catalog_entry: RunToolCatalogEntry | None = None,
     ) -> tuple[ToolOutput, ArtifactRef | None]:
         if capability.operational_effect is not OperationalEffect.NONE:
             raise ValueError("non-effect execution requires operational effect none")
@@ -1873,20 +2220,51 @@ class CapabilityRuntime:
             conversation_id=run.conversation_id or run.id,
             source_scope=run.resolved_source_scope,
             request_sensitivity=sensitivity,
+            one_time_artifact_destinations=(
+                ()
+                if session is None
+                else session.options.one_time_artifact_destinations
+            ),
+            task_attempt_guard=task_attempt_guard,
         )
-        candidate = await executor.execute(execution)
+        permit = await self._call_io_permit(
+            run,
+            capability,
+            arguments,
+            catalog_entry,
+            session=session,
+        )
+        if permit is None:
+            await _guard_attempt(task_attempt_guard, capability.id, "before_dispatch")
+            candidate = await executor.execute(execution)
+        else:
+            async with permit:
+                await _guard_attempt(
+                    task_attempt_guard, capability.id, "before_io_dispatch"
+                )
+                candidate = await executor.execute(execution)
         if not isinstance(candidate, ToolOutput):
             raise ToolOutputValidationError("executor did not return ToolOutput")
-        output = await domain.finalize_output(
+        if capability.machine_run_directive_kind is None:
+            await _guard_attempt(
+                task_attempt_guard, capability.id, "before_semantic_write"
+            )
+        output = await _domain_finalize_output(
+            domain,
             run,
             call,
             capability,
             arguments,
             candidate,
             request_sensitivity=sensitivity,
+            session=session,
         )
         output = self._registry.validate_output(capability.id, output)
         _validate_output_execution_scope(run, capability, output)
+        if capability.machine_run_directive_kind is None:
+            await _guard_attempt(
+                task_attempt_guard, capability.id, "before_artifact_commit"
+            )
         artifact_ref = await self._commit_artifact_output(
             run,
             call,
@@ -1895,6 +2273,50 @@ class CapabilityRuntime:
             reserved_artifact_id=reserved_artifact_id,
         )
         return output, artifact_ref
+
+    async def _call_io_permit(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        catalog_entry: RunToolCatalogEntry | None,
+        *,
+        session: RunSession | None,
+    ) -> AdmissionPermit | None:
+        coordinator = self._admission_coordinator
+        if coordinator is None:
+            return None
+        deadline = None if session is None else session.absolute_deadline
+        cancellation = None if session is None else session.cancellation
+        presentation = (
+            None if catalog_entry is None else catalog_entry.view.connector_presentation
+        )
+        if isinstance(presentation, Mapping):
+            binding_id = presentation.get("id")
+            if isinstance(binding_id, str) and binding_id:
+                return await coordinator.mcp_permit(
+                    f"mcp:{run.agent_id}:{binding_id}",
+                    deadline=deadline,
+                    cancellation=cancellation,
+                )
+        source_id = arguments.get("source_id")
+        if isinstance(source_id, str) and source_id:
+            return await coordinator.source_resource_permit(
+                f"source:{source_id}",
+                deadline=deadline,
+                cancellation=cancellation,
+            )
+        if (
+            capability.access_mode is AccessMode.READ
+            and run.execution_scope is not None
+            and len(run.execution_scope.allowed_source_ids) == 1
+        ):
+            return await coordinator.source_resource_permit(
+                f"source:{run.execution_scope.allowed_source_ids[0]}",
+                deadline=deadline,
+                cancellation=cancellation,
+            )
+        return None
 
     async def _execute_side_effect(
         self,
@@ -1908,6 +2330,7 @@ class CapabilityRuntime:
         *,
         sensitivity: ModelSensitivity,
         catalog_entry: RunToolCatalogEntry,
+        session: RunSession | None,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
@@ -1943,12 +2366,14 @@ class CapabilityRuntime:
         fingerprint = await side_effect.preflight(execution)
         if not isinstance(fingerprint, FrozenJsonObject):
             raise ValueError("side-effect preflight must return FrozenJsonObject")
-        plan = await domain.side_effect_plan(
+        plan = await _domain_side_effect_plan(
+            domain,
             run,
             call,
             capability,
             execution,
             fingerprint,
+            session=session,
         )
         if capability.effect_receipt_policy is not None:
             self._validate_effect_plan(run, capability, domain, plan)
@@ -2054,6 +2479,8 @@ class CapabilityRuntime:
             plan,
             domain,
             sensitivity=sensitivity,
+            catalog_entry=catalog_entry,
+            session=session,
         )
 
     async def _execute_preflighted_side_effect(
@@ -2069,16 +2496,35 @@ class CapabilityRuntime:
         domain: CapabilityDomain,
         *,
         sensitivity: ModelSensitivity,
+        catalog_entry: RunToolCatalogEntry,
+        session: RunSession | None,
     ) -> tuple[
         ToolResultBlock,
         ToolBatchInterruption | None,
         ToolBatchCertainty,
     ]:
-        async with self._mutation_lock:
+        async with self._side_effect_lane(
+            capability,
+            session,
+            run=run,
+            arguments=arguments,
+            catalog_entry=catalog_entry,
+        ):
+            await _guard_attempt(
+                execution.task_attempt_guard,
+                capability.id,
+                "after_approval_before_effect",
+            )
             await self._validate_execution_contracts(run)
             if capability.effect_receipt_policy is not None:
-                current_arguments = await domain.prepare_call(
-                    run, call, capability, arguments, request_sensitivity=sensitivity
+                current_arguments = await _domain_prepare_call(
+                    domain,
+                    run,
+                    call,
+                    capability,
+                    arguments,
+                    request_sensitivity=sensitivity,
+                    session=session,
                 )
                 if current_arguments != arguments:
                     raise CapabilityInputError(
@@ -2092,12 +2538,14 @@ class CapabilityRuntime:
                         raise ValueError(
                             "side-effect preflight must return FrozenJsonObject"
                         )
-                    current_plan = await domain.side_effect_plan(
+                    current_plan = await _domain_side_effect_plan(
+                        domain,
                         run,
                         call,
                         capability,
                         execution,
                         current,
+                        session=session,
                     )
                     if (
                         capability.effect_receipt_policy is not None
@@ -2136,6 +2584,11 @@ class CapabilityRuntime:
                         ToolBatchCertainty.DEFINITE,
                     )
             if capability.effect_receipt_policy is not None:
+                await _guard_attempt(
+                    execution.task_attempt_guard,
+                    capability.id,
+                    "before_effect_reservation",
+                )
                 return await self._execute_reserved_effect(
                     run,
                     call,
@@ -2146,15 +2599,17 @@ class CapabilityRuntime:
                     plan,
                     domain,
                     sensitivity=sensitivity,
+                    session=session,
                 )
-            candidate, execution_error, interruption_kind, outcome_certainty = (
-                await _execute_definitely(
-                    side_effect,
-                    execution,
-                    recovery_timeout_seconds=(
-                        self._side_effect_recovery_timeout_seconds
-                    ),
-                )
+            (
+                candidate,
+                execution_error,
+                interruption_kind,
+                outcome_certainty,
+            ) = await _execute_definitely(
+                side_effect,
+                execution,
+                recovery_timeout_seconds=(self._side_effect_recovery_timeout_seconds),
             )
             if execution_error is not None:
                 return (
@@ -2165,13 +2620,15 @@ class CapabilityRuntime:
             if not isinstance(candidate, ToolOutput):
                 raise ToolOutputValidationError("executor did not return ToolOutput")
             output = candidate
-            output = await domain.finalize_output(
+            output = await _domain_finalize_output(
+                domain,
                 run,
                 call,
                 capability,
                 arguments,
                 output,
                 request_sensitivity=sensitivity,
+                session=session,
             )
             output = self._registry.validate_output(capability.id, output)
             _validate_output_execution_scope(run, capability, output)
@@ -2184,6 +2641,76 @@ class CapabilityRuntime:
                 interruption_kind,
                 outcome_certainty,
             )
+
+    @asynccontextmanager
+    async def _side_effect_lane(
+        self,
+        capability: Capability,
+        session: RunSession | None,
+        *,
+        run: RunInput,
+        arguments: Mapping[str, object],
+        catalog_entry: RunToolCatalogEntry,
+    ) -> AsyncIterator[None]:
+        if capability.effect_receipt_policy is None:
+            owner_id = self._registry.resolve_domain_owner(capability.id)
+            async with self._owner_management_locks[owner_id]:
+                yield
+            return
+        if self._effect_coordinator is None:
+            async with self._local_effect_lock:
+                yield
+            return
+        permit = await self._effect_coordinator.acquire(
+            deadline=None if session is None else session.absolute_deadline,
+            cancellation=None if session is None else session.cancellation,
+        )
+        async with permit:
+            conflict_permit = await self._effect_conflict_permit(
+                run,
+                capability,
+                arguments,
+                catalog_entry,
+                session=session,
+            )
+            if conflict_permit is None:
+                yield
+            else:
+                async with conflict_permit:
+                    yield
+
+    async def _effect_conflict_permit(
+        self,
+        run: RunInput,
+        capability: Capability,
+        arguments: Mapping[str, object],
+        catalog_entry: RunToolCatalogEntry,
+        *,
+        session: RunSession | None,
+    ) -> AdmissionPermit | None:
+        coordinator = self._admission_coordinator
+        if coordinator is None or capability.effect_receipt_policy is None:
+            return None
+        deadline = None if session is None else session.absolute_deadline
+        cancellation = None if session is None else session.cancellation
+        presentation = catalog_entry.view.connector_presentation
+        if isinstance(presentation, Mapping):
+            binding_id = presentation.get("id")
+            if isinstance(binding_id, str) and binding_id:
+                return await coordinator.mcp_permit(
+                    f"mcp:{run.agent_id}:{binding_id}",
+                    deadline=deadline,
+                    cancellation=cancellation,
+                )
+        source_id = arguments.get("source_id")
+        resource_id = arguments.get("resource_id")
+        if isinstance(source_id, str) and isinstance(resource_id, str):
+            return await coordinator.source_resource_permit(
+                f"relwrite:{source_id}:{resource_id}",
+                deadline=deadline,
+                cancellation=cancellation,
+            )
+        return None
 
     def _validate_effect_plan(
         self,
@@ -2245,6 +2772,7 @@ class CapabilityRuntime:
         domain: CapabilityDomain,
         *,
         sensitivity: ModelSensitivity,
+        session: RunSession | None,
     ) -> tuple[ToolResultBlock, ToolBatchInterruption | None, ToolBatchCertainty]:
         from .storage.sqlite_records import EffectReceipt, effect_receipt_id
 
@@ -2264,6 +2792,11 @@ class CapabilityRuntime:
                 "routine_id": routine_id,
                 "routine_revision": None if scope is None else scope.routine_revision,
                 "occurrence_id": None if scope is None else scope.occurrence_id,
+                "graph_task_binding": (
+                    None
+                    if scope is None or scope.graph_task_binding is None
+                    else scope.graph_task_binding.digest
+                ),
                 "capability_contract_digest": self._registry.contract_digest(
                     capability.id
                 ),
@@ -2309,13 +2842,28 @@ class CapabilityRuntime:
         await store.start_effect_receipt(
             receipt,
             grant=grant,
+            task_attempt_guard=execution.task_attempt_guard,
             max_receipts_per_run=min(self._limits.max_tool_calls_per_run, 256),
         )
         execution = replace(execution, effect_receipt_id=receipt.receipt_id)
         observation: EffectObservation | None = None
         interruption: ToolBatchInterruption | None = None
         certainty = ToolBatchCertainty.DEFINITE
-        if (
+        reservation_guard_error: CapabilityInputError | None = None
+        try:
+            await _guard_attempt(
+                execution.task_attempt_guard,
+                capability.id,
+                "after_effect_reservation_before_dispatch",
+            )
+        except CapabilityInputError as error:
+            reservation_guard_error = error
+        if reservation_guard_error is not None:
+            observation = EffectObservation(
+                EffectOutcome.NOT_APPLIED, EffectEvidenceBasis.LOCAL_NOT_DISPATCHED
+            )
+            result = self._exception_result(call, reservation_guard_error, domain)
+        elif (
             active_task is not None
             and active_task.cancelling() > cancellations_before_reservation
         ):
@@ -2330,12 +2878,15 @@ class CapabilityRuntime:
             )
         else:
             try:
-                candidate, execution_error, interruption, certainty = (
-                    await _execute_definitely(
-                        executor,
-                        execution,
-                        recovery_timeout_seconds=self._side_effect_recovery_timeout_seconds,
-                    )
+                (
+                    candidate,
+                    execution_error,
+                    interruption,
+                    certainty,
+                ) = await _execute_definitely(
+                    executor,
+                    execution,
+                    recovery_timeout_seconds=self._side_effect_recovery_timeout_seconds,
                 )
                 if execution_error is not None:
                     failure = domain.normalize_error(call, execution_error)
@@ -2353,13 +2904,15 @@ class CapabilityRuntime:
                         observation = self._registry.validate_effect_observation(
                             capability.id, observation
                         )
-                    output = await domain.finalize_output(
+                    output = await _domain_finalize_output(
+                        domain,
                         run,
                         call,
                         capability,
                         arguments,
                         candidate,
                         request_sensitivity=sensitivity,
+                        session=session,
                     )
                     output = self._registry.validate_output(capability.id, output)
                     _validate_output_execution_scope(run, capability, output)
@@ -3838,6 +4391,15 @@ def _classified_success(
     )
 
 
+async def _guard_attempt(
+    guard: TaskAttemptGuard | None,
+    capability_id: str,
+    point: str,
+) -> None:
+    if guard is not None:
+        await guard.revalidate(capability_id=capability_id, point=point)
+
+
 def _with_execution_lineage(
     result: ToolResultBlock,
     capability: Capability,
@@ -3873,6 +4435,123 @@ def _error(
                 "details": {} if details is None else details,
             }
         },
+    )
+
+
+async def _domain_project(
+    domain: CapabilityDomain,
+    run: RunInput,
+    session: RunSession | None,
+) -> tuple[str, ...]:
+    project_session = getattr(domain, "project_session", None)
+    if session is not None and callable(project_session):
+        project = cast(
+            Callable[..., Awaitable[tuple[str, ...]]],
+            project_session,
+        )
+        return await project(run, session)
+    return await domain.project(run)
+
+
+async def _domain_prepare_call(
+    domain: CapabilityDomain,
+    run: RunInput,
+    call: ToolCall,
+    capability: Capability,
+    arguments: FrozenJsonObject,
+    *,
+    request_sensitivity: ModelSensitivity,
+    session: RunSession | None,
+) -> FrozenJsonObject:
+    prepare_session_call = getattr(domain, "prepare_session_call", None)
+    if session is not None and callable(prepare_session_call):
+        prepare = cast(
+            Callable[..., Awaitable[FrozenJsonObject]],
+            prepare_session_call,
+        )
+        return await prepare(
+            run,
+            call,
+            capability,
+            arguments,
+            request_sensitivity=request_sensitivity,
+            session=session,
+        )
+    return await domain.prepare_call(
+        run,
+        call,
+        capability,
+        arguments,
+        request_sensitivity=request_sensitivity,
+    )
+
+
+async def _domain_side_effect_plan(
+    domain: CapabilityDomain,
+    run: RunInput,
+    call: ToolCall,
+    capability: Capability,
+    execution: ToolExecution,
+    fingerprint: FrozenJsonObject,
+    *,
+    session: RunSession | None,
+) -> SideEffectPlan:
+    session_plan = getattr(domain, "session_side_effect_plan", None)
+    if session is not None and callable(session_plan):
+        plan = cast(
+            Callable[..., Awaitable[SideEffectPlan]],
+            session_plan,
+        )
+        return await plan(
+            run,
+            call,
+            capability,
+            execution,
+            fingerprint,
+            session=session,
+        )
+    return await domain.side_effect_plan(
+        run,
+        call,
+        capability,
+        execution,
+        fingerprint,
+    )
+
+
+async def _domain_finalize_output(
+    domain: CapabilityDomain,
+    run: RunInput,
+    call: ToolCall,
+    capability: Capability,
+    arguments: FrozenJsonObject,
+    output: ToolOutput,
+    *,
+    request_sensitivity: ModelSensitivity,
+    session: RunSession | None,
+) -> ToolOutput:
+    finalize_session_output = getattr(domain, "finalize_session_output", None)
+    if session is not None and callable(finalize_session_output):
+        finalize = cast(
+            Callable[..., Awaitable[ToolOutput]],
+            finalize_session_output,
+        )
+        return await finalize(
+            run,
+            call,
+            capability,
+            arguments,
+            output,
+            request_sensitivity=request_sensitivity,
+            session=session,
+        )
+    return await domain.finalize_output(
+        run,
+        call,
+        capability,
+        arguments,
+        output,
+        request_sensitivity=request_sensitivity,
     )
 
 

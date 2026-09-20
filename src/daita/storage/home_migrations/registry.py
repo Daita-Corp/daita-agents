@@ -5,17 +5,19 @@ from __future__ import annotations
 import re
 import sqlite3
 
-from ..sqlite_schema import require_healthy, require_schema
+from ..schema_contract import require_healthy, require_schema
 from .models import HomeMigration
 from .revision_0001 import REVISION_1
+from .revision_0002 import REVISION_2
 
-HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1,)
+HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2)
 CURRENT_HOME_REVISION = HOME_MIGRATIONS[-1].revision
 # Production revisions in this inclusive range upgrade automatically. The
 # one preproduction bridge is admitted separately by revision 1.
 MINIMUM_SUPPORTED_HOME_REVISION = 1
 _RELEASED_CHECKSUMS = (
     "a08bdc56e3cb7c3dbe77dc0d8b8ed9aac1299a6a701902dba8e11a5ebe70f25e",
+    "cb98e978fcb6db71cc1cb3ee5532d92ce99117db7359a008a98a4651df1c20e2",
 )
 
 

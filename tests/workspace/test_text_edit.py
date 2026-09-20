@@ -29,7 +29,12 @@ from daita.artifacts.models import (
 )
 from daita.artifacts.renderers import apply_bounded_text_edits
 from daita.artifacts.store import AgentHomeArtifactStore
-from daita.capabilities import AccessMode, ExecutionScope, OperationalEffect
+from daita.capabilities import (
+    AccessMode,
+    ExecutionScope,
+    ExecutionScopeKind,
+    OperationalEffect,
+)
 from daita.llm.models import (
     FinishReason,
     MessageRole,
@@ -1221,6 +1226,7 @@ async def test_machine_origin_cannot_project_or_forge_ambient_workspace_edit_aut
         distribution_plan_digest=inbox_distribution_plan(
             "conversation-machine-edit"
         ).plan_digest,
+        scope_kind=ExecutionScopeKind.JOB_EVENT,
     )
     run = RunInput(
         id="run-machine-local-edit-negative",

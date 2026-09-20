@@ -20,7 +20,45 @@ Use this order of authority when repository material disagrees:
 Preserve unrelated working-tree changes. Historical code and documents can
 explain intent, but they do not define current behavior.
 
-## Product architecture
+## Architecture status: current revision 2
+
+The production code, current schema, tests and all ordinary statements in this file
+describe **current agent-home revision 2**. Revision 2 is the sole runnable/current
+format. Revision-1 records and decoders exist only inside the immutable revision-2
+migration and its fixtures; they are not runtime compatibility paths. There is no
+feature flag, fallback or dual-runtime interval selecting legacy or draft execution.
+
+The current revision-2 graph has these non-negotiable boundaries:
+
+- the adaptive task graph is owned inside `jobs`; `JobOwner` owns commands and one
+  graph-aware `JobSupervisor` owns graph-local selection, claims and recovery;
+- there is still one reentrant `AgentLoop` semantic implementation and one
+  `CapabilityRuntime`; each model task attempt has a fresh isolated `RunSession`,
+  exact transcript and one `RunSessionWriter`;
+- `RunAdmissionCoordinator` owns host workload admission, lifecycle drain and keyed
+  provider/source/MCP/SQLite/effect permits; it does not own graph transitions,
+  model routing or capability semantics;
+- root authority, outcome, distribution, deadlines and total budgets are immutable;
+  planner-created task scope is a validated subset and model text never grants
+  authority;
+- graph effects are narrowly released only for preview-bound PostgreSQL update/upsert
+  and specifically admitted synchronous MCP actions under exact code-owned grants;
+  all other graph work remains effect-free and the existing receipt boundary remains
+  the only effect truth;
+- graph transactions are short indexed SQLite CAS operations. Provider, source, MCP,
+  artifact and effect I/O never occurs beneath a graph transaction or broad host
+  lock;
+- normalized tasks, edges, attempts, accepted results, controls, mutations, budget
+  ledgers and bounded audit events are current graph state/evidence. Events are never
+  event-sourced authority;
+- routines remain the separate time-triggered occurrence system; a routine is not a
+  graph task and no routine-to-graph bridge is part of graph V1;
+- revision 2 is one atomic conversion/cutover. Current runtime codecs contain only
+  the graph shape afterward; revision-1 decoders remain migration-only; the old
+  single-job, connected-executor and autonomous-follow-up paths are deleted at the
+  specified gates rather than retained as a selectable compatibility engine.
+
+## Current production architecture (revision 2)
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
 explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL,
@@ -109,10 +147,11 @@ delegates to `EmbeddedAgent`; it does not implement model progression, catalog
 truth, capability execution, or persistence.
 
 `daita.hosting.embedded.EmbeddedAgent` is the composition root. It admits the
-agent home, holds the process-level writer lock and in-process run/mutation
-locks, constructs the catalog, registry, domains, context builder, runtime,
-loop, artifact store, and supervisors, and closes them in order. Composition
-belongs here rather than in the loop or a dependency-injection framework.
+agent home, holds the process-level writer lock, composes the capacity-one
+`RunAdmissionCoordinator` and retains the broad mutation lock, constructs the
+catalog, registry, domains, context builder, runtime, loop, artifact store, and
+supervisors, and closes them in drain-safe order. Composition belongs here rather
+than in the loop or a dependency-injection framework.
 
 One open agent home has one writer. A foreground TUI or CLI process and the
 resident host must hand off that lock; they cannot open the same home
@@ -129,10 +168,19 @@ concurrently.
 - enforcing outer budgets; and
 - returning one terminal `LoopExit`.
 
-It depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
-`TranscriptStore` protocols. Provider payloads, catalog operations, SQL
-validation, source I/O, policy, and feature lifecycle state stay outside the
-loop.
+Each host-owned loop invocation consumes one immutable, single-use `RunSession`.
+The session owns its cancellation/deadline state, immutable run options and exactly
+one `RunSessionWriter`; the writer alone starts, appends to and terminates that run's
+transcript with exact ordering and conversation-predecessor binding. The capacity-one
+coordinator preserves revision-1 serial behavior while owning execution admission,
+keyed conversation ordering, provider admission and shutdown drain. Conservative
+source/resource, MCP, SQLite-pressure and effect permit interfaces do not yet enable
+cross-run I/O concurrency or replace the mutation lock.
+
+The loop depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
+transcript-store protocols through those session boundaries. Provider payloads,
+catalog operations, SQL validation, source I/O, policy, and feature lifecycle state
+stay outside the loop.
 
 `daita.context.AgentContextBuilder` creates each model request from
 the current transcript, current catalog, projected tool definitions, and model
@@ -197,10 +245,12 @@ are foreground-authorized content; job-event instructions are code-owned.
 Untrusted payloads and model text cannot enlarge the scope. `contract_bindings`
 retains exact capability, MCP-origin, resource-structure and model-configuration
 digests. The composition supplies one bound current-contract reader to routine
-admission, runtime checks and code-owned follow-up construction; it cannot execute
-work. Revalidation compares retained references, never accepts replacement current
-contracts implicitly. Local hints and refresh timestamps are presentation/freshness
-facts, not execution authority.
+admission, runtime checks and code-owned graph-task construction; it cannot execute
+work. Every current scope states `JOB_EVENT`, `SCHEDULED_ROUTINE` or `GRAPH_TASK`;
+only the revision-1 migration decoder may infer an omitted legacy kind. Revalidation
+compares retained references, never accepts replacement current contracts implicitly.
+Local hints and refresh timestamps are presentation/freshness facts, not execution
+authority.
 
 ## Capabilities and execution
 
@@ -278,7 +328,7 @@ External native data effects and admitted external actions declare an
 constraints. Effect-free and local management capabilities cannot use these
 external-effect policies. Unattended effects require concrete native/MCP admission
 and exact standing grants. Generic routine authority and outcome conformance alone
-do not enable them; implementation acceptance is not production release approval.
+do not enable them; eligibility metadata alone is not production authority.
 
 The runtime reserves a unique operation and call identity in SQLite before
 external dispatch, validates the resulting observation and ordinary output, and
@@ -343,7 +393,7 @@ evidence. Full request sensitivity must fit the current target classification.
 Research lineage remains model-derived claims, distinct from transaction facts.
 Receipt reservation/finalization stays in CapabilityRuntime. No arbitrary SQL,
 insert-only tool, delete, DDL, chunking, automatic retry or replay is supported.
-Native implementation acceptance is not production release approval.
+Native graph release is limited to these same PostgreSQL update/upsert contracts.
 
 ## Local computer files and artifacts
 
@@ -418,21 +468,38 @@ completion cannot execute or enter an unattended proposal. No task polling, cust
 remote receipts, status/idempotency extension, per-server action adapter or replay
 exists. Current MCP output/capability identities are `mcp.tool.result` / `mcp.tool`.
 
-## Durable jobs and follow-ups
+## Durable graph jobs
 
-`JobRun` is the single durable job aggregate. It embeds the frozen job
-specification, attempts, claims, fencing, cancellation intent, receipts,
-external observations, validated results and artifact references, and terminal
-observation state. `JobOwner` implements admission and bounded lifecycle
-operations. `JobSupervisor` claims independent jobs within global, per-agent,
-and per-source limits, fences stale claims, and resumes safe progress when the
-agent reopens.
+`GraphJob`, `JobGraph`, normalized tasks, dependencies, attempts, accepted results,
+controls, mutations, bounded events and budget ledgers are the sole current durable
+job records. `JobOwner` owns admission and bounded lifecycle commands. One
+graph-aware `JobSupervisor` owns graph-local selection, claims, fencing, recovery,
+fairness and finalization; all capability work still executes through the one
+`CapabilityRuntime`, and every model task uses the one `AgentLoop` implementation.
 
-`start_data_profile` is the only model-facing job starter. It freezes the exact
-non-secret read-only specification, execution capability ID, and immutable
-registry contract digest before persistence. The internal `data_profile`
-capability executes through `CapabilityRuntime` and produces a bounded result
-and verified artifact.
+`start_data_profile` admits the static effect-free profile graph. `start_graph_job`
+admits one code-resolved graph-eligible initial task and internal finalizer when a
+model route and finite cost ceiling are configured. Planner-created work is a
+validated immutable-authority subset. Unmappable migrated work is
+`needs_attention`; no legacy executor can run it.
+
+An effectful initial task additionally requires foreground approval and one
+code-normalized exact grant. Native grants bind the exact PostgreSQL source,
+resource revision, operation, columns, keys, identity generation and row ceiling;
+the task must execute its frozen preview before applying it once. MCP grants bind
+the exact active binding revision, remote tool and fixed nested JSON, with only
+explicit top-level scalar variables, `AUTOMATION_DIRECT`, `DIRECT_RESULT`, no
+required asynchronous task support and one call. Effect execution holds the global
+`effect:v1:global` lane plus `relwrite:<source>:<resource>` or
+`mcp:<agent>:<binding>`.
+
+Receipt reservation atomically authenticates the live job, task, attempt, claim,
+fencing epoch, task-spec digest and grant before dispatch. A task result may retain
+only its authenticated successful receipt reference. Any reserved operation that
+cannot be joined to an accepted task result blocks the task and descendants through
+a typed `effect_uncertain` control; startup and cancellation reconciliation never
+replay it. Human receipt resolution remains immutable evidence and does not retry,
+compensate or mark the task successful.
 
 Agent identity is the job authorization boundary. The originating
 conversation and run are immutable provenance, not access gates. Bounded list,
@@ -440,15 +507,11 @@ inspect, result-read, and cancellation operations can address any job owned by
 the agent. Cross-agent lookup fails without exposing metadata. Work pauses
 when no `EmbeddedAgent` host is open.
 
-Daita execution is the only connected job mode. External-executor behavior has
-deterministic offline conformance coverage, but no real external profile ships
-and no external service is selected or used as a fallback.
-
-Terminal Daita profile jobs can produce one bounded code-authored follow-up.
-The follow-up has a frozen execution scope, exact budgets, one-success limit,
-and the originating conversation inbox as its only distribution target. It
-uses the ordinary loop and runtime and cannot start or cancel jobs, mutate
-data, expand scope, or create another continuation.
+There is no current connected-executor mode, embedded single-job attempt/result
+state, autonomous-follow-up driver or selectable legacy supervisor. Finalizers
+authenticate accepted task results and publish through the existing delivery
+boundary. Revision-1 terminal follow-up/delivery provenance is preserved only by
+migration-owned conversion.
 
 ## Scheduled routines and deliveries
 
@@ -536,7 +599,7 @@ database, persisted records, model configuration, memory, user profile, skills,
 artifacts, and other durable files that must change together. It is independent
 of the package version and Git tag.
 
-Production home revision 1 is frozen. The registry is ordered and append-only;
+Production home revisions 1 and 2 are frozen. The registry is ordered and append-only;
 released migration IDs, checksums, implementations, target schemas, historical
 decoders, and golden fixtures never change. `CURRENT_HOME_REVISION` derives from
 the last registry entry. A format change appends one owner-local home migration
@@ -595,9 +658,11 @@ authority exists only in `relational_write_scopes`. Connection JSON never
 owns either permission. Reconstruction fails closed, refresh preserves exact
 scopes, and detach revokes both scope families atomically.
 
-All state mutation must be atomic and cancellation-safe. Do not add event
-sourcing, replay projections, checkpoints, another state abstraction, or a
-second writer around SQLite.
+In current revision 2, all state mutation must be atomic and cancellation-safe. Do
+not add event sourcing, replay projections, another state abstraction or a second
+writer around SQLite. Only the normalized graph records, bounded task checkpoints/
+comments and audit event cursor defined by the current schema are permitted; those
+records are not an event-sourced replay system and remain behind `SQLiteStateStore`.
 
 ## Models and providers
 
@@ -616,7 +681,7 @@ prices remain in `profiles.py` and `pricing.py`.
 
 One immutable `ModelCallPolicy` in `AgentConfig` and `ModelRequest` governs
 configured and conforming injected providers, both delivery modes, foreground,
-routines, follow-ups, validation and candidate review. Defaults are 180 seconds
+routines, graph tasks, validation and candidate review. Defaults are 180 seconds
 per logical request, 120 per attempt, 60 to first substantive progress, 30 idle,
 15 counting, 5 connect, 120 read, 30 write, 5 pool and 5 cleanup. Every logical
 request intersects its caller/run deadline before setup; retries retain that
@@ -714,12 +779,17 @@ Do not add provider branches to `AgentLoop`.
 
 ## Architectural constraints
 
-The product has one `AgentLoop`, one `CapabilityRuntime`, one capability
-registry, one catalog, one artifact store, one scheduler/supervisor path for
-routines, one SQLite state boundary, and one writer per agent home. Do not add
-a second execution loop, generic workflow or graph engine, dynamic executor or
-plugin registry, event bus, completion router, recovery service, policy DSL,
-generic scheduler, session runtime, or competing writer.
+Current revision 2 has one `AgentLoop`, one `CapabilityRuntime`, one capability
+registry, one catalog, one artifact store, one graph-aware jobs supervisor, one
+routines supervisor, one SQLite state boundary, and one writer per agent home. The
+graph coordinator is inside `jobs`; it does not add a second execution runtime. Do
+not add a second
+AgentLoop implementation, capability runtime, state store, transcript path, jobs
+supervisor, agent-home writer, generic workflow engine, graph engine outside `jobs`,
+dynamic executor/plugin registry, event bus, completion router, parallel recovery
+service, policy DSL or generic scheduler. `RunSession` is isolated invocation state,
+not a second loop or resumable conversation runtime. `RunAdmissionCoordinator`
+coordinates host capacity, not graph truth. Audit events cannot drive replay.
 
 Keep feature responsibilities in the existing concrete components. Avoid
 middleware frameworks, lifecycle-hook systems, dynamic extension scanning,

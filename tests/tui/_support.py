@@ -41,7 +41,7 @@ __all__ = (
     "InboxView",
     "Input",
     "Iterator",
-    "JobStatus",
+    "GraphState",
     "JobsScreen",
     "LoopExit",
     "LoopExitKind",
@@ -118,7 +118,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Iterator
@@ -147,8 +147,8 @@ from daita import (
     ApprovalRequest,
     DeliveryState,
     DeliverySubjectKind,
+    GraphState,
     InboxView,
-    JobStatus,
     LoopExit,
     LoopExitKind,
     OutcomeConclusionKind,
@@ -242,14 +242,14 @@ def _tui_inbox_item(
     return InboxView(
         delivery_id=delivery_id,
         conversation_id="conversation-inbox",
-        subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
-        subject_id="followup-inbox",
+        subject_kind=DeliverySubjectKind.ROUTINE_OCCURRENCE,
+        subject_id="occurrence-inbox",
         conclusion_kind=OutcomeConclusionKind.TERMINAL_RUN,
         conclusion_state=OutcomeState.SUCCEEDED,
         conclusion_digest="sha256:" + "2" * 64,
         conclusion_preview=report,
         conclusion_preview_truncated=False,
-        resulting_run_id="run-followup",
+        resulting_run_id="run-routine",
         artifact_references=(),
         effective_sensitivity=ModelSensitivity.INTERNAL,
         provenance_digest="sha256:" + "3" * 64,
@@ -265,62 +265,62 @@ def _tui_inbox_item(
 
 def _tui_job_summary(
     job_id: str,
-    status: JobStatus,
+    status: GraphState,
     *,
     result_available: bool,
 ) -> SimpleNamespace:
     observed = datetime(2026, 8, 23, 14, 0, tzinfo=UTC)
     return SimpleNamespace(
         job_id=job_id,
-        origin_conversation_id="conversation-jobs",
-        job_kind="data_profile",
-        status=status,
-        execution_mode=SimpleNamespace(value="daita"),
-        source_ids=("source-one",),
-        resource_ids=("resource-one",),
-        sensitivity=SimpleNamespace(value="internal"),
+        conversation_id="conversation-jobs",
+        state=status,
+        desired_state=SimpleNamespace(value="run"),
+        finalizer_task_id="task-finalizer",
+        deadline_at=observed + timedelta(minutes=5),
+        specification=SimpleNamespace(
+            objective="Profile the selected data.",
+            authority=SimpleNamespace(
+                source_ids=("source-one",),
+                resource_ids=("resource-one",),
+            ),
+        ),
         created_at=observed,
         updated_at=observed,
-        result_available=result_available,
+        terminal_at=(observed if result_available else None),
+        terminal_result_id=("result-final" if result_available else None),
+        failure_code=None,
     )
 
 
 def _tui_job_inspection(summary: SimpleNamespace) -> SimpleNamespace:
     observed = datetime(2026, 8, 23, 14, 0, tzinfo=UTC)
     return SimpleNamespace(
-        summary=summary,
-        origin_run_id="run-jobs",
-        specification_digest="sha256:" + "1" * 64,
-        execution_capability_id="jobs.data_profile.execute",
-        execution_contract_digest="sha256:" + "2" * 64,
-        desired_state=SimpleNamespace(
-            value=(
-                "cancel"
-                if summary.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}
-                else "run"
-            )
+        job=summary,
+        graph=SimpleNamespace(
+            revision=1,
+            task_count=0,
+            edge_count=0,
+            active_attempt_count=0,
         ),
-        deadline_at=observed,
+        tasks=(),
+        dependencies=(),
         attempts=(
             SimpleNamespace(
-                number=1,
+                ordinal=1,
                 fencing_epoch=1,
-                status=SimpleNamespace(value="claimed"),
-                claimed_at=observed,
-                completed_at=None,
+                state=SimpleNamespace(value="running"),
+                started_at=observed,
+                ended_at=None,
                 error_code=None,
-                external_intents=(),
-                external_observations=(),
             ),
         ),
-        cancel_requested_at=(
-            observed
-            if summary.status in {JobStatus.CANCEL_REQUESTED, JobStatus.CANCELLED}
-            else None
-        ),
-        terminal_at=(observed if summary.status is JobStatus.CANCELLED else None),
-        failure_code=None,
-        external_executor=None,
+        results=(),
+        controls=(),
+        checkpoints=(),
+        comments=(),
+        budget_ledgers=(),
+        events=(),
+        delivery_ids=(),
     )
 
 

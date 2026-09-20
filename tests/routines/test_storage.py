@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 import daita.storage.sqlite as sqlite_module
-from daita.capabilities import AccessMode, ExecutionScope, OperationalEffect
+from daita.capabilities import (
+    AccessMode,
+    ExecutionScope,
+    ExecutionScopeKind,
+    OperationalEffect,
+)
 from daita.distribution import DeliveryState, DeliverySubjectKind, OutcomeState
 from daita.llm.models import (
     CanonicalMessage,
@@ -148,6 +153,7 @@ def execution_scope(occurrence: RoutineOccurrence) -> ExecutionScope:
         routine_revision=occurrence.routine_revision,
         occurrence_id=occurrence.occurrence_id,
         allowed_connector_binding_ids=(),
+        scope_kind=ExecutionScopeKind.SCHEDULED_ROUTINE,
     )
 
 

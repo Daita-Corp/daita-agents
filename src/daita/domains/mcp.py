@@ -34,6 +34,7 @@ from ..capabilities import (
     EffectObservation,
     EffectOutcome,
     EffectReceiptPolicy,
+    ExecutionAdmissionPolicy,
     Executor,
     OperationalEffect,
     ToolExecution,
@@ -44,6 +45,7 @@ from ..capabilities import (
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..llm.models import ModelSensitivity, ToolCall
 from ..loop.models import RunInput
+from ..loop.session import RunSession
 from ..security import SecretProvider
 
 MCP_DOMAIN_OWNER_ID = "mcp"
@@ -453,16 +455,12 @@ class MCPCapabilityDomain:
         agent_id: str,
         bindings: tuple[MCPActivatedBinding, ...],
         store: MCPBindingStore,
-        files_only_run_ids: set[str] | None = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("MCP declarations belong to another domain")
         self._declarations = declarations
         self._agent_id = agent_id
         self._store = store
-        self._files_only_run_ids = (
-            files_only_run_ids if files_only_run_ids is not None else set()
-        )
         self._binding_by_capability = {
             tool.capability_id: (activated.binding, tool)
             for activated in bindings
@@ -478,8 +476,14 @@ class MCPCapabilityDomain:
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
 
-    async def project(self, run: RunInput) -> tuple[str, ...]:
-        if run.agent_id != self._agent_id or run.id in self._files_only_run_ids:
+    async def project(
+        self,
+        run: RunInput,
+        session: RunSession | None = None,
+    ) -> tuple[str, ...]:
+        if run.agent_id != self._agent_id or (
+            session is not None and session.options.files_only
+        ):
             return ()
         projected: list[str] = []
         bindings: dict[str, MCPServerBinding] = {}
@@ -495,7 +499,6 @@ class MCPCapabilityDomain:
         for capability_id, (binding, _tool) in self._binding_by_capability.items():
             if (
                 run.execution_scope is not None
-                and run.execution_scope.routine_id is not None
                 and binding.binding_id
                 not in run.execution_scope.allowed_connector_binding_ids
             ):
@@ -503,6 +506,8 @@ class MCPCapabilityDomain:
             if _binding_revision_is_active(current[binding.binding_id], binding):
                 projected.append(self._local_name_by_capability[capability_id])
         return tuple(sorted(projected))
+
+    project_session = project
 
     def normalize_arguments(
         self,
@@ -537,7 +542,6 @@ class MCPCapabilityDomain:
         scope = run.execution_scope
         if (
             scope is not None
-            and scope.routine_id is not None
             and binding.binding_id not in scope.allowed_connector_binding_ids
         ):
             raise CapabilityInputError(
@@ -889,7 +893,6 @@ async def activate_mcp_domain(
     client_factory: MCPClientFactory,
     secrets: SecretProvider,
     clock: Callable[[], datetime],
-    files_only_run_ids: set[str] | None = None,
 ) -> tuple[
     MCPCapabilityDomain | None,
     tuple[MCPActivatedBinding, ...],
@@ -942,6 +945,27 @@ async def activate_mcp_domain(
                 is AutomationEligibility.AUTOMATION_DIRECT
                 else None
             ),
+            execution_admission_policy=ExecutionAdmissionPolicy(
+                shape=(
+                    "read_only_mcp"
+                    if tool.operational_effect is OperationalEffect.NONE
+                    else "exact_grant_mcp_action"
+                ),
+                inline_eligible=True,
+                graph_v1_eligible=(
+                    tool.operational_effect is OperationalEffect.NONE
+                    or (
+                        tool.automation_eligibility
+                        is AutomationEligibility.AUTOMATION_DIRECT
+                        and tool.completion_semantics
+                        is MCPCompletionSemantics.DIRECT_RESULT
+                        and tool.task_support != "required"
+                    )
+                ),
+                target_count_argument=None,
+                inline_max_targets=1,
+                graph_max_targets=1,
+            ),
         )
         for item in activated
         for tool in item.binding.tools
@@ -986,7 +1010,6 @@ async def activate_mcp_domain(
         agent_id=agent_id,
         bindings=tuple(activated),
         store=store,
-        files_only_run_ids=files_only_run_ids,
     )
     return domain, tuple(activated), tuple(item.executor for item in activated)
 

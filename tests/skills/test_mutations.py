@@ -728,16 +728,16 @@ async def test_model_skill_write_uses_shared_lock_and_side_effect_barrier(
     actions: list[str] = []
 
     async def observed_save(name, description, instructions, *, sensitivity):
-        assert runtime._mutation_lock is agent._embedded._mutation_lock
-        assert runtime._mutation_lock is store._mutation_lock
-        assert runtime._mutation_lock.locked()
+        assert runtime._owner_management_locks["skills"] is store._mutation_lock
+        assert runtime._owner_management_locks["skills"].locked()
+        assert not hasattr(runtime, "_mutation_lock")
         actions.append("save")
         return await original_save(
             name, description, instructions, sensitivity=sensitivity
         )
 
     async def observed_delete(name):
-        assert runtime._mutation_lock.locked()
+        assert runtime._owner_management_locks["skills"].locked()
         assert actions == ["save"]
         actions.append("delete")
         return await original_delete(name)

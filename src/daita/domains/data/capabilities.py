@@ -16,6 +16,7 @@ from ...capabilities import (
     EffectEvidenceBasis,
     EffectObservation,
     EffectReceiptPolicy,
+    ExecutionAdmissionPolicy,
     Executor,
     OperationalEffect,
     ToolboxId,
@@ -865,6 +866,14 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         effect_receipt_policy=RELATIONAL_UPDATE_RECEIPT_POLICY,
         automation_grant_policy=NATIVE_WRITE_GRANT_POLICY,
+        execution_admission_policy=ExecutionAdmissionPolicy(
+            shape="preview_bound_postgresql_update",
+            inline_eligible=True,
+            graph_v1_eligible=True,
+            target_count_argument=None,
+            inline_max_targets=1,
+            graph_max_targets=1,
+        ),
     )
     view = ToolView(
         name=RELATIONAL_UPDATE_TOOL_NAME,
@@ -934,6 +943,14 @@ def _query_declarations(
         executor_id=DATA_QUERY_EXECUTOR_ID,
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        execution_admission_policy=ExecutionAdmissionPolicy(
+            shape="relational_read",
+            inline_eligible=True,
+            graph_v1_eligible=True,
+            target_count_argument="resource_ids",
+            inline_max_targets=4,
+            graph_max_targets=16,
+        ),
     )
     view = ToolView(
         name=DATA_QUERY_TOOL_NAME,
@@ -1402,6 +1419,14 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
             receipt_kind="data.upsert_rows",
             payload_schema=_UPSERT_RECEIPT_SCHEMA,
             success_evidence_basis=EffectEvidenceBasis.ADAPTER_VERIFIED,
+        ),
+        execution_admission_policy=ExecutionAdmissionPolicy(
+            shape="preview_bound_postgresql_upsert",
+            inline_eligible=True,
+            graph_v1_eligible=True,
+            target_count_argument=None,
+            inline_max_targets=1,
+            graph_max_targets=1,
         ),
     )
     return CapabilityDeclarations(

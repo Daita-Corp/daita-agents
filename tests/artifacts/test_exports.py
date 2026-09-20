@@ -389,18 +389,20 @@ async def test_postgresql_exact_adapter_streams_typed_values_without_json_projec
             ),
         ),
     )
-    content, columns, row_count = (
-        await postgresql_query_module._execute_exact_tabular_query(
-            connection,
-            'SELECT amount, "when", payload FROM public.orders WHERE id = $1',
-            (7,),
-            format_name="csv",
-            xlsx_provenance=None,
-            max_rows=100_000,
-            max_columns=256,
-            max_bytes=64 * 1024 * 1024,
-            timeout_seconds=60,
-        )
+    (
+        content,
+        columns,
+        row_count,
+    ) = await postgresql_query_module._execute_exact_tabular_query(
+        connection,
+        'SELECT amount, "when", payload FROM public.orders WHERE id = $1',
+        (7,),
+        format_name="csv",
+        xlsx_provenance=None,
+        max_rows=100_000,
+        max_columns=256,
+        max_bytes=64 * 1024 * 1024,
+        timeout_seconds=60,
     )
     assert columns == ("amount", "when", "payload")
     assert row_count == 1
@@ -1023,7 +1025,7 @@ async def test_csv_export_rejects_detached_mismatched_and_stale_sources(
         await agent.close()
 
 
-async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
+async def test_csv_exports_serialize_one_sqlite_source_and_keep_failed_siblings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1097,7 +1099,10 @@ async def test_concurrent_csv_exports_keep_call_order_and_failed_siblings(
         assert isinstance(blocks[1], ToolResultBlock)
         assert _error_code(blocks[1]) == "artifact_unsupported_value"
         assert tuple(ref.call_id for ref in result.artifacts) == ("first", "third")
-        assert result.artifacts[0].artifact_id > result.artifacts[1].artifact_id
+        # The host-wide SQLite-source gate is capacity one. Batch scheduling does
+        # not promise which waiter acquires that lane first; transcript and returned
+        # artifact order remain tied to call order regardless of completion order.
+        assert result.artifacts[0].artifact_id != result.artifacts[1].artifact_id
     finally:
         await agent.close()
 

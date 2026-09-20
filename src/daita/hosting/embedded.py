@@ -15,6 +15,7 @@ import sqlite3
 import stat
 import tomllib
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -26,7 +27,6 @@ if TYPE_CHECKING:
     from ..adapters.mcp import MCPServerBinding
 
 from .._json import FrozenJsonObject, canonical_json
-from ..adapters.job_profiles import ConnectedJobProfile
 from ..adapters.local_workspace import LocalWorkspaceBackend
 from ..adapters.mcp import (
     MCPAuthentication,
@@ -51,6 +51,7 @@ from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, Resource
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
 from ..artifacts.delivery import (
+    ArtifactDestinationGrant,
     LocalArtifactDelivery,
     validate_delivery_configuration,
 )
@@ -60,14 +61,6 @@ from ..artifacts.models import (
     ArtifactPayload,
 )
 from ..artifacts.store import AgentHomeArtifactStore, validate_artifact_home
-from ..autonomy import (
-    FOLLOWUP_INSTRUCTION,
-    FOLLOWUP_INSTRUCTION_DIGEST,
-    FOLLOWUP_INSTRUCTION_ID,
-    FOLLOWUP_LEASE_SECONDS,
-    FollowupDisposition,
-    create_terminal_job_followup,
-)
 from ..capabilities import (
     AccessMode,
     ApprovalDecision,
@@ -150,15 +143,34 @@ from ..jobs.capabilities import (
     JobCapabilityDomain,
     job_capability_declarations,
 )
-from ..jobs.models import (
-    JobCompletionOwnerKind,
-    JobExecutionMode,
-    JobInspection,
-    JobResultView,
-    JobStatus,
-    JobSummary,
+from ..jobs.graph.admission import (
+    GraphAdmissionBuilder,
+    GraphAdmissionCapabilityDomain,
+    RegistryInitialTaskProposalResolver,
+    graph_admission_declarations,
 )
-from ..jobs.owner import JobOwner
+from ..jobs.graph.capabilities import (
+    GRAPH_TASK_DOMAIN_OWNER_ID,
+    GraphTaskCapabilityDomain,
+    graph_task_capability_declarations,
+)
+from ..jobs.graph.models import (
+    MAX_MODEL_REQUESTS_PER_ATTEMPT,
+    GraphAdmission,
+    GraphInspection,
+    GraphJob,
+    GraphMutation,
+    GraphState,
+    GraphTask,
+    TaskAttempt,
+    TaskCheckpoint,
+    TaskControl,
+    TaskDependency,
+    TaskResult,
+    TaskState,
+)
+from ..jobs.owner import GraphBlockerProjection, JobOwner
+from ..jobs.projections import GraphBoardProjection, GraphTimelinePage
 from ..jobs.supervisor import JobSupervisor
 from ..learning_candidates import (
     LEARNING_REVIEW_MAX_TOTAL_TOKENS,
@@ -192,6 +204,7 @@ from ..llm.provider_definitions import (
     provider_definition,
 )
 from ..llm.routing import (
+    AdmittedModelProvider,
     ModelProviderRegistration,
     ModelRoute,
     ModelRouteCandidate,
@@ -202,19 +215,17 @@ from ..llm.subscription_auth import CodexDevicePrompt, login_codex_subscription
 from ..loop.driver import (
     AgentLoop,
     ContextBuilder,
-    LoopPreparationError,
     ToolRuntime,
 )
 from ..loop.models import (
     ConversationRun,
-    InstructionAuthority,
     LoopExit,
     LoopLimits,
     RunInput,
-    RunOrigin,
-    RunStartEnvelope,
     Transcript,
 )
+from ..loop.session import RunSession, RunSessionEvidence, RunSessionOptions
+from ..loop.transcripts import ConversationPredecessor, RunSessionWriter
 from ..memory import MemoryStore
 from ..memory.capabilities import (
     MEMORY_DOMAIN_OWNER_ID,
@@ -292,6 +303,11 @@ from ..storage.sqlite_records import (
     validate_effect_receipt_id,
 )
 from ..workspace import LocalWorkspace
+from .execution_governor import (
+    AdmissionClosedError,
+    RunAdmissionCoordinator,
+    WorkloadClass,
+)
 from .home_upgrade import AgentHomeStatus, inspect_agent_home, upgrade_agent_home
 
 
@@ -366,6 +382,7 @@ _LEGACY_STATE_ROOT_MARKERS = (
 _MODEL_CONFIG_NAME = "config.json"
 _MAX_MODEL_CONFIG_BYTES = 64 * 1_024
 _CREDENTIAL_CLEANUP_TIMEOUT_SECONDS = 1.0
+_RUN_ADMISSION_DRAIN_SECONDS = 30.0
 _MODEL_VALIDATION_TOOL_NAME = "daita_validate_tool_support"
 _MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 16
 _REASONING_MODEL_VALIDATION_MAX_OUTPUT_TOKENS = 25_000
@@ -569,14 +586,6 @@ async def _current_execution_contracts(
     return result
 
 
-def _safe_followup_failure_code(error: Exception) -> str:
-    candidate = getattr(error, "code", None)
-    if not isinstance(candidate, str):
-        candidate = type(error).__name__
-    normalized = re.sub(r"[^a-z0-9_]+", "_", candidate.casefold()).strip("_")
-    return f"followup_{normalized[:96] or 'revalidation_failed'}"
-
-
 def _validate_conversation_id(value: str) -> None:
     if not isinstance(value, str) or _CONVERSATION_ID.fullmatch(value) is None:
         raise ValueError("conversation_id must match [A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -754,8 +763,6 @@ class EmbeddedAgent:
         routine_supervisor: RoutineSupervisor,
         job_supervisor: JobSupervisor,
         data_profile_admission: DataProfileAdmission,
-        followup_wake: asyncio.Event,
-        followup_model_routes: tuple[str, ...],
         execution_contract_reader: ExecutionContractReader,
         data_profile_job_domain: DataProfileCapabilityDomain,
         learning_candidate_guard: LearningCandidateGuard,
@@ -765,12 +772,10 @@ class EmbeddedAgent:
         skill_store: SkillStore,
         candidate_reviewer: OneShotCandidateReviewer,
         context_builder: AgentContextBuilder | None,
-        files_only_run_ids: set[str],
         artifact_store: AgentHomeArtifactStore,
         artifact_delivery: LocalArtifactDelivery | None,
         candidate_acceptance_supported: bool,
-        mutation_lock: asyncio.Lock,
-        run_lock: asyncio.Lock,
+        admission_coordinator: RunAdmissionCoordinator,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
         owned_model_provider: ManagedModelProvider | None,
@@ -817,10 +822,7 @@ class EmbeddedAgent:
         self._routine_supervisor = routine_supervisor
         self._job_supervisor = job_supervisor
         self._data_profile_admission = data_profile_admission
-        self._followup_wake = followup_wake
-        self._followup_model_routes = followup_model_routes
         self._execution_contract_reader = execution_contract_reader
-        self._followup_driver: asyncio.Task[None] | None = None
         self._data_profile_job_domain = data_profile_job_domain
         self._learning_candidate_guard = learning_candidate_guard
         self._semantic_domain = semantic_domain
@@ -829,14 +831,23 @@ class EmbeddedAgent:
         self._skill_store = skill_store
         self._candidate_reviewer = candidate_reviewer
         self._context_builder = context_builder
-        self._files_only_run_ids = files_only_run_ids
         self._artifact_store = artifact_store
         self._artifact_delivery = artifact_delivery
         self._candidate_acceptance_supported = candidate_acceptance_supported
         self._clock = clock
         self._id_factory = id_factory
-        self._mutation_lock = mutation_lock
-        self._run_lock = run_lock
+        self._admission_coordinator = admission_coordinator
+        self._model_management_lock = asyncio.Lock()
+        self._effect_resolution_lock = asyncio.Lock()
+        self._routine_management_lock = asyncio.Lock()
+        self._artifact_publication_lock = asyncio.Lock()
+        self._semantic_management_lock = asyncio.Lock()
+        self._credential_management_lock = asyncio.Lock()
+        self._mcp_management_lock = asyncio.Lock()
+        self._mcp_commit_lock = asyncio.Lock()
+        self._source_management_lock = asyncio.Lock()
+        self._source_commit_lock = asyncio.Lock()
+        self._source_permission_lock = asyncio.Lock()
         self._source_permission_confirmation_key = secrets.token_bytes(32)
         self._source_permission_previews: dict[str, SourcePermissionsPreview] = {}
         self._closed = False
@@ -1002,7 +1013,6 @@ class EmbeddedAgent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
-        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         _validate_workspace_composition(workspace, hosted=hosted)
         if downloads_directory is not None and not isinstance(
@@ -1103,7 +1113,6 @@ class EmbeddedAgent:
                 approval_handler=approval_handler,
                 artifact_store=artifact_store,
                 artifact_delivery=artifact_delivery,
-                connected_job_profiles=connected_job_profiles,
             )
             _, cancelled = await _await_sync_completion(
                 lambda: _write_manifest(home, identity)
@@ -1150,7 +1159,6 @@ class EmbeddedAgent:
         observer: AgentObserver | None = None,
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
-        connected_job_profiles: tuple[ConnectedJobProfile, ...] = (),
     ) -> Self:
         _validate_workspace_composition(workspace, hosted=hosted)
         if downloads_directory is not None and not isinstance(
@@ -1306,7 +1314,6 @@ class EmbeddedAgent:
                 approval_handler=approval_handler,
                 artifact_store=artifact_store,
                 artifact_delivery=artifact_delivery,
-                connected_job_profiles=connected_job_profiles,
             )
         except BaseException:
             if workspace_backend is not None:
@@ -1348,7 +1355,6 @@ class EmbeddedAgent:
         approval_handler: ApprovalHandler | None,
         artifact_store: AgentHomeArtifactStore,
         artifact_delivery: LocalArtifactDelivery | None,
-        connected_job_profiles: tuple[ConnectedJobProfile, ...],
     ) -> Self:
         owned_model_provider: ManagedModelProvider | None = None
         if model_route is not None:
@@ -1410,11 +1416,39 @@ class EmbeddedAgent:
             if workspace_backend is None
             else local_file_declarations(workspace_backend)
         )
-        files_only_run_ids: set[str] = set()
-        mutation_lock = asyncio.Lock()
-        run_lock = asyncio.Lock()
-        memory_store = MemoryStore(home, mutation_lock)
-        skill_store = SkillStore(home, mutation_lock)
+        memory_lock = asyncio.Lock()
+        skill_lock = asyncio.Lock()
+        source_capacities = {
+            f"source:{registration.id}": (
+                2 if registration.adapter_id == "postgresql" else 1
+            )
+            for registration in await store.list_sources(identity.id)
+            if registration.active
+        }
+        admission_coordinator = RunAdmissionCoordinator(
+            execution_capacity=5,
+            foreground_execution_reserve=1,
+            provider_capacity=2,
+            foreground_provider_reserve=1,
+            source_resource_capacities=source_capacities,
+            sqlite_pressure_capacity=4,
+        )
+        model = _admit_host_model(
+            model,
+            admission_coordinator,
+            identity=identity.id,
+            home=home,
+        )
+        if owned_model_provider is not None:
+            owned_model_provider = cast(ManagedModelProvider, model)
+        model_validator = _admit_host_model(
+            model_validator,
+            admission_coordinator,
+            identity=identity.id,
+            home=home,
+        )
+        memory_store = MemoryStore(home, memory_lock)
+        skill_store = SkillStore(home, skill_lock)
         resolved_reviewer_model = reviewer_model
         resolved_reviewer_profile = reviewer_profile
         owned_reviewer_model: ManagedModelProvider | None = None
@@ -1436,6 +1470,17 @@ class EmbeddedAgent:
             resolved_reviewer_model,
             resolved_reviewer_profile,
         )
+        resolved_reviewer_model = _admit_host_model(
+            resolved_reviewer_model,
+            admission_coordinator,
+            identity=identity.id,
+            home=home,
+        )
+        if owned_reviewer_model is not None:
+            owned_reviewer_model = cast(
+                ManagedModelProvider,
+                resolved_reviewer_model,
+            )
         candidate_reviewer = OneShotCandidateReviewer(
             agent_id=identity.id,
             store=store,
@@ -1462,21 +1507,30 @@ class EmbeddedAgent:
             if artifact_store.available
             else None
         )
+        distribution_owner = DistributionOwner(agent_id=identity.id, store=store)
         job_owner = JobOwner(
             agent_id=identity.id,
             store=store,
-            connected_profiles=connected_job_profiles,
             clock=clock,
             id_factory=id_factory,
         )
         job_lifecycle = job_capability_declarations(job_owner)
+        graph_task_lifecycle = graph_task_capability_declarations(
+            job_owner,
+            store,
+            clock=clock,
+            id_factory=id_factory,
+        )
         data_profile_jobs, data_profile_admission = data_profile_declarations(
             agent_id=identity.id,
             catalog=data_view,
             owner=job_owner,
             sqlite_backend=sqlite_backend,
             postgresql_backend=postgresql_backend,
+            artifacts=artifact_store,
+            distribution=distribution_owner,
             clock=clock,
+            id_factory=id_factory,
         )
         learning_candidate_guard = LearningCandidateGuard()
         data_declarations = CapabilityDeclarations(
@@ -1560,6 +1614,14 @@ class EmbeddedAgent:
             executor_ids=tuple(item.executor_id for item in job_lifecycle.capabilities),
             tool_views=job_lifecycle.tool_views,
         )
+        graph_task_declaration_bundle = CapabilityDeclarations(
+            domain_owner_id=GRAPH_TASK_DOMAIN_OWNER_ID,
+            capabilities=graph_task_lifecycle.capabilities,
+            executor_ids=tuple(
+                item.executor_id for item in graph_task_lifecycle.capabilities
+            ),
+            tool_views=graph_task_lifecycle.tool_views,
+        )
         data_profile_declaration_bundle = CapabilityDeclarations(
             domain_owner_id=DATA_PROFILE_DOMAIN_OWNER_ID,
             capabilities=data_profile_jobs.capabilities,
@@ -1578,7 +1640,6 @@ class EmbeddedAgent:
             local_file_sensitivity=(
                 None if workspace_backend is None else workspace_backend.sensitivity
             ),
-            files_only_run_ids=files_only_run_ids,
         )
         memory_domain = MemoryCapabilityDomain(
             memory_declarations,
@@ -1593,7 +1654,6 @@ class EmbeddedAgent:
             data_view,
             store,
             learning_candidate_guard,
-            files_only_run_ids=files_only_run_ids,
         )
         artifact_domain = (
             None
@@ -1610,12 +1670,15 @@ class EmbeddedAgent:
             )
         )
         job_domain = JobCapabilityDomain(job_declaration_bundle, job_owner)
+        graph_task_domain = GraphTaskCapabilityDomain(
+            graph_task_declaration_bundle,
+            job_owner,
+        )
         data_profile_job_domain = DataProfileCapabilityDomain(
             data_profile_declaration_bundle,
             catalog=data_view,
             admission=data_profile_admission,
             learning=learning_candidate_guard,
-            files_only_run_ids=files_only_run_ids,
         )
         if model is not None and context_builder is None:
             assert model_profile is not None
@@ -1632,7 +1695,6 @@ class EmbeddedAgent:
             client_factory=resolved_mcp_client_factory,
             secrets=secret_provider,
             clock=clock,
-            files_only_run_ids=files_only_run_ids,
         )
         base_domains = (
             data_domain,
@@ -1640,6 +1702,7 @@ class EmbeddedAgent:
             skill_domain,
             semantic_domain,
             job_domain,
+            graph_task_domain,
             data_profile_job_domain,
             *((artifact_domain,) if artifact_domain is not None else ()),
             *((mcp_domain,) if mcp_domain is not None else ()),
@@ -1657,11 +1720,11 @@ class EmbeddedAgent:
             *skills.executors,
             *semantics.executors,
             *job_lifecycle.executors,
+            *graph_task_lifecycle.executors,
             *data_profile_jobs.executors,
             *(artifacts.executors if artifacts is not None else ()),
             *mcp_executors,
         )
-        distribution_owner = DistributionOwner(agent_id=identity.id, store=store)
         distribution_lifecycle = distribution_capability_declarations(
             distribution_owner
         )
@@ -1733,6 +1796,44 @@ class EmbeddedAgent:
             *distribution_lifecycle.executors,
             *routine_lifecycle.executors,
         )
+        graph_routes = _stage_c_model_routes(model, model_route)
+        graph_builder: GraphAdmissionBuilder | None = None
+        if graph_routes and limits.max_estimated_cost_usd is not None:
+            graph_prerequisite_registry = CapabilityRegistry(
+                declarations=tuple(domain.declarations for domain in domains),
+                executors=registered_executors,
+            )
+            graph_resolver = RegistryInitialTaskProposalResolver(
+                agent_id=identity.id,
+                registry=graph_prerequisite_registry,
+                contract_reader=read_execution_contracts,
+                model_route_id=graph_routes[0],
+                max_steps=min(limits.max_steps, MAX_MODEL_REQUESTS_PER_ATTEMPT),
+                per_run_max_tokens=limits.max_total_tokens,
+                per_run_max_cost_usd=limits.max_estimated_cost_usd,
+            )
+            graph_builder = GraphAdmissionBuilder(
+                agent_id=identity.id,
+                registry=graph_prerequisite_registry,
+                distribution=distribution_owner,
+                clock=clock,
+                id_factory=id_factory,
+            )
+            graph_admission_bundle, graph_admission_executors = (
+                graph_admission_declarations(
+                    owner=job_owner,
+                    resolver=graph_resolver,
+                    builder=graph_builder,
+                )
+            )
+            domains = (
+                *domains,
+                GraphAdmissionCapabilityDomain(graph_admission_bundle),
+            )
+            registered_executors = (
+                *registered_executors,
+                *graph_admission_executors,
+            )
         if hosted:
             declared_capability_ids = {
                 capability.id
@@ -1768,9 +1869,7 @@ class EmbeddedAgent:
         routine_owner.bind_capability_registry(capabilities)
 
         async def resolve_run_sources(run: RunInput):
-            return await resolve_effective_source_scope(
-                run, data_view, files_only=run.id in files_only_run_ids
-            )
+            return await resolve_effective_source_scope(run, data_view)
 
         capability_runtime = CapabilityRuntime(
             capabilities,
@@ -1778,7 +1877,12 @@ class EmbeddedAgent:
             effect_receipts=store,
             execution_contract_reader=read_execution_contracts,
             approval_handler=approval_handler,
-            mutation_lock=mutation_lock,
+            admission_coordinator=admission_coordinator,
+            effect_coordinator=admission_coordinator.effect_coordinator,
+            owner_management_locks={
+                MEMORY_DOMAIN_OWNER_ID: memory_lock,
+                SKILL_DOMAIN_OWNER_ID: skill_lock,
+            },
             source_scope_resolver=resolve_run_sources,
             observer=observer,
             clock=clock,
@@ -1786,23 +1890,10 @@ class EmbeddedAgent:
             limits=limits,
         )
         routine_owner.bind_grant_preparer(capability_runtime.prepare_automation_grant)
-        followup_wake = asyncio.Event()
-        job_supervisor = JobSupervisor(
-            agent_id=identity.id,
-            store=store,
-            owner=job_owner,
-            runtime=capability_runtime,
-            revalidate_external=data_profile_admission.revalidate_external,
-            artifacts=artifact_store,
-            clock=clock,
-            id_factory=id_factory,
-            on_terminal=lambda job: (
-                followup_wake.set()
-                if job.specification.execution_mode is JobExecutionMode.DAITA
-                else None
-            ),
-        )
-        job_owner.bind_wake(job_supervisor.wake)
+        if graph_builder is not None:
+            graph_builder.bind_grant_preparer(
+                capability_runtime.prepare_automation_grant
+            )
         resolved_context = context_builder
         resolved_tools = tools
         if model is not None and resolved_context is None:
@@ -1814,9 +1905,7 @@ class EmbeddedAgent:
                 effect_receipts=store,
                 memory=memory_store,
                 skills=skill_store,
-                scheduled_skill_bindings=skill_domain.scheduled_bindings,
                 semantics=store,
-                explicit_learning_requested=semantic_domain.explicit_learning_requested,
                 artifact_destinations=(
                     artifact_delivery if artifacts is not None else None
                 ),
@@ -1833,7 +1922,6 @@ class EmbeddedAgent:
                     if workspace_backend is None
                     else workspace_backend.model_context()
                 ),
-                files_only_run_ids=files_only_run_ids,
                 max_context_evidence_bytes=limits.max_context_evidence_bytes,
             )
             resolved_tools = capability_runtime
@@ -1857,6 +1945,19 @@ class EmbeddedAgent:
                 ),
             )
         )
+        job_supervisor = JobSupervisor(
+            agent_id=identity.id,
+            store=store,
+            owner=job_owner,
+            runtime=capability_runtime,
+            artifacts=artifact_store,
+            clock=clock,
+            id_factory=id_factory,
+            admission_coordinator=admission_coordinator,
+            distribution=distribution_owner,
+            graph_model_loop=loop,
+        )
+        job_owner.bind_wake(job_supervisor.wake)
 
         async def execute_routine_run(
             occurrence: RoutineOccurrence,
@@ -1871,54 +1972,75 @@ class EmbeddedAgent:
             )
             if routine is None or routine.revision != occurrence.routine_revision:
                 return None
-            skill_domain.select_scheduled_bindings(
+            deadline = asyncio.get_running_loop().time() + limits.max_wall_time_seconds
+            lease = await admission_coordinator.admit_execution(
+                WorkloadClass.ROUTINE,
                 run_input.id,
-                tuple(
-                    (binding.skill_name, binding.content_digest)
-                    for binding in routine.skill_bindings
-                ),
+                conversation_id=run_input.conversation_id or run_input.id,
+                absolute_deadline=deadline,
             )
-            try:
-                async with run_lock:
-                    (
-                        conversation_exists,
-                        conversation,
-                        older_history_exists,
-                    ) = await store.completed_conversation_tail(
-                        identity.id,
-                        run_input.conversation_id or run_input.id,
-                    )
-                    if not conversation_exists:
-                        raise ValueError("routine_destination_conversation_missing")
-                    # An approved routine is self-contained. The conversation
-                    # owns its inbox destination, not its reasoning context.
-                    prior_messages: tuple[CanonicalMessage, ...] = ()
-                    prepared = await loop.prepare(
+            async with lease:
+                (
+                    conversation_exists,
+                    _conversation,
+                    _older_history_exists,
+                ) = await store.completed_conversation_tail(
+                    identity.id,
+                    run_input.conversation_id or run_input.id,
+                )
+                if not conversation_exists:
+                    raise ValueError("routine_destination_conversation_missing")
+                # An approved routine is self-contained. The conversation
+                # owns its inbox destination, not its reasoning context.
+                prior_messages: tuple[CanonicalMessage, ...] = ()
+                predecessor_run = await store.latest_terminal_conversation_run(
+                    identity.id,
+                    run_input.conversation_id or run_input.id,
+                )
+                predecessor = (
+                    None
+                    if predecessor_run is None
+                    else ConversationPredecessor.from_run(predecessor_run)
+                )
+                session = RunSession(
+                    run=run_input,
+                    writer=RunSessionWriter(
+                        store,
                         run_input,
-                        prior_messages=prior_messages,
-                    )
-                    assert occurrence.claim_token is not None
-                    assert run_input.execution_scope is not None
-                    bound = await store.bind_routine_occurrence_run(
-                        identity.id,
-                        occurrence.occurrence_id,
-                        claim_token=occurrence.claim_token,
-                        run_id=run_input.id,
-                        execution_scope=run_input.execution_scope,
-                        bound_at=clock(),
-                        precheck_observation=observation,
-                    )
-                    if bound is None:
-                        return None
-                    return await loop.run(
-                        run_input,
-                        prior_messages=prior_messages,
-                        prepared=prepared,
-                    )
-            finally:
-                skill_domain.clear_scheduled_bindings(run_input.id)
-                if artifact_delivery is not None:
-                    artifact_delivery.end_run(run_input.id)
+                        predecessor=predecessor,
+                    ),
+                    absolute_deadline=deadline,
+                    cancellation=lease.cancellation,
+                    options=RunSessionOptions(
+                        retained_skill_bindings=tuple(
+                            (binding.skill_name, binding.content_digest)
+                            for binding in routine.skill_bindings
+                        )
+                    ),
+                    admission_lease=lease,
+                    predecessor=predecessor,
+                )
+                prepared = await loop.prepare(
+                    session,
+                    prior_messages=prior_messages,
+                )
+                assert occurrence.claim_token is not None
+                assert run_input.execution_scope is not None
+                bound = await store.bind_routine_occurrence_run(
+                    identity.id,
+                    occurrence.occurrence_id,
+                    claim_token=occurrence.claim_token,
+                    run_id=run_input.id,
+                    execution_scope=run_input.execution_scope,
+                    bound_at=clock(),
+                    precheck_observation=observation,
+                )
+                if bound is None:
+                    return None
+                return await loop.run(
+                    session.with_prepared(prepared),
+                    prior_messages=prior_messages,
+                )
 
         routine_supervisor = RoutineSupervisor(
             agent_id=identity.id,
@@ -1952,8 +2074,6 @@ class EmbeddedAgent:
             routine_supervisor=routine_supervisor,
             job_supervisor=job_supervisor,
             data_profile_admission=data_profile_admission,
-            followup_wake=followup_wake,
-            followup_model_routes=_stage_c_model_routes(model, model_route),
             execution_contract_reader=read_execution_contracts,
             data_profile_job_domain=data_profile_job_domain,
             learning_candidate_guard=learning_candidate_guard,
@@ -1967,15 +2087,13 @@ class EmbeddedAgent:
                 if isinstance(resolved_context, AgentContextBuilder)
                 else None
             ),
-            files_only_run_ids=files_only_run_ids,
             artifact_store=artifact_store,
             artifact_delivery=artifact_delivery,
             candidate_acceptance_supported=(
                 isinstance(resolved_context, AgentContextBuilder)
                 and resolved_tools is capability_runtime
             ),
-            mutation_lock=mutation_lock,
-            run_lock=run_lock,
+            admission_coordinator=admission_coordinator,
             model_profile=model_profile,
             model_route=model_route,
             owned_model_provider=owned_model_provider,
@@ -1992,7 +2110,6 @@ class EmbeddedAgent:
         )
         await job_supervisor.start()
         await routine_supervisor.start()
-        embedded._start_followup_driver()
         return embedded
 
     def model_requires_explicit_limits(self, *, provider: str, model: str) -> bool:
@@ -2084,7 +2201,9 @@ class EmbeddedAgent:
         ):
             raise ValueError("provider credential exceeds its 64 KiB bound")
 
-        async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "model-validation", self._model_management_lock
+        ):
             self._require_open()
             try:
                 previous = await asyncio.to_thread(
@@ -2135,6 +2254,7 @@ class EmbeddedAgent:
                     secret_provider=self._secret_provider or self._keychain,
                     injected_provider=self._model_validator,
                     call_policy=self._model_call_policy,
+                    provider_admission=self._provider_admission,
                 )
                 await _await_sync_completion(
                     lambda: _write_model_configuration(self.home, replacement)
@@ -2170,14 +2290,12 @@ class EmbeddedAgent:
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
         files_only: bool = False,
-        job_executor_profile_id: str | None = None,
     ) -> LoopExit:
         return await self._run(
             message,
             conversation_id=conversation_id,
             source_scope_ids=source_scope_ids,
             files_only=files_only,
-            job_executor_profile_id=job_executor_profile_id,
         )
 
     async def learn(
@@ -2207,7 +2325,9 @@ class EmbeddedAgent:
         learning_candidate: LearningCandidate | None = None,
         explicit_learning: bool = False,
         files_only: bool = False,
-        job_executor_profile_id: str | None = None,
+        run_id: str | None = None,
+        evidence: RunSessionEvidence | None = None,
+        one_time_artifact_destinations: tuple[ArtifactDestinationGrant, ...] = (),
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
@@ -2219,17 +2339,6 @@ class EmbeddedAgent:
             raise TypeError("files_only must be bool")
         if files_only and source_scope_ids:
             raise ValueError("files_only and source_scope_ids are mutually exclusive")
-        if files_only and job_executor_profile_id is not None:
-            raise ValueError(
-                "files_only and job_executor_profile_id are mutually exclusive"
-            )
-        if job_executor_profile_id is not None and (
-            not isinstance(job_executor_profile_id, str)
-            or not job_executor_profile_id.strip()
-        ):
-            raise ValueError(
-                "job_executor_profile_id must be a non-empty string or None"
-            )
         if learning_candidate_id is not None and (
             not isinstance(learning_candidate_id, str)
             or not learning_candidate_id.strip()
@@ -2248,47 +2357,6 @@ class EmbeddedAgent:
                 "model configuration changed; close and reopen required"
             )
         loop = self._require_loop()
-        async with self._run_lock:
-            return await self._run_locked(
-                loop,
-                message,
-                conversation_id=conversation_id,
-                source_scope_ids=source_scope_ids,
-                files_only=files_only,
-                learning_candidate_id=learning_candidate_id,
-                learning_candidate_text=learning_candidate_text,
-                learning_candidate=learning_candidate,
-                explicit_learning=explicit_learning,
-                job_executor_profile_id=job_executor_profile_id,
-            )
-
-    async def _run_locked(
-        self,
-        loop: AgentLoop,
-        message: str,
-        *,
-        conversation_id: str | None,
-        source_scope_ids: tuple[str, ...],
-        learning_candidate_id: str | None,
-        learning_candidate_text: str | None,
-        learning_candidate: LearningCandidate | None,
-        explicit_learning: bool = False,
-        files_only: bool = False,
-        run_id: str | None = None,
-        job_executor_profile_id: str | None = None,
-    ) -> LoopExit:
-        """Run once while the caller owns the foreground lifecycle lock."""
-
-        if not isinstance(message, str) or not message.strip():
-            raise ValueError("message must be a non-empty string")
-        if not isinstance(source_scope_ids, tuple) or any(
-            not isinstance(item, str) or not item.strip() for item in source_scope_ids
-        ):
-            raise ValueError("source_scope_ids must be a tuple of exact source IDs")
-        if self._model_reopen_required:
-            raise AgentNotConfiguredError(
-                "model configuration changed; close and reopen required"
-            )
         self._require_open()
         supplied_conversation = conversation_id is not None
         resolved_conversation = (
@@ -2297,429 +2365,113 @@ class EmbeddedAgent:
             else conversation_id
         )
         _validate_conversation_id(resolved_conversation)
-        (
-            conversation_exists,
-            conversation,
-            older_history_exists,
-        ) = await self._store.completed_conversation_tail(
-            self.identity.id,
-            resolved_conversation,
-        )
-        if supplied_conversation and not conversation_exists:
-            raise ValueError("unknown conversation for this agent")
-        if not supplied_conversation and conversation_exists:
-            raise ValueError("generated conversation id already exists")
-        active_ids = {
-            source.id
-            for source in await self._store.list_sources(self.identity.id)
-            if source.active
-        }
-        if not set(source_scope_ids) <= active_ids:
-            raise ValueError("A requested source is not active for this agent")
-        prior_messages = _project_completed_history(
-            conversation,
-            older_history_exists=older_history_exists,
-        )
-        run_input = RunInput(
-            id=run_id or self._id_factory("run"),
-            agent_id=self.identity.id,
-            message=message.strip(),
-            created_at=self._clock(),
-            conversation_id=resolved_conversation,
-            source_scope_ids=source_scope_ids,
-            history_sensitivity=max(
-                (
-                    item.result.sensitivity
-                    for item in conversation
-                    if item.result is not None
-                ),
-                key=lambda item: item.routing_rank,
-                default=ModelSensitivity.PUBLIC,
-            ),
-        )
-        if job_executor_profile_id is not None:
-            self._data_profile_job_domain.select_connected_executor(
-                run_input.id,
-                job_executor_profile_id.strip(),
-            )
-        if learning_candidate_id is not None:
-            if self._context_builder is None:
-                raise AgentHomeError(
-                    "learning candidate acceptance requires AgentContextBuilder"
-                )
-            self._context_builder.select_learning_candidate(
-                run_input.id,
-                learning_candidate_id,
-                cast(str, learning_candidate_text),
-                cast(LearningCandidate, learning_candidate).sensitivity,
-            )
-            self._learning_candidate_guard.select(
-                run_input.id,
-                cast(LearningCandidate, learning_candidate),
-            )
-        if explicit_learning:
-            self._semantic_domain.select_explicit_learning_run(run_input.id)
         if files_only:
             if self._workspace_backend is None:
                 raise AgentHomeError("files_only requires admitted local file access")
-            self._files_only_run_ids.add(run_input.id)
+        resolved_run_id = run_id or self._id_factory("run")
+        deadline = (
+            asyncio.get_running_loop().time() + self._limits.max_wall_time_seconds
+        )
         try:
+            lease = await self._admission_coordinator.admit_execution(
+                WorkloadClass.FOREGROUND,
+                resolved_run_id,
+                conversation_id=resolved_conversation,
+                absolute_deadline=deadline,
+            )
+        except AdmissionClosedError as error:
+            raise AgentHomeError("embedded agent is closed") from error
+        async with lease:
+            (
+                conversation_exists,
+                conversation,
+                older_history_exists,
+            ) = await self._store.completed_conversation_tail(
+                self.identity.id,
+                resolved_conversation,
+            )
+            if supplied_conversation and not conversation_exists:
+                raise ValueError("unknown conversation for this agent")
+            if not supplied_conversation and conversation_exists:
+                raise ValueError("generated conversation id already exists")
+            active_ids = {
+                source.id
+                for source in await self._store.list_sources(self.identity.id)
+                if source.active
+            }
+            if not set(source_scope_ids) <= active_ids:
+                raise ValueError("A requested source is not active for this agent")
+            prior_messages = _project_completed_history(
+                conversation,
+                older_history_exists=older_history_exists,
+            )
+            run_input = RunInput(
+                id=resolved_run_id,
+                agent_id=self.identity.id,
+                message=message.strip(),
+                created_at=self._clock(),
+                conversation_id=resolved_conversation,
+                source_scope_ids=source_scope_ids,
+                history_sensitivity=max(
+                    (
+                        item.result.sensitivity
+                        for item in conversation
+                        if item.result is not None
+                    ),
+                    key=lambda item: item.routing_rank,
+                    default=ModelSensitivity.PUBLIC,
+                ),
+            )
             run_input = replace(
                 run_input,
                 resolved_source_scope=await resolve_effective_source_scope(
                     run_input, self._data_view, files_only=files_only
                 ),
             )
+            predecessor_run = await self._store.latest_terminal_conversation_run(
+                self.identity.id,
+                resolved_conversation,
+            )
+            predecessor = (
+                None
+                if predecessor_run is None
+                else ConversationPredecessor.from_run(predecessor_run)
+            )
+            options = RunSessionOptions(
+                files_only=files_only,
+                explicit_learning=explicit_learning,
+                learning_candidate=learning_candidate,
+                learning_candidate_id=learning_candidate_id,
+                learning_candidate_text=learning_candidate_text,
+                learning_candidate_sensitivity=(
+                    None
+                    if learning_candidate is None
+                    else learning_candidate.sensitivity
+                ),
+                one_time_artifact_destinations=one_time_artifact_destinations,
+            )
+            session = RunSession(
+                run=run_input,
+                writer=RunSessionWriter(
+                    self._transcripts,
+                    run_input,
+                    predecessor=predecessor,
+                ),
+                absolute_deadline=deadline,
+                cancellation=lease.cancellation,
+                options=options,
+                admission_lease=lease,
+                predecessor=predecessor,
+                evidence=evidence or RunSessionEvidence(),
+            )
             return await loop.run(
-                run_input,
+                session,
                 prior_messages=prior_messages,
             )
-        finally:
-            if self._artifact_delivery is not None:
-                self._artifact_delivery.end_run(run_input.id)
-            if learning_candidate_id is not None:
-                assert self._context_builder is not None
-                self._context_builder.clear_learning_candidate(run_input.id)
-                self._learning_candidate_guard.clear(run_input.id)
-            if explicit_learning:
-                self._semantic_domain.clear_explicit_learning_run(run_input.id)
-            if job_executor_profile_id is not None:
-                self._data_profile_job_domain.clear_connected_executor(run_input.id)
-            if files_only:
-                self._files_only_run_ids.discard(run_input.id)
 
     async def transcript(self, run_id: str) -> Transcript:
         self._require_open()
         return await self._transcripts.load(run_id)
-
-    def _start_followup_driver(self) -> None:
-        if (
-            self._loop is None
-            or self._context_builder is None
-            or self._limits.max_estimated_cost_usd is None
-            or not self._followup_model_routes
-        ):
-            return
-        if self._followup_driver is not None:
-            raise RuntimeError("autonomous follow-up driver is already started")
-        self._followup_driver = asyncio.create_task(
-            self._drive_followups(),
-            name=f"daita-followups:{self.identity.id}",
-        )
-
-    async def _drive_followups(self) -> None:
-        try:
-            while not self._closed:
-                self._followup_wake.clear()
-                try:
-                    await self._store.recover_stale_autonomous_followups(
-                        self.identity.id,
-                        recovered_at=self._clock(),
-                    )
-                    await self._admit_terminal_followups()
-                    await self._reconcile_terminal_followups()
-                    claimed = await self._store.claim_next_autonomous_followup(
-                        self.identity.id,
-                        claim_token=self._id_factory("followup-claim"),
-                        reserved_run_id=self._id_factory("run"),
-                        claimed_at=self._clock(),
-                        lease_seconds=FOLLOWUP_LEASE_SECONDS,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    claimed = None
-                if claimed is not None:
-                    try:
-                        await self._execute_followup(claimed.followup_id)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        # The durable claim or terminal run remains recoverable. One
-                        # item must not stop unrelated durable-job follow-ups.
-                        pass
-                    continue
-                timeout = _STAGE_C_SAFETY_WAKE_SECONDS
-                try:
-                    deadline = await self._store.next_autonomous_followup_deadline(
-                        self.identity.id
-                    )
-                    if deadline is not None:
-                        timeout = min(
-                            timeout,
-                            max(0.25, (deadline - self._clock()).total_seconds()),
-                        )
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(
-                        self._followup_wake.wait(),
-                        timeout=timeout,
-                    )
-                except TimeoutError:
-                    pass
-        except asyncio.CancelledError:
-            return
-
-    async def _admit_terminal_followups(self) -> None:
-        if self._loop is None or self._limits.max_estimated_cost_usd is None:
-            return
-        routes = self._followup_model_routes
-        capability_ids = _stage_c_capability_ids(self._capabilities)
-        jobs = await self._store.list_unbound_terminal_daita_jobs(self.identity.id)
-        for job in jobs:
-            try:
-                contracts = await self._execution_contract_reader(
-                    agent_id=self.identity.id,
-                    source_ids=job.source_ids,
-                    resource_ids=job.resource_ids,
-                    capability_ids=capability_ids,
-                    connector_binding_ids=(),
-                    model_route_ids=routes,
-                )
-                if dict(contracts.resource_revisions) != {
-                    item.resource_id: item.resource_revision
-                    for item in job.specification.resource_bindings
-                }:
-                    raise ValueError("followup_job_resource_contract_changed")
-                followup = create_terminal_job_followup(
-                    job,
-                    contract_bindings=contracts,
-                    followup_id=self._id_factory("followup"),
-                    grant_id=self._id_factory("grant"),
-                    scope_id=self._id_factory("scope"),
-                    received_at=self._clock(),
-                    allowed_capability_ids=capability_ids,
-                    eligible_model_routes=routes,
-                    limits=self._limits,
-                )
-                await self._store.admit_autonomous_followup(followup)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                continue
-
-    async def _reconcile_terminal_followups(self) -> None:
-        active = await self._store.list_autonomous_followups(
-            self.identity.id,
-            dispositions=frozenset(
-                {
-                    FollowupDisposition.RUNNING,
-                    FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
-                }
-            ),
-        )
-        for followup in active:
-            try:
-                if followup.disposition is FollowupDisposition.RUNNING:
-                    assert followup.reserved_run_id is not None
-                    try:
-                        result = await self._store.result(followup.reserved_run_id)
-                    except KeyError:
-                        continue
-                    if result is None:
-                        continue
-                    followup = (
-                        await self._store.mark_autonomous_followup_run_terminal(
-                            self.identity.id,
-                            followup.followup_id,
-                            run_id=followup.reserved_run_id,
-                            terminal_at=result.created_at,
-                        )
-                        or followup
-                    )
-                if (
-                    followup.disposition
-                    is FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
-                ):
-                    await self._store.finalize_autonomous_followup(
-                        self.identity.id,
-                        followup.followup_id,
-                        delivery_id=self._id_factory("delivery"),
-                        finalized_at=self._clock(),
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                continue
-
-    async def _execute_followup(self, followup_id: str) -> None:
-        loop = self._require_loop()
-        async with self._run_lock:
-            followup = await self._store.load_autonomous_followup(
-                self.identity.id,
-                followup_id,
-            )
-            if (
-                followup is None
-                or followup.disposition is not FollowupDisposition.CLAIMED
-                or followup.claim_token is None
-                or followup.reserved_run_id is None
-            ):
-                return
-            try:
-                job = await self._revalidate_followup(followup)
-                prior_messages: tuple[CanonicalMessage, ...] = ()
-                run_input = RunInput(
-                    id=followup.reserved_run_id,
-                    agent_id=self.identity.id,
-                    message=FOLLOWUP_INSTRUCTION,
-                    created_at=self._clock(),
-                    conversation_id=followup.conversation_id,
-                    source_scope_ids=job.source_ids,
-                    start=RunStartEnvelope(
-                        origin=RunOrigin.JOB_EVENT,
-                        instruction_authority=InstructionAuthority.CODE_OWNED,
-                        trusted_instruction_id=FOLLOWUP_INSTRUCTION_ID,
-                        trusted_instruction=FOLLOWUP_INSTRUCTION,
-                        instruction_digest=FOLLOWUP_INSTRUCTION_DIGEST,
-                        untrusted_payload=followup.event_payload,
-                        payload_digest=followup.payload_digest,
-                        execution_scope=followup.execution_scope,
-                    ),
-                )
-                prepared = await loop.prepare(
-                    run_input,
-                    prior_messages=prior_messages,
-                )
-                snapshot = prepared.context_snapshot
-                audit_method = getattr(snapshot, "audit_context", None)
-                if not callable(audit_method):
-                    raise ValueError("followup_audit_context_unavailable")
-                audit = FrozenJsonObject.from_mapping(
-                    {
-                        "job_id": job.job_id,
-                        "job_terminal_revision": followup.job_terminal_revision,
-                        "job_current_revision": job.revision,
-                        "event_id": followup.event_id,
-                        "payload_digest": followup.payload_digest,
-                        "grant_id": followup.grant.grant_id,
-                        "execution_scope_digest": followup.execution_scope.digest,
-                        "capability_registry_digest": self._capabilities.digest,
-                        "prepared_context": audit_method(),
-                    }
-                )
-                bound = await self._store.bind_autonomous_followup_run(
-                    self.identity.id,
-                    followup.followup_id,
-                    claim_token=followup.claim_token,
-                    run_id=run_input.id,
-                    bound_at=self._clock(),
-                    audit_context=audit,
-                )
-                if bound is None:
-                    return
-            except LoopPreparationError as error:
-                await self._store.fail_autonomous_followup_claim(
-                    self.identity.id,
-                    followup.followup_id,
-                    claim_token=followup.claim_token,
-                    failed_at=self._clock(),
-                    failure_code=error.code,
-                )
-                return
-            except Exception as error:
-                await self._store.fail_autonomous_followup_claim(
-                    self.identity.id,
-                    followup.followup_id,
-                    claim_token=followup.claim_token,
-                    failed_at=self._clock(),
-                    failure_code=_safe_followup_failure_code(error),
-                )
-                return
-            try:
-                result = await loop.run(
-                    run_input,
-                    prior_messages=prior_messages,
-                    prepared=prepared,
-                )
-                await self._store.mark_autonomous_followup_run_terminal(
-                    self.identity.id,
-                    followup.followup_id,
-                    run_id=run_input.id,
-                    terminal_at=result.created_at,
-                )
-                await self._store.finalize_autonomous_followup(
-                    self.identity.id,
-                    followup.followup_id,
-                    delivery_id=self._id_factory("delivery"),
-                    finalized_at=self._clock(),
-                )
-            finally:
-                if self._artifact_delivery is not None:
-                    self._artifact_delivery.end_run(run_input.id)
-
-    async def _revalidate_followup(self, followup):
-        if await self._store.load_identity() != self.identity:
-            raise ValueError("followup_agent_identity_changed")
-        current_time = self._clock()
-        if followup.grant.expires_at <= current_time:
-            raise ValueError("followup_grant_expired")
-        if (
-            followup.lease_expires_at is None
-            or followup.lease_expires_at <= current_time
-        ):
-            raise ValueError("followup_claim_expired")
-        current_capability_ceiling = frozenset(
-            _stage_c_capability_ids(self._capabilities)
-        )
-        grant_capabilities = frozenset(followup.grant.allowed_capability_ids)
-        validated_grant = self._capabilities.validate_execution_scope_grant(
-            followup.grant.allowed_capability_ids,
-            allowed_access_modes=followup.grant.allowed_access_modes,
-            allowed_operational_effects=(followup.grant.allowed_operational_effects),
-        )
-        if (
-            followup.grant.instruction_id != FOLLOWUP_INSTRUCTION_ID
-            or followup.grant.instruction_digest != FOLLOWUP_INSTRUCTION_DIGEST
-            or grant_capabilities != frozenset(validated_grant)
-            or not grant_capabilities <= current_capability_ceiling
-            or not followup.grant.allowed_access_modes
-            <= frozenset({AccessMode.NONE, AccessMode.READ})
-            or not followup.grant.allowed_operational_effects
-            <= frozenset({OperationalEffect.NONE})
-            or followup.execution_scope.job_id != followup.job_id
-            or followup.execution_scope.job_revision != followup.job_terminal_revision
-        ):
-            raise ValueError("followup_grant_not_current")
-        job = await self._store.load_job(self.identity.id, followup.job_id)
-        if (
-            job is None
-            or not job.terminal
-            or job.specification.execution_mode is not JobExecutionMode.DAITA
-            or job.completion_binding is None
-            or job.completion_binding.owner_kind
-            is not JobCompletionOwnerKind.STANDALONE_FOLLOWUP
-            or job.completion_binding.owner_id != followup.followup_id
-            or job.completion_binding.terminal_event_id != followup.event_id
-            or job.revision != followup.job_terminal_revision + 1
-            or job.source_ids != followup.execution_scope.allowed_source_ids
-            or job.resource_ids != followup.execution_scope.allowed_resource_ids
-        ):
-            raise ValueError("followup_job_binding_not_current")
-        current_sensitivity = (
-            job.specification.sensitivity
-            if job.result is None
-            else job.result.sensitivity
-        )
-        if (
-            current_sensitivity.routing_rank
-            > followup.execution_scope.sensitivity_ceiling.routing_rank
-        ):
-            raise ValueError("followup_sensitivity_scope_changed")
-        scope = followup.execution_scope
-        contracts = await self._execution_contract_reader(
-            agent_id=self.identity.id,
-            source_ids=scope.allowed_source_ids,
-            resource_ids=scope.allowed_resource_ids,
-            capability_ids=scope.allowed_capability_ids,
-            connector_binding_ids=scope.allowed_connector_binding_ids,
-            model_route_ids=scope.eligible_model_routes,
-        )
-        if contracts != scope.contract_bindings:
-            raise ValueError("followup_execution_contract_changed")
-        await self._data_profile_admission.revalidate_job(job)
-        return job
 
     async def inbox(
         self,
@@ -2778,7 +2530,6 @@ class EmbeddedAgent:
             acknowledged_at=self._clock(),
         )
         if acknowledged is not None:
-            self._followup_wake.set()
             self._routine_supervisor.wake()
         return acknowledged
 
@@ -2809,13 +2560,13 @@ class EmbeddedAgent:
     async def list_jobs(
         self,
         *,
-        statuses: frozenset[JobStatus] = frozenset(),
+        states: frozenset[GraphState] = frozenset(),
         limit: int = 50,
-    ) -> tuple[JobSummary, ...]:
+    ) -> tuple[GraphJob, ...]:
         """Return the bounded current projection of this agent's durable jobs."""
 
         self._require_open()
-        return await self._job_owner.list(statuses=statuses, limit=limit)
+        return await self._job_owner.list(states=states, limit=limit)
 
     async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
         """Read one exact bounded agent-owned observation and separate resolution."""
@@ -2844,7 +2595,7 @@ class EmbeddedAgent:
         evidence_references: tuple[str, ...] = (),
     ) -> EffectReceipt:
         """Approve one exact human recovery decision; never retry an operation."""
-        async with self._run_lock:
+        async with self._admit_system_work("effect-recovery"):
             self._require_open()
             receipt = await self.inspect_effect(receipt_id)
             if receipt is None or receipt.receipt_digest != expected_digest:
@@ -2911,7 +2662,7 @@ class EmbeddedAgent:
                 )
             if await self._approval_handler(request) is not ApprovalDecision.APPROVE:
                 raise PermissionError("the effect recovery decision was denied")
-            async with self._mutation_lock:
+            async with self._effect_resolution_lock:
                 self._require_open()
                 current = await self.inspect_effect(receipt_id)
                 if (
@@ -2952,17 +2703,249 @@ class EmbeddedAgent:
                 )
         return tuple(evidence)
 
-    async def inspect_job(self, job_id: str) -> JobInspection | None:
+    async def inspect_job(self, job_id: str) -> GraphInspection | None:
         self._require_open()
         return await self._job_owner.inspect(job_id)
 
-    async def read_job_result(self, job_id: str) -> JobResultView | None:
+    async def list_job_tasks(
+        self,
+        job_id: str,
+        *,
+        states: frozenset[TaskState] = frozenset(),
+        limit: int = 64,
+    ) -> tuple[GraphTask, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_tasks(
+            job_id, states=states, limit=limit
+        )
+
+    async def inspect_job_task(self, job_id: str, task_id: str) -> GraphTask | None:
+        self._require_open()
+        return await self._job_owner.inspect_graph_task(job_id, task_id)
+
+    async def list_job_dependencies(
+        self, job_id: str, *, task_id: str | None = None, limit: int = 100
+    ) -> tuple[TaskDependency, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_dependencies(
+            job_id, task_id=task_id, limit=limit
+        )
+
+    async def list_task_attempts(
+        self, job_id: str, task_id: str, *, limit: int = 3
+    ) -> tuple[TaskAttempt, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_task_attempts(
+            job_id, task_id, limit=limit
+        )
+
+    async def read_task_result(self, job_id: str, task_id: str) -> TaskResult | None:
+        self._require_open()
+        return await self._job_owner.read_graph_task_result(job_id, task_id)
+
+    async def list_task_checkpoints(
+        self, job_id: str, task_id: str, *, limit: int = 8
+    ) -> tuple[TaskCheckpoint, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_task_checkpoints(
+            job_id, task_id, limit=limit
+        )
+
+    async def list_task_artifacts(
+        self, job_id: str, *, task_id: str | None = None, limit: int = 64
+    ) -> tuple[str, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_task_artifacts(
+            job_id, task_id=task_id, limit=limit
+        )
+
+    async def list_task_controls(
+        self, job_id: str, task_id: str, *, limit: int = 8
+    ) -> tuple[TaskControl, ...]:
+        self._require_open()
+        return await self._job_owner.list_graph_task_controls(
+            job_id, task_id, limit=limit
+        )
+
+    async def job_timeline(
+        self,
+        job_id: str,
+        *,
+        after_event_id: int = 0,
+        limit: int = 100,
+        task_id: str | None = None,
+    ) -> GraphTimelinePage | None:
+        self._require_open()
+        return await self._job_owner.graph_timeline(
+            job_id,
+            after_event_id=after_event_id,
+            limit=limit,
+            task_id=task_id,
+        )
+
+    async def job_board(self, job_id: str) -> GraphBoardProjection | None:
+        self._require_open()
+        return await self._job_owner.graph_board(job_id)
+
+    async def read_job_result(self, job_id: str) -> TaskResult | None:
         self._require_open()
         return await self._job_owner.read_result(job_id)
 
-    async def cancel_job(self, job_id: str) -> JobInspection | None:
+    async def cancel_job(self, job_id: str) -> GraphJob | None:
         self._require_open()
         return await self._job_owner.cancel(job_id)
+
+    async def graph_blockers(self, job_id: str) -> GraphBlockerProjection | None:
+        self._require_open()
+        return await self._job_owner.graph_blockers(job_id)
+
+    async def answer_task_input(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        answer: Mapping[str, object],
+        idempotency_key: str | None = None,
+    ) -> TaskControl | None:
+        self._require_open()
+        return await self._job_owner.answer_graph_task_input(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            answer=answer,
+            idempotency_key=idempotency_key,
+        )
+
+    async def accept_task_review(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        rationale: str,
+        idempotency_key: str,
+    ) -> TaskResult:
+        self._require_open()
+        return await self._job_owner.accept_graph_task_review_by_principal(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            rationale=rationale,
+            idempotency_key=idempotency_key,
+        )
+
+    async def request_task_review_changes(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        rationale: str,
+        replacement_guidance: str,
+        idempotency_key: str,
+    ) -> TaskControl:
+        self._require_open()
+        return await self._job_owner.request_graph_task_review_changes_by_principal(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            rationale=rationale,
+            replacement_guidance=replacement_guidance,
+            idempotency_key=idempotency_key,
+        )
+
+    async def retry_task_control(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        advisory_note: str,
+        idempotency_key: str,
+    ) -> TaskControl | None:
+        self._require_open()
+        return await self._job_owner.retry_graph_task_control(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            advisory_note=advisory_note,
+            idempotency_key=idempotency_key,
+        )
+
+    async def reject_task_control(
+        self,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        principal_id: str,
+        reason: str,
+        idempotency_key: str | None = None,
+    ) -> TaskControl | None:
+        self._require_open()
+        return await self._job_owner.reject_graph_task_control(
+            job_id,
+            task_id,
+            control_id,
+            principal_id=principal_id,
+            reason=reason,
+            idempotency_key=idempotency_key,
+        )
+
+    async def cancel_graph_job(
+        self, job_id: str, *, principal_id: str
+    ) -> GraphJob | None:
+        self._require_open()
+        return await self._job_owner.cancel_graph_job(job_id, principal_id=principal_id)
+
+    async def replace_graph_task_by_policy(
+        self,
+        job_id: str,
+        task_id: str,
+        *,
+        principal_id: str,
+        advisory_note: str,
+        idempotency_key: str,
+        expected_revision: int,
+    ) -> GraphMutation:
+        self._require_open()
+        return await self._job_owner.replace_graph_task_by_policy(
+            job_id,
+            task_id,
+            principal_id=principal_id,
+            advisory_note=advisory_note,
+            idempotency_key=idempotency_key,
+            expected_revision=expected_revision,
+        )
+
+    async def start_authorized_replacement_job(
+        self,
+        admission: GraphAdmission,
+        *,
+        replaces_job_id: str,
+        principal_id: str,
+        replaces_task_id: str | None = None,
+        control_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> GraphJob:
+        self._require_open()
+        return await self._job_owner.admit_authorized_replacement_graph(
+            admission,
+            replaces_job_id=replaces_job_id,
+            principal_id=principal_id,
+            replaces_task_id=replaces_task_id,
+            control_id=control_id,
+            idempotency_key=idempotency_key,
+        )
 
     async def propose_routine(self, draft: ScheduledRoutineDraft) -> ScheduledRoutine:
         """Build and revalidate one non-persisted exact routine proposal."""
@@ -3011,7 +2994,7 @@ class EmbeddedAgent:
                 or await confirmation_handler(request) is not ApprovalDecision.APPROVE
             ):
                 raise PermissionError("the routine creation was not approved")
-        async with self._mutation_lock:
+        async with self._routine_management_lock:
             self._require_open()
             if (
                 await self._routine_owner.proposal_authority_snapshot(proposal)
@@ -3074,7 +3057,7 @@ class EmbeddedAgent:
                 or await confirmation_handler(request) is not ApprovalDecision.APPROVE
             ):
                 raise PermissionError("the routine revision was not approved")
-        async with self._mutation_lock:
+        async with self._routine_management_lock:
             self._require_open()
             if (
                 await self._routine_owner.proposal_authority_snapshot(proposal)
@@ -3193,7 +3176,7 @@ class EmbeddedAgent:
         expected_revision: int,
         action: RoutineControlAction,
     ) -> ScheduledRoutine:
-        async with self._mutation_lock:
+        async with self._routine_management_lock:
             self._require_open()
             return await self._routine_owner.control(
                 routine_id,
@@ -3205,7 +3188,15 @@ class EmbeddedAgent:
     async def clear_conversations(self) -> int:
         """Delete transcripts and candidate records, not approved knowledge."""
 
-        async with self._run_lock:
+        deadline = (
+            asyncio.get_running_loop().time() + self._limits.max_wall_time_seconds
+        )
+        lease = await self._admission_coordinator.admit_execution(
+            WorkloadClass.SYSTEM,
+            self._id_factory("conversation-clear"),
+            absolute_deadline=deadline,
+        )
+        async with lease:
             self._require_open()
             cleared = await self._candidate_reviewer.clear_conversations()
             cancelled = False
@@ -3232,7 +3223,7 @@ class EmbeddedAgent:
         *,
         filename: str | None = None,
     ) -> ArtifactDeliveryReceipt:
-        async with self._mutation_lock:
+        async with self._artifact_publication_lock:
             self._require_open()
             return await self._require_artifact_delivery().save_public(
                 artifact_id,
@@ -3241,7 +3232,7 @@ class EmbeddedAgent:
             )
 
     async def export_destination(self) -> ArtifactDestination:
-        async with self._mutation_lock:
+        async with self._artifact_publication_lock:
             self._require_open()
             return await self._require_artifact_delivery().export_destination()
 
@@ -3249,14 +3240,14 @@ class EmbeddedAgent:
         self,
         directory: Path,
     ) -> ArtifactDestination:
-        async with self._mutation_lock:
+        async with self._artifact_publication_lock:
             self._require_open()
             return await self._require_artifact_delivery().set_export_destination(
                 directory
             )
 
     async def reset_export_destination(self) -> ArtifactDestination:
-        async with self._mutation_lock:
+        async with self._artifact_publication_lock:
             self._require_open()
             return await self._require_artifact_delivery().reset_export_destination()
 
@@ -3298,7 +3289,15 @@ class EmbeddedAgent:
     ) -> LearningReviewResult:
         """Explicitly trigger one bounded auxiliary review request."""
 
-        async with self._run_lock:
+        deadline = (
+            asyncio.get_running_loop().time() + self._limits.max_wall_time_seconds
+        )
+        lease = await self._admission_coordinator.admit_execution(
+            WorkloadClass.SYSTEM,
+            self._id_factory("learning-review"),
+            absolute_deadline=deadline,
+        )
+        async with lease:
             self._require_open()
             if max_estimated_cost_usd is None or self._candidate_reviewer.enabled:
                 return await self._candidate_reviewer.review(
@@ -3310,9 +3309,16 @@ class EmbeddedAgent:
                 self.model_route,
                 secret_provider=self._secret_provider or self._keychain,
             )
+            admitted_model = _admit_host_model(
+                model,
+                self._admission_coordinator,
+                identity=self.identity.id,
+                home=self.home,
+            )
+            assert admitted_model is not None
             try:
                 result = await self._candidate_reviewer.review_with_model(
-                    model=model,
+                    model=admitted_model,
                     profile=profile,
                     max_estimated_cost_usd=max_estimated_cost_usd,
                 )
@@ -3346,7 +3352,7 @@ class EmbeddedAgent:
         candidate_id: str,
         content: LearningCandidateContent,
     ) -> LearningCandidateView:
-        async with self._run_lock:
+        async with self._admit_system_work("learning-edit"):
             self._require_open()
             return await self._candidate_reviewer.edit_candidate(candidate_id, content)
 
@@ -3355,12 +3361,12 @@ class EmbeddedAgent:
         candidate_id: str,
         reason: LearningCandidateRejectionReason,
     ) -> LearningCandidateView:
-        async with self._run_lock:
+        async with self._admit_system_work("learning-reject"):
             self._require_open()
             return await self._candidate_reviewer.reject_candidate(candidate_id, reason)
 
     async def clear_rejected_learning_candidates(self) -> int:
-        async with self._run_lock:
+        async with self._admit_system_work("learning-clear-rejected"):
             self._require_open()
             return await self._candidate_reviewer.clear_rejected()
 
@@ -3373,78 +3379,74 @@ class EmbeddedAgent:
     ) -> LoopExit:
         """Start a fresh ordinary foreground run for one selected candidate."""
 
-        async with self._run_lock:
-            self._require_open()
-            if not self._candidate_acceptance_supported:
-                raise AgentHomeError(
-                    "learning candidate acceptance requires the built-in data "
-                    "context and tool runtime"
-                )
-            view = await self._candidate_reviewer.read_candidate(candidate_id)
-            if view is None:
-                raise ValueError(f"learning candidate not found: {candidate_id}")
-            if view.status is not LearningCandidateStatus.AWAITING_REVIEW:
-                raise ValueError(
-                    f"learning candidate is not awaiting review: {view.status.value}"
-                )
-            candidate = view.candidate
-            effective_source_id = source_id
-            if candidate.source_ids:
-                bound_source_id = candidate.source_ids[0]
-                if source_id is not None and source_id != bound_source_id:
-                    raise ValueError(
-                        "learning candidate acceptance must use its bound source"
-                    )
-                effective_source_id = bound_source_id
-            candidate_text = await self._candidate_reviewer.acceptance_context(
-                self.identity.id,
-                candidate.id,
-                effective_source_id,
+        self._require_open()
+        if not self._candidate_acceptance_supported:
+            raise AgentHomeError(
+                "learning candidate acceptance requires the built-in data "
+                "context and tool runtime"
             )
-            loop = self._require_loop()
-            run_id = self._id_factory("run")
-            result: LoopExit | None = None
-            run_error: BaseException | None = None
-            try:
-                result = await self._run_locked(
-                    loop,
-                    (
-                        "Review the explicitly selected inactive learning candidate "
-                        "against current catalog and active knowledge. If it remains "
-                        "correct, durable, grounded, scoped, and non-duplicate, "
-                        "propose the exact matching existing mutation before "
-                        "returning text. Otherwise do not mutate active knowledge."
-                    ),
-                    conversation_id=conversation_id,
-                    source_scope_ids=(
-                        () if effective_source_id is None else (effective_source_id,)
-                    ),
-                    learning_candidate_id=candidate.id,
-                    learning_candidate_text=candidate_text,
-                    learning_candidate=candidate,
-                    run_id=run_id,
+        view = await self._candidate_reviewer.read_candidate(candidate_id)
+        if view is None:
+            raise ValueError(f"learning candidate not found: {candidate_id}")
+        if view.status is not LearningCandidateStatus.AWAITING_REVIEW:
+            raise ValueError(
+                f"learning candidate is not awaiting review: {view.status.value}"
+            )
+        candidate = view.candidate
+        effective_source_id = source_id
+        if candidate.source_ids:
+            bound_source_id = candidate.source_ids[0]
+            if source_id is not None and source_id != bound_source_id:
+                raise ValueError(
+                    "learning candidate acceptance must use its bound source"
                 )
-            except BaseException as error:
-                run_error = error
+            effective_source_id = bound_source_id
+        candidate_text = await self._candidate_reviewer.acceptance_context(
+            self.identity.id,
+            candidate.id,
+            effective_source_id,
+        )
+        run_id = self._id_factory("run")
+        evidence = RunSessionEvidence()
+        result: LoopExit | None = None
+        run_error: BaseException | None = None
+        try:
+            result = await self._run(
+                (
+                    "Review the explicitly selected inactive learning candidate "
+                    "against current catalog and active knowledge. If it remains "
+                    "correct, durable, grounded, scoped, and non-duplicate, "
+                    "propose the exact matching existing mutation before "
+                    "returning text. Otherwise do not mutate active knowledge."
+                ),
+                conversation_id=conversation_id,
+                source_scope_ids=(
+                    () if effective_source_id is None else (effective_source_id,)
+                ),
+                learning_candidate_id=candidate.id,
+                learning_candidate_text=candidate_text,
+                learning_candidate=candidate,
+                run_id=run_id,
+                evidence=evidence,
+            )
+        except BaseException as error:
+            run_error = error
 
-            finalization_cancelled = False
-            try:
-                if self._learning_candidate_guard.mutation_succeeded(run_id):
-                    _, finalization_cancelled = await _await_async_completion(
-                        lambda: self._candidate_reviewer.mark_accepted(
-                            candidate.id,
-                            expected_fingerprint=candidate.candidate_fingerprint,
-                        )
-                    )
-            finally:
-                self._learning_candidate_guard.clear_outcome(run_id)
+        finalization_cancelled = False
+        if evidence.learning_mutation_succeeded:
+            _, finalization_cancelled = await _await_async_completion(
+                lambda: self._candidate_reviewer.mark_accepted(
+                    candidate.id,
+                    expected_fingerprint=candidate.candidate_fingerprint,
+                )
+            )
 
-            if run_error is not None:
-                raise run_error.with_traceback(run_error.__traceback__)
-            if finalization_cancelled:
-                raise asyncio.CancelledError
-            assert result is not None
-            return result
+        if run_error is not None:
+            raise run_error.with_traceback(run_error.__traceback__)
+        if finalization_cancelled:
+            raise asyncio.CancelledError
+        assert result is not None
+        return result
 
     async def list_semantic_annotations(
         self,
@@ -3502,7 +3504,7 @@ class EmbeddedAgent:
     ) -> bool:
         if not isinstance(annotation, SemanticAnnotation):
             raise TypeError("annotation must be SemanticAnnotation")
-        async with self._mutation_lock:
+        async with self._semantic_management_lock:
             self._require_open()
             if annotation.agent_id != self.identity.id:
                 raise ValueError("semantic annotation belongs to another agent")
@@ -3522,7 +3524,7 @@ class EmbeddedAgent:
         *,
         expected_sha256: str,
     ) -> bool:
-        async with self._mutation_lock:
+        async with self._semantic_management_lock:
             self._require_open()
             return await self._store.delete_semantic_annotation(
                 self.identity.id,
@@ -3580,7 +3582,7 @@ class EmbeddedAgent:
     ) -> MCPServerInspection:
         """Inspect one exact endpoint without persisting execution authority."""
 
-        async with self._mutation_lock:
+        async with self._mcp_commit_lock:
             self._require_open()
             return await self._inspect_mcp_endpoint(
                 endpoint=endpoint,
@@ -3604,8 +3606,10 @@ class EmbeddedAgent:
             raise TypeError("maximum_outbound_sensitivity is invalid")
         resolved_authentication = authentication or MCPAuthentication.no_auth()
         resolved_binding_id = binding_id or self._id_factory("mcp-binding")
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "mcp-attach", self._mcp_management_lock
+        ):
+            async with self._mcp_commit_lock:
                 self._require_open()
                 current = await self._store.load_mcp_binding(
                     self.identity.id,
@@ -3640,8 +3644,10 @@ class EmbeddedAgent:
         when_to_use: str,
         keywords: tuple[str, ...] = (),
     ) -> MCPServerBinding:
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "mcp-discovery", self._mcp_management_lock
+        ):
+            async with self._mcp_commit_lock:
                 self._require_open()
                 return await self._store.update_mcp_discovery(
                     self.identity.id,
@@ -3659,8 +3665,10 @@ class EmbeddedAgent:
         when_to_use: str,
         keywords: tuple[str, ...] = (),
     ) -> SourceRegistration:
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "source-discovery", self._source_management_lock
+        ):
+            async with self._source_commit_lock:
                 self._require_open()
                 return await self._store.update_source_discovery(
                     self.identity.id,
@@ -3689,8 +3697,10 @@ class EmbeddedAgent:
     async def refresh_mcp_server(self, binding_id: str) -> MCPBindingStatus:
         """Check exact remote drift and require reopen for any refreshed revision."""
 
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "mcp-refresh", self._mcp_management_lock
+        ):
+            async with self._mcp_commit_lock:
                 self._require_open()
                 current = await self._store.load_mcp_binding(
                     self.identity.id,
@@ -3720,7 +3730,7 @@ class EmbeddedAgent:
     async def revoke_mcp_server(self, binding_id: str) -> MCPBindingStatus:
         """Make one binding immediately unavailable without affecting siblings."""
 
-        async with self._mutation_lock:
+        async with self._mcp_commit_lock:
             self._require_open()
             activated = self._mcp_activated_bindings.get(binding_id)
             if activated is None:
@@ -3789,8 +3799,10 @@ class EmbeddedAgent:
         *,
         attached_at: datetime,
     ) -> SourceRegistration:
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "source-attach", self._source_management_lock
+        ):
+            async with self._source_commit_lock:
                 self._require_open()
                 return await self._attach_source_locked(
                     source,
@@ -3849,6 +3861,10 @@ class EmbeddedAgent:
                 discovery.snapshot,
                 registration=registration,
             )
+            self._admission_coordinator.configure_source_resource_capacity(
+                f"source:{registration.id}",
+                2 if registration.adapter_id == "postgresql" else 1,
+            )
             return registration
         except BaseException as error:
             if isinstance(error, ResourceAdapterError):
@@ -3890,8 +3906,10 @@ class EmbeddedAgent:
             raise TypeError("source must implement ResourceSource")
         if not callable(confirmation_handler):
             raise TypeError("confirmation_handler must be callable")
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "source-edit", self._source_management_lock
+        ):
+            async with self._source_commit_lock:
                 self._require_open()
                 current = await self._store.load_source(self.identity.id, source_id)
                 if current is None or not current.active:
@@ -4047,7 +4065,7 @@ class EmbeddedAgent:
             or len(password.encode("utf-8")) > 64 * 1_024
         ):
             raise ValueError("PostgreSQL password must be non-empty and at most 64 KiB")
-        async with self._mutation_lock:
+        async with self._credential_management_lock:
             self._require_open()
             reference = SecretReference.keychain(
                 _credential_account(
@@ -4086,7 +4104,7 @@ class EmbeddedAgent:
             raise ValueError(
                 "credential does not belong to this agent's PostgreSQL setup"
             )
-        async with self._mutation_lock:
+        async with self._credential_management_lock:
             self._require_open()
             await self._keychain.delete(reference)
 
@@ -4187,7 +4205,7 @@ class EmbeddedAgent:
     ) -> SourcePermissionsInspection:
         """Inspect exact scopes against complete trusted current catalog truth."""
 
-        async with self._mutation_lock:
+        async with self._source_commit_lock:
             self._require_open()
             return await self._inspect_source_permissions_locked(source_id)
 
@@ -4201,8 +4219,10 @@ class EmbeddedAgent:
     ) -> SourcePermissionsPreview:
         """Build and retain one bounded in-process exact confirmation preview."""
 
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "source-permission-preview", self._source_permission_lock
+        ):
+            async with self._source_commit_lock:
                 self._require_open()
                 inspection = await self._inspect_source_permissions_locked(source_id)
                 preview = await self._build_source_permissions_preview(
@@ -4222,8 +4242,10 @@ class EmbeddedAgent:
     ) -> SourcePermissionsInspection:
         """Revalidate and atomically apply one exact in-process preview."""
 
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "source-permission-apply", self._source_permission_lock
+        ):
+            async with self._source_commit_lock:
                 self._require_open()
                 preview = self._source_permission_previews.get(source_id)
                 if preview is None or not hmac.compare_digest(
@@ -4638,7 +4660,7 @@ class EmbeddedAgent:
     async def relational_upsert_readiness(
         self, source_id: str, resource_id: str
     ) -> FrozenJsonObject:
-        async with self._mutation_lock:
+        async with self._source_commit_lock:
             self._require_open()
             permission = await self._data_view.load_relational_write_scope(
                 self.identity.id, source_id, resource_id
@@ -4673,8 +4695,10 @@ class EmbeddedAgent:
         )
 
     async def detach(self, source_id: str) -> SourceRegistration:
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "source-detach", self._source_management_lock
+        ):
+            async with self._source_commit_lock:
                 self._require_open()
                 detached = await self._store.detach_source(
                     self.identity.id, source_id, self._clock()
@@ -4698,8 +4722,10 @@ class EmbeddedAgent:
 
         if not isinstance(source_id, str) or not source_id:
             raise ValueError("source_id must be a non-empty string")
-        async with self._run_lock:
-            async with self._mutation_lock:
+        async with self._admit_owned_system_work(
+            "source-refresh", self._source_management_lock
+        ):
+            async with self._source_commit_lock:
                 self._require_open()
                 registration = await self._store.load_source(
                     self.identity.id, source_id
@@ -4731,7 +4757,7 @@ class EmbeddedAgent:
     async def catalog_summary(self) -> CatalogSummary:
         """Return current committed catalog facts as one consistent projection."""
 
-        async with self._mutation_lock:
+        async with self._source_commit_lock:
             self._require_open()
             return await self._catalog_service.summary(self.identity.id)
 
@@ -4742,7 +4768,7 @@ class EmbeddedAgent:
     ) -> tuple[CatalogResource, ...]:
         """Return a bounded deterministic preview from current catalog truth."""
 
-        async with self._mutation_lock:
+        async with self._source_commit_lock:
             self._require_open()
             return await self._catalog_service.preview(
                 self.identity.id,
@@ -4763,6 +4789,38 @@ class EmbeddedAgent:
             self.identity.id, resource_id
         )
 
+    @asynccontextmanager
+    async def _admit_system_work(self, label: str):
+        deadline = (
+            asyncio.get_running_loop().time() + self._limits.max_wall_time_seconds
+        )
+        try:
+            lease = await self._admission_coordinator.admit_execution(
+                WorkloadClass.SYSTEM,
+                self._id_factory(label),
+                absolute_deadline=deadline,
+            )
+        except AdmissionClosedError as error:
+            raise AgentHomeError("embedded agent is closed") from error
+        async with lease:
+            yield lease
+
+    async def _provider_admission(self, key: str, deadline: float | None):
+        return await self._admission_coordinator.provider_permit(
+            key,
+            deadline=deadline,
+        )
+
+    @asynccontextmanager
+    async def _admit_owned_system_work(
+        self,
+        label: str,
+        owner_lock: asyncio.Lock,
+    ):
+        async with self._admit_system_work(label) as lease:
+            async with owner_lock:
+                yield lease
+
     async def close(self) -> None:
         if self._close_task is None:
             self._closed = True
@@ -4780,17 +4838,7 @@ class EmbeddedAgent:
 
     async def _finish_close(self) -> None:
         first_error: BaseException | None = None
-        followup_driver = self._followup_driver
-        self._followup_driver = None
-        if followup_driver is not None:
-            self._followup_wake.set()
-            followup_driver.cancel("host_closing")
-            try:
-                await followup_driver
-            except asyncio.CancelledError:
-                pass
-            except BaseException as error:
-                first_error = error
+        await self._admission_coordinator.begin_draining()
         try:
             await self._routine_supervisor.close()
         except BaseException as error:
@@ -4799,9 +4847,19 @@ class EmbeddedAgent:
             await self._job_supervisor.close()
         except BaseException as error:
             first_error = error
-        async with self._run_lock:
-            async with self._mutation_lock:
-                pass
+        drain_deadline = (
+            asyncio.get_running_loop().time() + _RUN_ADMISSION_DRAIN_SECONDS
+        )
+        try:
+            await self._admission_coordinator.close(deadline=drain_deadline)
+        except BaseException as error:
+            # Shared dependencies and the process writer lease must stay alive if
+            # an admitted owner could not be cancelled and settled by the barrier.
+            # A failed close is deliberately fail-closed rather than tearing the
+            # provider/store out from underneath live work.
+            if first_error is not None:
+                raise error from first_error
+            raise
         owned_model_provider = self._owned_model_provider
         model_shutdown_deadline = (
             asyncio.get_running_loop().time()
@@ -4876,6 +4934,33 @@ class EmbeddedAgent:
     def _require_open(self) -> None:
         if self._closed:
             raise AgentHomeError("embedded agent is closed")
+
+
+def _admit_host_model(
+    model: ModelProvider | None,
+    coordinator: RunAdmissionCoordinator,
+    *,
+    identity: str,
+    home: Path,
+) -> ModelProvider | None:
+    """Bind one host-owned provider at its exact request-attempt boundary."""
+
+    if model is None:
+        return None
+
+    async def admit(key: str, deadline: float | None):
+        return await coordinator.provider_permit(key, deadline=deadline)
+
+    if isinstance(model, ModelRouter):
+        if not model.provider_admission_bound:
+            model.bind_provider_admission(admit)
+        return model
+    key = f"injected:{model.provider_id}:{home.resolve()}"
+    return AdmittedModelProvider(
+        model,
+        concurrency_key=key,
+        admission=admit,
+    )
 
 
 def _source_permission_state_payload(
@@ -5390,6 +5475,13 @@ async def _validate_model_route(
     secret_provider: SecretProvider,
     injected_provider: ModelProvider | None,
     call_policy: ModelCallPolicy = _DEFAULT_CALL_POLICY,
+    provider_admission: (
+        Callable[
+            [str, float | None],
+            Awaitable[AbstractAsyncContextManager[object]],
+        ]
+        | None
+    ) = None,
 ) -> None:
     validation_candidates = tuple(
         replace(
@@ -5421,6 +5513,9 @@ async def _validate_model_route(
             validation_route,
             secret_provider=secret_provider,
         )
+        if provider_admission is not None:
+            assert isinstance(provider, ModelRouter)
+            provider.bind_provider_admission(provider_admission)
     else:
         assert injected_provider is not None
         if len(validation_candidates) != 1:

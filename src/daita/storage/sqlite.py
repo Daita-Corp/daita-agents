@@ -30,20 +30,12 @@ from ..artifacts.models import (
     ArtifactRef,
     artifact_ref_from_mapping,
 )
-from ..autonomy import (
-    MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT,
-    AutonomousFollowup,
-    FollowupCompletionConflictError,
-    FollowupDisposition,
-    FollowupIdentityConflictError,
-    assess_followup_conclusion,
-    terminal_job_event_payload,
-)
 from ..capabilities import (
     CapabilityGrant,
     EffectEvidenceBasis,
     EffectObservation,
     ExecutionScope,
+    TaskAttemptGuard,
 )
 from ..catalog.models import (
     CatalogFacet,
@@ -64,37 +56,43 @@ from ..distribution.models import (
     Delivery,
     DeliveryState,
     DeliverySubjectKind,
+    GraphJobDelivery,
     OutcomeArtifactReference,
     OutcomeConclusionKind,
     OutcomeState,
     conclusion_preview_projection,
+    distribution_plan_digest,
     outcome_artifact_reference,
     validate_outcome_artifact_references,
 )
 from ..distribution.owner import construct_logical_delivery
 from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
-from ..jobs.models import (
-    MAX_ACTIVE_JOBS_PER_AGENT,
-    MAX_JOB_ATTEMPTS,
-    MAX_JOB_LIST_PAGE_SIZE,
-    MAX_JOBS_PER_AGENT,
-    MAX_QUEUED_JOBS_PER_AGENT,
-    MAX_RUNNING_JOBS_PER_AGENT,
-    MAX_RUNNING_JOBS_PER_SOURCE,
-    ExternalIntent,
-    ExternalIntentDisposition,
-    ExternalIntentKind,
-    ExternalObservation,
-    JobAttempt,
-    JobAttemptStatus,
-    JobCompletionBinding,
-    JobCompletionOwnerKind,
-    JobDesiredState,
-    JobExecutionMode,
-    JobResult,
-    JobRun,
-    JobStatus,
+from ..jobs.graph.models import (
+    ACTIVE_ATTEMPT_STATES,
+    MAX_GRAPH_JOBS_PER_AGENT,
+    AttemptBudgetReservation,
+    AttemptState,
+    BudgetAmount,
+    BudgetLedger,
+    ControlKind,
+    ControlState,
+    GraphAdmission,
+    GraphDesiredState,
+    GraphEventPage,
+    GraphInspection,
+    GraphJob,
+    GraphMutation,
+    GraphMutationRequest,
+    GraphState,
+    GraphTask,
+    TaskAttempt,
+    TaskCheckpoint,
+    TaskComment,
+    TaskControl,
+    TaskResult,
+    TaskState,
+    canonical_digest,
 )
 from ..learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
@@ -124,6 +122,7 @@ from ..loop.models import (
     Transcript,
     validate_completed_transcript,
 )
+from ..loop.transcripts import ConversationPredecessor
 from ..routines.models import (
     MAX_ACTIVE_ROUTINES_PER_AGENT,
     MAX_ROUTINE_ATTEMPTS,
@@ -155,6 +154,8 @@ from ..semantics import (
     SemanticValidationError,
     semantic_annotation_sha256,
 )
+from . import sqlite_graph as _graph_store
+from .graph_schema import ClosingSQLiteConnection, connect_graph
 from .home_migrations import (
     CURRENT_HOME_REVISION,
     HomeMigrationJournalError,
@@ -164,12 +165,10 @@ from .home_migrations import (
 )
 from .sqlite_codecs import (
     CurrentSourceAdapterError,
-    decode_autonomous_followup,
     decode_catalog_snapshot,
     decode_catalog_sync,
     decode_delivery,
     decode_identity,
-    decode_job_run,
     decode_learning_candidate,
     decode_loop_exit,
     decode_mcp_binding,
@@ -184,12 +183,10 @@ from .sqlite_codecs import (
     decode_source,
     decode_source_credential_reference_for_deletion,
     decode_source_read_scope,
-    encode_autonomous_followup,
     encode_catalog_snapshot,
     encode_catalog_sync,
     encode_delivery,
     encode_identity,
-    encode_job_run,
     encode_learning_candidate,
     encode_loop_exit,
     encode_mcp_binding,
@@ -204,6 +201,7 @@ from .sqlite_codecs import (
     encode_source,
     encode_source_read_scope,
 )
+from .sqlite_codecs.graph import decode_graph_event, decode_graph_job_delivery
 from .sqlite_records import (
     EffectOutcome,
     EffectReceipt,
@@ -242,94 +240,6 @@ def _active_mcp_tool_count(bindings: Iterable[MCPServerBinding]) -> int:
 
 def _learning_review_stamps_key(agent_id: str) -> str:
     return f"{_LEARNING_REVIEW_STAMPS_KEY_PREFIX}{agent_id}"
-
-
-def _decode_job_rows(
-    rows: Iterable[tuple[object, object]],
-    *,
-    agent_id: str,
-) -> tuple[JobRun, ...]:
-    material = tuple(rows)
-    if len(material) > MAX_JOBS_PER_AGENT:
-        raise RuntimeError("stored job count exceeds its fixed bound")
-    jobs: list[JobRun] = []
-    for job_id, data in material:
-        if not isinstance(job_id, str) or not isinstance(data, str):
-            raise RuntimeError("stored job identity is invalid")
-        jobs.append(decode_job_run(data, agent_id=agent_id, job_id=job_id))
-    return tuple(jobs)
-
-
-def _load_job_row(
-    connection: sqlite3.Connection,
-    agent_id: str,
-    job_id: str,
-) -> tuple[JobRun, str] | None:
-    row = connection.execute(
-        "SELECT data FROM job_runs WHERE agent_id = ? AND job_id = ?",
-        (agent_id, job_id),
-    ).fetchone()
-    if row is None:
-        return None
-    if not isinstance(row[0], str):
-        raise RuntimeError("stored job payload is invalid")
-    return decode_job_run(row[0], agent_id=agent_id, job_id=job_id), row[0]
-
-
-def _replace_job_row(
-    connection: sqlite3.Connection,
-    current_data: str,
-    job: JobRun,
-) -> None:
-    result = connection.execute(
-        """UPDATE job_runs SET data = ?
-           WHERE agent_id = ? AND job_id = ? AND data = ?""",
-        (encode_job_run(job), job.agent_id, job.job_id, current_data),
-    )
-    if result.rowcount != 1:
-        raise RuntimeError("job changed during its conditional transition")
-
-
-def _load_followup_row(
-    connection: sqlite3.Connection,
-    agent_id: str,
-    followup_id: str,
-) -> tuple[AutonomousFollowup, str] | None:
-    row = connection.execute(
-        "SELECT data FROM autonomous_followups WHERE agent_id = ? AND followup_id = ?",
-        (agent_id, followup_id),
-    ).fetchone()
-    if row is None:
-        return None
-    if not isinstance(row[0], str):
-        raise RuntimeError("stored autonomous follow-up payload is invalid")
-    return (
-        decode_autonomous_followup(
-            row[0],
-            agent_id=agent_id,
-            followup_id=followup_id,
-        ),
-        row[0],
-    )
-
-
-def _replace_followup_row(
-    connection: sqlite3.Connection,
-    current_data: str,
-    followup: AutonomousFollowup,
-) -> None:
-    result = connection.execute(
-        "UPDATE autonomous_followups SET data = ? "
-        "WHERE agent_id = ? AND followup_id = ? AND data = ?",
-        (
-            encode_autonomous_followup(followup),
-            followup.agent_id,
-            followup.followup_id,
-            current_data,
-        ),
-    )
-    if result.rowcount != 1:
-        raise RuntimeError("follow-up changed during its conditional transition")
 
 
 def _load_delivery_row(
@@ -668,7 +578,10 @@ class SQLiteStateStore:
     current_revision = str(CURRENT_HOME_REVISION)
 
     def __init__(
-        self, path: Path, *, clock: Callable[[], datetime] | None = None
+        self,
+        path: Path,
+        *,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.path = path
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -709,9 +622,567 @@ class SQLiteStateStore:
             raise asyncio.CancelledError
         return cls(resolved, clock=resolved_clock)
 
+    async def admit_graph(self, admission: GraphAdmission) -> GraphJob:
+        if not isinstance(admission, GraphAdmission):
+            raise TypeError("graph admission must be GraphAdmission")
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.admit_graph(connection, admission),
+        )
+
+    async def admit_replacement_graph(
+        self,
+        admission: GraphAdmission,
+        *,
+        replaced_job_id: str,
+        replaced_task_id: str,
+        control_id: str,
+        principal_id: str,
+        idempotency_key: str,
+        resolved_at: datetime,
+        expected_control_digest: str,
+        expected_task_revision: int,
+    ) -> GraphJob:
+        if not isinstance(admission, GraphAdmission):
+            raise TypeError("replacement graph admission must be GraphAdmission")
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.admit_replacement_graph(
+                connection,
+                admission,
+                replaced_job_id=replaced_job_id,
+                replaced_task_id=replaced_task_id,
+                control_id=control_id,
+                principal_id=principal_id,
+                idempotency_key=idempotency_key,
+                resolved_at=resolved_at,
+                expected_control_digest=expected_control_digest,
+                expected_task_revision=expected_task_revision,
+            ),
+        )
+
+    async def inspect_graph(self, agent_id: str, job_id: str) -> GraphInspection | None:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.inspect_graph(connection, agent_id, job_id),
+        )
+
+    async def list_graph_jobs(
+        self,
+        agent_id: str,
+        *,
+        states: frozenset[GraphState] = frozenset(),
+        limit: int = 50,
+    ) -> tuple[GraphJob, ...]:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_graph_jobs(
+                connection,
+                agent_id,
+                states=states,
+                limit=limit,
+            ),
+        )
+
+    async def apply_graph_mutation(
+        self, request: GraphMutationRequest
+    ) -> GraphMutation:
+        if not isinstance(request, GraphMutationRequest):
+            raise TypeError("graph mutation must be GraphMutationRequest")
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.apply_mutation(connection, request),
+        )
+
+    async def request_graph_cancel(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        requested_at: datetime,
+        requested_by_id: str,
+    ) -> GraphJob | None:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.request_cancel(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                requested_at=requested_at,
+                requested_by_id=requested_by_id,
+            ),
+        )
+
+    async def list_ready_graph_tasks(
+        self,
+        agent_id: str,
+        *,
+        now: datetime,
+        limit: int = 64,
+    ) -> tuple[GraphTask, ...]:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_ready_tasks(
+                connection, agent_id, now=now, limit=limit
+            ),
+        )
+
+    async def expire_due_graphs(
+        self,
+        agent_id: str,
+        *,
+        expired_at: datetime,
+        limit: int = 64,
+    ) -> tuple[GraphJob, ...]:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.expire_due_graphs(
+                connection,
+                agent_id,
+                expired_at=expired_at,
+                limit=limit,
+            ),
+        )
+
+    async def list_stale_graph_attempts(
+        self,
+        agent_id: str,
+        *,
+        now: datetime,
+        limit: int = 64,
+    ) -> tuple[TaskAttempt, ...]:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_stale_attempts(
+                connection, agent_id, now=now, limit=limit
+            ),
+        )
+
+    async def list_active_graph_attempts(
+        self,
+        agent_id: str,
+        *,
+        limit: int = 64,
+    ) -> tuple[TaskAttempt, ...]:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_active_attempts(
+                connection, agent_id, limit=limit
+            ),
+        )
+
+    async def claim_graph_task(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        *,
+        attempt_id: str,
+        claim_token: str,
+        run_id: str,
+        executor_id: str,
+        claimed_at: datetime,
+        lease_seconds: int,
+        absolute_deadline_at: datetime,
+        budget_reservations: tuple[BudgetAmount, ...],
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.claim_task(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                run_id=run_id,
+                executor_id=executor_id,
+                claimed_at=claimed_at,
+                lease_seconds=lease_seconds,
+                absolute_deadline_at=absolute_deadline_at,
+                budget_reservations=budget_reservations,
+            ),
+        )
+
+    async def start_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        started_at: datetime,
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.start_attempt(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                started_at=started_at,
+            ),
+        )
+
+    async def heartbeat_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        heartbeat_at: datetime,
+        lease_seconds: int = 30,
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.heartbeat_attempt(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                heartbeat_at=heartbeat_at,
+                lease_seconds=lease_seconds,
+            ),
+        )
+
+    async def checkpoint_graph_attempt(
+        self, checkpoint: TaskCheckpoint, *, claim_token: str
+    ) -> TaskCheckpoint:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.checkpoint_attempt(
+                connection, checkpoint, claim_token=claim_token
+            ),
+        )
+
+    async def add_graph_comment(
+        self,
+        comment: TaskComment,
+        *,
+        attempt_id: str | None = None,
+        claim_token: str | None = None,
+        fencing_epoch: int | None = None,
+    ) -> TaskComment:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.add_comment(
+                connection,
+                comment,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+            ),
+        )
+
+    async def complete_graph_attempt(
+        self,
+        result: TaskResult,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        usage: tuple[BudgetAmount, ...] | None,
+    ) -> TaskResult:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.complete_attempt(
+                connection,
+                result,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                usage=usage,
+            ),
+        )
+
+    async def finalize_graph_attempt(
+        self,
+        result: TaskResult,
+        delivery: GraphJobDelivery,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        usage: tuple[BudgetAmount, ...] | None,
+    ) -> TaskResult:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.complete_attempt(
+                connection,
+                result,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                usage=usage,
+                delivery=delivery,
+            ),
+        )
+
+    async def list_graph_deliveries(
+        self,
+        agent_id: str,
+        *,
+        job_id: str | None = None,
+        limit: int = 100,
+    ) -> tuple[GraphJobDelivery, ...]:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_graph_deliveries(
+                connection,
+                agent_id,
+                job_id=job_id,
+                limit=limit,
+            ),
+        )
+
+    async def fence_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        fencing_epoch: int,
+        fenced_at: datetime,
+        requeue: bool,
+        reason_code: str,
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.fence_attempt(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                fencing_epoch=fencing_epoch,
+                fenced_at=fenced_at,
+                requeue=requeue,
+                reason_code=reason_code,
+            ),
+        )
+
+    async def fail_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        failed_at: datetime,
+        retryable: bool,
+        reason_code: str,
+        attempt_state: AttemptState = AttemptState.FAILED,
+    ) -> TaskAttempt | None:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.fail_attempt(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                failed_at=failed_at,
+                retryable=retryable,
+                reason_code=reason_code,
+                attempt_state=attempt_state,
+            ),
+        )
+
+    async def open_graph_control(
+        self,
+        control: TaskControl,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        replan_task: GraphTask | None = None,
+        reviewer_task: GraphTask | None = None,
+    ) -> TaskControl:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.open_control(
+                connection,
+                control,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+                replan_task=replan_task,
+                reviewer_task=reviewer_task,
+            ),
+        )
+
+    async def resolve_graph_control(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        control_id: str,
+        *,
+        state: ControlState,
+        resolved_at: datetime,
+        resolved_by_kind: str,
+        resolved_by_id: str,
+        resolution: dict[str, object],
+        make_ready: bool,
+        expected_control_digest: str | None = None,
+        expected_task_revision: int | None = None,
+    ) -> TaskControl | None:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.resolve_control(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                task_id=task_id,
+                control_id=control_id,
+                state=state,
+                resolved_at=resolved_at,
+                resolved_by_kind=resolved_by_kind,
+                resolved_by_id=resolved_by_id,
+                resolution=resolution,
+                make_ready=make_ready,
+                expected_control_digest=expected_control_digest,
+                expected_task_revision=expected_task_revision,
+            ),
+        )
+
+    async def accept_graph_review(
+        self,
+        *,
+        agent_id: str,
+        job_id: str,
+        subject_task_id: str,
+        control_id: str,
+        reviewer_task_id: str,
+        resolved_at: datetime,
+        resolved_by_kind: str,
+        resolved_by_id: str,
+        rationale: str,
+        idempotency_key: str,
+        expected_control_digest: str,
+        expected_subject_revision: int,
+        reviewer_result: TaskResult | None = None,
+        claim_token: str | None = None,
+        fencing_epoch: int | None = None,
+    ) -> TaskResult:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.accept_review(
+                connection,
+                agent_id=agent_id,
+                job_id=job_id,
+                subject_task_id=subject_task_id,
+                control_id=control_id,
+                reviewer_task_id=reviewer_task_id,
+                resolved_at=resolved_at,
+                resolved_by_kind=resolved_by_kind,
+                resolved_by_id=resolved_by_id,
+                rationale=rationale,
+                idempotency_key=idempotency_key,
+                expected_control_digest=expected_control_digest,
+                expected_subject_revision=expected_subject_revision,
+                reviewer_result=reviewer_result,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+            ),
+        )
+
+    async def request_graph_review_changes(
+        self,
+        *,
+        changes_control: TaskControl,
+        review_control_id: str,
+        reviewer_task_id: str,
+        resolved_at: datetime,
+        resolved_by_kind: str,
+        resolved_by_id: str,
+        rationale: str,
+        idempotency_key: str,
+        expected_control_digest: str,
+        expected_subject_revision: int,
+        reviewer_result: TaskResult | None = None,
+        claim_token: str | None = None,
+        fencing_epoch: int | None = None,
+    ) -> TaskControl:
+        return await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _graph_store.request_review_changes(
+                connection,
+                changes_control=changes_control,
+                review_control_id=review_control_id,
+                reviewer_task_id=reviewer_task_id,
+                resolved_at=resolved_at,
+                resolved_by_kind=resolved_by_kind,
+                resolved_by_id=resolved_by_id,
+                rationale=rationale,
+                idempotency_key=idempotency_key,
+                expected_control_digest=expected_control_digest,
+                expected_subject_revision=expected_subject_revision,
+                reviewer_result=reviewer_result,
+                claim_token=claim_token,
+                fencing_epoch=fencing_epoch,
+            ),
+        )
+
+    async def list_graph_events(
+        self,
+        agent_id: str,
+        job_id: str,
+        *,
+        after_event_id: int = 0,
+        limit: int = 100,
+        task_id: str | None = None,
+    ) -> GraphEventPage:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_graph_events(
+                connection,
+                agent_id,
+                job_id,
+                after_event_id=after_event_id,
+                limit=limit,
+                task_id=task_id,
+            ),
+        )
+
+    async def list_graph_budget_ledgers(
+        self, agent_id: str, job_id: str
+    ) -> tuple[BudgetLedger, ...]:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_budget_ledgers(
+                connection, agent_id, job_id
+            ),
+        )
+
+    async def list_graph_attempt_reservations(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> tuple[AttemptBudgetReservation, ...]:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_attempt_reservations(
+                connection, agent_id, job_id, task_id, attempt_id
+            ),
+        )
+
     async def close(self) -> None:
         async with self._decoded_catalog_snapshot_lock:
             self._decoded_catalog_snapshots.clear()
+        await asyncio.to_thread(_checkpoint_wal_for_close, self.path)
 
     async def initialize_identity(self, identity: AgentIdentity) -> AgentIdentity:
         def write() -> AgentIdentity:
@@ -2450,887 +2921,6 @@ class SQLiteStateStore:
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
-    async def admit_job(self, job: JobRun) -> JobRun:
-        if not isinstance(job, JobRun):
-            raise TypeError("job must be JobRun")
-        if (
-            job.status is not JobStatus.QUEUED
-            or job.desired_state is not JobDesiredState.RUN
-            or job.revision != 1
-            or job.attempts
-        ):
-            raise ValueError("new job must be one pristine queued aggregate")
-        encoded = encode_job_run(job)
-
-        def write(connection: sqlite3.Connection) -> JobRun:
-            rows = tuple(
-                connection.execute(
-                    "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
-                    (job.agent_id,),
-                )
-            )
-            jobs = _decode_job_rows(rows, agent_id=job.agent_id)
-            if any(item.job_id == job.job_id for item in jobs):
-                raise ValueError("job identity already exists")
-            if len(jobs) >= MAX_JOBS_PER_AGENT:
-                raise ValueError("job_retention_limit_exceeded")
-            active = sum(not item.terminal for item in jobs)
-            queued = sum(item.status is JobStatus.QUEUED for item in jobs)
-            if active >= MAX_ACTIVE_JOBS_PER_AGENT:
-                raise ValueError("job_active_limit_exceeded")
-            if queued >= MAX_QUEUED_JOBS_PER_AGENT:
-                raise ValueError("job_queue_limit_exceeded")
-            connection.execute(
-                "INSERT INTO job_runs(agent_id, job_id, data) VALUES (?, ?, ?)",
-                (job.agent_id, job.job_id, encoded),
-            )
-            return job
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def load_job(self, agent_id: str, job_id: str) -> JobRun | None:
-        def read() -> JobRun | None:
-            with _connect(self.path) as connection:
-                loaded = _load_job_row(connection, agent_id, job_id)
-            return None if loaded is None else loaded[0]
-
-        return await asyncio.to_thread(read)
-
-    async def list_jobs(
-        self,
-        agent_id: str,
-        *,
-        conversation_id: str | None = None,
-        statuses: frozenset[JobStatus] = frozenset(),
-        limit: int = MAX_JOB_LIST_PAGE_SIZE,
-    ) -> tuple[JobRun, ...]:
-        if (
-            not isinstance(limit, int)
-            or isinstance(limit, bool)
-            or not 1 <= limit <= MAX_JOB_LIST_PAGE_SIZE
-        ):
-            raise ValueError("job list limit is outside its bound")
-        statuses = frozenset(statuses)
-        if any(not isinstance(item, JobStatus) for item in statuses):
-            raise TypeError("job statuses must contain JobStatus values")
-
-        def read() -> tuple[JobRun, ...]:
-            with _connect(self.path) as connection:
-                jobs = _decode_job_rows(
-                    tuple(
-                        connection.execute(
-                            "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
-                            (agent_id,),
-                        )
-                    ),
-                    agent_id=agent_id,
-                )
-            selected = tuple(
-                item
-                for item in jobs
-                if (conversation_id is None or item.conversation_id == conversation_id)
-                and (not statuses or item.status in statuses)
-            )
-            return tuple(
-                sorted(
-                    selected,
-                    key=lambda item: (item.created_at, item.job_id),
-                    reverse=True,
-                )[:limit]
-            )
-
-        return await asyncio.to_thread(read)
-
-    async def list_unbound_terminal_daita_jobs(
-        self,
-        agent_id: str,
-    ) -> tuple[JobRun, ...]:
-        """Return every bounded terminal Daita job lacking a completion owner."""
-
-        def read() -> tuple[JobRun, ...]:
-            with _connect(self.path) as connection:
-                jobs = _decode_job_rows(
-                    connection.execute(
-                        "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
-                        (agent_id,),
-                    ),
-                    agent_id=agent_id,
-                )
-            return tuple(
-                sorted(
-                    (
-                        job
-                        for job in jobs
-                        if job.terminal
-                        and job.specification.execution_mode is JobExecutionMode.DAITA
-                        and job.completion_binding is None
-                    ),
-                    key=lambda item: (item.terminal_at, item.job_id),
-                )
-            )
-
-        return await asyncio.to_thread(read)
-
-    async def admit_autonomous_followup(
-        self,
-        followup: AutonomousFollowup,
-    ) -> AutonomousFollowup:
-        """Atomically bind one exact terminal Daita job to one follow-up."""
-
-        if not isinstance(followup, AutonomousFollowup):
-            raise TypeError("followup must be AutonomousFollowup")
-        if (
-            followup.disposition is not FollowupDisposition.AVAILABLE
-            or followup.revision != 1
-            or followup.attempt_count != 0
-            or followup.reserved_cost_usd != 0
-            or followup.reserved_tokens != 0
-            or followup.charged_cost_usd != 0
-            or followup.charged_tokens != 0
-        ):
-            raise ValueError("new follow-up must be one pristine available aggregate")
-
-        def write(connection: sqlite3.Connection) -> AutonomousFollowup:
-            event_row = connection.execute(
-                "SELECT followup_id, data FROM autonomous_followups "
-                "WHERE agent_id = ? AND event_id = ?",
-                (followup.agent_id, followup.event_id),
-            ).fetchone()
-            if event_row is not None:
-                existing = decode_autonomous_followup(
-                    event_row[1],
-                    agent_id=followup.agent_id,
-                    followup_id=event_row[0],
-                )
-                if (
-                    existing.job_id == followup.job_id
-                    and existing.payload_digest == followup.payload_digest
-                    and existing.event_type == followup.event_type
-                    and existing.event_payload == followup.event_payload
-                ):
-                    return existing
-                raise FollowupIdentityConflictError(
-                    "terminal observation identity was reused with different content"
-                )
-            bound_row = connection.execute(
-                "SELECT followup_id FROM autonomous_followups "
-                "WHERE agent_id = ? AND job_id = ?",
-                (followup.agent_id, followup.job_id),
-            ).fetchone()
-            if bound_row is not None:
-                raise FollowupCompletionConflictError(
-                    "terminal job already belongs to another follow-up"
-                )
-            count = connection.execute(
-                "SELECT COUNT(*) FROM autonomous_followups WHERE agent_id = ?",
-                (followup.agent_id,),
-            ).fetchone()
-            if int(count[0]) >= MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT:
-                raise ValueError("autonomous_followup_retention_limit_exceeded")
-            loaded = _load_job_row(
-                connection,
-                followup.agent_id,
-                followup.job_id,
-            )
-            if loaded is None:
-                raise FollowupCompletionConflictError("terminal job does not exist")
-            job, job_data = loaded
-            if (
-                not job.terminal
-                or job.specification.execution_mode is not JobExecutionMode.DAITA
-                or job.revision != followup.job_terminal_revision
-            ):
-                raise FollowupCompletionConflictError(
-                    "terminal job identity or revision is not eligible"
-                )
-            current_sensitivity = (
-                job.specification.sensitivity
-                if job.result is None
-                else job.result.sensitivity
-            )
-            if (
-                current_sensitivity.routing_rank
-                > followup.execution_scope.sensitivity_ceiling.routing_rank
-            ):
-                raise FollowupCompletionConflictError(
-                    "follow-up execution sensitivity is below its terminal job"
-                )
-            if job.completion_binding is not None:
-                raise FollowupCompletionConflictError(
-                    "terminal job already has a completion owner"
-                )
-            expected_payload = terminal_job_event_payload(job)
-            if (
-                followup.event_payload != expected_payload
-                or followup.event_id != f"stage-c:{job.job_id}:{job.revision}"
-                or followup.grant.allowed_terminal_job_observation != followup.event_id
-                or followup.execution_scope.job_id != job.job_id
-                or followup.execution_scope.job_revision != job.revision
-            ):
-                raise FollowupIdentityConflictError(
-                    "terminal observation does not match authoritative job state"
-                )
-            connection.execute(
-                "INSERT INTO autonomous_followups("
-                "agent_id, followup_id, job_id, event_id, data"
-                ") VALUES (?, ?, ?, ?, ?)",
-                (
-                    followup.agent_id,
-                    followup.followup_id,
-                    followup.job_id,
-                    followup.event_id,
-                    encode_autonomous_followup(followup),
-                ),
-            )
-            binding = JobCompletionBinding(
-                owner_kind=JobCompletionOwnerKind.STANDALONE_FOLLOWUP,
-                owner_id=followup.followup_id,
-                terminal_event_id=followup.event_id,
-                bound_at=followup.received_at,
-            )
-            _replace_job_row(
-                connection,
-                job_data,
-                replace(
-                    job,
-                    completion_binding=binding,
-                    terminal_observed_at=followup.received_at,
-                    updated_at=followup.received_at,
-                    revision=job.revision + 1,
-                ),
-            )
-            return followup
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def load_autonomous_followup(
-        self,
-        agent_id: str,
-        followup_id: str,
-    ) -> AutonomousFollowup | None:
-        def read() -> AutonomousFollowup | None:
-            with _connect(self.path) as connection:
-                loaded = _load_followup_row(connection, agent_id, followup_id)
-            return None if loaded is None else loaded[0]
-
-        return await asyncio.to_thread(read)
-
-    async def list_autonomous_followups(
-        self,
-        agent_id: str,
-        *,
-        dispositions: frozenset[FollowupDisposition] = frozenset(),
-        limit: int = MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT,
-    ) -> tuple[AutonomousFollowup, ...]:
-        dispositions = frozenset(dispositions)
-        if not 1 <= limit <= MAX_AUTONOMOUS_FOLLOWUPS_PER_AGENT:
-            raise ValueError("follow-up list limit is outside its bound")
-
-        def read() -> tuple[AutonomousFollowup, ...]:
-            with _connect(self.path) as connection:
-                rows = connection.execute(
-                    "SELECT followup_id, data FROM autonomous_followups "
-                    "WHERE agent_id = ?",
-                    (agent_id,),
-                ).fetchall()
-            items = tuple(
-                decode_autonomous_followup(
-                    data,
-                    agent_id=agent_id,
-                    followup_id=followup_id,
-                )
-                for followup_id, data in rows
-            )
-            return tuple(
-                item
-                for item in sorted(
-                    items, key=lambda value: (value.created_at, value.followup_id)
-                )
-                if not dispositions or item.disposition in dispositions
-            )[:limit]
-
-        return await asyncio.to_thread(read)
-
-    async def recover_stale_autonomous_followups(
-        self,
-        agent_id: str,
-        *,
-        recovered_at: datetime,
-    ) -> tuple[AutonomousFollowup, ...]:
-        """Recover expired claims without rerunning any bound terminal run."""
-
-        def write(connection: sqlite3.Connection) -> tuple[AutonomousFollowup, ...]:
-            rows = connection.execute(
-                "SELECT followup_id, data FROM autonomous_followups WHERE agent_id = ?",
-                (agent_id,),
-            ).fetchall()
-            recovered: list[AutonomousFollowup] = []
-            for followup_id, encoded in rows:
-                current = decode_autonomous_followup(
-                    encoded,
-                    agent_id=agent_id,
-                    followup_id=followup_id,
-                )
-                if (
-                    current.disposition
-                    in {
-                        FollowupDisposition.AVAILABLE,
-                        FollowupDisposition.RETRYABLE_FAILED,
-                    }
-                    and current.grant.expires_at <= recovered_at
-                ):
-                    updated = replace(
-                        current,
-                        disposition=FollowupDisposition.EXPIRED,
-                        updated_at=recovered_at,
-                        revision=current.revision + 1,
-                        failure_code="followup_grant_expired",
-                    )
-                elif (
-                    current.disposition
-                    in {
-                        FollowupDisposition.CLAIMED,
-                        FollowupDisposition.RUNNING,
-                    }
-                    and current.lease_expires_at is not None
-                    and current.lease_expires_at <= recovered_at
-                ):
-                    result_row = (
-                        None
-                        if current.reserved_run_id is None
-                        else connection.execute(
-                            "SELECT result FROM runs WHERE id = ? AND agent_id = ?",
-                            (current.reserved_run_id, agent_id),
-                        ).fetchone()
-                    )
-                    if result_row is not None and result_row[0] is not None:
-                        terminal = decode_loop_exit(result_row[0])
-                        updated = replace(
-                            current,
-                            disposition=(
-                                FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
-                            ),
-                            updated_at=recovered_at,
-                            revision=current.revision + 1,
-                            run_bound_at=current.run_bound_at or current.updated_at,
-                            run_terminal_at=terminal.created_at,
-                            audit_context=(
-                                current.audit_context
-                                or {"recovered_run_id": current.reserved_run_id}
-                            ),
-                        )
-                    else:
-                        attempts_exhausted = (
-                            current.attempt_count >= current.grant.max_attempts
-                        )
-                        updated = replace(
-                            current,
-                            disposition=(
-                                FollowupDisposition.TERMINAL_FAILED
-                                if attempts_exhausted
-                                else FollowupDisposition.AVAILABLE
-                            ),
-                            updated_at=recovered_at,
-                            revision=current.revision + 1,
-                            claim_token=None,
-                            lease_expires_at=None,
-                            reserved_run_id=None,
-                            reserved_cost_usd=Decimal("0"),
-                            reserved_tokens=0,
-                            run_bound_at=None,
-                            run_terminal_at=None,
-                            audit_context={},
-                            failure_code=(
-                                "followup_budget_exhausted"
-                                if attempts_exhausted
-                                else None
-                            ),
-                        )
-                else:
-                    continue
-                _replace_followup_row(connection, encoded, updated)
-                recovered.append(updated)
-            return tuple(recovered)
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def next_autonomous_followup_deadline(
-        self,
-        agent_id: str,
-    ) -> datetime | None:
-        """Return the nearest feature-owned grant or live-claim deadline."""
-
-        def read() -> datetime | None:
-            with _connect(self.path) as connection:
-                rows = connection.execute(
-                    "SELECT followup_id, data FROM autonomous_followups "
-                    "WHERE agent_id = ?",
-                    (agent_id,),
-                ).fetchall()
-            deadlines: list[datetime] = []
-            for followup_id, data in rows:
-                current = decode_autonomous_followup(
-                    data,
-                    agent_id=agent_id,
-                    followup_id=followup_id,
-                )
-                if current.disposition in {
-                    FollowupDisposition.AVAILABLE,
-                    FollowupDisposition.RETRYABLE_FAILED,
-                }:
-                    deadlines.append(current.grant.expires_at)
-                elif current.disposition in {
-                    FollowupDisposition.CLAIMED,
-                    FollowupDisposition.RUNNING,
-                }:
-                    deadlines.append(current.grant.expires_at)
-                    if current.lease_expires_at is not None:
-                        deadlines.append(current.lease_expires_at)
-            return min(deadlines) if deadlines else None
-
-        return await asyncio.to_thread(read)
-
-    async def claim_next_autonomous_followup(
-        self,
-        agent_id: str,
-        *,
-        claim_token: str,
-        reserved_run_id: str,
-        claimed_at: datetime,
-        lease_seconds: float,
-    ) -> AutonomousFollowup | None:
-        if not 0 < float(lease_seconds) <= 300:
-            raise ValueError("follow-up lease_seconds is outside its bound")
-
-        def write(connection: sqlite3.Connection) -> AutonomousFollowup | None:
-            rows = connection.execute(
-                "SELECT followup_id, data FROM autonomous_followups WHERE agent_id = ?",
-                (agent_id,),
-            ).fetchall()
-            items = sorted(
-                [
-                    decode_autonomous_followup(
-                        data,
-                        agent_id=agent_id,
-                        followup_id=followup_id,
-                    )
-                    for followup_id, data in rows
-                ],
-                key=lambda item: (item.created_at, item.followup_id),
-            )
-            row_data = {str(followup_id): str(data) for followup_id, data in rows}
-            for current in items:
-                encoded = row_data[current.followup_id]
-                if current.disposition not in {
-                    FollowupDisposition.AVAILABLE,
-                    FollowupDisposition.RETRYABLE_FAILED,
-                }:
-                    continue
-                if current.grant.expires_at <= claimed_at:
-                    continue
-                if (
-                    current.attempt_count >= current.grant.max_attempts
-                    or current.charged_cost_usd + current.grant.per_run_max_cost_usd
-                    > current.grant.cumulative_max_cost_usd
-                    or current.charged_tokens + current.grant.per_run_max_tokens
-                    > current.grant.cumulative_max_tokens
-                ):
-                    updated = replace(
-                        current,
-                        disposition=FollowupDisposition.TERMINAL_FAILED,
-                        updated_at=claimed_at,
-                        revision=current.revision + 1,
-                        failure_code="followup_budget_exhausted",
-                    )
-                    _replace_followup_row(connection, encoded, updated)
-                    continue
-                claimed = replace(
-                    current,
-                    disposition=FollowupDisposition.CLAIMED,
-                    updated_at=claimed_at,
-                    revision=current.revision + 1,
-                    attempt_count=current.attempt_count + 1,
-                    claim_token=claim_token,
-                    lease_expires_at=claimed_at
-                    + timedelta(seconds=float(lease_seconds)),
-                    reserved_run_id=reserved_run_id,
-                    reserved_cost_usd=current.grant.per_run_max_cost_usd,
-                    reserved_tokens=current.grant.per_run_max_tokens,
-                    failure_code=None,
-                )
-                _replace_followup_row(connection, encoded, claimed)
-                return claimed
-            return None
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def bind_autonomous_followup_run(
-        self,
-        agent_id: str,
-        followup_id: str,
-        *,
-        claim_token: str,
-        run_id: str,
-        bound_at: datetime,
-        audit_context: Mapping[str, object],
-    ) -> AutonomousFollowup | None:
-        def write(connection: sqlite3.Connection) -> AutonomousFollowup | None:
-            loaded = _load_followup_row(connection, agent_id, followup_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            if (
-                current.disposition is not FollowupDisposition.CLAIMED
-                or current.claim_token != claim_token
-                or current.reserved_run_id != run_id
-            ):
-                return None
-            if current.grant.expires_at <= bound_at:
-                expired = replace(
-                    current,
-                    disposition=FollowupDisposition.EXPIRED,
-                    updated_at=bound_at,
-                    revision=current.revision + 1,
-                    claim_token=None,
-                    lease_expires_at=None,
-                    reserved_run_id=None,
-                    reserved_cost_usd=Decimal("0"),
-                    reserved_tokens=0,
-                    failure_code="followup_grant_expired",
-                )
-                _replace_followup_row(connection, encoded, expired)
-                return None
-            if current.lease_expires_at is None or current.lease_expires_at <= bound_at:
-                attempts_exhausted = current.attempt_count >= current.grant.max_attempts
-                stale = replace(
-                    current,
-                    disposition=(
-                        FollowupDisposition.TERMINAL_FAILED
-                        if attempts_exhausted
-                        else FollowupDisposition.AVAILABLE
-                    ),
-                    updated_at=bound_at,
-                    revision=current.revision + 1,
-                    claim_token=None,
-                    lease_expires_at=None,
-                    reserved_run_id=None,
-                    reserved_cost_usd=Decimal("0"),
-                    reserved_tokens=0,
-                    failure_code=(
-                        "followup_attempts_exhausted"
-                        if attempts_exhausted
-                        else "followup_claim_expired"
-                    ),
-                )
-                _replace_followup_row(connection, encoded, stale)
-                return None
-            updated = replace(
-                current,
-                disposition=FollowupDisposition.RUNNING,
-                updated_at=bound_at,
-                revision=current.revision + 1,
-                run_bound_at=bound_at,
-                audit_context=audit_context,
-            )
-            _replace_followup_row(connection, encoded, updated)
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def fail_autonomous_followup_claim(
-        self,
-        agent_id: str,
-        followup_id: str,
-        *,
-        claim_token: str,
-        failed_at: datetime,
-        failure_code: str,
-        retryable: bool = False,
-    ) -> AutonomousFollowup | None:
-        def write(connection: sqlite3.Connection) -> AutonomousFollowup | None:
-            loaded = _load_followup_row(connection, agent_id, followup_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            if (
-                current.disposition is not FollowupDisposition.CLAIMED
-                or current.claim_token != claim_token
-            ):
-                return None
-            updated = replace(
-                current,
-                disposition=(
-                    FollowupDisposition.RETRYABLE_FAILED
-                    if retryable and current.attempt_count < current.grant.max_attempts
-                    else FollowupDisposition.TERMINAL_FAILED
-                ),
-                updated_at=failed_at,
-                revision=current.revision + 1,
-                claim_token=None,
-                lease_expires_at=None,
-                reserved_run_id=None,
-                reserved_cost_usd=Decimal("0"),
-                reserved_tokens=0,
-                failure_code=failure_code,
-            )
-            _replace_followup_row(connection, encoded, updated)
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def mark_autonomous_followup_run_terminal(
-        self,
-        agent_id: str,
-        followup_id: str,
-        *,
-        run_id: str,
-        terminal_at: datetime,
-    ) -> AutonomousFollowup | None:
-        def write(connection: sqlite3.Connection) -> AutonomousFollowup | None:
-            loaded = _load_followup_row(connection, agent_id, followup_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            if (
-                current.disposition
-                is FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
-            ):
-                return current
-            if (
-                current.disposition is not FollowupDisposition.RUNNING
-                or current.reserved_run_id != run_id
-            ):
-                return None
-            row = connection.execute(
-                "SELECT result FROM runs WHERE id = ? AND agent_id = ?",
-                (run_id, agent_id),
-            ).fetchone()
-            if row is None or row[0] is None:
-                return None
-            updated = replace(
-                current,
-                disposition=FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
-                updated_at=terminal_at,
-                revision=current.revision + 1,
-                run_terminal_at=terminal_at,
-            )
-            _replace_followup_row(connection, encoded, updated)
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def finalize_autonomous_followup(
-        self,
-        agent_id: str,
-        followup_id: str,
-        *,
-        delivery_id: str,
-        finalized_at: datetime,
-    ) -> tuple[AutonomousFollowup, Delivery] | None:
-        """Atomically charge, consume, and create exactly one logical delivery."""
-
-        def write(
-            connection: sqlite3.Connection,
-        ) -> tuple[AutonomousFollowup, Delivery] | None:
-            loaded = _load_followup_row(connection, agent_id, followup_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            target = current.grant.distribution_plan.targets[0]
-            existing_row = connection.execute(
-                "SELECT delivery_id, data FROM deliveries "
-                "WHERE agent_id = ? AND subject_kind = ? AND subject_id = ? "
-                "AND target_fingerprint = ?",
-                (
-                    agent_id,
-                    DeliverySubjectKind.AUTONOMOUS_FOLLOWUP.value,
-                    followup_id,
-                    target.target_fingerprint,
-                ),
-            ).fetchone()
-            if existing_row is not None:
-                delivery = decode_delivery(
-                    existing_row[1],
-                    agent_id=agent_id,
-                    delivery_id=existing_row[0],
-                )
-                return current, delivery
-            if (
-                current.disposition
-                is not FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION
-            ):
-                return None
-            assert current.reserved_run_id is not None
-            run_row = connection.execute(
-                "SELECT input, result FROM runs WHERE id = ? AND agent_id = ?",
-                (current.reserved_run_id, agent_id),
-            ).fetchone()
-            if run_row is None or run_row[1] is None:
-                return None
-            result = decode_loop_exit(run_row[1])
-            message_rows = connection.execute(
-                "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
-                (current.reserved_run_id,),
-            ).fetchall()
-            run_input = decode_run_input(run_row[0])
-            if (
-                run_input.origin is not RunOrigin.JOB_EVENT
-                or run_input.execution_scope is None
-                or run_input.execution_scope != current.execution_scope
-                or run_input.execution_scope.distribution_plan_digest
-                != current.grant.distribution_plan.plan_digest
-                or result.run_id != current.reserved_run_id
-            ):
-                raise ValueError("follow-up terminal run scope is invalid")
-            transcript = Transcript(
-                run=run_input,
-                messages=tuple(
-                    decode_message(message_data) for (message_data,) in message_rows
-                ),
-            )
-            loaded_job = _load_job_row(connection, agent_id, current.job_id)
-            if loaded_job is None:
-                return None
-            job, _job_encoded = loaded_job
-            evidence, conclusion_failure_code = assess_followup_conclusion(
-                current,
-                job,
-                transcript,
-                result,
-            )
-            successful = result.kind is LoopExitKind.COMPLETED and evidence is not None
-            try:
-                validate_outcome_artifact_references(
-                    (),
-                    contract=current.grant.outcome_contract,
-                    resulting_run_id=current.reserved_run_id,
-                )
-                if result.artifacts:
-                    raise ValueError("follow-up outcome contract permits no artifacts")
-            except (TypeError, ValueError):
-                successful = False
-                conclusion_failure_code = "outcome_artifact_contract_failed"
-            sensitivity = current.execution_scope.sensitivity_ceiling
-            for message in transcript.messages:
-                for block in message.content:
-                    if (
-                        isinstance(block, ToolResultBlock)
-                        and block.sensitivity is not None
-                        and block.sensitivity.routing_rank > sensitivity.routing_rank
-                    ):
-                        sensitivity = block.sensitivity
-            if (
-                sensitivity.routing_rank
-                > current.grant.outcome_contract.maximum_effective_sensitivity.routing_rank
-            ):
-                successful = False
-                conclusion_failure_code = "outcome_sensitivity_contract_failed"
-            estimate = result.usage.cost_estimate
-            charged_cost = estimate.amount_usd or Decimal("0")
-            charged_tokens = result.usage.total_tokens
-            if (
-                estimate.status is not CostEstimateStatus.COMPLETE
-                and estimate.code != "no_model_attempts"
-            ):
-                charged_cost = max(charged_cost, current.reserved_cost_usd)
-                charged_tokens = max(charged_tokens, current.reserved_tokens)
-                if successful:
-                    conclusion_failure_code = (
-                        conclusion_failure_code or "followup_run_usage_incomplete"
-                    )
-                successful = False
-            if (
-                result.usage.total_tokens > current.reserved_tokens
-                or charged_cost > current.reserved_cost_usd
-            ):
-                conclusion_failure_code = (
-                    conclusion_failure_code or "followup_run_budget_exceeded"
-                )
-                successful = False
-            report_digest: str | None = None
-            report_preview: str | None = None
-            report_truncated = False
-            if result.final_text is not None:
-                report_digest, bounded_report, report_truncated = (
-                    conclusion_preview_projection(result.final_text)
-                )
-                report_preview = bounded_report
-            if successful:
-                failure_code = None
-            elif result.kind is LoopExitKind.COMPLETED:
-                if conclusion_failure_code is None:
-                    raise ValueError(
-                        "failed completed follow-up requires a conclusion failure code"
-                    )
-                failure_code = conclusion_failure_code
-            else:
-                failure_code = f"followup_run_{result.reason}"
-            payload = {
-                "subject": {
-                    "kind": DeliverySubjectKind.AUTONOMOUS_FOLLOWUP.value,
-                    "subject_id": followup_id,
-                },
-                "job_id": current.job_id,
-                "run_id": current.reserved_run_id,
-                "outcome": "completed" if successful else "failed",
-                "reason": "completed" if successful else failure_code,
-                "report_digest": report_digest,
-                "report_preview": report_preview,
-                "report_truncated": report_truncated,
-                "evidence_digest": None if evidence is None else evidence.digest,
-            }
-            payload_digest = (
-                "sha256:" + sha256(canonical_json(payload).encode("utf-8")).hexdigest()
-            )
-            conclusion_digest = report_digest or payload_digest
-            delivery = construct_logical_delivery(
-                delivery_id=delivery_id,
-                agent_id=agent_id,
-                conversation_id=current.conversation_id,
-                subject_kind=DeliverySubjectKind.AUTONOMOUS_FOLLOWUP,
-                subject_id=followup_id,
-                target=target,
-                conclusion_kind=OutcomeConclusionKind.TERMINAL_RUN,
-                conclusion_state=(
-                    OutcomeState.SUCCEEDED if successful else OutcomeState.FAILED
-                ),
-                conclusion_id=current.reserved_run_id,
-                conclusion_digest=conclusion_digest,
-                conclusion_preview=report_preview or "",
-                conclusion_preview_truncated=report_truncated,
-                resulting_run_id=current.reserved_run_id,
-                artifact_references=(),
-                effective_sensitivity=sensitivity,
-                provenance_digest=(
-                    evidence.digest if evidence is not None else payload_digest
-                ),
-                failure_code=failure_code,
-                observed_at=finalized_at,
-            )
-            _insert_delivery(connection, delivery)
-            completed = replace(
-                current,
-                disposition=(
-                    FollowupDisposition.COMPLETED
-                    if successful
-                    else FollowupDisposition.TERMINAL_FAILED
-                ),
-                updated_at=finalized_at,
-                revision=current.revision + 1,
-                reserved_cost_usd=Decimal("0"),
-                reserved_tokens=0,
-                charged_cost_usd=current.charged_cost_usd + charged_cost,
-                charged_tokens=current.charged_tokens + charged_tokens,
-                grant_consumed_at=(finalized_at if successful else None),
-                conclusion_evidence=evidence,
-                delivery_id=delivery_id,
-                failure_code=failure_code,
-            )
-            _replace_followup_row(connection, encoded, completed)
-            return completed, delivery
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
     async def load_delivery(
         self,
         agent_id: str,
@@ -3355,7 +2945,7 @@ class SQLiteStateStore:
             raise ValueError("delivery list limit is outside its bound")
 
         def read() -> tuple[Delivery, ...]:
-            clauses = ["agent_id = ?"]
+            clauses = ["agent_id = ?", "subject_kind != 'graph_job'"]
             parameters: list[object] = [agent_id]
             if conversation_id is not None:
                 clauses.append("conversation_id = ?")
@@ -3413,449 +3003,6 @@ class SQLiteStateStore:
             )
             if result.rowcount != 1:
                 raise RuntimeError("delivery changed during acknowledgment")
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def claim_next_job(
-        self,
-        agent_id: str,
-        *,
-        claim_token: str,
-        execution_run_id: str,
-        reserved_artifact_id: str,
-        claimed_at: datetime,
-        lease_seconds: float,
-    ) -> JobRun | None:
-        if (
-            not isinstance(lease_seconds, (int, float))
-            or isinstance(lease_seconds, bool)
-            or not 0 < float(lease_seconds) <= 300
-        ):
-            raise ValueError("job lease_seconds is outside its bound")
-
-        def write(connection: sqlite3.Connection) -> JobRun | None:
-            rows = tuple(
-                connection.execute(
-                    "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
-                    (agent_id,),
-                )
-            )
-            jobs = _decode_job_rows(rows, agent_id=agent_id)
-            running = tuple(
-                item
-                for item in jobs
-                if item.status in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
-            )
-            if len(running) >= MAX_RUNNING_JOBS_PER_AGENT:
-                return None
-            per_source: dict[str, int] = {}
-            for item in running:
-                for source_id in item.source_ids:
-                    per_source[source_id] = per_source.get(source_id, 0) + 1
-            eligible = tuple(
-                item
-                for item in sorted(
-                    jobs, key=lambda value: (value.created_at, value.job_id)
-                )
-                if item.status is JobStatus.QUEUED
-                and item.desired_state is JobDesiredState.RUN
-                and item.specification.deadline_at > claimed_at
-                and len(item.attempts) < MAX_JOB_ATTEMPTS
-                and all(
-                    per_source.get(source_id, 0) < MAX_RUNNING_JOBS_PER_SOURCE
-                    for source_id in item.source_ids
-                )
-            )
-            if not eligible:
-                return None
-            current = eligible[0]
-            loaded = _load_job_row(connection, agent_id, current.job_id)
-            if loaded is None or loaded[0] != current:
-                raise RuntimeError("job changed during claim selection")
-            epoch = current.fencing_epoch + 1
-            attempt = JobAttempt(
-                number=len(current.attempts) + 1,
-                fencing_epoch=epoch,
-                claim_token=claim_token,
-                execution_run_id=execution_run_id,
-                reserved_artifact_id=reserved_artifact_id,
-                status=JobAttemptStatus.CLAIMED,
-                claimed_at=claimed_at,
-                lease_expires_at=claimed_at + timedelta(seconds=float(lease_seconds)),
-            )
-            claimed = replace(
-                current,
-                status=JobStatus.RUNNING,
-                updated_at=claimed_at,
-                revision=current.revision + 1,
-                fencing_epoch=epoch,
-                attempts=(*current.attempts, attempt),
-            )
-            _replace_job_row(connection, loaded[1], claimed)
-            return claimed
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def request_job_cancel(
-        self,
-        agent_id: str,
-        job_id: str,
-        *,
-        requested_at: datetime,
-    ) -> JobRun | None:
-        def write(connection: sqlite3.Connection) -> JobRun | None:
-            loaded = _load_job_row(connection, agent_id, job_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            if current.terminal or current.desired_state is JobDesiredState.CANCEL:
-                return current
-            if current.status is JobStatus.QUEUED:
-                updated = replace(
-                    current,
-                    desired_state=JobDesiredState.CANCEL,
-                    cancel_requested_at=requested_at,
-                    updated_at=requested_at,
-                    revision=current.revision + 1,
-                    status=JobStatus.CANCELLED,
-                    terminal_at=requested_at,
-                )
-            else:
-                updated = replace(
-                    current,
-                    desired_state=JobDesiredState.CANCEL,
-                    cancel_requested_at=requested_at,
-                    updated_at=requested_at,
-                    revision=current.revision + 1,
-                    status=JobStatus.CANCEL_REQUESTED,
-                )
-            _replace_job_row(connection, encoded, updated)
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def finalize_job_attempt(
-        self,
-        agent_id: str,
-        job_id: str,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        attempt_status: JobAttemptStatus,
-        completed_at: datetime,
-        result: JobResult | None = None,
-        failure_code: str | None = None,
-    ) -> JobRun | None:
-        if attempt_status is JobAttemptStatus.CLAIMED:
-            raise ValueError("job finalization requires a settled attempt status")
-
-        def write(connection: sqlite3.Connection) -> JobRun | None:
-            loaded = _load_job_row(connection, agent_id, job_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            attempt = current.current_attempt
-            if (
-                current.status not in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
-                or attempt is None
-                or attempt.status is not JobAttemptStatus.CLAIMED
-                or attempt.claim_token != claim_token
-                or attempt.fencing_epoch != fencing_epoch
-                or current.fencing_epoch != fencing_epoch
-            ):
-                return None
-            if attempt_status is JobAttemptStatus.SUCCEEDED:
-                if not isinstance(result, JobResult):
-                    raise ValueError("successful job finalization requires JobResult")
-                if _model_sensitivity_rank(
-                    result.sensitivity
-                ) < _model_sensitivity_rank(current.specification.sensitivity):
-                    raise ValueError("job result cannot lower sensitivity")
-                if any(
-                    ref.run_id != attempt.execution_run_id
-                    or ref.conversation_id != current.conversation_id
-                    or ref.capability_id
-                    != current.specification.execution_capability_id
-                    for ref in result.artifact_refs
-                ):
-                    raise ValueError("job artifact result identity is invalid")
-                status = JobStatus.SUCCEEDED
-            elif attempt_status is JobAttemptStatus.CANCELLED:
-                if result is not None:
-                    raise ValueError("cancelled job cannot retain a result")
-                status = JobStatus.CANCELLED
-            elif attempt_status is JobAttemptStatus.NEEDS_ATTENTION:
-                if result is not None:
-                    raise ValueError("needs-attention job cannot retain a result")
-                status = JobStatus.NEEDS_ATTENTION
-            else:
-                if result is not None:
-                    raise ValueError("failed job cannot retain a result")
-                status = JobStatus.FAILED
-            settled_attempt = replace(
-                attempt,
-                status=attempt_status,
-                completed_at=completed_at,
-                error_code=failure_code,
-            )
-            updated = replace(
-                current,
-                status=status,
-                updated_at=completed_at,
-                revision=current.revision + 1,
-                attempts=(*current.attempts[:-1], settled_attempt),
-                terminal_at=completed_at,
-                result=result,
-                failure_code=failure_code,
-            )
-            _replace_job_row(connection, encoded, updated)
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def recover_stale_job(
-        self,
-        agent_id: str,
-        job_id: str,
-        *,
-        recovered_at: datetime,
-        restart_safe: bool,
-    ) -> JobRun | None:
-        def write(connection: sqlite3.Connection) -> JobRun | None:
-            loaded = _load_job_row(connection, agent_id, job_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            attempt = current.current_attempt
-            if (
-                current.status not in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
-                or attempt is None
-                or attempt.status is not JobAttemptStatus.CLAIMED
-            ):
-                return current
-            if current.desired_state is JobDesiredState.CANCEL:
-                attempt_status = JobAttemptStatus.CANCELLED
-                status = JobStatus.CANCELLED
-                terminal_at = recovered_at
-                failure_code = None
-            elif restart_safe and len(current.attempts) < MAX_JOB_ATTEMPTS:
-                attempt_status = JobAttemptStatus.FENCED
-                status = JobStatus.QUEUED
-                terminal_at = None
-                failure_code = None
-            else:
-                attempt_status = JobAttemptStatus.NEEDS_ATTENTION
-                status = JobStatus.NEEDS_ATTENTION
-                terminal_at = recovered_at
-                failure_code = "job_recovery_unsafe"
-            settled_attempt = replace(
-                attempt,
-                status=attempt_status,
-                completed_at=recovered_at,
-                error_code=failure_code,
-            )
-            updated = replace(
-                current,
-                status=status,
-                updated_at=recovered_at,
-                revision=current.revision + 1,
-                fencing_epoch=current.fencing_epoch + 1,
-                attempts=(*current.attempts[:-1], settled_attempt),
-                terminal_at=terminal_at,
-                failure_code=failure_code,
-            )
-            _replace_job_row(connection, encoded, updated)
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def expire_due_jobs(
-        self,
-        agent_id: str,
-        *,
-        expired_at: datetime,
-    ) -> tuple[JobRun, ...]:
-        def write(connection: sqlite3.Connection) -> tuple[JobRun, ...]:
-            rows = tuple(
-                connection.execute(
-                    "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
-                    (agent_id,),
-                )
-            )
-            jobs = _decode_job_rows(rows, agent_id=agent_id)
-            expired: list[JobRun] = []
-            row_data = {str(job_id): str(data) for job_id, data in rows}
-            for current in jobs:
-                if (
-                    current.status is not JobStatus.QUEUED
-                    or current.specification.deadline_at > expired_at
-                ):
-                    continue
-                updated = replace(
-                    current,
-                    status=JobStatus.FAILED,
-                    updated_at=expired_at,
-                    revision=current.revision + 1,
-                    terminal_at=expired_at,
-                    failure_code="job_deadline_exceeded",
-                )
-                _replace_job_row(connection, row_data[current.job_id], updated)
-                expired.append(updated)
-            return tuple(expired)
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def record_external_intent(
-        self,
-        agent_id: str,
-        job_id: str,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        intent: ExternalIntent,
-    ) -> JobRun | None:
-        if not isinstance(intent, ExternalIntent):
-            raise TypeError("intent must be ExternalIntent")
-
-        def write(connection: sqlite3.Connection) -> JobRun | None:
-            loaded = _load_job_row(connection, agent_id, job_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            attempt = current.current_attempt
-            if (
-                attempt is None
-                or attempt.status is not JobAttemptStatus.CLAIMED
-                or attempt.claim_token != claim_token
-                or attempt.fencing_epoch != fencing_epoch
-                or current.fencing_epoch != fencing_epoch
-            ):
-                return None
-            by_kind = {item.kind: item for item in attempt.external_intents}
-            existing = by_kind.get(intent.kind)
-            if existing is not None:
-                return current if existing == intent else None
-            updated_attempt = replace(
-                attempt,
-                external_intents=(*attempt.external_intents, intent),
-            )
-            updated = replace(
-                current,
-                updated_at=intent.requested_at,
-                revision=current.revision + 1,
-                attempts=(*current.attempts[:-1], updated_attempt),
-            )
-            _replace_job_row(connection, encoded, updated)
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def settle_external_intent(
-        self,
-        agent_id: str,
-        job_id: str,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        kind: ExternalIntentKind,
-        disposition: ExternalIntentDisposition,
-        completed_at: datetime,
-        external_job_id: str | None = None,
-        reason_code: str | None = None,
-    ) -> JobRun | None:
-        if disposition is ExternalIntentDisposition.PENDING:
-            raise ValueError("external intent settlement cannot remain pending")
-
-        def write(connection: sqlite3.Connection) -> JobRun | None:
-            loaded = _load_job_row(connection, agent_id, job_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            attempt = current.current_attempt
-            if (
-                attempt is None
-                or attempt.status is not JobAttemptStatus.CLAIMED
-                or attempt.claim_token != claim_token
-                or attempt.fencing_epoch != fencing_epoch
-                or current.fencing_epoch != fencing_epoch
-            ):
-                return None
-            index = next(
-                (
-                    position
-                    for position, item in enumerate(attempt.external_intents)
-                    if item.kind is kind
-                ),
-                None,
-            )
-            if index is None:
-                return None
-            pending = attempt.external_intents[index]
-            if pending.disposition is not ExternalIntentDisposition.PENDING:
-                return current
-            settled = replace(
-                pending,
-                disposition=disposition,
-                completed_at=completed_at,
-                external_job_id=external_job_id,
-                reason_code=reason_code,
-            )
-            intents = list(attempt.external_intents)
-            intents[index] = settled
-            updated_attempt = replace(attempt, external_intents=tuple(intents))
-            updated = replace(
-                current,
-                updated_at=completed_at,
-                revision=current.revision + 1,
-                attempts=(*current.attempts[:-1], updated_attempt),
-            )
-            _replace_job_row(connection, encoded, updated)
-            return updated
-
-        return await _run_cancellation_safe_transaction(self.path, write)
-
-    async def record_external_observation(
-        self,
-        agent_id: str,
-        job_id: str,
-        *,
-        claim_token: str,
-        fencing_epoch: int,
-        observation: ExternalObservation,
-    ) -> JobRun | None:
-        if not isinstance(observation, ExternalObservation):
-            raise TypeError("observation must be ExternalObservation")
-
-        def write(connection: sqlite3.Connection) -> JobRun | None:
-            loaded = _load_job_row(connection, agent_id, job_id)
-            if loaded is None:
-                return None
-            current, encoded = loaded
-            attempt = current.current_attempt
-            if (
-                attempt is None
-                or attempt.status is not JobAttemptStatus.CLAIMED
-                or attempt.claim_token != claim_token
-                or attempt.fencing_epoch != fencing_epoch
-                or current.fencing_epoch != fencing_epoch
-                or observation.sequence != len(attempt.external_observations) + 1
-            ):
-                return None
-            updated_attempt = replace(
-                attempt,
-                external_observations=(
-                    *attempt.external_observations,
-                    observation,
-                ),
-            )
-            updated = replace(
-                current,
-                updated_at=observation.observed_at,
-                revision=current.revision + 1,
-                attempts=(*current.attempts[:-1], updated_attempt),
-            )
-            _replace_job_row(connection, encoded, updated)
             return updated
 
         return await _run_cancellation_safe_transaction(self.path, write)
@@ -4310,6 +3457,7 @@ class SQLiteStateStore:
         receipt: EffectReceipt,
         *,
         grant: CapabilityGrant | None = None,
+        task_attempt_guard: TaskAttemptGuard | None = None,
         max_receipts_per_run: int = 64,
     ) -> EffectReceipt:
         if (
@@ -4370,12 +3518,109 @@ class SQLiteStateStore:
                     "the run receipt reservation bound is exhausted"
                 )
             scope = run.start.execution_scope if run.start is not None else None
-            if receipt.routine_id is None:
-                if grant is not None or scope is not None:
+            graph_binding = None if scope is None else scope.graph_task_binding
+            if scope is None:
+                if grant is not None or task_attempt_guard is not None:
                     raise EffectReceiptConflictError(
                         "foreground receipt cannot carry machine authorization"
                     )
+            elif graph_binding is not None:
+                if (
+                    receipt.routine_id is not None
+                    or not isinstance(grant, CapabilityGrant)
+                    or grant not in scope.capability_grants
+                    or task_attempt_guard is None
+                    or task_attempt_guard.binding != graph_binding
+                    or task_attempt_guard.claim_token == ""
+                    or task_attempt_guard.run_id != receipt.run_id
+                ):
+                    raise EffectReceiptConflictError(
+                        "graph receipt lacks its exact frozen attempt authorization"
+                    )
+                if (
+                    grant.capability_id != receipt.capability_id
+                    or grant.domain_owner_id != receipt.domain_owner_id
+                    or grant.capability_contract_digest
+                    != receipt.capability_contract_digest
+                    or grant.grant_digest != receipt.capability_grant_digest
+                    or graph_binding.agent_id != receipt.agent_id
+                ):
+                    raise EffectReceiptConflictError(
+                        "graph receipt does not match its exact capability grant"
+                    )
+                loaded_job = _graph_store._load_job(
+                    connection, receipt.agent_id, graph_binding.job_id
+                )
+                loaded_task = _graph_store._load_task(
+                    connection,
+                    receipt.agent_id,
+                    graph_binding.job_id,
+                    graph_binding.task_id,
+                )
+                loaded_attempt = _graph_store._load_attempt(
+                    connection,
+                    receipt.agent_id,
+                    graph_binding.job_id,
+                    graph_binding.task_id,
+                    graph_binding.attempt_id,
+                )
+                if loaded_job is None or loaded_task is None or loaded_attempt is None:
+                    raise EffectReceiptConflictError(
+                        "graph receipt attempt is unavailable"
+                    )
+                job = loaded_job[0]
+                task = loaded_task[0]
+                attempt = loaded_attempt[0]
+                now = self._clock()
+                claim_digest = (
+                    "sha256:" + sha256(attempt.claim_token.encode("utf-8")).hexdigest()
+                )
+                if (
+                    job.specification.authority.digest
+                    != graph_binding.root_authority_digest
+                    or job.state not in {GraphState.QUEUED, GraphState.ACTIVE}
+                    or job.desired_state is not GraphDesiredState.RUN
+                    or job.deadline_at <= now
+                    or task.state is not TaskState.RUNNING
+                    or task.current_attempt_id != graph_binding.attempt_id
+                    or task.task_revision < graph_binding.task_revision
+                    or task.task_spec_digest != graph_binding.task_spec_digest
+                    or task.task_scope_digest != graph_binding.task_scope_digest
+                    or task.fencing_epoch != graph_binding.fencing_epoch
+                    or attempt.state not in ACTIVE_ATTEMPT_STATES
+                    or attempt.run_id != receipt.run_id
+                    or attempt.fencing_epoch != graph_binding.fencing_epoch
+                    or attempt.claim_token != task_attempt_guard.claim_token
+                    or claim_digest != graph_binding.claim_token_digest
+                    or attempt.absolute_deadline_at != graph_binding.task_deadline_at
+                    or attempt.absolute_deadline_at <= now
+                    or (
+                        attempt.lease_expires_at is not None
+                        and attempt.lease_expires_at <= now
+                    )
+                    or receipt.capability_id
+                    not in task.specification.authority.capability_ids
+                ):
+                    raise EffectReceiptConflictError("graph receipt attempt is stale")
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND grant_digest = ?",
+                    (
+                        receipt.agent_id,
+                        graph_binding.job_id,
+                        graph_binding.task_id,
+                        grant.grant_digest,
+                    ),
+                ).fetchone()[0]
+                if count >= grant.max_calls_per_occurrence:
+                    raise EffectReceiptConflictError(
+                        "the graph grant invocation ceiling is exhausted"
+                    )
             else:
+                routine_id = receipt.routine_id
+                if routine_id is None:
+                    raise EffectReceiptConflictError(
+                        "machine receipt lacks routine or graph authorization"
+                    )
                 if (
                     not isinstance(grant, CapabilityGrant)
                     or scope is None
@@ -4400,9 +3645,7 @@ class SQLiteStateStore:
                 occurrence = _load_routine_occurrence_row(
                     connection, receipt.agent_id, receipt.occurrence_id or ""
                 )
-                routine = _load_routine_row(
-                    connection, receipt.agent_id, receipt.routine_id
-                )
+                routine = _load_routine_row(connection, receipt.agent_id, routine_id)
                 if (
                     occurrence is None
                     or routine is None
@@ -4436,7 +3679,7 @@ class SQLiteStateStore:
                         "the grant invocation ceiling is exhausted"
                     )
             connection.execute(
-                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                "INSERT INTO effect_receipts(agent_id, id, run_id, call_id, operation_key, routine_id, occurrence_id, grant_digest, unresolved, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
                 (
                     receipt.agent_id,
                     receipt.receipt_id,
@@ -4446,6 +3689,11 @@ class SQLiteStateStore:
                     receipt.routine_id,
                     receipt.occurrence_id,
                     receipt.capability_grant_digest,
+                    None if graph_binding is None else graph_binding.job_id,
+                    None if graph_binding is None else graph_binding.task_id,
+                    None if graph_binding is None else graph_binding.attempt_id,
+                    None if graph_binding is None else graph_binding.fencing_epoch,
+                    None if graph_binding is None else graph_binding.task_spec_digest,
                     encode_receipt(receipt),
                 ),
             )
@@ -4465,7 +3713,7 @@ class SQLiteStateStore:
 
         def write(connection: sqlite3.Connection) -> EffectReceipt:
             row = connection.execute(
-                "SELECT data FROM effect_receipts WHERE agent_id = ? AND id = ?",
+                "SELECT data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest FROM effect_receipts WHERE agent_id = ? AND id = ?",
                 (receipt.agent_id, receipt.receipt_id),
             ).fetchone()
             if row is None:
@@ -4492,7 +3740,67 @@ class SQLiteStateStore:
                 _pause_effect_routine(
                     connection, receipt, receipt.finished_at or self._clock()
                 )
+                if row[1] is not None:
+                    _open_graph_effect_uncertain_control(
+                        connection,
+                        receipt=receipt,
+                        job_id=str(row[1]),
+                        task_id=str(row[2]),
+                        attempt_id=str(row[3]),
+                        fencing_epoch=int(row[4]),
+                        task_spec_digest=str(row[5]),
+                        opened_at=receipt.finished_at or self._clock(),
+                    )
             return receipt
+
+        return await _run_cancellation_safe_transaction(self.path, write)
+
+    async def list_effect_receipts_for_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> tuple[EffectReceipt, ...]:
+        def read() -> tuple[EffectReceipt, ...]:
+            with _connect_read_only(self.path) as connection:
+                rows = connection.execute(
+                    "SELECT data FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND task_attempt_id = ? ORDER BY id",
+                    (agent_id, job_id, task_id, attempt_id),
+                )
+                return tuple(decode_receipt(row[0]) for row in rows)
+
+        return await asyncio.to_thread(read)
+
+    async def reconcile_graph_effect_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+    ) -> bool:
+        def write(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                "SELECT data, fencing_epoch, task_spec_digest FROM effect_receipts WHERE agent_id = ? AND job_id = ? AND task_id = ? AND task_attempt_id = ? ORDER BY id LIMIT 1",
+                (agent_id, job_id, task_id, attempt_id),
+            ).fetchone()
+            if row is None:
+                return False
+            receipt = decode_receipt(row[0])
+            _open_graph_effect_uncertain_control(
+                connection,
+                receipt=receipt,
+                job_id=job_id,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                fencing_epoch=int(row[1]),
+                task_spec_digest=str(row[2]),
+                opened_at=max(
+                    receipt.finished_at or receipt.started_at,
+                    self._clock(),
+                ),
+            )
+            return True
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
@@ -5765,58 +5073,114 @@ class SQLiteStateStore:
 
         return await _run_cancellation_safe_transaction(self.path, write)
 
-    async def start(self, run: RunInput) -> Transcript:
+    _UNSPECIFIED_PREDECESSOR = object()
+
+    async def start(
+        self,
+        run: RunInput,
+        *,
+        predecessor=_UNSPECIFIED_PREDECESSOR,
+    ) -> Transcript:
         if run.conversation_id is None:
             raise ValueError("run conversation_id must be resolved before persistence")
 
-        def write() -> Transcript:
-            with _connect(self.path) as connection:
-                try:
-                    connection.execute("BEGIN IMMEDIATE")
-                    row = connection.execute(
-                        """SELECT COALESCE(MAX(turn_index), -1) + 1
+        def write(connection: sqlite3.Connection) -> Transcript:
+            try:
+                row = connection.execute(
+                    """SELECT id, turn_index, input, result
                            FROM runs
-                           WHERE agent_id = ? AND conversation_id = ?""",
-                        (run.agent_id, run.conversation_id),
-                    ).fetchone()
-                    connection.execute(
-                        """INSERT INTO runs(
+                           WHERE agent_id = ? AND conversation_id = ?
+                           ORDER BY turn_index DESC
+                           LIMIT 1""",
+                    (run.agent_id, run.conversation_id),
+                ).fetchone()
+                if predecessor is self._UNSPECIFIED_PREDECESSOR:
+                    turn_index = 0 if row is None else int(row[1]) + 1
+                elif predecessor is None:
+                    if row is not None:
+                        raise ValueError(
+                            "conversation predecessor changed before run start"
+                        )
+                    turn_index = 0
+                else:
+                    if not isinstance(predecessor, ConversationPredecessor):
+                        raise TypeError("conversation predecessor is invalid")
+                    if (
+                        row is None
+                        or row[0] != predecessor.run_id
+                        or int(row[1]) != predecessor.turn_index
+                        or row[3] is None
+                    ):
+                        raise ValueError(
+                            "conversation predecessor changed before run start"
+                        )
+                    current_predecessor = ConversationPredecessor.from_run(
+                        ConversationRun(
+                            turn_index=int(row[1]),
+                            transcript=Transcript(run=decode_run_input(row[2])),
+                            result=decode_loop_exit(row[3]),
+                        )
+                    )
+                    if current_predecessor != predecessor:
+                        raise ValueError(
+                            "conversation predecessor changed before run start"
+                        )
+                    turn_index = predecessor.turn_index + 1
+                connection.execute(
+                    """INSERT INTO runs(
                                id, agent_id, conversation_id, turn_index, input
                            ) VALUES (?, ?, ?, ?, ?)""",
-                        (
-                            run.id,
-                            run.agent_id,
-                            run.conversation_id,
-                            int(row[0]),
-                            encode_run_input(run),
-                        ),
-                    )
-                except sqlite3.IntegrityError as error:
-                    raise ValueError(f"run already exists: {run.id}") from error
+                    (
+                        run.id,
+                        run.agent_id,
+                        run.conversation_id,
+                        turn_index,
+                        encode_run_input(run),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(f"run already exists: {run.id}") from error
             return Transcript(run=run)
 
-        return await asyncio.to_thread(write)
+        return await _run_cancellation_safe_transaction(self.path, write)
 
     async def append(self, run_id: str, message: CanonicalMessage) -> None:
-        def write() -> None:
-            with _connect(self.path) as connection:
+        def position() -> int:
+            with _connect_read_only(self.path) as connection:
                 row = connection.execute(
                     "SELECT COALESCE(MAX(position), -1) + 1 FROM messages WHERE run_id = ?",
                     (run_id,),
                 ).fetchone()
-                if (
-                    connection.execute(
-                        "SELECT 1 FROM runs WHERE id = ?", (run_id,)
-                    ).fetchone()
-                    is None
-                ):
-                    raise KeyError(f"unknown run: {run_id}")
-                connection.execute(
-                    "INSERT INTO messages(run_id, position, data) VALUES (?, ?, ?)",
-                    (run_id, int(row[0]), encode_message(message)),
-                )
+                return int(row[0])
 
-        await asyncio.to_thread(write)
+        await self.append_at(run_id, await asyncio.to_thread(position), message)
+
+    async def append_at(
+        self,
+        run_id: str,
+        position: int,
+        message: CanonicalMessage,
+    ) -> None:
+        def write(connection: sqlite3.Connection) -> None:
+            run_row = connection.execute(
+                "SELECT result FROM runs WHERE id = ?", (run_id,)
+            ).fetchone()
+            if run_row is None:
+                raise KeyError(f"unknown run: {run_id}")
+            if run_row[0] is not None:
+                raise ValueError(f"run is already terminal: {run_id}")
+            row = connection.execute(
+                "SELECT COALESCE(MAX(position), -1) + 1 FROM messages WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if type(position) is not int or int(row[0]) != position:
+                raise ValueError("transcript append position is out of order")
+            connection.execute(
+                "INSERT INTO messages(run_id, position, data) VALUES (?, ?, ?)",
+                (run_id, position, encode_message(message)),
+            )
+
+        await _run_cancellation_safe_transaction(self.path, write)
 
     async def finish(self, result: LoopExit) -> None:
         if result.kind is LoopExitKind.COMPLETED:
@@ -6046,88 +5410,15 @@ class SQLiteStateStore:
             not isinstance(conversation_id, str) or not conversation_id
         ):
             raise ValueError("conversation_id must be non-empty text or None")
-
-        def read() -> tuple[ArtifactRef, ...]:
-            clauses = ["r.agent_id = ?"]
-            values: list[object] = [agent_id]
-            if run_id is not None:
-                clauses.append("r.id = ?")
-                values.append(run_id)
-            if conversation_id is not None:
-                clauses.append("r.conversation_id = ?")
-                values.append(conversation_id)
-            where = " AND ".join(clauses)
-            with _connect_read_only(self.path) as connection:
-                rows = connection.execute(
-                    f"""SELECT r.id, r.conversation_id, m.data
-                        FROM runs AS r
-                        JOIN messages AS m ON m.run_id = r.id
-                        WHERE {where}
-                        ORDER BY r.id, m.position""",
-                    tuple(values),
-                ).fetchall()
-                job_rows = tuple(
-                    connection.execute(
-                        "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
-                        (agent_id,),
-                    )
-                )
-            refs: dict[str, ArtifactRef] = {}
-            for stored_run_id, stored_conversation_id, data in rows:
-                message = decode_message(data)
-                if message.role is not MessageRole.TOOL:
-                    continue
-                for block in message.content:
-                    if not isinstance(block, ToolResultBlock) or block.is_error:
-                        continue
-                    value = block.output.get("artifact")
-                    if not isinstance(value, Mapping):
-                        continue
-                    try:
-                        ref = artifact_ref_from_mapping(value)
-                    except (TypeError, ValueError) as error:
-                        raise RuntimeError(
-                            "stored artifact reference is invalid"
-                        ) from error
-                    if (
-                        ref.run_id != stored_run_id
-                        or ref.conversation_id != stored_conversation_id
-                        or ref.call_id != block.call_id
-                    ):
-                        raise RuntimeError(
-                            "stored artifact reference identity does not match its run"
-                        )
-                    existing = refs.get(ref.artifact_id)
-                    if existing is not None and existing != ref:
-                        raise RuntimeError("stored artifact identity is ambiguous")
-                    refs[ref.artifact_id] = ref
-            jobs = _decode_job_rows(job_rows, agent_id=agent_id)
-            for job in jobs:
-                if job.result is None:
-                    continue
-                if (
-                    conversation_id is not None
-                    and job.conversation_id != conversation_id
-                ):
-                    continue
-                for ref in job.result.artifact_refs:
-                    if run_id is not None and ref.run_id != run_id:
-                        continue
-                    if ref.conversation_id != job.conversation_id:
-                        raise RuntimeError(
-                            "stored job artifact reference identity is invalid"
-                        )
-                    existing = refs.get(ref.artifact_id)
-                    if existing is not None and existing != ref:
-                        raise RuntimeError("stored artifact identity is ambiguous")
-                    refs[ref.artifact_id] = ref
-            return tuple(
-                sorted(
-                    refs.values(), key=lambda item: (item.created_at, item.artifact_id)
-                )
-            )
-
-        return await asyncio.to_thread(read)
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_graph_artifact_refs(
+                connection,
+                agent_id,
+                run_id=run_id,
+                conversation_id=conversation_id,
+            ),
+        )
 
     async def list_delivery_artifact_references(
         self,
@@ -6146,44 +5437,15 @@ class SQLiteStateStore:
             not isinstance(conversation_id, str) or not conversation_id
         ):
             raise ValueError("conversation_id must be non-empty text or None")
-
-        def read() -> tuple[OutcomeArtifactReference, ...]:
-            clauses = ["agent_id = ?"]
-            parameters: list[object] = [agent_id]
-            if conversation_id is not None:
-                clauses.append("conversation_id = ?")
-                parameters.append(conversation_id)
-            with _connect_read_only(self.path) as connection:
-                rows = connection.execute(
-                    "SELECT delivery_id, data FROM deliveries WHERE "
-                    + " AND ".join(clauses)
-                    + " ORDER BY created_at_us, delivery_id",
-                    tuple(parameters),
-                ).fetchall()
-            references: dict[str, OutcomeArtifactReference] = {}
-            for delivery_id, data in rows:
-                delivery = decode_delivery(
-                    data,
-                    agent_id=agent_id,
-                    delivery_id=delivery_id,
-                )
-                for reference in delivery.outcome.artifact_references:
-                    if run_id is not None and reference.producing_run_id != run_id:
-                        continue
-                    current = references.get(reference.artifact_id)
-                    if current is not None and current != reference:
-                        raise RuntimeError(
-                            "stored delivery artifact identity is ambiguous"
-                        )
-                    references[reference.artifact_id] = reference
-            return tuple(
-                sorted(
-                    references.values(),
-                    key=lambda item: (item.producing_run_id, item.artifact_id),
-                )
-            )
-
-        return await asyncio.to_thread(read)
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_current_delivery_artifact_references(
+                connection,
+                agent_id,
+                run_id=run_id,
+                conversation_id=conversation_id,
+            ),
+        )
 
     async def list_reserved_artifact_ids(
         self,
@@ -6191,26 +5453,12 @@ class SQLiteStateStore:
     ) -> frozenset[tuple[str, str]]:
         """Return exact live job artifact reservations for admission recovery."""
 
-        def read() -> frozenset[tuple[str, str]]:
-            with _connect_read_only(self.path) as connection:
-                jobs = _decode_job_rows(
-                    tuple(
-                        connection.execute(
-                            "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
-                            (agent_id,),
-                        )
-                    ),
-                    agent_id=agent_id,
-                )
-            return frozenset(
-                (attempt.execution_run_id, attempt.reserved_artifact_id)
-                for job in jobs
-                if job.status in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}
-                for attempt in (job.current_attempt,)
-                if attempt is not None and attempt.status is JobAttemptStatus.CLAIMED
-            )
-
-        return await asyncio.to_thread(read)
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.list_graph_reserved_artifact_ids(
+                connection, agent_id
+            ),
+        )
 
     async def conversation_runs(
         self,
@@ -6286,29 +5534,13 @@ class SQLiteStateStore:
             try:
                 if not gate.start(connection):
                     return None
-                followup_rows = connection.execute(
-                    "SELECT followup_id, data FROM autonomous_followups "
-                    "WHERE agent_id = ?",
-                    (agent_id,),
-                ).fetchall()
                 protected_run_ids = {
-                    followup.reserved_run_id
-                    for followup_id, data in followup_rows
-                    for followup in (
-                        decode_autonomous_followup(
-                            data,
-                            agent_id=agent_id,
-                            followup_id=followup_id,
-                        ),
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT run_id FROM job_task_attempts "
+                        "WHERE agent_id = ? AND state IN ('claimed', 'running')",
+                        (agent_id,),
                     )
-                    if followup.reserved_run_id is not None
-                    and followup.disposition
-                    in {
-                        FollowupDisposition.CLAIMED,
-                        FollowupDisposition.RUNNING,
-                        FollowupDisposition.RUN_TERMINAL_PENDING_FINALIZATION,
-                        FollowupDisposition.RETRYABLE_FAILED,
-                    }
                 }
                 occurrence_rows = connection.execute(
                     "SELECT occurrence_id, data FROM routine_occurrences "
@@ -6470,6 +5702,48 @@ class SQLiteStateStore:
                     )
             records.reverse()
             return exists, tuple(records), older_completed_exists
+
+        return await asyncio.to_thread(read)
+
+    async def latest_terminal_conversation_run(
+        self,
+        agent_id: str,
+        conversation_id: str,
+    ) -> ConversationRun | None:
+        """Return the exact latest terminal revision used for writer CAS binding."""
+
+        def read() -> ConversationRun | None:
+            connection = _connect_read_only(self.path)
+            try:
+                row = connection.execute(
+                    """SELECT id, turn_index, input, result
+                       FROM runs
+                       WHERE agent_id = ? AND conversation_id = ?
+                       ORDER BY turn_index DESC LIMIT 1""",
+                    (agent_id, conversation_id),
+                ).fetchone()
+                if row is None:
+                    return None
+                run_id, turn_index, input_data, result_data = row
+                if result_data is None:
+                    raise ValueError("latest conversation run is not terminal")
+                messages = tuple(
+                    decode_message(message_row[0])
+                    for message_row in connection.execute(
+                        "SELECT data FROM messages WHERE run_id = ? ORDER BY position",
+                        (run_id,),
+                    )
+                )
+                return ConversationRun(
+                    turn_index=int(turn_index),
+                    transcript=Transcript(
+                        run=decode_run_input(input_data),
+                        messages=messages,
+                    ),
+                    result=decode_loop_exit(result_data),
+                )
+            finally:
+                connection.close()
 
         return await asyncio.to_thread(read)
 
@@ -6879,6 +6153,57 @@ async def _run_cancellation_safe_transaction(
     return cast(_T, result)
 
 
+async def _run_graph_read(
+    path: Path,
+    callback: Callable[[sqlite3.Connection], _T],
+) -> _T:
+    def read() -> _T:
+        with connect_graph(path, read_only=True) as connection:
+            return callback(connection)
+
+    return await asyncio.to_thread(read)
+
+
+async def _run_cancellation_safe_graph_transaction(
+    path: Path,
+    callback: Callable[[sqlite3.Connection], _T],
+) -> _T:
+    gate = _CatalogCommitGate()
+    cancelled_sentinel = object()
+
+    def write() -> _T | object:
+        connection = connect_graph(path)
+        try:
+            if not gate.start(connection):
+                return cancelled_sentinel
+            result = callback(connection)
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    worker = asyncio.create_task(asyncio.to_thread(write))
+    cancelled_before_start = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled_before_start = (
+                gate.cancel_before_start() or cancelled_before_start
+            )
+    result = worker.result()
+    if cancelled_before_start:
+        if result is not cancelled_sentinel:
+            raise AssertionError("cancelled graph transaction committed")
+        raise asyncio.CancelledError
+    if result is cancelled_sentinel:
+        raise AssertionError("graph transaction stopped without cancellation")
+    return cast(_T, result)
+
+
 def _validate_current_mcp_binding_bounds(connection: sqlite3.Connection) -> None:
     totals: dict[str, int] = {}
     binding_counts: dict[str, int] = {}
@@ -7134,18 +6459,92 @@ def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity |
         if identity is not None and candidate.agent_id != identity.id:
             raise ValueError("stored learning candidate belongs to another agent")
 
+    graph_jobs: dict[tuple[str, str], GraphInspection] = {}
     job_counts: dict[str, int] = {}
-    for agent_id, job_id, data in connection.execute(
-        "SELECT agent_id, job_id, data FROM job_runs"
-    ):
-        job = decode_job_run(data, agent_id=agent_id, job_id=job_id)
-        if job.agent_id != agent_id or job.job_id != job_id:
-            raise ValueError("stored job ownership is invalid")
-        if identity is not None and job.agent_id != identity.id:
-            raise ValueError("stored job belongs to another agent")
+    for agent_id, job_id in connection.execute("SELECT agent_id, job_id FROM job_runs"):
+        inspection = _graph_store.inspect_graph(connection, agent_id, job_id)
+        if inspection is None:
+            raise ValueError("stored graph job is unavailable")
+        if identity is not None and inspection.job.agent_id != identity.id:
+            raise ValueError("stored graph job belongs to another agent")
+        graph_jobs[(agent_id, job_id)] = inspection
         job_counts[agent_id] = job_counts.get(agent_id, 0) + 1
-        if job_counts[agent_id] > MAX_JOBS_PER_AGENT:
-            raise ValueError("stored job count exceeds its fixed bound")
+        if job_counts[agent_id] > MAX_GRAPH_JOBS_PER_AGENT:
+            raise ValueError("stored graph job count exceeds its fixed bound")
+
+    graph_attention_producers: dict[tuple[str, str], tuple[GraphJob, str, datetime]] = (
+        {}
+    )
+    for (
+        event_id,
+        agent_id,
+        job_id,
+        task_id,
+        attempt_id,
+        kind,
+        created_at_us,
+        data,
+    ) in connection.execute(
+        """SELECT event_id, agent_id, job_id, task_id, attempt_id, kind,
+                  created_at_us, data
+           FROM job_graph_events
+           WHERE kind IN (
+               'task_control_opened',
+               'task_retry_circuit_opened',
+               'task_review_changes_requested'
+           )"""
+    ):
+        inspection = graph_jobs.get((agent_id, job_id))
+        if inspection is None:
+            raise ValueError("stored graph attention event has no owned job")
+        created_at = datetime(1970, 1, 1, tzinfo=UTC) + timedelta(
+            microseconds=int(created_at_us)
+        )
+        event = decode_graph_event(
+            data,
+            event_id=int(event_id),
+            agent_id=agent_id,
+            job_id=job_id,
+            task_id=task_id,
+            attempt_id=attempt_id,
+            kind=kind,
+            created_at=created_at,
+        )
+        transition_kind: str
+        transition_identity: object
+        if event.kind == "task_control_opened":
+            control_kind = event.payload.get("kind")
+            if control_kind in {
+                ControlKind.NEEDS_REPLAN.value,
+                ControlKind.REVIEW_REQUESTED.value,
+            }:
+                continue
+            transition_kind = "control_opened"
+            transition_identity = event.payload.get("control_id")
+        elif event.kind == "task_retry_circuit_opened":
+            transition_kind = "retry_circuit_open"
+            transition_identity = event.payload.get("control_id")
+        else:
+            transition_kind = "review_changes_requested"
+            transition_identity = event.payload.get("changes_control_id")
+        if not isinstance(transition_identity, str) or not transition_identity:
+            raise ValueError("stored graph attention event identity is invalid")
+        subject = (
+            f"{event.job_id}/event/{event.event_id}/{transition_kind}/"
+            f"{transition_identity}"
+        )
+        digest = canonical_digest(
+            {
+                "job_id": event.job_id,
+                "event_id": event.event_id,
+                "transition_kind": transition_kind,
+                "transition_identity": transition_identity,
+            }
+        )
+        key = (event.agent_id, subject)
+        if key in graph_attention_producers:
+            raise ValueError("stored graph attention producer identity is duplicated")
+        graph_attention_producers[key] = (inspection.job, digest, created_at)
 
     routines: dict[tuple[str, str], ScheduledRoutine] = {}
     routine_counts: dict[str, int] = {}
@@ -7237,22 +6636,6 @@ def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity |
         if active is None or active.routine_id != routine.routine_id:
             raise ValueError("stored routine active occurrence is invalid")
 
-    followups: dict[tuple[str, str], AutonomousFollowup] = {}
-    for agent_id, followup_id, job_id, event_id, data in connection.execute(
-        """SELECT agent_id, followup_id, job_id, event_id, data
-           FROM autonomous_followups"""
-    ):
-        followup = decode_autonomous_followup(
-            data,
-            agent_id=agent_id,
-            followup_id=followup_id,
-        )
-        if followup.job_id != job_id or followup.event_id != event_id:
-            raise ValueError("stored autonomous follow-up projection is invalid")
-        if identity is not None and followup.agent_id != identity.id:
-            raise ValueError("stored autonomous follow-up belongs to another agent")
-        followups[(agent_id, followup_id)] = followup
-
     delivery_counts: dict[str, int] = {}
     for (
         agent_id,
@@ -7272,11 +6655,30 @@ def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity |
                   state, created_at_us, data
            FROM deliveries"""
     ):
-        delivery = decode_delivery(
-            data,
-            agent_id=agent_id,
-            delivery_id=delivery_id,
-        )
+        if subject_kind == "graph_job":
+            graph_delivery = decode_graph_job_delivery(
+                data,
+                agent_id=agent_id,
+                delivery_id=delivery_id,
+                conversation_id=conversation_id,
+                subject_kind=subject_kind,
+                subject_id=subject_id,
+                logical_key=logical_key,
+                state=state,
+            )
+            if not isinstance(graph_delivery, GraphJobDelivery):
+                raise TypeError("current graph delivery did not decode to its record")
+            if (
+                graph_delivery.target.target_fingerprint != target_fingerprint_value
+                or _datetime_us(graph_delivery.created_at) != created_at_us
+                or (agent_id, subject_id) not in graph_jobs
+            ):
+                raise ValueError("stored graph delivery projection is invalid")
+            delivery_counts[agent_id] = delivery_counts.get(agent_id, 0) + 1
+            if delivery_counts[agent_id] > MAX_DELIVERIES_PER_AGENT:
+                raise ValueError("stored delivery count exceeds its fixed bound")
+            continue
+        delivery = decode_delivery(data, agent_id=agent_id, delivery_id=delivery_id)
         if (
             delivery.conversation_id != conversation_id
             or delivery.subject_kind.value != subject_kind
@@ -7290,16 +6692,34 @@ def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity |
             raise ValueError("stored delivery projection is invalid")
         if identity is not None and delivery.agent_id != identity.id:
             raise ValueError("stored delivery belongs to another agent")
-        producer: AutonomousFollowup | RoutineOccurrence | None
-        if delivery.subject_kind is DeliverySubjectKind.AUTONOMOUS_FOLLOWUP:
-            producer = followups.get((agent_id, subject_id))
-        else:
+        if delivery.subject_kind is DeliverySubjectKind.ROUTINE_OCCURRENCE:
             producer = occurrences.get((agent_id, subject_id))
-        producer_references_delivery = producer is not None and (
-            producer.delivery_id == delivery_id
-            if isinstance(producer, AutonomousFollowup)
-            else delivery_id in producer.delivery_ids
-        )
+            producer_references_delivery = (
+                producer is not None and delivery_id in producer.delivery_ids
+            )
+        elif delivery.subject_kind is DeliverySubjectKind.GRAPH_ATTENTION:
+            attention = graph_attention_producers.get((agent_id, subject_id))
+            if attention is None:
+                raise ValueError("stored graph attention producer is invalid")
+            attention_job, transition_digest, transition_at = attention
+            producer_references_delivery = (
+                delivery.conversation_id == attention_job.conversation_id
+                and delivery.outcome.conclusion_id == subject_id
+                and delivery.outcome.conclusion_digest == transition_digest
+                and delivery.outcome.provenance_digest == transition_digest
+                and delivery.outcome.observed_at == transition_at
+                and delivery.outcome.resulting_run_id is None
+                and not delivery.outcome.artifact_references
+                and not delivery.outcome.effect_receipt_ids
+                and delivery.delivery_id
+                == "delivery-" + sha256(subject_id.encode()).hexdigest()[:32]
+                and attention_job.specification.distribution_plan_digest
+                == distribution_plan_digest(
+                    targets=(delivery.target,), required_target_count=1
+                )
+            )
+        else:
+            raise ValueError("stored delivery retained a legacy producer")
         if not producer_references_delivery:
             raise ValueError("stored delivery producer reference is invalid")
         delivery_counts[agent_id] = delivery_counts.get(agent_id, 0) + 1
@@ -7316,93 +6736,27 @@ def load_current_artifact_inventory(
     tuple[OutcomeArtifactReference, ...],
     frozenset[tuple[str, str]],
 ]:
-    """Read exact artifact roots from an already validated current database."""
+    """Read exact artifact roots from an already validated revision-2 database."""
 
     if not isinstance(agent_id, str) or not agent_id:
         raise ValueError("agent_id must be non-empty text")
-    with _connect_read_only(path) as connection:
-        message_rows = tuple(
-            connection.execute(
-                """SELECT r.id, r.conversation_id, m.data
-                   FROM runs AS r
-                   JOIN messages AS m ON m.run_id = r.id
-                   WHERE r.agent_id = ?
-                   ORDER BY r.id, m.position""",
-                (agent_id,),
-            )
+    with connect_graph(path) as connection:
+        refs = _graph_store.list_graph_artifact_refs(connection, agent_id)
+        reservations = _graph_store.list_graph_reserved_artifact_ids(
+            connection, agent_id
         )
-        job_rows = tuple(
-            connection.execute(
-                "SELECT job_id, data FROM job_runs WHERE agent_id = ?",
-                (agent_id,),
-            )
+        delivery_references = _graph_store.list_current_delivery_artifact_references(
+            connection, agent_id
         )
-        delivery_rows = tuple(
-            connection.execute(
-                "SELECT delivery_id, data FROM deliveries "
-                "WHERE agent_id = ? ORDER BY created_at_us, delivery_id",
-                (agent_id,),
-            )
-        )
-
-    refs: dict[str, ArtifactRef] = {}
-    for run_id, conversation_id, data in message_rows:
-        message = decode_message(data)
-        if message.role is not MessageRole.TOOL:
-            continue
-        for block in message.content:
-            if not isinstance(block, ToolResultBlock) or block.is_error:
-                continue
-            raw = block.output.get("artifact")
-            if not isinstance(raw, Mapping):
-                continue
-            ref = artifact_ref_from_mapping(raw)
-            if (
-                ref.run_id != run_id
-                or ref.conversation_id != conversation_id
-                or ref.call_id != block.call_id
-            ):
-                raise ValueError("stored artifact reference identity is invalid")
-            prior = refs.get(ref.artifact_id)
-            if prior is not None and prior != ref:
-                raise ValueError("stored artifact identity is ambiguous")
-            refs[ref.artifact_id] = ref
-    jobs = _decode_job_rows(job_rows, agent_id=agent_id)
-    reservations: set[tuple[str, str]] = set()
-    for job in jobs:
-        if job.result is not None:
-            for ref in job.result.artifact_refs:
-                if ref.conversation_id != job.conversation_id:
-                    raise ValueError("stored job artifact identity is invalid")
-                prior = refs.get(ref.artifact_id)
-                if prior is not None and prior != ref:
-                    raise ValueError("stored artifact identity is ambiguous")
-                refs[ref.artifact_id] = ref
-        if job.status not in {JobStatus.RUNNING, JobStatus.CANCEL_REQUESTED}:
-            continue
-        attempt = job.current_attempt
-        if attempt is not None and attempt.status is JobAttemptStatus.CLAIMED:
-            reservations.add((attempt.execution_run_id, attempt.reserved_artifact_id))
-
-    delivery_references: dict[str, OutcomeArtifactReference] = {}
-    for delivery_id, data in delivery_rows:
-        delivery = decode_delivery(data, agent_id=agent_id, delivery_id=delivery_id)
-        for reference in delivery.outcome.artifact_references:
-            prior_delivery = delivery_references.get(reference.artifact_id)
-            if prior_delivery is not None and prior_delivery != reference:
-                raise ValueError("stored delivery artifact identity is ambiguous")
-            delivery_references[reference.artifact_id] = reference
     return (
-        tuple(
-            sorted(refs.values(), key=lambda item: (item.created_at, item.artifact_id))
-        ),
+        refs,
         tuple(
             sorted(
-                delivery_references.values(),
+                delivery_references,
                 key=lambda item: (item.producing_run_id, item.artifact_id),
             )
         ),
-        frozenset(reservations),
+        reservations,
     )
 
 
@@ -7524,6 +6878,86 @@ def _pause_effect_routine(
     )
 
 
+def _open_graph_effect_uncertain_control(
+    connection: sqlite3.Connection,
+    *,
+    receipt: EffectReceipt,
+    job_id: str,
+    task_id: str,
+    attempt_id: str,
+    fencing_epoch: int,
+    task_spec_digest: str,
+    opened_at: datetime,
+) -> TaskControl | None:
+    loaded_task = _graph_store._load_task(connection, receipt.agent_id, job_id, task_id)
+    loaded_attempt = _graph_store._load_attempt(
+        connection, receipt.agent_id, job_id, task_id, attempt_id
+    )
+    if loaded_task is None or loaded_attempt is None:
+        return None
+    task = loaded_task[0]
+    attempt = loaded_attempt[0]
+    if (
+        task.state is not TaskState.RUNNING
+        or task.current_attempt_id != attempt_id
+        or task.task_spec_digest != task_spec_digest
+        or task.fencing_epoch != fencing_epoch
+        or attempt.state not in ACTIVE_ATTEMPT_STATES
+        or attempt.fencing_epoch != fencing_epoch
+    ):
+        return None
+    control_id = (
+        "control-"
+        + sha256(f"{receipt.receipt_id}:effect-uncertain".encode()).hexdigest()[:32]
+    )
+    existing = connection.execute(
+        "SELECT data FROM job_task_controls WHERE agent_id = ? AND job_id = ? AND task_id = ? AND control_id = ?",
+        (receipt.agent_id, job_id, task_id, control_id),
+    ).fetchone()
+    if existing is not None:
+        return None
+    if receipt.outcome is EffectOutcome.SUCCEEDED:
+        message = (
+            "The external operation succeeded, but its graph result was not committed; "
+            "the operation will not be replayed."
+        )
+    elif receipt.outcome is EffectOutcome.NOT_APPLIED:
+        message = "The reserved external operation was not applied and will not be replayed automatically."
+    else:
+        message = (
+            "The external operation outcome is uncertain and will not be replayed."
+        )
+    payload = {
+        "message": message,
+        "details": {
+            "receipt_id": receipt.receipt_id,
+            "receipt_digest": receipt.receipt_digest,
+            "outcome": receipt.outcome.value,
+            "evidence_basis": receipt.evidence_basis.value,
+            "resolution_does_not_retry": True,
+            "resolution_does_not_mark_success": True,
+        },
+    }
+    control = TaskControl(
+        agent_id=receipt.agent_id,
+        job_id=job_id,
+        task_id=task_id,
+        control_id=control_id,
+        kind=ControlKind.EFFECT_UNCERTAIN,
+        state=ControlState.OPEN,
+        requesting_attempt_id=attempt_id,
+        payload=payload,
+        created_at=opened_at,
+        payload_digest=canonical_digest(payload),
+    )
+    return _graph_store.open_control(
+        connection,
+        control,
+        claim_token=attempt.claim_token,
+        fencing_epoch=fencing_epoch,
+    )
+
+
 def _recover_started_effect_receipts(
     path: Path,
     clock: Callable[[], datetime],
@@ -7531,11 +6965,31 @@ def _recover_started_effect_receipts(
     try:
         with _connect_read_only(path) as connection:
             rows = tuple(
-                connection.execute("SELECT agent_id, id, data FROM effect_receipts")
+                connection.execute(
+                    "SELECT agent_id, id, data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest FROM effect_receipts"
+                )
             )
         started = tuple(
-            (agent_id, receipt_id, receipt)
-            for agent_id, receipt_id, data in rows
+            (
+                agent_id,
+                receipt_id,
+                receipt,
+                job_id,
+                task_id,
+                attempt_id,
+                fencing_epoch,
+                task_spec_digest,
+            )
+            for (
+                agent_id,
+                receipt_id,
+                data,
+                job_id,
+                task_id,
+                attempt_id,
+                fencing_epoch,
+                task_spec_digest,
+            ) in rows
             if (receipt := decode_receipt(data)).outcome is EffectOutcome.STARTED
         )
         if not started:
@@ -7543,7 +6997,16 @@ def _recover_started_effect_receipts(
         completed_at = _effect_receipt_aware(clock(), "receipt recovery completed_at")
         with _connect(path) as connection:
             connection.execute("BEGIN IMMEDIATE")
-            for agent_id, receipt_id, receipt in started:
+            for (
+                agent_id,
+                receipt_id,
+                receipt,
+                job_id,
+                task_id,
+                attempt_id,
+                fencing_epoch,
+                task_spec_digest,
+            ) in started:
                 recovered = receipt.finish(
                     EffectObservation(
                         EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN
@@ -7563,6 +7026,17 @@ def _recover_started_effect_receipts(
                 if result.rowcount != 1:
                     raise RuntimeError("effect receipt changed during startup recovery")
                 _pause_effect_routine(connection, recovered, completed_at)
+                if job_id is not None:
+                    _open_graph_effect_uncertain_control(
+                        connection,
+                        receipt=recovered,
+                        job_id=str(job_id),
+                        task_id=str(task_id),
+                        attempt_id=str(attempt_id),
+                        fencing_epoch=int(fencing_epoch),
+                        task_spec_digest=str(task_spec_digest),
+                        opened_at=completed_at,
+                    )
     except RuntimeError:
         raise
     except (OSError, sqlite3.Error, TypeError, ValueError):
@@ -7570,7 +7044,11 @@ def _recover_started_effect_receipts(
 
 
 def _connect(path: Path) -> sqlite3.Connection:
-    connection = sqlite3.connect(path, timeout=30)
+    connection = sqlite3.connect(
+        path,
+        timeout=30,
+        factory=ClosingSQLiteConnection,
+    )
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
 
@@ -7580,10 +7058,25 @@ def _connect_read_only(path: Path) -> sqlite3.Connection:
         path.as_uri() + "?mode=ro",
         timeout=30,
         uri=True,
+        factory=ClosingSQLiteConnection,
     )
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA query_only = ON")
     return connection
+
+
+def _checkpoint_wal_for_close(path: Path) -> None:
+    connection = _connect(path)
+    try:
+        checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if (
+            checkpoint is None
+            or int(checkpoint[0]) != 0
+            or int(checkpoint[1]) != int(checkpoint[2])
+        ):
+            raise RuntimeError("state database WAL checkpoint did not complete")
+    finally:
+        connection.close()
 
 
 def _commit_catalog_transaction(connection: sqlite3.Connection) -> None:
