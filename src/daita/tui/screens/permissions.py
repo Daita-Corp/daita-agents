@@ -55,6 +55,15 @@ class PermissionsScreen(Screen[bool]):
                 yield Button("Apply", id="perm-apply", variant="primary")
             yield Footer()
 
+    def on_mount(self) -> None:
+        if self._source_id is not None:
+            self.run_worker(
+                self._load_selected_source(),
+                name="permissions-initial-source",
+                group="permissions-interaction",
+                exclusive=True,
+            )
+
     def action_cancel(self) -> None:
         self.dismiss(False)
 
@@ -125,6 +134,24 @@ class PermissionsScreen(Screen[bool]):
             return
         self._source_id = selected[0]
         self._preview = None
+        await self._render_selected_source(controller)
+
+    async def _load_selected_source(self) -> None:
+        try:
+            await self._render_selected_source(self.app.controller)  # type: ignore[attr-defined]
+        except (ValueError, RuntimeError, PermissionError, OSError) as error:
+            self.query_one("#perm-help", Static).update(
+                sanitize_terminal_text(
+                    str(error),
+                    maximum=2048,
+                    preserve_lines=True,
+                    fallback="Could not load source permissions.",
+                )
+            )
+
+    async def _render_selected_source(self, controller: Any) -> None:
+        if self._source_id is None:
+            return
         inspection = await controller.inspect_source_permissions(self._source_id)
         self.query_one("#perm-body", Static).update(self._inspection_text(inspection))
 

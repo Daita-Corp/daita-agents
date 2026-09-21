@@ -22,8 +22,9 @@ class SourceEditScreen(Screen[bool]):
 
     BINDINGS = [Binding("escape", "cancel", "Cancel")]
 
-    def __init__(self) -> None:
+    def __init__(self, *, source_id: str | None = None) -> None:
         super().__init__()
+        self._initial_source_id = source_id
         self._source: Any = None
         self._adapter_id: str | None = None
         self._preview_error: str | None = None
@@ -72,6 +73,16 @@ class SourceEditScreen(Screen[bool]):
     async def _load_initial_source(self) -> None:
         controller = self.app.controller  # type: ignore[attr-defined]
         sources = tuple(item for item in await controller.list_sources() if item.active)
+        if self._initial_source_id is not None:
+            source = next(
+                (item for item in sources if item.id == self._initial_source_id),
+                None,
+            )
+            if source is None:
+                self._show_error("The selected source is no longer active.")
+                return
+            self._load_source(source)
+            return
         if len(sources) == 1:
             self._load_source(sources[0])
             return

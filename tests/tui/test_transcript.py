@@ -14,6 +14,7 @@ from tests.tui._support import (
     ClipboardResult,
     CollapsibleTitle,
     Composer,
+    ConfirmScreen,
     DaitaApp,
     FinishReason,
     FrozenJsonObject,
@@ -452,4 +453,31 @@ async def test_copy_uses_native_wrap_independent_text_selection(monkeypatch):
         chat.selections = {widget: Selection.from_offsets(Offset(0, 0), Offset(5, 0))}
         await app.copy_or_cancel()
         assert copied == ["hello"]
+        app.exit(0)
+
+
+async def test_popup_copy_uses_terminal_aware_clipboard(monkeypatch):
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    copied: list[str] = []
+
+    async def deliver(text: str) -> ClipboardResult:
+        copied.append(text)
+        return ClipboardResult("success", "test", "Copied selection.")
+
+    monkeypatch.setattr("daita.tui.app.deliver_clipboard", deliver)
+    async with app.run_test(size=(80, 24)) as pilot:
+        popup = ConfirmScreen("copy popup text")
+        await app.push_screen(popup)
+        await pilot.pause()
+        message = popup.query_one("#confirm-message", Static)
+        popup.selections = {
+            message: Selection.from_offsets(Offset(0, 0), Offset(10, 0))
+        }
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+
+        assert copied == ["copy popup"]
+        assert app.clipboard == "copy popup"
+        assert app.screen is popup
         app.exit(0)

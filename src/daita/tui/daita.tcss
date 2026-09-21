@@ -506,6 +506,17 @@ ModelSetupScreen #model-help {
     height: 88%;
 }
 
+#catalog-modes {
+    height: 3;
+    padding-bottom: 1;
+}
+
+#catalog-modes Button {
+    width: auto;
+    min-width: 14;
+    margin-right: 1;
+}
+
 #catalog-tree {
     height: 1fr;
     padding: 0 1;
@@ -533,10 +544,96 @@ ModelSetupScreen #model-help {
     color: #6A6A6A;
 }
 
+#catalog-graph-view {
+    display: none;
+    height: 1fr;
+    background: $panel;
+    border-top: solid #2A2A2A;
+}
+
+#catalog-graph-tree {
+    width: 2fr;
+    height: 1fr;
+    padding: 0 1;
+    background: $panel;
+    border: none;
+    border-right: solid #2A2A2A;
+}
+
+#catalog-graph-tree:focus {
+    background: $panel;
+    background-tint: $foreground 2%;
+    border: none;
+    border-right: solid #343434;
+}
+
+#catalog-graph-tree > .tree--cursor,
+#catalog-graph-tree:focus > .tree--cursor {
+    color: $foreground;
+    background: #343434;
+    text-style: bold;
+}
+
+#catalog-graph-tree > .tree--guides-selected,
+#catalog-graph-tree:focus > .tree--guides-selected {
+    color: #6A6A6A;
+}
+
+#catalog-graph-detail {
+    width: 1fr;
+    min-width: 28;
+    height: 1fr;
+    padding: 1 2;
+    color: $text-muted;
+    background: $panel;
+    overflow-y: auto;
+}
+
+#catalog-graph-view.-compact {
+    layout: vertical;
+}
+
+#catalog-graph-view.-compact #catalog-graph-tree {
+    width: 1fr;
+    height: 2fr;
+    border: none;
+    border-bottom: solid #2A2A2A;
+}
+
+#catalog-graph-view.-compact #catalog-graph-detail {
+    width: 1fr;
+    min-width: 0;
+    height: 1fr;
+    padding: 1;
+}
+
 #catalog-help {
     height: auto;
     padding-top: 1;
     color: $text-muted;
+}
+
+#source-actions {
+    height: auto;
+    padding-top: 1;
+    grid-gutter: 0 1;
+}
+
+#source-actions Button {
+    width: 1fr;
+    min-width: 12;
+}
+
+#catalog-graph-actions {
+    display: none;
+    height: 3;
+    padding-top: 1;
+}
+
+#catalog-graph-actions Button {
+    width: auto;
+    min-width: 14;
+    margin-right: 1;
 }
 
 #jobs-manager,

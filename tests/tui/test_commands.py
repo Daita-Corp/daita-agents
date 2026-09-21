@@ -11,6 +11,7 @@ from tests.tui._support import (
     Agent,
     App,
     Button,
+    CatalogScreen,
     CompletionPopup,
     Composer,
     ComposeResult,
@@ -41,8 +42,12 @@ def test_every_advertised_slash_root_is_the_recognized_builtin_set():
         for _insertion, display, _description in SLASH_COMMAND_COMPLETIONS
     )
 
-    assert BUILTIN_SLASH_COMMAND_ROOTS == advertised_roots
-    assert BUILTIN_SLASH_COMMANDS == advertised_roots
+    assert advertised_roots < BUILTIN_SLASH_COMMAND_ROOTS
+    assert BUILTIN_SLASH_COMMANDS == BUILTIN_SLASH_COMMAND_ROOTS
+    assert BUILTIN_SLASH_COMMAND_ROOTS - advertised_roots == {
+        "/catalog",
+        "/source",
+    }
 
 
 async def test_typed_command_palette_navigates_and_inserts_without_submitting(
@@ -79,6 +84,15 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
             )
             assert listing.highlighted == 0
             assert popup.selected_insertion() == "/model"
+            assert listing.option_count == len(SLASH_COMMAND_COMPLETIONS)
+
+            for _ in range(len(SLASH_COMMAND_COMPLETIONS) - 1):
+                popup.move_highlight(1)
+            assert popup.selected_insertion() == "/exit"
+            assert listing.scroll_offset.y > 0
+            for _ in range(len(SLASH_COMMAND_COMPLETIONS) - 1):
+                popup.move_highlight(-1)
+            assert popup.selected_insertion() == "/model"
 
             await pilot.press("down", "enter")
             await pilot.pause()
@@ -88,15 +102,17 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
 
             await pilot.press("enter")
             await pilot.pause()
+            assert isinstance(app.screen, CatalogScreen)
+            await pilot.press("escape")
+            await pilot.pause()
             assert composer.text == ""
             assert app._run_task is None
 
             await pilot.press("/", "s", "o", "u")
             await pilot.pause()
             assert popup.display is True
-            assert {shown for _insert, shown, _description in popup.matches} >= {
-                "/source",
-                "/sources",
+            assert {shown for _insert, shown, _description in popup.matches} == {
+                "/sources"
             }
 
             await pilot.press("escape")
