@@ -11,7 +11,12 @@ from textual.containers import Vertical
 from textual.screen import Screen
 from textual.widgets import Button, Footer, Input, Label, Select, Static
 
-from ...llm.provider_definitions import AuthenticationMode, provider_definition
+from ...llm.profiles import reviewed_model_profile
+from ...llm.provider_definitions import (
+    AuthenticationMode,
+    EndpointMode,
+    provider_definition,
+)
 from ..commands import parse_postgresql_connection_url
 from ..models import (
     BUILTIN_PROVIDER_IDS,
@@ -80,6 +85,7 @@ class ModelSetupScreen(Screen[bool]):
         self._provider: str | None = None
         self._model: str | None = None
         self._subscription_prompt: tuple[str, str] | None = None
+        self._busy = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="onboard", classes="control-panel"):
@@ -100,23 +106,23 @@ class ModelSetupScreen(Screen[bool]):
             )
             yield Input(placeholder="Model ID (optional override)", id="model-id")
             yield Input(placeholder="API key", id="model-secret", password=True)
-            yield Input(
-                placeholder="Base URL (custom provider only)", id="model-base-url"
-            )
-            yield Input(
-                placeholder="Context window tokens (if required)", id="model-context"
-            )
-            yield Input(
-                placeholder="Max output tokens (if required)", id="model-output"
-            )
+            yield Input(placeholder="Base URL", id="model-base-url")
+            yield Input(placeholder="Context window tokens", id="model-context")
+            yield Input(placeholder="Max output tokens", id="model-output")
             yield Label("", id="onboard-error", markup=False)
-            yield Button("Save model", id="save-model", variant="success")
+            yield Button("Validate and save", id="save-model", variant="success")
             yield Footer()
 
+    def on_mount(self) -> None:
+        self._refresh_provider_fields()
+
     def action_cancel(self) -> None:
-        self.dismiss(False)
+        if not self._busy:
+            self.dismiss(False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if self._busy:
+            return
         if event.button.id == "choose-provider":
             self.run_worker(
                 self._choose_provider(),
@@ -132,6 +138,10 @@ class ModelSetupScreen(Screen[bool]):
                 group="model-setup-interaction",
                 exclusive=True,
             )
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "model-id" and self._provider is not None:
+            self._refresh_provider_fields()
 
     async def _save_model(self) -> None:
         if self._provider is None:
@@ -153,11 +163,20 @@ class ModelSetupScreen(Screen[bool]):
             )
             return
         secret_input = self.query_one("#model-secret", Input)
-        api_key = secret_input.value or None
+        api_key = (secret_input.value or None) if secret_input.display else None
         subscription_credential: str | None = None
+        self._set_busy(True)
+        self.query_one("#onboard-error", Label).update("")
+        self.query_one("#model-help", Static).update(
+            "Validating the credential, model, and required request features…"
+        )
         try:
-            context = _optional_int(self.query_one("#model-context", Input).value)
-            output = _optional_int(self.query_one("#model-output", Input).value)
+            context_input = self.query_one("#model-context", Input)
+            output_input = self.query_one("#model-output", Input)
+            context = (
+                _optional_int(context_input.value) if context_input.display else None
+            )
+            output = _optional_int(output_input.value) if output_input.display else None
             if self.app.controller.model_requires_explicit_limits(  # type: ignore[attr-defined]
                 provider=provider,
                 model=model,
@@ -167,7 +186,12 @@ class ModelSetupScreen(Screen[bool]):
                 raise ValueError(
                     "This model requires explicit context-window and output-token limits."
                 )
-            base_url = self.query_one("#model-base-url", Input).value.strip() or None
+            base_url_input = self.query_one("#model-base-url", Input)
+            base_url = (
+                (base_url_input.value.strip() or None)
+                if base_url_input.display
+                else None
+            )
             if selected_provider == "custom" and base_url is None:
                 raise ValueError("A custom provider requires a base URL.")
             definition = provider_definition(provider)
@@ -200,6 +224,9 @@ class ModelSetupScreen(Screen[bool]):
                 max_output_tokens=output,
             )
         except Exception as error:
+            self.query_one("#model-help", Static).update(
+                "Configuration was not saved. Correct the error below and retry."
+            )
             self.query_one("#onboard-error", Label).update(
                 sanitize_terminal_text(
                     str(error),
@@ -213,7 +240,74 @@ class ModelSetupScreen(Screen[bool]):
             api_key = None
             subscription_credential = None
             secret_input.clear()
+            if self.is_mounted:
+                self._set_busy(False)
         self.dismiss(True)
+
+    def _set_busy(self, busy: bool) -> None:
+        self._busy = busy
+        self.query_one("#choose-provider", Button).disabled = busy
+        save = self.query_one("#save-model", Button)
+        save.disabled = busy or self._provider is None
+        save.label = "Validating…" if busy else "Validate and save"
+
+    def _refresh_provider_fields(self) -> None:
+        provider = self._provider
+        custom = provider == "custom"
+        definition = (
+            None if provider in {None, "custom"} else provider_definition(provider)
+        )
+        model = self.query_one("#model-id", Input).value.strip() or self._model
+        requires_limits = bool(
+            provider is not None
+            and model
+            and (custom or reviewed_model_profile(f"{provider}:{model}") is None)
+        )
+        requires_api_key = custom or (
+            definition is not None
+            and definition.authentication is AuthenticationMode.API_KEY
+        )
+        accepts_base_url = custom or (
+            definition is not None
+            and definition.endpoint is EndpointMode.OPTIONAL_OVERRIDE
+        )
+
+        self.query_one("#model-provider-id", Input).display = custom
+        self.query_one("#model-id", Input).display = provider is not None
+        self.query_one("#model-secret", Input).display = requires_api_key
+        self.query_one("#model-base-url", Input).display = accepts_base_url
+        self.query_one("#model-context", Input).display = requires_limits
+        self.query_one("#model-output", Input).display = requires_limits
+
+        choose = self.query_one("#choose-provider", Button)
+        choose.label = (
+            "Choose provider"
+            if provider is None
+            else f"Provider · {dict(PROVIDERS).get(provider, provider)}"
+        )
+        save = self.query_one("#save-model", Button)
+        save.display = provider is not None
+        save.disabled = self._busy or provider is None
+
+    def _apply_provider_selection(self, provider: str, model: str | None) -> None:
+        current_model = self.query_one("#model-id", Input).value.strip() or self._model
+        if provider != self._provider:
+            for selector in (
+                "#model-provider-id",
+                "#model-secret",
+                "#model-base-url",
+                "#model-context",
+                "#model-output",
+            ):
+                self.query_one(selector, Input).clear()
+        elif model != current_model:
+            self.query_one("#model-context", Input).clear()
+            self.query_one("#model-output", Input).clear()
+        self._provider = provider
+        self._model = model
+        self.query_one("#model-id", Input).value = model or ""
+        self.query_one("#onboard-error", Label).update("")
+        self._refresh_provider_fields()
 
     def _show_subscription_verification(self, prompt: object) -> None:
         verification_url = getattr(prompt, "verification_url", "")
@@ -252,7 +346,6 @@ class ModelSetupScreen(Screen[bool]):
         provider = selected[0]
         if not isinstance(provider, str):
             return
-        self._provider = provider
         suggestions = MODEL_SUGGESTIONS.get(provider, ())
         model_options = tuple(
             PickerOption(
@@ -266,11 +359,12 @@ class ModelSetupScreen(Screen[bool]):
             )
             for item in suggestions
         )
-        if self._provider == "custom":
-            self._model = None
+        if provider == "custom":
+            self._apply_provider_selection(provider, None)
             self.query_one("#model-help", Static).update(
                 "Enter the custom provider identifier, model ID, base URL, and API key."
             )
+            self.query_one("#model-provider-id", Input).focus()
             return
         if model_options:
             chosen = await self.app._await_modal(  # type: ignore[attr-defined]
@@ -281,11 +375,12 @@ class ModelSetupScreen(Screen[bool]):
             model = chosen[0]
             if not isinstance(model, str):
                 return
-            self._model = model
-            self.query_one("#model-id", Input).value = model
+            self._apply_provider_selection(provider, model)
+        else:
+            self._apply_provider_selection(provider, None)
         self.query_one("#model-help", Static).update(
             sanitize_terminal_text(
-                f"{self._provider}:{self._model}",
+                f"{self._provider}:{self._model or 'enter a model ID'}",
                 maximum=240,
                 preserve_lines=False,
                 fallback="model",

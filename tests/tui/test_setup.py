@@ -558,6 +558,13 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
         assert screen.query_one("#onboard-title").styles.color.hex == "#FFFFFF"
         assert screen.query_one("#model-help").styles.color.hex == "#FFFFFF99"
         model_id = screen.query_one("#model-id", Input)
+        assert model_id.display is False
+        assert screen.query_one("#model-provider-id", Input).display is False
+        assert screen.query_one("#model-secret", Input).display is False
+        assert screen.query_one("#model-base-url", Input).display is False
+        assert screen.query_one("#model-context", Input).display is False
+        assert screen.query_one("#model-output", Input).display is False
+        assert screen.query_one("#save-model", Button).display is False
         assert model_id.styles.border_left[0] == ""
         assert model_id.styles.border_bottom[0] == "solid"
         assert model_id.styles.background.hex == "#111111"
@@ -565,10 +572,14 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
         assert choose_provider.styles.border_left[0] == "solid"
         assert choose_provider.styles.background.hex in {"#181818", "#303030"}
         assert screen.query_one(Footer).styles.background.hex == "#111111"
-        screen._provider = "codex"
-        screen._model = "gpt-5.6-sol"
-        screen.query_one("#model-id", Input).value = "gpt-5.6-sol"
+        screen._apply_provider_selection("codex", "gpt-5.6-sol")
+        await pilot.pause()
+        assert screen.query_one("#model-secret", Input).display is False
+        assert screen.query_one("#save-model", Button).display is True
         screen.query_one("#model-secret", Input).value = "must-not-be-used"
+        screen.query_one("#model-base-url", Input).value = "https://must-not-be-used"
+        screen.query_one("#model-context", Input).value = "1"
+        screen.query_one("#model-output", Input).value = "1"
         assert await pilot.click("#save-model") is True
         await asyncio.wait_for(authentication_started.wait(), timeout=5)
         await asyncio.wait_for(pilot.pause(), timeout=5)
@@ -584,6 +595,9 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
     assert configured["model"] == "gpt-5.6-sol"
     assert configured["api_key"] is None
     assert configured["subscription_credential"] == "opaque-subscription-credential"
+    assert configured["base_url"] is None
+    assert configured["context_window_tokens"] is None
+    assert configured["max_output_tokens"] is None
     assert verification == [("https://auth.openai.com/codex/device", "ABCD-EFGH")]
 
 
@@ -615,6 +629,38 @@ async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
         assert setup._provider == "openai"
         assert setup._model == "gpt-5.6-sol"
         assert setup.query_one("#model-id", Input).value == "gpt-5.6-sol"
+        assert "OpenAI API" in str(setup.query_one("#choose-provider", Button).label)
+        assert setup.query_one("#model-provider-id", Input).display is False
+        assert setup.query_one("#model-secret", Input).display is True
+        assert setup.query_one("#model-base-url", Input).display is False
+        assert setup.query_one("#model-context", Input).display is False
+        assert setup.query_one("#model-output", Input).display is False
+        assert setup.query_one("#save-model", Button).display is True
+        app.exit(0)
+
+
+async def test_model_setup_reveals_only_custom_provider_fields_when_selected():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+
+    async with app.run_test(size=(90, 30)) as pilot:
+        await app.push_screen(ModelSetupScreen())
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, ModelSetupScreen)
+
+        setup._apply_provider_selection("custom", None)
+        await pilot.pause()
+        assert setup.query_one("#model-provider-id", Input).display is True
+        assert setup.query_one("#model-id", Input).display is True
+        assert setup.query_one("#model-secret", Input).display is True
+        assert setup.query_one("#model-base-url", Input).display is True
+        assert setup.query_one("#model-context", Input).display is False
+        assert setup.query_one("#model-output", Input).display is False
+
+        setup.query_one("#model-id", Input).value = "private-model"
+        await pilot.pause()
+        assert setup.query_one("#model-context", Input).display is True
+        assert setup.query_one("#model-output", Input).display is True
         app.exit(0)
 
 

@@ -1230,8 +1230,34 @@ class DaitaApp(App[int]):
         if screen is None:
             return
         text = screen.get_selected_text() or ""
+        await self._deliver_clipboard_text(text)
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Use Daita's terminal-aware clipboard path for every screen."""
+
+        # Preserve Textual's local clipboard so copied input can still be pasted
+        # within the app while the platform delivery runs asynchronously.
+        self._clipboard = text
+        self.run_worker(
+            self._deliver_clipboard_text(text),
+            name="clipboard-copy",
+            group="clipboard",
+            exclusive=True,
+            exit_on_error=False,
+        )
+
+    async def _deliver_clipboard_text(self, text: str) -> None:
         result = await deliver_clipboard(text)
-        screen.show_notice(result.message)
+        screen = self.chat()
+        if screen is not None:
+            screen.show_notice(result.message)
+            return
+        self.notify(
+            result.message,
+            title="Clipboard",
+            severity="information" if result.status == "success" else "warning",
+            markup=False,
+        )
 
     async def _request_exit(self) -> None:
         if self._run_task is not None and not self._run_task.done():
