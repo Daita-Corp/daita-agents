@@ -629,6 +629,11 @@ class PresentationController:
     ) -> tuple[Any, ...]:
         return await self.require_agent().list_catalog_resources(source_id=source_id)
 
+    async def inspect_catalog_resource(self, resource_id: str) -> Any:
+        """Read one bounded relationship neighborhood through the public API."""
+
+        return await self.require_agent().inspect_catalog_resource(resource_id)
+
     async def skill_completions(self) -> tuple[tuple[str, str], ...]:
         summaries = await self.require_agent().list_skills()
         return tuple(

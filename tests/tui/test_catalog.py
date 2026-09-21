@@ -473,6 +473,100 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
         await opened.close()
 
 
+async def test_catalog_tree_graph_explores_relationship_neighborhoods(tmp_path: Path):
+    database = tmp_path / "relationships.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript("""
+            CREATE TABLE customers (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL
+            );
+            CREATE TABLE orders (
+                id INTEGER PRIMARY KEY,
+                customer_id INTEGER NOT NULL REFERENCES customers(id)
+            );
+            """)
+
+    opened = await Agent.create(
+        "catalog-tree-graph", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    await opened.attach(SQLiteSource(database, name="Sales"))
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(100, 34)) as pilot:
+            await app._show_chat()
+            composer = app.screen.query_one(Composer)
+            composer.load_text("/sources")
+            composer.action_submit()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, CatalogScreen)
+            assert await pilot.click("#catalog-mode-graph") is True
+            for _ in range(30):
+                await pilot.pause(0.05)
+                graph = screen.query_one("#catalog-graph-tree", Tree)
+                if str(graph.root.label).startswith("main.customers"):
+                    break
+
+            graph = screen.query_one("#catalog-graph-tree", Tree)
+            assert str(screen.query_one("#catalog-title").render()) == (
+                "Catalog tree graph"
+            )
+            assert screen.query_one("#catalog-tree", Tree).display is False
+            assert screen.query_one("#source-actions").display is False
+            assert str(graph.root.label) == "main.customers  table"
+            assert len(graph.root.children) == 1
+            relationship = graph.root.children[0]
+            assert str(relationship.label) == "← references  connector"
+            assert str(relationship.children[0].label) == "main.orders  table"
+            assert "Relationships: 1" in str(
+                screen.query_one("#catalog-graph-detail", Static).content
+            )
+
+            await pilot.press("down")
+            relationship_detail = str(
+                screen.query_one("#catalog-graph-detail", Static).content
+            )
+            assert "Kind: references" in relationship_detail
+            assert "Direction from center: incoming" in relationship_detail
+            assert "Provenance: connector" in relationship_detail
+            assert "customer_id → id" in relationship_detail
+            assert "does not grant access or execution authority" in relationship_detail
+
+            await pilot.press("down")
+            assert screen.query_one("#catalog-graph-open", Button).disabled is False
+            assert await pilot.click("#catalog-graph-open") is True
+            for _ in range(30):
+                await pilot.pause(0.05)
+                if str(graph.root.label).startswith("main.orders"):
+                    break
+            assert str(graph.root.label) == "main.orders  table"
+            assert screen.query_one("#catalog-graph-back", Button).disabled is False
+
+            assert await pilot.click("#catalog-graph-back") is True
+            for _ in range(30):
+                await pilot.pause(0.05)
+                if str(graph.root.label).startswith("main.customers"):
+                    break
+            assert str(graph.root.label) == "main.customers  table"
+
+            await pilot.resize_terminal(78, 34)
+            await pilot.pause()
+            assert screen.query_one("#catalog-graph-view").has_class("-compact")
+
+            await pilot.press("s")
+            assert screen.query_one("#catalog-tree", Tree).display is True
+            assert screen.query_one("#source-actions").display is True
+            assert screen.query_one("#catalog-tree", Tree).has_focus is True
+            app.exit(0)
+    finally:
+        await opened.close()
+
+
 async def test_sources_manager_routes_actions_for_the_selected_source(tmp_path: Path):
     database = tmp_path / "managed.sqlite"
     _create_sqlite_source(database, "records")

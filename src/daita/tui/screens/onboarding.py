@@ -254,9 +254,9 @@ class ModelSetupScreen(Screen[bool]):
     def _refresh_provider_fields(self) -> None:
         provider = self._provider
         custom = provider == "custom"
-        definition = (
-            None if provider in {None, "custom"} else provider_definition(provider)
-        )
+        definition = None
+        if provider is not None and not custom:
+            definition = provider_definition(provider)
         model = self.query_one("#model-id", Input).value.strip() or self._model
         requires_limits = bool(
             provider is not None
@@ -406,17 +406,14 @@ class SourceSetupScreen(Screen[bool]):
             yield Input(placeholder="Display name", id="source-name")
             yield Input(placeholder="Path or PostgreSQL URL", id="source-path")
             yield Input(placeholder="Host", id="pg-host")
-            yield Input(placeholder="Port", id="pg-port", value="5432")
+            yield Input(placeholder="Port", id="pg-port")
             yield Input(placeholder="Database", id="pg-database")
             yield Input(placeholder="Username", id="pg-username")
             yield Input(placeholder="Password", id="pg-password", password=True)
-            yield Input(
-                placeholder="Schemas (comma-separated)", id="pg-schemas", value="public"
-            )
+            yield Input(placeholder="Schemas (comma-separated)", id="pg-schemas")
             yield Select(
                 ((mode, mode) for mode in sorted(SSL_MODES)),
                 prompt="SSL mode",
-                value="require",
                 id="pg-ssl",
             )
             yield Label("", id="onboard-error", markup=False)
@@ -492,6 +489,9 @@ class SourceSetupScreen(Screen[bool]):
                 )
             except ValueError as error:
                 raise ValueError(POSTGRESQL_CONNECTION_URL_ERROR) from error
+            selected_ssl_mode = self.query_one("#pg-ssl", Select).value
+            if selected_ssl_mode is not Select.NULL:
+                ssl_mode = str(selected_ssl_mode)
         else:
             host = self.query_one("#pg-host", Input).value.strip()
             database = self.query_one("#pg-database", Input).value.strip()

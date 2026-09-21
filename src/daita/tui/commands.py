@@ -21,7 +21,7 @@ SLASH_COMMAND_COMPLETIONS = (
     (
         "/sources",
         "/sources",
-        "Manage source catalogs, connections, and permissions",
+        "Manage sources and explore the catalog relationship tree",
     ),
     ("/jobs", "/jobs", "Manage durable jobs"),
     ("/inbox", "/inbox", "Inspect and acknowledge completed background reports"),

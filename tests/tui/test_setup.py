@@ -787,6 +787,93 @@ async def test_source_setup_accepts_a_successfully_attached_empty_catalog(monkey
         app.exit(0)
 
 
+async def test_source_setup_starts_with_unfilled_labeled_fields():
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    async with app.run_test(size=(100, 32)) as pilot:
+        await app.push_screen(SourceSetupScreen())
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, SourceSetupScreen)
+
+        field_ids = (
+            "source-name",
+            "source-path",
+            "pg-host",
+            "pg-port",
+            "pg-database",
+            "pg-username",
+            "pg-password",
+            "pg-schemas",
+        )
+        assert all(
+            setup.query_one(f"#{field_id}", Input).value == "" for field_id in field_ids
+        )
+        assert setup.query_one("#source-type", Select).value is Select.NULL
+        assert setup.query_one("#pg-ssl", Select).value is Select.NULL
+        assert setup.query_one("#pg-port", Input).placeholder == "Port"
+        assert setup.query_one("#pg-schemas", Input).placeholder == (
+            "Schemas (comma-separated)"
+        )
+        app.exit(0)
+
+
+async def test_postgresql_url_honors_an_explicit_ssl_selection(monkeypatch):
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+    credential = SecretReference.keychain("test-postgresql-url-ssl")
+    probed: dict[str, object] = {}
+
+    async def store_password(_password: str) -> SecretReference:
+        return credential
+
+    async def probe_postgresql(**kwargs: object) -> object:
+        probed.update(kwargs)
+        return SimpleNamespace(
+            schemas=(SimpleNamespace(name="analytics", has_base_tables=True),),
+            truncated=False,
+        )
+
+    async def attach_postgresql(**_kwargs: object) -> object:
+        return SimpleNamespace(id="source-postgresql")
+
+    monkeypatch.setattr(app.controller, "store_postgresql_password", store_password)
+    monkeypatch.setattr(app.controller, "probe_postgresql", probe_postgresql)
+    monkeypatch.setattr(app.controller, "attach_postgresql", attach_postgresql)
+
+    async with app.run_test(size=(100, 32)) as pilot:
+        modal_task = asyncio.create_task(app._await_modal(SourceSetupScreen()))
+        await pilot.pause()
+        setup = app.screen
+        assert isinstance(setup, SourceSetupScreen)
+        setup.query_one("#source-type", Select).value = "postgresql"
+        setup.query_one("#source-path", Input).value = (
+            "postgresql://postgres:fixture_admin_password@127.0.0.1:55432/"
+            "daita_fixture"
+        )
+        setup.query_one("#pg-schemas", Input).value = "analytics"
+        setup.query_one("#pg-ssl", Select).value = "disable"
+
+        assert await pilot.click("#attach-source", offset=(2, 1)) is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if isinstance(app.screen, SelectionScreen):
+                break
+        picker = app.screen
+        assert isinstance(picker, SelectionScreen)
+        picker.action_confirm()
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if modal_task.done():
+                break
+
+        assert await modal_task is True
+        assert probed["host"] == "127.0.0.1"
+        assert probed["port"] == 55432
+        assert probed["database"] == "daita_fixture"
+        assert probed["username"] == "postgres"
+        assert probed["ssl_mode"] == "disable"
+        app.exit(0)
+
+
 async def test_postgresql_setup_probes_and_preselects_schemas_with_tables(monkeypatch):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     credential = SecretReference.keychain("test-postgresql-probe")
