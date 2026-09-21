@@ -18,20 +18,10 @@ SKILL_INSTRUCTIONS_PLACEHOLDER = "Write the reusable procedure here."
 
 SLASH_COMMAND_COMPLETIONS = (
     ("/model", "/model", "Choose or validate the active model"),
-    ("/sources", "/sources", "List registered data sources"),
-    ("/source", "/source", "Browse admitted sources"),
-    ("/source add", "/source add", "Add a data source"),
-    ("/source edit", "/source edit", "Edit an admitted source connection"),
-    ("/source refresh ", "/source refresh <id>", "Refresh a source catalog"),
     (
-        "/source detach ",
-        "/source detach <source>",
-        "Detach a source and delete its Daita-owned credential",
-    ),
-    (
-        "/source permissions",
-        "/source permissions",
-        "Configure read and PostgreSQL update/upsert access",
+        "/sources",
+        "/sources",
+        "Manage source catalogs, connections, and permissions",
     ),
     ("/jobs", "/jobs", "Manage durable jobs"),
     ("/inbox", "/inbox", "Inspect and acknowledge completed background reports"),
@@ -61,7 +51,6 @@ SLASH_COMMAND_COMPLETIONS = (
     ),
     ("/mcp refresh ", "/mcp refresh <binding-id>", "Refresh one MCP binding"),
     ("/mcp revoke ", "/mcp revoke <binding-id>", "Revoke one MCP binding"),
-    ("/catalog", "/catalog", "Browse current catalog resources by source"),
     ("/settings", "/settings", "Show agent and model settings"),
     ("/new", "/new", "Start a new conversation"),
     ("/resume ", "/resume <id>", "Resume a previous conversation"),
@@ -98,10 +87,21 @@ SLASH_COMMAND_COMPLETIONS = (
     ("/help", "/help", "Show controls and usage help"),
     ("/exit", "/exit", "Exit Daita"),
 )
+UNADVERTISED_SOURCE_COMMANDS = frozenset(
+    {
+        "/catalog",
+        "/source",
+        "/source add",
+        "/source edit",
+        "/source refresh <source-id>",
+        "/source detach <source>",
+        "/source permissions",
+    }
+)
 BUILTIN_SLASH_COMMAND_ROOTS = frozenset(
     display.split(maxsplit=1)[0]
     for _insertion, display, _description in SLASH_COMMAND_COMPLETIONS
-)
+) | frozenset(command.split(maxsplit=1)[0] for command in UNADVERTISED_SOURCE_COMMANDS)
 BUILTIN_SLASH_COMMANDS = BUILTIN_SLASH_COMMAND_ROOTS
 HELP_TEXT = (
     "Type / to browse commands and their descriptions.\n"

@@ -539,6 +539,17 @@ ModelSetupScreen #model-help {
     color: $text-muted;
 }
 
+#source-actions {
+    height: auto;
+    padding-top: 1;
+    grid-gutter: 0 1;
+}
+
+#source-actions Button {
+    width: 1fr;
+    min-width: 12;
+}
+
 #jobs-manager,
 #inbox-manager {
     height: 88%;

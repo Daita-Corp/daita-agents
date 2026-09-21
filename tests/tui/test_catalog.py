@@ -376,11 +376,12 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
             await app._show_chat()
             await pilot.pause()
             composer = app.screen.query_one(Composer)
-            composer.load_text("/catalog")
+            composer.load_text("/sources")
             composer.action_submit()
             await pilot.pause()
 
             assert isinstance(app.screen, CatalogScreen)
+            assert str(app.screen.query_one("#catalog-title").render()) == "Sources"
             summary = app.screen.query_one("#catalog-summary", Static)
             assert "2 sources  ·  2 resources  ·  0 relationships" in str(
                 summary.content
@@ -394,6 +395,13 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
             assert tree.styles.background.hex == "#111111"
             assert tree.get_component_styles("tree--cursor").background.hex == "#343434"
             assert app.screen.query_one("#catalog-title").styles.color.hex == "#FFFFFF"
+            for button_id in (
+                "source-refresh",
+                "source-edit",
+                "source-permissions",
+                "source-detach",
+            ):
+                assert app.screen.query_one(f"#{button_id}", Button).disabled is False
             assert tree.has_focus is True
             assert tree.cursor_line == 0
             source_labels = tuple(str(node.label) for node in tree.root.children)
@@ -424,6 +432,19 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
             await pilot.pause()
             assert first_source.is_expanded is True
 
+            manager = app.screen
+            assert await pilot.click("#source-refresh") is True
+            for _ in range(20):
+                await pilot.pause(0.05)
+                current = app.screen
+                if isinstance(current, CatalogScreen) and current is not manager:
+                    break
+            assert isinstance(app.screen, CatalogScreen)
+            refresh_notice = app.screen.query_one("#catalog-notice", Static)
+            assert str(refresh_notice.content) == (
+                "Catalog refresh succeeded · Sales · 1 resource"
+            )
+
             await pilot.press("escape")
             await pilot.pause()
             assert isinstance(app.screen, ChatScreen)
@@ -447,6 +468,66 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
                 "Catalog refresh succeeded · Sales · 1 resource"
             )
             assert refresh_notice.has_class("-warning") is False
+            app.exit(0)
+    finally:
+        await opened.close()
+
+
+async def test_sources_manager_routes_actions_for_the_selected_source(tmp_path: Path):
+    database = tmp_path / "managed.sqlite"
+    _create_sqlite_source(database, "records")
+    opened = await Agent.create(
+        "sources-manager", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    source = await opened.attach(SQLiteSource(database, name="Managed source"))
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
+    app.controller.agent = opened
+    try:
+        async with app.run_test(size=(100, 34)) as pilot:
+            await app._show_chat()
+            composer = app.screen.query_one(Composer)
+            composer.load_text("/sources")
+            composer.action_submit()
+            await pilot.pause()
+
+            assert isinstance(app.screen, CatalogScreen)
+            assert await pilot.click("#source-edit") is True
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, SourceEditScreen):
+                    break
+            edit = app.screen
+            assert isinstance(edit, SourceEditScreen)
+            assert edit._source is not None
+            assert edit._source.id == source.id
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, CatalogScreen)
+            assert await pilot.click("#source-permissions") is True
+            await pilot.pause()
+            permissions = app.screen
+            assert isinstance(permissions, PermissionsScreen)
+            assert permissions._source_id == source.id
+            assert "Managed source" in str(
+                permissions.query_one("#perm-body", Static).content
+            )
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, CatalogScreen)
+            assert await pilot.click("#source-detach") is True
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("n")
+            await pilot.pause()
+            assert isinstance(app.screen, CatalogScreen)
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert isinstance(app.screen, ChatScreen)
             app.exit(0)
     finally:
         await opened.close()
@@ -523,7 +604,7 @@ async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
             refresh_notice = app.screen.query_one("#catalog-notice", Static)
             assert str(refresh_notice.content) == (
                 "Catalog refresh completed, but found no resources · Empty source · "
-                "use /source edit to review its schemas or path"
+                "open /sources and choose Edit to review its schemas or path"
             )
             assert refresh_notice.has_class("-warning") is True
             tree = app.screen.query_one("#catalog-tree", Tree)

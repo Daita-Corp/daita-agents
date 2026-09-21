@@ -155,6 +155,8 @@ class ComposerCompletionMoved(Message):
 class CompletionPopup(Static):
     """Contextual slash, skill, and source completions."""
 
+    MAX_MATCHES = 100
+
     matches: reactive[tuple[tuple[str, str, str], ...]] = reactive(())
 
     def compose(self):
@@ -168,7 +170,7 @@ class CompletionPopup(Static):
     def update_matches(self, matches: tuple[tuple[str, str, str], ...]) -> None:
         listing = self.query_one(OptionList)
         listing.clear_options()
-        self.matches = matches[:12]
+        self.matches = matches[: self.MAX_MATCHES]
         for index, (_insertion, shown, description) in enumerate(self.matches):
             label = Text(
                 sanitize_terminal_text(

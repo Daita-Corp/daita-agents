@@ -75,7 +75,6 @@ from .commands import (
 )
 from .models import (
     PROVIDERS,
-    SOURCE_TYPE_LABELS,
     CommandOutcome,
     UserInputError,
     parse_candidate_review_cost_limit,
@@ -954,8 +953,8 @@ class PresentationController:
             )
         if name == "/sources" and len(parts) == 1:
             return CommandOutcome(
-                "notice",
-                await self._sources_text(),
+                "screen",
+                screen="catalog",
                 conversation_id=conversation_id,
             )
         if name == "/mcp":
@@ -1070,7 +1069,7 @@ class PresentationController:
                 message = (
                     "Catalog refresh completed, but found no resources · "
                     + safe_display(refreshed.display_name, fallback="source")
-                    + " · use /source edit to review its schemas or path"
+                    + " · open /sources and choose Edit to review its schemas or path"
                 )
             return CommandOutcome(
                 "screen",
@@ -1695,20 +1694,6 @@ class PresentationController:
         except Exception:
             pass
         return tuple(notices)
-
-    async def _sources_text(self) -> str:
-        sources = await self.list_sources()
-        if not sources:
-            return "Sources\n  (none)"
-        lines = ["Sources"]
-        for source in sources:
-            label = SOURCE_TYPE_LABELS.get(source.adapter_id, source.adapter_id)
-            state = "active" if source.active else "inactive"
-            lines.append(
-                f"  {safe_display(source.display_name, fallback='source')} "
-                f"({label}, {state}) [{source.id}]"
-            )
-        return "\n".join(lines)
 
     def _settings_text(self) -> str:
         agent = self.require_agent()

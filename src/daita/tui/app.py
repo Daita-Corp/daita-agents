@@ -42,8 +42,8 @@ from .models import (
 )
 from .observer import ObserverEvent, RunObserver
 from .projection import CAPABILITY_LABELS, project_conversation
-from .sanitization import render_model_answer, sanitize_terminal_text
-from .screens.catalog import CatalogScreen
+from .sanitization import render_model_answer, safe_display, sanitize_terminal_text
+from .screens.catalog import CatalogScreen, SourceManagerAction
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
 from .screens.editing import ReviewCostScreen, SkillNameScreen
@@ -384,7 +384,9 @@ class DaitaApp(App[int]):
         else:
             source_status = f"Sources: {len(sources)} admitted"
             if (await self.controller.catalog_summary()).is_empty:
-                setup_guidance.append("catalog has 0 resources · use /source edit")
+                setup_guidance.append(
+                    "catalog has 0 resources · open /sources and choose Edit"
+                )
         status = "  ·  ".join((workspace_status, source_status, *setup_guidance))
         chat.show_notice(status)
 
@@ -713,7 +715,9 @@ class DaitaApp(App[int]):
             await self._show_home_guidance()
             return
         if screen_name == "source_edit":
-            changed = await self._await_modal(SourceEditScreen())
+            changed = await self._await_modal(
+                SourceEditScreen(source_id=payload.get("source_id"))
+            )
             if changed:
                 self.controller.conversation_id = None
                 self._reset_context_usage()
@@ -723,7 +727,10 @@ class DaitaApp(App[int]):
                     summary = await self.controller.catalog_summary()
                     notice = "Source connection updated. Started a new conversation."
                     if summary.is_empty:
-                        notice += " Catalog contains 0 resources; use /source edit to correct its scope."
+                        notice += (
+                            " Catalog contains 0 resources; open /sources and choose "
+                            "Edit to correct its scope."
+                        )
                     chat.show_notice(notice)
             else:
                 await self._show_home_guidance()
@@ -741,7 +748,9 @@ class DaitaApp(App[int]):
             await self._show_home_guidance()
             return
         if screen_name == "permissions":
-            await self._await_modal(PermissionsScreen())
+            await self._await_modal(
+                PermissionsScreen(source_id=payload.get("source_id"))
+            )
             return
         if screen_name == "mcp_management":
             result = await self._await_modal(MCPManagementScreen())
@@ -763,30 +772,9 @@ class DaitaApp(App[int]):
             await self.refresh_background_status(notify_new=False)
             return
         if screen_name == "catalog":
-            sources = tuple(
-                source
-                for source in await self.controller.list_sources()
-                if source.active
-            )
-            resource_groups = await asyncio.gather(
-                *(
-                    self.controller.list_catalog_resources(source_id=source.id)
-                    for source in sources
-                )
-            )
-            resources = tuple(
-                resource
-                for source_resources in resource_groups
-                for resource in source_resources
-            )
-            await self._await_modal(
-                CatalogScreen(
-                    summary=await self.controller.catalog_summary(),
-                    sources=sources,
-                    resources=resources,
-                    notice=message,
-                    notice_warning=bool(payload.get("catalog_notice_warning", False)),
-                )
+            await self._manage_sources(
+                notice=message,
+                notice_warning=bool(payload.get("catalog_notice_warning", False)),
             )
             if message:
                 chat = self.chat()
@@ -876,6 +864,150 @@ class DaitaApp(App[int]):
                         f"{'deleted' if deleted else 'not found'}."
                     )
             return
+
+    async def _manage_sources(
+        self,
+        *,
+        notice: str = "",
+        notice_warning: bool = False,
+    ) -> None:
+        selected_source_id: str | None = None
+        while True:
+            sources = tuple(
+                source
+                for source in await self.controller.list_sources()
+                if source.active
+            )
+            resources_by_source = await asyncio.gather(
+                *(
+                    self.controller.list_catalog_resources(source_id=source.id)
+                    for source in sources
+                )
+            )
+            resources = tuple(
+                resource
+                for source_resources in resources_by_source
+                for resource in source_resources
+            )
+            action = await self._await_modal(
+                CatalogScreen(
+                    summary=await self.controller.catalog_summary(),
+                    sources=sources,
+                    resources=resources,
+                    notice=notice,
+                    notice_warning=notice_warning,
+                    initial_source_id=selected_source_id,
+                )
+            )
+            notice = ""
+            notice_warning = False
+            if action is None:
+                return
+            if not isinstance(action, SourceManagerAction):
+                raise RuntimeError("invalid source manager action")
+            selected_source_id = action.source_id
+
+            if action.kind == "add":
+                if await self._await_modal(SourceSetupScreen()):
+                    notice = "Source attached."
+                    await self._refresh_status()
+                continue
+
+            source = next(
+                (item for item in sources if item.id == selected_source_id),
+                None,
+            )
+            if source is None or selected_source_id is None:
+                notice = "The selected source is no longer active."
+                notice_warning = True
+                selected_source_id = None
+                continue
+
+            if action.kind == "refresh":
+                try:
+                    refreshed = await self.controller.refresh_source(selected_source_id)
+                    refreshed_resources = await self.controller.list_catalog_resources(
+                        source_id=refreshed.id
+                    )
+                except (UserInputError, ValueError, RuntimeError, OSError) as error:
+                    notice = sanitize_terminal_text(
+                        str(error),
+                        maximum=512,
+                        preserve_lines=False,
+                        fallback="Source refresh failed.",
+                    )
+                    notice_warning = True
+                    continue
+                noun = "resource" if len(refreshed_resources) == 1 else "resources"
+                if refreshed_resources:
+                    notice = (
+                        "Catalog refresh succeeded · "
+                        + safe_display(
+                            refreshed.display_name,
+                            fallback="source",
+                        )
+                        + f" · {len(refreshed_resources)} {noun}"
+                    )
+                else:
+                    notice = (
+                        "Catalog refresh completed, but found no resources · "
+                        + safe_display(
+                            refreshed.display_name,
+                            fallback="source",
+                        )
+                        + " · choose Edit to review its schemas or path"
+                    )
+                    notice_warning = True
+                continue
+
+            if action.kind == "edit":
+                changed = await self._await_modal(
+                    SourceEditScreen(source_id=selected_source_id)
+                )
+                if changed:
+                    self.controller.conversation_id = None
+                    self._reset_context_usage()
+                    await self._replace_conversation_transcript()
+                    notice = "Source connection updated. Started a new conversation."
+                    await self._refresh_status()
+                continue
+
+            if action.kind == "permissions":
+                changed = await self._await_modal(
+                    PermissionsScreen(source_id=selected_source_id)
+                )
+                if changed:
+                    notice = "Source permissions updated."
+                continue
+
+            if action.kind == "detach":
+                accepted = await self._await_modal(
+                    ConfirmScreen(
+                        "Detach "
+                        + safe_display(
+                            source.display_name,
+                            fallback="this source",
+                        )
+                        + " and delete its Daita-owned credential?"
+                    )
+                )
+                if accepted:
+                    await self.controller.detach_source(selected_source_id)
+                    self.controller.conversation_id = None
+                    self._reset_context_usage()
+                    await self._replace_conversation_transcript()
+                    notice = (
+                        safe_display(
+                            source.display_name,
+                            fallback="Source",
+                        )
+                        + " detached. Started a new conversation."
+                    )
+                    selected_source_id = None
+                    await self._refresh_status()
+                continue
+
+            raise RuntimeError("unknown source manager action")
 
     async def _complete_mcp_screen(self, result: str | None) -> None:
         chat = self.chat()
