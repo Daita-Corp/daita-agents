@@ -476,7 +476,7 @@ class DataQueryExecutor:
         postgresql_backend: PostgreSQLReadBackend,
         *,
         max_rows: int = 100,
-        max_bytes: int = 65_536,
+        max_bytes: int = 16_384,
     ) -> None:
         self._agent_id = agent_id
         self._backends: dict[str, SqlReadBackend] = {

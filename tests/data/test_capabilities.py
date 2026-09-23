@@ -332,15 +332,24 @@ async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:
 
 
 class _ReadBackend:
-    def __init__(self, adapter_id: str) -> None:
+    def __init__(
+        self,
+        adapter_id: str,
+        rows: tuple[dict[str, object], ...] = ({"id": 1},),
+    ) -> None:
         self.adapter_id = adapter_id
+        self.rows = rows
         self.calls = 0
 
     async def execute_read(self, **arguments: object):
         self.calls += 1
         source_id = str(arguments["source_id"])
         resource_id = f"resource-{self.adapter_id}"
-        projection = project_result_rows(({"id": 1},), max_rows=100, max_bytes=65_536)
+        projection = project_result_rows(
+            self.rows,
+            max_rows=int(arguments["max_rows"]),
+            max_bytes=int(arguments["max_bytes"]),
+        )
         result_type = (
             PostgreSQLReadResult
             if self.adapter_id == "postgresql"
@@ -381,10 +390,36 @@ async def test_data_query_routes_each_catalog_binding_to_exactly_one_backend() -
         assert output.data["adapter_id"] == adapter_id
         assert output.data["resource_ids"] == (f"resource-{adapter_id}",)
         assert output.data["row_limit"] == 100
-        assert output.data["byte_limit"] == 65_536
+        assert output.data["byte_limit"] == 16_384
 
     assert sqlite.calls == 1
     assert postgresql.calls == 1
+
+
+async def test_data_query_inline_byte_limit_reports_truncation() -> None:
+    rows = tuple({"id": index, "detail": "x" * 1_000} for index in range(100))
+    sqlite = _ReadBackend("sqlite", rows)
+    executor = DataQueryExecutor("agent-relational", sqlite, _ReadBackend("postgresql"))
+
+    output = await executor.execute(
+        ToolExecution(
+            run_id="run-relational",
+            call_id="call-sqlite",
+            capability_id=DATA_QUERY_CAPABILITY_ID,
+            arguments={
+                "source_id": "source-sqlite",
+                "resource_ids": ("resource-sqlite",),
+                "sql": "SELECT id, detail FROM items",
+                "_adapter_id": "sqlite",
+            },
+        )
+    )
+
+    assert output.data["byte_limit"] == 16_384
+    assert output.data["truncated"] is True
+    assert output.data["truncation_reasons"] == ("byte_limit",)
+    assert 0 < output.data["returned_rows"] < len(rows)
+    assert output.data["utf8_bytes"] <= output.data["byte_limit"]
 
 
 class _ExportBackend:

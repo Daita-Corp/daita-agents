@@ -19,6 +19,7 @@ from .._json import FrozenJsonObject, canonical_json
 from .models import (
     CATALOG_MATCH_CANDIDATE_BINDING_LIMIT,
     CATALOG_MAX_LIMIT,
+    CATALOG_SCHEMA_MAX_RELATIONSHIPS,
     CATALOG_TRAVERSAL_MAX_EDGES,
     CATALOG_TRAVERSAL_MAX_NODES,
     CATALOG_TRAVERSAL_MAX_PATHS,
@@ -57,7 +58,7 @@ if TYPE_CHECKING:
 _INSPECT_INCIDENT_RELATIONSHIP_LIMIT = 50
 _SCHEMA_COLUMN_LIMIT = 256
 _SCHEMA_KEY_LIMIT = 64
-_SCHEMA_RELATIONSHIP_LIMIT = 200
+_SCHEMA_RELATIONSHIP_LIMIT = CATALOG_SCHEMA_MAX_RELATIONSHIPS
 _SCHEMA_STRUCTURAL_FACT_LIMIT = 32
 _SCHEMA_JOIN_MAX_EDGES = CATALOG_TRAVERSAL_MAX_EDGES
 _SCHEMA_JOIN_MAX_NODES = CATALOG_TRAVERSAL_MAX_NODES
@@ -1329,19 +1330,24 @@ class CatalogService:
                         or edge.neighbor_resource_id in selected_resources
                     )
                 )
-            relationships = tuple(
-                sorted(
-                    (
-                        relationships_by_id[relationship_id]
-                        for relationship_id in selected_relationship_ids
-                    ),
-                    key=lambda item: item.id,
-                )
+            # Preserve every selected join path before optional adjacent edges.
+            # A compact tool projection must not point at an omitted relationship.
+            required_ids = set(join_selection.relationship_ids)
+            ordered_ids = (
+                *sorted(required_ids),
+                *sorted(selected_relationship_ids - required_ids),
             )
-            if len(relationships) > _SCHEMA_RELATIONSHIP_LIMIT:
+            relationship_limit = max(
+                len(required_ids),
+                min(request.relationship_limit, _SCHEMA_RELATIONSHIP_LIMIT),
+            )
+            relationships = tuple(
+                relationships_by_id[relationship_id] for relationship_id in ordered_ids
+            )
+            if len(relationships) > relationship_limit:
                 relationships_truncated = True
             selected_ids = set(selected_resources)
-            for relationship in relationships[:_SCHEMA_RELATIONSHIP_LIMIT]:
+            for relationship in relationships[:relationship_limit]:
                 from_resource, to_resource = self._snapshot_relationship_endpoints(
                     relationship,
                     resources_by_id,
@@ -1450,7 +1456,11 @@ class CatalogService:
                 "bounds": {
                     "columns_per_resource": _SCHEMA_COLUMN_LIMIT,
                     "primary_key_fields_per_resource": _SCHEMA_KEY_LIMIT,
-                    "relationships": _SCHEMA_RELATIONSHIP_LIMIT,
+                    "relationships": (
+                        relationship_limit
+                        if request.include_relationships
+                        else request.relationship_limit
+                    ),
                     "resources": request.limit,
                     "join_depth": request.max_join_depth,
                     "join_graph_edges": _SCHEMA_JOIN_MAX_EDGES,
