@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "1.1.0"
-description = "A transcript driven data agent"
+version = "1.1.1"
+description = "A persistent data agent for grounded analysis and controlled automation across databases, files, and connected tools"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 license = "MIT"
