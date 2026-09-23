@@ -187,6 +187,27 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             assert "Writing answer" in str(activity.content)
             assert "Streaming answer" in chat.query_one(TranscriptView).copy_text()
 
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
+                        kind=AgentEventKind.MODEL_TEXT_DELTA,
+                        occurred_at=datetime.now(UTC),
+                        run_id="run-live",
+                        conversation_id="conversation-live",
+                        data=FrozenJsonObject.from_mapping(
+                            {"model_call_index": 1, "text": " with **details**"}
+                        ),
+                    )
+                )
+            )
+            await pilot.pause()
+            transcript = chat.query_one(TranscriptView)
+            assert "Streaming answer with **details**" in transcript.copy_text()
+            assert (
+                transcript.query_one("#block-assistant-partial", Static).content
+                == "Streaming answer with **details**"
+            )
+
             completed = AgentEvent(
                 kind=AgentEventKind.MODEL_COMPLETED,
                 occurred_at=datetime.now(UTC),

@@ -57,7 +57,8 @@ class TranscriptView(VerticalScroll):
                 widget.update(sanitize_markdown(text))
                 self._maybe_follow()
                 return
-        self.append_block(TranscriptBlock("assistant", identity, text))
+        # Stream through Static; the settled transcript mounts Markdown once.
+        self.append_block(TranscriptBlock("assistant_partial", identity, text))
 
     def remove_block(self, identity: str) -> None:
         self._blocks = [block for block in self._blocks if block.identity != identity]
