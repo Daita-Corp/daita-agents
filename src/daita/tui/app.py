@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import traceback
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -1436,4 +1438,14 @@ async def run_daita_app(
     result = await app.run_async()
     if app._startup_error is not None:
         raise app._startup_error
+    if app.return_code not in (None, 0):
+        print("Daita terminal UI failed:", file=sys.stderr)
+        # Textual captures message-handler exceptions instead of raising them
+        # from run_async(). Print the original traceback after terminal restore.
+        error = getattr(app, "_exception", None)
+        if isinstance(error, BaseException):
+            traceback.print_exception(error, file=sys.stderr)
+        else:
+            print(f"Textual exit code: {app.return_code}", file=sys.stderr)
+        return app.return_code
     return 0 if result is None else int(result)

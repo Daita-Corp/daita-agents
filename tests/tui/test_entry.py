@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from daita import Agent
-from daita.tui.app import DaitaApp
+from daita.tui.app import DaitaApp, run_daita_app
 from daita.tui.screens.onboarding import AgentCreateScreen
 from tests.support.workspace import workspace_for
 
@@ -56,6 +56,53 @@ async def test_run_terminal_application_constructs_textual_app(
     assert seen["root"] == tmp_path
     assert seen["agent_name"] == "atlas"
     assert seen["conversation_id"] == "conversation-1"
+
+
+async def test_tui_fatal_error_preserves_exit_code_and_traceback(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from daita.tui import app as app_module
+
+    try:
+        raise RuntimeError("sentinel fatal UI error")
+    except RuntimeError as error:
+        captured_error = error
+
+    class FailedApp:
+        return_code = 1
+        _startup_error = None
+        _exception = captured_error
+
+        async def run_async(self):
+            return None
+
+    monkeypatch.setattr(app_module, "DaitaApp", lambda **kwargs: FailedApp())
+    code = await run_daita_app(root=tmp_path, workspace=workspace_for(tmp_path))
+    output = capsys.readouterr()
+    assert code == 1
+    assert "Daita terminal UI failed:" in output.err
+    assert "test_tui_fatal_error_preserves_exit_code_and_traceback" in output.err
+    assert "RuntimeError: sentinel fatal UI error" in output.err
+
+
+async def test_tui_nonzero_exit_without_exception_is_not_reported_as_success(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    from daita.tui import app as app_module
+
+    class FailedApp:
+        return_code = 2
+        _startup_error = None
+        _exception = None
+
+        async def run_async(self):
+            return None
+
+    monkeypatch.setattr(app_module, "DaitaApp", lambda **kwargs: FailedApp())
+    code = await run_daita_app(root=tmp_path, workspace=workspace_for(tmp_path))
+    output = capsys.readouterr()
+    assert code == 2
+    assert "Textual exit code: 2" in output.err
 
 
 async def test_requested_conversation_is_validated_and_resumed(
