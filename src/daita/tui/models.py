@@ -49,9 +49,9 @@ class ModelSuggestion:
     recommendation: str | None = None
 
 
-# Curated current-model picker, reviewed 2026-09-22 against the vendors'
-# official model catalogs. Runtime adapters continue to accept explicit model
-# IDs where the provider contract permits them.
+# Curated model picker, reviewed 2026-09-22 against the vendors' official
+# model catalogs. Runtime adapters continue to accept explicit model IDs
+# where the provider contract permits them.
 MODEL_SUGGESTIONS = {
     "openai": (
         ModelSuggestion(
@@ -74,6 +74,24 @@ MODEL_SUGGESTIONS = {
             "GPT-6 Luna",
             "Efficient model for focused high-volume tasks",
             "Fast",
+        ),
+        ModelSuggestion(
+            "openai",
+            "gpt-5.6-sol",
+            "GPT-5.6 Sol",
+            "Frontier capability for complex data-agent work",
+        ),
+        ModelSuggestion(
+            "openai",
+            "gpt-5.6-terra",
+            "GPT-5.6 Terra",
+            "Balanced intelligence and cost for everyday workflows",
+        ),
+        ModelSuggestion(
+            "openai",
+            "gpt-5.6-luna",
+            "GPT-5.6 Luna",
+            "Efficient model for high-volume bounded tasks",
         ),
     ),
     "anthropic": (
@@ -105,6 +123,12 @@ MODEL_SUGGESTIONS = {
             "Low-latency near-frontier model",
             "Fast",
         ),
+        ModelSuggestion(
+            "anthropic",
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            "Earlier Opus model for complex agentic work",
+        ),
     ),
     "codex": (
         ModelSuggestion(
@@ -127,6 +151,24 @@ MODEL_SUGGESTIONS = {
             "GPT-6 Luna",
             "Efficient Codex model through Daita's ChatGPT connection",
             "Fast",
+        ),
+        ModelSuggestion(
+            "codex",
+            "gpt-5.6-sol",
+            "GPT-5.6 Sol",
+            "Use GPT-5.6 Sol through Daita's ChatGPT connection",
+        ),
+        ModelSuggestion(
+            "codex",
+            "gpt-5.6-terra",
+            "GPT-5.6 Terra",
+            "Use GPT-5.6 Terra through Daita's ChatGPT connection",
+        ),
+        ModelSuggestion(
+            "codex",
+            "gpt-5.6-luna",
+            "GPT-5.6 Luna",
+            "Use GPT-5.6 Luna through Daita's ChatGPT connection",
         ),
     ),
     "claude-code": (
@@ -158,6 +200,12 @@ MODEL_SUGGESTIONS = {
             "Low-latency work through the signed-in Claude Code client",
             "Fast",
         ),
+        ModelSuggestion(
+            "claude-code",
+            "claude-opus-4-8",
+            "Claude Opus 4.8",
+            "Earlier Opus model through the signed-in Claude Code client",
+        ),
     ),
     "grok-build": (
         ModelSuggestion(
@@ -166,6 +214,12 @@ MODEL_SUGGESTIONS = {
             "Grok 4.7",
             "Use Grok 4.7 through an existing Grok Build subscription login",
             "Recommended",
+        ),
+        ModelSuggestion(
+            "grok-build",
+            "grok-4.5",
+            "Grok 4.5",
+            "Use Grok 4.5 through an existing Grok Build subscription login",
         ),
     ),
     "gemini": (
@@ -185,6 +239,18 @@ MODEL_SUGGESTIONS = {
         ),
         ModelSuggestion(
             "gemini",
+            "gemini-3.6-flash",
+            "Gemini 3.6 Flash",
+            "Stable model for general agentic and everyday tasks",
+        ),
+        ModelSuggestion(
+            "gemini",
+            "gemini-3.5-flash",
+            "Gemini 3.5 Flash",
+            "Stable model for sustained agent and coding tasks",
+        ),
+        ModelSuggestion(
+            "gemini",
             "gemini-3.5-flash-lite",
             "Gemini 3.5 Flash-Lite",
             "Low-latency model for high-volume agent tasks",
@@ -199,6 +265,12 @@ MODEL_SUGGESTIONS = {
             "Agentic tool calling for general and code workflows",
             "Recommended",
         ),
+        ModelSuggestion(
+            "grok",
+            "grok-4.5",
+            "Grok 4.5",
+            "Agentic tool calling for software and engineering tasks",
+        ),
     ),
     "ollama": (
         ModelSuggestion(
@@ -207,6 +279,12 @@ MODEL_SUGGESTIONS = {
             "Qwen 3.8",
             "Current local model with tool, vision, and reasoning support",
             "Recommended",
+        ),
+        ModelSuggestion(
+            "ollama",
+            "qwen3",
+            "Qwen 3",
+            "Local model with tool and reasoning support",
         ),
         ModelSuggestion(
             "ollama",
