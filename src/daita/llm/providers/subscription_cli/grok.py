@@ -74,7 +74,7 @@ _GROK_REQUIRED_HELP_TOKENS = frozenset(
 )
 
 
-_GROK_BUILTIN_MODELS = frozenset({"grok-4.5"})
+_GROK_BUILTIN_MODELS = frozenset({"grok-4.5", "grok-4.7"})
 
 
 _GROK_DENIED_TOOLS = ",".join(

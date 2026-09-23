@@ -49,44 +49,54 @@ class ModelSuggestion:
     recommendation: str | None = None
 
 
+# Curated current-model picker, reviewed 2026-09-22 against the vendors'
+# official model catalogs. Runtime adapters continue to accept explicit model
+# IDs where the provider contract permits them.
 MODEL_SUGGESTIONS = {
     "openai": (
         ModelSuggestion(
             "openai",
-            "gpt-5.6-sol",
-            "GPT-5.6 Sol",
-            "Frontier capability for complex data-agent work",
+            "gpt-6-astra",
+            "GPT-6 Astra",
+            "Highest capability for difficult end-to-end data-agent work",
             "Recommended",
         ),
         ModelSuggestion(
             "openai",
-            "gpt-5.6-terra",
-            "GPT-5.6 Terra",
-            "Balanced intelligence and cost for everyday workflows",
+            "gpt-6-sol",
+            "GPT-6 Sol",
+            "Complex coding and agentic workflows at balanced cost",
             "Balanced",
         ),
         ModelSuggestion(
             "openai",
-            "gpt-5.6-luna",
-            "GPT-5.6 Luna",
-            "Efficient model for high-volume bounded tasks",
+            "gpt-6-luna",
+            "GPT-6 Luna",
+            "Efficient model for focused high-volume tasks",
             "Fast",
         ),
     ),
     "anthropic": (
         ModelSuggestion(
             "anthropic",
-            "claude-opus-4-8",
-            "Claude Opus 4.8",
-            "Complex agentic and enterprise work",
-            "Strong",
+            "claude-opus-5-5",
+            "Claude Opus 5.5",
+            "Top-tier coding, agents, and complex enterprise work",
+            "Recommended",
+        ),
+        ModelSuggestion(
+            "anthropic",
+            "claude-fable-5-1",
+            "Claude Fable 5.1",
+            "Highest-capability Claude model for difficult reasoning",
+            "Frontier",
         ),
         ModelSuggestion(
             "anthropic",
             "claude-sonnet-5",
             "Claude Sonnet 5",
             "Fast balance of speed and intelligence",
-            "Recommended",
+            "Balanced",
         ),
         ModelSuggestion(
             "anthropic",
@@ -99,22 +109,22 @@ MODEL_SUGGESTIONS = {
     "codex": (
         ModelSuggestion(
             "codex",
-            "gpt-5.6-sol",
-            "GPT-5.6 Sol",
+            "gpt-6-astra",
+            "GPT-6 Astra",
             "Connect ChatGPT to Daita and use the subscription allowance",
             "Recommended",
         ),
         ModelSuggestion(
             "codex",
-            "gpt-5.6-terra",
-            "GPT-5.6 Terra",
+            "gpt-6-sol",
+            "GPT-6 Sol",
             "Balanced Codex model through Daita's ChatGPT connection",
             "Balanced",
         ),
         ModelSuggestion(
             "codex",
-            "gpt-5.6-luna",
-            "GPT-5.6 Luna",
+            "gpt-6-luna",
+            "GPT-6 Luna",
             "Efficient Codex model through Daita's ChatGPT connection",
             "Fast",
         ),
@@ -122,17 +132,24 @@ MODEL_SUGGESTIONS = {
     "claude-code": (
         ModelSuggestion(
             "claude-code",
-            "claude-sonnet-5",
-            "Claude Sonnet 5",
+            "claude-opus-5-5",
+            "Claude Opus 5.5",
             "Use Claude through an existing Claude Code subscription login",
             "Recommended",
         ),
         ModelSuggestion(
             "claude-code",
-            "claude-opus-4-8",
-            "Claude Opus 4.8",
+            "claude-fable-5-1",
+            "Claude Fable 5.1",
             "Complex work through the signed-in Claude Code client",
-            "Strong",
+            "Frontier",
+        ),
+        ModelSuggestion(
+            "claude-code",
+            "claude-sonnet-5",
+            "Claude Sonnet 5",
+            "Balanced work through the signed-in Claude Code client",
+            "Balanced",
         ),
         ModelSuggestion(
             "claude-code",
@@ -145,25 +162,25 @@ MODEL_SUGGESTIONS = {
     "grok-build": (
         ModelSuggestion(
             "grok-build",
-            "grok-4.5",
-            "Grok 4.5",
-            "Use Grok 4.5 through an existing Grok Build subscription login",
+            "grok-4.7",
+            "Grok 4.7",
+            "Use Grok 4.7 through an existing Grok Build subscription login",
             "Recommended",
         ),
     ),
     "gemini": (
         ModelSuggestion(
             "gemini",
-            "gemini-3.6-flash",
-            "Gemini 3.6 Flash",
-            "Stable agentic model balancing speed and intelligence",
+            "gemini-3.8-flash",
+            "Gemini 3.8 Flash",
+            "Latest stable model for agentic and multimodal workflows",
             "Recommended",
         ),
         ModelSuggestion(
             "gemini",
-            "gemini-3.5-flash",
-            "Gemini 3.5 Flash",
-            "Sustained performance for long-running agent work",
+            "gemini-3.7-flash",
+            "Gemini 3.7 Flash",
+            "Stable balance of speed and intelligence for agent work",
             "Strong",
         ),
         ModelSuggestion(
@@ -177,8 +194,8 @@ MODEL_SUGGESTIONS = {
     "grok": (
         ModelSuggestion(
             "grok",
-            "grok-4.5",
-            "Grok 4.5",
+            "grok-4.7",
+            "Grok 4.7",
             "Agentic tool calling for general and code workflows",
             "Recommended",
         ),
@@ -186,9 +203,9 @@ MODEL_SUGGESTIONS = {
     "ollama": (
         ModelSuggestion(
             "ollama",
-            "qwen3",
-            "Qwen 3",
-            "Common local model with tool and reasoning support",
+            "qwen3.8",
+            "Qwen 3.8",
+            "Current local model with tool, vision, and reasoning support",
             "Recommended",
         ),
         ModelSuggestion(

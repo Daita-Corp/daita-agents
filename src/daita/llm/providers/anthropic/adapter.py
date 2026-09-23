@@ -678,7 +678,12 @@ class AnthropicMessagesProvider:
                 cost_estimate=CostEstimate.unavailable("billing_dimensions_incomplete"),
             )
         qualifiers = {"service_tier": billing.service_tier}
-        if response_model in {"claude-opus-4-8", "claude-sonnet-5"}:
+        if response_model in {
+            "claude-fable-5-1",
+            "claude-opus-4-8",
+            "claude-opus-5-5",
+            "claude-sonnet-5",
+        }:
             if billing.inference_geo is None:
                 return replace(
                     usage,

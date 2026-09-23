@@ -49,6 +49,7 @@ from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.storage.sqlite import SQLiteStateStore
 
 NOW = datetime(2026, 7, 26, 12, tzinfo=UTC)
+CURRENT_NOW = datetime(2026, 9, 22, 12, tzinfo=UTC)
 SOURCE = PricingSource(
     purpose="rates",
     url="https://example.com/pricing",
@@ -139,6 +140,7 @@ def _calculate_openai(
     cache_read: int,
     cache_write: int,
     output: int,
+    requested_at: datetime = NOW,
 ):
     assert uncached + cache_read + cache_write == input_tokens
     return calculate_cost_estimate(
@@ -146,7 +148,7 @@ def _calculate_openai(
         provider="openai",
         model=model,
         endpoint="responses",
-        requested_at=NOW,
+        requested_at=requested_at,
         qualifiers={"service_tier": "default", "region": "global"},
         usage_values={"request_input_tokens": Decimal(input_tokens)},
         quantities=(
@@ -188,7 +190,7 @@ def test_bundled_schedule_file_is_bounded_packaged_and_official():
 
     assert schedule_file.is_file()
     assert 0 < len(data) <= 256 * 1_024
-    assert len(schedules) == 16
+    assert len(schedules) == 31
     assert {item.provider for item in schedules} == {
         "anthropic",
         "gemini",
@@ -196,14 +198,21 @@ def test_bundled_schedule_file_is_bounded_packaged_and_official():
     }
     assert {item.model for item in schedules} == {
         "claude-haiku-4-5-20251001",
+        "claude-fable-5-1",
         "claude-opus-4-8",
+        "claude-opus-5-5",
         "claude-sonnet-5",
         "gemini-3.5-flash",
         "gemini-3.5-flash-lite",
         "gemini-3.6-flash",
+        "gemini-3.7-flash",
+        "gemini-3.8-flash",
         "gpt-5.6-sol",
         "gpt-5.6-terra",
         "gpt-5.6-luna",
+        "gpt-6-astra",
+        "gpt-6-sol",
+        "gpt-6-luna",
     }
     assert {item.endpoint for item in schedules} == {
         "generate_content",
@@ -523,6 +532,51 @@ def test_openai_uncached_cache_and_output_arithmetic_is_auditable():
     }
 
 
+@pytest.mark.parametrize(
+    ("model", "short_amount", "long_amount"),
+    (
+        ("gpt-6-astra", Decimal("6.725"), Decimal("12.2")),
+        ("gpt-6-sol", Decimal("1.345"), Decimal("2.44")),
+        ("gpt-6-luna", Decimal("0.06725"), Decimal("0.122")),
+    ),
+)
+def test_current_openai_models_have_complete_short_and_long_pricing(
+    model: str,
+    short_amount: Decimal,
+    long_amount: Decimal,
+):
+    short = _calculate_openai(
+        model=model,
+        input_tokens=250_000,
+        uncached=100_000,
+        cache_read=100_000,
+        cache_write=50_000,
+        output=100_000,
+        requested_at=CURRENT_NOW,
+    )
+    long = _calculate_openai(
+        model=model,
+        input_tokens=300_000,
+        uncached=100_000,
+        cache_read=100_000,
+        cache_write=100_000,
+        output=100_000,
+        requested_at=CURRENT_NOW,
+    )
+
+    assert short.status is CostEstimateStatus.COMPLETE
+    assert long.status is CostEstimateStatus.COMPLETE
+    assert short.amount_usd == short_amount
+    assert long.amount_usd == long_amount
+    assert short.rate_schedule_id is not None
+    assert long.rate_schedule_id is not None
+    assert ".short." in short.rate_schedule_id
+    assert ".long." in long.rate_schedule_id
+    assert OpenAIProvider(model, clock=lambda: CURRENT_NOW).has_complete_pricing(
+        _request()
+    )
+
+
 def test_openai_reasoning_is_an_output_subset_and_is_not_double_counted():
     usage = decode_openai_usage(
         {
@@ -797,7 +851,15 @@ def test_configured_contract_schedule_uses_the_validated_public_shape():
     document = _bundled_document()
     schedules = document["schedules"]
     assert isinstance(schedules, list)
-    configured = copy.deepcopy(schedules[0])
+    configured = copy.deepcopy(
+        next(
+            schedule
+            for schedule in schedules
+            if isinstance(schedule, dict)
+            and schedule.get("schedule_id")
+            == "openai.responses.gpt-5.6-sol.default.global.short.2026-07-26"
+        )
+    )
     assert isinstance(configured, dict)
     configured["schedule_id"] = "customer.responses.exact-model.2026-q3"
     configured["basis"] = "configured_contract"
@@ -1085,7 +1147,7 @@ def test_anthropic_sonnet_transition_haiku_and_unknown_dimensions_fail_closed():
         requested_at=datetime(2026, 9, 1, tzinfo=UTC),
     )
     assert introductory.usage.cost_estimate.amount_usd == Decimal("12")
-    assert standard.usage.cost_estimate.amount_usd == Decimal("18")
+    assert standard.usage.cost_estimate.amount_usd == Decimal("12")
 
     haiku = AnthropicProvider("claude-haiku-4-5-20251001", clock=lambda: NOW)
     haiku_response = _anthropic_response(
@@ -1128,14 +1190,47 @@ def test_anthropic_sonnet_transition_haiku_and_unknown_dimensions_fail_closed():
     )
 
 
+@pytest.mark.parametrize(
+    ("model", "global_amount", "us_amount"),
+    (
+        ("claude-opus-5-5", Decimal("7.32"), Decimal("8.052")),
+        ("claude-fable-5-1", Decimal("18.275"), Decimal("20.1025")),
+    ),
+)
+def test_current_anthropic_models_price_cache_ttls_and_residency(
+    model: str,
+    global_amount: Decimal,
+    us_amount: Decimal,
+):
+    provider = AnthropicProvider(model, clock=lambda: CURRENT_NOW)
+    global_response = provider._decode_response(  # noqa: SLF001
+        _anthropic_response(model=model),
+        requested_at=CURRENT_NOW,
+    )
+    us_response = provider._decode_response(  # noqa: SLF001
+        _anthropic_response(model=model, inference_geo="us"),
+        requested_at=CURRENT_NOW,
+    )
+
+    assert global_response.usage.cost_estimate.status is CostEstimateStatus.COMPLETE
+    assert global_response.usage.cost_estimate.amount_usd == global_amount
+    assert us_response.usage.cost_estimate.status is CostEstimateStatus.COMPLETE
+    assert us_response.usage.cost_estimate.amount_usd == us_amount
+    assert all(
+        component.modifiers == (PricingModifier("data_residency", Decimal("1.10")),)
+        for component in us_response.usage.cost_estimate.components
+    )
+
+
 def _gemini_response(
     *,
+    model: str = "gemini-3.6-flash",
     service_tier: str = "STANDARD",
     total_tokens: int = 1_160_000,
 ) -> dict[str, object]:
     return {
         "response_id": "response-1",
-        "model_version": "gemini-3.6-flash",
+        "model_version": model,
         "prompt_feedback": None,
         "candidates": [
             {
@@ -1168,7 +1263,7 @@ def test_gemini_standard_paid_list_estimate_includes_thinking_and_tool_use():
     assert decoded.usage.cache_read_tokens == 100_000
     assert decoded.usage.total_tokens == 1_160_000
     assert decoded.usage.cost_estimate.status is CostEstimateStatus.COMPLETE
-    assert decoded.usage.cost_estimate.amount_usd == Decimal("2.505")
+    assert decoded.usage.cost_estimate.amount_usd == Decimal("1.2525")
     assert provider.has_complete_pricing(_request()) is True
     pricing_dimensions = decoded.provider_metadata["pricing_dimensions"]
     assert isinstance(pricing_dimensions, Mapping)
@@ -1179,9 +1274,11 @@ def test_gemini_standard_paid_list_estimate_includes_thinking_and_tool_use():
 def test_gemini_exact_models_are_covered_but_aliases_and_other_tiers_are_not():
     request = _request()
     assert all(
-        GeminiProvider(model, clock=lambda: NOW).has_complete_pricing(request)
+        GeminiProvider(model, clock=lambda: CURRENT_NOW).has_complete_pricing(request)
         for model in (
             "gemini-3.6-flash",
+            "gemini-3.7-flash",
+            "gemini-3.8-flash",
             "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
         )
@@ -1231,6 +1328,25 @@ def test_gemini_exact_models_are_covered_but_aliases_and_other_tiers_are_not():
                 "candidates_token_count": 0,
             }
         )
+
+
+@pytest.mark.parametrize("model", ("gemini-3.7-flash", "gemini-3.8-flash"))
+def test_current_gemini_models_apply_introductory_and_standard_periods(model: str):
+    provider = GeminiProvider(model, clock=lambda: CURRENT_NOW)
+    response = _gemini_response(model=model)
+    introductory = provider._decode_response(  # noqa: SLF001
+        response,
+        requested_at=CURRENT_NOW,
+    )
+    standard = provider._decode_response(  # noqa: SLF001
+        response,
+        requested_at=datetime(2027, 1, 1, tzinfo=UTC),
+    )
+
+    assert introductory.usage.cost_estimate.status is CostEstimateStatus.COMPLETE
+    assert introductory.usage.cost_estimate.amount_usd == Decimal("1.2525")
+    assert standard.usage.cost_estimate.status is CostEstimateStatus.COMPLETE
+    assert standard.usage.cost_estimate.amount_usd == Decimal("2.505")
 
 
 def test_openai_concrete_response_model_overrides_request_alias():

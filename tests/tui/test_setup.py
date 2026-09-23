@@ -263,7 +263,12 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
         picker = app.screen
         assert isinstance(picker, SelectionScreen)
         listing = picker.query_one("#picker-options", OptionList)
-        assert await pilot.click(listing, offset=(2, 0)) is True
+        listing.highlighted = next(
+            index
+            for index in range(listing.option_count)
+            if str(listing.get_option_at_index(index).id) == "legacy-model"
+        )
+        picker.action_confirm()
 
         for _ in range(40):
             await pilot.pause(0.05)
@@ -627,8 +632,8 @@ async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
         assert app.screen is setup
         assert isinstance(setup, ModelSetupScreen)
         assert setup._provider == "openai"
-        assert setup._model == "gpt-5.6-sol"
-        assert setup.query_one("#model-id", Input).value == "gpt-5.6-sol"
+        assert setup._model == "gpt-6-astra"
+        assert setup.query_one("#model-id", Input).value == "gpt-6-astra"
         assert "OpenAI API" in str(setup.query_one("#choose-provider", Button).label)
         assert setup.query_one("#model-provider-id", Input).display is False
         assert setup.query_one("#model-secret", Input).display is True
