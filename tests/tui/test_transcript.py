@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from tests.tui._support import (
     MAX_CLIPBOARD_UTF8_BYTES,
     MAX_COMPOSER_CHARACTERS,
@@ -140,7 +142,37 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             context = chat.query_one("#context-window", Static)
             assert "ctx — / 32K" in str(context.content)
 
+            pending_run = asyncio.create_task(asyncio.sleep(3600))
+            app._run_task = pending_run
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
+                        kind=AgentEventKind.RUN_STARTED,
+                        occurred_at=datetime.now(UTC),
+                        run_id="run-live",
+                        conversation_id="conversation-live",
+                        data=FrozenJsonObject.from_mapping({"agent_id": opened.id}),
+                    )
+                )
+            )
             chat.set_activity("Thinking", restart=True)
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
+                        kind=AgentEventKind.TOOL_COMPLETED,
+                        occurred_at=datetime.now(UTC),
+                        run_id="run-background",
+                        conversation_id="conversation-live",
+                        data=FrozenJsonObject.from_mapping(
+                            {
+                                "tool_name": "internal:profile",
+                                "call_id": "call-background",
+                            }
+                        ),
+                    )
+                )
+            )
+            assert "Thinking" in str(activity.content)
             delta = AgentEvent(
                 kind=AgentEventKind.MODEL_TEXT_DELTA,
                 occurred_at=datetime.now(UTC),
@@ -226,6 +258,8 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             )
             await app.on_observer_event(ObserverEvent(run_completed))
             assert activity.display is False
+            pending_run.cancel()
+            await asyncio.gather(pending_run, return_exceptions=True)
             app.exit(0)
     finally:
         await opened.close()

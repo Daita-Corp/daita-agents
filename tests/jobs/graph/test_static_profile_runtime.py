@@ -3,13 +3,18 @@ from __future__ import annotations
 import asyncio
 import contextvars
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
 
+from daita.adapters.postgresql_query import PostgreSQLQueryError
+from daita.capabilities import CapabilityInputError
 from daita.cli import _graph_inspection_mapping
+from daita.domains.data.profile_jobs import DataProfileExecutor, ProfileResourceBinding
+from daita.domains.data.sql import validate_postgresql_read
 from daita.hosting.execution_governor import PermitKind
 from daita.jobs.graph.models import (
     AttemptState,
@@ -17,6 +22,8 @@ from daita.jobs.graph.models import (
     TaskRole,
     TaskState,
 )
+from daita.llm.models import ModelSensitivity
+from daita.observation import AgentEvent, AgentEventKind
 from daita.tui.screens.jobs import render_graph_inspection
 from tests.support.static_graph_integration import (
     AGENT_ID,
@@ -26,6 +33,127 @@ from tests.support.static_graph_integration import (
 )
 
 pytestmark = pytest.mark.integration
+
+
+async def test_postgresql_profile_read_uses_exact_qualified_catalog_identity() -> None:
+    catalog = StaticProfileCatalog((("source-a", "resource-a"),))
+    original = catalog.schemas[0]
+    schema = replace(original, name="tickets", aliases=("support.tickets",))
+    catalog.schemas = (schema,)
+    backend = ObservedReadBackend(catalog)
+    executor = DataProfileExecutor(
+        agent_id=AGENT_ID,
+        catalog=catalog,
+        sqlite_backend=backend,
+        postgresql_backend=backend,
+    )
+    assert schema.revision is not None
+    assert schema.source_revision is not None
+    binding = ProfileResourceBinding(
+        source_id=schema.source_id,
+        source_revision=schema.source_revision,
+        resource_id=schema.resource_id,
+        resource_revision=schema.revision,
+        adapter_id="postgresql",
+        sensitivity=ModelSensitivity.INTERNAL,
+    )
+    result = await executor._read(binding, schema, 100)
+    assert result.canonical_sql == 'SELECT * FROM "support"."tickets" LIMIT 100'
+    other_schema = replace(
+        schema,
+        resource_id="resource-b",
+        aliases=("archive.tickets",),
+        revision="sha256:" + "b" * 64,
+    )
+    validation = validate_postgresql_read(
+        result.canonical_sql,
+        source_id=schema.source_id,
+        resources=(schema, other_schema),
+        allowed_resource_ids=(schema.resource_id, other_schema.resource_id),
+    )
+    assert validation.valid
+    assert validation.resource_ids == (schema.resource_id,)
+
+
+async def test_postgresql_profile_admission_rejects_missing_qualified_identity(
+    tmp_path: Path,
+) -> None:
+    integration = await StaticGraphIntegration.open(
+        tmp_path, (("source-a", "resource-a"),)
+    )
+
+    async def postgresql_adapter(agent_id: str, source_id: str) -> str:
+        assert agent_id == AGENT_ID and source_id == "source-a"
+        return "postgresql"
+
+    integration.catalog.source_adapter_id = postgresql_adapter  # type: ignore[method-assign]
+    pg_schema = replace(
+        integration.catalog.schemas[0],
+        name="tickets",
+        aliases=("support.tickets",),
+    )
+    integration.catalog.schemas = (pg_schema,)
+    try:
+        bindings = await integration.admission._current_bindings(("resource-a",))
+        assert bindings[0].adapter_id == "postgresql"
+        integration.catalog.schemas = (replace(pg_schema, aliases=()),)
+        with pytest.raises(CapabilityInputError) as raised:
+            await integration.admission._current_bindings(("resource-a",))
+        assert raised.value.code == "data_profile_resource_stale"
+    finally:
+        await integration.close()
+
+
+async def test_deterministic_postgresql_failure_does_not_retry_graph_task(
+    tmp_path: Path,
+) -> None:
+    integration = await StaticGraphIntegration.open(
+        tmp_path, (("source-a", "resource-a"),)
+    )
+
+    async def reject_query(request):
+        del request
+        raise PostgreSQLQueryError(
+            "query_revalidation_failed",
+            "PostgreSQL query failed deterministic revalidation.",
+        )
+
+    integration.runtime.execute_internal = reject_query  # type: ignore[method-assign]
+    try:
+        admission = await integration.build(("resource-a",))
+        await integration.admit_and_start(admission)
+        terminal = await integration.wait_terminal(admission.job.job_id)
+        assert terminal.job.state is GraphState.FAILED
+        assert terminal.job.failure_code == "query_revalidation_failed"
+        assert len(terminal.attempts) == 1
+        assert terminal.attempts[0].state is AttemptState.FAILED
+    finally:
+        await integration.close()
+
+
+async def test_internal_graph_capability_events_keep_job_task_origin(
+    tmp_path: Path,
+) -> None:
+    integration = await StaticGraphIntegration.open(
+        tmp_path, (("source-a", "resource-a"),)
+    )
+    events: list[AgentEvent] = []
+    integration.runtime._observer = events.append
+    try:
+        admission = await integration.build(("resource-a",))
+        await integration.admit_and_start(admission)
+        terminal = await integration.wait_terminal(admission.job.job_id)
+        assert terminal.job.state is GraphState.SUCCEEDED
+        tool_events = tuple(
+            event
+            for event in events
+            if event.kind
+            in (AgentEventKind.TOOL_STARTED, AgentEventKind.TOOL_COMPLETED)
+        )
+        assert tool_events
+        assert all(event.run_origin == "job_task" for event in tool_events)
+    finally:
+        await integration.close()
 
 
 async def test_static_profile_graph_has_bounded_work_and_one_finalizer(
