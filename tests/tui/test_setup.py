@@ -627,8 +627,8 @@ async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():
         assert app.screen is setup
         assert isinstance(setup, ModelSetupScreen)
         assert setup._provider == "openai"
-        assert setup._model == "gpt-5.6-sol"
-        assert setup.query_one("#model-id", Input).value == "gpt-5.6-sol"
+        assert setup._model == "gpt-6-astra"
+        assert setup.query_one("#model-id", Input).value == "gpt-6-astra"
         assert "OpenAI API" in str(setup.query_one("#choose-provider", Button).label)
         assert setup.query_one("#model-provider-id", Input).display is False
         assert setup.query_one("#model-secret", Input).display is True

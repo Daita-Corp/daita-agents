@@ -184,7 +184,11 @@ def _validate_opaque_block(block: Mapping[str, object], block_type: str) -> None
     if block.get("type") != block_type:
         raise ValueError("opaque content block type changed during normalization")
     if block_type == "thinking":
-        _required_text(block.get("thinking"), "thinking content")
+        # Current adaptive-thinking models return an empty display string when
+        # thinking.display is omitted. The signed block must still be replayed
+        # byte-for-byte for tool and multi-turn continuity.
+        if not isinstance(block.get("thinking"), str):
+            raise ValueError("thinking content must be text")
         _required_text(block.get("signature"), "thinking signature")
     elif block_type == "redacted_thinking":
         _required_text(block.get("data"), "redacted thinking data")
