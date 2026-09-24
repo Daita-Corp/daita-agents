@@ -24,7 +24,9 @@ from .models import (
     CATALOG_MAX_LIMIT,
     CATALOG_RESOURCE_ID_MAX_CHARACTERS,
     CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
+    CATALOG_SCHEMA_MAX_RELATIONSHIPS,
     CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+    CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
     CATALOG_SOURCE_ID_MAX_CHARACTERS,
     CATALOG_TOOL_DEFAULT_LIMIT,
     CATALOG_TOOL_QUERY_MAX_CHARACTERS,
@@ -223,6 +225,11 @@ class CatalogSchemaExecutor:
                     "max_join_depth",
                     CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
                 ),
+                relationship_limit=_integer_argument(
+                    request,
+                    "relationship_limit",
+                    CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
+                ),
             ),
             **(
                 {}
@@ -389,6 +396,18 @@ def catalog_declarations(
                     "minimum": 1,
                     "maximum": CATALOG_TRAVERSAL_MAX_DEPTH,
                     "default": CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH,
+                },
+                "relationship_limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": CATALOG_SCHEMA_MAX_RELATIONSHIPS,
+                    "default": CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS,
+                    "description": (
+                        "Limit optional adjacent relationships in the inline schema. "
+                        "Required join-path relationships are always retained; "
+                        "increase this only when the reported relationship "
+                        "truncation omits a needed edge."
+                    ),
                 },
             },
             "additionalProperties": False,

@@ -29,7 +29,7 @@ from ..domains.data.export_capabilities import (
 )
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_postgresql_read
-from ..errors import DaitaError
+from ..errors import DaitaError, ErrorRetryability
 from ..security import SecretProvider, default_secret_provider
 from ..storage.sqlite_records import SourcePermissionStateError
 from .postgresql import (
@@ -50,6 +50,21 @@ _MAX_QUERY_BYTES = 16 * 1_024 * 1_024
 _MAX_RESULT_COLUMNS = 512
 _MAX_VALUE_DEPTH = 32
 _BOUNDED_RESULT_MARKER = "/* daita:postgresql.bounded_result */"
+_PERMANENT_QUERY_ERRORS = frozenset(
+    {
+        "source_not_available",
+        "source_adapter_mismatch",
+        "source_permission_state_invalid",
+        "resource_read_not_allowed",
+        "query_revalidation_failed",
+        "query_resource_scope_empty",
+        "catalog_provenance_missing",
+        "catalog_source_stale",
+        "query_result_too_wide",
+        "query_result_invalid",
+        "query_value_unsupported",
+    }
+)
 
 
 class PostgreSQLQueryError(DaitaError):
@@ -61,7 +76,15 @@ class PostgreSQLQueryError(DaitaError):
         if not isinstance(message, str) or not message.strip():
             raise ValueError("query error message must be a non-empty string")
         self.code = code
-        super().__init__(message, error_code=code)
+        super().__init__(
+            message,
+            error_code=code,
+            retryability=(
+                ErrorRetryability.PERMANENT
+                if code in _PERMANENT_QUERY_ERRORS
+                else ErrorRetryability.UNKNOWN
+            ),
+        )
 
 
 class PostgreSQLQueryBackend:

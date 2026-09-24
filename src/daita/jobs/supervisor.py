@@ -27,6 +27,7 @@ from ..distribution.models import (
     validate_outcome_artifact_references,
 )
 from ..distribution.owner import DistributionOwner, construct_graph_job_delivery
+from ..errors import DaitaError, ErrorRetryability
 from ..hosting.execution_governor import RunAdmissionCoordinator, WorkloadClass
 from ..llm.models import ModelSensitivity
 from ..loop.driver import AgentLoop
@@ -644,6 +645,7 @@ class JobSupervisor:
         )
         request = InternalCapabilityRequest(
             run=run,
+            observation_origin=RunOrigin.JOB_TASK,
             call_id=f"graph-call-{attempt.attempt_id}",
             capability_id=str(contract["capability_id"]),
             contract_digest=str(contract["contract_digest"]),
@@ -1453,6 +1455,14 @@ def _safe_graph_failure_code(error: BaseException) -> str:
 
 
 def _graph_failure_is_retryable(error: BaseException) -> bool:
+    if isinstance(error, DaitaError):
+        if error.retryability is ErrorRetryability.PERMANENT:
+            return False
+        if error.retryability in (
+            ErrorRetryability.TRANSIENT,
+            ErrorRetryability.RETRYABLE,
+        ):
+            return True
     return not isinstance(
         error,
         (ArtifactError, CapabilityInputError, TypeError, ValueError),

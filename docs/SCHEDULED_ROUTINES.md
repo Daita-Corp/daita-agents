@@ -15,6 +15,20 @@ A routine uses one typed schedule:
   to five years; or
 - `calendar` at an exact local hour and minute in an IANA timezone.
 
+The model-facing `routine_create` tool also accepts bounded creation-time timing:
+`once` with `after_seconds`, `interval` with `anchor_after_seconds`, and
+`once_next_weekday` with an IANA timezone, ISO weekday (Monday=1), hour and
+minute. Relative delays are 1 second through 30 days. Creation can use
+`expires_after_seconds` instead of an absolute `expires_at`. The routine owner
+resolves these inputs to the existing exact UTC schedule and finite expiration;
+stored routines and the supervisor have no relative-time execution mode.
+
+In a local foreground session, Daita supplies the code-owned UTC time at run
+start and detected IANA local timezone to the model. Explicit user
+timezones take precedence. A hosted session without a reliable user timezone
+reports it as unknown, so an unqualified wall-clock request needs clarification.
+The database clock and source queries are not scheduling time sources.
+
 Calendar definitions reject ambiguous abbreviations such as `CST`. They retain
 an explicit daylight-saving gap policy (`skip` or `next_valid`) and overlap
 policy (`first` or `second`). Missed schedules use bounded `skip` or
@@ -142,6 +156,12 @@ fails validation. Model-authored revisions may omit it or supply `false`; `true`
 is rejected. Typed Python owner inputs keep their default of `false`. Review the
 actual saved schedule and immediate choice; explicit syntax alone cannot verify
 that the model understood the requested timing.
+
+For relative creation, approval shows the bounded timing intent. Its displayed
+absolute times are estimates: the delay begins when approval completes and the
+routine is created. A named one-time local instant is frozen for approval and
+fails if it passes before creation. The committed receipt shows the exact stored
+UTC schedule. Routine revisions still require exact timestamps.
 
 Every permitted effect has one completion requirement. A positive minimum requires
 that many unique successful, validated invocations; zero explicitly permits no

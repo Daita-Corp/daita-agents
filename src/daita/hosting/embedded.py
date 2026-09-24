@@ -1901,6 +1901,7 @@ class EmbeddedAgent:
             resolved_context = AgentContextBuilder(
                 data_view,
                 profile=model_profile,
+                user_timezone=(lambda: None) if hosted else None,
                 routine_authoring_facts=routine_owner.authoring_facts,
                 effect_receipts=store,
                 memory=memory_store,

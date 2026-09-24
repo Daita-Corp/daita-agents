@@ -322,6 +322,11 @@ class RoutineOwner:
             raise TypeError("routine wake callback must be callable")
         self._wake = wake
 
+    def current_time(self) -> datetime:
+        """The same trusted UTC clock used by routine admission and execution."""
+
+        return self._clock()
+
     async def prepare_create(
         self,
         *,

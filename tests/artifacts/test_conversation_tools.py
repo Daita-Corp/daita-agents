@@ -5,6 +5,7 @@ import sqlite3
 import threading
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -157,7 +158,8 @@ async def test_model_lists_reads_and_converts_the_current_conversation_xlsx_snap
         "artifact-conversation",
         root=tmp_path,
         model=provider,
-        model_profile=_profile(provider),
+        # Keep this multi-step artifact flow clear of the context window limit.
+        model_profile=replace(_profile(provider), context_window_tokens=40_000),
         id_factory=_ids(),
         downloads_directory=downloads,
         workspace=workspace_for(tmp_path),

@@ -235,6 +235,7 @@ class InternalCapabilityRequest:
     contract_digest: str
     arguments: Mapping[str, object]
     sensitivity: ModelSensitivity
+    observation_origin: RunOrigin | None = None
     reserved_artifact_id: str | None = None
     task_attempt_guard: TaskAttemptGuard | None = None
 
@@ -252,6 +253,10 @@ class InternalCapabilityRequest:
             raise ValueError("internal contract_digest must use sha256")
         if not isinstance(self.sensitivity, ModelSensitivity):
             raise TypeError("internal request sensitivity must be ModelSensitivity")
+        if self.observation_origin is not None and not isinstance(
+            self.observation_origin, RunOrigin
+        ):
+            raise TypeError("internal request observation_origin must be RunOrigin")
         if self.reserved_artifact_id is not None and (
             not isinstance(self.reserved_artifact_id, str)
             or not self.reserved_artifact_id.strip()
@@ -855,6 +860,7 @@ class CapabilityRuntime:
             call,
             capability,
             catalog_entry=None,
+            run_origin=request.observation_origin,
         )
         try:
             await _guard_attempt(
@@ -924,6 +930,7 @@ class CapabilityRuntime:
                 started,
                 capability=capability,
                 catalog_entry=None,
+                run_origin=request.observation_origin,
             )
             raise
         self._emit_tool_completed(
@@ -933,6 +940,7 @@ class CapabilityRuntime:
             started,
             capability=capability,
             catalog_entry=None,
+            run_origin=request.observation_origin,
         )
         return InternalCapabilityOutcome(output=output, artifact_ref=artifact_ref)
 
@@ -3150,13 +3158,14 @@ class CapabilityRuntime:
         capability: Capability | None,
         *,
         catalog_entry: RunToolCatalogEntry | None,
+        run_origin: RunOrigin | None = None,
     ) -> None:
         data: dict[str, object] = {"call_id": call.id, "tool_name": call.name}
         if capability is not None:
             data["capability_id"] = capability.id
         if catalog_entry is not None:
             data.update(_toolbox_observation(catalog_entry))
-        self._emit(AgentEventKind.TOOL_STARTED, run, data)
+        self._emit(AgentEventKind.TOOL_STARTED, run, data, run_origin=run_origin)
 
     def _emit_approval_requested(
         self,
@@ -3207,6 +3216,7 @@ class CapabilityRuntime:
         *,
         capability: Capability | None,
         catalog_entry: RunToolCatalogEntry | None,
+        run_origin: RunOrigin | None = None,
     ) -> None:
         if self._observer is None:
             return
@@ -3226,6 +3236,7 @@ class CapabilityRuntime:
             AgentEventKind.TOOL_COMPLETED,
             run,
             data,
+            run_origin=run_origin,
         )
 
     def _emit(
@@ -3233,6 +3244,8 @@ class CapabilityRuntime:
         kind: AgentEventKind,
         run: RunInput,
         data: Mapping[str, object],
+        *,
+        run_origin: RunOrigin | None = None,
     ) -> None:
         if self._observer is None:
             return
@@ -3243,7 +3256,7 @@ class CapabilityRuntime:
                 run_id=run.id,
                 conversation_id=run.conversation_id or run.id,
                 data=FrozenJsonObject.from_mapping(data),
-                run_origin=run.origin.value,
+                run_origin=(run_origin or run.origin).value,
             )
         except Exception:
             return

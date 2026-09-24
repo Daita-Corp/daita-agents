@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import traceback
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -137,6 +139,7 @@ class DaitaApp(App[int]):
         self._requested_conversation_id = conversation_id
         self._observer = RunObserver(self)
         self._run_task: asyncio.Task[None] | None = None
+        self._foreground_run_id: str | None = None
         self._pending_user_identity: str | None = None
         self._partial_identity = "assistant.partial"
         self._partial_text = ""
@@ -1186,6 +1189,7 @@ class DaitaApp(App[int]):
             self._reset_context_usage()
         screen.set_activity("Thinking", restart=True)
         self._partial_text = ""
+        self._foreground_run_id = None
         self._run_task = asyncio.create_task(
             self._execute_run(
                 message,
@@ -1235,6 +1239,7 @@ class DaitaApp(App[int]):
                     )
                 )
         finally:
+            self._foreground_run_id = None
             self.invalidate_completion_cache()
             chat = self.chat()
             if chat is not None:
@@ -1283,6 +1288,12 @@ class DaitaApp(App[int]):
                 self._autonomous_run_ids.discard(event.run_id)
                 await self._refresh_status()
                 await self.refresh_background_status(notify_new=True)
+            return
+        if event.kind is AgentEventKind.RUN_STARTED:
+            if self._run_task is not None and not self._run_task.done():
+                self._foreground_run_id = event.run_id
+            return
+        if event.run_id != self._foreground_run_id:
             return
         screen = self.chat()
         if screen is None:
@@ -1351,6 +1362,7 @@ class DaitaApp(App[int]):
             await self._refresh_status(running=True, state="working")
             return
         if event.kind is AgentEventKind.RUN_COMPLETED:
+            self._foreground_run_id = None
             screen.clear_activity()
             await self._refresh_status(running=False)
 
@@ -1426,4 +1438,14 @@ async def run_daita_app(
     result = await app.run_async()
     if app._startup_error is not None:
         raise app._startup_error
+    if app.return_code not in (None, 0):
+        print("Daita terminal UI failed:", file=sys.stderr)
+        # Textual captures message-handler exceptions instead of raising them
+        # from run_async(). Print the original traceback after terminal restore.
+        error = getattr(app, "_exception", None)
+        if isinstance(error, BaseException):
+            traceback.print_exception(error, file=sys.stderr)
+        else:
+            print(f"Textual exit code: {app.return_code}", file=sys.stderr)
+        return app.return_code
     return 0 if result is None else int(result)
