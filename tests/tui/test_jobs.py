@@ -317,6 +317,22 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
             await app.on_observer_event(
                 ObserverEvent(
                     AgentEvent(
+                        kind=AgentEventKind.TOOL_COMPLETED,
+                        occurred_at=observed,
+                        run_id="run-misattributed-background",
+                        conversation_id="conversation-origin",
+                        data=FrozenJsonObject.from_mapping(
+                            {"tool_name": "internal:profile", "call_id": "call-job"}
+                        ),
+                        run_origin="user",
+                    )
+                )
+            )
+            assert chat.query_one(ActivityBar).display is False
+
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
                         kind=AgentEventKind.RUN_COMPLETED,
                         occurred_at=observed,
                         run_id="run-autonomous",

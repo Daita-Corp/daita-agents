@@ -36,7 +36,9 @@ async def test_run_context_snapshot_is_prepared_once_and_aggregates_results():
         max_output_tokens=2_000,
         supports_tools=True,
     )
-    builder = AgentContextBuilder(catalog, profile=profile)
+    builder = AgentContextBuilder(
+        catalog, profile=profile, user_timezone=lambda: "America/Chicago"
+    )
     run = RunInput(
         id="run-context-snapshot",
         agent_id="agent-stage-a",

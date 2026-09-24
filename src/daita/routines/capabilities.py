@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import TypedDict
 
@@ -79,6 +79,7 @@ from .owner import (
     _schedule_payload,
     routine_approval_arguments,
 )
+from .temporal import next_weekday_utc
 
 ROUTINE_DOMAIN_OWNER_ID = "routines"
 ROUTINE_LIST_CAPABILITY_ID = "routines.list"
@@ -96,6 +97,7 @@ ROUTINE_UPDATE_TOOL_NAME = "routine_update"
 ROUTINE_CONTROL_CAPABILITY_ID = "routines.control"
 ROUTINE_CONTROL_EXECUTOR_ID = "routines.control.executor"
 ROUTINE_CONTROL_TOOL_NAME = "routine_control"
+MAX_RELATIVE_SCHEDULE_SECONDS = 30 * 24 * 60 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,7 +173,22 @@ class RoutineCreateExecutor(_RoutineExecutor):
         return await self._owner.proposal_authority_snapshot(proposal)
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
-        proposal = await _create_proposal(self._owner, request)
+        proposal = await _create_proposal(self._owner, request, commit_time=True)
+        if _has_temporal_intent(request.arguments):
+            schedule_intent = _mapping(request.arguments, "schedule")
+            first_at = (
+                _first_absolute_slot(proposal.schedule)
+                if "after_seconds" in schedule_intent
+                or "anchor_after_seconds" in schedule_intent
+                or schedule_intent.get("kind") == "once_next_weekday"
+                else None
+            )
+            now = self._owner.current_time()
+            if proposal.expires_at <= now or (first_at is not None and first_at <= now):
+                raise RoutineError(
+                    "routine_schedule_passed",
+                    "The approved timing passed before admission; choose a new time.",
+                )
         stored = await self._owner.admit(proposal)
         return ToolOutput(
             kind="routine.receipt",
@@ -334,6 +351,17 @@ class RoutineCapabilityDomain:
                     "routine_instruction_sensitivity_exceeded",
                     "The saved instruction must retain the full request sensitivity.",
                 )
+        if capability.id == ROUTINE_CREATE_CAPABILITY_ID and _has_temporal_intent(
+            arguments
+        ):
+            # Capture a stable reference for both approval preflights. Relative
+            # delays themselves are rebased once after approval, at creation.
+            return FrozenJsonObject.from_mapping(
+                {
+                    **arguments,
+                    "_timing_reference_at": self._owner.current_time().isoformat(),
+                }
+            )
         return arguments
 
     async def prepare_automation_grant(
@@ -356,26 +384,44 @@ class RoutineCapabilityDomain:
         execution: ToolExecution,
         fingerprint: FrozenJsonObject,
     ) -> SideEffectPlan:
-        del run, call, execution
+        del run, call
         if (
             capability.operational_effect
             is not OperationalEffect.MANAGE_SCHEDULED_ROUTINE
         ):
             raise ValueError("routine domain received an unsupported effect")
         if capability.id == ROUTINE_CREATE_CAPABILITY_ID:
-            reason = (
-                "Approve this exact assignment, its standing actions, and its schedule?"
-            )
+            reason = "Approve this assignment, its standing actions, and its schedule?"
         elif capability.id == ROUTINE_UPDATE_CAPABILITY_ID:
             reason = "Replace this routine with the exact proposed revision once?"
         else:
             reason = "Apply this exact routine control action once?"
+        approval_arguments = (
+            routine_approval_arguments(fingerprint)
+            if "routine" in fingerprint
+            else fingerprint
+        )
+        if capability.id == ROUTINE_CREATE_CAPABILITY_ID and _has_temporal_intent(
+            execution.arguments
+        ):
+            approval_arguments = FrozenJsonObject.from_mapping(
+                {
+                    **approval_arguments,
+                    "timing_intent": {
+                        "schedule": execution.arguments["schedule"],
+                        "expires_after_seconds": execution.arguments.get(
+                            "expires_after_seconds"
+                        ),
+                    },
+                    "timing_note": (
+                        "Relative delays start when approval completes and the "
+                        "routine is created; displayed absolute times for them are "
+                        "estimates. A named local instant is frozen at approval."
+                    ),
+                }
+            )
         return SideEffectPlan(
-            approval_arguments=(
-                routine_approval_arguments(fingerprint)
-                if "routine" in fingerprint
-                else fingerprint
-            ),
+            approval_arguments=approval_arguments,
             approval_reason=reason,
             recheck_after_approval=True,
         )
@@ -442,8 +488,8 @@ def routine_capability_declarations(
     create_capability = Capability(
         id=ROUTINE_CREATE_CAPABILITY_ID,
         description=(
-            "Create one exact, finite routine with frozen action grants from a self-contained instruction "
-            "and typed schedule."
+            "Create one finite routine with frozen action grants from a self-contained instruction "
+            "and typed absolute, relative, or user-local schedule."
         ),
         input_schema=_spec_schema(update=False),
         output_kind="routine.receipt",
@@ -521,7 +567,7 @@ def routine_capability_declarations(
         ),
         ROUTINE_CREATE_CAPABILITY_ID: (
             "Create one scheduled assignment with exact action limits.",
-            "Discover assignment capabilities and their automation_contract in toolbox_search, and the Inbox destination. Load routine_create to author the schedule and exact grants; assignment execution tools need not be loaded.",
+            "Discover assignment capabilities and their automation_contract in toolbox_search, and the Inbox destination. Load routine_create to author the schedule and exact grants; relative once and interval timing need no clock query. Assignment execution tools need not be loaded.",
             ("routine", "schedule", "create"),
         ),
         ROUTINE_UPDATE_CAPABILITY_ID: (
@@ -559,14 +605,43 @@ def routine_capability_declarations(
 
 
 async def _create_proposal(
-    owner: RoutineOwner, request: ToolExecution
+    owner: RoutineOwner, request: ToolExecution, *, commit_time: bool = False
 ) -> ScheduledRoutine:
     if request.conversation_id is None:
         raise RoutineError(
             "routine_conversation_required",
             "Routine creation requires an exact conversation.",
         )
-    values = _parsed_spec(request.arguments)
+    reference_text = request.arguments.get("_timing_reference_at")
+    reference_at = (
+        _datetime(reference_text) if isinstance(reference_text, str) else None
+    )
+    relative_at = (
+        owner.current_time()
+        if commit_time and _has_relative_timing(request.arguments)
+        else reference_at
+    )
+    values = _parsed_spec(
+        request.arguments,
+        reference_at=reference_at,
+        relative_at=relative_at,
+    )
+    first_at = _first_absolute_slot(values["schedule"])
+    if first_at is not None and first_at > values["expires_at"]:
+        raise RoutineError(
+            "routine_expiration_before_schedule",
+            "The routine expires before its first scheduled instant.",
+        )
+    if (
+        commit_time
+        and _mapping(request.arguments, "schedule").get("kind") == "once_next_weekday"
+        and isinstance(values["schedule"], OnceSchedule)
+        and values["schedule"].exact_at <= owner.current_time()
+    ):
+        raise RoutineError(
+            "routine_schedule_passed",
+            "The approved local time passed before creation; choose a new time.",
+        )
     return await owner.prepare_create(
         run_id=request.run_id,
         conversation_id=request.conversation_id,
@@ -630,7 +705,12 @@ class _ParsedSpec(TypedDict):
     basis_run_id: str | None
 
 
-def _parsed_spec(arguments: Mapping[str, object]) -> _ParsedSpec:
+def _parsed_spec(
+    arguments: Mapping[str, object],
+    *,
+    reference_at: datetime | None = None,
+    relative_at: datetime | None = None,
+) -> _ParsedSpec:
     return {
         "title": _string(arguments, "title"),
         "requested_capability_grants": _parse_requested_grants(
@@ -642,7 +722,11 @@ def _parsed_spec(arguments: Mapping[str, object]) -> _ParsedSpec:
             else False
         ),
         "authorized_instruction": _string(arguments, "authorized_instruction"),
-        "schedule": _parse_schedule(_mapping(arguments, "schedule")),
+        "schedule": _parse_schedule(
+            _mapping(arguments, "schedule"),
+            reference_at=reference_at,
+            relative_at=relative_at,
+        ),
         "misfire_policy": MisfirePolicy(_string(arguments, "misfire_policy")),
         "reporting_mode": ReportingMode(_string(arguments, "reporting_mode")),
         "precheck": _parse_precheck(arguments.get("precheck")),
@@ -671,7 +755,11 @@ def _parsed_spec(arguments: Mapping[str, object]) -> _ParsedSpec:
         "maximum_consecutive_failures": _integer(
             arguments, "maximum_consecutive_failures"
         ),
-        "expires_at": _datetime(_string(arguments, "expires_at")),
+        "expires_at": (
+            _relative_instant(arguments, "expires_after_seconds", relative_at)
+            if "expires_after_seconds" in arguments
+            else _datetime(_string(arguments, "expires_at"))
+        ),
         "skill_names": _strings(arguments, "skill_names"),
         "basis_run_id": (
             None
@@ -681,15 +769,44 @@ def _parsed_spec(arguments: Mapping[str, object]) -> _ParsedSpec:
     }
 
 
-def _parse_schedule(value: Mapping[str, object]) -> RoutineSchedule:
+def _parse_schedule(
+    value: Mapping[str, object],
+    *,
+    reference_at: datetime | None = None,
+    relative_at: datetime | None = None,
+) -> RoutineSchedule:
     kind = _string(value, "kind")
     if kind == "once":
+        if "after_seconds" in value:
+            return OnceSchedule(_relative_instant(value, "after_seconds", relative_at))
         return OnceSchedule(_datetime(_string(value, "exact_at")))
     if kind == "interval":
         return IntervalSchedule(
             _integer(value, "interval_seconds"),
-            _datetime(_string(value, "anchor_at")),
+            (
+                _relative_instant(value, "anchor_after_seconds", relative_at)
+                if "anchor_after_seconds" in value
+                else _datetime(_string(value, "anchor_at"))
+            ),
         )
+    if kind == "once_next_weekday":
+        if reference_at is None:
+            raise CapabilityInputError(
+                "routine_time_unavailable", "A trusted current time is required."
+            )
+        try:
+            exact_at = next_weekday_utc(
+                now=reference_at,
+                timezone=_string(value, "timezone"),
+                weekday=_integer(value, "weekday"),
+                hour=_integer(value, "hour"),
+                minute=_integer(value, "minute"),
+            )
+        except ValueError as error:
+            raise CapabilityInputError(
+                "routine_local_time_invalid", str(error)
+            ) from error
+        return OnceSchedule(exact_at)
     if kind == "calendar":
         return CalendarSchedule(
             timezone=_string(value, "timezone"),
@@ -709,6 +826,51 @@ def _parse_schedule(value: Mapping[str, object]) -> RoutineSchedule:
     raise CapabilityInputError(
         "routine_schedule_invalid", "Schedule kind must be once, interval, or calendar."
     )
+
+
+def _relative_instant(
+    values: Mapping[str, object], name: str, reference_at: datetime | None
+) -> datetime:
+    seconds = _integer(values, name)
+    if not 1 <= seconds <= MAX_RELATIVE_SCHEDULE_SECONDS:
+        raise CapabilityInputError(
+            "routine_relative_time_invalid", "Relative timing is outside its bound."
+        )
+    if reference_at is None:
+        raise CapabilityInputError(
+            "routine_time_unavailable", "A trusted current time is required."
+        )
+    if reference_at.tzinfo is None or reference_at.utcoffset() is None:
+        raise CapabilityInputError(
+            "routine_time_unavailable", "A timezone-aware current time is required."
+        )
+    return reference_at.astimezone(UTC) + timedelta(seconds=seconds)
+
+
+def _has_relative_timing(arguments: Mapping[str, object]) -> bool:
+    schedule = arguments.get("schedule")
+    return bool(
+        "expires_after_seconds" in arguments
+        or (
+            isinstance(schedule, Mapping)
+            and ("after_seconds" in schedule or "anchor_after_seconds" in schedule)
+        )
+    )
+
+
+def _has_temporal_intent(arguments: Mapping[str, object]) -> bool:
+    schedule = arguments.get("schedule")
+    return _has_relative_timing(arguments) or (
+        isinstance(schedule, Mapping) and schedule.get("kind") == "once_next_weekday"
+    )
+
+
+def _first_absolute_slot(schedule: RoutineSchedule) -> datetime | None:
+    if isinstance(schedule, OnceSchedule):
+        return schedule.exact_at
+    if isinstance(schedule, IntervalSchedule):
+        return schedule.anchor_at
+    return None
 
 
 def _parse_precheck(value: object) -> ResourceRevisionPrecheck | None:
@@ -830,7 +992,7 @@ def _parse_outcome_contract(value: Mapping[str, object]) -> OutcomeContract:
         ) from error
 
 
-def _schedule_schema() -> dict[str, object]:
+def _schedule_schema(*, relative: bool = False) -> dict[str, object]:
     """The model sees the same finite schedule family the owner accepts."""
     calendar: dict[str, object] = {
         "kind": {"type": "string", "enum": ["calendar"]},
@@ -895,6 +1057,62 @@ def _schedule_schema() -> dict[str, object]:
             "additionalProperties": False,
         },
     ]
+    if relative:
+        branches.extend(
+            (
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["once"]},
+                        "after_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_RELATIVE_SCHEDULE_SECONDS,
+                            "description": "Run once this many seconds after approval and creation.",
+                        },
+                    },
+                    "required": ["kind", "after_seconds"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["interval"]},
+                        "interval_seconds": {
+                            "type": "integer",
+                            "minimum": MIN_ROUTINE_INTERVAL_SECONDS,
+                            "maximum": MAX_ROUTINE_INTERVAL_SECONDS,
+                        },
+                        "anchor_after_seconds": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": MAX_RELATIVE_SCHEDULE_SECONDS,
+                            "description": "First scheduled slot this many seconds after creation; use run_immediately for an additional immediate slot.",
+                        },
+                    },
+                    "required": ["kind", "interval_seconds", "anchor_after_seconds"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "description": "Run once at the next occurrence of this local weekday and time.",
+                    "properties": {
+                        "kind": {"type": "string", "enum": ["once_next_weekday"]},
+                        "timezone": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128,
+                            "description": "Exact IANA timezone; use the trusted user-local timezone when not specified by the user.",
+                        },
+                        "weekday": {"type": "integer", "minimum": 1, "maximum": 7},
+                        "hour": {"type": "integer", "minimum": 0, "maximum": 23},
+                        "minute": {"type": "integer", "minimum": 0, "maximum": 59},
+                    },
+                    "required": ["kind", "timezone", "weekday", "hour", "minute"],
+                    "additionalProperties": False,
+                },
+            )
+        )
     calendar["day_selector"] = {
         "type": "string",
         "enum": [item.value for item in CalendarDaySelector],
@@ -958,7 +1176,7 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
             "minLength": 1,
             "maxLength": MAX_ROUTINE_INSTRUCTION_BYTES,
         },
-        "schedule": _schedule_schema(),
+        "schedule": _schedule_schema(relative=not update),
         "run_immediately": (
             {
                 "type": "boolean",
@@ -1104,10 +1322,10 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         "cumulative_max_attempts",
         "cumulative_max_occurrences",
         "maximum_consecutive_failures",
-        "expires_at",
         "skill_names",
     ]
     if update:
+        required.append("expires_at")
         properties.update(
             {
                 "routine_id": {"type": "string", "minLength": 1, "maxLength": 1024},
@@ -1117,12 +1335,24 @@ def _spec_schema(*, update: bool) -> dict[str, object]:
         required.extend(("routine_id", "expected_revision"))
     else:
         required.append("run_immediately")
-    return {
+        properties["expires_after_seconds"] = {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": MAX_RELATIVE_SCHEDULE_SECONDS,
+            "description": "Expire this many seconds after approval and creation; choose a finite window after the last requested slot.",
+        }
+    result: dict[str, object] = {
         "type": "object",
         "properties": properties,
         "required": required,
         "additionalProperties": False,
     }
+    if not update:
+        result["oneOf"] = [
+            {"type": "object", "required": ["expires_at"]},
+            {"type": "object", "required": ["expires_after_seconds"]},
+        ]
+    return result
 
 
 def _routine_id_schema() -> dict[str, object]:
@@ -1487,7 +1717,7 @@ def _datetime(value: str) -> datetime:
         raise CapabilityInputError(
             "routine_datetime_invalid", "Datetime must include an exact UTC offset."
         )
-    return parsed
+    return parsed.astimezone(UTC)
 
 
 __all__ = [

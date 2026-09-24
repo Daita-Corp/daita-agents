@@ -24,6 +24,8 @@ CATALOG_RESOURCE_ID_MAX_CHARACTERS = 256
 CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT = 20
 CATALOG_SEARCH_REQUEST_MAX_QUERY_CHARACTERS = 4_000
 CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH = 3
+CATALOG_SCHEMA_MAX_RELATIONSHIPS = 200
+CATALOG_SCHEMA_TOOL_DEFAULT_RELATIONSHIPS = 8
 CATALOG_SCHEMA_MAX_RESOURCE_IDS = 50
 CATALOG_SOURCE_ID_MAX_CHARACTERS = 256
 CATALOG_TOOL_DEFAULT_LIMIT = 12
@@ -1223,6 +1225,7 @@ class CatalogSchemaRequest:
     limit: int = CATALOG_TOOL_DEFAULT_LIMIT
     include_relationships: bool = True
     max_join_depth: int = CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH
+    relationship_limit: int = CATALOG_SCHEMA_MAX_RELATIONSHIPS
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "catalog schema agent_id")
@@ -1261,6 +1264,15 @@ class CatalogSchemaRequest:
             )
         if not isinstance(self.include_relationships, bool):
             raise TypeError("catalog schema include_relationships must be a boolean")
+        if (
+            not isinstance(self.relationship_limit, int)
+            or isinstance(self.relationship_limit, bool)
+            or not 1 <= self.relationship_limit <= CATALOG_SCHEMA_MAX_RELATIONSHIPS
+        ):
+            raise ValueError(
+                "catalog schema relationship_limit must be from 1 through "
+                f"{CATALOG_SCHEMA_MAX_RELATIONSHIPS}"
+            )
         if (
             not isinstance(self.max_join_depth, int)
             or isinstance(self.max_join_depth, bool)

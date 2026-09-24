@@ -73,6 +73,22 @@ async def test_connected_schema_selects_direct_and_required_bridge_paths(
                 "main.products",
             ),
         )
+        compact_bridged = await _schema(
+            agent,
+            resource_ids=(resources["customers"].id, resources["products"].id),
+            limit=5,
+            relationship_limit=1,
+        )
+        required_ids = set(
+            _object_sequence(
+                _mapping_sequence(compact_bridged["paths"])[0]["relationship_ids"]
+            )
+        )
+        returned_ids = {
+            item["relationship_id"]
+            for item in _mapping_sequence(compact_bridged["relationships"])
+        }
+        assert required_ids <= returned_ids
         roles = {
             item["name"]: item["selection_role"]
             for item in _mapping_sequence(bridged["resources"])
@@ -741,6 +757,16 @@ async def test_schema_resource_and_relationship_bounds_are_explicit(tmp_path: Pa
         assert truncation["columns"] is True
         assert truncation["relationships"] is True
         assert len(_mapping_sequence(projection["relationships"])) == 200
+
+        compact = await _schema(
+            agent,
+            resource_ids=(parent.id,),
+            limit=1,
+            relationship_limit=8,
+        )
+        assert _mapping(compact["bounds"])["relationships"] == 8
+        assert len(_mapping_sequence(compact["relationships"])) == 8
+        assert _mapping(compact["truncation"])["relationships"] is True
 
         resource_projection = await _schema(
             agent,

@@ -805,6 +805,7 @@ async def _schema(
     limit: int = 50,
     include_relationships: bool = True,
     max_join_depth: int = 3,
+    relationship_limit: int = 200,
 ) -> Mapping[str, object]:
     projection = await agent._embedded._catalog_service.schema_slice(
         CatalogSchemaRequest(
@@ -815,6 +816,7 @@ async def _schema(
             limit=limit,
             include_relationships=include_relationships,
             max_join_depth=max_join_depth,
+            relationship_limit=relationship_limit,
         )
     )
     return projection

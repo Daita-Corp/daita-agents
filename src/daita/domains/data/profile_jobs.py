@@ -68,7 +68,7 @@ from ...scope import resolve_effective_source_scope
 from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .capabilities import SqlReadBackend, SqlReadResult
-from .sql import ResourceSchema
+from .sql import ResourceSchema, validate_postgresql_read
 
 DATA_PROFILE_DOMAIN_OWNER_ID = "data_profile_jobs"
 START_DATA_PROFILE_CAPABILITY_ID = "jobs.data_profile.start"
@@ -580,6 +580,7 @@ class DataProfileAdmission:
                 "One requested data-profile resource is not available for reading.",
             )
         schemas: dict[str, ResourceSchema] = {}
+        schemas_by_source: dict[str, tuple[ResourceSchema, ...]] = {}
         adapters: dict[str, str] = {}
         for source_id in source_ids:
             adapter = await self._catalog.source_adapter_id(
@@ -592,10 +593,12 @@ class DataProfileAdmission:
                     "The first data-profile job supports SQLite and PostgreSQL resources.",
                 )
             adapters[source_id] = adapter
-            for current_schema in await self._catalog.resource_schemas(
+            source_schemas = await self._catalog.resource_schemas(
                 self._agent_id,
                 source_id,
-            ):
+            )
+            schemas_by_source[source_id] = source_schemas
+            for current_schema in source_schemas:
                 schemas[current_schema.resource_id] = current_schema
         bindings = []
         for resource_id, source_id, resource_kind, resource_revision in identities:
@@ -610,6 +613,19 @@ class DataProfileAdmission:
                     "data_profile_resource_stale",
                     "One requested data-profile resource changed during admission.",
                 )
+            if adapters[source_id] == "postgresql":
+                validation = validate_postgresql_read(
+                    _profile_sql(schema, "postgresql", _MAX_PROFILE_SAMPLE_ROWS),
+                    source_id=source_id,
+                    resources=schemas_by_source[source_id],
+                    parameters=(),
+                    allowed_resource_ids=readable,
+                )
+                if not validation.valid or validation.resource_ids != (resource_id,):
+                    raise CapabilityInputError(
+                        "data_profile_query_invalid",
+                        "A selected PostgreSQL resource cannot be profiled under its current catalog contract.",
+                    )
             bindings.append(
                 ProfileResourceBinding(
                     source_id=source_id,
@@ -850,7 +866,7 @@ class DataProfileExecutor:
         sample_rows: int,
     ) -> SqlReadResult:
         backend = self._sqlite if binding.adapter_id == "sqlite" else self._postgresql
-        sql = f"SELECT * FROM {_quoted_relation(schema.name)} LIMIT {sample_rows}"
+        sql = _profile_sql(schema, binding.adapter_id, sample_rows)
         result = await backend.execute_read(
             agent_id=self._agent_id,
             source_id=binding.source_id,
@@ -1542,8 +1558,34 @@ def _maximum_sensitivity(
     return max(values or (ModelSensitivity.RESTRICTED,), key=order.__getitem__)
 
 
-def _quoted_relation(value: str) -> str:
-    return ".".join('"' + part.replace('"', '""') + '"' for part in value.split("."))
+def _profile_sql(schema: ResourceSchema, adapter_id: str, sample_rows: int) -> str:
+    def quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    if adapter_id == "sqlite":
+        relation = quote(schema.name)
+    elif adapter_id == "postgresql":
+        identity = next(
+            (
+                (alias[: -len(suffix)], schema.name)
+                for alias in schema.aliases
+                for suffix in ("." + schema.name,)
+                if alias.endswith(suffix) and len(alias) > len(suffix)
+            ),
+            None,
+        )
+        if identity is None:
+            raise CapabilityInputError(
+                "data_profile_resource_stale",
+                "A PostgreSQL profile resource lacks its exact qualified catalog identity.",
+            )
+        relation = ".".join(quote(part) for part in identity)
+    else:
+        raise CapabilityInputError(
+            "data_profile_adapter_unsupported",
+            "Data profiles support only SQLite and PostgreSQL resources.",
+        )
+    return f"SELECT * FROM {relation} LIMIT {sample_rows}"
 
 
 def _column_profiles(

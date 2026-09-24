@@ -21,6 +21,55 @@ from tests.tui._support import (
 )
 
 
+def test_routine_approval_summary_shows_relative_and_local_timing_intent() -> None:
+    import json
+
+    from daita.tui.projection import approval_summary
+
+    proposal = {
+        "title": "Follow up",
+        "revision": 1,
+        "authorized_instruction": "Report once.",
+        "schedule": {"kind": "once", "exact_at": "2026-09-23T22:00:00+00:00"},
+        "misfire_policy": "latest_only",
+    }
+    relative = approval_summary(
+        json.dumps(
+            {
+                "proposal": proposal,
+                "timing_intent": {
+                    "schedule": {"kind": "once", "after_seconds": 300},
+                    "expires_after_seconds": 3600,
+                },
+                "timing_note": "The exact time is resolved after approval.",
+            }
+        ),
+        "routines.create",
+    )
+    assert "Requested delay: 300 seconds after approval" in relative
+    assert "Requested lifetime: 3600 seconds after approval" in relative
+    assert "The exact time is resolved after approval" in relative
+
+    local = approval_summary(
+        json.dumps(
+            {
+                "proposal": proposal,
+                "timing_intent": {
+                    "schedule": {
+                        "kind": "once_next_weekday",
+                        "timezone": "America/Chicago",
+                        "weekday": 3,
+                        "hour": 17,
+                        "minute": 0,
+                    },
+                },
+            }
+        ),
+        "routines.create",
+    )
+    assert "next ISO weekday 3 at 17:00 in America/Chicago" in local
+
+
 async def test_routines_command_opens_records_and_routes_create_through_agent_loop():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     listing = await app.controller.dispatch_command("/routines")
@@ -104,11 +153,39 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
                 break
         manager = app.screen
         assert isinstance(manager, RoutinesScreen)
+        panel = manager.query_one("#routines-manager")
+        assert panel.size.width <= 100
+        assert panel.size.width < app.size.width
+        actions = manager.query_one("#routines-actions")
+        assert (
+            manager.query_one("#routines-close", Button).region.right
+            <= actions.region.right
+        )
         assert manager.query_one("#routines-list", OptionList).option_count == 1
+        overview = str(manager.query_one("#routines-detail", Static).content)
+        assert "Choose Details" in overview
+        assert "instruction_digest" not in overview
+        assert await pilot.click("#routines-details") is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if "Instruction" in str(
+                manager.query_one("#routines-detail", Static).content
+            ):
+                break
+        assert "Instruction" in str(
+            manager.query_one("#routines-detail", Static).content
+        )
+        assert await pilot.click("#routines-record") is True
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if "instruction_digest" in str(
+                manager.query_one("#routines-detail", Static).content
+            ):
+                break
         assert "instruction_digest" in str(
             manager.query_one("#routines-detail", Static).content
         )
-        assert await pilot.click("#routines-pause") is True
+        assert await pilot.click("#routines-toggle") is True
         for _ in range(20):
             await pilot.pause(0.05)
             if isinstance(app.screen, ConfirmScreen):
@@ -120,5 +197,30 @@ async def test_routines_screen_lists_authoritative_state_and_controls(monkeypatc
             if app.screen is manager and controls:
                 break
         assert controls == [("routine-ui", 1, "pause")]
-        assert manager.query_one("#routines-resume", Button).disabled is False
+        toggle = manager.query_one("#routines-toggle", Button)
+        assert str(toggle.label) == "Resume"
+        assert toggle.disabled is False
+        app.exit(0)
+
+
+async def test_routines_screen_keeps_actions_inside_compact_panel(monkeypatch):
+    app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
+
+    async def list_routines() -> tuple[ScheduledRoutineSummary, ...]:
+        return ()
+
+    monkeypatch.setattr(app.controller, "list_routines", list_routines)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await app.push_screen(RoutinesScreen())
+        await pilot.pause(0.2)
+        manager = app.screen
+        assert isinstance(manager, RoutinesScreen)
+        assert manager.has_class("-compact")
+        panel = manager.query_one("#routines-manager")
+        actions = manager.query_one("#routines-actions")
+        assert actions.region.bottom <= panel.region.bottom
+        assert (
+            manager.query_one("#routines-disable", Button).region.right
+            <= actions.region.right
+        )
         app.exit(0)

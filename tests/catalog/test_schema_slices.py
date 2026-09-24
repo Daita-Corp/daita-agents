@@ -191,6 +191,8 @@ async def test_schema_capability_validates_output_and_is_smaller_than_inspection
         )
         assert output.kind == CATALOG_SCHEMA_EVIDENCE_KIND
         assert registry.validate_output(capability.id, output) == output
+        assert _mapping(output.data["bounds"])["relationships"] == 8
+        assert len(_mapping_sequence(output.data["relationships"])) <= 8
         with pytest.raises(ToolOutputValidationError):
             registry.validate_output(
                 capability.id,
