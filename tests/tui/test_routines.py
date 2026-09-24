@@ -21,6 +21,55 @@ from tests.tui._support import (
 )
 
 
+def test_routine_approval_summary_shows_relative_and_local_timing_intent() -> None:
+    import json
+
+    from daita.tui.projection import approval_summary
+
+    proposal = {
+        "title": "Follow up",
+        "revision": 1,
+        "authorized_instruction": "Report once.",
+        "schedule": {"kind": "once", "exact_at": "2026-09-23T22:00:00+00:00"},
+        "misfire_policy": "latest_only",
+    }
+    relative = approval_summary(
+        json.dumps(
+            {
+                "proposal": proposal,
+                "timing_intent": {
+                    "schedule": {"kind": "once", "after_seconds": 300},
+                    "expires_after_seconds": 3600,
+                },
+                "timing_note": "The exact time is resolved after approval.",
+            }
+        ),
+        "routines.create",
+    )
+    assert "Requested delay: 300 seconds after approval" in relative
+    assert "Requested lifetime: 3600 seconds after approval" in relative
+    assert "The exact time is resolved after approval" in relative
+
+    local = approval_summary(
+        json.dumps(
+            {
+                "proposal": proposal,
+                "timing_intent": {
+                    "schedule": {
+                        "kind": "once_next_weekday",
+                        "timezone": "America/Chicago",
+                        "weekday": 3,
+                        "hour": 17,
+                        "minute": 0,
+                    },
+                },
+            }
+        ),
+        "routines.create",
+    )
+    assert "next ISO weekday 3 at 17:00 in America/Chicago" in local
+
+
 async def test_routines_command_opens_records_and_routes_create_through_agent_loop():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     listing = await app.controller.dispatch_command("/routines")

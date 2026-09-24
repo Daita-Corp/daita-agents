@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
+from datetime import UTC
 from hashlib import sha256
 from typing import Protocol, cast
 
@@ -87,6 +88,7 @@ from .llm.models import (
 from .loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
 from .loop.session import RunSessionOptions
 from .memory.capabilities import MEMORY_SET_OUTPUT_KIND, MEMORY_SET_TOOL_NAME
+from .routines.temporal import system_user_timezone, valid_iana_timezone
 from .scope import SourceScopeCatalog, resolve_effective_source_scope
 from .semantics import (
     SEMANTIC_DELETE_OUTPUT_KIND,
@@ -348,11 +350,14 @@ class AgentContextBuilder:
         workspace_id: str | None = None,
         workspace_sensitivity: ModelSensitivity | None = None,
         local_file_context: FrozenJsonObject | None = None,
+        user_timezone: Callable[[], str | None] | None = None,
         catalog_limit: int = CATALOG_CONTEXT_DEFAULT_LIMIT,
         max_context_evidence_bytes: int = 512 * 1_024,
     ) -> None:
         if not isinstance(profile, ModelProfile):
             raise TypeError("profile must be ModelProfile")
+        if user_timezone is not None and not callable(user_timezone):
+            raise TypeError("user timezone reader must be callable")
         if not callable(getattr(catalog, "catalog_context", None)):
             raise TypeError("catalog must provide catalog_context")
         if not callable(getattr(catalog, "admitted_model_sensitivity", None)):
@@ -409,6 +414,7 @@ class AgentContextBuilder:
         ):
             raise ValueError("max_context_evidence_bytes must be positive")
         self._catalog = catalog
+        self._user_timezone = user_timezone or system_user_timezone
         self._memory = memory
         self._skills = skills
         self._semantics = semantics
@@ -591,6 +597,33 @@ class AgentContextBuilder:
                 sensitivity,
                 ModelSensitivity.INTERNAL,
                 key=lambda item: item.routing_rank,
+            )
+        if run.origin is RunOrigin.USER:
+            now = run.created_at.astimezone(UTC)
+            zone_name = self._user_timezone()
+            if zone_name is not None:
+                try:
+                    zone = valid_iana_timezone(zone_name)
+                except ValueError:
+                    zone_name = None
+                else:
+                    local = now.astimezone(zone)
+                    time_context = (
+                        "Code-owned time at run start: "
+                        f"{now.isoformat()} UTC; detected user-local "
+                        f"{local.strftime('%A %Y-%m-%d %H:%M:%S %z')} "
+                        f"({zone_name}; ISO weekday {local.isoweekday()}). "
+                        "An explicit user timezone overrides the detected zone. "
+                        "The routine owner resolves relative times at creation."
+                    )
+            if zone_name is None:
+                time_context = (
+                    "Code-owned UTC time at run start: "
+                    f"{now.isoformat()}. User-local IANA timezone is unknown; "
+                    "ask before interpreting an unqualified local clock time."
+                )
+            effect_context = "\n\n".join(
+                item for item in (effect_context, time_context) if item
             )
         execution_scope = run.execution_scope
         if execution_scope is not None:
@@ -2829,7 +2862,10 @@ def _tool_guidance(
             "Fixed/variable grant arguments must use the declared input names and types; "
             "load tools to invoke them. Effect-free "
             "reads need no requested_capability_grants; include their IDs in allowed_capability_ids."
-            " Use one run_immediately recurring assignment for now-and-later work. "
+            " For a foreground update now and one later, answer now and create one "
+            "relative once schedule. For recurring now-and-later work, use one "
+            "run_immediately interval with its first scheduled anchor after one interval. "
+            "Use relative timing instead of querying a data source for the clock. "
             "Routine approval cannot grant missing connector or native write permission. "
             "Report the saved assignment and its host-dependent status, not completion. "
             "Uncertain action receipts require human operator recovery; never replay an action."

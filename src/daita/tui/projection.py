@@ -818,6 +818,36 @@ def approval_summary(arguments_text: str, capability_id: str) -> str:
             "This revision grants no missing connector permissions. Uncertain actions pause work; actions are never automatically replayed.",
             "Model-cost limits do not cap third-party service fees.",
         ]
+        timing = document.get("timing_intent")
+        if isinstance(timing, dict):
+            requested = timing.get("schedule")
+            if isinstance(requested, dict):
+                if "after_seconds" in requested:
+                    lines.insert(
+                        3,
+                        f"Requested delay: {requested['after_seconds']} seconds after approval.",
+                    )
+                elif "anchor_after_seconds" in requested:
+                    lines.insert(
+                        3,
+                        f"First scheduled slot: {requested['anchor_after_seconds']} seconds after approval.",
+                    )
+                elif requested.get("kind") == "once_next_weekday":
+                    lines.insert(
+                        3,
+                        "Requested local time: next ISO weekday "
+                        f"{requested.get('weekday')} at "
+                        f"{requested.get('hour')}:{str(requested.get('minute')).zfill(2)} "
+                        f"in {requested.get('timezone')}.",
+                    )
+            if timing.get("expires_after_seconds") is not None:
+                lines.insert(
+                    4,
+                    f"Requested lifetime: {timing['expires_after_seconds']} seconds after approval.",
+                )
+            note = document.get("timing_note")
+            if isinstance(note, str):
+                lines.insert(5, note)
         authority = document.get("authority", {})
         if isinstance(authority, dict):
             for resource in authority.get("resources", ()):

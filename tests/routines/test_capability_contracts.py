@@ -200,9 +200,92 @@ def test_shared_calendar_constraints_reject_invalid_values_in_every_selector(
 
 def test_routine_schema_retains_typed_constraints_with_a_bounded_wire_footprint():
     schema = _spec_schema(update=False)
-    assert len(canonical_json(schema).encode()) < 8600
+    assert len(canonical_json(schema).encode()) < 11000
     properties = cast(Mapping[str, object], schema["properties"])
-    assert len(canonical_json(properties["schedule"]).encode()) < 2600
+    assert len(canonical_json(properties["schedule"]).encode()) < 4200
+
+
+@pytest.mark.parametrize(
+    "schedule",
+    (
+        {"kind": "once", "after_seconds": 300},
+        {"kind": "interval", "interval_seconds": 300, "anchor_after_seconds": 300},
+        {
+            "kind": "once_next_weekday",
+            "timezone": "America/Chicago",
+            "weekday": 3,
+            "hour": 17,
+            "minute": 0,
+        },
+    ),
+)
+def test_create_accepts_bounded_temporal_intents_but_update_requires_exact_time(
+    schedule,
+):
+    create_schema = cast(
+        Mapping[str, object], _spec_schema(update=False)["properties"]
+    )["schedule"]
+    update_schema = cast(Mapping[str, object], _spec_schema(update=True)["properties"])[
+        "schedule"
+    ]
+    validate_tool_schema_value(cast(Mapping[str, object], create_schema), schedule)
+    with pytest.raises(ToolOutputValidationError):
+        validate_tool_schema_value(cast(Mapping[str, object], update_schema), schedule)
+
+
+def test_exact_offset_schedule_is_normalized_to_utc():
+    from datetime import UTC, datetime
+
+    schedule = _parse_schedule(
+        {"kind": "once", "exact_at": "2026-09-23T17:00:00-05:00"}
+    )
+    assert schedule.exact_at == datetime(2026, 9, 23, 22, tzinfo=UTC)
+
+
+async def test_named_local_instant_does_not_jump_to_next_week_after_approval(
+    monkeypatch,
+):
+    from datetime import UTC, datetime
+
+    from daita.capabilities import ToolExecution
+    from daita.routines.capabilities import _create_proposal
+    from daita.routines.owner import RoutineError, _routine_proposal_payload
+    from tests.routines._owner_support import _owner, _proposal, _Store
+
+    owner = _owner(_Store())
+    proposal = await _proposal(owner)
+    properties = cast(Mapping[str, object], _spec_schema(update=False)["properties"])
+    arguments = {
+        key: value
+        for key, value in _routine_proposal_payload(proposal).items()
+        if key in properties and value is not None
+    }
+    arguments.update(
+        schedule={
+            "kind": "once_next_weekday",
+            "timezone": "America/Chicago",
+            "weekday": 3,
+            "hour": 17,
+            "minute": 0,
+        },
+        expires_after_seconds=86400,
+        skill_names=(),
+        distribution_destination_id="destination",
+        _timing_reference_at="2026-09-23T21:59:00+00:00",
+    )
+    arguments.pop("expires_at")
+    monkeypatch.setattr(
+        owner, "current_time", lambda: datetime(2026, 9, 23, 22, 1, tzinfo=UTC)
+    )
+    execution = ToolExecution(
+        run_id="run-local-passed",
+        call_id="call-local-passed",
+        capability_id="routines.create",
+        arguments=arguments,
+        conversation_id="conversation-local-passed",
+    )
+    with pytest.raises(RoutineError, match="passed before creation"):
+        await _create_proposal(owner, execution, commit_time=True)
 
 
 @pytest.mark.parametrize(
