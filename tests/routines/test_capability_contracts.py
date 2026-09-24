@@ -8,6 +8,7 @@ import pytest
 from daita._json import FrozenJsonObject, canonical_json
 from daita.capabilities import ToolOutputValidationError, validate_tool_schema_value
 from daita.routines.capabilities import _parse_schedule, _spec_schema
+from daita.routines.models import OnceSchedule
 
 
 @pytest.mark.parametrize("update", [False, True])
@@ -239,6 +240,7 @@ def test_exact_offset_schedule_is_normalized_to_utc():
     schedule = _parse_schedule(
         {"kind": "once", "exact_at": "2026-09-23T17:00:00-05:00"}
     )
+    assert isinstance(schedule, OnceSchedule)
     assert schedule.exact_at == datetime(2026, 9, 23, 22, tzinfo=UTC)
 
 

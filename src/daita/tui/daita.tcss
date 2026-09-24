@@ -197,6 +197,7 @@ PermissionsScreen {
 #review-cost,
 #catalog-browser,
 #jobs-manager,
+#routines-manager,
 #inbox-manager,
 #mcp-management,
 #mcp-setup {
@@ -392,7 +393,8 @@ ModelSetupScreen #model-help {
 #onboard-title,
 #confirm-message,
 #catalog-title,
-#jobs-title {
+#jobs-title,
+#routines-title {
     color: $foreground;
     text-style: bold;
     padding-bottom: 1;
@@ -637,6 +639,7 @@ ModelSetupScreen #model-help {
 }
 
 #jobs-manager,
+#routines-manager,
 #inbox-manager {
     height: 88%;
 }
@@ -920,24 +923,85 @@ Select {
     background: $error;
 }
 
-RoutinesScreen {
-    align: center middle;
+#routines-summary {
+    height: auto;
+    padding-bottom: 1;
+    color: $text-muted;
 }
-#routines-manager {
-    width: 96%;
-    height: 96%;
-    padding: 1 2;
-    background: $panel;
-}
+
 #routines-list {
-    height: 7;
+    height: 9;
+    min-height: 4;
+    padding: 0;
+    background: $panel;
+    border: none;
+    border-top: solid #2A2A2A;
 }
+
+#routines-list > .option-list--option-highlighted {
+    color: $foreground;
+    background: #343434;
+    text-style: bold;
+}
+
+#routines-list > .option-list--option-hover {
+    background: #242424;
+}
+
 #routines-detail-scroll {
     height: 1fr;
+    min-height: 5;
+    padding: 1 0;
+    background: $panel;
+    border: none;
+    border-top: solid #2A2A2A;
+}
+
+#routines-detail {
+    height: auto;
+    color: $foreground;
+}
+
+#routines-help {
+    height: auto;
+    padding-top: 1;
+    color: $text-muted;
+}
+
+#routines-actions {
+    height: auto;
+    margin-top: 1;
+}
+
+#routines-actions Button {
+    width: auto;
+    min-width: 8;
+    margin-right: 1;
+}
+
+#routines-error {
+    display: none;
+    height: auto;
+    color: $error;
+}
+
+#routines-error.-visible {
+    display: block;
+}
+
+RoutinesScreen.-compact #routines-list {
+    height: 3;
     min-height: 3;
 }
-#routines-help, #routines-error, #routines-summary, #routines-actions {
-    height: auto;
+
+RoutinesScreen.-compact #routines-detail-scroll {
+    min-height: 2;
+}
+
+RoutinesScreen.-compact #routines-help,
+RoutinesScreen.-compact #routines-refresh,
+RoutinesScreen.-compact #routines-close {
+    display: none;
 }
 
 .permission-actions {

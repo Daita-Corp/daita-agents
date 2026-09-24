@@ -9,7 +9,7 @@ import pytest
 
 from daita import Agent, ApprovalDecision
 from daita.distribution import outcome_contract_projection
-from daita.llm.models import FinishReason, ModelResponse, ToolCall
+from daita.llm.models import FinishReason, ModelResponse, TextBlock, ToolCall
 from daita.llm.providers.mock import MockModelProvider
 from daita.routines.temporal import next_weekday_utc, system_user_timezone
 from tests.support.capability_runtime import execute_projected
@@ -73,7 +73,9 @@ async def test_hosted_run_does_not_claim_the_host_timezone_as_the_users(
     )
     try:
         await agent.run("Check again Wednesday at 5pm.")
-        system_text = provider.requests[0].messages[0].content[0].text
+        system_block = provider.requests[0].messages[0].content[0]
+        assert isinstance(system_block, TextBlock)
+        system_text = system_block.text
         assert "User-local IANA timezone is unknown" in system_text
         assert "detected user-local" not in system_text
     finally:
@@ -154,7 +156,9 @@ async def test_relative_schedule_starts_after_approval_and_uses_trusted_local_ti
     )
     try:
         origin = await agent.run("Update me now and again in five minutes.")
-        system_text = provider.requests[0].messages[0].content[0].text
+        system_block = provider.requests[0].messages[0].content[0]
+        assert isinstance(system_block, TextBlock)
+        system_text = system_block.text
         assert "user-local Wednesday 2026-09-23 11:00:00 -0500" in system_text
         assert "America/Chicago" in system_text
         destinations = await agent.distribution_destinations(origin.conversation_id)
@@ -195,9 +199,7 @@ async def test_relative_schedule_starts_after_approval_and_uses_trusted_local_ti
         assert len(approvals) == 1
         if seconds_field is not None:
             assert (
-                approvals[0].arguments["timing_intent"]["schedule"][
-                    seconds_field
-                ]
+                approvals[0].arguments["timing_intent"]["schedule"][seconds_field]
                 == 300
             )
         summary = (await agent.list_routines())[0]
