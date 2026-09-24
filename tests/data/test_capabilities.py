@@ -345,10 +345,14 @@ class _ReadBackend:
         self.calls += 1
         source_id = str(arguments["source_id"])
         resource_id = f"resource-{self.adapter_id}"
+        max_rows = arguments["max_rows"]
+        max_bytes = arguments["max_bytes"]
+        assert isinstance(max_rows, int)
+        assert isinstance(max_bytes, int)
         projection = project_result_rows(
             self.rows,
-            max_rows=int(arguments["max_rows"]),
-            max_bytes=int(arguments["max_bytes"]),
+            max_rows=max_rows,
+            max_bytes=max_bytes,
         )
         result_type = (
             PostgreSQLReadResult
@@ -418,8 +422,14 @@ async def test_data_query_inline_byte_limit_reports_truncation() -> None:
     assert output.data["byte_limit"] == 16_384
     assert output.data["truncated"] is True
     assert output.data["truncation_reasons"] == ("byte_limit",)
-    assert 0 < output.data["returned_rows"] < len(rows)
-    assert output.data["utf8_bytes"] <= output.data["byte_limit"]
+    returned_rows = output.data["returned_rows"]
+    utf8_bytes = output.data["utf8_bytes"]
+    byte_limit = output.data["byte_limit"]
+    assert isinstance(returned_rows, int)
+    assert isinstance(utf8_bytes, int)
+    assert isinstance(byte_limit, int)
+    assert 0 < returned_rows < len(rows)
+    assert utf8_bytes <= byte_limit
 
 
 class _ExportBackend:
