@@ -8,7 +8,7 @@ from typing import ClassVar
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.binding import Binding
+from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Label, OptionList, Static
@@ -31,7 +31,7 @@ from .confirm import ConfirmScreen
 class RoutinesScreen(ModalScreen[None]):
     """Bounded lifecycle view over the public Agent routine surface."""
 
-    BINDINGS: ClassVar[list[Binding]] = [
+    BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "close", "Back", priority=True),
         Binding("r", "refresh", "Refresh", priority=True),
         Binding("i", "details", "Details", priority=True),
