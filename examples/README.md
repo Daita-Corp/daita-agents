@@ -1,17 +1,19 @@
 # Offline examples
 
-These examples use the package in `src` and the current public `Agent` API.
-Unless `--root` is provided, each walkthrough creates a fresh
-temporary root and removes it on exit. A supplied root should be dedicated to
-that example. The shared helper also admits a separate sibling workspace,
-matching the required local `Agent.create(..., workspace=LocalWorkspace(...))`
-contract.
+These walkthroughs use Daita's public `Agent` API with a scripted model. They
+run offline, need no credentials, and keep their state in a temporary agent
+home unless you supply a dedicated `--root`.
 
-The data walkthroughs exercise the read-only catalog and data tools with a tiny
-scripted provider, so they are deterministic, offline, and free of
-credentials. Production providers are configured through
-`daita.create_llm_provider()` and secret providers or provider SDK environment
-configuration; no example contains an API key.
+| Example | What it shows |
+| --- | --- |
+| `00_quickstart_sqlite_from_db.py` | Attach a SQLite database and ask a grounded question. |
+| `02_catalog_assisted_joins.py` | Use catalog relationships to guide a query across tables. |
+| `03_offline_assignments_and_recovery.py` | Schedule work, reopen the host, and investigate a lost action response. |
+| `10_csv_to_sqlite_data_app.py` | Build a local data workflow from CSV and SQLite. |
+
+The data examples use read-only catalog and data tools. Production providers
+are configured through `daita.create_llm_provider()` and their supported secret
+or SDK settings; no example contains an API key.
 
 The public `Agent` also supports explicit conversation IDs with bounded
 cold continuation, bounded `MEMORY.md`/`USER.md` context, bounded Markdown

@@ -89,6 +89,8 @@ See [relational writes](docs/RELATIONAL_WRITES.md),
 | Reports, exports, and provenance | [Artifacts](docs/ARTIFACTS.md) |
 | Source scope and retained context | [Context and scope](docs/CONTEXT_AND_SCOPE.md) |
 | Scheduled work, outcomes, and hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |
+| Durable investigations and task graphs | [Durable jobs](docs/DURABLE_JOBS.md) |
+| Learning, business meaning, and procedures | [Learning and semantics](docs/LEARNING_AND_SEMANTICS.md) |
 | Model setup and subscriptions | [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
 | Python API walkthroughs | [Offline examples](examples/README.md) |
 | Architecture and development | [Repository guide](AGENTS.md) · [Contributing](CONTRIBUTING.md) |

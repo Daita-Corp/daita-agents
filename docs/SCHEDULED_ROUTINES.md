@@ -1,10 +1,13 @@
 # Scheduled assignments and outcomes
 
-Daita scheduled routines perform bounded assignments once or on a recurring schedule. A routine freezes
-one exact self-contained instruction and executes each admitted occurrence
-through the ordinary `AgentLoop` and `CapabilityRuntime`. Each terminal
-occurrence converges atomically with one immutable logical `Delivery` in the
-originating conversation's durable inbox.
+Daita can carry out an approved assignment once or on a recurring schedule.
+Each routine keeps its instruction, access, budget, and delivery destination
+fixed until you approve a revision. Results appear in the originating
+conversation's inbox. An agent host must remain open for scheduled work to
+progress.
+
+Each occurrence uses the same model loop and capability checks as other Daita
+work. Its terminal outcome and inbox delivery are recorded together.
 
 ## Supported schedules
 
@@ -82,7 +85,8 @@ ceilings; those empty machine ceilings never mean all currently admitted sources
 Native update/upsert and explicitly admitted direct-result MCP actions have concrete
 domain grant contracts; the common routine contract does not confer connector
 authority. MCP grants fix exact top-level arguments and allow only named scalar
-variables, with 1–256 reserved calls per occurrence further narrowed by run limits.
+variables, with 1 to 256 reserved calls per occurrence, further narrowed by
+run limits.
 MCP completion evidence is server-reported invocation only. See
 [MCP admission and actions](MCP_CONNECTIVITY.md) for the supported subset.
 

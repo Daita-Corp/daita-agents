@@ -1,12 +1,14 @@
 # Relational updates and upserts
 
-Daita begins with read access only. PostgreSQL updates are an explicit opt-in
-for users who need the agent to change selected columns in selected tables.
-Every update is structured, previewed, checked against the current catalog and
-permissions, approved once, and executed in a transaction. The model never
-writes SQL.
+Daita starts with read access. You can separately allow it to update or upsert
+selected PostgreSQL tables and columns. Each proposed change needs a current
+preview and exact authority. Daita checks the live table, permissions, and
+preview again before a transaction. The model never writes mutation SQL.
 
-Updates can affect one row or many rows within the explicitly approved row ceiling (at most 10,000). Upserts permit one uniform batch of at most 1,000 rows, further narrowed by the permission and routine grant. PostgreSQL is the initial native backend.
+Updates can affect one row or many rows within an approved ceiling of at most
+10,000. Upserts use one uniform batch of at most 1,000 rows. Permissions and
+any standing grant may narrow these limits further. PostgreSQL is the initial
+native backend.
 
 For release evaluation with real model generation and a disposable PostgreSQL
 database, see the [live model acceptance suite](../tests/live/data/test_model_write_acceptance.py). Its evidence is
@@ -39,7 +41,10 @@ Four independent controls must all permit an update:
    enabled by the user.
 3. **Current readiness:** the live table, role, grants, and catalog state must
    pass Daita's non-mutating checks.
-4. **Exact approval:** foreground writes require approval of the current-run previewed call. Routines require an approved revision with one native write grant and one invocation per occurrence.
+4. **Exact authority:** foreground writes need approval of the current-run
+   previewed call. Routines need an approved revision with one native write
+   grant and one invocation per occurrence. An effectful graph job needs
+   foreground approval and an exact grant for its initial task.
 
 The model cannot enable source permissions, grant database privileges, or
 approve its own update.
@@ -387,8 +392,9 @@ unsatisfied when research yields no batch.
 
 This native implementation has deterministic acceptance coverage with fake external
 I/O. It is not production release approval or live PostgreSQL certification.
-Guided authoring and [receipt inspection/recovery](EFFECT_RECEIPTS.md) are available
-in the terminal. Routines execute only while an eligible host is open.
+Guided permission authoring is available in the TUI. Use the Python API or
+headless CLI for [receipt inspection and recovery](EFFECT_RECEIPTS.md). Routines
+execute only while an eligible host is open.
 
 The opt-in [PostgreSQL write release checks](../tests/fixtures/postgres-large/README.md#native-write-release-checks)
 exercise real transactions and independent readback using the existing disposable
