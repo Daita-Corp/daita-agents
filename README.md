@@ -33,16 +33,14 @@ with OpenAI's API, and [supported model subscriptions](docs/SUBSCRIPTION_MODEL_S
 
 ## Quick start
 
-Requires Python 3.11 or 3.12 and
-[pipx](https://pipx.pypa.io/stable/installation/).
+On supported macOS and Linux systems, install Daita with:
 
 ```bash
-pipx install daita-agents
-daita
+curl -fsSL https://daita-tech.io/install.sh | bash
 ```
 
-If pipx selects an unsupported Python version, use
-`pipx install --python python3.12 daita-agents`.
+The installer supplies its own Python runtime and starts onboarding when run
+in a terminal. Run `daita` in a new terminal to return later.
 
 The first launch guides you through creating an agent, configuring a model, and
 optionally attaching a data source for reading. The launch directory becomes
@@ -98,11 +96,17 @@ See [relational writes](docs/RELATIONAL_WRITES.md),
 
 ## Upgrade or uninstall
 
-Close any running Daita terminal or host before `pipx upgrade daita-agents` or
-`pipx uninstall daita-agents`. Agent state under `~/.daita` is separate from
-the installation. Daita 0.19.0 and earlier belong to a different framework
-family and cannot be migrated into 1.x; preserve that state before upgrading.
-See [local state compatibility](docs/LOCAL_STATE_UPGRADES.md).
+Close any running Daita terminal or host first. Run the Quick start command
+again to upgrade a managed installation. To remove it, run:
+
+```bash
+curl -fsSL https://daita-tech.io/install.sh | bash -s -- --uninstall
+```
+
+Agent state under `~/.daita` is separate from the installation. Existing pipx
+installations still use pipx for upgrades and removal. Daita 0.19.0 and earlier
+belong to a different framework family and cannot be migrated into 1.x; preserve
+that state before upgrading. See [local state compatibility](docs/LOCAL_STATE_UPGRADES.md).
 
 ## License
 
