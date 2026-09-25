@@ -1,9 +1,9 @@
 # Agent-home compatibility and upgrades
 
-Daita's production persistence contract is the revision of the complete agent
-home, not the package version, a Git tag, the SQLite schema version, or a set of
-independent record-codec versions. The current production home revision is `1`
-and the minimum automatically supported production revision is `1`.
+Daita versions its entire agent home as one unit. The home revision is separate
+from the package version, Git tag, and SQLite schema version. The current
+production home revision is `2`; revision `1` is the oldest production home
+that upgrades automatically.
 
 One home revision covers every durable component whose shapes must remain
 compatible together, including:
@@ -95,12 +95,17 @@ The migration registry remains the sole runtime compatibility authority.
 
 ## Open and upgrade behavior
 
-The normal operator flow remains:
+For a managed installation, close running Daita hosts and install the current
+release. Opening the agent then checks its home and applies any supported
+upgrade:
 
 ```bash
-pipx upgrade daita-agents
+curl -fsSL https://daita-tech.io/install.sh | bash
 daita
 ```
+
+If Daita was installed with pipx, continue to upgrade it with
+`pipx upgrade daita-agents`.
 
 Opening an agent acquires that home's existing writer lock before inspecting,
 recovering, or upgrading it. A current home is fully validated before its
@@ -136,11 +141,11 @@ refusals do not rewrite or reset the home.
 
 ## Production revision policy
 
-Revision `1` is frozen. Released migration files, IDs, checksums, historical
-decoders, and golden fixtures are immutable. A durable format change requires a
-new revision even when it changes only a non-SQLite file. Fresh homes are built
-directly at the latest complete revision; they do not replay historical
-migrations.
+Revisions `1` and `2` are frozen. Released migration files, IDs, checksums,
+historical decoders, and golden fixtures are immutable. A durable format change
+requires a new revision even when it changes only a non-SQLite file. Fresh
+homes are built directly at the latest complete revision; they do not replay
+historical migrations.
 
 A new revision is a mutable release candidate only until its first Git tag. It
 may be refined across development commits by updating its implementation,
@@ -164,7 +169,7 @@ There is deliberately no independently growing codec registry, SQLite-only
 migration sequence, spreadsheet, or Git-tag map that must line up with this
 revision. The append-only home registry is the one persistence version source.
 
-## First production bridge
+## Revision 1 preproduction bridge
 
 Revision `1` contains a one-time, immutable bridge for the three complete
 preproduction home shapes observed immediately before the freeze. It translates
@@ -175,3 +180,12 @@ memory, user profile, skills, conversations, and other supported durable state.
 
 This bridge is not a general legacy framework. Daita `0.19.0` and earlier are a
 different product family and remain outside the automatic support window.
+
+## Revision 2 graph cutover
+
+Revision `2` converts the previous single-job and autonomous-follow-up records
+to the current durable task graph in one atomic home upgrade. It preserves
+terminal evidence and turns only provably safe queued profiles into runnable
+graph work. Work that cannot be mapped safely needs attention; Daita does not
+fall back to the previous executor. Revision `1` decoders remain inside this
+immutable migration and are not part of current execution.

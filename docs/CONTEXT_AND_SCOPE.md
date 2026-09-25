@@ -4,6 +4,11 @@ Daita discovers currently admitted readable sources for an ordinary question.
 There is no selected-source mode. Every data call still names its exact source
 and resource, and current permissions are checked before I/O.
 
+In practice, Daita can search across sources you have made readable, but it
+does not guess which table or connector you meant when a consequential choice
+is ambiguous. Source content, prior answers, and saved knowledge can guide an
+investigation; they cannot add access or replace current catalog facts.
+
 The frozen readable resource set is a candidate ceiling, not an exact selection.
 Initial catalog context ranks only within that ceiling and reports separate
 `match_outcomes.current_query` and `match_outcomes.prior_query` assessments. The

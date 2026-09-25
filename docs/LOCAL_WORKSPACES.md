@@ -1,11 +1,10 @@
 # Local computer files
 
-A plain local Daita session provides a read-first Files surface for ordinary
-files allowed by the host OS. The launch directory is the working directory,
-not the boundary of computer access. Files are not registered data sources and
-are not cataloged as SQLite, PostgreSQL, CSV, or JSON. The Files domain never
-owns a general writer. One existing text file can change only through the
-committed artifact and approved exact-target delivery workflow described below.
+A local Daita session can read ordinary files allowed by the host OS. The
+launch directory sets the default for relative paths, but you can also give an
+absolute or `~/` path. Local Files are separate from registered data sources.
+To change an existing text file, Daita first creates an edit artifact and then
+asks for approval before saving to that exact file.
 
 ## Launching Daita
 
@@ -67,8 +66,8 @@ For bounded mode, the workspace and agent-state roots must not overlap in either
 direction, and filesystem root/home cannot be the workspace. Computer mode can
 use home or a directory that contains private state, but direct state access is
 rejected and broad searches prune state subtrees. Hosted compositions have no
-ambient local backend, and scheduled, follow-up, and other machine-originated
-runs cannot use foreground computer access.
+ambient local backend, and scheduled routines, graph tasks, and other
+machine-originated runs cannot use foreground computer access.
 
 ## Read boundary
 

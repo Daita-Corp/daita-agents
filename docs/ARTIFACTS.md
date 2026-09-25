@@ -1,12 +1,12 @@
 # Artifacts
 
-Daita stores generated files as internal artifacts before any optional local
-delivery. The existing artifact store is the only boundary that commits
-artifact bytes and manifests.
+Daita keeps generated reports and exports as artifacts in the agent home. You
+can inspect or reuse them later. Creating an artifact does not save a copy to
+your computer; that requires explicit approval.
 
 ## Exact exports and derived findings
 
-Use the two tabular paths for different guarantees:
+Choose a tabular tool by the kind of evidence you need:
 
 - `data_export_tabular` runs one validated relational query directly against
   exact current catalog resources and creates a complete CSV or XLSX artifact

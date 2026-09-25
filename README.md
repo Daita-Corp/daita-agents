@@ -1,211 +1,114 @@
-![Daita: persistent data agents](assets/banner.png)
+![Daita data operations agent](assets/banner.png)
 
 # Daita
 
-The data agent that learns how your business works.
+**An autonomous data operations agent that learns your data systems.**
 
-Daita connects to SQLite and PostgreSQL and can work with permitted local computer files, then
-returns grounded answers to questions asked in plain language. Conversations,
-approved memory, and reusable skills persist across sessions so useful business
-context does not have to be explained again.
+Data systems are more than tables. Daita maps their structure, learns the
+business meaning you approve, and turns individual investigations into durable
+jobs and recurring checks. It answers from current evidence and carries out
+admitted actions. The goal is fully autonomous data operations within the
+access, budgets, and actions you authorize.
 
-[Quick start](#quick-start) ·
-[Artifacts](docs/ARTIFACTS.md) ·
-[Local computer files](docs/LOCAL_WORKSPACES.md) ·
-[Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) ·
-[Remote MCP](docs/MCP_CONNECTIVITY.md) ·
-[Scheduled routines](docs/SCHEDULED_ROUTINES.md) ·
-[Action receipts and recovery](docs/EFFECT_RECEIPTS.md) ·
-[Examples](examples/README.md)
+## What Daita can do
 
-```text
-You:   Which region led paid revenue last quarter?
-Daita: EMEA led with $4.2M, followed by North America with $3.7M.
-```
+- **Understand your data.** Explore SQLite and PostgreSQL catalogs, follow
+  relationships between resources, and run durable data profiles without
+  changing source data.
+- **Answer across systems.** Query admitted databases, local CSV, TSV, JSON,
+  NDJSON, and Parquet files, and remote MCP tools using current source evidence.
+- **Carry work forward.** Run durable task graphs or set assignments to run
+  once or regularly. Review their results in the inbox while a Daita host is open.
+- **Improve with use.** Keep conversations, approved business knowledge,
+  meanings tied to specific sources, and reusable Markdown procedures. An
+  optional, explicit review can propose lessons from completed runs for you to accept.
+- **Deliver useful output.** Create reports backed by evidence and CSV or XLSX
+  exports, including exact relational snapshots.
+- **Take controlled action.** Preview and approve scoped PostgreSQL updates or
+  upserts, and admit specific remote MCP actions. Durable receipts support
+  inspection and recovery when an outcome is uncertain.
 
-## Why Daita?
-
-| | |
-| --- | --- |
-| **Talk to real data** | Query SQLite and PostgreSQL, or analyze admitted CSV, TSV, JSON, NDJSON, and Parquet files without writing SQL. |
-| **Get grounded answers** | Daita validates queries against the current catalog before reading a source. |
-| **Choose your model** | Use OpenAI, Anthropic, Gemini, Grok, Ollama, an OpenAI-compatible endpoint, or supported model subscriptions. |
-| **Keep useful context** | Persist conversations, user-approved memory, and reusable Markdown skills. |
-| **Stay in control** | Sources begin read-only, access is explicitly scoped, and operational effects require exact approval. |
+Daita works with OpenAI, Anthropic, Gemini, Grok, Ollama, endpoints compatible
+with OpenAI's API, and [supported model subscriptions](docs/SUBSCRIPTION_MODEL_SOURCES.md).
 
 ## Quick start
 
-You need Python 3.11 or 3.12 and
-[pipx](https://pipx.pypa.io/stable/installation/).
+On supported macOS and Linux systems, install Daita with:
 
 ```bash
-pipx install daita-agents
-daita
+curl -fsSL https://daita-tech.io/install.sh | bash
 ```
 
-If pipx would otherwise select a newer unsupported interpreter, choose an
-installed Python 3.11 or 3.12 explicitly:
+The installer supplies its own Python runtime and starts onboarding when run
+in a terminal. Run `daita` in a new terminal to return later.
 
-```bash
-pipx install --python python3.12 daita-agents
-```
+The first launch guides you through creating an agent, configuring a model, and
+optionally attaching a data source for reading. The launch directory becomes
+the default local working directory; foreground Files tools also accept
+explicit local paths.
 
-The first launch guides you through creating an agent, selecting a model, and
-optionally attaching a read-only data source. The launch directory is the default
-working directory, while foreground Files tools can also use host-resolved
-Downloads, Documents, Desktop, and other explicit local paths. API-backed
-model credentials are stored in the OS keychain. Ollama needs no API key, and
-supported Codex, Claude Code, and Grok Build subscriptions can use their
-documented sign-in flows. See
-[Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) for setup and
-security boundaries.
-
-Once setup is complete, try asking:
+Try asking:
 
 ```text
-Which products grew fastest month over month?
-How many customers have not ordered in 90 days?
-Compare paid revenue by region and plan.
-Find the latest CSV in Downloads and compare it with the CSV in Documents.
+How do our customers, orders, and payments tables relate?
+Profile the orders and payments tables without changing them.
+Compare paid revenue by region across our admitted sources.
+Every Monday, summarize last week's revenue and put the result in my inbox.
 ```
 
-Run `daita` again for a returning launch. Daita reopens the only agent or shows
-a picker when several exist. Use `daita --agent atlas` to select one directly.
-Inside the terminal, `/help` lists commands and controls, `/` opens the command
-palette, and `@` narrows one question to a source. Ordinary questions can discover
-and compare all admitted connections without a selection. `/routines` shows saved
-assignments and occurrence evidence, and `/inbox` shows results. In `/sources`,
-choose Permissions for exact PostgreSQL update/upsert authoring. The same screen
-provides a read-only tree graph: choose a resource, follow its catalog relationships
-to neighboring resources, and inspect relationship direction, provenance,
-confidence, and fields. The graph presents catalog evidence only; it does not grant
-access or execution authority.
+Use `/learn <material>` to teach Daita a business definition or procedure with
+approval. `/jobs` shows durable work, `/routines` manages saved assignments, and
+`/inbox` shows their results. `/sources` explores connections and relationships;
+`@` narrows a question to one source. Type `/help` for the full command list.
 
-Saved assignments execute while the TUI or `daita host --agent atlas` keeps the
-agent open. Exit the current host before opening another; no work progresses
-while all hosts are closed. Routine approval grants no missing connector
-permission, and recovering an uncertain action performs no retry.
+Scheduled work progresses only while the terminal or `daita host --agent <name>`
+keeps that agent open. One host can open an agent home at a time.
 
-## Read-first by design
+## Authority stays explicit
 
-Daita treats source metadata, query results, file content, remote tool output,
-memory, and skills as untrusted input. None of them can grant authority or
-change the execution policy.
+Database connections start with read access only. Daita validates SQL against
+the current catalog, checks tool calls against current scope and permissions,
+and treats source content, remote output, memory, and skills as untrusted input.
+Saved knowledge helps interpret data; it cannot grant access or override
+current source facts.
 
-- SQLite and PostgreSQL sources begin read-only.
-- SQL is validated against the current catalog before source I/O.
-- Local-file reads reject traversal, symlinks, private state, secret-like paths, and special
-  files.
-- Remote MCP tools require explicit local access/effect admission and are
-  revalidated at call time. Admitted actions use exact per-call approval or a
-  frozen routine grant, one dispatch and durable invocation receipts.
-- Native source-data mutations are explicitly enabled structured updates and
-  upserts, initially backed by PostgreSQL. Exact current-run previews, explicit
-  operation/column/row permissions, transactional drift checks, and runtime-owned
-  receipts govern each call. A routine permits one native write invocation per occurrence.
+External effects require exact permissions and approval or a bounded standing
+grant. Native writes use a preview from the current run and transactional
+checks. Daita records effect receipts and never silently retries an uncertain
+action.
 
-Learn more in [Local computer files](docs/LOCAL_WORKSPACES.md),
-[Remote MCP tools and actions](docs/MCP_CONNECTIVITY.md), and
-[Relational writes](docs/RELATIONAL_WRITES.md).
+See [relational writes](docs/RELATIONAL_WRITES.md),
+[remote MCP connectivity](docs/MCP_CONNECTIVITY.md), and
+[action receipts and recovery](docs/EFFECT_RECEIPTS.md) for the exact limits.
 
-## How it works
-
-Daita uses one direct model/tool loop:
-
-```text
-user message -> model -> tool calls -> ordered tool results -> model -> answer
-```
-
-The current transcript is the loop state. Tool failures are returned to the
-model like ordinary results so it can correct a call on the next step. Steps,
-wall time, tokens, and estimated cost bound progression. Exhaustion ends the run
-with retained evidence and an explicit failure; it never starts an extra model
-request to write a closing answer. Requests carry the remaining allowance, and
-OpenAI, Anthropic, and Gemini API adapters count the prepared input through their
-provider's counting endpoint before narrowing output limits. Counting shares the
-run deadline and does not generate a response. Routes without complete request
-counting retain usage-based stopping and supported output caps; they cannot admit
-an estimated-cost ceiling. Actual returned usage is retained even when it exceeds
-an allowance. An in-flight generation timeout can leave usage unknown; estimated
-ceilings are not a billing guarantee.
-
-Configured model routes own bounded retries, with SDK retries disabled. Credential
-resolution, counting, generation, and backoff share one run deadline; counting also
-has a 15-second phase cap. Temporary pre-generation failures can retry with known
-zero usage. Unknown generation consumption prevents budgeted retry or fallback.
-Stream progress and completion stop retry eligibility, and model retries never
-replay completed tool actions. Injecting a provider directly retains that provider's
-own behavior rather than implicitly adding a router.
-
-Each request includes procedure guidance for its currently loaded tools. Optional
-discovery and prior conversation context are fitted to the run allowance as well
-as the model window, while current-run messages remain exact. Admission diagnostics
-retain native input counts separately from actual returned usage.
-
-Agent identity, source registrations, catalog snapshots, transcripts, jobs,
-routines, and results are stored in one SQLite database inside the agent home.
-Memory and skills are bounded advisory Markdown—not source truth, evidence, or
-authorization. Durable jobs and scheduled routines use the same catalog,
-capability runtime, and execution loop as foreground questions.
-
-Questions can span admitted sources without selecting one first. See
-[context and source scope](docs/CONTEXT_AND_SCOPE.md) for exact caller filters,
-retained sensitivity, and the self-contained context used by scheduled work.
-
-For the full implementation boundaries, see the
-[repository architecture guide](AGENTS.md).
-
-## Documentation
+## Guides
 
 | Topic | Guide |
 | --- | --- |
-| Exact exports and evidence-bound derived files | [Artifacts](docs/ARTIFACTS.md) |
-| Working directory, local file reads, queries, and edits | [Local computer files](docs/LOCAL_WORKSPACES.md) |
-| Codex, Claude Code, and Grok Build subscriptions | [Subscription model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
-| Remote reads and admitted actions | [Remote MCP connectivity](docs/MCP_CONNECTIVITY.md) |
-| Schedules, outcomes, inboxes, and resident hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |
-| Scoped relational writes and receipts | [Relational writes](docs/RELATIONAL_WRITES.md) |
-| State compatibility and automatic upgrades | [Local state compatibility](docs/LOCAL_STATE_UPGRADES.md) |
-| Managed installer release status | [Managed installer](docs/MANAGED_INSTALLER_RELEASE.md) |
-| Public Python API walkthroughs | [Offline examples](examples/README.md) |
-| Development and architecture contracts | [Repository guide](AGENTS.md) |
-| Model provider implementation | [Provider implementation guide](docs/MODEL_PROVIDERS.md) |
-| Contribution workflow | [Contributing](CONTRIBUTING.md) |
+| Local file access and edits | [Local computer files](docs/LOCAL_WORKSPACES.md) |
+| Reports, exports, and provenance | [Artifacts](docs/ARTIFACTS.md) |
+| Source scope and retained context | [Context and scope](docs/CONTEXT_AND_SCOPE.md) |
+| Scheduled work, outcomes, and hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |
+| Durable investigations and task graphs | [Durable jobs](docs/DURABLE_JOBS.md) |
+| Learning, business meaning, and procedures | [Learning and semantics](docs/LEARNING_AND_SEMANTICS.md) |
+| Model setup and subscriptions | [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
+| Python API walkthroughs | [Offline examples](examples/README.md) |
+| Architecture and development | [Repository guide](AGENTS.md) · [Contributing](CONTRIBUTING.md) |
 | Private vulnerability reporting | [Security policy](SECURITY.md) |
-
-For command discovery, use:
-
-```bash
-daita --help
-daita routines --help
-```
-
-Python users can start with the deterministic SQLite quickstart:
-
-```bash
-PYTHONPATH=src .venv/bin/python examples/00_quickstart_sqlite_from_db.py
-```
 
 ## Upgrade or uninstall
 
-Close every running Daita terminal before managing the installation:
+Close any running Daita terminal or host first. Run the Quick start command
+again to upgrade a managed installation. To remove it, run:
 
 ```bash
-pipx upgrade daita-agents
-pipx reinstall daita-agents
-pipx uninstall daita-agents
+curl -fsSL https://daita-tech.io/install.sh | bash -s -- --uninstall
 ```
 
-Application state under `~/.daita` is separate from the installation and is
-not removed by pipx. Daita 0.19.0 and earlier belong to a different legacy
-framework family; a 0.x-to-1.0 migration is unsupported. Preserve legacy state
-before installing Daita 1.x. See [Local state compatibility](docs/LOCAL_STATE_UPGRADES.md)
-and the [managed installer status](docs/MANAGED_INSTALLER_RELEASE.md).
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and pull-request
-guidance. Report security issues privately through [SECURITY.md](SECURITY.md).
+Agent state under `~/.daita` is separate from the installation. Existing pipx
+installations still use pipx for upgrades and removal. Daita 0.19.0 and earlier
+belong to a different framework family and cannot be migrated into 1.x; preserve
+that state before upgrading. See [local state compatibility](docs/LOCAL_STATE_UPGRADES.md).
 
 ## License
 

@@ -1,11 +1,13 @@
 # Remote MCP tools and external actions
 
-Daita can admit independently configured remote Model Context Protocol (MCP)
-servers as locally admitted reads or external actions in the existing direct model/tool loop. The feature
-is deliberately narrow and server neutral: a binding records one exact HTTPS
-endpoint, one negotiated server identity, explicit local tool permissions, and
-canonical schema digests. A server's names, descriptions, annotations, and
-results are untrusted data and never create authorization.
+Daita can use approved remote Model Context Protocol (MCP) tools to read from
+other systems or take specific external actions. An operator first inspects a
+server and admits its exact tools, access, and effects. A server's own names,
+descriptions, annotations, and results cannot grant permission.
+
+Each binding retains one exact endpoint, negotiated server identity, local
+tool permissions, and schema digests. Calls recheck those facts before remote
+I/O.
 
 ## Supported surface
 
@@ -221,10 +223,11 @@ status = await agent.attach_mcp_server(
 ```
 
 Action selections default to `INTERACTIVE_ONLY` when eligibility is omitted.
-Setting `AUTOMATION_DIRECT` permits a routine proposal; it grants no standing
-authority by itself. Each foreground invocation still requires exact per-call
-approval through the ordinary runtime. The public typed admission API is a local
-operator control and must not be delegated to model-written content.
+Setting `AUTOMATION_DIRECT` permits a routine or eligible graph job proposal;
+it grants no standing authority by itself. Each foreground invocation still
+requires exact approval through the ordinary runtime. The public typed
+admission API is a local operator control and must not be delegated to
+model-written content.
 
 Both tool and binding outbound ceilings apply to the **full model request
 classification**, including retained history, research and connector metadata.
@@ -244,7 +247,7 @@ constraints = {
 ```
 
 The enclosing `RequestedCapabilityGrant` supplies the exact capability ID and
-`max_calls_per_occurrence` (1–256, further bounded by the run). The constraints
+`max_calls_per_occurrence` (1 to 256, further bounded by the run). The constraints
 kind is `mcp.tool_call`; it is assigned by the domain policy, not sent to the server.
 Approval shows the fixed values and variable names. Every fixed value must be
 present and match exactly; extra names are rejected. The complete call must pass
@@ -296,8 +299,10 @@ Unresolved effects block potentially duplicating work across restart, future slo
 run-now, resume, changed arguments, revision and new effectful clones. Exact human
 recovery records a receipt-linked decision without invoking anything. See
 [effect receipts and recovery](EFFECT_RECEIPTS.md) and
-[scheduled assignments](SCHEDULED_ROUTINES.md). This implementation and its
-deterministic fake-I/O acceptance are not production release approval.
+[scheduled assignments](SCHEDULED_ROUTINES.md). Graph jobs admit only an exact,
+foreground-approved synchronous MCP action as their initial effectful task; an
+uncertain receipt blocks that task and its descendants. This implementation and
+its deterministic fake-I/O acceptance are not production release approval.
 
 The [offline assignment and recovery walkthrough](../examples/03_offline_assignments_and_recovery.py)
 uses the production MCP client with an in-memory HTTP transport. It demonstrates

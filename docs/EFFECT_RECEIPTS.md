@@ -1,9 +1,11 @@
 # External-effect evidence and recovery
 
-Daita reserves a durable receipt before dispatching a native database change or an
-admitted external action. The receipt identifies the exact capability contract,
-run, call and normalized operation. A repeated operation in the same run or
-occurrence is not dispatched again, including after definite non-application.
+An external action can succeed even if its response never reaches Daita. Daita
+records a durable receipt before dispatching a native PostgreSQL change or an
+admitted MCP action so an uncertain result can be investigated without
+silently repeating it. The receipt binds the exact capability, run, call, and
+normalized operation. A repeated operation in the same run or occurrence is
+not dispatched again, including after definite non-application.
 
 `SUCCEEDED / ADAPTER_VERIFIED` records native transaction evidence.
 `SUCCEEDED / SERVER_REPORTED` means the remote tool invocation returned normally;
@@ -16,6 +18,10 @@ reopens. Unresolved evidence survives conversation clearing and blocks new
 foreground external effects. Read-only investigation and receipt inspection
 remain available. If terminal evidence cannot be persisted, the current host
 blocks further effects; reopen the agent to recover the reserved receipt.
+
+An uncertain routine effect pauses the routine. In a graph job, an effect that
+cannot be joined to an accepted task result opens an `effect_uncertain` control
+and blocks that task and its descendants. Neither path replays the action.
 
 The Python control plane provides bounded inspection and explicit recovery:
 
@@ -49,7 +55,8 @@ model tools and scheduled instructions.
 
 ## Operator inspection and recovery
 
-Receipt inspection and recovery are intentionally absent from the interactive TUI.
+Receipt inspection and recovery use the Python API or headless CLI, not the
+interactive TUI.
 An operator can use the headless controls to review the original observation,
 evidence basis, normalized payload, run/occurrence IDs, digest and any separate
 human resolution. No model is called. Denial, cancellation, a stale digest or
