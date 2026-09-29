@@ -39,9 +39,11 @@ from daita.storage.home_migrations.revision_0001_schema import (
     SCHEMA_REVISION_1,
 )
 from daita.storage.home_migrations.revision_0002 import REVISION_2
+from daita.storage.home_migrations.revision_0003 import REVISION_3
 from daita.storage.schema_contract import require_healthy, require_schema
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
+from tests.support.mcp_actions import ActionFixture
 from tests.support.paths import REPO_ROOT
 from tests.support.workspace import workspace_for
 
@@ -88,14 +90,14 @@ def _validate_synthetic_home(
     assert (
         (memory_home / "MEMORY.md")
         .read_text(encoding="utf-8")
-        .endswith("revision three\n")
+        .endswith("revision four\n")
     )
 
 
 def _synthetic_next_apply(staged_home: Path, source_shape: str | None) -> None:
     assert source_shape is None
     with (staged_home / "MEMORY.md").open("a", encoding="utf-8") as file:
-        file.write("revision three\n")
+        file.write("revision four\n")
 
 
 def _synthetic_failure(staged_home: Path, source_shape: str | None) -> None:
@@ -105,8 +107,8 @@ def _synthetic_failure(staged_home: Path, source_shape: str | None) -> None:
 
 def _synthetic_next_migration(*, apply=_synthetic_next_apply) -> HomeMigration:
     return HomeMigration(
-        revision=3,
-        migration_id="test_only_agent_home_revision_3",
+        revision=4,
+        migration_id="test_only_agent_home_revision_4",
         definition="test-only whole-home revision",
         affected_paths=("state.db", "MEMORY.md"),
         target_schema=CURRENT_SCHEMA,
@@ -119,13 +121,13 @@ def _patch_next_migration(
     monkeypatch: pytest.MonkeyPatch,
     migration: HomeMigration,
 ) -> None:
-    migrations = (REVISION_1, REVISION_2, migration)
+    migrations = (REVISION_1, REVISION_2, REVISION_3, migration)
     monkeypatch.setattr(migration_registry, "HOME_MIGRATIONS", migrations)
-    monkeypatch.setattr(migration_registry, "CURRENT_HOME_REVISION", 3)
+    monkeypatch.setattr(migration_registry, "CURRENT_HOME_REVISION", 4)
     monkeypatch.setattr(coordinator, "HOME_MIGRATIONS", migrations)
-    monkeypatch.setattr(coordinator, "CURRENT_HOME_REVISION", 3)
-    monkeypatch.setattr(sqlite_store, "CURRENT_HOME_REVISION", 3)
-    monkeypatch.setattr(SQLiteStateStore, "current_revision", "3")
+    monkeypatch.setattr(coordinator, "CURRENT_HOME_REVISION", 4)
+    monkeypatch.setattr(sqlite_store, "CURRENT_HOME_REVISION", 4)
+    monkeypatch.setattr(SQLiteStateStore, "current_revision", "4")
 
 
 async def _create_rich_home(tmp_path: Path, name: str = "atlas") -> tuple[Path, str]:
@@ -346,6 +348,101 @@ def _make_preproduction_home(home: Path, shape: str) -> None:
             )
 
 
+async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt(
+    tmp_path: Path,
+) -> None:
+    action = await ActionFixture(tmp_path).start()
+    try:
+        proposal = await action.agent.propose_routine(await action.draft())
+        action.script()
+        routine = await action.agent.create_routine(proposal)
+        await action.delivery()
+        inspection = await action.agent.inspect_routine(routine.routine_id)
+        receipts = await action.receipts()
+        assert inspection is not None
+        assert len(inspection.routine.capability_grants) == len(receipts) == 1
+        grant = inspection.routine.capability_grants[0]
+        receipt = receipts[0]
+        assert receipt.capability_grant_digest == grant.grant_digest
+        assert receipt.routine_id == routine.routine_id
+        binding = action.binding
+        home = action.agent.home
+        request_count = len(action.server.request_methods)
+    finally:
+        await action.agent.close()
+
+    # Phase 1 changed only run and binding payloads. Restore their released
+    # revision-2 shapes, retaining the real grant, receipt, and other home data.
+    with sqlite3.connect(home / "state.db") as connection:
+        preserved = {
+            table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
+            for table in ("scheduled_routines", "effect_receipts")
+        }
+        run_ids = tuple(connection.execute("SELECT id FROM runs ORDER BY id"))
+        for run_id, encoded in connection.execute("SELECT id, input FROM runs"):
+            payload = json.loads(encoded)
+            fields = payload["fields"]
+            del fields["caller_principal_id"]
+            del fields["caller_principal_verified"]
+            connection.execute(
+                "UPDATE runs SET input = ? WHERE id = ?",
+                (json.dumps(payload, sort_keys=True, separators=(",", ":")), run_id),
+            )
+        for binding_id, encoded in connection.execute(
+            "SELECT binding_id, data FROM mcp_server_bindings"
+        ):
+            payload = json.loads(encoded)
+            fields = payload["fields"]
+            assert fields["owner_principal_id"] == binding.agent_id
+            for field in (
+                "owner_principal_id",
+                "connection_id",
+                "resource_uri",
+                "required_scopes",
+            ):
+                del fields[field]
+            connection.execute(
+                "UPDATE mcp_server_bindings SET data = ? WHERE binding_id = ?",
+                (
+                    json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                    binding_id,
+                ),
+            )
+        assert (
+            connection.execute(
+                "DELETE FROM agent_home_migrations WHERE revision = 3"
+            ).rowcount
+            == 1
+        )
+    connection.close()
+
+    before = await Agent.inspect_home("mcp-actions", root=tmp_path)
+    assert before.found_revision == 2 and before.upgrade_required
+    reopened = await Agent.open("mcp-actions", **action.kwargs())
+    try:
+        assert (await reopened.list_mcp_servers())[0].binding == binding
+        upgraded = await reopened.inspect_routine(routine.routine_id)
+        assert upgraded is not None
+        assert upgraded.routine.capability_grants == (grant,)
+        assert await reopened.inspect_effect(receipt.receipt_id) == receipt
+        assert len(action.server.request_methods) == request_count
+    finally:
+        await reopened.close()
+
+    with sqlite3.connect(home / "state.db") as connection:
+        assert tuple(connection.execute("SELECT id FROM runs ORDER BY id")) == run_ids
+        for table, rows in preserved.items():
+            assert (
+                tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
+                == rows
+            )
+    assert _journal(home / "state.db")[-1] == (
+        3,
+        REVISION_3.migration_id,
+        REVISION_3.checksum,
+    )
+
+
 async def test_generic_engine_upgrades_database_and_owned_file_together(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -360,16 +457,17 @@ async def test_generic_engine_upgrades_database_and_owned_file_together(
         validate_home=_validate_synthetic_home,
     )
 
-    assert result.source_revision == 2
-    assert result.target_revision == 3
+    assert result.source_revision == 3
+    assert result.target_revision == 4
     assert result.upgraded
     assert _journal(home / "state.db") == (
         (1, REVISION_1.migration_id, REVISION_1.checksum),
         (2, REVISION_2.migration_id, REVISION_2.checksum),
-        (3, migration.migration_id, migration.checksum),
+        (3, REVISION_3.migration_id, REVISION_3.checksum),
+        (4, migration.migration_id, migration.checksum),
     )
     assert (home / "MEMORY.md").read_text(encoding="utf-8") == (
-        before_memory + "revision three\n"
+        before_memory + "revision four\n"
     )
     assert result.rollback_path is not None
     assert (result.rollback_path / "state.db").is_file()
@@ -452,7 +550,7 @@ async def test_publish_failure_restores_the_complete_source_then_recovers(
     )
     assert result.recovered
     assert result.upgraded
-    assert _journal(home / "state.db")[-1][0] == 3
+    assert _journal(home / "state.db")[-1][0] == 4
 
 
 @pytest.mark.parametrize("phase", ("prepared", "committing", "committed"))
@@ -484,7 +582,7 @@ async def test_upgrade_recovers_after_each_durable_commit_boundary(
 
     assert recovered.recovered
     assert _journal(home / "state.db")[-1] == (
-        3,
+        4,
         migration.migration_id,
         migration.checksum,
     )
@@ -526,7 +624,7 @@ async def test_recovery_finishes_a_partially_published_whole_home(
     )
 
     assert result.recovered
-    assert _journal(home / "state.db")[-1][0] == 3
+    assert _journal(home / "state.db")[-1][0] == 4
     assert not upgrade.exists()
 
 
@@ -545,8 +643,8 @@ async def test_recovery_finishes_a_partially_published_whole_home(
             "unknown",
         ),
         (
-            "UPDATE agent_home_migrations SET revision = 3 WHERE revision = 2",
-            "3",
+            "UPDATE agent_home_migrations SET revision = 4 WHERE revision = 3",
+            "4",
         ),
     ),
 )
@@ -576,7 +674,7 @@ async def test_newer_home_revision_is_a_downgrade_refusal_without_write(
     path = home / "state.db"
     with sqlite3.connect(path) as connection:
         connection.execute(
-            "INSERT INTO agent_home_migrations VALUES (3, 'future_revision', ?)",
+            "INSERT INTO agent_home_migrations VALUES (4, 'future_revision', ?)",
             ("f" * 64,),
         )
     before = _sha256(path)
@@ -585,7 +683,7 @@ async def test_newer_home_revision_is_a_downgrade_refusal_without_write(
         await Agent.open("atlas", root=tmp_path, workspace=workspace_for(tmp_path))
 
     assert raised.value.code is StateCompatibilityCode.NEWER_REVISION
-    assert raised.value.found_revision == "3"
+    assert raised.value.found_revision == "4"
     assert _sha256(path) == before
 
 
@@ -652,8 +750,8 @@ async def test_newer_unfinished_upgrade_is_refused_without_write(
         "operation_id": "a" * 32,
         "phase": "staging",
         "source_kind": "production",
-        "source_revision": 2,
-        "target_revision": 3,
+        "source_revision": 3,
+        "target_revision": 4,
     }
     (upgrade / "journal.json").write_text(json.dumps(journal), encoding="utf-8")
     before = _sha256(home / "state.db")
@@ -722,6 +820,7 @@ async def test_revision_1_bridge_preserves_complete_observed_preproduction_homes
     assert _journal(home / "state.db") == (
         (1, REVISION_1.migration_id, REVISION_1.checksum),
         (2, REVISION_2.migration_id, REVISION_2.checksum),
+        (3, REVISION_3.migration_id, REVISION_3.checksum),
     )
     assert not (home / ".home-upgrade").exists()
     assert len(tuple((home / ".home-rollbacks").iterdir())) == 1
@@ -743,8 +842,8 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     assert stderr.getvalue() == ""
     status = json.loads(stdout.getvalue())
     assert status == {
-        "current_revision": 2,
-        "found_revision": 2,
+        "current_revision": 3,
+        "found_revision": 3,
         "minimum_supported_revision": 1,
         "recovery_required": False,
         "source_kind": "production",
@@ -765,7 +864,7 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
     assert stdout.getvalue() == ""
     error = json.loads(stderr.getvalue())["error"]
     assert error["code"] == "state_revision_unsupported"
-    assert error["current_revision"] == "2"
+    assert error["current_revision"] == "3"
     assert error["found_revision"] == "unknown"
     assert error["state_changed"] is False
     assert error["state_path"] == str(path)
@@ -834,6 +933,7 @@ def test_runtime_has_one_home_revision_owner_and_no_legacy_version_gates() -> No
         "revision_0001.py",
         "revision_0001_schema.py",
         "revision_0002.py",
+        "revision_0003.py",
         "revision_0002_conversion.py",
         "revision_0002_legacy_autonomy.py",
         "revision_0002_legacy_autonomy_codecs.py",
@@ -841,7 +941,7 @@ def test_runtime_has_one_home_revision_owner_and_no_legacy_version_gates() -> No
         "revision_0002_legacy_job_codecs.py",
         "revision_0002_legacy_jobs.py",
     }
-    assert HOME_MIGRATIONS == (REVISION_1, REVISION_2)
+    assert HOME_MIGRATIONS[:2] == (REVISION_1, REVISION_2)
     current_code = "\n".join(
         path.read_text(encoding="utf-8")
         for path in (production / "storage/sqlite_codecs").glob("*.py")

@@ -118,6 +118,15 @@
         "definition": "Atomically replace revision-1 single-job and autonomous-follow-up state with the ratified durable adaptive task graph, preserving terminal evidence and converting only provably safe queued profiles to runnable graph work.",
         "migration_id": "0002_durable_adaptive_task_graph",
         "revision": 2
+      },
+      {
+        "affected_paths": [
+          "state.db"
+        ],
+        "checksum": "01b86ca489e3a2ff72fafbc37bc76fbd177ad2e08199c4650c22a5b099dd1bea",
+        "definition": "Add caller provenance and opaque personal MCP connection claims while preserving released revision-2 identities, grants, receipts and data.",
+        "migration_id": "0003_framework_caller_authority",
+        "revision": 3
       }
     ],
     "sqlite_record_fields": {
@@ -635,8 +644,12 @@
       ],
       "MCPServerBinding": [
         "endpoint",
+        "owner_principal_id",
         "authentication_mode",
         "secret_reference",
+        "connection_id",
+        "resource_uri",
+        "required_scopes",
         "protocol_version",
         "server_name",
         "server_version",
@@ -820,6 +833,8 @@
       "RunInput": [
         "id",
         "agent_id",
+        "caller_principal_id",
+        "caller_principal_verified",
         "message",
         "created_at",
         "conversation_id",
@@ -3893,8 +3908,8 @@
       }
     }
   },
-  "contract_sha256": "950510639b534b3a58c74369c7ad3b1e2b66c9dcc67a44204a770720f99a3660",
-  "home_revision": 2,
+  "contract_sha256": "c66958cd50ece1467545fc89206850ff46c6a31d70bbb7c90bbb2c809540e47f",
+  "home_revision": 3,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1
 }

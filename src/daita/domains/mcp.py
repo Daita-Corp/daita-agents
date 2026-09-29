@@ -11,15 +11,18 @@ from typing import Protocol, cast
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.mcp import (
+    MCPAuthenticationMode,
     MCPBindingState,
     MCPClient,
     MCPClientFactory,
     MCPCompletionSemantics,
+    MCPConnectionProvider,
     MCPError,
     MCPProtocolError,
     MCPRemoteToolError,
     MCPServerBinding,
     MCPToolBinding,
+    check_personal_connection,
     mcp_binding_drift_reason,
     mcp_execution_origin_digest,
 )
@@ -192,6 +195,7 @@ class MCPToolExecutor:
         binding: MCPServerBinding,
         client_factory: MCPClientFactory,
         secrets: SecretProvider,
+        connection_provider: MCPConnectionProvider | None,
         store: MCPBindingStore,
         clock: Callable[[], datetime],
         lock: asyncio.Lock,
@@ -200,6 +204,7 @@ class MCPToolExecutor:
         self._binding = binding
         self._client_factory = client_factory
         self._secrets = secrets
+        self._connection_provider = connection_provider
         self._client: MCPClient | None = None
         self._store = store
         self._clock = clock
@@ -217,6 +222,43 @@ class MCPToolExecutor:
             self._binding.agent_id, self._binding.binding_id
         )
         _require_current_binding(current, self._binding, tool)
+        if (
+            self._binding.authentication.mode
+            is MCPAuthenticationMode.PERSONAL_CONNECTION
+            and not request.caller_principal_verified
+        ):
+            raise MCPProtocolError(
+                "needs_authorization",
+                "The personal MCP connection needs an authenticated caller.",
+            )
+        if (
+            self._binding.authentication.mode
+            is MCPAuthenticationMode.PERSONAL_CONNECTION
+            and request.caller_principal_id != self._binding.owner_principal_id
+        ):
+            raise MCPProtocolError(
+                "needs_authorization", "The MCP binding is unavailable to this caller."
+            )
+        await check_personal_connection(
+            self._binding.authentication,
+            self._connection_provider,
+            request.caller_principal_id,
+        )
+        if (
+            self._binding.authentication.mode
+            is MCPAuthenticationMode.PERSONAL_CONNECTION
+        ):
+            scope = request.execution_scope
+            if scope is not None and (
+                scope.principal_id != request.caller_principal_id
+                or self._binding.binding_id not in scope.allowed_connector_binding_ids
+                or scope.contract_bindings.tool_origins.get(tool.capability_id)
+                != mcp_execution_origin_digest(self._binding, tool)
+            ):
+                raise MCPProtocolError(
+                    "execution_scope_violation",
+                    "The personal MCP connection is outside the frozen machine scope.",
+                )
         validate_tool_schema_value(tool.input_schema, request.arguments)
         if (
             tool.completion_semantics is not MCPCompletionSemantics.DIRECT_RESULT
@@ -240,6 +282,19 @@ class MCPToolExecutor:
                 authentication=self._binding.authentication,
                 secrets=self._secrets,
             )
+            if (
+                self._binding.authentication.mode
+                is MCPAuthenticationMode.PERSONAL_CONNECTION
+            ):
+                binder = getattr(self._client, "bind_personal_connection", None)
+                if not callable(binder) or self._connection_provider is None:
+                    self._client = None
+                    raise MCPProtocolError(
+                        "account_unavailable",
+                        "The MCP client cannot use a personal connection.",
+                    )
+                assert request.caller_principal_id is not None
+                binder(self._connection_provider, request.caller_principal_id)
         inspection = await self._client.inspect(observed_at=self._clock())
         drift = mcp_binding_drift_reason(self._binding, inspection)
         if drift is not None:
@@ -455,12 +510,14 @@ class MCPCapabilityDomain:
         agent_id: str,
         bindings: tuple[MCPActivatedBinding, ...],
         store: MCPBindingStore,
+        connection_provider: MCPConnectionProvider | None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("MCP declarations belong to another domain")
         self._declarations = declarations
         self._agent_id = agent_id
         self._store = store
+        self._connection_provider = connection_provider
         self._binding_by_capability = {
             tool.capability_id: (activated.binding, tool)
             for activated in bindings
@@ -496,7 +553,19 @@ class MCPCapabilityDomain:
             )
             for binding in bindings.values()
         }
+        # Share the provider decision only within this projection; calls recheck.
+        personal_access: dict[str, bool] = {}
         for capability_id, (binding, _tool) in self._binding_by_capability.items():
+            if (
+                binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+                and binding.owner_principal_id != run.caller_principal_id
+            ):
+                continue
+            if (
+                binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+                and not run.caller_principal_verified
+            ):
+                continue
             if (
                 run.execution_scope is not None
                 and binding.binding_id
@@ -504,6 +573,33 @@ class MCPCapabilityDomain:
             ):
                 continue
             if _binding_revision_is_active(current[binding.binding_id], binding):
+                if (
+                    binding.authentication.mode
+                    is MCPAuthenticationMode.PERSONAL_CONNECTION
+                ):
+                    if run.execution_scope is not None and (
+                        run.execution_scope.principal_id != run.caller_principal_id
+                        or binding.binding_id
+                        not in run.execution_scope.allowed_connector_binding_ids
+                        or run.execution_scope.contract_bindings.tool_origins.get(
+                            capability_id
+                        )
+                        != mcp_execution_origin_digest(binding, _tool)
+                    ):
+                        continue
+                    if binding.binding_id not in personal_access:
+                        try:
+                            await check_personal_connection(
+                                binding.authentication,
+                                self._connection_provider,
+                                run.caller_principal_id,
+                            )
+                        except MCPError:
+                            personal_access[binding.binding_id] = False
+                        else:
+                            personal_access[binding.binding_id] = True
+                    if not personal_access[binding.binding_id]:
+                        continue
                 projected.append(self._local_name_by_capability[capability_id])
         return tuple(sorted(projected))
 
@@ -539,7 +635,43 @@ class MCPCapabilityDomain:
                 "The MCP capability is not admitted in this runtime.",
             )
         binding, tool = admitted
+        if (
+            binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+            and not run.caller_principal_verified
+        ):
+            raise CapabilityInputError(
+                "needs_authorization",
+                "The personal MCP connection needs an authenticated caller.",
+            )
+        if (
+            binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+            and binding.owner_principal_id != run.caller_principal_id
+        ):
+            raise CapabilityInputError(
+                "needs_authorization", "The MCP binding is unavailable to this caller."
+            )
+        try:
+            await check_personal_connection(
+                binding.authentication,
+                self._connection_provider,
+                run.caller_principal_id,
+            )
+        except MCPError as error:
+            raise CapabilityInputError(error.code, str(error)) from None
         scope = run.execution_scope
+        if (
+            binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+            and scope is not None
+            and (
+                scope.principal_id != run.caller_principal_id
+                or scope.contract_bindings.tool_origins.get(capability.id)
+                != mcp_execution_origin_digest(binding, tool)
+            )
+        ):
+            raise CapabilityInputError(
+                "execution_scope_violation",
+                "The personal MCP connection is outside the frozen machine scope.",
+            )
         if (
             scope is not None
             and binding.binding_id not in scope.allowed_connector_binding_ids
@@ -628,11 +760,23 @@ class MCPCapabilityDomain:
         if (
             proposal.agent_id != self._agent_id
             or binding.binding_id not in proposal.allowed_connector_binding_ids
+            or (
+                binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+                and proposal.principal_id != binding.owner_principal_id
+            )
         ):
             raise CapabilityInputError(
                 "automation_grant_scope_invalid",
                 "The MCP binding is outside the proposed scope.",
             )
+        try:
+            await check_personal_connection(
+                binding.authentication,
+                self._connection_provider,
+                proposal.principal_id,
+            )
+        except MCPError as error:
+            raise CapabilityInputError(error.code, str(error)) from None
         _require_current_binding(
             await self._store.load_mcp_binding(self._agent_id, binding.binding_id),
             binding,
@@ -892,6 +1036,7 @@ async def activate_mcp_domain(
     store: MCPBindingStore,
     client_factory: MCPClientFactory,
     secrets: SecretProvider,
+    connection_provider: MCPConnectionProvider | None,
     clock: Callable[[], datetime],
 ) -> tuple[
     MCPCapabilityDomain | None,
@@ -909,6 +1054,7 @@ async def activate_mcp_domain(
             binding=binding,
             client_factory=client_factory,
             secrets=secrets,
+            connection_provider=connection_provider,
             store=store,
             clock=clock,
             lock=lock,
@@ -1010,6 +1156,7 @@ async def activate_mcp_domain(
         agent_id=agent_id,
         bindings=tuple(activated),
         store=store,
+        connection_provider=connection_provider,
     )
     return domain, tuple(activated), tuple(item.executor for item in activated)
 

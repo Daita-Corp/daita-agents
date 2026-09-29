@@ -48,12 +48,16 @@ def encode_mcp_binding(value: MCPServerBinding) -> str:
             "MCPServerBinding",
             {
                 "endpoint": value.endpoint,
+                "owner_principal_id": value.owner_principal_id,
                 "authentication_mode": value.authentication.mode.value,
                 "secret_reference": (
                     None
                     if value.authentication.secret_reference is None
                     else value.authentication.secret_reference.to_uri()
                 ),
+                "connection_id": value.authentication.connection_id,
+                "resource_uri": value.authentication.resource_uri,
+                "required_scopes": list(value.authentication.required_scopes),
                 "protocol_version": value.protocol_version,
                 "server_name": value.server_name,
                 "server_version": value.server_version,
@@ -87,8 +91,12 @@ def decode_mcp_binding(
         "MCPServerBinding",
         (
             "endpoint",
+            "owner_principal_id",
             "authentication_mode",
             "secret_reference",
+            "connection_id",
+            "resource_uri",
+            "required_scopes",
             "protocol_version",
             "server_name",
             "server_version",
@@ -123,6 +131,17 @@ def decode_mcp_binding(
     authentication = MCPAuthentication(
         authentication_mode,
         None if secret_uri is None else SecretReference.parse(secret_uri),
+        optional_text(fields["connection_id"], "MCP connection ID"),
+        (
+            text(fields["owner_principal_id"], "MCP owner principal")
+            if authentication_mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+            else None
+        ),
+        optional_text(fields["resource_uri"], "MCP resource URI"),
+        tuple(
+            text(item, "MCP required scope")
+            for item in sequence(fields["required_scopes"], "MCP required scopes")
+        ),
     )
     tools = tuple(
         _decode_tool(item) for item in sequence(fields["tools"], "MCP binding tools")
@@ -131,6 +150,7 @@ def decode_mcp_binding(
         binding_id=binding_id,
         agent_id=agent_id,
         endpoint=text(fields["endpoint"], "MCP endpoint"),
+        owner_principal_id=text(fields["owner_principal_id"], "MCP binding owner"),
         authentication=authentication,
         protocol_version=text(fields["protocol_version"], "MCP protocol version"),
         server_name=text(fields["server_name"], "MCP server name"),

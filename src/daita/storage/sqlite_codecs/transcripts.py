@@ -98,6 +98,8 @@ def _encode_run_input(value: RunInput) -> dict[str, JsonValue]:
         {
             "id": value.id,
             "agent_id": value.agent_id,
+            "caller_principal_id": value.caller_principal_id,
+            "caller_principal_verified": value.caller_principal_verified,
             "message": value.message,
             "created_at": datetime_encode(value.created_at),
             "conversation_id": value.conversation_id,
@@ -120,6 +122,8 @@ def _decode_run_input(value: JsonValue) -> RunInput:
         (
             "id",
             "agent_id",
+            "caller_principal_id",
+            "caller_principal_verified",
             "message",
             "created_at",
             "conversation_id",
@@ -132,6 +136,10 @@ def _decode_run_input(value: JsonValue) -> RunInput:
     return RunInput(
         id=text(fields["id"], "run id"),
         agent_id=text(fields["agent_id"], "run agent_id"),
+        caller_principal_id=text(fields["caller_principal_id"], "run caller principal"),
+        caller_principal_verified=boolean(
+            fields["caller_principal_verified"], "run caller verification"
+        ),
         message=text(fields["message"], "run message"),
         created_at=datetime_decode(fields["created_at"]),
         conversation_id=optional_text(fields["conversation_id"], "conversation id"),

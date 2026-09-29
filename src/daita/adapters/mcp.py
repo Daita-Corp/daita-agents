@@ -91,6 +91,7 @@ class MCPTransportKind(str, Enum):
 class MCPAuthenticationMode(str, Enum):
     NONE = "none"
     BEARER = "bearer"
+    PERSONAL_CONNECTION = "personal_connection"
 
 
 class MCPBindingState(str, Enum):
@@ -150,15 +151,73 @@ class MCPRemoteToolError(MCPError):
 class MCPAuthentication:
     mode: MCPAuthenticationMode
     secret_reference: SecretReference | None = None
+    connection_id: str | None = None
+    owner_principal_id: str | None = None
+    resource_uri: str | None = None
+    required_scopes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, MCPAuthenticationMode):
             raise TypeError("MCP authentication mode is invalid")
-        if self.mode is MCPAuthenticationMode.NONE:
+        if self.mode is MCPAuthenticationMode.PERSONAL_CONNECTION:
             if self.secret_reference is not None:
-                raise ValueError("no-auth MCP configuration cannot contain a secret")
-        elif not isinstance(self.secret_reference, SecretReference):
-            raise ValueError("bearer MCP authentication requires a secret reference")
+                raise ValueError("personal MCP authentication cannot contain a secret")
+            for value, label in (
+                (self.connection_id, "connection ID"),
+                (self.owner_principal_id, "owner principal"),
+                (self.resource_uri, "resource URI"),
+            ):
+                if (
+                    not isinstance(value, str)
+                    or not value
+                    or len(value) > 512
+                    or any(character in value for character in "\r\n\x00")
+                ):
+                    raise ValueError(f"personal MCP {label} is invalid")
+            if (
+                not isinstance(self.required_scopes, tuple)
+                or len(self.required_scopes) > 64
+            ):
+                raise ValueError("personal MCP scopes are invalid")
+            if len(set(self.required_scopes)) != len(self.required_scopes) or any(
+                not isinstance(scope, str)
+                or not scope
+                or len(scope) > 256
+                or any(character in scope for character in "\r\n\x00")
+                for scope in self.required_scopes
+            ):
+                raise ValueError("personal MCP scopes are invalid")
+            resource = urlsplit(self.resource_uri or "")
+            if (
+                resource.scheme != "https"
+                or not resource.hostname
+                or resource.username is not None
+                or resource.password is not None
+                or resource.query
+                or resource.fragment
+            ):
+                raise ValueError("personal MCP resource URI must be HTTPS")
+        else:
+            if any(
+                (
+                    self.connection_id,
+                    self.owner_principal_id,
+                    self.resource_uri,
+                    self.required_scopes,
+                )
+            ):
+                raise ValueError(
+                    "non-personal MCP authentication cannot name a connection"
+                )
+            if self.mode is MCPAuthenticationMode.NONE:
+                if self.secret_reference is not None:
+                    raise ValueError(
+                        "no-auth MCP configuration cannot contain a secret"
+                    )
+            elif not isinstance(self.secret_reference, SecretReference):
+                raise ValueError(
+                    "bearer MCP authentication requires a secret reference"
+                )
 
     @classmethod
     def no_auth(cls) -> MCPAuthentication:
@@ -167,6 +226,90 @@ class MCPAuthentication:
     @classmethod
     def bearer(cls, reference: SecretReference) -> MCPAuthentication:
         return cls(MCPAuthenticationMode.BEARER, reference)
+
+    @classmethod
+    def personal_connection(
+        cls,
+        connection_id: str,
+        owner_principal_id: str,
+        resource_uri: str,
+        required_scopes: tuple[str, ...] = (),
+    ) -> MCPAuthentication:
+        return cls(
+            MCPAuthenticationMode.PERSONAL_CONNECTION,
+            connection_id=connection_id,
+            owner_principal_id=owner_principal_id,
+            resource_uri=resource_uri,
+            required_scopes=required_scopes,
+        )
+
+
+class MCPConnectionProvider(Protocol):
+    """Host-owned personal connection policy and per-request credential source.
+
+    Implementations must raise MCPAuthenticationError with one of the four
+    connection status codes and never include credential material in errors.
+    """
+
+    async def check_access(
+        self,
+        *,
+        connection_id: str,
+        principal_id: str,
+        resource_uri: str,
+        required_scopes: tuple[str, ...],
+    ) -> None: ...
+
+    async def access_token(
+        self,
+        *,
+        connection_id: str,
+        principal_id: str,
+        resource_uri: str,
+        required_scopes: tuple[str, ...],
+    ) -> str: ...
+
+
+_PERSONAL_STATUS_MESSAGES = {
+    "needs_authorization": "The personal MCP connection needs authorization.",
+    "needs_scope_upgrade": "The personal MCP connection needs additional scope.",
+    "connection_revoked": "The personal MCP connection was revoked.",
+    "account_unavailable": "The personal MCP account is unavailable.",
+}
+
+
+async def check_personal_connection(
+    authentication: MCPAuthentication,
+    provider: MCPConnectionProvider | None,
+    principal_id: str | None,
+) -> None:
+    if authentication.mode is not MCPAuthenticationMode.PERSONAL_CONNECTION:
+        return
+    if principal_id != authentication.owner_principal_id or provider is None:
+        raise MCPAuthenticationError(
+            "needs_authorization", _PERSONAL_STATUS_MESSAGES["needs_authorization"]
+        )
+    assert authentication.connection_id is not None
+    assert authentication.resource_uri is not None
+    assert principal_id is not None
+    try:
+        await provider.check_access(
+            connection_id=authentication.connection_id,
+            principal_id=principal_id,
+            resource_uri=authentication.resource_uri,
+            required_scopes=authentication.required_scopes,
+        )
+    except MCPAuthenticationError as error:
+        code = (
+            error.code
+            if error.code in _PERSONAL_STATUS_MESSAGES
+            else "account_unavailable"
+        )
+        raise MCPAuthenticationError(code, _PERSONAL_STATUS_MESSAGES[code]) from None
+    except Exception:
+        raise MCPAuthenticationError(
+            "account_unavailable", _PERSONAL_STATUS_MESSAGES["account_unavailable"]
+        ) from None
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,6 +542,7 @@ class MCPServerBinding:
     summary: str = ""
     when_to_use: str = ""
     keywords: tuple[str, ...] = ()
+    owner_principal_id: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -407,9 +551,17 @@ class MCPServerBinding:
         ):
             raise ValueError("MCP binding_id must use mcp-binding-<32 lowercase hex>")
         _bounded_text(self.agent_id, "MCP agent_id", maximum=256)
-        object.__setattr__(self, "endpoint", normalize_mcp_endpoint(self.endpoint))
         if not isinstance(self.authentication, MCPAuthentication):
             raise TypeError("MCP binding authentication is invalid")
+        owner = self.owner_principal_id or self.agent_id
+        _bounded_text(owner, "MCP owner principal", maximum=512)
+        if self.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION and (
+            self.authentication.owner_principal_id != owner
+        ):
+            raise ValueError("personal MCP connection owner differs from binding owner")
+        object.__setattr__(self, "owner_principal_id", owner)
+        object.__setattr__(self, "endpoint", normalize_mcp_endpoint(self.endpoint))
+        _require_personal_resource_origin(self.endpoint, self.authentication)
         if self.protocol_version not in MCP_SUPPORTED_PROTOCOL_VERSIONS:
             raise ValueError("MCP binding protocol version is unsupported")
         _server_identity(self.server_name, "MCP server name")
@@ -534,6 +686,13 @@ def mcp_execution_origin_digest(binding: MCPServerBinding, tool: MCPToolBinding)
         "completion_semantics": tool.completion_semantics.value,
         "task_support": tool.task_support,
     }
+    if binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION:
+        material.update(
+            owner_principal_id=binding.owner_principal_id,
+            connection_id=binding.authentication.connection_id,
+            resource_uri=binding.authentication.resource_uri,
+            required_scopes=binding.authentication.required_scopes,
+        )
     return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
@@ -664,6 +823,7 @@ class StreamableHTTPMCPClient:
         self.endpoint = normalize_mcp_endpoint(endpoint)
         if not isinstance(authentication, MCPAuthentication):
             raise TypeError("MCP authentication is invalid")
+        _require_personal_resource_origin(self.endpoint, authentication)
         if not isinstance(secrets, SecretProvider):
             raise TypeError("MCP secrets must implement SecretProvider")
         self._authentication = authentication
@@ -678,6 +838,21 @@ class StreamableHTTPMCPClient:
         self._request_id = 0
         self._initialize_lock = asyncio.Lock()
         self._closed = False
+        self._personal_provider: MCPConnectionProvider | None = None
+        self._personal_principal_id: str | None = None
+
+    def bind_personal_connection(
+        self, provider: MCPConnectionProvider, principal_id: str
+    ) -> None:
+        """Bind host-owned credentials to this client without storing a token."""
+        if self._authentication.mode is not MCPAuthenticationMode.PERSONAL_CONNECTION:
+            raise ValueError("MCP client has no personal connection")
+        if principal_id != self._authentication.owner_principal_id:
+            raise MCPAuthenticationError(
+                "needs_authorization", "The personal MCP connection is unavailable."
+            )
+        self._personal_provider = provider
+        self._personal_principal_id = principal_id
 
     async def inspect(self, *, observed_at: datetime) -> MCPServerInspection:
         _aware(observed_at, "MCP observed_at")
@@ -1020,6 +1195,50 @@ class StreamableHTTPMCPClient:
                     "The MCP bearer credential is invalid.",
                 )
             headers["Authorization"] = f"Bearer {token}"
+        elif self._authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION:
+            await check_personal_connection(
+                self._authentication,
+                self._personal_provider,
+                self._personal_principal_id,
+            )
+            assert self._personal_provider is not None
+            assert self._personal_principal_id is not None
+            assert self._authentication.connection_id is not None
+            assert self._authentication.resource_uri is not None
+            try:
+                token = await self._personal_provider.access_token(
+                    connection_id=self._authentication.connection_id,
+                    principal_id=self._personal_principal_id,
+                    resource_uri=self._authentication.resource_uri,
+                    required_scopes=self._authentication.required_scopes,
+                )
+            except MCPAuthenticationError as error:
+                code = (
+                    error.code
+                    if error.code in _PERSONAL_STATUS_MESSAGES
+                    else "account_unavailable"
+                )
+                raise MCPAuthenticationError(
+                    code, _PERSONAL_STATUS_MESSAGES[code]
+                ) from None
+            except Exception:
+                raise MCPAuthenticationError(
+                    "account_unavailable",
+                    _PERSONAL_STATUS_MESSAGES["account_unavailable"],
+                ) from None
+            if (
+                not isinstance(token, str)
+                or not token
+                or len(token.encode("utf-8")) > 64 * 1_024
+                or "\r" in token
+                or "\n" in token
+            ):
+                raise MCPAuthenticationError(
+                    "account_unavailable",
+                    _PERSONAL_STATUS_MESSAGES["account_unavailable"],
+                )
+            headers["Authorization"] = f"Bearer {token}"
+            token = None
         body_parts: list[bytes] = []
         response_too_large = False
         try:
@@ -1060,6 +1279,17 @@ class StreamableHTTPMCPClient:
                 "mcp_response_too_large",
                 "The MCP response exceeded its fixed byte bound.",
             )
+        body = b"".join(body_parts)
+        authorization = headers.get("Authorization")
+        if authorization is not None:
+            credential = authorization.removeprefix("Bearer ")
+            if credential.encode("utf-8") in body or any(
+                credential in value for value in response_headers.values()
+            ):
+                raise MCPProtocolError(
+                    "mcp_credential_echo_rejected",
+                    "The MCP endpoint echoed a credential in its response.",
+                )
         if status in {401, 403}:
             raise MCPAuthenticationError(
                 "mcp_authentication_failed",
@@ -1081,7 +1311,6 @@ class StreamableHTTPMCPClient:
                     else ErrorRetryability.PERMANENT
                 ),
             )
-        body = b"".join(body_parts)
         if not expect_response:
             if status != 202 or body:
                 raise MCPProtocolError(
@@ -1159,6 +1388,26 @@ def normalize_mcp_endpoint(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
+def _require_personal_resource_origin(
+    endpoint: str, authentication: MCPAuthentication
+) -> None:
+    if authentication.mode is not MCPAuthenticationMode.PERSONAL_CONNECTION:
+        return
+    assert authentication.resource_uri is not None
+    target = urlsplit(endpoint)
+    resource = urlsplit(authentication.resource_uri)
+    try:
+        same_origin = (
+            target.scheme == resource.scheme == "https"
+            and target.hostname == resource.hostname
+            and (target.port or 443) == (resource.port or 443)
+        )
+    except ValueError:
+        same_origin = False
+    if not same_origin:
+        raise ValueError("personal MCP resource and endpoint origins differ")
+
+
 def mcp_binding_from_inspection(
     *,
     binding_id: str,
@@ -1169,12 +1418,18 @@ def mcp_binding_from_inspection(
     inspection: MCPServerInspection,
     local_label: str | None = None,
     prior: MCPServerBinding | None = None,
+    owner_principal_id: str | None = None,
 ) -> MCPServerBinding:
     if prior is not None:
         if prior.binding_id != binding_id or prior.agent_id != agent_id:
             raise MCPAdmissionError(
                 "mcp_binding_identity_mismatch",
                 "The existing MCP binding belongs to another identity.",
+            )
+        if prior.owner_principal_id != (owner_principal_id or agent_id):
+            raise MCPAdmissionError(
+                "mcp_binding_identity_mismatch",
+                "The existing MCP binding belongs to another caller.",
             )
         if (
             prior.endpoint != inspection.endpoint
@@ -1295,6 +1550,7 @@ def mcp_binding_from_inspection(
         summary="" if prior is None else prior.summary,
         when_to_use="" if prior is None else prior.when_to_use,
         keywords=() if prior is None else prior.keywords,
+        owner_principal_id=owner_principal_id or agent_id,
     )
 
 

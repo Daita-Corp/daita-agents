@@ -32,7 +32,7 @@ def _materialize_fixture(fixture: Path, home: Path) -> None:
         if source.name == "state.sql":
             with sqlite3.connect(home / "state.db") as connection:
                 connection.executescript(source.read_text(encoding="utf-8"))
-                if fixture.name == "revision-2":
+                if fixture.name in {"revision-2", "revision-3"}:
                     assert connection.execute(
                         "PRAGMA journal_mode = WAL"
                     ).fetchone() == ("wal",)
@@ -57,7 +57,7 @@ async def test_revision_1_golden_whole_home_upgrades_once_and_preserves_content(
     before = _sha256(home / "state.db")
 
     status = await Agent.inspect_home("golden", root=tmp_path)
-    assert status.current_revision == 2
+    assert status.current_revision == 3
     assert status.found_revision == 1
     assert status.minimum_supported_revision == 1
     assert status.upgrade_required

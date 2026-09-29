@@ -260,7 +260,11 @@ async def test_mcp_hint_edits_preserve_execution_and_change_bounded_discovery(
     )
     binding = status.binding
     tool = binding.tools[0]
-    run = replace(_run("hint-snapshot"), agent_id=agent.id)
+    run = replace(
+        _run("hint-snapshot"),
+        agent_id=agent.id,
+        caller_principal_id=agent.id,
+    )
     runtime = agent._embedded._capability_runtime
     catalog_before = await runtime.prepare_run(run)
     contract_before = agent._embedded._capabilities.contract_digest(tool.capability_id)

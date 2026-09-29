@@ -201,7 +201,7 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
     assert "self._one_time" not in delivery
     assert "_source_permission_lock" in embedded
     assert (
-        "HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2)"
+        "HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2, REVISION_3)"
         in migrations
     )
     assert "job_graphs" in CURRENT_SCHEMA.tables
@@ -660,6 +660,7 @@ def test_public_surface_is_focused():
         "MCPAuthenticationMode",
         "MCPBindingState",
         "MCPBindingStatus",
+        "MCPConnectionProvider",
         "MCPCompletionSemantics",
         "MCPError",
         "MCPInspectedTool",
@@ -2064,6 +2065,7 @@ def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
         "revision_0002_legacy_delivery.py",
         "revision_0002_legacy_job_codecs.py",
         "revision_0002_legacy_jobs.py",
+        "revision_0003.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 

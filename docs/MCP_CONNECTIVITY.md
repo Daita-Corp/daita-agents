@@ -13,8 +13,9 @@ I/O.
 
 - Remote Streamable HTTP only. Plain HTTP is accepted only for loopback hosts.
 - MCP protocol versions `2025-11-25` and `2025-06-18`.
-- No authentication or a static bearer token resolved from an existing
-  `SecretReference` at request time.
+- No authentication, a static bearer token resolved from an existing
+  `SecretReference`, or a host-owned personal connection reference. The
+  framework does not perform OAuth setup or token refresh itself.
 - Bounded JSON object input schemas using the documented accepted subset. An
   omitted dialect defaults to JSON Schema 2020-12; the exact explicit root
   declaration `https://json-schema.org/draft/2020-12/schema` is also accepted,
@@ -44,7 +45,7 @@ I/O.
   the frozen run catalog; a verified load receipt replaces the prior loaded
   set. Search and load grant no authority and perform no remote tool calls.
 
-Stdio, OAuth, dynamic client registration, sampling, roots, prompts,
+Stdio, framework-owned OAuth, dynamic client registration, sampling, roots, prompts,
 resources, subscriptions, server-initiated requests, binary content, arbitrary
 schema dialects, shell/infrastructure/arbitrary execution and asynchronous
 completion are not supported. There is no automatic
@@ -116,6 +117,40 @@ authentication = MCPAuthentication.bearer(
 The token value and MCP session identifier are never stored in the binding or
 state database. The reference is resolved again immediately before every
 network request.
+
+### Hosted personal connections
+
+`Agent.create` and `Agent.open` accept an `mcp_connection_provider`. The host
+owns this provider and passes an authenticated `caller_principal_id` to each
+foreground `run`, `learn`, candidate acceptance, MCP management, and hosted
+artifact/history read. Calls without an actor retain the agent-owner default
+for existing agent-owned work; they cannot access a personal connection owned
+by another principal. The hosted dispatcher must pass its authenticated actor
+for personal connections. Model instructions and tool arguments cannot set it.
+
+For a personal binding, use
+`MCPAuthentication.personal_connection(connection_id, owner_principal_id,
+resource_uri, required_scopes)`. The binding stores these exact non-secret claims
+and its owner. The provider's `check_access` verifies connection ownership,
+resource, scopes, and revocation at projection and call time. Its
+`access_token` returns a short-lived token for the same claims on each HTTP
+request. The resource URI and MCP endpoint must share one HTTPS origin;
+redirects and responses that echo a credential are rejected. Provider failures
+return one of `needs_authorization`,
+`needs_scope_upgrade`, `connection_revoked`, or `account_unavailable`; provider
+error text is discarded. The host must enforce the same actor on its saved
+conversation and token-vault APIs. The framework has no hosted connection setup
+or callback flow.
+
+Existing no-auth and static-bearer tools remain agent-scoped for execution;
+binding management uses the binding owner's principal.
+
+Personal tools are omitted from another caller's catalog, including toolbox
+search and connector metadata. Management lists omit bindings owned by another
+caller; exact operations refuse them. A machine scope must freeze both the
+personal binding ID, its exact tool origin digest, and its owner principal
+before it can project or call the tool. A token is never written to the
+binding, home database, transcript, artifact, or effect receipt.
 
 The CLI provides the same bounded lifecycle surface. Each command takes the
 local agent name first:

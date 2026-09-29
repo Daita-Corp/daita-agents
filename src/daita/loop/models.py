@@ -221,10 +221,25 @@ class RunInput:
     start: RunStartEnvelope | None = None
     history_sensitivity: ModelSensitivity = ModelSensitivity.PUBLIC
     resolved_source_scope: EffectiveSourceScope | None = None
+    caller_principal_id: str | None = None
+    caller_principal_verified: bool = True
 
     def __post_init__(self) -> None:
         _required_text(self.id, "run id")
         _required_text(self.agent_id, "run agent_id")
+        principal_id = self.caller_principal_id
+        if principal_id is None:
+            principal_id = (
+                self.start.execution_scope.principal_id
+                if self.start is not None and self.start.execution_scope is not None
+                else self.agent_id
+            )
+        _required_text(principal_id, "run caller principal")
+        if len(principal_id) > 512 or any(c in principal_id for c in "\r\n\x00"):
+            raise ValueError("run caller principal is invalid")
+        object.__setattr__(self, "caller_principal_id", principal_id)
+        if not isinstance(self.caller_principal_verified, bool):
+            raise TypeError("run caller verification must be bool")
         _required_text(self.message, "run message")
         _aware(self.created_at, "run created_at")
         if not isinstance(self.history_sensitivity, ModelSensitivity):
@@ -259,6 +274,8 @@ class RunInput:
         if start.execution_scope is not None:
             if start.execution_scope.agent_id != self.agent_id:
                 raise ValueError("run execution scope belongs to another agent")
+            if start.execution_scope.principal_id != principal_id:
+                raise ValueError("run caller principal differs from execution scope")
             if not set(self.source_scope_ids) <= set(
                 start.execution_scope.allowed_source_ids
             ):

@@ -30,12 +30,16 @@ from .._json import FrozenJsonObject, canonical_json
 from ..adapters.local_workspace import LocalWorkspaceBackend
 from ..adapters.mcp import (
     MCPAuthentication,
+    MCPAuthenticationError,
+    MCPAuthenticationMode,
     MCPBindingState,
     MCPBindingStatus,
     MCPClientFactory,
+    MCPConnectionProvider,
     MCPServerInspection,
     MCPToolSelection,
     StreamableHTTPMCPClientFactory,
+    check_personal_connection,
     mcp_binding_drift_reason,
     mcp_binding_from_inspection,
     mcp_execution_origin_digest,
@@ -786,7 +790,9 @@ class EmbeddedAgent:
         owns_credential_session: bool,
         model_validator: ModelProvider | None,
         mcp_client_factory: MCPClientFactory,
+        mcp_connection_provider: MCPConnectionProvider | None,
         mcp_activated_bindings: tuple[MCPActivatedBinding, ...],
+        hosted: bool,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
     ) -> None:
@@ -804,6 +810,8 @@ class EmbeddedAgent:
         self._owns_credential_session = owns_credential_session
         self._model_validator = model_validator
         self._mcp_client_factory = mcp_client_factory
+        self._mcp_connection_provider = mcp_connection_provider
+        self._hosted = hosted
         self._mcp_activated_bindings = {
             item.binding.binding_id: item for item in mcp_activated_bindings
         }
@@ -859,6 +867,19 @@ class EmbeddedAgent:
         if self._workspace is None:
             raise AgentHomeError("hosted composition has no local file access")
         return self._workspace
+
+    def _resolve_caller_principal(self, caller_principal_id: str | None) -> str:
+        """Accept only host-supplied caller identity, never model content."""
+        if caller_principal_id is None:
+            return self.identity.id
+        if (
+            not isinstance(caller_principal_id, str)
+            or not caller_principal_id
+            or len(caller_principal_id) > 512
+            or any(c in caller_principal_id for c in "\r\n\x00")
+        ):
+            raise ValueError("caller principal is invalid")
+        return caller_principal_id
 
     @classmethod
     async def list(
@@ -1005,6 +1026,7 @@ class EmbeddedAgent:
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
         mcp_client_factory: MCPClientFactory | None = None,
+        mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -1103,6 +1125,7 @@ class EmbeddedAgent:
                 id_factory=resolved_ids,
                 secret_provider=runtime_secrets,
                 mcp_client_factory=mcp_client_factory,
+                mcp_connection_provider=mcp_connection_provider,
                 keychain=credential_session,
                 owns_credential_session=owns_credential_session,
                 model_validator=model_validator,
@@ -1151,6 +1174,7 @@ class EmbeddedAgent:
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
         mcp_client_factory: MCPClientFactory | None = None,
+        mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -1304,6 +1328,7 @@ class EmbeddedAgent:
                 id_factory=resolved_ids,
                 secret_provider=runtime_secrets,
                 mcp_client_factory=mcp_client_factory,
+                mcp_connection_provider=mcp_connection_provider,
                 keychain=credential_session,
                 owns_credential_session=owns_credential_session,
                 model_validator=model_validator,
@@ -1345,6 +1370,7 @@ class EmbeddedAgent:
         id_factory: Callable[[str], str],
         secret_provider: SecretProvider,
         mcp_client_factory: MCPClientFactory | None,
+        mcp_connection_provider: MCPConnectionProvider | None,
         keychain: CredentialSession,
         owns_credential_session: bool,
         model_validator: ModelProvider | None,
@@ -1694,6 +1720,7 @@ class EmbeddedAgent:
             store=store,
             client_factory=resolved_mcp_client_factory,
             secrets=secret_provider,
+            connection_provider=mcp_connection_provider,
             clock=clock,
         )
         base_domains = (
@@ -2105,7 +2132,9 @@ class EmbeddedAgent:
             owns_credential_session=owns_credential_session,
             model_validator=model_validator,
             mcp_client_factory=resolved_mcp_client_factory,
+            mcp_connection_provider=mcp_connection_provider,
             mcp_activated_bindings=mcp_activated_bindings,
+            hosted=hosted,
             clock=clock,
             id_factory=id_factory,
         )
@@ -2291,12 +2320,14 @@ class EmbeddedAgent:
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
         files_only: bool = False,
+        caller_principal_id: str | None = None,
     ) -> LoopExit:
         return await self._run(
             message,
             conversation_id=conversation_id,
             source_scope_ids=source_scope_ids,
             files_only=files_only,
+            caller_principal_id=caller_principal_id,
         )
 
     async def learn(
@@ -2305,6 +2336,7 @@ class EmbeddedAgent:
         *,
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
+        caller_principal_id: str | None = None,
     ) -> LoopExit:
         """Run one explicit user-authorized foreground learning action."""
 
@@ -2313,6 +2345,7 @@ class EmbeddedAgent:
             conversation_id=conversation_id,
             source_scope_ids=source_scope_ids,
             explicit_learning=True,
+            caller_principal_id=caller_principal_id,
         )
 
     async def _run(
@@ -2329,9 +2362,11 @@ class EmbeddedAgent:
         run_id: str | None = None,
         evidence: RunSessionEvidence | None = None,
         one_time_artifact_destinations: tuple[ArtifactDestinationGrant, ...] = (),
+        caller_principal_id: str | None = None,
     ) -> LoopExit:
         if not isinstance(message, str) or not message.strip():
             raise ValueError("message must be a non-empty string")
+        principal_id = self._resolve_caller_principal(caller_principal_id)
         if not isinstance(source_scope_ids, tuple) or any(
             not isinstance(item, str) or not item.strip() for item in source_scope_ids
         ):
@@ -2395,6 +2430,10 @@ class EmbeddedAgent:
                 raise ValueError("unknown conversation for this agent")
             if not supplied_conversation and conversation_exists:
                 raise ValueError("generated conversation id already exists")
+            if conversation_exists and self._hosted:
+                await self._require_conversation_caller(
+                    resolved_conversation, principal_id
+                )
             active_ids = {
                 source.id
                 for source in await self._store.list_sources(self.identity.id)
@@ -2409,6 +2448,10 @@ class EmbeddedAgent:
             run_input = RunInput(
                 id=resolved_run_id,
                 agent_id=self.identity.id,
+                caller_principal_id=principal_id,
+                caller_principal_verified=(
+                    not self._hosted or caller_principal_id is not None
+                ),
                 message=message.strip(),
                 created_at=self._clock(),
                 conversation_id=resolved_conversation,
@@ -2470,9 +2513,27 @@ class EmbeddedAgent:
                 prior_messages=prior_messages,
             )
 
-    async def transcript(self, run_id: str) -> Transcript:
+    async def transcript(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> Transcript:
         self._require_open()
-        return await self._transcripts.load(run_id)
+        principal_id = self._resolve_caller_principal(caller_principal_id)
+        transcript = await self._transcripts.load(run_id)
+        if self._hosted and transcript.run.caller_principal_id != principal_id:
+            raise ValueError("run is unavailable to this caller")
+        return transcript
+
+    async def _require_conversation_caller(
+        self, conversation_id: str, principal_id: str
+    ) -> bool:
+        records = await self._store.conversation_runs(self.identity.id, conversation_id)
+        if not records:
+            return False
+        if self._hosted and any(
+            item.transcript.run.caller_principal_id != principal_id for item in records
+        ):
+            raise ValueError("conversation is unavailable to this caller")
+        return True
 
     async def inbox(
         self,
@@ -2480,28 +2541,38 @@ class EmbeddedAgent:
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = 50,
+        caller_principal_id: str | None = None,
     ) -> tuple[InboxView, ...]:
         """Inspect a bounded agent-owned durable conversation inbox."""
 
         self._require_open()
+        principal_id = self._resolve_caller_principal(caller_principal_id)
         if conversation_id is not None:
             _validate_conversation_id(conversation_id)
-        return await self._distribution_owner.list(
+            await self._require_conversation_caller(conversation_id, principal_id)
+        elif self._hosted:
+            raise ValueError("hosted inbox requires an owned conversation")
+        items = await self._distribution_owner.list(
             conversation_id=conversation_id,
             include_acknowledged=include_acknowledged,
             limit=limit,
         )
+        return items
 
     async def distribution_destinations(
         self,
         conversation_id: str,
         *,
         sensitivity_ceiling: ModelSensitivity,
+        caller_principal_id: str | None = None,
     ) -> tuple[DistributionDestination, ...]:
         """Discover exact current destinations for one owned conversation."""
 
         self._require_open()
         _validate_conversation_id(conversation_id)
+        await self._require_conversation_caller(
+            conversation_id, self._resolve_caller_principal(caller_principal_id)
+        )
         if not isinstance(sensitivity_ceiling, ModelSensitivity):
             raise TypeError("sensitivity_ceiling must be ModelSensitivity")
         return await self._distribution_owner.discover_destinations(
@@ -2512,20 +2583,36 @@ class EmbeddedAgent:
     async def inspect_delivery(
         self,
         delivery_id: str,
+        *,
+        caller_principal_id: str | None = None,
     ) -> DeliveryInspection | None:
         """Inspect one exact agent-owned logical delivery."""
 
         self._require_open()
         if not isinstance(delivery_id, str) or not delivery_id.strip():
             raise ValueError("delivery_id must be non-empty text")
-        return await self._distribution_owner.inspect(delivery_id.strip())
+        principal_id = self._resolve_caller_principal(caller_principal_id)
+        result = await self._distribution_owner.inspect(delivery_id.strip())
+        if result is not None:
+            await self._require_conversation_caller(
+                result.delivery.conversation_id, principal_id
+            )
+        return result
 
-    async def acknowledge_inbox(self, delivery_id: str) -> InboxView | None:
+    async def acknowledge_inbox(
+        self, delivery_id: str, *, caller_principal_id: str | None = None
+    ) -> InboxView | None:
         """Idempotently acknowledge one exact agent-owned inbox result."""
 
         self._require_open()
         if not isinstance(delivery_id, str) or not delivery_id.strip():
             raise ValueError("delivery_id must be non-empty text")
+        principal_id = self._resolve_caller_principal(caller_principal_id)
+        inspection = await self._distribution_owner.inspect(delivery_id.strip())
+        if inspection is not None:
+            await self._require_conversation_caller(
+                inspection.delivery.conversation_id, principal_id
+            )
         acknowledged = await self._distribution_owner.acknowledge(
             delivery_id.strip(),
             acknowledged_at=self._clock(),
@@ -2537,6 +2624,8 @@ class EmbeddedAgent:
     async def conversation_runs(
         self,
         conversation_id: str,
+        *,
+        caller_principal_id: str | None = None,
     ) -> tuple[ConversationRun, ...]:
         self._require_open()
         _validate_conversation_id(conversation_id)
@@ -2546,17 +2635,27 @@ class EmbeddedAgent:
         )
         if not records:
             raise ValueError("unknown conversation for this agent")
+        principal_id = self._resolve_caller_principal(caller_principal_id)
+        if self._hosted and any(
+            item.transcript.run.caller_principal_id != principal_id for item in records
+        ):
+            raise ValueError("conversation is unavailable to this caller")
         return records
 
-    async def conversation_exists(self, conversation_id: str) -> bool:
+    async def conversation_exists(
+        self, conversation_id: str, *, caller_principal_id: str | None = None
+    ) -> bool:
         """Validate and check one bounded agent-scoped conversation identity."""
 
         self._require_open()
         _validate_conversation_id(conversation_id)
-        return await self._store.conversation_exists(
-            self.identity.id,
-            conversation_id,
-        )
+        principal_id = self._resolve_caller_principal(caller_principal_id)
+        try:
+            return await self._require_conversation_caller(
+                conversation_id, principal_id
+            )
+        except ValueError:
+            return False
 
     async def list_jobs(
         self,
@@ -2569,21 +2668,36 @@ class EmbeddedAgent:
         self._require_open()
         return await self._job_owner.list(states=states, limit=limit)
 
-    async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
+    async def inspect_effect(
+        self, receipt_id: str, *, caller_principal_id: str | None = None
+    ) -> EffectReceipt | None:
         """Read one exact bounded agent-owned observation and separate resolution."""
         self._require_open()
         validate_effect_receipt_id(receipt_id)
-        return await self._store.load_effect_receipt(self.identity.id, receipt_id)
+        principal_id = self._resolve_caller_principal(caller_principal_id)
+        receipt = await self._store.load_effect_receipt(self.identity.id, receipt_id)
+        if self._hosted and receipt is not None:
+            transcript = await self._transcripts.load(receipt.run_id)
+            if transcript.run.caller_principal_id != principal_id:
+                return None
+        return receipt
 
     async def list_effects(
-        self, *, unresolved_only: bool = False, limit: int = 20, offset: int = 0
+        self,
+        *,
+        unresolved_only: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+        caller_principal_id: str | None = None,
     ) -> tuple[EffectReceipt, ...]:
         self._require_open()
+        principal_id = self._resolve_caller_principal(caller_principal_id)
         return await self._store.list_effect_receipts(
             self.identity.id,
             unresolved_only=unresolved_only,
             limit=limit,
             offset=offset,
+            caller_principal_id=principal_id if self._hosted else None,
         )
 
     async def resolve_effect(
@@ -2594,11 +2708,15 @@ class EmbeddedAgent:
         decision: EffectResolutionDecision,
         note: str,
         evidence_references: tuple[str, ...] = (),
+        caller_principal_id: str | None = None,
     ) -> EffectReceipt:
         """Approve one exact human recovery decision; never retry an operation."""
         async with self._admit_system_work("effect-recovery"):
             self._require_open()
-            receipt = await self.inspect_effect(receipt_id)
+            principal_id = self._resolve_caller_principal(caller_principal_id)
+            receipt = await self.inspect_effect(
+                receipt_id, caller_principal_id=principal_id
+            )
             if receipt is None or receipt.receipt_digest != expected_digest:
                 raise ValueError(
                     "the exact owned receipt or expected observation digest is unavailable"
@@ -2607,7 +2725,7 @@ class EmbeddedAgent:
                 receipt_id=receipt_id,
                 receipt_digest=expected_digest,
                 decision=decision,
-                approving_principal_id=self.identity.id,
+                approving_principal_id=principal_id,
                 control_id=self._id_factory("effect-recovery"),
                 resolved_at=max(
                     self._clock(), receipt.finished_at or receipt.started_at
@@ -2633,7 +2751,8 @@ class EmbeddedAgent:
                     "effect recovery requires the foreground approval handler"
                 )
             evidence = await self._effect_recovery_evidence(
-                resolution.evidence_references
+                resolution.evidence_references,
+                caller_principal_id=principal_id,
             )
             request = ApprovalRequest(
                 run_id=resolution.control_id,
@@ -2665,11 +2784,14 @@ class EmbeddedAgent:
                 raise PermissionError("the effect recovery decision was denied")
             async with self._effect_resolution_lock:
                 self._require_open()
-                current = await self.inspect_effect(receipt_id)
+                current = await self.inspect_effect(
+                    receipt_id, caller_principal_id=principal_id
+                )
                 if (
                     current != receipt
                     or await self._effect_recovery_evidence(
-                        resolution.evidence_references
+                        resolution.evidence_references,
+                        caller_principal_id=principal_id,
                     )
                     != evidence
                 ):
@@ -2681,12 +2803,17 @@ class EmbeddedAgent:
                 )
 
     async def _effect_recovery_evidence(
-        self, references: tuple[str, ...]
+        self,
+        references: tuple[str, ...],
+        *,
+        caller_principal_id: str | None = None,
     ) -> tuple[dict[str, object], ...]:
         evidence: list[dict[str, object]] = []
         for reference in references:
             if reference.startswith("effect-receipt:"):
-                receipt = await self.inspect_effect(reference)
+                receipt = await self.inspect_effect(
+                    reference, caller_principal_id=caller_principal_id
+                )
                 if receipt is None or receipt.outcome is EffectOutcome.STARTED:
                     raise ValueError(
                         "recovery evidence requires exact owned terminal receipts"
@@ -2698,6 +2825,7 @@ class EmbeddedAgent:
                     }
                 )
             else:
+                await self._require_artifact_caller(reference, caller_principal_id)
                 artifact = await self._artifact_store.find_ref(reference)
                 evidence.append(
                     {"artifact_id": artifact.artifact_id, "sha256": artifact.sha256}
@@ -3189,6 +3317,11 @@ class EmbeddedAgent:
     async def clear_conversations(self) -> int:
         """Delete transcripts and candidate records, not approved knowledge."""
 
+        if self._hosted:
+            raise ValueError(
+                "hosted callers cannot clear agent-wide conversation history"
+            )
+
         deadline = (
             asyncio.get_running_loop().time() + self._limits.max_wall_time_seconds
         )
@@ -3213,9 +3346,23 @@ class EmbeddedAgent:
                 raise asyncio.CancelledError
             return cleared
 
-    async def read_artifact(self, artifact_id: str) -> ArtifactPayload:
+    async def read_artifact(
+        self, artifact_id: str, *, caller_principal_id: str | None = None
+    ) -> ArtifactPayload:
         self._require_open()
+        await self._require_artifact_caller(artifact_id, caller_principal_id)
         return await self._artifact_store.read(artifact_id)
+
+    async def _require_artifact_caller(
+        self, artifact_id: str, caller_principal_id: str | None
+    ) -> None:
+        if not self._hosted:
+            return
+        principal_id = self._resolve_caller_principal(caller_principal_id)
+        ref = await self._artifact_store.find_ref(artifact_id)
+        transcript = await self._transcripts.load(ref.run_id)
+        if transcript.run.caller_principal_id != principal_id:
+            raise ValueError("artifact is unavailable to this caller")
 
     async def save_artifact(
         self,
@@ -3223,9 +3370,11 @@ class EmbeddedAgent:
         destination: Path | None = None,
         *,
         filename: str | None = None,
+        caller_principal_id: str | None = None,
     ) -> ArtifactDeliveryReceipt:
         async with self._artifact_publication_lock:
             self._require_open()
+            await self._require_artifact_caller(artifact_id, caller_principal_id)
             return await self._require_artifact_delivery().save_public(
                 artifact_id,
                 destination=destination,
@@ -3377,10 +3526,12 @@ class EmbeddedAgent:
         *,
         conversation_id: str | None = None,
         source_id: str | None = None,
+        caller_principal_id: str | None = None,
     ) -> LoopExit:
         """Start a fresh ordinary foreground run for one selected candidate."""
 
         self._require_open()
+        principal_id = self._resolve_caller_principal(caller_principal_id)
         if not self._candidate_acceptance_supported:
             raise AgentHomeError(
                 "learning candidate acceptance requires the built-in data "
@@ -3429,6 +3580,7 @@ class EmbeddedAgent:
                 learning_candidate=candidate,
                 run_id=run_id,
                 evidence=evidence,
+                caller_principal_id=caller_principal_id,
             )
         except BaseException as error:
             run_error = error
@@ -3580,14 +3732,26 @@ class EmbeddedAgent:
         *,
         endpoint: str,
         authentication: MCPAuthentication | None = None,
+        caller_principal_id: str | None = None,
     ) -> MCPServerInspection:
         """Inspect one exact endpoint without persisting execution authority."""
 
         async with self._mcp_commit_lock:
             self._require_open()
+            if (
+                self._hosted
+                and caller_principal_id is None
+                and authentication is not None
+                and authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+            ):
+                raise ValueError(
+                    "personal MCP connection requires authenticated caller"
+                )
+            principal_id = self._resolve_caller_principal(caller_principal_id)
             return await self._inspect_mcp_endpoint(
                 endpoint=endpoint,
                 authentication=authentication or MCPAuthentication.no_auth(),
+                principal_id=principal_id,
             )
 
     async def attach_mcp_server(
@@ -3599,6 +3763,7 @@ class EmbeddedAgent:
         maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
         local_label: str | None = None,
         binding_id: str | None = None,
+        caller_principal_id: str | None = None,
     ) -> MCPBindingStatus:
         """Persist exact local MCP admission for the next immutable composition."""
         """Persist one exact binding; declarations activate only after reopen."""
@@ -3606,6 +3771,14 @@ class EmbeddedAgent:
         if not isinstance(maximum_outbound_sensitivity, ModelSensitivity):
             raise TypeError("maximum_outbound_sensitivity is invalid")
         resolved_authentication = authentication or MCPAuthentication.no_auth()
+        if (
+            self._hosted
+            and caller_principal_id is None
+            and resolved_authentication.mode
+            is MCPAuthenticationMode.PERSONAL_CONNECTION
+        ):
+            raise ValueError("personal MCP connection requires authenticated caller")
+        principal_id = self._resolve_caller_principal(caller_principal_id)
         resolved_binding_id = binding_id or self._id_factory("mcp-binding")
         async with self._admit_owned_system_work(
             "mcp-attach", self._mcp_management_lock
@@ -3616,9 +3789,13 @@ class EmbeddedAgent:
                     self.identity.id,
                     resolved_binding_id,
                 )
+                self._require_mcp_management_owner(
+                    current, principal_id, caller_principal_id
+                )
                 inspection = await self._inspect_mcp_endpoint(
                     endpoint=endpoint,
                     authentication=resolved_authentication,
+                    principal_id=principal_id,
                 )
                 binding = mcp_binding_from_inspection(
                     binding_id=resolved_binding_id,
@@ -3629,6 +3806,7 @@ class EmbeddedAgent:
                     inspection=inspection,
                     local_label=local_label,
                     prior=current,
+                    owner_principal_id=principal_id,
                 )
                 stored = await self._store.store_mcp_binding(
                     binding,
@@ -3644,12 +3822,20 @@ class EmbeddedAgent:
         summary: str,
         when_to_use: str,
         keywords: tuple[str, ...] = (),
+        caller_principal_id: str | None = None,
     ) -> MCPServerBinding:
         async with self._admit_owned_system_work(
             "mcp-discovery", self._mcp_management_lock
         ):
             async with self._mcp_commit_lock:
                 self._require_open()
+                principal_id = self._resolve_caller_principal(caller_principal_id)
+                current = await self._store.load_mcp_binding(
+                    self.identity.id, binding_id
+                )
+                self._require_mcp_management_owner(
+                    current, principal_id, caller_principal_id
+                )
                 return await self._store.update_mcp_discovery(
                     self.identity.id,
                     binding_id,
@@ -3679,13 +3865,20 @@ class EmbeddedAgent:
                     keywords=keywords,
                 )
 
-    async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
+    async def list_mcp_servers(
+        self, *, caller_principal_id: str | None = None
+    ) -> tuple[MCPBindingStatus, ...]:
         """Return bounded non-secret status for all independently keyed bindings."""
 
         self._require_open()
+        principal_id = self._resolve_caller_principal(caller_principal_id)
         bindings = await self._store.list_mcp_bindings(self.identity.id)
         statuses: list[MCPBindingStatus] = []
         for binding in bindings:
+            if not self._mcp_management_visible(
+                binding, principal_id, caller_principal_id
+            ):
+                continue
             activated = self._mcp_activated_bindings.get(binding.binding_id)
             statuses.append(
                 MCPBindingStatus(
@@ -3695,7 +3888,9 @@ class EmbeddedAgent:
             )
         return tuple(statuses)
 
-    async def refresh_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+    async def refresh_mcp_server(
+        self, binding_id: str, *, caller_principal_id: str | None = None
+    ) -> MCPBindingStatus:
         """Check exact remote drift and require reopen for any refreshed revision."""
 
         async with self._admit_owned_system_work(
@@ -3709,6 +3904,10 @@ class EmbeddedAgent:
                 )
                 if current is None:
                     raise ValueError("MCP binding does not exist")
+                principal_id = self._resolve_caller_principal(caller_principal_id)
+                self._require_mcp_management_owner(
+                    current, principal_id, caller_principal_id
+                )
                 if current.state is MCPBindingState.REVOKED:
                     raise ValueError(
                         "revoked MCP binding must be explicitly reattached"
@@ -3716,6 +3915,7 @@ class EmbeddedAgent:
                 inspection = await self._inspect_mcp_endpoint(
                     endpoint=current.endpoint,
                     authentication=current.authentication,
+                    principal_id=principal_id,
                 )
                 refreshed = current.checked(
                     observed_at=inspection.observed_at,
@@ -3728,11 +3928,14 @@ class EmbeddedAgent:
                 await self._deactivate_mcp_binding(stored.binding_id)
                 return MCPBindingStatus(stored, None)
 
-    async def revoke_mcp_server(self, binding_id: str) -> MCPBindingStatus:
+    async def revoke_mcp_server(
+        self, binding_id: str, *, caller_principal_id: str | None = None
+    ) -> MCPBindingStatus:
         """Make one binding immediately unavailable without affecting siblings."""
 
         async with self._mcp_commit_lock:
             self._require_open()
+            principal_id = self._resolve_caller_principal(caller_principal_id)
             activated = self._mcp_activated_bindings.get(binding_id)
             if activated is None:
                 current = await self._store.load_mcp_binding(
@@ -3741,6 +3944,9 @@ class EmbeddedAgent:
                 )
                 if current is None:
                     raise ValueError("MCP binding does not exist")
+                self._require_mcp_management_owner(
+                    current, principal_id, caller_principal_id
+                )
                 if current.state is MCPBindingState.REVOKED:
                     return MCPBindingStatus(current, None)
                 stored = await self._store.store_mcp_binding(
@@ -3756,6 +3962,9 @@ class EmbeddedAgent:
                 )
                 if current is None:
                     raise ValueError("MCP binding does not exist")
+                self._require_mcp_management_owner(
+                    current, principal_id, caller_principal_id
+                )
                 stored = (
                     current
                     if current.state is MCPBindingState.REVOKED
@@ -3775,16 +3984,52 @@ class EmbeddedAgent:
         *,
         endpoint: str,
         authentication: MCPAuthentication,
+        principal_id: str,
     ) -> MCPServerInspection:
+        await check_personal_connection(
+            authentication, self._mcp_connection_provider, principal_id
+        )
         client = self._mcp_client_factory.create(
             endpoint=endpoint,
             authentication=authentication,
             secrets=self._secret_provider,
         )
+        if authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION:
+            binder = getattr(client, "bind_personal_connection", None)
+            if not callable(binder) or self._mcp_connection_provider is None:
+                await client.close()
+                raise MCPAuthenticationError(
+                    "account_unavailable",
+                    "The MCP client cannot use a personal connection.",
+                )
+            binder(self._mcp_connection_provider, principal_id)
         try:
             return await client.inspect(observed_at=self._clock())
         finally:
             await client.close()
+
+    def _mcp_management_visible(
+        self,
+        binding: MCPServerBinding,
+        principal_id: str,
+        caller_principal_id: str | None,
+    ) -> bool:
+        return binding.owner_principal_id == principal_id and not (
+            self._hosted
+            and caller_principal_id is None
+            and binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+        )
+
+    def _require_mcp_management_owner(
+        self,
+        binding: MCPServerBinding | None,
+        principal_id: str,
+        caller_principal_id: str | None,
+    ) -> None:
+        if binding is not None and not self._mcp_management_visible(
+            binding, principal_id, caller_principal_id
+        ):
+            raise ValueError("MCP binding does not exist")
 
     async def _deactivate_mcp_binding(self, binding_id: str) -> None:
         activated = self._mcp_activated_bindings.pop(binding_id, None)

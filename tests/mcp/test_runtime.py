@@ -27,6 +27,7 @@ from daita.adapters.mcp import (
     MCPServerBinding,
     MCPToolBinding,
     StreamableHTTPMCPClientFactory,
+    mcp_execution_origin_digest,
 )
 from daita.capabilities import (
     AccessMode,
@@ -1405,6 +1406,13 @@ async def test_workspace_sensitivity_and_call_time_auth_use_current_admission(tm
             ),
         ),
     )
+    for binding in (public_status.binding, bearer_status.binding):
+        assert mcp_execution_origin_digest(
+            binding, binding.tools[0]
+        ) == mcp_execution_origin_digest(
+            replace(binding, owner_principal_id="another-principal"),
+            binding.tools[0],
+        )
     await agent.close()
     provider = _MCPBatchProvider(
         (
@@ -1433,7 +1441,9 @@ async def test_workspace_sensitivity_and_call_time_auth_use_current_admission(tm
     )
     try:
         secrets.values["env:BETA_TOKEN"] = "wrong-at-call-time"
-        result = await reopened.run("Exercise safe boundary failures.")
+        result = await reopened.run(
+            "Exercise safe boundary failures.", caller_principal_id="alice"
+        )
         transcript = await reopened.transcript(result.run_id)
         blocks = tuple(
             block

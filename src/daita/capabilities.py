@@ -1498,11 +1498,23 @@ class ToolExecution:
     effect_receipt_id: str | None = None
     one_time_artifact_destinations: tuple[object, ...] = ()
     task_attempt_guard: TaskAttemptGuard | None = None
+    caller_principal_id: str | None = None
+    execution_scope: ExecutionScope | None = None
+    caller_principal_verified: bool = True
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
         _text(self.call_id, "tool call_id")
         _text(self.capability_id, "tool capability_id")
+        if self.caller_principal_id is not None:
+            _text(self.caller_principal_id, "tool caller principal")
+        if not isinstance(self.caller_principal_verified, bool):
+            raise TypeError("tool caller verification must be bool")
+        if self.execution_scope is not None:
+            if not isinstance(self.execution_scope, ExecutionScope):
+                raise TypeError("tool execution scope is invalid")
+            if self.caller_principal_id != self.execution_scope.principal_id:
+                raise ValueError("tool caller principal differs from execution scope")
         if not isinstance(self.request_sensitivity, ModelSensitivity):
             raise TypeError("request_sensitivity must be ModelSensitivity")
         if self.conversation_id is not None:

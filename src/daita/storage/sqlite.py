@@ -3407,6 +3407,7 @@ class SQLiteStateStore:
         unresolved_only: bool = False,
         limit: int = 20,
         offset: int = 0,
+        caller_principal_id: str | None = None,
     ) -> tuple[EffectReceipt, ...]:
         _effect_receipt_text(agent_id, "receipt agent")
         if (
@@ -3419,24 +3420,50 @@ class SQLiteStateStore:
         for value in (run_id, routine_id):
             if value is not None:
                 _effect_receipt_text(value, "receipt inspection identity")
+        if caller_principal_id is not None:
+            _effect_receipt_text(caller_principal_id, "receipt caller principal")
         if not isinstance(unresolved_only, bool):
             raise TypeError("unresolved_only must be boolean")
 
         def read() -> tuple[EffectReceipt, ...]:
             with _connect_read_only(self.path) as connection:
-                rows = connection.execute(
-                    "SELECT data FROM effect_receipts WHERE agent_id = ? AND (? IS NULL OR run_id = ?) AND (? IS NULL OR routine_id = ?) AND (? = 0 OR unresolved = 1) ORDER BY id LIMIT ? OFFSET ?",
-                    (
-                        agent_id,
-                        run_id,
-                        run_id,
-                        routine_id,
-                        routine_id,
-                        int(unresolved_only),
-                        limit,
-                        offset,
-                    ),
-                )
+                if caller_principal_id is None:
+                    rows = connection.execute(
+                        "SELECT data FROM effect_receipts WHERE agent_id = ? AND (? IS NULL OR run_id = ?) AND (? IS NULL OR routine_id = ?) AND (? = 0 OR unresolved = 1) ORDER BY id LIMIT ? OFFSET ?",
+                        (
+                            agent_id,
+                            run_id,
+                            run_id,
+                            routine_id,
+                            routine_id,
+                            int(unresolved_only),
+                            limit,
+                            offset,
+                        ),
+                    )
+                else:
+                    rows = connection.execute(
+                        "SELECT effect_receipts.data FROM effect_receipts "
+                        "JOIN runs ON runs.id = effect_receipts.run_id "
+                        "AND runs.agent_id = effect_receipts.agent_id "
+                        "WHERE effect_receipts.agent_id = ? "
+                        "AND json_extract(runs.input, '$.fields.caller_principal_id') = ? "
+                        "AND (? IS NULL OR effect_receipts.run_id = ?) "
+                        "AND (? IS NULL OR effect_receipts.routine_id = ?) "
+                        "AND (? = 0 OR effect_receipts.unresolved = 1) "
+                        "ORDER BY effect_receipts.id LIMIT ? OFFSET ?",
+                        (
+                            agent_id,
+                            caller_principal_id,
+                            run_id,
+                            run_id,
+                            routine_id,
+                            routine_id,
+                            int(unresolved_only),
+                            limit,
+                            offset,
+                        ),
+                    )
                 return tuple(decode_receipt(row[0]) for row in rows)
 
         return await asyncio.to_thread(read)
