@@ -634,8 +634,8 @@ async def test_possible_dispatch_failures_are_uncertain_and_never_replayed(
     assert len(action.server.calls) == len(receipts) == 1
     assert receipts[0].outcome is EffectOutcome.UNCERTAIN
     if fault == "accepted_async":
-        assert receipts[0].payload["operation_handle"] == "operation-42"
-        assert receipts[0].evidence_basis is EffectEvidenceBasis.SERVER_REPORTED
+        assert "operation_handle" not in receipts[0].payload
+        assert receipts[0].evidence_basis is EffectEvidenceBasis.UNKNOWN
     if fault == "tool_error":
         assert receipts[0].payload["classification"] == "tool_error"
     results = await action.results(result.run_id)

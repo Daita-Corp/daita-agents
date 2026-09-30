@@ -371,8 +371,8 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
     finally:
         await action.agent.close()
 
-    # Phase 1 changed only run and binding payloads. Restore their released
-    # revision-2 shapes, retaining the real grant, receipt, and other home data.
+    # Restore the released revision-2 run and binding shapes. The migration
+    # must keep identities, grants, receipts and all unrelated rows.
     with sqlite3.connect(home / "state.db") as connection:
         preserved = {
             table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
@@ -399,6 +399,7 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
                 "connection_id",
                 "resource_uri",
                 "required_scopes",
+                "protocol_capabilities_digest",
             ):
                 del fields[field]
             connection.execute(
@@ -420,7 +421,9 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
     assert before.found_revision == 2 and before.upgrade_required
     reopened = await Agent.open("mcp-actions", **action.kwargs())
     try:
-        assert (await reopened.list_mcp_servers())[0].binding == binding
+        assert (await reopened.list_mcp_servers())[0].binding == replace(
+            binding, protocol_capabilities_digest=None
+        )
         upgraded = await reopened.inspect_routine(routine.routine_id)
         assert upgraded is not None
         assert upgraded.routine.capability_grants == (grant,)

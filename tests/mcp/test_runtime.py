@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from hashlib import sha256
 
-import httpx
+import httpx2 as httpx
 import pytest
 from textual.widgets import Button, Input, OptionList, Static
 
@@ -26,7 +26,7 @@ from daita.adapters.mcp import (
     MCPCompletionSemantics,
     MCPServerBinding,
     MCPToolBinding,
-    StreamableHTTPMCPClientFactory,
+    SDKMCPClientFactory,
     mcp_execution_origin_digest,
 )
 from daita.capabilities import (
@@ -186,6 +186,8 @@ class _BlockingCallTimeInspection:
         self.release = asyncio.Event()
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.method != "POST":
+            return await self._transport(request)
         payload = json.loads(request.content)
         if payload.get("method") == "tools/list":
             self._list_count += 1
@@ -240,7 +242,7 @@ def _mcp_limit_binding(
 
 async def _mcp_limit_agent(tmp_path, name: str):
     alpha, _beta = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(
+    factory = SDKMCPClientFactory(
         http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
     )
     agent = await Agent.create(
@@ -266,7 +268,7 @@ async def _mcp_limit_agent(tmp_path, name: str):
 async def _attach_two_bindings(tmp_path):
     alpha, beta = conformance_identities()
     secrets = MappingSecretProvider({"env:BETA_TOKEN": "fixture-beta-secret"})
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha, beta))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha, beta))
     agent = await Agent.create(
         "mcp-multi-binding",
         root=tmp_path,
@@ -389,7 +391,7 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
 
 async def test_m3_open_status_and_close_are_network_free_until_exact_call(tmp_path):
     alpha, _beta = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(
+    factory = SDKMCPClientFactory(
         http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
     )
     agent = await Agent.create(
@@ -582,7 +584,7 @@ async def test_concurrent_mcp_admission_cannot_cross_the_agent_tool_limit(tmp_pa
 
 async def test_mcp_storage_enforces_per_binding_and_agent_aggregate_bounds(tmp_path):
     alpha, _beta = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(
+    factory = SDKMCPClientFactory(
         http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
     )
     agent = await Agent.create(
@@ -706,7 +708,7 @@ async def test_existing_binding_identity_cannot_be_redirected_to_another_server(
 ):
     alpha, beta = conformance_identities()
     secrets = MappingSecretProvider({"env:BETA_TOKEN": "fixture-beta-secret"})
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha, beta))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha, beta))
     agent = await Agent.create(
         "mcp-stable-binding",
         root=tmp_path,
@@ -751,7 +753,7 @@ async def test_existing_binding_identity_cannot_be_redirected_to_another_server(
 
 async def test_cli_and_tui_expose_bounded_mcp_administration(tmp_path, monkeypatch):
     alpha, _beta = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha))
     agent = await Agent.create(
         "mcp-administration-surface",
         root=tmp_path,
@@ -880,7 +882,7 @@ def test_guided_mcp_aliases_are_safe_stable_and_collision_free():
 
 async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
     identity = _guided_mcp_identity()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(identity))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
     agent = await Agent.create(
         "mcp-grouped-management",
         root=tmp_path,
@@ -946,7 +948,7 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
     tmp_path,
 ):
     identity = _guided_mcp_identity()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(identity))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
     opened = await Agent.create(
         "mcp-guided-setup",
         root=tmp_path,
@@ -1039,7 +1041,7 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
 
 async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_path):
     identity = _guided_mcp_identity()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(identity))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
     agent = await Agent.create(
         "mcp-guided-actions",
         root=tmp_path,
@@ -1150,7 +1152,7 @@ async def test_tui_attach_exposes_bounded_schema_rejection_reason(tmp_path):
         ],
         results={},
     )
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(identity))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
     agent = await Agent.create(
         "mcp-tui-schema-reason",
         root=tmp_path,
@@ -1241,9 +1243,7 @@ async def test_revocation_after_frozen_context_blocks_io_and_is_binding_isolated
 async def test_revocation_serializes_with_call_time_inspection(tmp_path):
     alpha, _beta = conformance_identities()
     transport = _BlockingCallTimeInspection(alpha)
-    factory = StreamableHTTPMCPClientFactory(
-        http_transport=httpx.MockTransport(transport)
-    )
+    factory = SDKMCPClientFactory(http_transport=httpx.MockTransport(transport))
     agent = await Agent.create(
         "mcp-revocation-linearization",
         root=tmp_path,
@@ -1373,7 +1373,7 @@ async def test_schema_drift_is_unavailable_until_explicit_refresh_and_reopen(tmp
 async def test_workspace_sensitivity_and_call_time_auth_use_current_admission(tmp_path):
     alpha, beta = conformance_identities()
     secrets = MappingSecretProvider({"env:BETA_TOKEN": "fixture-beta-secret"})
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha, beta))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha, beta))
     agent = await Agent.create(
         "mcp-boundary-failures",
         root=tmp_path,
@@ -1464,7 +1464,7 @@ async def test_workspace_sensitivity_and_call_time_auth_use_current_admission(tm
 
 async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_path):
     alpha, _beta = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha))
     agent = await Agent.create(
         "mcp-sensitivity-floor",
         root=tmp_path,
@@ -1554,7 +1554,7 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
 async def test_host_close_waits_for_remote_call_then_closes_mcp_client(tmp_path):
     alpha, _beta = conformance_identities()
     alpha.block_calls = asyncio.Event()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha))
     agent = await Agent.create(
         "mcp-close",
         root=tmp_path,
@@ -1607,7 +1607,7 @@ async def test_host_close_waits_for_remote_call_then_closes_mcp_client(tmp_path)
 
 async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_path):
     alpha, _beta = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha))
     agent = await Agent.create(
         "mcp-oversized-result",
         root=tmp_path,

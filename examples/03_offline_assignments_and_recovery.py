@@ -8,7 +8,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-import httpx
+import httpx2 as httpx
 
 from _shared import (
     OFFLINE_PROFILE,
@@ -33,7 +33,7 @@ from daita import (
     ScheduledRoutineDraft,
 )
 from daita._json import FrozenJsonObject
-from daita.adapters.mcp import StreamableHTTPMCPClientFactory
+from daita.adapters.mcp import SDKMCPClientFactory
 from daita.artifacts.models import ArtifactAuthorship
 from daita.capabilities import (
     AccessMode,
@@ -75,8 +75,22 @@ class OfflineService:
         self.disconnect = False
 
     async def __call__(self, request):
+        if request.method == "GET":
+            return httpx.Response(405, request=request)
+        if request.method == "DELETE":
+            return httpx.Response(204, request=request)
         payload = json.loads(request.content)
         method = payload["method"]
+        if method == "server/discover":
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "error": {"code": -32601, "message": "Legacy fixture"},
+                },
+                request=request,
+            )
         if method == "notifications/initialized":
             return httpx.Response(202, request=request)
         if method == "initialize":
@@ -159,7 +173,7 @@ async def run() -> None:
             model_profile=OFFLINE_PROFILE,
             clock=lambda: now[0],
             approval_handler=approve,
-            mcp_client_factory=StreamableHTTPMCPClientFactory(
+            mcp_client_factory=SDKMCPClientFactory(
                 http_transport=httpx.MockTransport(service)
             ),
         )

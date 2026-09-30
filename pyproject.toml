@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "daita-agents"
-version = "1.1.2"
+version = "1.2.0"
 description = "A persistent data agent for grounded analysis and controlled automation across databases, files, and connected tools"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -29,6 +29,8 @@ dependencies = [
     "textual>=8.2.8,<9.0.0",
     "XlsxWriter>=3.2.5,<4.0.0",
     "httpx>=0.28.1,<1.0.0",
+    "httpx2>=2.13.1,<3.0.0",
+    "mcp==2.2.0",
     "duckdb==1.5.5",
 ]
 

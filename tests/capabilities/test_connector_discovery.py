@@ -230,7 +230,7 @@ async def test_mcp_hint_edits_preserve_execution_and_change_bounded_discovery(
 ):
     from daita import MCPToolSelection
     from daita.adapters.mcp import (
-        StreamableHTTPMCPClientFactory,
+        SDKMCPClientFactory,
         mcp_execution_origin_digest,
     )
     from daita.context import _connector_directory
@@ -240,7 +240,7 @@ async def test_mcp_hint_edits_preserve_execution_and_change_bounded_discovery(
     from tests.support.mcp import conformance_identities, mock_transport
 
     alpha, _ = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha))
     bootstrap = await Agent.create(
         "mcp-hints", root=tmp_path, hosted=True, mcp_client_factory=factory
     )

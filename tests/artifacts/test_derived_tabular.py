@@ -8,11 +8,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
-import httpx
+import httpx2 as httpx
 import pytest
 
 from daita import Agent, MCPToolSelection, SQLiteSource
-from daita.adapters.mcp import StreamableHTTPMCPClientFactory
+from daita.adapters.mcp import SDKMCPClientFactory
 from daita.artifacts.models import ArtifactAuthorship, ArtifactError
 from daita.artifacts.renderers import (
     HTML_MEDIA_TYPE,
@@ -277,7 +277,7 @@ async def test_mcp_result_can_feed_tabular_and_document_artifacts_with_inherited
     tmp_path: Path,
 ) -> None:
     alpha, _beta = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(
+    factory = SDKMCPClientFactory(
         http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
     )
     agent = await Agent.create(

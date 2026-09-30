@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import builtins
+import json
 from datetime import UTC, datetime
 from hashlib import sha256
 
+import httpx2 as httpx
 import pytest
 
 from daita import __version__
@@ -13,14 +14,16 @@ from daita.adapters.mcp import (
     MCP_MAX_REQUEST_BYTES,
     MCP_MAX_RESPONSE_BYTES,
     MCPAuthentication,
+    MCPAuthenticationError,
     MCPProtocolError,
     MCPTransportError,
-    StreamableHTTPMCPClient,
-    StreamableHTTPMCPClientFactory,
+    SDKMCPClient,
+    SDKMCPClientFactory,
 )
 from daita.security import EmptySecretProvider, SecretReference
 from tests.support.mcp import (
     MappingSecretProvider,
+    MCPConformanceTransport,
     MCPFixtureIdentity,
     conformance_identities,
     mock_transport,
@@ -29,10 +32,222 @@ from tests.support.mcp import (
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 
 
+async def test_modern_sdk_discovery_optional_server_info_and_uncached_tools_list():
+    identity = MCPFixtureIdentity(
+        host="modern.fixture.test",
+        server_name="display-only",
+        server_version="1",
+        protocol_version="2026-07-28",
+        tools=[{"name": "lookup", "inputSchema": {"type": "object", "properties": {}}}],
+        results={"lookup": {"content": [{"type": "text", "text": "modern"}]}},
+        omit_server_info=True,
+    )
+    client = SDKMCPClientFactory(http_transport=mock_transport(identity)).create(
+        endpoint=identity.endpoint,
+        authentication=MCPAuthentication.no_auth(),
+        secrets=EmptySecretProvider(),
+    )
+    try:
+        first = await client.inspect(observed_at=NOW)
+        second = await client.inspect(observed_at=NOW)
+        assert first.protocol_version == second.protocol_version == "2026-07-28"
+        assert first.server_name is None and first.server_version is None
+        assert first.protocol_capabilities_digest is not None
+        assert identity.request_methods.count("server/discover") == 1
+        assert identity.request_methods.count("tools/list") == 2
+        assert "initialize" not in identity.request_methods
+        assert (await client.call_tool("lookup", {})).text == ("modern",)
+    finally:
+        await client.close()
+    assert isinstance(client, SDKMCPClient)
+    assert client._owner is not None and client._owner.done()
+
+
+@pytest.mark.parametrize("fault", ["auth", "malformed", "network", "redirect"])
+async def test_modern_probe_never_downgrades_after_non_method_failure(fault):
+    identity = MCPFixtureIdentity(
+        host="probe.fixture.test",
+        server_name="probe",
+        server_version="1",
+        protocol_version="2026-07-28",
+        tools=[],
+        results={},
+        bearer_token="private-probe-token" if fault == "auth" else None,
+        malformed_method="server/discover" if fault == "malformed" else None,
+    )
+    calls: list[str] = []
+    base = MCPConformanceTransport(identity)
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        calls.append(request.method)
+        if fault == "network" and request.method == "POST":
+            raise httpx.ReadError("disconnected", request=request)
+        if fault == "redirect" and request.method == "POST":
+            return httpx.Response(
+                307, headers={"location": identity.endpoint}, request=request
+            )
+        return await base(request)
+
+    client = SDKMCPClientFactory(http_transport=httpx.MockTransport(transport)).create(
+        endpoint=identity.endpoint,
+        authentication=MCPAuthentication.no_auth(),
+        secrets=EmptySecretProvider(),
+    )
+    try:
+        with pytest.raises(
+            (MCPAuthenticationError, MCPProtocolError, MCPTransportError)
+        ):
+            await client.inspect(observed_at=NOW)
+    finally:
+        await client.close()
+    assert "initialize" not in identity.request_methods
+    assert calls.count("POST") == 1
+
+
+@pytest.mark.parametrize("advertised", ["2025-11-25", "2025-06-18", "2024-11-05"])
+async def test_explicit_legacy_advertisement_is_the_only_other_downgrade(advertised):
+    identity = MCPFixtureIdentity(
+        host="advertised-legacy.fixture.test",
+        server_name="advertised-legacy",
+        server_version="1",
+        protocol_version="2025-11-25",
+        tools=[{"name": "lookup", "inputSchema": {"type": "object", "properties": {}}}],
+        results={},
+    )
+    base = MCPConformanceTransport(identity)
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and b"server/discover" in request.content:
+            identity.request_methods.append("server/discover")
+            return httpx.Response(
+                200,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": json.loads(request.content)["id"],
+                    "result": {
+                        "supportedVersions": [advertised],
+                        "capabilities": {"tools": {}},
+                        "resultType": "complete",
+                        "ttlMs": 0,
+                        "cacheScope": "public",
+                    },
+                },
+                request=request,
+            )
+        return await base(request)
+
+    client = SDKMCPClientFactory(http_transport=httpx.MockTransport(transport)).create(
+        endpoint=identity.endpoint,
+        authentication=MCPAuthentication.no_auth(),
+        secrets=EmptySecretProvider(),
+    )
+    try:
+        if advertised == "2025-11-25":
+            assert (
+                await client.inspect(observed_at=NOW)
+            ).protocol_version == "2025-11-25"
+            assert identity.request_methods.count("initialize") == 1
+        else:
+            with pytest.raises(MCPProtocolError) as raised:
+                await client.inspect(observed_at=NOW)
+            assert raised.value.code == "mcp_protocol_unsupported"
+            assert ("initialize" in identity.request_methods) == (
+                advertised == "2025-06-18"
+            )
+    finally:
+        await client.close()
+
+
+async def test_streamed_body_without_length_is_bounded_before_sdk_parse():
+    identity = MCPFixtureIdentity(
+        host="streamed.fixture.test",
+        server_name="streamed",
+        server_version="1",
+        protocol_version="2025-06-18",
+        tools=[{"name": "large", "inputSchema": {"type": "object", "properties": {}}}],
+        results={},
+    )
+    base = MCPConformanceTransport(identity)
+
+    class Chunks(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b"x" * (MCP_MAX_RESPONSE_BYTES // 2)
+            yield b"y" * (MCP_MAX_RESPONSE_BYTES // 2 + 1)
+            raise AssertionError("The byte limit must stop the response stream early")
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and b"tools/call" in request.content:
+            identity.request_methods.append("tools/call")
+            return httpx.Response(
+                200,
+                stream=Chunks(),
+                headers={"content-type": "application/json"},
+                request=request,
+            )
+        return await base(request)
+
+    client = SDKMCPClientFactory(http_transport=httpx.MockTransport(transport)).create(
+        endpoint=identity.endpoint,
+        authentication=MCPAuthentication.no_auth(),
+        secrets=EmptySecretProvider(),
+    )
+    try:
+        await client.inspect(observed_at=NOW)
+        with pytest.raises(MCPProtocolError, match="fixed byte bound") as raised:
+            await client.call_tool("large", {})
+        assert raised.value.code == "mcp_response_too_large"
+    finally:
+        await client.close()
+    assert identity.request_methods.count("tools/call") == 1
+
+
+async def test_json_escaped_bearer_echo_is_rejected_before_sdk_parse():
+    token = "private-token-echo"
+    identity = MCPFixtureIdentity(
+        host="escaped-echo.fixture.test",
+        server_name="escaped-echo",
+        server_version="1",
+        protocol_version="2025-11-25",
+        tools=[{"name": "echo", "inputSchema": {"type": "object", "properties": {}}}],
+        results={"echo": {"content": [{"type": "text", "text": token}]}},
+        bearer_token=token,
+    )
+    base = MCPConformanceTransport(identity)
+
+    async def transport(request: httpx.Request) -> httpx.Response:
+        response = await base(request)
+        if request.method == "POST" and b"tools/call" in request.content:
+            body = response.content.replace(
+                token.encode(), b"\\u0070" + token[1:].encode()
+            )
+            return httpx.Response(
+                response.status_code,
+                content=body,
+                headers=response.headers,
+                request=request,
+            )
+        return response
+
+    client = SDKMCPClientFactory(http_transport=httpx.MockTransport(transport)).create(
+        endpoint=identity.endpoint,
+        authentication=MCPAuthentication.bearer(
+            SecretReference.environment("ECHO_TOKEN")
+        ),
+        secrets=MappingSecretProvider({"env:ECHO_TOKEN": token}),
+    )
+    try:
+        await client.inspect(observed_at=NOW)
+        with pytest.raises(MCPProtocolError) as raised:
+            await client.call_tool("echo", {})
+        assert raised.value.code == "mcp_credential_echo_rejected"
+    finally:
+        await client.close()
+
+
 async def test_two_fixture_identities_use_one_production_streamable_http_boundary():
     alpha, beta = conformance_identities()
     secrets = MappingSecretProvider({"env:BETA_TOKEN": "fixture-beta-secret"})
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha, beta))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha, beta))
     alpha_client = factory.create(
         endpoint=alpha.endpoint,
         authentication=MCPAuthentication.no_auth(),
@@ -109,9 +324,7 @@ async def test_inspection_marks_remote_ref_unsupported_without_call_authority():
         ],
         results={},
     )
-    client = StreamableHTTPMCPClientFactory(
-        http_transport=mock_transport(identity)
-    ).create(
+    client = SDKMCPClientFactory(http_transport=mock_transport(identity)).create(
         endpoint=identity.endpoint,
         authentication=MCPAuthentication.no_auth(),
         secrets=EmptySecretProvider(),
@@ -169,9 +382,7 @@ async def test_inspection_rejects_other_or_nested_schema_dialects(
         tools=[{"name": "dialect", "inputSchema": input_schema}],
         results={},
     )
-    client = StreamableHTTPMCPClientFactory(
-        http_transport=mock_transport(identity)
-    ).create(
+    client = SDKMCPClientFactory(http_transport=mock_transport(identity)).create(
         endpoint=identity.endpoint,
         authentication=MCPAuthentication.no_auth(),
         secrets=EmptySecretProvider(),
@@ -204,9 +415,7 @@ async def test_malformed_and_unsupported_media_results_are_typed_and_bounded():
             }
         },
     )
-    client = StreamableHTTPMCPClientFactory(
-        http_transport=mock_transport(identity)
-    ).create(
+    client = SDKMCPClientFactory(http_transport=mock_transport(identity)).create(
         endpoint=identity.endpoint,
         authentication=MCPAuthentication.no_auth(),
         secrets=EmptySecretProvider(),
@@ -241,7 +450,7 @@ async def test_timeout_and_cancellation_do_not_retry_remote_tool_calls():
         results={"wait": {"content": [{"type": "text", "text": "done"}]}},
         block_calls=asyncio.Event(),
     )
-    client = StreamableHTTPMCPClientFactory(
+    client = SDKMCPClientFactory(
         http_transport=mock_transport(identity),
         timeout_seconds=0.02,
     ).create(
@@ -269,7 +478,41 @@ async def test_timeout_and_cancellation_do_not_retry_remote_tool_calls():
         await client.close()
 
 
-async def test_failed_initialized_notification_resets_negotiated_client_state():
+async def test_cancelled_queued_action_never_reaches_the_sdk():
+    gate = asyncio.Event()
+    identity = MCPFixtureIdentity(
+        host="queued-cancellation.fixture.test",
+        server_name="queued-cancellation",
+        server_version="1",
+        protocol_version="2025-11-25",
+        tools=[{"name": "wait", "inputSchema": {"type": "object", "properties": {}}}],
+        results={"wait": {"content": [{"type": "text", "text": "done"}]}},
+        block_calls=gate,
+    )
+    client = SDKMCPClientFactory(http_transport=mock_transport(identity)).create(
+        endpoint=identity.endpoint,
+        authentication=MCPAuthentication.no_auth(),
+        secrets=EmptySecretProvider(),
+    )
+    try:
+        await client.inspect(observed_at=NOW)
+        first = asyncio.create_task(client.call_tool("wait", {}))
+        while identity.request_methods.count("tools/call") < 1:
+            await asyncio.sleep(0)
+        queued = asyncio.create_task(client.call_tool("wait", {}))
+        await asyncio.sleep(0)
+        queued.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await queued
+        gate.set()
+        assert (await first).text == ("done",)
+        assert identity.request_methods.count("tools/call") == 1
+    finally:
+        gate.set()
+        await client.close()
+
+
+async def test_sdk_legacy_initialize_notification_is_not_a_second_negotiation():
     identity = MCPFixtureIdentity(
         host="initialize-retry.fixture.test",
         server_name="initialize-retry-fixture",
@@ -279,20 +522,16 @@ async def test_failed_initialized_notification_resets_negotiated_client_state():
         results={},
         initialized_notification_failures=1,
     )
-    client = StreamableHTTPMCPClientFactory(
-        http_transport=mock_transport(identity)
-    ).create(
+    client = SDKMCPClientFactory(http_transport=mock_transport(identity)).create(
         endpoint=identity.endpoint,
         authentication=MCPAuthentication.no_auth(),
         secrets=EmptySecretProvider(),
     )
     try:
-        with pytest.raises(MCPTransportError):
-            await client.inspect(observed_at=NOW)
         inspection = await client.inspect(observed_at=NOW)
         assert inspection.server_name == identity.server_name
-        assert identity.request_methods.count("initialize") == 2
-        assert identity.request_methods.count("notifications/initialized") == 2
+        assert identity.request_methods.count("initialize") == 1
+        assert identity.request_methods.count("notifications/initialized") == 1
         assert identity.request_methods[-1] == "tools/list"
     finally:
         await client.close()
@@ -319,9 +558,7 @@ async def test_request_and_streamed_response_byte_bounds_precede_tool_results():
             }
         },
     )
-    client = StreamableHTTPMCPClientFactory(
-        http_transport=mock_transport(identity)
-    ).create(
+    client = SDKMCPClientFactory(http_transport=mock_transport(identity)).create(
         endpoint=identity.endpoint,
         authentication=MCPAuthentication.no_auth(),
         secrets=EmptySecretProvider(),
@@ -343,22 +580,3 @@ async def test_request_and_streamed_response_byte_bounds_precede_tool_results():
         assert identity.request_methods.count("tools/call") == calls_before + 1
     finally:
         await client.close()
-
-
-def test_missing_http_dependency_uses_pipx_repair_guidance(monkeypatch):
-    identity, _beta = conformance_identities()
-    client = StreamableHTTPMCPClient(
-        endpoint=identity.endpoint,
-        authentication=MCPAuthentication.no_auth(),
-        secrets=EmptySecretProvider(),
-    )
-    original = builtins.__import__
-
-    def missing_httpx(name, *args, **kwargs):
-        if name == "httpx":
-            raise ImportError("controlled missing dependency")
-        return original(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", missing_httpx)
-    with pytest.raises(ImportError, match="pipx reinstall daita-agents"):
-        client._client()

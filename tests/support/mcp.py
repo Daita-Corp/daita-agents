@@ -6,7 +6,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 
-import httpx
+import httpx2 as httpx
 
 
 @dataclass
@@ -25,6 +25,7 @@ class MCPFixtureIdentity:
     malformed_method: str | None = None
     initialized_notification_failures: int = 0
     initialize_client_info: dict[str, object] | None = None
+    omit_server_info: bool = False
 
     @property
     def endpoint(self) -> str:
@@ -43,6 +44,11 @@ class MCPConformanceTransport:
         identity = self.identities.get(request.url.host)
         if identity is None:
             return httpx.Response(404, request=request)
+        if request.method == "GET":
+            return httpx.Response(405, request=request)
+        if request.method == "DELETE":
+            identity.closed_sessions += 1
+            return httpx.Response(204, request=request)
         if (
             identity.bearer_token is not None
             and request.headers.get("Authorization")
@@ -59,6 +65,28 @@ class MCPConformanceTransport:
                 content=b"{broken",
                 headers={"content-type": "application/json"},
                 request=request,
+            )
+        if method == "server/discover":
+            if identity.protocol_version != "2026-07-28":
+                return _error_response(request, payload["id"], -32601)
+            result: dict[str, object] = {
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {"listChanged": True}},
+                "resultType": "complete",
+                "ttlMs": 0,
+                "cacheScope": "public",
+            }
+            if not identity.omit_server_info:
+                result["_meta"] = {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": identity.server_name,
+                        "version": identity.server_version,
+                    }
+                }
+            return _json_response(
+                request,
+                payload["id"],
+                result,
             )
         if method == "notifications/initialized":
             if identity.initialized_notification_failures > 0:
@@ -88,10 +116,13 @@ class MCPConformanceTransport:
             identity.protocol_version
         )
         if method == "tools/list":
+            result = {"tools": identity.tools}
+            if identity.protocol_version == "2026-07-28":
+                result.update(resultType="complete", ttlMs=0, cacheScope="public")
             return _json_response(
                 request,
                 payload["id"],
-                {"tools": identity.tools},
+                result,
             )
         if method == "tools/call":
             if identity.block_calls is not None:
@@ -102,10 +133,12 @@ class MCPConformanceTransport:
             assert isinstance(name, str)
             assert isinstance(arguments, dict)
             identity.calls.append((name, arguments))
-            result = identity.results.get(name)
-            if result is None:
+            tool_result = identity.results.get(name)
+            if tool_result is None:
                 return _error_response(request, payload["id"], -32602)
-            return _json_response(request, payload["id"], result)
+            if identity.protocol_version == "2026-07-28":
+                tool_result = {"resultType": "complete", **tool_result}
+            return _json_response(request, payload["id"], tool_result)
         return _error_response(request, payload.get("id"), -32601)
 
 

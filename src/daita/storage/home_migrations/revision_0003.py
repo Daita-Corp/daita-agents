@@ -40,14 +40,14 @@ def _apply_revision_3(home: Path, source_shape: str | None) -> None:
             fields = record["fields"]
             if record["__record__"] != "MCPServerBinding":
                 raise ValueError("revision-2 MCP binding is invalid")
-            if "connection_id" in fields:
-                continue
-            fields["owner_principal_id"] = agent_id
-            fields.update(
-                connection_id=None,
-                resource_uri=None,
-                required_scopes=[],
-            )
+            if "connection_id" not in fields:
+                fields["owner_principal_id"] = agent_id
+                fields.update(
+                    connection_id=None,
+                    resource_uri=None,
+                    required_scopes=[],
+                )
+            fields.setdefault("protocol_capabilities_digest", None)
             connection.execute(
                 "UPDATE mcp_server_bindings SET data = ? WHERE agent_id = ? AND binding_id = ?",
                 (
@@ -63,8 +63,9 @@ REVISION_3 = HomeMigration(
     revision=3,
     migration_id="0003_framework_caller_authority",
     definition=(
-        "Add caller provenance and opaque personal MCP connection claims while "
-        "preserving released revision-2 identities, grants, receipts and data."
+        "Add caller provenance, opaque personal MCP connection claims and SDK "
+        "protocol facts while preserving released revision-2 identities, grants, "
+        "receipts and data."
     ),
     affected_paths=("state.db",),
     target_schema=SCHEMA_REVISION_2,

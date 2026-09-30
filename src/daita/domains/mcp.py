@@ -25,6 +25,7 @@ from ..adapters.mcp import (
     check_personal_connection,
     mcp_binding_drift_reason,
     mcp_execution_origin_digest,
+    validate_mcp_schema_value,
 )
 from ..capabilities import (
     AutomationEligibility,
@@ -259,7 +260,7 @@ class MCPToolExecutor:
                     "execution_scope_violation",
                     "The personal MCP connection is outside the frozen machine scope.",
                 )
-        validate_tool_schema_value(tool.input_schema, request.arguments)
+        validate_mcp_schema_value(tool.input_schema, request.arguments)
         if (
             tool.completion_semantics is not MCPCompletionSemantics.DIRECT_RESULT
             or tool.task_support == "required"
@@ -443,7 +444,7 @@ class MCPToolExecutor:
                         "The MCP tool omitted its admitted structured result.",
                     )
                 try:
-                    validate_tool_schema_value(tool.output_schema, result.structured)
+                    validate_mcp_schema_value(tool.output_schema, result.structured)
                 except (TypeError, ValueError, RuntimeError):
                     raise MCPProtocolError(
                         "mcp_result_schema_mismatch",
@@ -733,7 +734,7 @@ class MCPCapabilityDomain:
                     "mcp_grant_arguments_invalid",
                     "MCP arguments differ from the approved fixed values or variable names.",
                 )
-        validate_tool_schema_value(tool.input_schema, arguments)
+        validate_mcp_schema_value(tool.input_schema, arguments)
         return arguments
 
     async def prepare_automation_grant(

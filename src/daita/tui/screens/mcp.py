@@ -33,7 +33,7 @@ class MCPServerGroup:
     """One presentation-only server group over independently keyed bindings."""
 
     local_label: str
-    server_version: str
+    server_version: str | None
     endpoint: str
     status_label: str
     tool_names: tuple[str, ...]

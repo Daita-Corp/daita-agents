@@ -38,7 +38,6 @@ from ..adapters.mcp import (
     MCPConnectionProvider,
     MCPServerInspection,
     MCPToolSelection,
-    StreamableHTTPMCPClientFactory,
     check_personal_connection,
     mcp_binding_drift_reason,
     mcp_binding_from_inspection,
@@ -1712,9 +1711,13 @@ class EmbeddedAgent:
                 raise AgentNotConfiguredError(
                     "the data agent requires a tool-capable model profile"
                 )
-        resolved_mcp_client_factory = (
-            mcp_client_factory or StreamableHTTPMCPClientFactory()
-        )
+        resolved_mcp_client_factory: MCPClientFactory
+        if mcp_client_factory is None:
+            from ..adapters.mcp_sdk import SDKMCPClientFactory
+
+            resolved_mcp_client_factory = SDKMCPClientFactory()
+        else:
+            resolved_mcp_client_factory = mcp_client_factory
         mcp_domain, mcp_activated_bindings, mcp_executors = await activate_mcp_domain(
             agent_id=identity.id,
             store=store,

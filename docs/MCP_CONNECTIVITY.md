@@ -5,14 +5,18 @@ other systems or take specific external actions. An operator first inspects a
 server and admits its exact tools, access, and effects. A server's own names,
 descriptions, annotations, and results cannot grant permission.
 
-Each binding retains one exact endpoint, negotiated server identity, local
-tool permissions, and schema digests. Calls recheck those facts before remote
-I/O.
+Each binding retains one exact endpoint, accepted protocol and tool capability
+facts, local tool permissions, and schema digests. Calls recheck those facts
+before remote I/O. Optional `serverInfo` is a display and drift hint.
 
 ## Supported surface
 
 - Remote Streamable HTTP only. Plain HTTP is accepted only for loopback hosts.
-- MCP protocol versions `2025-11-25` and `2025-06-18`.
+- MCP protocol versions `2026-07-28`, `2025-11-25`, and `2025-06-18`.
+  The SDK adapter probes `2026-07-28` explicitly and selects the legacy
+  handshake only when the server rejects discovery with `METHOD_NOT_FOUND` or
+  explicitly advertises an admitted 2025 version. Other failures never
+  trigger a downgrade.
 - No authentication, a static bearer token resolved from an existing
   `SecretReference`, or a host-owned personal connection reference. The
   framework does not perform OAuth setup or token refresh itself.
@@ -21,7 +25,9 @@ I/O.
   declaration `https://json-schema.org/draft/2020-12/schema` is also accepted,
   retained in the admission/drift digest, and removed from the model-facing
   projection. Other or nested `$schema` declarations, unsupported keywords,
-  and `$ref` are rejected.
+  and `$ref` are rejected. The SDK's JSON Schema 2020-12 validator checks
+  admitted arguments and structured output; schemas the selected model cannot
+  project faithfully remain inspectable but cannot be attached.
 - Text content and optional structured JSON-object results only.
 - At most 32 independently keyed bindings per agent, 256 inspected tools per
   server, 128 admitted tools per binding, and 384 active admitted MCP tools in
@@ -118,6 +124,15 @@ The token value and MCP session identifier are never stored in the binding or
 state database. The reference is resolved again immediately before every
 network request.
 
+The default transport is `SDKMCPClientFactory` from `daita.adapters.mcp`.
+`Agent` still accepts an injected `MCPClientFactory` with the same
+`create(endpoint, authentication, secrets)` contract, and `MCPClient` still
+provides `inspect`, `call_tool`, and `close`. The former concrete
+`StreamableHTTPMCPClient` and its factory were removed with the custom wire
+implementation. Callers that imported those concrete classes must use the
+supported factory interface. The framework release is versioned as `1.2.0`.
+This package version does not change the independent agent-home revision.
+
 ### Hosted personal connections
 
 `Agent.create` and `Agent.open` accept an `mcp_connection_provider`. The host
@@ -135,10 +150,10 @@ and its owner. The provider's `check_access` verifies connection ownership,
 resource, scopes, and revocation at projection and call time. Its
 `access_token` returns a short-lived token for the same claims on each HTTP
 request. The resource URI and MCP endpoint must share one HTTPS origin;
-redirects and responses that echo a credential are rejected. Provider failures
-return one of `needs_authorization`,
-`needs_scope_upgrade`, `connection_revoked`, or `account_unavailable`; provider
-error text is discarded. The host must enforce the same actor on its saved
+redirects and responses that echo a credential are rejected before SDK parsing.
+Provider failures return one of `needs_authorization`, `needs_scope_upgrade`,
+`connection_revoked`, or `account_unavailable`; provider error text is discarded.
+The host must enforce the same actor on its saved
 conversation and token-vault APIs. The framework has no hosted connection setup
 or callback flow.
 
@@ -209,8 +224,8 @@ revoked = await agent.revoke_mcp_server(binding_id)
 ```
 
 Before every admitted tool call, Daita reloads the exact binding revision,
-re-resolves authentication, re-inspects server identity and accepted schema
-digests, and enforces the configured outbound sensitivity ceiling. A stale,
+re-resolves authentication, re-inspects the accepted protocol, capabilities,
+and schema digests, and enforces the configured outbound sensitivity ceiling. A stale,
 changed, revoked, unavailable, or authentication-failed binding returns one
 bounded structured tool error. It does not fall back to another server or
 retry the remote call.
@@ -218,8 +233,8 @@ retry the remote call.
 Refresh records a new active or stale revision and requires another controlled
 open before execution. Revocation is binding-local and immediately removes
 that revision's authority while sibling bindings remain usable. Agent close
-waits for in-flight binding work and closes only clients that were actually
-initialized; a never-used binding owns no transport resource.
+waits for in-flight binding work and closes each used SDK client in its own
+serial owner task; a never-used binding owns no transport resource.
 
 All successful remote results receive code-owned provenance containing the
 binding and revision, exact remote tool identity, schema digests, call

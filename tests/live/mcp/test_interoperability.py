@@ -10,7 +10,7 @@ import pytest
 
 from daita.adapters.mcp import (
     MCPAuthentication,
-    StreamableHTTPMCPClientFactory,
+    SDKMCPClientFactory,
 )
 from daita.security import (
     EmptySecretProvider,
@@ -54,7 +54,7 @@ async def test_context7_remote_streamable_http_interoperability_smoke() -> None:
         authentication = MCPAuthentication.no_auth()
         secrets = EmptySecretProvider()
 
-    client = StreamableHTTPMCPClientFactory().create(
+    client = SDKMCPClientFactory().create(
         endpoint=endpoint,
         authentication=authentication,
         secrets=secrets,

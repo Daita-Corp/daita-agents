@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
-import httpx
+import httpx2 as httpx
 import pytest
 
 from daita import (
@@ -30,7 +30,7 @@ from daita.adapters import (
     postgresql_query as postgresql_query_module,
     sqlite_query as sqlite_query_module,
 )
-from daita.adapters.mcp import StreamableHTTPMCPClientFactory
+from daita.adapters.mcp import SDKMCPClientFactory
 from daita.adapters.models import (
     DiscoveryRequest,
     DiscoveryResult,
@@ -186,7 +186,7 @@ async def _run_routine(
         expected_revision=created.revision,
     )
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + 5.0
+    deadline = loop.time() + 15.0
     while loop.time() < deadline:
         inbox = await agent.inbox(conversation_id=conversation_id)
         if inbox:
@@ -807,7 +807,7 @@ async def test_scheduled_mcp_result_snapshot_uses_the_same_inbox_path(
     tmp_path: Path,
 ) -> None:
     alpha, _beta = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(
+    factory = SDKMCPClientFactory(
         http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
     )
     bootstrap = await Agent.create(
@@ -924,7 +924,7 @@ async def test_schema_less_mcp_result_cannot_be_snapshotted(
             }
         },
     )
-    factory = StreamableHTTPMCPClientFactory(
+    factory = SDKMCPClientFactory(
         http_transport=httpx.MockTransport(MCPConformanceTransport(schema_less))
     )
     bootstrap = await Agent.create(

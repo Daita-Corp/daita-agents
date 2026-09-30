@@ -123,8 +123,8 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "01b86ca489e3a2ff72fafbc37bc76fbd177ad2e08199c4650c22a5b099dd1bea",
-        "definition": "Add caller provenance and opaque personal MCP connection claims while preserving released revision-2 identities, grants, receipts and data.",
+        "checksum": "00ed76a32e5d99402aeecfa7432ce3d2f289700e5dbec65d9c8405dfc76edcc4",
+        "definition": "Add caller provenance, opaque personal MCP connection claims and SDK protocol facts while preserving released revision-2 identities, grants, receipts and data.",
         "migration_id": "0003_framework_caller_authority",
         "revision": 3
       }
@@ -651,6 +651,7 @@
         "resource_uri",
         "required_scopes",
         "protocol_version",
+        "protocol_capabilities_digest",
         "server_name",
         "server_version",
         "local_label",
@@ -3908,7 +3909,7 @@
       }
     }
   },
-  "contract_sha256": "c66958cd50ece1467545fc89206850ff46c6a31d70bbb7c90bbb2c809540e47f",
+  "contract_sha256": "4578641ca499134488e759c5991f9850e116b73ba7f0238f6dcd6d6150f26cce",
   "home_revision": 3,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

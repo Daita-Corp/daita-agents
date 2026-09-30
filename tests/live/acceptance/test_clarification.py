@@ -22,7 +22,7 @@ from daita import (
     SQLiteSource,
     create_llm_provider,
 )
-from daita.adapters.mcp import StreamableHTTPMCPClientFactory
+from daita.adapters.mcp import SDKMCPClientFactory
 from daita.llm.models import ModelProfile, ToolCall, ToolResultBlock
 from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider
@@ -249,7 +249,7 @@ async def test_live_mcp_ambiguity_clarifies_without_remote_dispatch(
     workspace = workspace_for(state_root)
     alpha, beta = conformance_identities()
     secrets = MappingSecretProvider({"env:BETA_TOKEN": "fixture-beta-secret"})
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha, beta))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha, beta))
 
     seed = await Agent.create(
         "live-mcp-clarification",

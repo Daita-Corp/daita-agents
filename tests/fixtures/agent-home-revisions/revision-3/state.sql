@@ -6,7 +6,7 @@ CREATE TABLE agent_home_migrations (
 );
 INSERT INTO "agent_home_migrations" VALUES(1,'agent_home_revision_1','a08bdc56e3cb7c3dbe77dc0d8b8ed9aac1299a6a701902dba8e11a5ebe70f25e');
 INSERT INTO "agent_home_migrations" VALUES(2,'0002_durable_adaptive_task_graph','cb98e978fcb6db71cc1cb3ee5532d92ce99117db7359a008a98a4651df1c20e2');
-INSERT INTO "agent_home_migrations" VALUES(3,'0003_framework_caller_authority','01b86ca489e3a2ff72fafbc37bc76fbd177ad2e08199c4650c22a5b099dd1bea');
+INSERT INTO "agent_home_migrations" VALUES(3,'0003_framework_caller_authority','00ed76a32e5d99402aeecfa7432ce3d2f289700e5dbec65d9c8405dfc76edcc4');
 CREATE TABLE deliveries (
     agent_id TEXT NOT NULL,
     delivery_id TEXT NOT NULL,

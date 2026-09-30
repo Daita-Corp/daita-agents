@@ -419,7 +419,7 @@ def test_mcp_is_server_neutral_lazy_and_uses_existing_runtime_owners():
         for alias in node.names
     }
     assert "httpx" not in top_level_imports
-    assert _class_owners("StreamableHTTPMCPClient") == {"adapters/mcp.py"}
+    assert _class_owners("SDKMCPClient") == {"adapters/mcp_sdk.py"}
     assert _class_owners("MCPCapabilityDomain") == {"domains/mcp.py"}
     assert "CapabilityRuntime(" not in adapter
     assert "CapabilityRuntime(" not in domain

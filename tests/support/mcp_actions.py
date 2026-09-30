@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-import httpx
+import httpx2 as httpx
 import pytest
 
 from daita import (
@@ -24,7 +24,7 @@ from daita import (
     ScheduledRoutineDraft,
 )
 from daita._json import FrozenJsonObject
-from daita.adapters.mcp import StreamableHTTPMCPClientFactory
+from daita.adapters.mcp import SDKMCPClientFactory
 from daita.capabilities import (
     AccessMode,
     ApprovalDecision,
@@ -60,6 +60,8 @@ class ActionTransport(MCPConformanceTransport):
         self.release = asyncio.Event()
 
     async def __call__(self, request):
+        if request.method != "POST":
+            return await super().__call__(request)
         payload = json.loads(request.content)
         result = await super().__call__(request)
         if (
@@ -174,7 +176,7 @@ class ActionFixture:
             },
         )
         self.transport = ActionTransport(self.server)
-        self.factory = StreamableHTTPMCPClientFactory(
+        self.factory = SDKMCPClientFactory(
             http_transport=httpx.MockTransport(self.transport), timeout_seconds=0.2
         )
 

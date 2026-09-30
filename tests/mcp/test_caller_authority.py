@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 
-import httpx
+import httpx2 as httpx
 import pytest
 
 from daita import (
@@ -23,7 +23,7 @@ from daita import (
 from daita._json import FrozenJsonObject
 from daita.adapters.mcp import (
     MCPAuthenticationError,
-    StreamableHTTPMCPClientFactory,
+    SDKMCPClientFactory,
     mcp_execution_origin_digest,
 )
 from daita.capabilities import (
@@ -111,7 +111,7 @@ async def _attached(tmp_path, *, action: bool = False):
     identity, _ = conformance_identities()
     identity.bearer_token = TOKEN
     vault = PersonalConnections(identity.endpoint)
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(identity))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
     authentication = MCPAuthentication.personal_connection(
         "connection-alice", "alice", identity.endpoint, ("read:records",)
     )
@@ -167,7 +167,7 @@ async def test_local_personal_projection_checks_once_per_binding_and_rechecks_ne
     identity, _ = conformance_identities()
     identity.bearer_token = TOKEN
     vault = PersonalConnections(identity.endpoint)
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(identity))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
     agent = await Agent.create(
         "personal-projection-cost",
         root=tmp_path,
@@ -233,7 +233,7 @@ async def test_hosted_personal_connection_requires_explicit_actor_even_for_agent
     tmp_path,
 ):
     identity, _ = conformance_identities()
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(identity))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
     vault = PersonalConnections(identity.endpoint)
     agent = await Agent.create(
         "owner-personal-mcp",
@@ -387,7 +387,9 @@ async def test_personal_token_cannot_be_sent_to_another_endpoint_origin(tmp_path
         await agent.close()
 
 
-async def test_echoed_personal_token_is_rejected_before_transcript_or_storage(tmp_path):
+async def test_echoed_personal_token_is_rejected_before_transcript_or_storage(
+    tmp_path, caplog
+):
     identity, vault, _factory, binding = await _attached(tmp_path)
 
     class EchoToken:
@@ -396,7 +398,10 @@ async def test_echoed_personal_token_is_rejected_before_transcript_or_storage(tm
 
         async def __call__(self, request: httpx.Request) -> httpx.Response:
             response = await self.base(request)
-            if json.loads(request.content).get("method") == "tools/call":
+            if (
+                request.method == "POST"
+                and json.loads(request.content).get("method") == "tools/call"
+            ):
                 return httpx.Response(
                     response.status_code,
                     headers=response.headers,
@@ -404,9 +409,7 @@ async def test_echoed_personal_token_is_rejected_before_transcript_or_storage(tm
                 )
             return response
 
-    factory = StreamableHTTPMCPClientFactory(
-        http_transport=httpx.MockTransport(EchoToken())
-    )
+    factory = SDKMCPClientFactory(http_transport=httpx.MockTransport(EchoToken()))
     model = ToolboxAwareMockModelProvider(
         (
             ModelResponse(
@@ -438,6 +441,7 @@ async def test_echoed_personal_token_is_rejected_before_transcript_or_storage(tm
         assert _tool_error(transcript, "echoed-token") == "mcp_credential_echo_rejected"
         assert TOKEN not in repr(transcript)
         assert TOKEN.encode("utf-8") not in (agent.home / "state.db").read_bytes()
+        assert TOKEN not in caplog.text
     finally:
         await agent.close()
 
@@ -745,7 +749,7 @@ async def test_personal_action_receipt_never_contains_token_or_replays(
             return result
 
     if lose_response:
-        factory = StreamableHTTPMCPClientFactory(
+        factory = SDKMCPClientFactory(
             http_transport=httpx.MockTransport(ResponseLoss())
         )
 
