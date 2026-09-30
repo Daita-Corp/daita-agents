@@ -18,6 +18,7 @@ from ..adapters.mcp import (
     MCPCompletionSemantics,
     MCPConnectionProvider,
     MCPError,
+    MCPPersonalConnectionClient,
     MCPProtocolError,
     MCPRemoteToolError,
     MCPServerBinding,
@@ -278,24 +279,32 @@ class MCPToolExecutor:
                 "The request exceeds the admitted outbound sensitivity.",
             )
         if self._client is None:
-            self._client = self._client_factory.create(
+            client = self._client_factory.create(
                 endpoint=self._binding.endpoint,
                 authentication=self._binding.authentication,
                 secrets=self._secrets,
             )
-            if (
-                self._binding.authentication.mode
-                is MCPAuthenticationMode.PERSONAL_CONNECTION
-            ):
-                binder = getattr(self._client, "bind_personal_connection", None)
-                if not callable(binder) or self._connection_provider is None:
-                    self._client = None
-                    raise MCPProtocolError(
-                        "account_unavailable",
-                        "The MCP client cannot use a personal connection.",
+            try:
+                if (
+                    self._binding.authentication.mode
+                    is MCPAuthenticationMode.PERSONAL_CONNECTION
+                ):
+                    if (
+                        not isinstance(client, MCPPersonalConnectionClient)
+                        or self._connection_provider is None
+                    ):
+                        raise MCPProtocolError(
+                            "account_unavailable",
+                            "The MCP client cannot use a personal connection.",
+                        )
+                    assert request.caller_principal_id is not None
+                    client.bind_personal_connection(
+                        self._connection_provider, request.caller_principal_id
                     )
-                assert request.caller_principal_id is not None
-                binder(self._connection_provider, request.caller_principal_id)
+            except BaseException:
+                await client.close()
+                raise
+            self._client = client
         inspection = await self._client.inspect(observed_at=self._clock())
         drift = mcp_binding_drift_reason(self._binding, inspection)
         if drift is not None:

@@ -124,14 +124,55 @@ The token value and MCP session identifier are never stored in the binding or
 state database. The reference is resolved again immediately before every
 network request.
 
-The default transport is `SDKMCPClientFactory` from `daita.adapters.mcp`.
-`Agent` still accepts an injected `MCPClientFactory` with the same
-`create(endpoint, authentication, secrets)` contract, and `MCPClient` still
-provides `inspect`, `call_tool`, and `close`. The former concrete
-`StreamableHTTPMCPClient` and its factory were removed with the custom wire
-implementation. Callers that imported those concrete classes must use the
-supported factory interface. The framework release is versioned as `1.2.0`.
-This package version does not change the independent agent-home revision.
+## Client factory API
+
+Ordinary callers omit `mcp_client_factory` from `Agent.create` and `Agent.open`.
+The agent uses the official SDK through its sole built-in factory. Importing
+Daita, constructing the factory, and opening an agent home do not load the MCP
+SDK, resolve credentials, or contact a server. Client construction loads the
+SDK; the first inspection or call starts the connection.
+
+The supported injection contract lives in `daita.adapters.mcp`:
+
+- `MCPClientFactory.create(*, endpoint, authentication, secrets) -> MCPClient`
+  creates a new independent client without network or credential I/O.
+- `MCPClient.inspect(*, observed_at)` returns `MCPServerInspection` with freshly
+  fetched contracts. It must not cache `tools/list` responses.
+- `MCPClient.call_tool(remote_name, arguments)` returns `MCPToolResult`, sends at
+  most one `tools/call`, and never retries or automatically continues a result.
+- `MCPClient.close()` drains owned work and closes resources. It is terminal and
+  idempotent. Operations have finite bounds, propagate cancellation, and report
+  bounded failures as `MCPError` without credentials or unsafe remote error text.
+
+The agent retains the injected factory and owns the clients it returns. Temporary
+inspection clients close after success or failure. An activated binding owns one
+client, constructed at its first exact call and reused for later drift checks and
+calls until revocation or agent shutdown. A client rejected during credential
+binding is closed before inspection or dispatch. Injection does not replace
+Daita's binding admission, caller checks, approval, or receipt enforcement.
+
+The built-in factory can be configured explicitly through the same interface:
+
+```python
+from daita import Agent
+from daita.adapters.mcp import MCPClientFactory, SDKMCPClientFactory
+
+factory: MCPClientFactory = SDKMCPClientFactory(timeout_seconds=10)
+agent = await Agent.open("my-agent", mcp_client_factory=factory)
+```
+
+The `SDKMCPClientFactory` constructor's `http_transport` option accepts
+`httpx2.AsyncBaseTransport` for SDK transport configuration and disposable tests;
+it is outside the generic factory contract. Direct SDK client construction and
+its internal owner/session objects are implementation details. The former
+`StreamableHTTPMCPClient` and its factory
+are removed. Migrate their imports to `SDKMCPClientFactory` and obtain clients via
+`create`; migrate injected `httpx` fixtures to `httpx2`.
+
+`Agent` and `MCPClientFactory` retain their existing signatures. Removing the
+former concrete client imports is an intentional API break in `1.2.0`; those
+callers must migrate to the factory interface. This interface clarification
+requires no further package-version change or agent-home revision.
 
 ### Hosted personal connections
 
@@ -142,6 +183,14 @@ artifact/history read. Calls without an actor retain the agent-owner default
 for existing agent-owned work; they cannot access a personal connection owned
 by another principal. The hosted dispatcher must pass its authenticated actor
 for personal connections. Model instructions and tool arguments cannot set it.
+
+An injected personal client implements the optional, typed
+`MCPPersonalConnectionClient` protocol. Its synchronous
+`bind_personal_connection(provider, principal_id)` hook binds the exact provider
+and verified principal once before its first inspection or call. No-auth and
+static-bearer clients need only the base `MCPClient` protocol. Binding the provider
+does not resolve a token or grant access; rights and credentials are checked again
+at their existing projection, dispatch, and request boundaries.
 
 For a personal binding, use
 `MCPAuthentication.personal_connection(connection_id, owner_principal_id,

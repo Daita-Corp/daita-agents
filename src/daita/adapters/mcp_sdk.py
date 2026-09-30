@@ -33,7 +33,6 @@ from .mcp import (
     MCPAuthentication,
     MCPAuthenticationError,
     MCPAuthenticationMode,
-    MCPClient,
     MCPConnectionProvider,
     MCPProtocolError,
     MCPServerInspection,
@@ -405,40 +404,6 @@ def _safe_error(error: BaseException) -> Exception:
     )
 
 
-class SDKMCPClientFactory:
-    """Build SDK clients without changing the injectable MCPClientFactory protocol."""
-
-    def __init__(
-        self,
-        *,
-        http_transport: httpx2.AsyncBaseTransport | None = None,
-        timeout_seconds: float = MCP_REQUEST_TIMEOUT_SECONDS,
-    ) -> None:
-        if (
-            not isinstance(timeout_seconds, (int, float))
-            or isinstance(timeout_seconds, bool)
-            or not 0 < float(timeout_seconds) <= 60
-        ):
-            raise ValueError("MCP timeout must be positive and at most 60 seconds")
-        self._transport = http_transport
-        self._timeout = float(timeout_seconds)
-
-    def create(
-        self,
-        *,
-        endpoint: str,
-        authentication: MCPAuthentication,
-        secrets: SecretProvider,
-    ) -> MCPClient:
-        return SDKMCPClient(
-            endpoint=endpoint,
-            authentication=authentication,
-            secrets=secrets,
-            http_transport=self._transport,
-            timeout_seconds=self._timeout,
-        )
-
-
 class SDKMCPClient:
     """Serialize all SDK client lifecycle and calls in one owning asyncio task."""
 
@@ -474,6 +439,8 @@ class SDKMCPClient:
             raise MCPAuthenticationError(
                 "needs_authorization", "The MCP connection is unavailable."
             )
+        if self._provider is not None or self._owner is not None or self._closed:
+            raise ValueError("MCP personal connection must be bound once before use")
         self._provider = provider
         self._principal_id = principal_id
 

@@ -43,7 +43,6 @@ from daita.llm.models import (
     FinishReason,
     MessageRole,
     ModelProfile,
-    ModelRequest,
     ModelResponse,
     ModelSensitivity,
     ToolCall,
@@ -68,6 +67,7 @@ from daita.tui.screens.selection import SelectionScreen
 from daita.tui.widgets.composer import Composer
 from tests.support.mcp import (
     MappingSecretProvider,
+    MCPBatchProvider,
     MCPConformanceTransport,
     MCPFixtureIdentity,
     conformance_identities,
@@ -78,104 +78,6 @@ from tests.support.workspace import workspace_for
 
 NOW = datetime(2026, 8, 19, 12, 0, tzinfo=UTC)
 EAGER_LIMITS = LoopLimits()
-
-
-class _MCPBatchProvider:
-    provider_id = "mock:mcp-batch"
-
-    def __init__(
-        self,
-        calls: tuple[ToolCall, ...],
-        *,
-        block_first_response: bool = False,
-    ) -> None:
-        profile = ModelProfile(
-            id=self.provider_id,
-            context_window_tokens=128_000,
-            max_output_tokens=8_192,
-            supports_tools=True,
-            supports_parallel_tools=True,
-        )
-        self.calls = calls
-        self._provider = ToolboxAwareMockModelProvider(
-            (
-                ModelResponse(
-                    finish_reason=FinishReason.TOOL_CALLS,
-                    tool_calls=calls,
-                ),
-                ModelResponse(finish_reason=FinishReason.STOP, text="done"),
-            ),
-            provider_id=self.provider_id,
-            model_profile=profile,
-        )
-        self.model_profile = profile
-        self._batch_started = False
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-        if not block_first_response:
-            self.release.set()
-
-    def supports_request_policy(self, request: ModelRequest) -> bool:
-        return self._provider.supports_request_policy(request)
-
-    @property
-    def requests(self) -> tuple[ModelRequest, ...]:
-        return self._provider.requests
-
-    @property
-    def logical_requests(self) -> tuple[ModelRequest, ...]:
-        return self._provider.logical_requests
-
-    async def generate(self, request: ModelRequest) -> ModelResponse:
-        response = await self._provider.generate(request)
-        if not self._batch_started and response.tool_calls == self.calls:
-            self._batch_started = True
-            self.started.set()
-            await self.release.wait()
-        return response
-
-
-class _MCPSequenceProvider:
-    provider_id = "mock:mcp-sequence"
-
-    def __init__(self, calls: tuple[tuple[ToolCall, ...], ...]) -> None:
-        profile = ModelProfile(
-            id=self.provider_id,
-            context_window_tokens=128_000,
-            max_output_tokens=8_192,
-            supports_tools=True,
-            supports_parallel_tools=True,
-        )
-        self.calls = calls
-        self._provider = ToolboxAwareMockModelProvider(
-            (
-                *(
-                    ModelResponse(
-                        finish_reason=FinishReason.TOOL_CALLS,
-                        tool_calls=response_calls,
-                    )
-                    for response_calls in calls
-                ),
-                ModelResponse(finish_reason=FinishReason.STOP, text="done"),
-            ),
-            provider_id=self.provider_id,
-            model_profile=profile,
-        )
-        self.model_profile = profile
-
-    def supports_request_policy(self, request: ModelRequest) -> bool:
-        return self._provider.supports_request_policy(request)
-
-    @property
-    def requests(self) -> tuple[ModelRequest, ...]:
-        return self._provider.requests
-
-    @property
-    def logical_requests(self) -> tuple[ModelRequest, ...]:
-        return self._provider.logical_requests
-
-    async def generate(self, request: ModelRequest) -> ModelResponse:
-        return await self._provider.generate(request)
 
 
 class _BlockingCallTimeInspection:
@@ -336,7 +238,7 @@ async def test_multi_binding_reopen_executes_through_normal_runtime_and_transcri
     beta_name = beta_status.binding.tools[0].local_name
     await agent.close()
 
-    provider = _MCPBatchProvider(
+    provider = MCPBatchProvider(
         (
             ToolCall(id="alpha-call", name=alpha_name, arguments={"query": "x"}),
             ToolCall(id="beta-call", name=beta_name, arguments={"id": 7}),
@@ -1192,7 +1094,7 @@ async def test_revocation_after_frozen_context_blocks_io_and_is_binding_isolated
     await agent.close()
     alpha_name = alpha_status.binding.tools[0].local_name
     beta_name = beta_status.binding.tools[0].local_name
-    provider = _MCPBatchProvider(
+    provider = MCPBatchProvider(
         (
             ToolCall(id="revoked-call", name=alpha_name, arguments={"query": "x"}),
             ToolCall(id="sibling-call", name=beta_name, arguments={"id": 9}),
@@ -1262,7 +1164,7 @@ async def test_revocation_serializes_with_call_time_inspection(tmp_path):
         ),
     )
     await agent.close()
-    provider = _MCPBatchProvider(
+    provider = MCPBatchProvider(
         (
             ToolCall(
                 id="in-flight",
@@ -1414,7 +1316,7 @@ async def test_workspace_sensitivity_and_call_time_auth_use_current_admission(tm
             binding.tools[0],
         )
     await agent.close()
-    provider = _MCPBatchProvider(
+    provider = MCPBatchProvider(
         (
             ToolCall(
                 id="sensitivity-call",
@@ -1496,23 +1398,38 @@ async def test_current_run_sensitivity_blocks_later_lower_ceiling_egress(tmp_pat
         ),
     )
     await agent.close()
-    provider = _MCPSequenceProvider(
+    provider = ToolboxAwareMockModelProvider(
         (
-            (
-                ToolCall(
-                    id="raise-floor",
-                    name=high.binding.tools[0].local_name,
-                    arguments={"query": "x"},
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="raise-floor",
+                        name=high.binding.tools[0].local_name,
+                        arguments={"query": "x"},
+                    ),
                 ),
             ),
-            (
-                ToolCall(
-                    id="blocked-egress",
-                    name=low.binding.tools[0].local_name,
-                    arguments={"query": "confidential-derived"},
+            ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        id="blocked-egress",
+                        name=low.binding.tools[0].local_name,
+                        arguments={"query": "confidential-derived"},
+                    ),
                 ),
             ),
-        )
+            ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+        ),
+        provider_id="mock:mcp-sequence",
+        model_profile=ModelProfile(
+            id="mock:mcp-sequence",
+            context_window_tokens=128_000,
+            max_output_tokens=8_192,
+            supports_tools=True,
+            supports_parallel_tools=True,
+        ),
     )
     reopened = await Agent.open(
         "mcp-sensitivity-floor",
@@ -1573,7 +1490,7 @@ async def test_host_close_waits_for_remote_call_then_closes_mcp_client(tmp_path)
         ),
     )
     await agent.close()
-    provider = _MCPBatchProvider(
+    provider = MCPBatchProvider(
         (
             ToolCall(
                 id="close-call",
@@ -1630,7 +1547,7 @@ async def test_oversized_remote_result_becomes_one_bounded_transcript_error(tmp_
         "content": [{"type": "text", "text": "REMOTE-SECRET" * 30_000}],
         "structuredContent": {"answer": "unused"},
     }
-    provider = _MCPBatchProvider(
+    provider = MCPBatchProvider(
         (
             ToolCall(
                 id="oversized-call",

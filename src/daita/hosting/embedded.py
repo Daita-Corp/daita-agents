@@ -36,8 +36,10 @@ from ..adapters.mcp import (
     MCPBindingStatus,
     MCPClientFactory,
     MCPConnectionProvider,
+    MCPPersonalConnectionClient,
     MCPServerInspection,
     MCPToolSelection,
+    SDKMCPClientFactory,
     check_personal_connection,
     mcp_binding_drift_reason,
     mcp_binding_from_inspection,
@@ -1713,8 +1715,6 @@ class EmbeddedAgent:
                 )
         resolved_mcp_client_factory: MCPClientFactory
         if mcp_client_factory is None:
-            from ..adapters.mcp_sdk import SDKMCPClientFactory
-
             resolved_mcp_client_factory = SDKMCPClientFactory()
         else:
             resolved_mcp_client_factory = mcp_client_factory
@@ -3997,16 +3997,19 @@ class EmbeddedAgent:
             authentication=authentication,
             secrets=self._secret_provider,
         )
-        if authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION:
-            binder = getattr(client, "bind_personal_connection", None)
-            if not callable(binder) or self._mcp_connection_provider is None:
-                await client.close()
-                raise MCPAuthenticationError(
-                    "account_unavailable",
-                    "The MCP client cannot use a personal connection.",
-                )
-            binder(self._mcp_connection_provider, principal_id)
         try:
+            if authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION:
+                if (
+                    not isinstance(client, MCPPersonalConnectionClient)
+                    or self._mcp_connection_provider is None
+                ):
+                    raise MCPAuthenticationError(
+                        "account_unavailable",
+                        "The MCP client cannot use a personal connection.",
+                    )
+                client.bind_personal_connection(
+                    self._mcp_connection_provider, principal_id
+                )
             return await client.inspect(observed_at=self._clock())
         finally:
             await client.close()

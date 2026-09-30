@@ -94,6 +94,65 @@ efficiency target into the functional oracle. Record token use as benchmark
 evidence. Test exact token admission and exhaustion behavior with deterministic
 providers in the owning loop and LLM suites.
 
+The live MCP action and scheduled execution suites default to a `$0.50`
+estimated cost cap per agent run in both evaluation profiles. Configure it with
+`DAITA_PHASE_F_LIVE_MAX_COST_USD`; it must remain finite and positive. These
+suites use real model providers with simulated MCP servers.
+
+### Real remote MCP reads
+
+`tests/live/mcp/test_interoperability.py` uses the production SDK transport against
+the exact `MCP_HOST` endpoint. It has two separately authorized cases:
+
+- `DAITA_RUN_LIVE_MCP=1` enables SDK inspection and one remote read, without an LLM.
+- Both `DAITA_RUN_LIVE_MCP=1` and `DAITA_RUN_LIVE_MCP_LLM=1` enable one real OpenAI
+  agent run: inspect, admit one read tool, close/reopen the home, load and invoke
+  the admitted tool, verify binding provenance, and check a grounded final answer.
+  It uses `OPENAI_API_KEY`, defaults to `openai:gpt-5.6-terra`, and caps estimated
+  model cost at `$0.50`. Override with `DAITA_LIVE_MCP_MODEL_ID` (a reviewed OpenAI
+  tool model) and finite positive `DAITA_LIVE_MCP_MAX_COST_USD`.
+
+Configure the exact read contract and an independently known result marker:
+
+```bash
+export MCP_HOST=https://mcp.firecrawl.dev/v2/mcp
+export MCP_TOOL=firecrawl_scrape
+export MCP_ARGUMENTS='{"url":"https://example.com","formats":["markdown"]}'
+export MCP_EXPECT_TEXT='Example Domain'
+# Set MCP_TOKEN privately to an existing Firecrawl API key for authenticated access.
+# Omitting MCP_TOKEN selects no authentication; it does not start OAuth sign-in.
+```
+
+Firecrawl documents [API-key and limited keyless access](https://docs.firecrawl.dev/mcp-server/keyless)
+at this endpoint. Its [OAuth endpoint](https://docs.firecrawl.dev/mcp-server)
+requires an existing access token or a host-owned connection provider; this test
+does not obtain or refresh one. An incompatible protocol or schema fails the
+case before model construction; do not weaken admission or switch endpoints
+after a failure. The example tool is subject to the server's current schemas,
+availability, credit charges, and rate limits.
+
+After authorizing the resource use and exporting credentials/configuration:
+
+```bash
+DAITA_RUN_LIVE_MCP=1 .venv/bin/python -m pytest \
+  tests/live/mcp/test_interoperability.py \
+  -o addopts="--tb=short -q --strict-markers" -m 'not requires_llm'
+
+DAITA_RUN_LIVE_MCP=1 DAITA_RUN_LIVE_MCP_LLM=1 .venv/bin/python -m pytest \
+  tests/live/mcp/test_interoperability.py \
+  -o addopts="--tb=short -q --strict-markers" -m requires_llm \
+  --junitxml=/private/tmp/daita-live-mcp.xml -o junit_family=xunit1
+```
+
+Pytest does not load `.env` automatically. Explicitly load its values into the
+test process only after authorizing live execution. JUnit properties record
+protocol, binding/schema identity, run ID, model requests, tokens, and estimated
+cost. The disposable home retains the exact transcript for diagnosis.
+These cases prove remote reads; external actions, approval, receipts, and OAuth
+refresh require their own real-service qualification. The prior Context7-specific
+smoke is now server-neutral; `DAITA_MCP_SMOKE_*` test settings are replaced by the
+`MCP_*` settings above.
+
 The fully offline job concurrency soak retains its explicit enable flag:
 
 ```bash

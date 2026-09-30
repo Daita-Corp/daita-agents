@@ -111,9 +111,9 @@ def evaluation_profile() -> str:
 
 
 def limits() -> LoopLimits:
-    user_flow = evaluation_profile() == "user_flow"
+    evaluation_profile()
     try:
-        amount = Decimal(os.environ.get(COST_ENV, "0.50" if user_flow else "0.15"))
+        amount = Decimal(os.environ.get(COST_ENV, "0.50"))
     except InvalidOperation as error:
         raise ValueError(f"{COST_ENV} must be a finite positive decimal") from error
     if not amount.is_finite() or amount <= 0:

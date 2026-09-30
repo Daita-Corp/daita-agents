@@ -23,6 +23,7 @@ from daita import (
 from daita._json import FrozenJsonObject
 from daita.adapters.mcp import (
     MCPAuthenticationError,
+    MCPPersonalConnectionClient,
     SDKMCPClientFactory,
     mcp_execution_origin_digest,
 )
@@ -49,8 +50,9 @@ from daita.loop.models import (
     RunOrigin,
     RunStartEnvelope,
 )
-from tests.mcp.test_runtime import _MCPBatchProvider
+from daita.security import EmptySecretProvider
 from tests.support.mcp import (
+    MCPBatchProvider,
     MCPConformanceTransport,
     conformance_identities,
     mock_transport,
@@ -105,6 +107,35 @@ class PersonalConnections:
         )
         self.token_requests += 1
         return TOKEN
+
+
+@pytest.mark.parametrize("state", ["bound", "started", "closed"])
+async def test_sdk_personal_client_binds_only_once_before_first_use(state):
+    identity, _ = conformance_identities()
+    identity.bearer_token = TOKEN
+    provider = PersonalConnections(identity.endpoint)
+    client = SDKMCPClientFactory(http_transport=mock_transport(identity)).create(
+        endpoint=identity.endpoint,
+        authentication=MCPAuthentication.personal_connection(
+            "connection-alice", "alice", identity.endpoint, ("read:records",)
+        ),
+        secrets=EmptySecretProvider(),
+    )
+    assert isinstance(client, MCPPersonalConnectionClient)
+    try:
+        if state == "bound":
+            client.bind_personal_connection(provider, "alice")
+        elif state == "started":
+            with pytest.raises(MCPAuthenticationError):
+                await client.inspect(observed_at=NOW)
+        else:
+            await client.close()
+        with pytest.raises(ValueError, match="once before use"):
+            client.bind_personal_connection(provider, "alice")
+        assert provider.token_requests == 0
+        assert identity.calls == []
+    finally:
+        await client.close()
 
 
 async def _attached(tmp_path, *, action: bool = False):
@@ -588,7 +619,7 @@ async def test_personal_binding_isolated_across_projection_dispatch_management_a
 async def test_personal_revocation_between_projection_and_call_stops_dispatch(tmp_path):
     identity, vault, factory, binding = await _attached(tmp_path)
     name = binding.tools[0].local_name
-    model = _MCPBatchProvider(
+    model = MCPBatchProvider(
         (ToolCall(id="revoked-call", name=name, arguments={"query": "x"}),),
         block_first_response=True,
     )

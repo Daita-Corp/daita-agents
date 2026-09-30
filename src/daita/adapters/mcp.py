@@ -8,11 +8,11 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
+from .._installation import repair_guidance
 from .._json import FrozenJsonObject, canonical_json
-from .._version import __version__
 from ..capabilities import (
     AccessMode,
     AutomationEligibility,
@@ -44,7 +44,7 @@ MCP_MAX_TEXT_CHARACTERS = 256 * 1_024
 MCP_REQUEST_TIMEOUT_SECONDS = 15.0
 
 if TYPE_CHECKING:
-    from .mcp_sdk import SDKMCPClient, SDKMCPClientFactory
+    import httpx2
 
 _BINDING_ID = re.compile(r"mcp-binding-[0-9a-f]{32}\Z")
 _REMOTE_TOOL_NAME = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}\Z")
@@ -66,11 +66,9 @@ _SCHEMA_RULE_KEYS = (
             "maxLength",
             "minimum",
             "maximum",
-            "pattern",
             "items",
             "minItems",
             "maxItems",
-            "uniqueItems",
             "properties",
             "required",
             "additionalProperties",
@@ -767,6 +765,14 @@ class MCPToolResult:
 
 
 class MCPClient(Protocol):
+    """One endpoint's protocol client, owned and closed by its factory's caller.
+
+    Inspection must fetch current remote contracts without a tools/list cache.
+    A tool call sends at most one tools/call and never continues an input-required
+    or asynchronous result. Operations have finite bounds, propagate cancellation
+    and use MCPError for safe failures. close is terminal and idempotent.
+    """
+
     async def inspect(self, *, observed_at: datetime) -> MCPServerInspection: ...
 
     async def call_tool(
@@ -778,7 +784,27 @@ class MCPClient(Protocol):
     async def close(self) -> None: ...
 
 
+@runtime_checkable
+class MCPPersonalConnectionClient(MCPClient, Protocol):
+    """Optional client extension for an exact host-owned personal connection."""
+
+    def bind_personal_connection(
+        self, provider: MCPConnectionProvider, principal_id: str
+    ) -> None:
+        """Bind once before first use; resolve credentials only per request."""
+        ...
+
+
 class MCPClientFactory(Protocol):
+    """Supported construction seam for Agent.create and Agent.open.
+
+    create performs no network or credential I/O and returns a new independently
+    owned client. Agent retains the factory but closes every client it creates,
+    including temporary inspection clients and clients rejected before use.
+    No-auth and bearer clients need only MCPClient; personal clients additionally
+    implement MCPPersonalConnectionClient.
+    """
+
     def create(
         self,
         *,
@@ -786,6 +812,50 @@ class MCPClientFactory(Protocol):
         authentication: MCPAuthentication,
         secrets: SecretProvider,
     ) -> MCPClient: ...
+
+
+class SDKMCPClientFactory:
+    """Configure the sole built-in SDK client without importing its integration.
+
+    Agent uses this factory by default. http_transport is an SDK-specific httpx2
+    test or transport configuration option, outside MCPClientFactory's contract.
+    """
+
+    def __init__(
+        self,
+        *,
+        http_transport: httpx2.AsyncBaseTransport | None = None,
+        timeout_seconds: float = MCP_REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not 0 < float(timeout_seconds) <= 60
+        ):
+            raise ValueError("MCP timeout must be positive and at most 60 seconds")
+        self._transport = http_transport
+        self._timeout = float(timeout_seconds)
+
+    def create(
+        self,
+        *,
+        endpoint: str,
+        authentication: MCPAuthentication,
+        secrets: SecretProvider,
+    ) -> MCPClient:
+        try:
+            from .mcp_sdk import SDKMCPClient
+        except ImportError as error:
+            raise ImportError(
+                "The MCP SDK integration is unavailable. " + repair_guidance()
+            ) from error
+        return SDKMCPClient(
+            endpoint=endpoint,
+            authentication=authentication,
+            secrets=secrets,
+            http_transport=self._transport,
+            timeout_seconds=self._timeout,
+        )
 
 
 def normalize_mcp_endpoint(value: str) -> str:
@@ -1070,10 +1140,6 @@ def canonical_mcp_schema(
             if not isinstance(items, Mapping):
                 raise ValueError("schema items must be an object rule")
             pending.append((items, depth + 1, False))
-        # Regex and pairwise uniqueness have no dependable cost bound here.
-        for expensive in ("pattern", "uniqueItems"):
-            if expensive in node:
-                raise ValueError(f"unsupported schema keyword: {expensive}")
     try:
         Draft202012Validator.check_schema(raw.to_dict())
     except SchemaError:
@@ -1266,9 +1332,11 @@ __all__ = [
     "MCPClient",
     "MCPClientFactory",
     "MCPCompletionSemantics",
+    "MCPConnectionProvider",
     "MCPError",
     "MCPInspectedTool",
     "MCPProtocolError",
+    "MCPPersonalConnectionClient",
     "MCPRemoteToolError",
     "MCPServerBinding",
     "MCPServerInspection",
@@ -1281,18 +1349,9 @@ __all__ = [
     "MCP_MAX_ACTIVE_TOOLS_PER_AGENT",
     "MCP_MAX_BINDINGS_PER_AGENT",
     "MCP_MAX_REQUEST_BYTES",
-    "SDKMCPClient",
     "SDKMCPClientFactory",
     "canonical_mcp_schema",
     "mcp_binding_drift_reason",
     "mcp_binding_from_inspection",
     "normalize_mcp_endpoint",
 ]
-
-
-def __getattr__(name: str) -> Any:
-    if name in {"SDKMCPClient", "SDKMCPClientFactory"}:
-        from . import mcp_sdk
-
-        return getattr(mcp_sdk, name)
-    raise AttributeError(name)

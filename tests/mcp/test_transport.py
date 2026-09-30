@@ -17,9 +17,9 @@ from daita.adapters.mcp import (
     MCPAuthenticationError,
     MCPProtocolError,
     MCPTransportError,
-    SDKMCPClient,
     SDKMCPClientFactory,
 )
+from daita.adapters.mcp_sdk import SDKMCPClient
 from daita.security import EmptySecretProvider, SecretReference
 from tests.support.mcp import (
     MappingSecretProvider,
@@ -47,6 +47,7 @@ async def test_modern_sdk_discovery_optional_server_info_and_uncached_tools_list
         authentication=MCPAuthentication.no_auth(),
         secrets=EmptySecretProvider(),
     )
+    assert identity.request_methods == []
     try:
         first = await client.inspect(observed_at=NOW)
         second = await client.inspect(observed_at=NOW)
@@ -59,11 +60,14 @@ async def test_modern_sdk_discovery_optional_server_info_and_uncached_tools_list
         assert (await client.call_tool("lookup", {})).text == ("modern",)
     finally:
         await client.close()
+        await client.close()
     assert isinstance(client, SDKMCPClient)
     assert client._owner is not None and client._owner.done()
 
 
-@pytest.mark.parametrize("fault", ["auth", "malformed", "network", "redirect"])
+@pytest.mark.parametrize(
+    "fault", ["auth", "malformed", "network", "redirect", "incompatibility"]
+)
 async def test_modern_probe_never_downgrades_after_non_method_failure(fault):
     identity = MCPFixtureIdentity(
         host="probe.fixture.test",
@@ -86,6 +90,24 @@ async def test_modern_probe_never_downgrades_after_non_method_failure(fault):
             return httpx.Response(
                 307, headers={"location": identity.endpoint}, request=request
             )
+        if fault == "incompatibility" and request.method == "POST":
+            payload = json.loads(request.content)
+            assert payload["method"] == "server/discover"
+            assert request.headers["mcp-protocol-version"] == "2026-07-28"
+            identity.request_methods.append(payload["method"])
+            return httpx.Response(
+                400,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "error": {
+                        "code": -32000,
+                        "message": "Bad Request: Unsupported protocol version: 2026-07-28 "
+                        "(supported versions: 2025-11-25, 2025-06-18)",
+                    },
+                },
+                request=request,
+            )
         return await base(request)
 
     client = SDKMCPClientFactory(http_transport=httpx.MockTransport(transport)).create(
@@ -96,8 +118,10 @@ async def test_modern_probe_never_downgrades_after_non_method_failure(fault):
     try:
         with pytest.raises(
             (MCPAuthenticationError, MCPProtocolError, MCPTransportError)
-        ):
+        ) as error:
             await client.inspect(observed_at=NOW)
+        if fault == "incompatibility":
+            assert error.value.code == "mcp_remote_protocol_error"
     finally:
         await client.close()
     assert "initialize" not in identity.request_methods

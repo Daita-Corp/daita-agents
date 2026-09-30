@@ -8,6 +8,52 @@ from dataclasses import dataclass, field
 
 import httpx2 as httpx
 
+from daita.llm.models import (
+    FinishReason,
+    ModelProfile,
+    ModelRequest,
+    ModelResponse,
+    ToolCall,
+)
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider
+
+
+class MCPBatchProvider(ToolboxAwareMockModelProvider):
+    """Script one admitted batch, optionally gating it before runtime dispatch."""
+
+    def __init__(
+        self, calls: tuple[ToolCall, ...], *, block_first_response: bool = False
+    ) -> None:
+        provider_id = "mock:mcp-batch"
+        super().__init__(
+            (
+                ModelResponse(finish_reason=FinishReason.TOOL_CALLS, tool_calls=calls),
+                ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+            ),
+            provider_id=provider_id,
+            model_profile=ModelProfile(
+                id=provider_id,
+                context_window_tokens=128_000,
+                max_output_tokens=8_192,
+                supports_tools=True,
+                supports_parallel_tools=True,
+            ),
+        )
+        self.calls = calls
+        self._batch_started = False
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        if not block_first_response:
+            self.release.set()
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        response = await super().generate(request)
+        if not self._batch_started and response.tool_calls == self.calls:
+            self._batch_started = True
+            self.started.set()
+            await self.release.wait()
+        return response
+
 
 @dataclass
 class MCPFixtureIdentity:

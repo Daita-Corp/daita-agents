@@ -33,7 +33,7 @@ from daita import (
     ScheduledRoutineDraft,
 )
 from daita._json import FrozenJsonObject
-from daita.adapters.mcp import SDKMCPClientFactory
+from daita.adapters.mcp import MCPClientFactory, SDKMCPClientFactory
 from daita.artifacts.models import ArtifactAuthorship
 from daita.capabilities import (
     AccessMode,
@@ -157,6 +157,9 @@ async def run() -> None:
         workspace_root.mkdir(exist_ok=True)
         model = OfflineModel()
         service = OfflineService()
+        factory: MCPClientFactory = SDKMCPClientFactory(
+            http_transport=httpx.MockTransport(service)
+        )
         now = [datetime(2026, 9, 6, 12, tzinfo=UTC)]
 
         async def approve(request):
@@ -173,9 +176,7 @@ async def run() -> None:
             model_profile=OFFLINE_PROFILE,
             clock=lambda: now[0],
             approval_handler=approve,
-            mcp_client_factory=SDKMCPClientFactory(
-                http_transport=httpx.MockTransport(service)
-            ),
+            mcp_client_factory=factory,
         )
         agent = await Agent.create("offline-assignments", **options)
         try:

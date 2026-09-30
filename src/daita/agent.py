@@ -179,7 +179,11 @@ class Agent:
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
     ) -> Self:
-        """Create an agent; injected model providers remain caller-owned."""
+        """Create an agent; injected model providers remain caller-owned.
+
+        An injected MCP factory retains caller ownership; its created clients
+        are owned and closed by the agent. Omit it to use the built-in SDK client.
+        """
 
         _validate_downloads_directory(downloads_directory)
         return cls(
@@ -234,7 +238,11 @@ class Agent:
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
     ) -> Self:
-        """Open an agent; injected model providers remain caller-owned."""
+        """Open an agent; injected model providers remain caller-owned.
+
+        An injected MCP factory retains caller ownership; its created clients
+        are owned and closed by the agent. Omit it to use the built-in SDK client.
+        """
 
         _validate_downloads_directory(downloads_directory)
         return cls(

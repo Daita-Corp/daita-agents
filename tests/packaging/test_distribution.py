@@ -222,9 +222,8 @@ def test_real_wheel_metadata_drives_installed_runtime_cli_tui_and_mcp(
             str(python),
             "-c",
             "import daita; "
-            "from daita.adapters import mcp; "
             "from daita.tui.widgets import welcome; "
-            "print(daita.__version__); print(mcp.__version__); "
+            "print(daita.__version__); "
             "print(welcome.__version__)",
         ],
         check=False,
@@ -234,7 +233,7 @@ def test_real_wheel_metadata_drives_installed_runtime_cli_tui_and_mcp(
         env=runtime_environment,
     )
     assert surfaces.returncode == 0, surfaces.stderr
-    assert surfaces.stdout.splitlines() == [metadata.version] * 3
+    assert surfaces.stdout.splitlines() == [metadata.version] * 2
     cli_path = runtime / "bin" / "daita"
     assert cli_path.is_file(), installed.stdout + installed.stderr
     cli = subprocess.run(
@@ -380,6 +379,45 @@ def test_missing_xlsxwriter_uses_exact_pipx_repair_guidance():
     assert "daita-agents[" not in str(caught.value)
 
 
+@pytest.mark.parametrize("dependency", ["mcp", "httpx2"])
+def test_mcp_factory_reports_missing_integration_only_at_client_construction(
+    tmp_path, dependency
+):
+    script = """
+import builtins
+import sys
+
+original = builtins.__import__
+def guarded(name, *args, **kwargs):
+    level = kwargs.get("level", args[3] if len(args) >= 4 else 0)
+    if level == 0 and name.split(".")[0] == sys.argv[1]:
+        raise ImportError("missing test dependency")
+    return original(name, *args, **kwargs)
+builtins.__import__ = guarded
+
+from daita.adapters.mcp import MCPAuthentication, SDKMCPClientFactory
+from daita.security import EmptySecretProvider
+factory = SDKMCPClientFactory()
+try:
+    factory.create(
+        endpoint="https://unused.example.test/mcp",
+        authentication=MCPAuthentication.no_auth(),
+        secrets=EmptySecretProvider(),
+    )
+except ImportError as error:
+    assert "pipx reinstall daita-agents" in str(error)
+else:
+    raise AssertionError("A missing integration must fail at construction")
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, dependency],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_managed_repair_guidance_requires_a_verified_runtime_topology(tmp_path: Path):
     home = tmp_path / "home"
     generation = home / ".local" / "share" / "daita" / "generations" / "1.0.0-fixture-1"
@@ -430,7 +468,10 @@ blocked = {
     "asyncpg",
     "google",
     "httpx",
+    "httpx2",
+    "jsonschema",
     "keyring",
+    "mcp",
     "openai",
     "prompt_toolkit",
     "rich",
@@ -449,6 +490,10 @@ def guarded(name, *args, **kwargs):
 builtins.__import__ = guarded
 import daita
 import daita.cli
+from daita.adapters.mcp import (
+    MCPClient, MCPClientFactory, MCPPersonalConnectionClient, SDKMCPClientFactory,
+)
+factory = SDKMCPClientFactory()
 
 raise SystemExit(
     daita.cli.main(
