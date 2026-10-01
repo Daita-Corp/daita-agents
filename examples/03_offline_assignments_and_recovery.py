@@ -197,9 +197,8 @@ async def run() -> None:
                 ),
                 maximum_outbound_sensitivity=ModelSensitivity.INTERNAL,
             )
-            # Admission is persisted; one controlled reopen composes its immutable tools.
-            await agent.close()
-            agent = await Agent.open("offline-assignments", **options)
+            # Admission activates in this Agent before the next run.
+            assert status.active_in_runtime
             tools = {item.remote_name: item for item in status.binding.tools}
             model.extend(final_response("Prepare one immediate and weekly assignment."))
             origin = await agent.run(

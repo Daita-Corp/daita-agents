@@ -10,6 +10,7 @@ import pytest
 
 from daita.capabilities import (
     AutomationEligibility,
+    CapabilityRegistry,
     OperationalEffect,
 )
 from daita.llm.models import (
@@ -66,16 +67,27 @@ async def test_routine_instruction_cannot_lower_completed_origin_sensitivity():
     assert store.routines == {}
 
 
-async def test_owner_requires_one_once_only_complete_registry_binding() -> None:
+async def test_owner_replaces_complete_registry_without_rewriting_frozen_proposals() -> (
+    None
+):
     owner = _unbound_owner(_Store())
     with pytest.raises(RuntimeError, match="registry is not bound"):
         await _proposal(owner)
 
     registry = _registry()
     owner.bind_capability_registry(registry)
-    assert (await _proposal(owner)).allowed_capability_ids == ("test.read",)
-    with pytest.raises(RuntimeError, match="already bound"):
-        owner.bind_capability_registry(registry)
+    proposal = await _proposal(owner)
+    retained = proposal.contract_bindings
+    assert proposal.allowed_capability_ids == ("test.read",)
+
+    owner.bind_capability_registry(CapabilityRegistry())
+    with pytest.raises(RoutineError) as unavailable:
+        await owner.authority_snapshot(proposal)
+    assert unavailable.value.code == "routine_capability_invalid"
+    assert proposal.contract_bindings == retained
+
+    owner.bind_capability_registry(_registry())
+    assert (await _proposal(owner)).contract_bindings == retained
 
 
 async def test_owner_admits_lists_inspects_and_controls_exact_agent_scope() -> None:

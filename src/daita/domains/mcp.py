@@ -11,6 +11,7 @@ from typing import Protocol, cast
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.mcp import (
+    MCPAdmissionError,
     MCPAuthenticationMode,
     MCPBindingState,
     MCPClient,
@@ -20,6 +21,7 @@ from ..adapters.mcp import (
     MCPError,
     MCPPersonalConnectionClient,
     MCPProtocolError,
+    MCPProtocolPinnedClient,
     MCPRemoteToolError,
     MCPServerBinding,
     MCPToolBinding,
@@ -49,6 +51,7 @@ from ..capabilities import (
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
 from ..llm.models import ModelSensitivity, ToolCall
+from ..llm.provider_definitions import tool_schema_incompatibility
 from ..loop.models import RunInput
 from ..loop.session import RunSession
 from ..security import SecretProvider
@@ -261,7 +264,9 @@ class MCPToolExecutor:
                     "execution_scope_violation",
                     "The personal MCP connection is outside the frozen machine scope.",
                 )
-        validate_mcp_schema_value(tool.input_schema, request.arguments)
+        await validate_mcp_schema_value(
+            tool.raw_input_schema or tool.input_schema, request.arguments
+        )
         if (
             tool.completion_semantics is not MCPCompletionSemantics.DIRECT_RESULT
             or tool.task_support == "required"
@@ -285,6 +290,8 @@ class MCPToolExecutor:
                 secrets=self._secrets,
             )
             try:
+                if isinstance(client, MCPProtocolPinnedClient):
+                    client.bind_protocol(self._binding.protocol_version)
                 if (
                     self._binding.authentication.mode
                     is MCPAuthenticationMode.PERSONAL_CONNECTION
@@ -453,7 +460,9 @@ class MCPToolExecutor:
                         "The MCP tool omitted its admitted structured result.",
                     )
                 try:
-                    validate_mcp_schema_value(tool.output_schema, result.structured)
+                    await validate_mcp_schema_value(
+                        tool.output_schema, result.structured
+                    )
                 except (TypeError, ValueError, RuntimeError):
                     raise MCPProtocolError(
                         "mcp_result_schema_mismatch",
@@ -729,7 +738,7 @@ class MCPCapabilityDomain:
                     "effect_grant_required",
                     "The MCP action requires its exact retained standing grant.",
                 )
-            self._validate_constraints(binding, tool, grant.constraints)
+            await self._validate_constraints(binding, tool, grant.constraints)
             fixed = cast(Mapping[str, object], grant.constraints["fixed_arguments"])
             variable = cast(
                 tuple[str, ...], grant.constraints["variable_argument_names"]
@@ -743,7 +752,9 @@ class MCPCapabilityDomain:
                     "mcp_grant_arguments_invalid",
                     "MCP arguments differ from the approved fixed values or variable names.",
                 )
-        validate_mcp_schema_value(tool.input_schema, arguments)
+        await validate_mcp_schema_value(
+            tool.raw_input_schema or tool.input_schema, arguments
+        )
         return arguments
 
     async def prepare_automation_grant(
@@ -800,7 +811,7 @@ class MCPCapabilityDomain:
                 "mcp_outbound_sensitivity_exceeded",
                 "The proposed request classification exceeds MCP outbound admission.",
             )
-        self._validate_constraints(binding, tool, constraints)
+        await self._validate_constraints(binding, tool, constraints)
         normalized = constraints.to_dict()
         normalized["variable_argument_names"] = sorted(
             cast(tuple[str, ...], constraints["variable_argument_names"])
@@ -808,12 +819,19 @@ class MCPCapabilityDomain:
         return FrozenJsonObject.from_mapping(normalized)
 
     @staticmethod
-    def _validate_constraints(
+    async def _validate_constraints(
         binding: MCPServerBinding, tool: MCPToolBinding, constraints: FrozenJsonObject
     ) -> None:
         validate_tool_schema_value(MCP_GRANT_POLICY.constraints_schema, constraints)
         fixed = cast(Mapping[str, object], constraints["fixed_arguments"])
         variable = cast(tuple[str, ...], constraints["variable_argument_names"])
+        if variable and any(
+            key in tool.input_schema for key in ("oneOf", "anyOf", "allOf")
+        ):
+            raise CapabilityInputError(
+                "mcp_grant_constraints_invalid",
+                "Root schema alternatives cannot establish scalar variable grant boundaries.",
+            )
         properties = cast(
             Mapping[str, Mapping[str, object]], tool.input_schema.get("properties", {})
         )
@@ -894,7 +912,13 @@ class MCPCapabilityDomain:
             )
         partial_schema = tool.input_schema.to_dict()
         partial_schema["required"] = list(fixed)
-        validate_tool_schema_value(partial_schema, fixed)
+        try:
+            await validate_mcp_schema_value(partial_schema, fixed)
+        except ValueError:
+            raise CapabilityInputError(
+                "mcp_grant_constraints_invalid",
+                "Fixed grant arguments do not satisfy the admitted MCP schema.",
+            ) from None
 
     async def side_effect_plan(
         self,
@@ -1048,6 +1072,9 @@ async def activate_mcp_domain(
     secrets: SecretProvider,
     connection_provider: MCPConnectionProvider | None,
     clock: Callable[[], datetime],
+    bindings: tuple[MCPServerBinding, ...] | None = None,
+    existing: tuple[MCPActivatedBinding, ...] = (),
+    model_ids: tuple[str, ...] = (),
 ) -> tuple[
     MCPCapabilityDomain | None,
     tuple[MCPActivatedBinding, ...],
@@ -1056,8 +1083,23 @@ async def activate_mcp_domain(
     """Compose accepted persisted bindings without network activity."""
 
     activated: list[MCPActivatedBinding] = []
-    for binding in await store.list_mcp_bindings(agent_id):
+    reusable = {item.binding.binding_id: item for item in existing}
+    for binding in (
+        await store.list_mcp_bindings(agent_id) if bindings is None else bindings
+    ):
         if binding.state is not MCPBindingState.ACTIVE:
+            continue
+        for tool in binding.tools:
+            reason = tool_schema_incompatibility(tool.input_schema, model_ids)
+            if reason is not None:
+                raise MCPAdmissionError(
+                    "mcp_schema_unsupported",
+                    "The selected model route cannot represent this MCP contract.",
+                    {"remote_name": tool.remote_name, "reason": reason},
+                )
+        previous = reusable.get(binding.binding_id)
+        if previous is not None and previous.binding == binding:
+            activated.append(previous)
             continue
         lock = asyncio.Lock()
         executor = MCPToolExecutor(
@@ -1083,6 +1125,7 @@ async def activate_mcp_domain(
             id=tool.capability_id,
             description=tool.description,
             input_schema=tool.input_schema,
+            external_input_schema=tool.raw_input_schema or tool.input_schema,
             output_kind=MCP_OUTPUT_KIND,
             output_schema=_MCP_OUTPUT_SCHEMA,
             executor_id=tool.executor_id,

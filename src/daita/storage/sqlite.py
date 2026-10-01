@@ -202,6 +202,7 @@ from .sqlite_codecs import (
     encode_source_read_scope,
 )
 from .sqlite_codecs.graph import decode_graph_event, decode_graph_job_delivery
+from .sqlite_codecs.mcp_bindings import decode_mcp_credential_reference_for_deletion
 from .sqlite_records import (
     EffectOutcome,
     EffectReceipt,
@@ -1218,13 +1219,13 @@ class SQLiteStateStore:
     async def load_deletion_credential_inventory(
         self,
         agent_id: str,
-    ) -> tuple[AgentIdentity | None, tuple[str, ...]]:
-        """Read identity and owned-source reference candidates without admission."""
+    ) -> tuple[AgentIdentity | None, tuple[str, ...], tuple[str, ...]]:
+        """Read identity and credential reference candidates without admission."""
 
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be non-empty text")
 
-        def read() -> tuple[AgentIdentity | None, tuple[str, ...]]:
+        def read() -> tuple[AgentIdentity | None, tuple[str, ...], tuple[str, ...]]:
             with _connect_read_only(self.path) as connection:
                 identity_row = connection.execute(
                     "SELECT data FROM metadata WHERE key = 'identity'"
@@ -1234,6 +1235,17 @@ class SQLiteStateStore:
                        WHERE agent_id = ? ORDER BY id""",
                     (agent_id,),
                 ).fetchall()
+                mcp_rows = (
+                    connection.execute(
+                        "SELECT data FROM mcp_server_bindings WHERE agent_id = ?",
+                        (agent_id,),
+                    ).fetchall()
+                    if connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                        "AND name = 'mcp_server_bindings'"
+                    ).fetchone()
+                    else ()
+                )
             identity = (
                 None if identity_row is None else decode_identity(identity_row[0])
             )
@@ -1250,7 +1262,13 @@ class SQLiteStateStore:
                 )
                 if reference is not None:
                     references.append(reference)
-            return identity, tuple(references)
+            mcp_references = tuple(
+                reference
+                for (data,) in mcp_rows
+                if (reference := decode_mcp_credential_reference_for_deletion(data))
+                is not None
+            )
+            return identity, tuple(references), mcp_references
 
         return await asyncio.to_thread(read)
 

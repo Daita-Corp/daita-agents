@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Protocol, TypeVar
 
 from ._json import FrozenJsonObject, canonical_json
+from ._json_schema import project_json_schema, validate_json_schema_value
 from .artifacts.models import ArtifactAuthorship, ArtifactDraft
 from .llm.models import ModelSensitivity, ToolDefinition
 from .scope import EffectiveSourceScope
@@ -1216,6 +1217,7 @@ class Capability:
     machine_run_directive_kind: MachineRunDirectiveKind | None = None
     execution_admission_policy: ExecutionAdmissionPolicy | None = None
     durable_foreground_entrypoint: bool = False
+    external_input_schema: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -1304,7 +1306,16 @@ class Capability:
             raise TypeError("durable_foreground_entrypoint must be bool")
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)
         output_schema = FrozenJsonObject.from_mapping(self.output_schema)
-        _check_schema(input_schema)
+        if self.external_input_schema is None:
+            _check_schema(input_schema)
+        else:
+            external = FrozenJsonObject.from_mapping(self.external_input_schema)
+            projected, _ = project_json_schema(external)
+            if projected != input_schema:
+                raise ValueError(
+                    "external input schema differs from its faithful projection"
+                )
+            object.__setattr__(self, "external_input_schema", external)
         _check_schema(output_schema)
         object.__setattr__(self, "input_schema", input_schema)
         object.__setattr__(self, "output_schema", output_schema)
@@ -1842,10 +1853,31 @@ class CapabilityRegistry:
         self, capability_id: str, arguments: Mapping[str, object]
     ) -> FrozenJsonObject:
         capability = self._capabilities[capability_id]
+        if capability.external_input_schema is not None:
+            raise CapabilityInputError(
+                "external_schema_validation_required",
+                "External contracts require asynchronous bounded validation.",
+            )
         value = FrozenJsonObject.from_mapping(arguments)
         _validate_rule(
             "arguments", value, capability.input_schema, CapabilityInputError
         )
+        return value
+
+    async def validate_arguments_async(
+        self, capability_id: str, arguments: Mapping[str, object]
+    ) -> FrozenJsonObject:
+        capability = self._capabilities[capability_id]
+        if capability.external_input_schema is None:
+            return self.validate_arguments(capability_id, arguments)
+        value = FrozenJsonObject.from_mapping(arguments)
+        try:
+            await validate_json_schema_value(capability.external_input_schema, value)
+        except ValueError:
+            raise CapabilityInputError(
+                "invalid_arguments",
+                "Arguments do not satisfy the admitted external schema.",
+            ) from None
         return value
 
     def validate_execution_scope_grant(

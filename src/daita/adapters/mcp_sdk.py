@@ -6,6 +6,7 @@ import asyncio
 import re
 from collections.abc import Mapping
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from datetime import datetime
 from hashlib import sha256
 from typing import Any, cast
@@ -15,11 +16,18 @@ import httpx2
 from mcp import Client, types
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError as SDKError
+from pydantic import ValidationError
 
 from .._json import FrozenJsonObject, canonical_json
+from .._json_schema import check_json_schemas
 from .._version import __version__
 from ..errors import ErrorRetryability
-from ..security import SecretProvider, SecretResolutionError
+from ..security import (
+    CredentialSession,
+    SecretProvider,
+    SecretResolutionError,
+    default_secret_provider,
+)
 from .mcp import (
     _PERSONAL_STATUS_MESSAGES,
     MCP_MAX_DISCOVERED_TOOLS,
@@ -49,6 +57,17 @@ from .mcp import (
 _MODERN_VERSION = "2026-07-28"
 _METHOD_NOT_FOUND = -32601
 _JSON_UNICODE_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+_JSON_SIMPLE_ESCAPE = re.compile(r'\\(["\\/bfnrt])')
+_JSON_ESCAPES = {
+    '"': '"',
+    "\\": "\\",
+    "/": "/",
+    "b": "\b",
+    "f": "\f",
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+}
 
 
 def _contains_credential(body: bytes, token: str) -> bool:
@@ -62,7 +81,10 @@ def _contains_credential(body: bytes, token: str) -> bool:
         return False
     unescaped = _JSON_UNICODE_ESCAPE.sub(
         lambda match: chr(int(match.group(1), 16)), text
-    ).replace("\\/", "/")
+    )
+    unescaped = _JSON_SIMPLE_ESCAPE.sub(
+        lambda match: _JSON_ESCAPES[match.group(1)], unescaped
+    )
     # JSON represents non-BMP characters as a UTF-16 surrogate pair.
     unescaped = unescaped.encode("utf-16", "surrogatepass").decode(
         "utf-16", "surrogatepass"
@@ -94,6 +116,7 @@ class _BoundedMCPHTTPClient(httpx2.AsyncClient):
         self._secrets = secrets
         self._provider: MCPConnectionProvider | None = None
         self._principal_id: str | None = None
+        self.legacy_probe_error: types.ErrorData | None = None
         self.wire_fault: (
             MCPProtocolError | MCPTransportError | MCPAuthenticationError | None
         ) = None
@@ -120,7 +143,13 @@ class _BoundedMCPHTTPClient(httpx2.AsyncClient):
         if auth.mode is MCPAuthenticationMode.BEARER:
             assert auth.secret_reference is not None
             try:
-                token = await self._secrets.resolve(auth.secret_reference)
+                token = (
+                    await self._secrets.resolve_uncached(auth.secret_reference)
+                    if isinstance(self._secrets, CredentialSession)
+                    else await default_secret_provider(self._secrets).resolve(
+                        auth.secret_reference
+                    )
+                )
             except SecretResolutionError:
                 raise MCPAuthenticationError(
                     "mcp_authentication_failed",
@@ -363,6 +392,23 @@ class _BoundedMCPHTTPClient(httpx2.AsyncClient):
                     "The MCP endpoint echoed a credential.",
                 ),
             )
+        if (
+            response.status_code == 400
+            and request.headers.get("mcp-method") == "server/discover"
+        ):
+            # HTTP status alone is not era evidence: the SDK also synthesizes
+            # errors for empty/HTML/malformed HTTP failures. Use its wire model
+            # to retain only a validated implementation-defined JSON-RPC error.
+            try:
+                rpc_error = types.JSONRPCError.model_validate_json(body).error
+            except ValidationError:
+                pass
+            else:
+                if (
+                    -32019 <= rpc_error.code <= -32000
+                    and rpc_error.code != types.REQUEST_TIMEOUT
+                ):
+                    self.legacy_probe_error = rpc_error
         return httpx2.Response(
             response.status_code,
             headers=response.headers,
@@ -429,6 +475,18 @@ class SDKMCPClient:
         )
         self._owner: asyncio.Task[None] | None = None
         self._closed = False
+        self._protocol_version: str | None = None
+
+    def bind_protocol(self, protocol_version: str) -> None:
+        if protocol_version not in MCP_SUPPORTED_PROTOCOL_VERSIONS:
+            raise ValueError("MCP protocol version is unsupported")
+        if (
+            self._protocol_version is not None
+            or self._owner is not None
+            or self._closed
+        ):
+            raise ValueError("MCP protocol must be bound once before use")
+        self._protocol_version = protocol_version
 
     def bind_personal_connection(
         self, provider: MCPConnectionProvider, principal_id: str
@@ -455,7 +513,38 @@ class SDKMCPClient:
 
     async def inspect(self, *, observed_at: datetime) -> MCPServerInspection:
         _aware(observed_at, "MCP observed_at")
-        return cast(MCPServerInspection, await self._submit("inspect", observed_at))
+        inspection = cast(
+            MCPServerInspection, await self._submit("inspect", observed_at)
+        )
+        tools = list(inspection.tools)
+        schemas = tuple(
+            schema
+            for tool in tools
+            if tool.supported
+            for schema in (tool.raw_input_schema, tool.output_schema)
+            if schema is not None
+        )
+        checks = iter(await check_json_schemas(schemas))
+        for index, inspected in enumerate(tools):
+            if not inspected.supported:
+                continue
+            valid = [
+                next(checks)
+                for schema in (inspected.raw_input_schema, inspected.output_schema)
+                if schema is not None
+            ]
+            if not all(valid):
+                tools[index] = replace(
+                    inspected,
+                    supported=False,
+                    unsupported_reason="schema is invalid",
+                    input_schema=None,
+                    input_schema_digest=None,
+                    raw_input_schema=None,
+                    output_schema=None,
+                    output_schema_digest=None,
+                )
+        return replace(inspection, tools=tuple(tools))
 
     async def call_tool(
         self, remote_name: str, arguments: Mapping[str, object]
@@ -472,17 +561,23 @@ class SDKMCPClient:
         )
 
     async def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+        if not self._closed:
+            self._closed = True
+            if self._owner is not None and not self._owner.done():
+                future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+                self._queue.put_nowait(("close", (), future))
         owner = self._owner
         if owner is None:
             return
-        if owner.done():
-            return
-        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        await self._queue.put(("close", (), future))
-        await asyncio.shield(owner)
+        cancelled = False
+        while not owner.done():
+            try:
+                await asyncio.shield(owner)
+            except asyncio.CancelledError:
+                cancelled = True
+        owner.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def _run(self) -> None:
         try:
@@ -513,6 +608,7 @@ class SDKMCPClient:
                     result: MCPServerInspection | MCPToolResult
                     try:
                         http_client.wire_fault = None
+                        http_client.legacy_probe_error = None
                         async with asyncio.timeout(self._timeout):
                             if sdk is None:
                                 sdk = await self._connect(stack, http_client)
@@ -550,6 +646,10 @@ class SDKMCPClient:
     async def _connect(
         self, stack: AsyncExitStack, http_client: _BoundedMCPHTTPClient
     ) -> Client:
+        if self._protocol_version in MCP_SUPPORTED_PROTOCOL_VERSIONS[1:]:
+            return await self._connect_legacy(
+                stack, http_client, frozenset({self._protocol_version})
+            )
         modern = Client(
             streamable_http_client(self.endpoint, http_client=http_client),
             mode=_MODERN_VERSION,
@@ -565,7 +665,11 @@ class SDKMCPClient:
             except SDKError as error:
                 if http_client.wire_fault is not None:
                     raise http_client.wire_fault
-                if error.code != _METHOD_NOT_FOUND:
+                legacy_error = http_client.legacy_probe_error
+                compatible = error.code == _METHOD_NOT_FOUND or (
+                    legacy_error is not None and legacy_error.code == error.code
+                )
+                if not compatible or self._protocol_version is not None:
                     raise
                 admitted_legacy_versions = frozenset(
                     MCP_SUPPORTED_PROTOCOL_VERSIONS[1:]
@@ -574,16 +678,25 @@ class SDKMCPClient:
                 discovered = types.DiscoverResult.model_validate(raw)
                 if _MODERN_VERSION in discovered.supported_versions:
                     modern.session.adopt(discovered)
+                    self._protocol_version = _MODERN_VERSION
                     stack.push_async_exit(probe_stack.pop_all().__aexit__)
                     return modern
                 admitted_legacy_versions = frozenset(
                     discovered.supported_versions
                 ).intersection(MCP_SUPPORTED_PROTOCOL_VERSIONS[1:])
-                if not admitted_legacy_versions:
+                if not admitted_legacy_versions or self._protocol_version is not None:
                     raise MCPProtocolError(
                         "mcp_protocol_unsupported",
                         "The MCP protocol version is unsupported.",
                     )
+        return await self._connect_legacy(stack, http_client, admitted_legacy_versions)
+
+    async def _connect_legacy(
+        self,
+        stack: AsyncExitStack,
+        http_client: _BoundedMCPHTTPClient,
+        admitted_legacy_versions: frozenset[str],
+    ) -> Client:
         legacy_client = Client(
             streamable_http_client(self.endpoint, http_client=http_client),
             mode="legacy",
@@ -596,6 +709,7 @@ class SDKMCPClient:
             raise MCPProtocolError(
                 "mcp_protocol_unsupported", "The MCP protocol version is unsupported."
             )
+        self._protocol_version = legacy_client.session.protocol_version
         return legacy_client
 
     async def _inspect(self, sdk: Client, observed_at: datetime) -> MCPServerInspection:

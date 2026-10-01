@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, replace
 from typing import cast
 
@@ -13,6 +12,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Input, Label, Select, Static
 
 from daita import (
+    MCPAuthentication,
     MCPBindingState,
     MCPBindingStatus,
     MCPCompletionSemantics,
@@ -21,6 +21,7 @@ from daita import (
 )
 from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
 from daita.llm.models import ModelSensitivity
+from daita.security import SecretReference
 
 from ..models import PickerOption
 from ..sanitization import safe_display, sanitize_terminal_text
@@ -49,7 +50,7 @@ def mcp_binding_status_label(status: MCPBindingStatus) -> str:
     if status.binding.state is MCPBindingState.REVOKED:
         return "Revoked"
     if status.reopen_required:
-        return "Restart required"
+        return "Activation pending"
     if status.active_in_runtime:
         return "Accepted (validated at call)"
     return "Unavailable"
@@ -71,7 +72,7 @@ def group_mcp_servers(
         if any(member.binding.state is MCPBindingState.STALE for member in ordered):
             label = "Needs refresh"
         elif any(member.reopen_required for member in ordered):
-            label = "Restart required"
+            label = "Activation pending"
         elif any(member.active_in_runtime for member in ordered):
             label = "Accepted (validated at call)"
         elif all(member.binding.state is MCPBindingState.REVOKED for member in ordered):
@@ -157,44 +158,6 @@ def render_mcp_servers(statuses: tuple[MCPBindingStatus, ...]) -> tuple[str, str
     return summary, "\n\n".join(blocks)
 
 
-def generated_mcp_aliases(remote_names: tuple[str, ...]) -> tuple[str, ...]:
-    """Create deterministic provider-safe aliases without server-specific rules."""
-
-    aliases: list[str] = []
-    used: set[str] = set()
-    for remote_name in remote_names:
-        base = re.sub(r"[^a-z0-9]+", "_", remote_name.casefold()).strip("_")
-        if not base:
-            base = "remote_tool"
-        if not base[0].isalpha() or not base[0].isascii():
-            base = "tool_" + base
-        base = base[:40].rstrip("_") or "remote_tool"
-        candidate = base
-        suffix_number = 2
-        while candidate in used:
-            suffix = f"_{suffix_number}"
-            stem = base[: 40 - len(suffix)].rstrip("_") or "tool"
-            candidate = stem + suffix
-            suffix_number += 1
-        used.add(candidate)
-        aliases.append(candidate)
-    return tuple(aliases)
-
-
-def mcp_tool_selections(remote_names: tuple[str, ...]) -> tuple[MCPToolSelection, ...]:
-    """Build the code-owned admission records shown in the review step."""
-
-    aliases = generated_mcp_aliases(remote_names)
-    return tuple(
-        MCPToolSelection(
-            remote_name=remote_name,
-            local_alias=alias,
-            description=f"Read the explicitly admitted MCP tool {remote_name}.",
-        )
-        for remote_name, alias in zip(remote_names, aliases, strict=True)
-    )
-
-
 class MCPManagementScreen(ModalScreen[str | None]):
     """Manage remote MCP servers without exposing binding IDs as the primary UX."""
 
@@ -220,7 +183,6 @@ class MCPManagementScreen(ModalScreen[str | None]):
                 yield Button("Add server", id="mcp-add", variant="primary")
                 yield Button("Refresh", id="mcp-refresh")
                 yield Button("Revoke", id="mcp-revoke")
-                yield Button("Restart now", id="mcp-restart", disabled=True)
                 yield Button("Close", id="mcp-close")
             yield Static("", id="mcp-error", markup=False)
             yield Footer()
@@ -235,11 +197,7 @@ class MCPManagementScreen(ModalScreen[str | None]):
 
     def action_close(self) -> None:
         if not self._busy:
-            self.dismiss(
-                "restart_required"
-                if any(status.reopen_required for status in self._statuses)
-                else None
-            )
+            self.dismiss(None)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
@@ -268,14 +226,9 @@ class MCPManagementScreen(ModalScreen[str | None]):
         try:
             if button_id == "mcp-add":
                 result = await self.app._await_modal(MCPSetupScreen())  # type: ignore[attr-defined]
-                if result == "reopen":
-                    self.dismiss("reopen")
-                    return
-                if result == "restart_required":
+                if result == "active":
                     await self._load()
-                    self.query_one("#mcp-help", Static).update(
-                        "Server attached. Restart the agent runtime before using its tools."
-                    )
+                    self.query_one("#mcp-help", Static).update("MCP tools activated.")
                 return
             if button_id == "mcp-refresh":
                 await self._refresh_binding()
@@ -283,13 +236,6 @@ class MCPManagementScreen(ModalScreen[str | None]):
             if button_id == "mcp-revoke":
                 await self._revoke_binding()
                 return
-            if button_id == "mcp-restart":
-                if any(status.reopen_required for status in self._statuses):
-                    self.dismiss("reopen")
-                else:
-                    self.query_one("#mcp-help", Static).update(
-                        "All current MCP tools are already active."
-                    )
         except (ValueError, RuntimeError, OSError) as error:
             self._show_error(error)
         finally:
@@ -304,18 +250,9 @@ class MCPManagementScreen(ModalScreen[str | None]):
             status.binding.binding_id
         )
         await self._load()
-        if refreshed.reopen_required:
-            restart = await self.app._await_modal(  # type: ignore[attr-defined]
-                ConfirmScreen(
-                    "The MCP definition is current. Restart the agent runtime now "
-                    "to activate this refreshed tool set?"
-                )
-            )
-            if restart:
-                self.dismiss("reopen")
-                return
+        if refreshed.active_in_runtime:
             self.query_one("#mcp-help", Static).update(
-                "Tools refreshed. Restart the agent runtime before using them."
+                "MCP tools refreshed and active."
             )
             return
         reason = refreshed.binding.stale_reason or "The remote definition changed."
@@ -412,9 +349,6 @@ class MCPManagementScreen(ModalScreen[str | None]):
     def _update_actions(self) -> None:
         for button in self.query("#mcp-actions Button").results(Button):
             button.disabled = self._busy
-        self.query_one("#mcp-restart", Button).disabled = self._busy or not any(
-            status.reopen_required for status in self._statuses
-        )
 
     def _show_error(self, error: Exception) -> None:
         self.query_one("#mcp-error", Static).update(
@@ -564,18 +498,41 @@ class MCPSetupScreen(ModalScreen[str | None]):
         self._selections: tuple[MCPToolSelection, ...] = ()
         self._tool_picker: dict[str, str] = {}
         self._busy = False
+        self._authentication = MCPAuthentication.no_auth()
+        self._owned_credential: SecretReference | None = None
+        self._attached = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mcp-setup"):
             yield Label("Add MCP server", id="mcp-title", markup=False)
             yield Static(
-                "Step 1 of 3  ·  Enter a no-auth Streamable HTTP endpoint",
+                "Step 1 of 3  ·  Enter an endpoint and credentials",
                 id="mcp-step",
                 markup=False,
             )
             yield Input(
                 placeholder="https://mcp.example.com/mcp",
                 id="mcp-endpoint",
+            )
+            with Horizontal():
+                yield Select(
+                    [
+                        ("No authentication", "none"),
+                        ("Environment variable", "env"),
+                        ("Keychain reference", "keychain"),
+                        ("Save bearer token", "token"),
+                    ],
+                    value="none",
+                    allow_blank=False,
+                    id="mcp-auth",
+                )
+                yield Input(
+                    placeholder="Credential reference name", id="mcp-credential-ref"
+                )
+            yield Input(
+                placeholder="Bearer token (masked, saved in keychain)",
+                password=True,
+                id="mcp-token",
             )
             with VerticalScroll(id="mcp-inspection"):
                 yield Static(
@@ -605,10 +562,23 @@ class MCPSetupScreen(ModalScreen[str | None]):
         self.query_one("#mcp-endpoint", Input).focus()
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "mcp-endpoint" or self._inspected_input is None:
+        if (
+            event.input.id not in {"mcp-endpoint", "mcp-credential-ref", "mcp-token"}
+            or self._inspected_input is None
+        ):
             return
-        if event.value.strip() == self._inspected_input:
+        if (
+            event.input.id == "mcp-endpoint"
+            and event.value.strip() == self._inspected_input
+        ):
             return
+        self._clear_inspection()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "mcp-auth" and self._inspected_input is not None:
+            self._clear_inspection()
+
+    def _clear_inspection(self) -> None:
         self._inspection = None
         self._inspected_input = None
         self._selections = ()
@@ -623,7 +593,19 @@ class MCPSetupScreen(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         if not self._busy:
-            self.dismiss(None)
+            self.run_worker(self._cancel_setup(), name="mcp-cancel")
+
+    async def _cancel_setup(self) -> None:
+        await self._discard_unused_credential()
+        self.dismiss(None)
+
+    async def _discard_unused_credential(self) -> None:
+        if self._owned_credential is not None and not self._attached:
+            await self.app.controller.delete_mcp_bearer(self._owned_credential)  # type: ignore[attr-defined]
+            self._owned_credential = None
+
+    async def on_unmount(self) -> None:
+        await self._discard_unused_credential()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
@@ -661,7 +643,25 @@ class MCPSetupScreen(ModalScreen[str | None]):
         endpoint = self.query_one("#mcp-endpoint", Input).value.strip()
         if not endpoint:
             raise ValueError("Enter an MCP endpoint first.")
-        inspection = await self.app.controller.inspect_mcp_server(endpoint)  # type: ignore[attr-defined]
+        mode = self.query_one("#mcp-auth", Select).value
+        if mode == "none":
+            authentication = MCPAuthentication.no_auth()
+        elif mode in {"env", "keychain"}:
+            name = self.query_one("#mcp-credential-ref", Input).value.strip()
+            authentication = MCPAuthentication.bearer(
+                SecretReference(cast(str, mode), name)
+            )
+        else:
+            token_input = self.query_one("#mcp-token", Input)
+            if token_input.value:
+                await self._discard_unused_credential()
+                self._owned_credential = await self.app.controller.store_mcp_bearer(token_input.value)  # type: ignore[attr-defined]
+                token_input.value = ""
+            if self._owned_credential is None:
+                raise ValueError("Enter a bearer token first.")
+            authentication = MCPAuthentication.bearer(self._owned_credential)
+        inspection = await self.app.controller.inspect_mcp_server(endpoint, authentication=authentication)  # type: ignore[attr-defined]
+        self._authentication = authentication
         self._inspection = inspection
         self._inspected_input = endpoint
         self._selections = ()
@@ -735,7 +735,9 @@ class MCPSetupScreen(ModalScreen[str | None]):
             for picker_id in selected
             if self._tool_picker[picker_id] in supported_by_name
         )
-        self._selections = mcp_tool_selections(remote_names)
+        self._selections = MCPToolSelection.resolve(
+            tuple(MCPToolSelection(name) for name in remote_names), inspection
+        )
         self._render_selection()
 
     async def _configure_tool(self) -> None:
@@ -786,7 +788,7 @@ class MCPSetupScreen(ModalScreen[str | None]):
                 (
                     "",
                     safe_display(selection.remote_name, fallback="tool", maximum=256),
-                    "  Alias: " + selection.local_alias,
+                    "  Alias: " + cast(str, selection.local_alias),
                     "  Description: "
                     + safe_display(
                         selection.description, fallback="MCP read tool", maximum=512
@@ -831,19 +833,15 @@ class MCPSetupScreen(ModalScreen[str | None]):
         status = await self.app.controller.attach_mcp_tools(  # type: ignore[attr-defined]
             inspection.endpoint,
             self._selections,
+            authentication=self._authentication,
             maximum_outbound_sensitivity=ModelSensitivity(
                 cast(str, self.query_one("#mcp-outbound", Select).value)
             ),
         )
-        restart = False
-        if status.reopen_required:
-            restart = await self.app._await_modal(  # type: ignore[attr-defined]
-                ConfirmScreen(
-                    "The MCP server is attached. Restart the agent runtime now to "
-                    "activate the selected tools?"
-                )
-            )
-        self.dismiss("reopen" if restart else "restart_required")
+        if not status.active_in_runtime:
+            raise RuntimeError("MCP admission was saved but activation is pending.")
+        self._attached = True
+        self.dismiss("active")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy

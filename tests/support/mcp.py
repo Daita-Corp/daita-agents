@@ -314,3 +314,31 @@ class MappingSecretProvider:
         uri = reference.to_uri()
         self.resolutions.append(uri)
         return self.values[uri]
+
+
+class MemoryKeychain(MappingSecretProvider):
+    """Explicit local keychain boundary for offline setup and cleanup tests."""
+
+    def __init__(self) -> None:
+        super().__init__({})
+        self.deleted: list[str] = []
+
+    async def resolve(self, reference) -> str:
+        from daita.security.secrets import SecretResolutionError
+
+        if reference.scheme != "keychain":
+            raise SecretResolutionError(
+                "secret_scheme_unsupported", "Keychain references only."
+            )
+        if reference.to_uri() not in self.values:
+            raise SecretResolutionError(
+                "secret_not_found", "Credential is unavailable."
+            )
+        return await super().resolve(reference)
+
+    async def set(self, reference, value: str) -> None:
+        self.values[reference.to_uri()] = value
+
+    async def delete(self, reference) -> None:
+        self.deleted.append(reference.to_uri())
+        self.values.pop(reference.to_uri(), None)

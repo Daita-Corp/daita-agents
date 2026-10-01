@@ -402,6 +402,8 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
                 "protocol_capabilities_digest",
             ):
                 del fields[field]
+            for tool in fields["tools"]:
+                del tool["fields"]["raw_input_schema"]
             connection.execute(
                 "UPDATE mcp_server_bindings SET data = ? WHERE binding_id = ?",
                 (
@@ -422,7 +424,9 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
     reopened = await Agent.open("mcp-actions", **action.kwargs())
     try:
         assert (await reopened.list_mcp_servers())[0].binding == replace(
-            binding, protocol_capabilities_digest=None
+            binding,
+            protocol_capabilities_digest=None,
+            tools=tuple(replace(tool, raw_input_schema=None) for tool in binding.tools),
         )
         upgraded = await reopened.inspect_routine(routine.routine_id)
         assert upgraded is not None
@@ -830,11 +834,16 @@ async def test_revision_1_bridge_preserves_complete_observed_preproduction_homes
 
 
 def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) -> None:
-    created = asyncio.run(
-        Agent.create("status", root=tmp_path, workspace=workspace_for(tmp_path))
-    )
-    path = created.home / "state.db"
-    asyncio.run(created.close())
+    async def prepare() -> Path:
+        created = await Agent.create(
+            "status", root=tmp_path, workspace=workspace_for(tmp_path)
+        )
+        try:
+            return created.home / "state.db"
+        finally:
+            await created.close()
+
+    path = asyncio.run(prepare())
     stdout = io.StringIO()
     stderr = io.StringIO()
 
@@ -874,11 +883,16 @@ def test_headless_cli_reports_revision_status_and_safe_failures(tmp_path: Path) 
 
 
 def test_interactive_tui_renders_human_safe_upgrade_diagnostic(tmp_path: Path) -> None:
-    created = asyncio.run(
-        Agent.create("unsupported", root=tmp_path, workspace=workspace_for(tmp_path))
-    )
-    path = created.home / "state.db"
-    asyncio.run(created.close())
+    async def prepare() -> Path:
+        created = await Agent.create(
+            "unsupported", root=tmp_path, workspace=workspace_for(tmp_path)
+        )
+        try:
+            return created.home / "state.db"
+        finally:
+            await created.close()
+
+    path = asyncio.run(prepare())
     with sqlite3.connect(path) as connection:
         connection.execute(
             "UPDATE agent_home_migrations SET migration_id = 'unknown' "

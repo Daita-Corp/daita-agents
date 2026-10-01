@@ -1110,7 +1110,7 @@ def test_attempt_observation_bounds_and_unsafe_correlation_are_inert():
 
 
 @pytest.mark.parametrize("routed", [False, True])
-@pytest.mark.parametrize("stop", ["deadline", "cancel"])
+@pytest.mark.parametrize("stop", ["deadline", "cancel", "progress_timeout"])
 @pytest.mark.parametrize("progress", ["silent", "arguments"])
 async def test_actual_sdk_silent_stream_stops_without_tool_dispatch(
     routed, stop, progress
@@ -1121,6 +1121,7 @@ async def test_actual_sdk_silent_stream_stops_without_tool_dispatch(
 
     import httpx
 
+    from daita.llm.models import ModelCallPolicy
     from daita.llm.routing import ModelRouter, RetryPolicy
     from daita.loop import AgentLoop, InMemoryTranscriptStore, LoopLimits, RunInput
     from tests.llm._routing_support import registration
@@ -1191,6 +1192,14 @@ async def test_actual_sdk_silent_stream_stops_without_tool_dispatch(
             transcripts=store,
             clock=lambda: NOW,
             stream_model_calls=True,
+            model_call_policy=(
+                ModelCallPolicy(
+                    first_progress_timeout_seconds=0.15,
+                    progress_idle_timeout_seconds=0.15,
+                )
+                if stop == "progress_timeout"
+                else ModelCallPolicy()
+            ),
             limits=LoopLimits(
                 max_wall_time_seconds=1.5,
                 max_total_tokens=2000,
@@ -1243,12 +1252,164 @@ async def test_actual_sdk_silent_stream_stops_without_tool_dispatch(
                 progress == "arguments"
             )
             assert diagnostic["transport_error_kind"] is None
+            if stop == "progress_timeout":
+                assert diagnostic["timeout_reason"] == (
+                    "idle_progress" if progress == "arguments" else "first_progress"
+                )
             assert released == [True]
         finally:
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
             await router.close()
+
+
+@pytest.mark.parametrize(
+    "mode,native_code,native_type",
+    [
+        ("sdk_error", "server_error", "server_error"),
+        ("sdk_error", "SECRET_ERROR_TOKEN", "server_error"),
+        ("stream_error", "server_error", "server_error"),
+        ("failed_response", "server_error", "server_error"),
+        ("eof", None, None),
+        ("sdk_error", None, "insufficient_quota"),
+        ("stream_error", "insufficient_quota", "insufficient_quota"),
+        ("failed_response", None, "insufficient_quota"),
+        ("sdk_error", "credit_balance_exhausted", "insufficient_quota"),
+        ("stream_error", "credit_balance_exhausted", "insufficient_quota"),
+    ],
+)
+async def test_actual_openai_sdk_preserves_safe_stream_failure_facts(
+    mode, native_code, native_type
+):
+    import json
+    from decimal import Decimal
+    from hashlib import sha256
+
+    import httpx
+
+    from daita.loop import AgentLoop, InMemoryTranscriptStore, LoopLimits, RunInput
+    from tests.llm._token_counting_support import count_response, is_count, provider_at
+    from tests.support.job_benchmarks import RecordingProvider
+    from tests.support.loop import NOW, ScriptedTools, TranscriptContext
+
+    paths = []
+    released = []
+    private = "PRIVATE_ERROR_MESSAGE SECRET_PARAM SECRET_ERROR_TOKEN"
+    error = {
+        "code": native_code,
+        "type": native_type,
+        "message": private,
+        "param": "SECRET_PARAM",
+    }
+    events = [
+        {
+            "type": "response.created",
+            "response": {"id": "resp_offline", "status": "in_progress"},
+        },
+        {
+            "type": "response.in_progress",
+            "response": {"id": "resp_offline", "status": "in_progress"},
+        },
+    ]
+    if mode == "sdk_error":
+        events.append({"error": error})
+    elif mode == "stream_error":
+        events.append({**error, "type": "error"})
+    elif mode == "failed_response":
+        events.append(
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_offline",
+                    "status": "failed",
+                    "error": error,
+                    "output": [],
+                },
+            }
+        )
+
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for event in events:
+                yield ("data: " + json.dumps(event) + "\n\n").encode()
+
+        async def aclose(self):
+            released.append(True)
+
+    async def respond(request):
+        paths.append(request.url.path)
+        if is_count(request.url.path):
+            return httpx.Response(200, json=count_response("openai", 500))
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "text/event-stream",
+                "x-request-id": "req_offline",
+            },
+            stream=Body(),
+        )
+
+    async with provider_at("openai", respond) as adapter:
+        recorder = RecordingProvider(adapter)
+        store = InMemoryTranscriptStore()
+        runtime = ScriptedTools({})
+        loop = AgentLoop(
+            model=recorder,
+            context_builder=TranscriptContext(),
+            tools=runtime,
+            transcripts=store,
+            clock=lambda: NOW,
+            stream_model_calls=True,
+            limits=LoopLimits(max_estimated_cost_usd=Decimal("0.05")),
+        )
+        result = await loop.run(
+            RunInput(
+                id="failed-sdk",
+                agent_id="agent-1",
+                message="Read the value.",
+                created_at=NOW,
+            )
+        )
+    assert result.kind.value == "failed"
+    assert result.reason == (
+        "malformed_response"
+        if mode == "eof"
+        else (
+            "rate_limit_error"
+            if native_type == "insufficient_quota"
+            else "provider_unavailable"
+        )
+    )
+    assert result.final_text is None and not runtime.calls
+    assert result.usage.cost_estimate.status.value != "complete"
+    assert len(paths) == 2 and is_count(paths[0]) and not is_count(paths[1])
+    assert len(recorder.requests) == 1 and released == [True]
+    diagnostic = recorder.timings[0]["attempt_diagnostic"]
+    assert isinstance(diagnostic, Mapping)
+    assert diagnostic["generation_http_status"] == 200
+    assert (
+        diagnostic["generation_request_id_digest"]
+        == "sha256:" + sha256(b"req_offline").hexdigest()
+    )
+    assert diagnostic["terminal_observed"] is False
+    if mode != "eof":
+        assert diagnostic["upstream_error_origin"] == mode
+        assert diagnostic["upstream_error_code"] == (
+            native_code
+            if native_code
+            in {"server_error", "insufficient_quota", "credit_balance_exhausted"}
+            else "unrecognized"
+        )
+        if mode == "sdk_error":
+            assert diagnostic["sdk_error_type"] == "APIError"
+            assert diagnostic["upstream_error_type"] == native_type
+    else:
+        assert result.provider_failure is not None
+        assert result.provider_failure.code == "terminal_completion_missing"
+    evidence = json.dumps(recorder.timings)
+    assert all(token not in evidence for token in private.split())
+    assert len(json.dumps(diagnostic).encode()) < 8192
 
 
 async def test_gemini_repeated_cumulative_function_snapshots_emit_one_final_call(

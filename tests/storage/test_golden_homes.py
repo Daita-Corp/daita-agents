@@ -120,6 +120,16 @@ async def test_every_supported_golden_home_reaches_current_revision(
         root=tmp_path,
         workspace=workspace_for(tmp_path),
     )
+    if source_revision == 3:
+        servers = await agent.list_mcp_servers()
+        assert len(servers) == 1
+        tool = servers[0].binding.tools[0]
+        assert tool.raw_input_schema is not None
+        assert (
+            tool.raw_input_schema["$schema"]
+            == "http://json-schema.org/draft-07/schema#"
+        )
+        assert "$schema" not in tool.input_schema
     await agent.close()
 
     current = await Agent.inspect_home("golden", root=tmp_path)

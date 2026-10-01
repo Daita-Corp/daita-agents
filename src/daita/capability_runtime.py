@@ -585,6 +585,43 @@ def _control_definitions(
 class CapabilityRuntime:
     """Apply common execution mechanics to statically composed domains."""
 
+    @staticmethod
+    def _catalog_owners(
+        registry: CapabilityRegistry, domains: tuple[CapabilityDomain, ...]
+    ) -> dict[str, CapabilityDomain]:
+        """Validate a complete host-owned catalog before it is published."""
+        if not isinstance(registry, CapabilityRegistry):
+            raise TypeError("registry must be CapabilityRegistry")
+        owners: dict[str, CapabilityDomain] = {}
+        for domain in domains:
+            owner_id = domain.domain_owner_id
+            if not isinstance(owner_id, str) or not owner_id:
+                raise ValueError("domain_owner_id must be non-empty text")
+            if owner_id in owners:
+                raise ValueError(f"duplicate capability domain: {owner_id}")
+            if domain.declarations.domain_owner_id != owner_id:
+                raise ValueError(f"domain declaration owner differs: {owner_id}")
+            registry.validate_declarations(domain.declarations)
+            owners[owner_id] = domain
+        if set(owners) != registry.domain_owner_ids:
+            raise ValueError(
+                "runtime domains must exactly match registry domain owners"
+            )
+        return owners
+
+    def _replace_catalog(
+        self, registry: CapabilityRegistry, domains: tuple[CapabilityDomain, ...]
+    ) -> None:
+        """Publish between executions, under the host's system admission lease."""
+        owners = self._catalog_owners(registry, domains)
+        self._registry = registry
+        self._domains = owners
+        self._owner_management_locks: dict[str, asyncio.Lock] = {
+            owner_id: self._owner_management_locks.get(owner_id, asyncio.Lock())
+            for owner_id in owners
+        }
+        self._search_cursor_key = secrets.token_bytes(32)
+
     def __init__(
         self,
         registry: CapabilityRegistry,
@@ -605,24 +642,8 @@ class CapabilityRuntime:
             Callable[[RunInput], Awaitable[EffectiveSourceScope]] | None
         ) = None,
     ) -> None:
-        if not isinstance(registry, CapabilityRegistry):
-            raise TypeError("registry must be CapabilityRegistry")
         domains = tuple(domains)
-        owners: dict[str, CapabilityDomain] = {}
-        for domain in domains:
-            owner_id = domain.domain_owner_id
-            if not isinstance(owner_id, str) or not owner_id:
-                raise ValueError("domain_owner_id must be non-empty text")
-            if owner_id in owners:
-                raise ValueError(f"duplicate capability domain: {owner_id}")
-            if domain.declarations.domain_owner_id != owner_id:
-                raise ValueError(f"domain declaration owner differs: {owner_id}")
-            registry.validate_declarations(domain.declarations)
-            owners[owner_id] = domain
-        if set(owners) != registry.domain_owner_ids:
-            raise ValueError(
-                "runtime domains must exactly match registry domain owners"
-            )
+        owners = self._catalog_owners(registry, domains)
         if approval_handler is not None and not callable(approval_handler):
             raise TypeError("approval_handler must be callable or None")
         if admission_coordinator is not None and not all(
@@ -870,7 +891,9 @@ class CapabilityRuntime:
             )
             await self._validate_execution_contracts(request.run)
             normalized = domain.normalize_arguments(capability, request.arguments)
-            arguments = self._registry.validate_arguments(capability.id, normalized)
+            arguments = await self._registry.validate_arguments_async(
+                capability.id, normalized
+            )
             arguments = await domain.prepare_call(
                 request.run,
                 call,
@@ -2074,7 +2097,7 @@ class CapabilityRuntime:
             domain = self._domains[owner_id]
             if validated_arguments is None:
                 raw_arguments = domain.normalize_arguments(capability, call.arguments)
-                arguments = self._registry.validate_arguments(
+                arguments = await self._registry.validate_arguments_async(
                     capability.id,
                     raw_arguments,
                 )

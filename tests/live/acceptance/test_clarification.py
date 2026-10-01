@@ -282,8 +282,8 @@ async def test_live_mcp_ambiguity_clarifies_without_remote_dispatch(
                 ),
             ),
         )
-        assert alpha_status.reopen_required
-        assert beta_status.reopen_required
+        assert alpha_status.active_in_runtime
+        assert beta_status.active_in_runtime
     finally:
         await seed.close()
 

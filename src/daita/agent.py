@@ -1028,6 +1028,13 @@ class Agent:
     async def delete_skill(self, name: str) -> bool:
         return await self._embedded.delete_skill(name)
 
+    async def store_mcp_bearer(self, credential: str) -> SecretReference:
+        """Store a local MCP bearer credential; return only its secret reference."""
+        return await self._embedded.store_mcp_bearer(credential)
+
+    async def delete_mcp_bearer(self, reference: SecretReference) -> None:
+        await self._embedded.delete_mcp_bearer(reference)
+
     async def inspect_mcp_server(
         self,
         *,
@@ -1076,7 +1083,7 @@ class Agent:
         keywords: tuple[str, ...] = (),
         caller_principal_id: str | None = None,
     ) -> MCPServerBinding:
-        """Edit local hints; reopened MCP discovery uses them without a new admission revision."""
+        """Edit local hints without changing the execution admission revision."""
         return await self._embedded.update_mcp_discovery(
             binding_id,
             summary=summary,

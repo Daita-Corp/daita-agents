@@ -26,6 +26,7 @@ from daita import (
     LocalWorkspace,
     LoopExit,
     MCPAdmissionError,
+    MCPAuthentication,
     MCPBindingState,
     MCPBindingStatus,
     MCPServerInspection,
@@ -1323,8 +1324,18 @@ class PresentationController:
     async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
         return await self.require_agent().list_mcp_servers()
 
-    async def inspect_mcp_server(self, endpoint: str) -> MCPServerInspection:
-        return await self.require_agent().inspect_mcp_server(endpoint=endpoint)
+    async def store_mcp_bearer(self, credential: str) -> SecretReference:
+        return await self.require_agent().store_mcp_bearer(credential)
+
+    async def delete_mcp_bearer(self, reference: SecretReference) -> None:
+        await self.require_agent().delete_mcp_bearer(reference)
+
+    async def inspect_mcp_server(
+        self, endpoint: str, *, authentication: MCPAuthentication | None = None
+    ) -> MCPServerInspection:
+        return await self.require_agent().inspect_mcp_server(
+            endpoint=endpoint, authentication=authentication
+        )
 
     async def attach_mcp_tools(
         self,
@@ -1332,12 +1343,14 @@ class PresentationController:
         selections: tuple[MCPToolSelection, ...],
         *,
         maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
+        authentication: MCPAuthentication | None = None,
     ) -> MCPBindingStatus:
         try:
             return await self.require_agent().attach_mcp_server(
                 endpoint=endpoint,
                 selections=selections,
                 maximum_outbound_sensitivity=maximum_outbound_sensitivity,
+                authentication=authentication,
             )
         except MCPAdmissionError as error:
             reason = error.details.get("reason")

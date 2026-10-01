@@ -279,7 +279,9 @@ class ProviderAttempt:
             self.values[f"{phase}_headers_availability"] = (
                 "observed" if arrived else "status_only"
             )
-        self.values[f"{phase}_request_id_digest"] = self._id_digest(request_id)
+        digest = self._id_digest(request_id)
+        if digest is not None:
+            self.values[f"{phase}_request_id_digest"] = digest
 
     @staticmethod
     def _id_digest(value: object) -> str | None:

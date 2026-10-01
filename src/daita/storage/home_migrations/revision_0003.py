@@ -48,6 +48,11 @@ def _apply_revision_3(home: Path, source_shape: str | None) -> None:
                     required_scopes=[],
                 )
             fields.setdefault("protocol_capabilities_digest", None)
+            for tool in fields["tools"]:
+                # Released records retain the admitted assertion projection and
+                # original digest, but not the discarded remote annotations.
+                # Do not invent a raw schema or rehash retained authority.
+                tool["fields"]["raw_input_schema"] = None
             connection.execute(
                 "UPDATE mcp_server_bindings SET data = ? WHERE agent_id = ? AND binding_id = ?",
                 (
@@ -64,7 +69,7 @@ REVISION_3 = HomeMigration(
     migration_id="0003_framework_caller_authority",
     definition=(
         "Add caller provenance, opaque personal MCP connection claims and SDK "
-        "protocol facts while preserving released revision-2 identities, grants, "
+        "protocol facts and exact external schema contracts while preserving released revision-2 identities, grants, "
         "receipts and data."
     ),
     affected_paths=("state.db",),

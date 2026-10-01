@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from daita import Agent, LoopLimits, create_llm_provider
+from daita._json import FrozenJsonObject
 from daita.adapters.mcp import (
     MCPAuthentication,
     MCPToolSelection,
@@ -93,7 +94,7 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
     tmp_path: Path,
     record_property: Callable[[str, object], None],
 ) -> None:
-    """Real admission, restart, discovery, dispatch and grounded model completion."""
+    """Real attach, same-Agent run, restart and grounded model completion."""
 
     if (
         os.environ.get("DAITA_RUN_LIVE_MCP") != "1"
@@ -101,7 +102,7 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
     ):
         pytest.skip(
             "set DAITA_RUN_LIVE_MCP=1 and DAITA_RUN_LIVE_MCP_LLM=1 to authorize "
-            "one live model run and a remote read; Firecrawl may charge credits"
+            "two bounded live model runs and remote reads; Firecrawl may charge credits"
         )
 
     endpoint = os.environ["MCP_HOST"]
@@ -137,10 +138,20 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
         raise ValueError("DAITA_LIVE_MCP_MAX_COST_USD must be finite and positive")
     limits = LoopLimits(max_estimated_cost_usd=amount)
 
+    provider = RecordingProvider(
+        create_llm_provider(
+            model_id,
+            api_key=api_key,
+            max_output_tokens=min(profile.max_output_tokens, 2_048),
+        )
+    )
     agent = await Agent.create(
         "remote-mcp-read",
         root=tmp_path,
         hosted=True,
+        model=provider,
+        model_profile=profile,
+        limits=limits,
         secret_provider=secrets,
     )
     try:
@@ -165,32 +176,24 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
                 ),
             ),
         )
+        assert status.active_in_runtime
         binding = status.binding
         local_name = binding.tools[0].local_name
         record_property("mcp_binding_id", binding.binding_id)
         record_property("mcp_input_schema_digest", selected.input_schema_digest)
-    finally:
-        await agent.close()
-
-    # Construct the paid provider only after remote inspection/admission succeeds.
-    provider = RecordingProvider(
-        create_llm_provider(
-            model_id,
-            api_key=api_key,
-            max_output_tokens=min(profile.max_output_tokens, 2_048),
-        )
-    )
-    try:
-        agent = await Agent.open(
-            "remote-mcp-read",
-            root=tmp_path,
-            hosted=True,
-            model=provider,
-            model_profile=profile,
-            limits=limits,
-            secret_provider=secrets,
-        )
-        try:
+        for phase in ("attached", "restarted"):
+            if phase == "restarted":
+                await agent.close()
+                agent = await Agent.open(
+                    "remote-mcp-read",
+                    root=tmp_path,
+                    hosted=True,
+                    model=provider,
+                    model_profile=profile,
+                    limits=limits,
+                    secret_provider=secrets,
+                )
+            request_start = len(provider.requests)
             statuses = await agent.list_mcp_servers()
             assert len(statuses) == 1 and statuses[0].active_in_runtime
             result = await agent.run(
@@ -200,16 +203,20 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
                 "Ground your answer in the successful tool result."
             )
             transcript = await agent.transcript(result.run_id)
-            record_property("mcp_run_id", result.run_id)
-            record_property("mcp_model_requests", len(provider.requests))
-            record_property("mcp_total_tokens", result.usage.total_tokens)
+            record_property(f"mcp_{phase}_run_id", result.run_id)
             record_property(
-                "mcp_estimated_cost_usd", result.usage.cost_estimate.amount_usd
+                f"mcp_{phase}_model_requests", len(provider.requests) - request_start
+            )
+            record_property(f"mcp_{phase}_total_tokens", result.usage.total_tokens)
+            record_property(
+                f"mcp_{phase}_estimated_cost_usd", result.usage.cost_estimate.amount_usd
             )
             assert result.kind is LoopExitKind.COMPLETED, result.reason
             assert result.final_text and result.usage.total_tokens > 0
             validate_completed_transcript(transcript, result)
-            capture = RunCapture(result, transcript, tuple(provider.requests))
+            capture = RunCapture(
+                result, transcript, tuple(provider.requests[request_start:])
+            )
             assert_on_demand_invocation(capture, local_name)
             calls = [
                 call
@@ -217,7 +224,9 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
                 for call in message.tool_calls
                 if call.name == local_name
             ]
-            assert len(calls) == 1 and calls[0].arguments == arguments
+            assert len(calls) == 1 and calls[
+                0
+            ].arguments == FrozenJsonObject.from_mapping(arguments)
             outputs = results_for(transcript, local_name)
             assert len(outputs) == 1
             data = outputs[0].output["data"]
@@ -231,7 +240,6 @@ async def test_real_model_reads_remote_mcp_after_agent_restart(
             assert provenance["input_schema_digest"] == selected.input_schema_digest
             assert expected_text.casefold() in result.final_text.casefold()
             assert await agent.list_effects() == ()
-        finally:
-            await agent.close()
     finally:
+        await agent.close()
         await provider.close()

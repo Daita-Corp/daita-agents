@@ -363,7 +363,7 @@ async def test_grant_argument_errors_identify_exact_correction(
         }
     )
     with pytest.raises(CapabilityInputError) as failure:
-        MCPCapabilityDomain._validate_constraints(
+        await MCPCapabilityDomain._validate_constraints(
             action.binding, action.tool, constraints
         )
     assert failure.value.code == "mcp_grant_constraints_invalid"
@@ -577,7 +577,7 @@ async def test_grant_diagnostic_names_are_bounded_and_omission_is_explicit(actio
         }
     )
     with pytest.raises(CapabilityInputError) as failure:
-        MCPCapabilityDomain._validate_constraints(
+        await MCPCapabilityDomain._validate_constraints(
             action.binding, action.tool, constraints
         )
     details = json.loads(canonical_json(failure.value.details))
@@ -1242,20 +1242,10 @@ async def test_guided_ui_explicit_action_permissions_reach_public_admission(tmp_
             attestation = app.screen
             assert isinstance(attestation, ConfirmScreen)
             await pilot.press("y")
-            for _ in range(100):
-                await pilot.pause(0.05)
-                if (
-                    isinstance(app.screen, ConfirmScreen)
-                    and app.screen is not attestation
-                ):
-                    break
-            assert (
-                isinstance(app.screen, ConfirmScreen) and app.screen is not attestation
-            )
-            await pilot.press("n")
-            await setup_task
+            await asyncio.wait_for(setup_task, timeout=10)
             statuses = await app.controller.list_mcp_servers()
-            assert len(statuses) == 1
+            assert len(statuses) == 1 and statuses[0].active_in_runtime
+            assert app.controller.agent is opened
             tool = statuses[0].binding.tools[0]
             assert tool.remote_name == "notify"
             assert tool.access_mode is AccessMode.NONE

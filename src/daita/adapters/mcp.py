@@ -13,7 +13,10 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .._installation import repair_guidance
 from .._json import FrozenJsonObject, canonical_json
+from .._json_schema import project_json_schema, validate_json_schema_value
 from ..capabilities import (
+    MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS,
+    MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS,
     AccessMode,
     AutomationEligibility,
     OperationalEffect,
@@ -51,31 +54,6 @@ _REMOTE_TOOL_NAME = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}\Z")
 _LOCAL_ALIAS = re.compile(r"[a-z][a-z0-9_]{0,39}\Z")
 _SCHEMA_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SERVER_IDENTITY = re.compile(r"[^\r\n\x00]{1,256}\Z")
-_JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
-_SCHEMA_ANNOTATION_KEYS = frozenset({"description", "title", "examples"})
-_SCHEMA_ROOT_KEYS = (
-    frozenset({"$schema", "type", "properties", "required", "additionalProperties"})
-    | _SCHEMA_ANNOTATION_KEYS
-)
-_SCHEMA_RULE_KEYS = (
-    frozenset(
-        {
-            "type",
-            "enum",
-            "minLength",
-            "maxLength",
-            "minimum",
-            "maximum",
-            "items",
-            "minItems",
-            "maxItems",
-            "properties",
-            "required",
-            "additionalProperties",
-        }
-    )
-    | _SCHEMA_ANNOTATION_KEYS
-)
 
 
 class MCPTransportKind(str, Enum):
@@ -311,8 +289,8 @@ class MCPToolSelection:
     """Local admission facts for one exact tool, independent of remote hints."""
 
     remote_name: str
-    local_alias: str
-    description: str
+    local_alias: str | None = None
+    description: str | None = None
     summary: str | None = None
     when_to_use: str | None = None
     keywords: tuple[str, ...] = ()
@@ -325,16 +303,28 @@ class MCPToolSelection:
 
     def __post_init__(self) -> None:
         _remote_tool_name(self.remote_name)
-        if (
+        if self.local_alias is not None and (
             not isinstance(self.local_alias, str)
             or _LOCAL_ALIAS.fullmatch(self.local_alias) is None
         ):
             raise ValueError(
                 "MCP local_alias must use lowercase letters, digits, and underscores"
             )
-        _bounded_text(self.description, "MCP tool description", maximum=1_024)
-        summary = self.description if self.summary is None else self.summary
-        when_to_use = self.description if self.when_to_use is None else self.when_to_use
+        if self.description is not None:
+            _bounded_text(self.description, "MCP tool description", maximum=1_024)
+        fallback = (
+            self.description or f"Use the admitted MCP tool {self.remote_name}."
+        ).strip()
+        summary = (
+            fallback[:MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS].rstrip()
+            if self.summary is None
+            else self.summary
+        )
+        when_to_use = (
+            fallback[:MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS].rstrip()
+            if self.when_to_use is None
+            else self.when_to_use
+        )
         presentation = ToolPresentation(
             toolbox_id=ToolboxId.SOURCES,
             load_mode=ToolLoadMode.ON_DEMAND,
@@ -343,8 +333,10 @@ class MCPToolSelection:
             when_to_use=when_to_use,
             keywords=self.keywords,
         )
-        object.__setattr__(self, "summary", presentation.summary)
-        object.__setattr__(self, "when_to_use", presentation.when_to_use)
+        if self.description is not None or self.summary is not None:
+            object.__setattr__(self, "summary", presentation.summary)
+        if self.description is not None or self.when_to_use is not None:
+            object.__setattr__(self, "when_to_use", presentation.when_to_use)
         object.__setattr__(self, "keywords", presentation.keywords)
         if not isinstance(self.result_sensitivity, ModelSensitivity):
             raise TypeError("MCP result_sensitivity is invalid")
@@ -366,6 +358,67 @@ class MCPToolSelection:
             self.completion_semantics,
         )
 
+    @staticmethod
+    def generated_aliases(remote_names: tuple[str, ...]) -> tuple[str, ...]:
+        """Generate bounded aliases with order-independent collision handling."""
+        bases = tuple(
+            re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_") or "remote_tool"
+            for name in remote_names
+        )
+        bases = tuple(
+            (base if base[0].isalpha() else "tool_" + base)[:40].rstrip("_")
+            for base in bases
+        )
+        return tuple(
+            (
+                base
+                if bases.count(base) == 1
+                else base[:31].rstrip("_") + "_" + sha256(name.encode()).hexdigest()[:8]
+            )
+            for name, base in zip(remote_names, bases, strict=True)
+        )
+
+    @staticmethod
+    def resolve(
+        selections: tuple[MCPToolSelection, ...],
+        inspection: MCPServerInspection,
+        prior: MCPServerBinding | None = None,
+    ) -> tuple[MCPToolSelection, ...]:
+        """Resolve presentation defaults once for API, CLI and TUI admission."""
+        names = tuple(tool.remote_name for tool in inspection.tools)
+        aliases = dict(
+            zip(names, MCPToolSelection.generated_aliases(names), strict=True)
+        )
+        inspected = {tool.remote_name: tool for tool in inspection.tools}
+        previous = (
+            {} if prior is None else {tool.remote_name: tool for tool in prior.tools}
+        )
+        resolved = []
+        for item in selections:
+            tool = inspected.get(item.remote_name)
+            old = previous.get(item.remote_name)
+            description = item.description or (
+                old.description
+                if old is not None
+                else (
+                    tool.remote_description.strip()[:1_024].rstrip()
+                    if tool is not None and tool.remote_description
+                    else f"Use the admitted MCP tool {item.remote_name}."
+                )
+            )
+            if not description:
+                description = f"Use the admitted MCP tool {item.remote_name}."
+            alias = item.local_alias or (
+                old.local_name.split("_", 2)[2]
+                if old is not None
+                else aliases.get(
+                    item.remote_name,
+                    MCPToolSelection.generated_aliases((item.remote_name,))[0],
+                )
+            )
+            resolved.append(replace(item, local_alias=alias, description=description))
+        return tuple(resolved)
+
 
 @dataclass(frozen=True, slots=True)
 class MCPInspectedTool:
@@ -378,6 +431,7 @@ class MCPInspectedTool:
     supported: bool
     unsupported_reason: str | None = None
     task_support: str = "forbidden"
+    raw_input_schema: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
         _remote_tool_name(self.remote_name)
@@ -396,6 +450,7 @@ class MCPInspectedTool:
             self.input_schema_digest,
             self.output_schema,
             self.output_schema_digest,
+            self.raw_input_schema,
         )
         if self.supported:
             if self.input_schema is None or self.input_schema_digest is None:
@@ -472,6 +527,7 @@ class MCPToolBinding:
     maximum_outbound_sensitivity: ModelSensitivity
     completion_semantics: MCPCompletionSemantics
     task_support: str
+    raw_input_schema: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
         _validate_local_admission(
@@ -513,6 +569,14 @@ class MCPToolBinding:
                 self,
                 "input_schema",
                 FrozenJsonObject.from_mapping(self.input_schema),
+            )
+        if self.raw_input_schema is not None and not isinstance(
+            self.raw_input_schema, FrozenJsonObject
+        ):
+            object.__setattr__(
+                self,
+                "raw_input_schema",
+                FrozenJsonObject.from_mapping(self.raw_input_schema),
             )
         for digest in (self.input_schema_digest, self.output_schema_digest):
             if digest is not None and _SCHEMA_DIGEST.fullmatch(digest) is None:
@@ -785,6 +849,15 @@ class MCPClient(Protocol):
 
 
 @runtime_checkable
+class MCPProtocolPinnedClient(MCPClient, Protocol):
+    """Optional client extension for an already admitted protocol version."""
+
+    def bind_protocol(self, protocol_version: str) -> None:
+        """Pin once before first use; never renegotiate into another era."""
+        ...
+
+
+@runtime_checkable
 class MCPPersonalConnectionClient(MCPClient, Protocol):
     """Optional client extension for an exact host-owned personal connection."""
 
@@ -938,7 +1011,7 @@ def mcp_binding_from_inspection(
                     "observed_server_name": inspection.server_name,
                 },
             )
-    selections = tuple(selections)
+    selections = MCPToolSelection.resolve(tuple(selections), inspection, prior)
     resolved_local_label = (
         prior.local_label
         if local_label is None and prior is not None
@@ -997,7 +1070,7 @@ def mcp_binding_from_inspection(
                 executor_id=executor_id,
                 local_name=local_name,
                 remote_name=selection.remote_name,
-                description=selection.description,
+                description=cast(str, selection.description),
                 presentation=ToolPresentation(
                     toolbox_id=ToolboxId.SOURCES,
                     load_mode=ToolLoadMode.ON_DEMAND,
@@ -1007,6 +1080,7 @@ def mcp_binding_from_inspection(
                     keywords=selection.keywords,
                 ),
                 input_schema=inspected.input_schema,
+                raw_input_schema=inspected.raw_input_schema,
                 input_schema_digest=inspected.input_schema_digest,
                 output_schema=inspected.output_schema,
                 output_schema_digest=inspected.output_schema_digest,
@@ -1097,82 +1171,13 @@ def mcp_binding_drift_reason(
 def canonical_mcp_schema(
     schema: Mapping[str, object],
 ) -> tuple[FrozenJsonObject, str]:
-    from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
-    from jsonschema.exceptions import SchemaError  # type: ignore[import-untyped]
-
-    raw = FrozenJsonObject.from_mapping(schema)
-    encoded = canonical_json(raw).encode("utf-8")
-    if len(encoded) > MCP_MAX_SCHEMA_BYTES:
-        raise ValueError("schema exceeds the fixed byte bound")
-    # The selected model adapters project this deliberately small schema subset.
-    # Reject other valid JSON Schema features instead of weakening them on projection.
-    pending: list[tuple[Mapping[str, object], int, bool]] = [(raw, 1, True)]
-    nodes = 0
-    while pending:
-        node, depth, root = pending.pop()
-        nodes += 1
-        if depth > MCP_MAX_SCHEMA_DEPTH or nodes > 1024:
-            raise ValueError("schema exceeds the fixed depth or node bound")
-        unsupported = sorted(
-            set(node) - (_SCHEMA_ROOT_KEYS if root else _SCHEMA_RULE_KEYS)
-        )
-        if unsupported:
-            raise ValueError(f"unsupported schema keyword: {unsupported[0]}")
-        if root:
-            if "$schema" in node and node["$schema"] != _JSON_SCHEMA_2020_12:
-                raise ValueError("schema dialect is unsupported")
-            if node.get("type") != "object":
-                raise ValueError("schema root must have type object")
-        properties = node.get("properties", {})
-        if not isinstance(properties, Mapping) or len(properties) > 128:
-            raise ValueError("schema properties must be a bounded object")
-        for name, rule in properties.items():
-            if (
-                not isinstance(name, str)
-                or not name
-                or len(name) > 128
-                or not isinstance(rule, Mapping)
-            ):
-                raise ValueError("schema property declaration is invalid")
-            pending.append((rule, depth + 1, False))
-        items = node.get("items")
-        if items is not None:
-            if not isinstance(items, Mapping):
-                raise ValueError("schema items must be an object rule")
-            pending.append((items, depth + 1, False))
-    try:
-        Draft202012Validator.check_schema(raw.to_dict())
-    except SchemaError:
-        raise ValueError("schema is invalid") from None
-    projected = FrozenJsonObject.from_mapping(_strip_schema_annotations(raw))
-    return projected, f"sha256:{sha256(encoded).hexdigest()}"
+    return project_json_schema(schema)
 
 
-def validate_mcp_schema_value(
-    schema: FrozenJsonObject, value: Mapping[str, object]
+async def validate_mcp_schema_value(
+    schema: Mapping[str, object], value: Mapping[str, object]
 ) -> None:
-    from jsonschema import Draft202012Validator
-
-    frozen = FrozenJsonObject.from_mapping(value)
-    encoded = canonical_json(frozen).encode("utf-8")
-    if len(encoded) > MCP_MAX_REQUEST_BYTES:
-        raise ValueError("MCP schema value exceeds the fixed byte bound")
-    pending: list[tuple[object, int]] = [(frozen, 1)]
-    nodes = 0
-    while pending:
-        item, depth = pending.pop()
-        nodes += 1
-        if depth > MCP_MAX_SCHEMA_DEPTH + 8 or nodes > 4096:
-            raise ValueError("MCP schema value exceeds the fixed depth or node bound")
-        if isinstance(item, Mapping):
-            pending.extend((nested, depth + 1) for nested in item.values())
-        elif isinstance(item, (tuple, list)):
-            pending.extend((nested, depth + 1) for nested in item)
-    if (
-        next(Draft202012Validator(schema.to_dict()).iter_errors(frozen.to_dict()), None)
-        is not None
-    ):
-        raise ValueError("MCP schema value is invalid")
+    await validate_json_schema_value(schema, value)
 
 
 def _inspect_tool(value: object) -> MCPInspectedTool:
@@ -1215,7 +1220,8 @@ def _inspect_tool(value: object) -> MCPInspectedTool:
         else:
             if not isinstance(output_raw, Mapping):
                 raise ValueError("output schema must be an object")
-            output_schema, output_digest = canonical_mcp_schema(output_raw)
+            _, output_digest = canonical_mcp_schema(output_raw)
+            output_schema = FrozenJsonObject.from_mapping(output_raw)
     except (TypeError, ValueError) as error:
         return MCPInspectedTool(
             remote_name=cast(str, name),
@@ -1236,6 +1242,7 @@ def _inspect_tool(value: object) -> MCPInspectedTool:
         output_schema_digest=output_digest,
         supported=True,
         task_support=cast(str, task_support),
+        raw_input_schema=FrozenJsonObject.from_mapping(input_raw),
     )
 
 
@@ -1273,24 +1280,6 @@ def _validate_local_admission(
         and eligibility is AutomationEligibility.AUTOMATION_DIRECT
     ):
         raise ValueError("MCP unattended asynchronous completion is unsupported")
-
-
-def _strip_schema_annotations(value: Mapping[str, object]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, item in value.items():
-        if key in _SCHEMA_ANNOTATION_KEYS or key == "$schema":
-            continue
-        if key == "properties" and isinstance(item, Mapping):
-            result[key] = {
-                name: _strip_schema_annotations(rule)
-                for name, rule in item.items()
-                if isinstance(name, str) and isinstance(rule, Mapping)
-            }
-        elif key == "items" and isinstance(item, Mapping):
-            result[key] = _strip_schema_annotations(item)
-        else:
-            result[key] = item
-    return result
 
 
 def _bounded_text(value: str, label: str, *, maximum: int) -> None:
@@ -1337,6 +1326,7 @@ __all__ = [
     "MCPInspectedTool",
     "MCPProtocolError",
     "MCPPersonalConnectionClient",
+    "MCPProtocolPinnedClient",
     "MCPRemoteToolError",
     "MCPServerBinding",
     "MCPServerInspection",

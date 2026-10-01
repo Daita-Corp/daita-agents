@@ -282,6 +282,12 @@ class RegistryInitialTaskProposalResolver:
         self._per_run_max_tokens = per_run_max_tokens
         self._per_run_max_cost_usd = per_run_max_cost_usd
 
+    def bind_capability_registry(self, registry: CapabilityRegistry) -> None:
+        """Replace current admission facts under the host's system lease."""
+        if not isinstance(registry, CapabilityRegistry):
+            raise TypeError("proposal resolver requires CapabilityRegistry")
+        self._registry = registry
+
     async def __call__(
         self,
         *,
@@ -339,18 +345,22 @@ class RegistryInitialTaskProposalResolver:
             requested_constraints = requested_grant["constraints"]
             if native:
                 preview_capability_id = _native_preview_capability(capability_id)
-                validated = self._registry.validate_arguments(
+                validated = await self._registry.validate_arguments_async(
                     preview_capability_id, arguments
                 )
             else:
-                validated = self._registry.validate_arguments(capability_id, arguments)
+                validated = await self._registry.validate_arguments_async(
+                    capability_id, arguments
+                )
         else:
             if requested_grant is not None:
                 raise CapabilityInputError(
                     "graph_effect_grant_invalid",
                     "Effect-free graph work cannot retain an effect grant.",
                 )
-            validated = self._registry.validate_arguments(capability_id, arguments)
+            validated = await self._registry.validate_arguments_async(
+                capability_id, arguments
+            )
         if (
             policy is None
             or policy.admission_error(validated, ExecutionPreference.DURABLE)
@@ -456,6 +466,12 @@ class GraphAdmissionBuilder:
         self._clock = clock
         self._id_factory = id_factory
         self._grant_preparer: GraphGrantPreparer | None = None
+
+    def bind_capability_registry(self, registry: CapabilityRegistry) -> None:
+        """Replace current admission facts under the host's system lease."""
+        if not isinstance(registry, CapabilityRegistry):
+            raise TypeError("graph admission requires CapabilityRegistry")
+        self._registry = registry
 
     def bind_grant_preparer(self, preparer: GraphGrantPreparer) -> None:
         if self._grant_preparer is not None:

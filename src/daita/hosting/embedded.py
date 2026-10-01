@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Self, TypedDict, TypeVar, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
-    from ..adapters.mcp import MCPServerBinding
+    from ..adapters.mcp import MCPServerBinding, MCPToolBinding
 
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.local_workspace import LocalWorkspaceBackend
@@ -138,7 +138,11 @@ from ..domains.data.sql import (
     validate_relational_write_scope,
 )
 from ..domains.learning import LearningCandidateGuard
-from ..domains.mcp import MCPActivatedBinding, activate_mcp_domain
+from ..domains.mcp import (
+    MCP_DOMAIN_OWNER_ID,
+    MCPActivatedBinding,
+    activate_mcp_domain,
+)
 from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
 from ..jobs.capabilities import (
@@ -207,6 +211,7 @@ from ..llm.provider_definitions import (
     AuthenticationMode,
     admit_model_selection,
     provider_definition,
+    tool_schema_incompatibility,
 )
 from ..llm.routing import (
     AdmittedModelProvider,
@@ -793,6 +798,10 @@ class EmbeddedAgent:
         mcp_client_factory: MCPClientFactory,
         mcp_connection_provider: MCPConnectionProvider | None,
         mcp_activated_bindings: tuple[MCPActivatedBinding, ...],
+        stage_mcp_catalog: Callable[
+            [tuple[MCPServerBinding, ...], tuple[MCPActivatedBinding, ...]],
+            Awaitable[tuple[tuple[MCPActivatedBinding, ...], Callable[[], None]]],
+        ],
         hosted: bool,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
@@ -812,10 +821,12 @@ class EmbeddedAgent:
         self._model_validator = model_validator
         self._mcp_client_factory = mcp_client_factory
         self._mcp_connection_provider = mcp_connection_provider
+        self._stage_mcp_catalog = stage_mcp_catalog
         self._hosted = hosted
         self._mcp_activated_bindings = {
             item.binding.binding_id: item for item in mcp_activated_bindings
         }
+        self._retired_mcp_bindings: list[MCPActivatedBinding] = []
         self._writer_lock = writer_lock
         self._store = store
         self._distribution_owner = distribution_owner
@@ -972,6 +983,7 @@ class EmbeddedAgent:
                 (
                     identity,
                     source_reference_values,
+                    mcp_reference_values,
                 ) = await store.load_deletion_credential_inventory(manifest.id)
             except (OSError, sqlite3.Error, TypeError, ValueError) as error:
                 raise AgentHomeError(
@@ -989,6 +1001,7 @@ class EmbeddedAgent:
                 identity.id,
                 model_document=model_document,
                 source_reference_values=source_reference_values,
+                mcp_reference_values=mcp_reference_values,
             )
             failures = 0
             for reference in references:
@@ -1725,6 +1738,11 @@ class EmbeddedAgent:
             secrets=secret_provider,
             connection_provider=mcp_connection_provider,
             clock=clock,
+            model_ids=(
+                tuple(candidate.provider_id for candidate in model_route.candidates)
+                if model_route is not None
+                else (() if model_profile is None else (model_profile.id,))
+            ),
         )
         base_domains = (
             data_domain,
@@ -1828,6 +1846,7 @@ class EmbeddedAgent:
         )
         graph_routes = _stage_c_model_routes(model, model_route)
         graph_builder: GraphAdmissionBuilder | None = None
+        graph_resolver: RegistryInitialTaskProposalResolver | None = None
         if graph_routes and limits.max_estimated_cost_usd is not None:
             graph_prerequisite_registry = CapabilityRegistry(
                 declarations=tuple(domain.declarations for domain in domains),
@@ -1924,6 +1943,68 @@ class EmbeddedAgent:
             graph_builder.bind_grant_preparer(
                 capability_runtime.prepare_automation_grant
             )
+        native_domains = tuple(
+            domain
+            for domain in domains
+            if domain.domain_owner_id != MCP_DOMAIN_OWNER_ID
+        )
+        initial_mcp_executor_ids = {item.executor_id for item in mcp_executors}
+        native_executors = tuple(
+            executor
+            for executor in registered_executors
+            if executor.executor_id not in initial_mcp_executor_ids
+        )
+
+        async def stage_mcp_catalog(
+            bindings: tuple[MCPServerBinding, ...],
+            existing: tuple[MCPActivatedBinding, ...],
+        ) -> tuple[tuple[MCPActivatedBinding, ...], Callable[[], None]]:
+            """Stage without I/O, then publish synchronously under system admission."""
+            next_domain, next_bindings, next_executors = await activate_mcp_domain(
+                agent_id=identity.id,
+                store=store,
+                client_factory=resolved_mcp_client_factory,
+                secrets=secret_provider,
+                connection_provider=mcp_connection_provider,
+                clock=clock,
+                bindings=bindings,
+                existing=existing,
+                model_ids=(
+                    tuple(candidate.provider_id for candidate in model_route.candidates)
+                    if model_route is not None
+                    else (() if model_profile is None else (model_profile.id,))
+                ),
+            )
+            next_domains = (
+                *native_domains,
+                *((next_domain,) if next_domain is not None else ()),
+            )
+            next_registry = CapabilityRegistry(
+                declarations=tuple(domain.declarations for domain in next_domains),
+                executors=(*native_executors, *next_executors),
+            )
+            capability_runtime._catalog_owners(next_registry, next_domains)
+
+            def publish() -> None:
+                nonlocal capabilities
+                # No await: every reader switches before another task can run.
+                capability_runtime._replace_catalog(next_registry, next_domains)
+                data_domain.bind_capability_registry(next_registry)
+                if artifact_domain is not None:
+                    artifact_domain.bind_capability_registry(next_registry)
+                routine_owner.bind_capability_registry(next_registry)
+                if graph_resolver is not None:
+                    graph_resolver.bind_capability_registry(next_registry)
+                if graph_builder is not None:
+                    graph_builder.bind_capability_registry(next_registry)
+                capabilities = next_registry
+                embedded._capabilities = next_registry
+                embedded._mcp_activated_bindings = {
+                    item.binding.binding_id: item for item in next_bindings
+                }
+
+            return next_bindings, publish
+
         resolved_context = context_builder
         resolved_tools = tools
         if model is not None and resolved_context is None:
@@ -2137,6 +2218,7 @@ class EmbeddedAgent:
             mcp_client_factory=resolved_mcp_client_factory,
             mcp_connection_provider=mcp_connection_provider,
             mcp_activated_bindings=mcp_activated_bindings,
+            stage_mcp_catalog=stage_mcp_catalog,
             hosted=hosted,
             clock=clock,
             id_factory=id_factory,
@@ -2447,6 +2529,8 @@ class EmbeddedAgent:
             prior_messages = _project_completed_history(
                 conversation,
                 older_history_exists=older_history_exists,
+                capabilities=self._capabilities,
+                mcp_tool_contract=self._read_mcp_tool_contract,
             )
             run_input = RunInput(
                 id=resolved_run_id,
@@ -3730,6 +3814,63 @@ class EmbeddedAgent:
         self._require_open()
         return await self._skill_store.delete_skill(name)
 
+    def _read_mcp_tool_contract(
+        self, capability_id: str
+    ) -> tuple[MCPServerBinding, MCPToolBinding] | None:
+        """Inspect currently activated immutable MCP contracts without I/O."""
+
+        for activated in self._mcp_activated_bindings.values():
+            binding = activated.binding
+            for tool in binding.tools:
+                if tool.capability_id == capability_id:
+                    return binding, tool
+        return None
+
+    async def store_mcp_bearer(self, credential: str) -> SecretReference:
+        """Store a masked local setup credential under this agent's ownership."""
+        if self._hosted:
+            raise AgentHomeError("hosted MCP credentials require secret references")
+        if (
+            not isinstance(credential, str)
+            or not credential
+            or len(credential.encode()) > 64 * 1024
+        ):
+            raise ValueError("MCP credential must be non-empty and at most 64 KiB")
+        async with self._credential_management_lock:
+            self._require_open()
+            reference = SecretReference.keychain(
+                _credential_account(
+                    self.identity.id, "mcp", self._id_factory("credential")
+                )
+            )
+            try:
+                await self._keychain.set(reference, credential)
+            except BaseException:
+                await self._keychain.delete(reference)
+                raise
+            finally:
+                credential = ""
+            return reference
+
+    async def delete_mcp_bearer(self, reference: SecretReference) -> None:
+        """Remove an unused credential created for this agent's local setup."""
+        if not isinstance(
+            reference, SecretReference
+        ) or not _credential_reference_is_owned(
+            reference, agent_id=self.identity.id, provider="mcp"
+        ):
+            raise ValueError("credential does not belong to this agent's MCP setup")
+        async with self._admit_owned_system_work(
+            "mcp-credential-delete", self._credential_management_lock
+        ):
+            if any(
+                item.authentication.secret_reference == reference
+                for item in await self._store.list_mcp_bindings(self.identity.id)
+            ):
+                raise ValueError("credential is retained by an MCP binding")
+            self._require_open()
+            await self._keychain.delete(reference)
+
     async def inspect_mcp_server(
         self,
         *,
@@ -3739,7 +3880,7 @@ class EmbeddedAgent:
     ) -> MCPServerInspection:
         """Inspect one exact endpoint without persisting execution authority."""
 
-        async with self._mcp_commit_lock:
+        async with self._admit_system_work("mcp-inspect"):
             self._require_open()
             if (
                 self._hosted
@@ -3768,8 +3909,7 @@ class EmbeddedAgent:
         binding_id: str | None = None,
         caller_principal_id: str | None = None,
     ) -> MCPBindingStatus:
-        """Persist exact local MCP admission for the next immutable composition."""
-        """Persist one exact binding; declarations activate only after reopen."""
+        """Inspect, admit and activate exact tools before the next run."""
 
         if not isinstance(maximum_outbound_sensitivity, ModelSensitivity):
             raise TypeError("maximum_outbound_sensitivity is invalid")
@@ -3795,28 +3935,25 @@ class EmbeddedAgent:
                 self._require_mcp_management_owner(
                     current, principal_id, caller_principal_id
                 )
-                inspection = await self._inspect_mcp_endpoint(
-                    endpoint=endpoint,
-                    authentication=resolved_authentication,
-                    principal_id=principal_id,
-                )
-                binding = mcp_binding_from_inspection(
-                    binding_id=resolved_binding_id,
-                    agent_id=self.identity.id,
-                    authentication=resolved_authentication,
-                    maximum_outbound_sensitivity=maximum_outbound_sensitivity,
-                    selections=tuple(selections),
-                    inspection=inspection,
-                    local_label=local_label,
-                    prior=current,
-                    owner_principal_id=principal_id,
-                )
-                stored = await self._store.store_mcp_binding(
-                    binding,
-                    expected_revision=(None if current is None else current.revision),
-                )
-                await self._deactivate_mcp_binding(stored.binding_id)
-                return MCPBindingStatus(stored, None)
+            inspection = await self._inspect_mcp_endpoint(
+                endpoint=endpoint,
+                authentication=resolved_authentication,
+                principal_id=principal_id,
+            )
+            binding = mcp_binding_from_inspection(
+                binding_id=resolved_binding_id,
+                agent_id=self.identity.id,
+                authentication=resolved_authentication,
+                maximum_outbound_sensitivity=maximum_outbound_sensitivity,
+                selections=tuple(selections),
+                inspection=inspection,
+                local_label=local_label,
+                prior=current,
+                owner_principal_id=principal_id,
+            )
+            return await self._publish_mcp_binding(
+                binding, expected_revision=None if current is None else current.revision
+            )
 
     async def update_mcp_discovery(
         self,
@@ -3839,13 +3976,16 @@ class EmbeddedAgent:
                 self._require_mcp_management_owner(
                     current, principal_id, caller_principal_id
                 )
-                return await self._store.update_mcp_discovery(
-                    self.identity.id,
-                    binding_id,
-                    summary=summary,
-                    when_to_use=when_to_use,
-                    keywords=keywords,
+                if current is None:
+                    raise ValueError("MCP binding does not exist")
+                updated = replace(
+                    current, summary=summary, when_to_use=when_to_use, keywords=keywords
                 )
+            return (
+                await self._publish_mcp_binding(
+                    updated, expected_revision=current.revision, discovery_only=True
+                )
+            ).binding
 
     async def update_source_discovery(
         self,
@@ -3894,7 +4034,7 @@ class EmbeddedAgent:
     async def refresh_mcp_server(
         self, binding_id: str, *, caller_principal_id: str | None = None
     ) -> MCPBindingStatus:
-        """Check exact remote drift and require reopen for any refreshed revision."""
+        """Check exact remote drift and publish the checked catalog between runs."""
 
         async with self._admit_owned_system_work(
             "mcp-refresh", self._mcp_management_lock
@@ -3915,21 +4055,18 @@ class EmbeddedAgent:
                     raise ValueError(
                         "revoked MCP binding must be explicitly reattached"
                     )
-                inspection = await self._inspect_mcp_endpoint(
-                    endpoint=current.endpoint,
-                    authentication=current.authentication,
-                    principal_id=principal_id,
-                )
-                refreshed = current.checked(
-                    observed_at=inspection.observed_at,
-                    stale_reason=mcp_binding_drift_reason(current, inspection),
-                )
-                stored = await self._store.store_mcp_binding(
-                    refreshed,
-                    expected_revision=current.revision,
-                )
-                await self._deactivate_mcp_binding(stored.binding_id)
-                return MCPBindingStatus(stored, None)
+            inspection = await self._inspect_mcp_endpoint(
+                endpoint=current.endpoint,
+                authentication=current.authentication,
+                principal_id=principal_id,
+            )
+            refreshed = current.checked(
+                observed_at=inspection.observed_at,
+                stale_reason=mcp_binding_drift_reason(current, inspection),
+            )
+            return await self._publish_mcp_binding(
+                refreshed, expected_revision=current.revision
+            )
 
     async def revoke_mcp_server(
         self, binding_id: str, *, caller_principal_id: str | None = None
@@ -4010,7 +4147,32 @@ class EmbeddedAgent:
                 client.bind_personal_connection(
                     self._mcp_connection_provider, principal_id
                 )
-            return await client.inspect(observed_at=self._clock())
+            inspection = await client.inspect(observed_at=self._clock())
+            model_ids = (
+                tuple(
+                    candidate.provider_id for candidate in self.model_route.candidates
+                )
+                if self.model_route is not None
+                else (() if self.model_profile is None else (self.model_profile.id,))
+            )
+            return replace(
+                inspection,
+                tools=tuple(
+                    (
+                        replace(tool, supported=False, unsupported_reason=reason)
+                        if tool.supported
+                        and tool.input_schema is not None
+                        and (
+                            reason := tool_schema_incompatibility(
+                                tool.input_schema, model_ids
+                            )
+                        )
+                        is not None
+                        else tool
+                    )
+                    for tool in inspection.tools
+                ),
+            )
         finally:
             await client.close()
 
@@ -4037,10 +4199,54 @@ class EmbeddedAgent:
         ):
             raise ValueError("MCP binding does not exist")
 
-    async def _deactivate_mcp_binding(self, binding_id: str) -> None:
-        activated = self._mcp_activated_bindings.pop(binding_id, None)
-        if activated is not None:
-            await activated.executor.close()
+    async def _publish_mcp_binding(
+        self,
+        binding: MCPServerBinding,
+        *,
+        expected_revision: int | None,
+        discovery_only: bool = False,
+    ) -> MCPBindingStatus:
+        """Stage first, CAS persistence, then switch every catalog reader together."""
+        async with self._mcp_commit_lock:
+            self._require_open()
+            bindings = await self._store.list_mcp_bindings(self.identity.id)
+            next_bindings = tuple(
+                item for item in bindings if item.binding_id != binding.binding_id
+            ) + (binding,)
+            previous = tuple(self._mcp_activated_bindings.values())
+            activated, publish = await self._stage_mcp_catalog(next_bindings, previous)
+            retired = [item for item in previous if item not in activated]
+            if discovery_only:
+                current = next(
+                    (
+                        item
+                        for item in bindings
+                        if item.binding_id == binding.binding_id
+                    ),
+                    None,
+                )
+                if current is None or current.revision != expected_revision:
+                    raise ValueError("MCP binding revision precondition failed")
+                stored = await self._store.update_mcp_discovery(
+                    self.identity.id,
+                    binding.binding_id,
+                    summary=binding.summary,
+                    when_to_use=binding.when_to_use,
+                    keywords=binding.keywords,
+                )
+            else:
+                stored = await self._store.store_mcp_binding(
+                    binding, expected_revision=expected_revision
+                )
+            self._retired_mcp_bindings.extend(retired)
+            publish()
+        for item in retired:
+            await item.executor.close()
+            self._retired_mcp_bindings.remove(item)
+        return MCPBindingStatus(
+            stored,
+            stored.revision if stored.state is MCPBindingState.ACTIVE else None,
+        )
 
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._attach_source(source, attached_at=self._clock())
@@ -5132,8 +5338,12 @@ class EmbeddedAgent:
         except BaseException as error:
             if first_error is None:
                 first_error = error
-        activated_bindings = tuple(self._mcp_activated_bindings.values())
+        activated_bindings = (
+            *self._mcp_activated_bindings.values(),
+            *self._retired_mcp_bindings,
+        )
         self._mcp_activated_bindings.clear()
+        self._retired_mcp_bindings.clear()
         for activated in activated_bindings:
             try:
                 await activated.executor.close()
@@ -5668,6 +5878,7 @@ def _owned_agent_credential_references(
     *,
     model_document: object | None,
     source_reference_values: tuple[str, ...],
+    mcp_reference_values: tuple[str, ...] = (),
 ) -> tuple[SecretReference, ...]:
     references: dict[str, SecretReference] = {}
     if model_document is not None:
@@ -5717,6 +5928,10 @@ def _owned_agent_credential_references(
             agent_id=agent_id,
             provider="postgresql",
         ):
+            references[reference.to_uri()] = reference
+    for reference_value in mcp_reference_values:
+        reference = SecretReference.parse(reference_value)
+        if _credential_reference_is_owned(reference, agent_id=agent_id, provider="mcp"):
             references[reference.to_uri()] = reference
     return tuple(references[key] for key in sorted(references))
 
