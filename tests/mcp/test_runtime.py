@@ -10,7 +10,7 @@ from hashlib import sha256
 
 import httpx2 as httpx
 import pytest
-from textual.widgets import Button, Input, OptionList, Select, Static
+from textual.widgets import Input, OptionList, Select, Static
 
 from daita import (
     Agent,

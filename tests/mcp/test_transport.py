@@ -411,14 +411,14 @@ async def test_default_credential_session_resolves_rotated_bearer_per_request(
         value = "old-bearer"
         reads = 0
 
-        def get_password(self, service, name):
+        def get_password(self, service_name: str, username: str) -> str:
             self.reads += 1
             return self.value
 
-        def set_password(self, service, name, password):
+        def set_password(self, service_name: str, username: str, password: str) -> None:
             raise AssertionError("MCP must not write credentials")
 
-        def delete_password(self, service, name):
+        def delete_password(self, service_name: str, username: str) -> None:
             raise AssertionError("MCP must not delete credentials")
 
     keyring = Keyring()

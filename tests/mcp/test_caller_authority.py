@@ -29,6 +29,7 @@ from daita.adapters.mcp import (
 )
 from daita.capabilities import (
     AccessMode,
+    ApprovalRequest,
     CapabilityInputError,
     ExecutionContractBindings,
     ExecutionScope,
@@ -564,11 +565,7 @@ async def test_personal_binding_isolated_across_projection_dispatch_management_a
                 ToolCall(id="forged", name=name, arguments={"query": "x"}),
                 capability,
                 FrozenJsonObject.from_mapping({"query": "x"}),
-                request_sensitivity=(
-                    capability.result_sensitivity
-                    if hasattr(capability, "result_sensitivity")
-                    else binding.tools[0].result_sensitivity
-                ),
+                request_sensitivity=binding.tools[0].result_sensitivity,
             )
         assert denied.value.code == "needs_authorization"
 
@@ -784,7 +781,7 @@ async def test_personal_action_receipt_never_contains_token_or_replays(
             http_transport=httpx.MockTransport(ResponseLoss())
         )
 
-    async def approve(_request):
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
         return ApprovalDecision.APPROVE
 
     model = ToolboxAwareMockModelProvider(

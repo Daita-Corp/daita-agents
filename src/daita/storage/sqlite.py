@@ -1262,13 +1262,12 @@ class SQLiteStateStore:
                 )
                 if reference is not None:
                     references.append(reference)
-            mcp_references = tuple(
-                reference
-                for (data,) in mcp_rows
-                if (reference := decode_mcp_credential_reference_for_deletion(data))
-                is not None
-            )
-            return identity, tuple(references), mcp_references
+            mcp_references: list[str] = []
+            for (data,) in mcp_rows:
+                reference = decode_mcp_credential_reference_for_deletion(data)
+                if reference is not None:
+                    mcp_references.append(reference)
+            return identity, tuple(references), tuple(mcp_references)
 
         return await asyncio.to_thread(read)
 

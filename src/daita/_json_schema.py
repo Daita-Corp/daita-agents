@@ -272,6 +272,7 @@ async def _worker(request: Mapping[str, object]) -> object:
     try:
         async with asyncio.timeout(VALIDATION_TIMEOUT_SECONDS):
             process = await asyncio.shield(start)
+            assert process is not None
             stdout, _ = await process.communicate(payload)
             if process.returncode != 0 or len(stdout) > 2048:
                 raise ValueError("JSON Schema validation worker failed")
@@ -284,6 +285,7 @@ async def _worker(request: Mapping[str, object]) -> object:
         # Even cancellation during spawn must acquire, kill and reap the child.
         if process is None:
             process = await asyncio.shield(start)
+        assert process is not None
         if process.returncode is None:
             try:
                 process.kill()

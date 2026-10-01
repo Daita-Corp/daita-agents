@@ -28,7 +28,7 @@ from ..capabilities import (
 )
 from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
-from ..security import SecretProvider, SecretReference, SecretResolutionError
+from ..security import SecretProvider, SecretReference
 
 MCP_SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18")
 MCP_MAX_SCHEMA_BYTES = 64 * 1_024

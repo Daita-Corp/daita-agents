@@ -180,14 +180,14 @@ async def test_injected_factory_owns_fresh_inspection_and_persistent_binding_cli
             "alice-connection", "alice", ENDPOINT, ("read:records",)
         ),
     }[mode]
-    options: ClientOptions = dict(
-        root=tmp_path,
-        hosted=True,
-        clock=lambda: NOW,
-        secret_provider=secrets,
-        mcp_client_factory=factory,
-        mcp_connection_provider=connections,
-    )
+    options: ClientOptions = {
+        "root": tmp_path,
+        "hosted": True,
+        "clock": lambda: NOW,
+        "secret_provider": secrets,
+        "mcp_client_factory": factory,
+        "mcp_connection_provider": connections,
+    }
     agent = await Agent.create("injected-mcp", **options)
     try:
         assert recording.clients == []
@@ -273,14 +273,14 @@ async def test_personal_client_binding_failure_closes_before_inspection_or_dispa
     authentication = MCPAuthentication.personal_connection(
         "alice-connection", "alice", ENDPOINT, ("read:records",)
     )
-    options: ClientOptions = dict(
-        root=tmp_path,
-        hosted=True,
-        clock=lambda: NOW,
-        secret_provider=EmptySecretProvider(),
-        mcp_client_factory=factory,
-        mcp_connection_provider=connections,
-    )
+    options: ClientOptions = {
+        "root": tmp_path,
+        "hosted": True,
+        "clock": lambda: NOW,
+        "secret_provider": EmptySecretProvider(),
+        "mcp_client_factory": factory,
+        "mcp_connection_provider": connections,
+    }
     agent = await Agent.create("rejected-client", **options)
     if stage == "execution":
         try:

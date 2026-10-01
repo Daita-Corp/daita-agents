@@ -16,6 +16,7 @@ from daita.adapters.mcp_sdk import SDKMCPClient
 from daita.capabilities import (
     MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS,
     MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS,
+    ApprovalRequest,
 )
 from daita.llm.models import (
     CostEstimate,
@@ -397,7 +398,7 @@ async def test_owned_mcp_credentials_cleanup_preserves_shared_secrets(tmp_path):
 async def test_graph_admission_sees_new_binding_and_retains_frozen_origin(tmp_path):
     from decimal import Decimal
 
-    async def approve(_request):
+    async def approve(request: ApprovalRequest) -> ApprovalDecision:
         return ApprovalDecision.APPROVE
 
     alpha, _ = conformance_identities()
