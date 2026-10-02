@@ -30,6 +30,7 @@ from daita.distribution import (
     conversation_inbox_destination_id,
 )
 from daita.distribution.models import EffectRequirement
+from daita.identity import AgentIdentity
 from daita.llm.models import (
     FinishReason,
     ModelRequest,
@@ -236,10 +237,14 @@ async def _assignment(
     document_domain = StaticTestDomain(
         (document,), (document_view,), domain_owner_id="artifact"
     )
+    if await store.load_identity() is None:
+        await store.initialize_identity(
+            AgentIdentity("agent-effect", "effect-test", clock())
+        )
     artifacts = await AgentHomeArtifactStore.open(
         agent_id="agent-effect",
         agent_home=tmp_path,
-        references=store,
+        registry=store,
         clock=clock,
     )
     usage = ModelUsage(cost_estimate=CostEstimate.complete(Decimal("0")))

@@ -848,6 +848,19 @@ class Agent:
             artifact_id, caller_principal_id=caller_principal_id
         )
 
+    async def delete_artifact(
+        self, artifact_id: str, *, caller_principal_id: str | None = None
+    ) -> bool:
+        """Delete active home bytes; return whether this call first marked deletion.
+
+        Repeated calls finish incomplete cleanup. Historical evidence and copies
+        already exported outside this home are retained.
+        """
+        _validate_artifact_id(artifact_id)
+        return await self._embedded.delete_artifact(
+            artifact_id, caller_principal_id=caller_principal_id
+        )
+
     async def save_artifact(
         self,
         artifact_id: str,

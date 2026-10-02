@@ -107,6 +107,34 @@ estimated cost cap per agent run in both evaluation profiles. Configure it with
 `DAITA_PHASE_F_LIVE_MAX_COST_USD`; it must remain finite and positive. These
 suites use real model providers with simulated MCP servers.
 
+### Real-model artifact lifecycle
+
+`tests/live/artifacts/test_lifecycle.py` exercises three real `Agent.run` interactions:
+creating a TXT artifact and a retained control, reading and saving the first after
+reopening, and verifying its absence through model tools after owner deletion and
+another reopen. It checks exact bytes, hashes, filesystem storage, preserved
+transcripts, retained exported copies, the unaffected control, and removal of the
+deleted registry row. Deletion uses the public typed owner API because model tools
+do not grant deletion authority. Failure injection and crash timing remain in
+`tests/artifacts/test_deletion.py`.
+
+Run only after explicit live-model authorization:
+
+```bash
+DAITA_RUN_LIVE_ARTIFACT_LIFECYCLE=1 \
+DAITA_ARTIFACT_LIVE_MODEL_ID=openai:gpt-5.6-terra \
+DAITA_ARTIFACT_LIVE_MAX_COST_USD=0.15 \
+.venv/bin/python -m pytest tests/live/artifacts/test_lifecycle.py \
+  -o addopts="--tb=short -q --strict-markers" \
+  --junitxml=/private/tmp/daita-artifact-lifecycle.xml
+```
+
+Set `DAITA_ARTIFACT_LIVE_LLM_API_KEY` or the selected provider's ordinary environment
+key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, or `XAI_API_KEY`). The
+default is one reviewed OpenAI model, with a $0.15 estimated-cost ceiling per run
+and at most $0.45 across the three interactions. Temporary exports stay inside the
+test's private directory. Collection does not contact a model or resolve credentials.
+
 ### Real remote MCP reads
 
 `tests/live/mcp/test_interoperability.py` uses the production SDK transport against

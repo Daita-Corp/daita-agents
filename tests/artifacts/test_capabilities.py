@@ -15,6 +15,7 @@ import pytest
 import daita.domains.data.controller as data_controller
 from daita import Agent, ApprovalDecision, ApprovalRequest, ArtifactError
 from daita._json import FrozenJsonObject
+from daita.artifacts.models import ArtifactRef
 from daita.capabilities import AccessMode, AutomationEligibility, OperationalEffect
 from daita.context import AgentContextBuilder
 from daita.domains.data.export_capabilities import (
@@ -497,7 +498,7 @@ async def test_result_snapshot_obeys_the_existing_artifact_quota(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import daita.artifacts.store as artifact_store_module
+    import daita.storage.sqlite as artifact_store_module
 
     monkeypatch.setattr(artifact_store_module, "MAX_ARTIFACTS_PER_RUN", 1)
     provider = MockModelProvider(
@@ -553,7 +554,7 @@ async def test_result_snapshot_cancellation_cannot_publish_a_partial_artifact(
     original_commit = store._commit_sync
 
     def blocked_snapshot_commit(*args: object, **kwargs: object):
-        capability_id = args[5]
+        capability_id = cast(ArtifactRef, args[1]).capability_id
         if capability_id == RESULT_SNAPSHOT_CAPABILITY_ID:
             entered.set()
             release.wait(timeout=5)

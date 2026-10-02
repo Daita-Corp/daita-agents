@@ -351,7 +351,8 @@ async def test_hosted_personal_connection_requires_explicit_actor_even_for_agent
         await reopened.close()
 
 
-async def test_hosted_artifact_read_and_save_follow_run_caller(tmp_path):
+@pytest.mark.parametrize("caller", [None, "alice"])
+async def test_hosted_artifact_read_save_and_delete_follow_run_caller(tmp_path, caller):
     downloads = tmp_path / "downloads"
     downloads.mkdir()
     model = ToolboxAwareMockModelProvider(
@@ -382,17 +383,34 @@ async def test_hosted_artifact_read_and_save_follow_run_caller(tmp_path):
         downloads_directory=downloads,
     )
     try:
-        result = await agent.run("Create a text artifact.", caller_principal_id="alice")
+        result = await agent.run("Create a text artifact.", caller_principal_id=caller)
         artifact_id = result.artifacts[0].artifact_id
         with pytest.raises(ValueError, match="unavailable to this caller"):
             await agent.read_artifact(artifact_id, caller_principal_id="bob")
         with pytest.raises(ValueError, match="unavailable to this caller"):
             await agent.save_artifact(artifact_id, caller_principal_id="bob")
+        with pytest.raises(ValueError, match="unavailable to this caller"):
+            await agent.delete_artifact(artifact_id, caller_principal_id="bob")
         assert (
-            await agent.read_artifact(artifact_id, caller_principal_id="alice")
+            await agent.read_artifact(artifact_id, caller_principal_id=caller)
         ).content == b"Alice owns this artifact."
+        assert await agent.delete_artifact(artifact_id, caller_principal_id=caller)
+        # Once physically deleted there is no owner metadata to disclose or retain.
+        assert (
+            await agent.delete_artifact(artifact_id, caller_principal_id="bob") is False
+        )
     finally:
         await agent.close()
+    reopened = await Agent.open("hosted-artifact", root=tmp_path, hosted=True)
+    try:
+        assert not await reopened.delete_artifact(
+            artifact_id, caller_principal_id="bob"
+        )
+        assert not await reopened.delete_artifact(
+            artifact_id, caller_principal_id=caller
+        )
+    finally:
+        await reopened.close()
 
 
 async def test_personal_token_cannot_be_sent_to_another_endpoint_origin(tmp_path):

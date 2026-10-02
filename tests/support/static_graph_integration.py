@@ -32,6 +32,7 @@ from daita.domains.data.results import project_result_rows
 from daita.domains.data.sql import ResourceSchema
 from daita.domains.learning import LearningCandidateGuard
 from daita.hosting.execution_governor import RunAdmissionCoordinator
+from daita.identity import AgentIdentity
 from daita.jobs.graph.models import GraphAdmission, GraphInspection, GraphState
 from daita.jobs.owner import JobOwner
 from daita.jobs.supervisor import JobSupervisor
@@ -240,10 +241,14 @@ class StaticGraphIntegration:
             root / "state.sqlite",
             clock=resolved_clock,
         )
+        if await store.load_identity() is None:
+            await store.initialize_identity(
+                AgentIdentity(AGENT_ID, "graph-test", resolved_clock())
+            )
         artifacts = await AgentHomeArtifactStore.open(
             agent_id=AGENT_ID,
             agent_home=root,
-            references=store,
+            registry=store,
             clock=resolved_clock,
             id_factory=ids,
         )

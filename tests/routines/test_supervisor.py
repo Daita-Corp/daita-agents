@@ -18,6 +18,7 @@ from daita.capability_runtime import (
     InternalCapabilityRequest,
 )
 from daita.distribution import DistributionOwner, OutcomeState
+from daita.identity import AgentIdentity
 from daita.llm.models import (
     CanonicalMessage,
     MessageRole,
@@ -164,6 +165,8 @@ def _routine(
 
 
 async def _seed_conversation(store: SQLiteStateStore) -> None:
+    if await store.load_identity() is None:
+        await store.initialize_identity(AgentIdentity("agent-1", "routine-test", NOW))
     run = RunInput(
         id="run-foreground",
         agent_id="agent-1",
@@ -224,7 +227,7 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
     artifacts = await AgentHomeArtifactStore.open(
         agent_id="agent-1",
         agent_home=tmp_path,
-        references=store,
+        registry=store,
     )
     executed = 0
 
@@ -333,7 +336,7 @@ async def test_supervisor_retries_pending_finalization_after_capacity_is_freed(
     artifacts = await AgentHomeArtifactStore.open(
         agent_id="agent-1",
         agent_home=tmp_path,
-        references=store,
+        registry=store,
     )
 
     async def execute(
@@ -479,7 +482,7 @@ async def test_unchanged_precheck_advances_with_zero_model_runs(tmp_path) -> Non
     artifacts = await AgentHomeArtifactStore.open(
         agent_id="agent-1",
         agent_home=tmp_path,
-        references=store,
+        registry=store,
     )
     model_calls = 0
 
@@ -576,7 +579,7 @@ async def test_recovery_finishes_exhausted_or_unstarted_occurrence_without_repla
         )
     )
     artifacts = await AgentHomeArtifactStore.open(
-        agent_id="agent-1", agent_home=tmp_path, references=store
+        agent_id="agent-1", agent_home=tmp_path, registry=store
     )
     now = NOW
     executed = 0

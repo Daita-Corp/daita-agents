@@ -31,6 +31,7 @@ from daita.capabilities import (
 from daita.capability_runtime import CapabilityRuntime
 from daita.distribution.owner import DistributionOwner
 from daita.hosting.execution_governor import RunAdmissionCoordinator
+from daita.identity import AgentIdentity
 from daita.jobs.graph.admission import GraphAdmissionBuilder, InitialTaskProposal
 from daita.jobs.graph.capabilities import (
     GRAPH_TASK_DOMAIN_OWNER_ID,
@@ -185,10 +186,14 @@ class ModelGraphIntegration:
         resolved_clock = clock or (lambda: datetime.now(UTC))
         ids = DeterministicIds(namespace)
         store = await SQLiteStateStore.open(root / "state.sqlite", clock=resolved_clock)
+        if await store.load_identity() is None:
+            await store.initialize_identity(
+                AgentIdentity(AGENT_ID, "graph-test", resolved_clock())
+            )
         artifacts = await AgentHomeArtifactStore.open(
             agent_id=AGENT_ID,
             agent_home=root,
-            references=store,
+            registry=store,
             clock=resolved_clock,
             id_factory=ids,
         )

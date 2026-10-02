@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -17,7 +18,9 @@ from daita.artifacts.models import (
     ArtifactDraft,
     ArtifactError,
     ArtifactProvenance,
+    ArtifactRecord,
     ArtifactRef,
+    ArtifactState,
     artifact_ref_from_mapping,
     artifact_ref_to_mapping,
 )
@@ -26,7 +29,6 @@ from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import ArtifactPolicy, Capability, ToolOutput
 from daita.capability_runtime import CapabilityRuntime
 from daita.catalog.models import Sensitivity
-from daita.distribution import OutcomeArtifactReference
 from daita.domains.data.export_capabilities import _resolved_sensitivity
 from daita.domains.data.file_capabilities import LocalFileReadExecutor
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
@@ -52,9 +54,39 @@ RUN_ID = "run-00000000000000000000000000000001"
 CONVERSATION_ID = "conversation-00000000000000000000000000000001"
 
 
-class _References:
-    def __init__(self, refs: tuple[ArtifactRef, ...] = ()) -> None:
-        self.refs = refs
+class _Registry:
+    def __init__(self) -> None:
+        self.records: dict[str, ArtifactRecord] = {}
+
+    @property
+    def refs(self) -> tuple[ArtifactRef, ...]:
+        return tuple(
+            record.ref
+            for record in self.records.values()
+            if record.state is ArtifactState.READY
+        )
+
+    async def get_artifact_record(self, artifact_id: str) -> ArtifactRecord | None:
+        return self.records.get(artifact_id)
+
+    async def list_artifact_records(
+        self,
+        agent_id: str,
+        *,
+        state: ArtifactState | None = None,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[ArtifactRecord, ...]:
+        return tuple(
+            record
+            for record in self.records.values()
+            if record.agent_id == agent_id
+            and (state is None or record.state is state)
+            and (run_id is None or record.ref.run_id == run_id)
+            and (
+                conversation_id is None or record.ref.conversation_id == conversation_id
+            )
+        )
 
     async def list_artifact_refs(
         self,
@@ -63,23 +95,39 @@ class _References:
         run_id: str | None = None,
         conversation_id: str | None = None,
     ) -> tuple[ArtifactRef, ...]:
-        del agent_id
         return tuple(
-            item
-            for item in self.refs
-            if (run_id is None or item.run_id == run_id)
-            and (conversation_id is None or item.conversation_id == conversation_id)
+            record.ref
+            for record in await self.list_artifact_records(
+                agent_id,
+                state=ArtifactState.READY,
+                run_id=run_id,
+                conversation_id=conversation_id,
+            )
         )
 
-    async def list_delivery_artifact_references(
-        self,
-        agent_id: str,
-        *,
-        run_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> tuple[OutcomeArtifactReference, ...]:
-        del agent_id, run_id, conversation_id
-        return ()
+    async def begin_artifact_creation(
+        self, record: ArtifactRecord, *, reserved: bool = False
+    ) -> None:
+        from daita.artifacts import models
+
+        rows = tuple(self.records.values())
+        run_rows = tuple(item for item in rows if item.ref.run_id == record.ref.run_id)
+        if len(run_rows) >= models.MAX_ARTIFACTS_PER_RUN:
+            raise ArtifactError(
+                "artifact_quota_exceeded", "Run count exceeded", {"scope": "run"}
+            )
+        self.records[record.ref.artifact_id] = record
+
+    async def transition_artifact(
+        self, record: ArtifactRecord, state: ArtifactState
+    ) -> ArtifactRecord:
+        assert self.records[record.ref.artifact_id] == record
+        updated = replace(record, state=state)
+        self.records[record.ref.artifact_id] = updated
+        return updated
+
+    async def finish_artifact_deletion(self, record: ArtifactRecord) -> None:
+        assert self.records.pop(record.ref.artifact_id) == record
 
 
 class _Catalog:
@@ -132,16 +180,16 @@ def _draft(
 async def _store(
     tmp_path: Path,
     *,
-    refs: _References | None = None,
+    refs: _Registry | None = None,
     agent_id: str = "agent-one",
-) -> tuple[AgentHomeArtifactStore, _References]:
+) -> tuple[AgentHomeArtifactStore, _Registry]:
     home = tmp_path / agent_id
     home.mkdir(parents=True)
-    references = refs or _References()
+    references = refs or _Registry()
     store = await AgentHomeArtifactStore.open(
         agent_id=agent_id,
         agent_home=home,
-        references=references,
+        registry=references,
         clock=lambda: NOW,
         id_factory=_artifact_ids(),
     )
@@ -179,14 +227,12 @@ async def test_artifact_store_open_cancellation_finishes_admission_cleanup(
 
     def blocked_cleanup(
         store: AgentHomeArtifactStore,
-        refs: tuple[ArtifactRef, ...],
-        delivery_refs: tuple[OutcomeArtifactReference, ...],
-        reservations: frozenset[tuple[str, str]],
+        records: tuple[ArtifactRecord, ...],
     ) -> None:
         started.set()
         assert release.wait(2)
         try:
-            original(store, refs, delivery_refs, reservations)
+            original(store, records)
         finally:
             finished.set()
 
@@ -195,7 +241,7 @@ async def test_artifact_store_open_cancellation_finishes_admission_cleanup(
         AgentHomeArtifactStore.open(
             agent_id="agent-one",
             agent_home=home,
-            references=_References(),
+            registry=_Registry(),
             clock=lambda: NOW,
             id_factory=_artifact_ids(),
         )
@@ -220,11 +266,9 @@ async def test_artifact_store_open_preserves_admission_failure_as_unavailable(
 
     def fail_cleanup(
         store: AgentHomeArtifactStore,
-        refs: tuple[ArtifactRef, ...],
-        delivery_refs: tuple[OutcomeArtifactReference, ...],
-        reservations: frozenset[tuple[str, str]],
+        records: tuple[ArtifactRecord, ...],
     ) -> None:
-        del store, refs, delivery_refs, reservations
+        del store, records
         raise ArtifactError(
             "artifact_storage_failed",
             "Injected admission failure.",
@@ -235,7 +279,7 @@ async def test_artifact_store_open_preserves_admission_failure_as_unavailable(
     store = await AgentHomeArtifactStore.open(
         agent_id="agent-one",
         agent_home=home,
-        references=_References(),
+        registry=_Registry(),
         clock=lambda: NOW,
         id_factory=_artifact_ids(),
     )
@@ -331,7 +375,6 @@ async def test_artifact_draft_bytes_never_enter_tool_result_transcript_exit_or_j
     store, refs = await _store(tmp_path)
     secret = b"DRAFT_BYTE_SENTINEL"
     ref = await _commit(store, _draft(secret))
-    refs.refs = (ref,)
     serialized_ref = canonical_json(artifact_ref_to_mapping(ref))
     assert "DRAFT_BYTE_SENTINEL" not in serialized_ref
     assert "content" not in artifact_ref_to_mapping(ref)
@@ -347,43 +390,6 @@ async def test_unreleased_pre_lineage_artifact_reference_is_rejected_exactly(
     provenance = cast(dict[str, object], serialized["provenance"])
     provenance.pop("derived_from_artifact_id")
 
-    class _PreLineageReferences:
-        async def list_artifact_refs(
-            self,
-            agent_id: str,
-            *,
-            run_id: str | None = None,
-            conversation_id: str | None = None,
-        ) -> tuple[ArtifactRef, ...]:
-            del agent_id
-            decoded = artifact_ref_from_mapping(serialized)
-            if run_id is not None and decoded.run_id != run_id:
-                return ()
-            if (
-                conversation_id is not None
-                and decoded.conversation_id != conversation_id
-            ):
-                return ()
-            return (decoded,)
-
-        async def list_delivery_artifact_references(
-            self,
-            agent_id: str,
-            *,
-            run_id: str | None = None,
-            conversation_id: str | None = None,
-        ) -> tuple[OutcomeArtifactReference, ...]:
-            del agent_id, run_id, conversation_id
-            return ()
-
-    reopened = await AgentHomeArtifactStore.open(
-        agent_id="agent-one",
-        agent_home=store.agent_home,
-        references=_PreLineageReferences(),
-        clock=lambda: NOW,
-        id_factory=_artifact_ids(),
-    )
-    assert not reopened.available
     with pytest.raises(ValueError, match="invalid shape"):
         artifact_ref_from_mapping(serialized)
 
@@ -440,7 +446,7 @@ async def test_artifact_commit_cancellation_boundaries_leave_only_clean_staging_
             }
 
 
-async def test_complete_unreferenced_artifact_is_removed_on_next_open(
+async def test_registered_artifact_survives_restart_without_transcript_reference(
     tmp_path: Path,
 ) -> None:
     store, references = await _store(tmp_path)
@@ -450,12 +456,13 @@ async def test_complete_unreferenced_artifact_is_removed_on_next_open(
     reopened = await AgentHomeArtifactStore.open(
         agent_id="agent-one",
         agent_home=store.agent_home,
-        references=references,
+        registry=references,
         clock=lambda: NOW,
         id_factory=_artifact_ids(),
     )
     assert reopened.available
-    assert not final.exists()
+    assert final.exists()
+    assert (await reopened.read(ref.artifact_id)).content == b"# Result\n"
 
 
 async def test_referenced_artifact_survives_restart_and_read_verifies_bytes(
@@ -463,11 +470,10 @@ async def test_referenced_artifact_survives_restart_and_read_verifies_bytes(
 ) -> None:
     store, references = await _store(tmp_path)
     ref = await _commit(store)
-    references.refs = (ref,)
     reopened = await AgentHomeArtifactStore.open(
         agent_id="agent-one",
         agent_home=store.agent_home,
-        references=references,
+        registry=references,
         clock=lambda: NOW,
         id_factory=_artifact_ids(),
     )
@@ -486,7 +492,6 @@ async def test_artifact_read_rejects_missing_payload_and_manifest_size_digest_or
 ) -> None:
     store, references = await _store(tmp_path / corruption)
     ref = await _commit(store)
-    references.refs = (ref,)
     directory = store.root / ref.run_id / ref.artifact_id
     payload = directory / "payload"
     if corruption == "missing":
@@ -510,7 +515,6 @@ async def test_unknown_cleared_and_cross_agent_artifact_ids_are_indistinguishabl
 ) -> None:
     first, first_refs = await _store(tmp_path, agent_id="agent-one")
     ref = await _commit(first)
-    first_refs.refs = (ref,)
     second, _ = await _store(tmp_path, agent_id="agent-two")
     errors = []
     for store, artifact_id in (
@@ -537,9 +541,8 @@ async def test_call_run_and_agent_quotas_fail_without_silent_eviction(
     with pytest.raises(ArtifactError) as call_limit:
         await _commit(store, _draft(b"12"), policy=_policy(maximum=1))
     assert call_limit.value.code == "artifact_quota_exceeded"
-    monkeypatch.setattr(store_module, "MAX_ARTIFACTS_PER_RUN", 1)
+    monkeypatch.setattr("daita.artifacts.models.MAX_ARTIFACTS_PER_RUN", 1)
     first = await _commit(store)
-    references.refs = (first,)
     with pytest.raises(ArtifactError) as run_limit:
         await _commit(store, call_id="second")
     assert run_limit.value.details["scope"] == "run"
@@ -550,7 +553,7 @@ async def test_parallel_commits_cannot_oversubscribe_run_or_agent_quota(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     store, _ = await _store(tmp_path)
-    monkeypatch.setattr(store_module, "MAX_ARTIFACTS_PER_RUN", 1)
+    monkeypatch.setattr("daita.artifacts.models.MAX_ARTIFACTS_PER_RUN", 1)
     results = await asyncio.gather(
         _commit(store, call_id="one"),
         _commit(store, call_id="two"),
@@ -604,7 +607,7 @@ def _document_script() -> tuple[ModelResponse, ...]:
     )
 
 
-async def test_clear_conversations_removes_internal_artifacts_but_preserves_delivery_config(
+async def test_clear_conversations_preserves_independent_artifacts_and_delivery_config(
     tmp_path: Path,
 ) -> None:
     downloads = tmp_path / "downloads"
@@ -628,54 +631,7 @@ async def test_clear_conversations_removes_internal_artifacts_but_preserves_deli
         assert await agent.clear_conversations() == 1
         assert (await agent.export_destination()).display_name == "export"
         assert (agent.home / "artifacts" / "delivery-config.json").is_file()
-        with pytest.raises(ArtifactError) as missing:
-            await agent.read_artifact(artifact_id)
-        assert missing.value.code == "artifact_missing"
-    finally:
-        await agent.close()
-
-
-async def test_clear_conversations_cancellation_never_leaves_a_persisted_dangling_ref(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    downloads = tmp_path / "downloads-cancel"
-    downloads.mkdir()
-    provider = MockModelProvider(
-        _document_script(), provider_id="mock:artifact-clear-cancel"
-    )
-    agent = await Agent.create(
-        "artifact-clear-cancel",
-        root=tmp_path,
-        model=provider,
-        model_profile=_profile(provider),
-        id_factory=_agent_ids(),
-        downloads_directory=downloads,
-        workspace=workspace_for(tmp_path),
-    )
-    try:
-        result = await agent.run("Create a TXT file.")
-        artifact_id = result.artifacts[0].artifact_id
-        entered = asyncio.Event()
-        release = asyncio.Event()
-
-        async def delayed_cleanup() -> None:
-            entered.set()
-            await release.wait()
-
-        monkeypatch.setattr(
-            agent._embedded._artifact_store,
-            "remove_unreferenced_run_artifacts",
-            delayed_cleanup,
-        )
-        clearing = asyncio.create_task(agent.clear_conversations())
-        await entered.wait()
-        clearing.cancel()
-        release.set()
-        with pytest.raises(asyncio.CancelledError):
-            await clearing
-        with pytest.raises(ArtifactError) as missing:
-            await agent.read_artifact(artifact_id)
-        assert missing.value.code == "artifact_missing"
+        assert (await agent.read_artifact(artifact_id)).content == b"retained notes"
     finally:
         await agent.close()
 

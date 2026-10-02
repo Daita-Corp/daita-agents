@@ -3104,6 +3104,7 @@ class CapabilityRuntime:
             call_id=call.id,
             capability_id=capability.id,
             reserved_artifact_id=reserved_artifact_id,
+            caller_principal_id=run.caller_principal_id,
         )
 
     def _exception_result(

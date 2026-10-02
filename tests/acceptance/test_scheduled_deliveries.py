@@ -335,6 +335,23 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
     finally:
         await reopened.close()
 
+    # A released home can retain only the delivery after its transcript is cleared.
+    # Revision 3 must recover its full registry record from the owned manifest.
+    with sqlite3.connect(reopened.home / "state.db") as connection:
+        connection.execute("DROP TABLE artifacts")
+        connection.execute("DELETE FROM agent_home_migrations WHERE revision = 3")
+    migrated = await Agent.open(
+        "d2-sqlite-csv",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        clock=lambda: NOW,
+    )
+    try:
+        assert (await migrated.read_artifact(artifact_id)).content == payload.content
+        assert (await migrated.inbox())[0].delivery_id == delivery_id
+    finally:
+        await migrated.close()
+
 
 async def test_scheduled_sqlite_export_rejects_readable_resource_outside_scope(
     tmp_path: Path,

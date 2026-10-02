@@ -48,8 +48,8 @@ from daita.skills.capabilities import (
     SKILL_VIEW_OUTPUT_KIND,
     SKILL_VIEW_TOOL_NAME,
 )
-from daita.storage.graph_schema import GRAPH_TABLE_NAMES
 from daita.storage.home_migrations import migration_rows
+from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.capability_runtime import execute_projected
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
@@ -1049,7 +1049,7 @@ async def test_skills_remain_files_only_outside_catalog_and_sqlite(tmp_path):
                 "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        assert tables == GRAPH_TABLE_NAMES
+        assert tables == set(CURRENT_SCHEMA.tables)
         for table in tables:
             expected_rows = 1 if table == "metadata" else 0
             if table == "agent_home_migrations":

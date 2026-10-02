@@ -1,4 +1,4 @@
-"""Define and validate the sole current revision-2 physical SQLite schema."""
+"""Define the current schema and immutable released schema contracts."""
 
 from __future__ import annotations
 
@@ -23,12 +23,33 @@ from .schema_contract import (
 )
 
 SCHEMA_REVISION_2 = schema_from_sql(REVISION_2_DATABASE_SQL)
-CURRENT_SCHEMA = SCHEMA_REVISION_2
+ARTIFACT_REGISTRY_SQL = """
+CREATE TABLE artifacts (
+    artifact_id TEXT PRIMARY KEY NOT NULL,
+    agent_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    caller_principal_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('creating', 'ready', 'deleting')),
+    byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
+    created_at_us INTEGER NOT NULL,
+    data TEXT NOT NULL
+);
+CREATE INDEX artifacts_by_conversation ON artifacts
+    (agent_id, state, conversation_id, created_at_us, artifact_id);
+CREATE INDEX artifacts_by_run ON artifacts (agent_id, run_id, state);
+"""
+CURRENT_DATABASE_SQL = REVISION_2_DATABASE_SQL + ARTIFACT_REGISTRY_SQL
+SCHEMA_REVISION_3 = schema_from_sql(CURRENT_DATABASE_SQL)
+CURRENT_SCHEMA = SCHEMA_REVISION_3
 
 __all__ = [
+    "ARTIFACT_REGISTRY_SQL",
+    "CURRENT_DATABASE_SQL",
     "CURRENT_SCHEMA",
     "REVISION_2_DATABASE_SQL",
     "SCHEMA_REVISION_2",
+    "SCHEMA_REVISION_3",
     "SQLiteSchema",
     "require_healthy",
     "require_schema",

@@ -639,6 +639,7 @@ class JobSupervisor:
             id=attempt.run_id,
             agent_id=attempt.agent_id,
             message="Execute the exact frozen internal graph task.",
+            caller_principal_id=inspection.job.specification.principal_id,
             created_at=attempt.started_at or self._clock(),
             conversation_id=inspection.job.conversation_id,
             source_scope_ids=task.specification.authority.source_ids,

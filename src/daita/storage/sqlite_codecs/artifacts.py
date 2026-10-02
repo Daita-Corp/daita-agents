@@ -9,9 +9,11 @@ from ...artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactLocalFileBinding,
     ArtifactProvenance,
+    ArtifactRecord,
     ArtifactRef,
     ArtifactResourceBinding,
     ArtifactResultBinding,
+    ArtifactState,
     ArtifactTextChangeSummary,
     artifact_text_change_summary_to_mapping,
 )
@@ -21,9 +23,11 @@ from .common import (
     boolean,
     datetime_decode,
     datetime_encode,
+    dump_payload,
     enum_decode,
     enum_encode,
     integer,
+    load_payload,
     optional_integer,
     optional_text,
     plain_encode,
@@ -32,6 +36,39 @@ from .common import (
     sequence,
     text,
 )
+
+
+def encode_artifact_record(value: ArtifactRecord) -> str:
+    return dump_payload(
+        record(
+            "ArtifactRecord",
+            {
+                "ref": encode_artifact_ref(value.ref),
+                "agent_id": value.agent_id,
+                "caller_principal_id": value.caller_principal_id,
+                "state": enum_encode(value.state, "ArtifactState"),
+            },
+        )
+    )
+
+
+def decode_artifact_record(value: str) -> ArtifactRecord:
+    fields = record_fields(
+        load_payload(value),
+        "ArtifactRecord",
+        (
+            "ref",
+            "agent_id",
+            "caller_principal_id",
+            "state",
+        ),
+    )
+    return ArtifactRecord(
+        ref=decode_artifact_ref(fields["ref"]),
+        agent_id=text(fields["agent_id"], "artifact owner"),
+        caller_principal_id=text(fields["caller_principal_id"], "artifact caller"),
+        state=enum_decode(fields["state"], ArtifactState, "ArtifactState"),
+    )
 
 
 def encode_artifact_binding(value: ArtifactResourceBinding) -> dict[str, JsonValue]:

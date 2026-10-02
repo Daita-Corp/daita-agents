@@ -14,6 +14,7 @@ from daita.domains.data import DATA_QUERY_EVIDENCE_KIND
 from daita.jobs.graph.models import AttemptState, TaskExecutionKind, TaskRole
 from daita.llm.profiles import reviewed_model_profile
 from daita.loop.models import LoopExitKind
+from daita.storage.home_migrations import CURRENT_HOME_REVISION
 from tests.support.job_benchmarks import create_probe_home
 from tests.support.workspace import workspace_for
 
@@ -109,7 +110,7 @@ async def test_live_model_task_uses_public_revision_2_composition(
     )
     try:
         status = await Agent.inspect_home(home.name, root=home.root)
-        assert status.found_revision == status.current_revision == 2
+        assert status.found_revision == status.current_revision == CURRENT_HOME_REVISION
         foreground = await agent.run(
             "Start exactly one durable graph. Load start_graph_job, then call it "
             "with objective 'Run the exact admitted relational read', outcome_contract "

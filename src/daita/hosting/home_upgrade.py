@@ -28,6 +28,11 @@ from ..storage.home_migrations import (
 )
 from ..storage.home_migrations.models import HomeMigration
 from ..storage.home_migrations.revision_0001 import detect_preproduction_shape
+from ..storage.home_migrations.revision_0003 import (
+    PRE_REGISTRY_REVISION_3_CHECKSUM,
+    PRE_REGISTRY_REVISION_3_SOURCE,
+    is_pre_registry_revision_3,
+)
 from ..storage.schema_contract import require_healthy, require_schema
 
 _UPGRADE_DIRECTORY = ".home-upgrade"
@@ -166,6 +171,25 @@ def inspect_agent_home(home: Path) -> AgentHomeStatus:
                         found=error.found_revision,
                     ) from None
                 except HomeMigrationJournalError as error:
+                    if (
+                        error.found_revision == 3
+                        and MINIMUM_SUPPORTED_HOME_REVISION <= 3
+                        and is_pre_registry_revision_3(
+                            connection,
+                            tuple(
+                                (item.revision, item.migration_id, item.checksum)
+                                for item in HOME_MIGRATIONS[:2]
+                            ),
+                        )
+                    ):
+                        return AgentHomeStatus(
+                            current_revision=CURRENT_HOME_REVISION,
+                            found_revision=3,
+                            minimum_supported_revision=MINIMUM_SUPPORTED_HOME_REVISION,
+                            source_kind=PRE_REGISTRY_REVISION_3_SOURCE,
+                            upgrade_required=True,
+                            recovery_required=recovery_required,
+                        )
                     raise _error(
                         StateCompatibilityCode.REVISION_UNSUPPORTED,
                         home,
@@ -341,7 +365,9 @@ def _stage_file(source: Path, destination: Path, *, database: bool) -> None:
         _copy_regular(source, destination)
 
 
-def _preflight(home: Path, affected_paths: tuple[str, ...]) -> None:
+def _preflight(
+    home: Path, affected_paths: tuple[str, ...], read_only_globs: tuple[str, ...] = ()
+) -> None:
     required = _DISK_HEADROOM_BYTES
     for relative in affected_paths:
         path = _contained_home_path(home, relative)
@@ -349,16 +375,33 @@ def _preflight(home: Path, affected_paths: tuple[str, ...]) -> None:
             continue
         _require_regular(path)
         required += path.stat().st_size * 2
+    input_count = 0
+    for pattern in read_only_globs:
+        for candidate in home.glob(pattern):
+            source = _contained_home_path(home, candidate.relative_to(home).as_posix())
+            _require_regular(source)
+            size = source.stat().st_size
+            input_count += 1
+            if input_count > 10_000 or size > 64 * 1024:
+                raise ValueError("migration manifest inputs exceed their fixed bounds")
+            required += size
     if shutil.disk_usage(home).free < required:
         raise OSError("insufficient free space for a recoverable agent-home upgrade")
 
 
-def _planned_migrations(source_revision: int) -> tuple[HomeMigration, ...]:
-    return tuple(
+def _planned_migrations(
+    source_revision: int, source_kind: str = "production"
+) -> tuple[HomeMigration, ...]:
+    suffix = tuple(
         migration
         for migration in HOME_MIGRATIONS
         if migration.revision > source_revision
     )
+    if source_kind == PRE_REGISTRY_REVISION_3_SOURCE:
+        if source_revision != 3:
+            raise ValueError("development revision-3 source range is invalid")
+        return (HOME_MIGRATIONS[2], *suffix)
+    return suffix
 
 
 def _journal_path(value: object, allowed: frozenset[str]) -> str:
@@ -401,6 +444,7 @@ def _validate_journal(journal: dict[str, object]) -> tuple[str, ...]:
         "preproduction_current",
         "preproduction_inbox",
         "preproduction_routines",
+        PRE_REGISTRY_REVISION_3_SOURCE,
     }:
         raise ValueError("agent-home upgrade source kind is invalid")
     operation_id = journal.get("operation_id")
@@ -424,9 +468,15 @@ def _validate_journal(journal: dict[str, object]) -> tuple[str, ...]:
         raise HomeMigrationJournalNewerError(
             "unfinished upgrade belongs to a newer release", target_revision
         )
-    if target_revision != CURRENT_HOME_REVISION or source_revision >= target_revision:
+    same_revision_conversion = (
+        source_revision == target_revision == 3
+        and journal.get("source_kind") == PRE_REGISTRY_REVISION_3_SOURCE
+    )
+    if target_revision != CURRENT_HOME_REVISION or (
+        source_revision >= target_revision and not same_revision_conversion
+    ):
         raise ValueError("agent-home upgrade revision range is invalid")
-    planned = _planned_migrations(source_revision)
+    planned = _planned_migrations(source_revision, str(journal["source_kind"]))
     raw_migrations = journal.get("migrations")
     if not isinstance(raw_migrations, list) or len(raw_migrations) != len(planned):
         raise ValueError("agent-home upgrade migration plan is invalid")
@@ -509,7 +559,7 @@ def _stage_upgrade(
     phase_hook: PhaseHook | None,
 ) -> dict[str, object]:
     source_revision = status.found_revision or 0
-    migrations = _planned_migrations(source_revision)
+    migrations = _planned_migrations(source_revision, status.source_kind)
     if not migrations:
         raise RuntimeError("agent-home upgrade plan is empty")
     affected_paths = tuple(
@@ -519,7 +569,12 @@ def _stage_upgrade(
             for relative in migration.affected_paths
         )
     )
-    _preflight(home, affected_paths)
+    read_only_globs = tuple(
+        dict.fromkeys(
+            pattern for migration in migrations for pattern in migration.read_only_globs
+        )
+    )
+    _preflight(home, affected_paths, read_only_globs)
     upgrade = home / _UPGRADE_DIRECTORY
     upgrade.mkdir(mode=0o700)
     stage = upgrade / "stage"
@@ -565,6 +620,24 @@ def _stage_upgrade(
                 ),
             }
         )
+    # Metadata needed for a database-only conversion is staged read-only. These
+    # files are neither rewritten nor published and never enter the rollback set.
+    input_count = 0
+    input_bytes = 0
+    for pattern in read_only_globs:
+        for source in home.glob(pattern):
+            relative = source.relative_to(home).as_posix()
+            source = _contained_home_path(home, relative)
+            _require_regular(source)
+            input_count += 1
+            input_bytes += source.stat().st_size
+            if (
+                input_count > 10_000
+                or input_bytes > 10_000 * 64 * 1024
+                or source.stat().st_size > 64 * 1024
+            ):
+                raise ValueError("migration manifest inputs exceed their fixed bounds")
+            _copy_regular(source, stage / relative)
     source_shape = None if status.source_kind == "production" else status.source_kind
     for migration in migrations:
         migration.apply(stage, source_shape)
@@ -572,7 +645,23 @@ def _stage_upgrade(
             stage / "state.db",
             factory=ClosingSQLiteConnection,
         ) as connection:
-            insert_migration_row(connection, migration)
+            if (
+                status.source_kind == PRE_REGISTRY_REVISION_3_SOURCE
+                and migration.revision == 3
+            ):
+                changed = connection.execute(
+                    "UPDATE agent_home_migrations SET checksum = ? "
+                    "WHERE revision = 3 AND migration_id = ? AND checksum = ?",
+                    (
+                        migration.checksum,
+                        migration.migration_id,
+                        PRE_REGISTRY_REVISION_3_CHECKSUM,
+                    ),
+                ).rowcount
+                if changed != 1:
+                    raise ValueError("development revision-3 history changed")
+            else:
+                insert_migration_row(connection, migration)
             require_schema(connection, migration.target_schema)
             require_healthy(connection)
             connection.commit()

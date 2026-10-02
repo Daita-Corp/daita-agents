@@ -4,6 +4,8 @@ repos:
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
+        # Artifact fixtures preserve exact payload and canonical manifest bytes.
+        exclude: ^tests/fixtures/agent-home-revisions/revision-[0-9]+/artifacts/[^/]+/[^/]+/(payload|manifest\.json)$
       - id: check-yaml
       - id: check-merge-conflict
       - id: check-added-large-files

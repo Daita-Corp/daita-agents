@@ -64,6 +64,7 @@ from ..artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,
     ArtifactPayload,
+    ArtifactState,
 )
 from ..artifacts.store import AgentHomeArtifactStore, validate_artifact_home
 from ..capabilities import (
@@ -860,7 +861,11 @@ class EmbeddedAgent:
         self._model_management_lock = asyncio.Lock()
         self._effect_resolution_lock = asyncio.Lock()
         self._routine_management_lock = asyncio.Lock()
-        self._artifact_publication_lock = asyncio.Lock()
+        self._artifact_publication_lock = (
+            artifact_delivery.publication_lock
+            if artifact_delivery is not None
+            else asyncio.Lock()
+        )
         self._semantic_management_lock = asyncio.Lock()
         self._credential_management_lock = asyncio.Lock()
         self._mcp_management_lock = asyncio.Lock()
@@ -1102,7 +1107,7 @@ class EmbeddedAgent:
             artifact_store = await AgentHomeArtifactStore.open(
                 agent_id=identity.id,
                 agent_home=home,
-                references=store,
+                registry=store,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
             )
@@ -1305,7 +1310,7 @@ class EmbeddedAgent:
             artifact_store = await AgentHomeArtifactStore.open(
                 agent_id=identity.id,
                 agent_home=home,
-                references=store,
+                registry=store,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
             )
@@ -2971,8 +2976,17 @@ class EmbeddedAgent:
         self, job_id: str, *, task_id: str | None = None, limit: int = 64
     ) -> tuple[str, ...]:
         self._require_open()
-        return await self._job_owner.list_graph_task_artifacts(
+        artifact_ids = await self._job_owner.list_graph_task_artifacts(
             job_id, task_id=task_id, limit=limit
+        )
+        return tuple(
+            [
+                artifact_id
+                for artifact_id in artifact_ids
+                if (record := await self._store.get_artifact_record(artifact_id))
+                is not None
+                and record.state is ArtifactState.READY
+            ]
         )
 
     async def list_task_controls(
@@ -3420,25 +3434,29 @@ class EmbeddedAgent:
         async with lease:
             self._require_open()
             cleared = await self._candidate_reviewer.clear_conversations()
-            cancelled = False
-            try:
-                _, cancelled = await _await_async_completion(
-                    self._artifact_store.remove_unreferenced_run_artifacts
-                )
-            except Exception:
-                # SQLite deletion is already authoritative. A private orphan is
-                # retried by bounded startup cleanup and never restores a ref.
-                pass
-            if cancelled:
-                raise asyncio.CancelledError
             return cleared
 
     async def read_artifact(
         self, artifact_id: str, *, caller_principal_id: str | None = None
     ) -> ArtifactPayload:
-        self._require_open()
-        await self._require_artifact_caller(artifact_id, caller_principal_id)
-        return await self._artifact_store.read(artifact_id)
+        async with self._artifact_publication_lock:
+            self._require_open()
+            await self._require_artifact_caller(artifact_id, caller_principal_id)
+            return await self._artifact_store.read(artifact_id)
+
+    async def delete_artifact(
+        self, artifact_id: str, *, caller_principal_id: str | None = None
+    ) -> bool:
+        async with self._artifact_publication_lock:
+            self._require_open()
+            principal_id = self._resolve_caller_principal(caller_principal_id)
+            record = await self._store.get_artifact_record(artifact_id)
+            if record is not None and (
+                record.agent_id != self.identity.id
+                or (self._hosted and record.caller_principal_id != principal_id)
+            ):
+                raise ValueError("artifact is unavailable to this caller")
+            return await self._artifact_store.delete(artifact_id)
 
     async def _require_artifact_caller(
         self, artifact_id: str, caller_principal_id: str | None
@@ -3447,8 +3465,8 @@ class EmbeddedAgent:
             return
         principal_id = self._resolve_caller_principal(caller_principal_id)
         ref = await self._artifact_store.find_ref(artifact_id)
-        transcript = await self._transcripts.load(ref.run_id)
-        if transcript.run.caller_principal_id != principal_id:
+        record = await self._store.get_artifact_record(ref.artifact_id)
+        if record is None or record.caller_principal_id != principal_id:
             raise ValueError("artifact is unavailable to this caller")
 
     async def save_artifact(
@@ -6719,16 +6737,9 @@ def _validate_agent_home_target(
     )
     validate_memory_documents(memory_home)
     validate_skill_documents(source_home)
-    references, delivery_references, reservations = load_current_artifact_inventory(
-        state_home / "state.db",
-        manifest.id,
-    )
+    records = load_current_artifact_inventory(state_home / "state.db", manifest.id)
     validate_artifact_home(
-        agent_id=manifest.id,
-        agent_home=source_home,
-        references=references,
-        delivery_references=delivery_references,
-        reservations=reservations,
+        agent_id=manifest.id, agent_home=source_home, records=records
     )
     validate_delivery_configuration(source_home)
 

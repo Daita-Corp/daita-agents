@@ -5,8 +5,8 @@ from __future__ import annotations
 import sqlite3
 
 from ..sqlite_schema import (
+    CURRENT_DATABASE_SQL,
     CURRENT_SCHEMA,
-    REVISION_2_DATABASE_SQL,
     require_healthy,
     require_schema,
 )
@@ -21,7 +21,7 @@ def create_current_database(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.execute("PRAGMA wal_autocheckpoint = 1000")
-    connection.executescript("BEGIN IMMEDIATE;\n" + REVISION_2_DATABASE_SQL)
+    connection.executescript("BEGIN IMMEDIATE;\n" + CURRENT_DATABASE_SQL)
     stamp_fresh_home(connection)
     require_schema(connection, CURRENT_SCHEMA)
     require_healthy(connection)
