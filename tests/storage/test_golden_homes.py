@@ -40,6 +40,9 @@ def _materialize_fixture(fixture: Path, home: Path) -> None:
             shutil.copytree(source, home / source.name)
         else:
             shutil.copyfile(source, home / source.name)
+    if (home / "artifacts").is_dir():
+        # Git cannot retain the empty directory required by the artifact layout.
+        (home / "artifacts" / ".staging").mkdir(mode=0o700, exist_ok=True)
 
 
 def test_every_production_home_revision_has_one_golden_fixture() -> None:
