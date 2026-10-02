@@ -21,7 +21,7 @@ from time import perf_counter
 from typing import cast
 from uuid import uuid4
 
-import httpx
+import httpx2 as httpx
 
 from daita import (
     Agent,
@@ -37,7 +37,7 @@ from daita import (
     create_llm_provider,
 )
 from daita._json import FrozenJsonObject, canonical_json
-from daita.adapters.mcp import StreamableHTTPMCPClientFactory
+from daita.adapters.mcp import SDKMCPClientFactory
 from daita.capabilities import (
     AccessMode,
     ApprovalDecision,
@@ -111,9 +111,9 @@ def evaluation_profile() -> str:
 
 
 def limits() -> LoopLimits:
-    user_flow = evaluation_profile() == "user_flow"
+    evaluation_profile()
     try:
-        amount = Decimal(os.environ.get(COST_ENV, "0.50" if user_flow else "0.15"))
+        amount = Decimal(os.environ.get(COST_ENV, "0.50"))
     except InvalidOperation as error:
         raise ValueError(f"{COST_ENV} must be a finite positive decimal") from error
     if not amount.is_finite() or amount <= 0:
@@ -157,6 +157,8 @@ class EvaluationTransport(MCPConformanceTransport):
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         started = perf_counter()
+        if request.method != "POST":
+            return await super().__call__(request)
         payload = json.loads(request.content)
         try:
             result = await super().__call__(request)
@@ -316,7 +318,7 @@ class Evaluation:
         self.started = perf_counter()
 
     async def start(self) -> None:
-        factory = StreamableHTTPMCPClientFactory(
+        factory = SDKMCPClientFactory(
             http_transport=httpx.MockTransport(self.transport)
         )
         self.agent = await Agent.create(

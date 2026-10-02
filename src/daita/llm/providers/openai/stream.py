@@ -166,6 +166,13 @@ async def decode_openai_stream(
                     "response.failed",
                 }:
                     native_response = _field(event, "response")
+                    if _safe_field(native_response, "status") == "failed":
+                        self._observe_failure(
+                            attempt,
+                            _safe_field(native_response, "error"),
+                            phase="generation",
+                            origin="failed_response",
+                        )
                     terminal_diagnostic = _openai_failure_diagnostic(
                         native_response,
                         phase=ProviderFailurePhase.STREAM_TERMINAL,
@@ -241,6 +248,9 @@ async def decode_openai_stream(
                         _stream_fragment(_field(event, "delta"), "reasoning delta")
                     )
                 elif event_type == "error":
+                    self._observe_failure(
+                        attempt, event, phase="generation", origin="stream_error"
+                    )
                     code = _optional_text(
                         _field(event, "code", None), "stream error code"
                     )
@@ -269,6 +279,9 @@ async def decode_openai_stream(
                 ),
             ) from error
         except Exception as error:
+            self._observe_failure(
+                attempt, error, phase="generation", origin="sdk_error"
+            )
             self._observe_headers(
                 attempt, "generation", _safe_field(error, "response"), arrived=False
             )

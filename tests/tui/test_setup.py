@@ -256,13 +256,24 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
 
     app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
     async with app.run_test(size=(90, 28)) as pilot:
+        # Screen selection precedes its mount handler populating the options.
+        # Wait for the actual picker contents, not only the active screen type.
         for _ in range(20):
             await pilot.pause(0.05)
-            if isinstance(app.screen, SelectionScreen):
+            if (
+                isinstance(app.screen, SelectionScreen)
+                and app.screen.is_mounted
+                and app.screen.query_one("#picker-options", OptionList).option_count
+                == 2
+            ):
                 break
         picker = app.screen
         assert isinstance(picker, SelectionScreen)
         listing = picker.query_one("#picker-options", OptionList)
+        assert {
+            str(listing.get_option_at_index(index).id)
+            for index in range(listing.option_count)
+        } == {"legacy-model", "other-agent"}
         listing.highlighted = next(
             index
             for index in range(listing.option_count)

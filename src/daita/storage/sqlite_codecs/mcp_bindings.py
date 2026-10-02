@@ -28,6 +28,7 @@ from .common import (
     dump_payload,
     integer,
     load_payload,
+    mapping,
     optional_datetime_decode,
     optional_datetime_encode,
     optional_text,
@@ -40,6 +41,23 @@ from .common import (
 )
 
 
+def decode_mcp_credential_reference_for_deletion(value: str) -> str | None:
+    """Read deletion-critical fields without decoding historical tool schemas."""
+    decoded = load_payload(value)
+    if not isinstance(decoded, dict) or set(decoded) != {"__record__", "fields"}:
+        raise ValueError("stored MCP binding record envelope is invalid")
+    if decoded["__record__"] != "MCPServerBinding":
+        raise ValueError("stored record is not MCPServerBinding")
+    fields = mapping(decoded["fields"], "MCP binding fields")
+    mode = text(fields.get("authentication_mode"), "MCP authentication mode")
+    reference = optional_text(fields.get("secret_reference"), "MCP secret reference")
+    if mode not in {item.value for item in MCPAuthenticationMode} or (
+        (mode == MCPAuthenticationMode.BEARER.value) != (reference is not None)
+    ):
+        raise ValueError("stored MCP binding authentication is invalid")
+    return reference
+
+
 def encode_mcp_binding(value: MCPServerBinding) -> str:
     if not isinstance(value, MCPServerBinding):
         raise TypeError("MCP binding codec requires MCPServerBinding")
@@ -48,13 +66,18 @@ def encode_mcp_binding(value: MCPServerBinding) -> str:
             "MCPServerBinding",
             {
                 "endpoint": value.endpoint,
+                "owner_principal_id": value.owner_principal_id,
                 "authentication_mode": value.authentication.mode.value,
                 "secret_reference": (
                     None
                     if value.authentication.secret_reference is None
                     else value.authentication.secret_reference.to_uri()
                 ),
+                "connection_id": value.authentication.connection_id,
+                "resource_uri": value.authentication.resource_uri,
+                "required_scopes": list(value.authentication.required_scopes),
                 "protocol_version": value.protocol_version,
+                "protocol_capabilities_digest": value.protocol_capabilities_digest,
                 "server_name": value.server_name,
                 "server_version": value.server_version,
                 "local_label": value.local_label,
@@ -87,9 +110,14 @@ def decode_mcp_binding(
         "MCPServerBinding",
         (
             "endpoint",
+            "owner_principal_id",
             "authentication_mode",
             "secret_reference",
+            "connection_id",
+            "resource_uri",
+            "required_scopes",
             "protocol_version",
+            "protocol_capabilities_digest",
             "server_name",
             "server_version",
             "local_label",
@@ -123,6 +151,17 @@ def decode_mcp_binding(
     authentication = MCPAuthentication(
         authentication_mode,
         None if secret_uri is None else SecretReference.parse(secret_uri),
+        optional_text(fields["connection_id"], "MCP connection ID"),
+        (
+            text(fields["owner_principal_id"], "MCP owner principal")
+            if authentication_mode is MCPAuthenticationMode.PERSONAL_CONNECTION
+            else None
+        ),
+        optional_text(fields["resource_uri"], "MCP resource URI"),
+        tuple(
+            text(item, "MCP required scope")
+            for item in sequence(fields["required_scopes"], "MCP required scopes")
+        ),
     )
     tools = tuple(
         _decode_tool(item) for item in sequence(fields["tools"], "MCP binding tools")
@@ -131,10 +170,14 @@ def decode_mcp_binding(
         binding_id=binding_id,
         agent_id=agent_id,
         endpoint=text(fields["endpoint"], "MCP endpoint"),
+        owner_principal_id=text(fields["owner_principal_id"], "MCP binding owner"),
         authentication=authentication,
         protocol_version=text(fields["protocol_version"], "MCP protocol version"),
-        server_name=text(fields["server_name"], "MCP server name"),
-        server_version=text(fields["server_version"], "MCP server version"),
+        protocol_capabilities_digest=optional_text(
+            fields["protocol_capabilities_digest"], "MCP protocol capabilities digest"
+        ),
+        server_name=optional_text(fields["server_name"], "MCP server name"),
+        server_version=optional_text(fields["server_version"], "MCP server version"),
         local_label=text(fields["local_label"], "MCP local server label"),
         summary=text(fields["summary"], "MCP binding summary"),
         when_to_use=text(fields["when_to_use"], "MCP binding when_to_use"),
@@ -169,6 +212,11 @@ def _encode_tool(value: MCPToolBinding):
             "presentation_when_to_use": value.presentation.when_to_use,
             "presentation_keywords": list(value.presentation.keywords),
             "input_schema": plain_encode(value.input_schema),
+            "raw_input_schema": (
+                None
+                if value.raw_input_schema is None
+                else plain_encode(value.raw_input_schema)
+            ),
             "input_schema_digest": value.input_schema_digest,
             "output_schema": (
                 None
@@ -204,6 +252,7 @@ def _decode_tool(value) -> MCPToolBinding:
             "presentation_when_to_use",
             "presentation_keywords",
             "input_schema",
+            "raw_input_schema",
             "input_schema_digest",
             "output_schema",
             "output_schema_digest",
@@ -219,6 +268,10 @@ def _decode_tool(value) -> MCPToolBinding:
     input_schema = plain_decode(fields["input_schema"])
     if not isinstance(input_schema, dict):
         raise ValueError("stored MCP input schema is invalid")
+    raw_input = fields["raw_input_schema"]
+    raw_input_schema = None if raw_input is None else plain_decode(raw_input)
+    if raw_input_schema is not None and not isinstance(raw_input_schema, dict):
+        raise ValueError("stored MCP raw input schema is invalid")
     output_raw = fields["output_schema"]
     output_schema = None if output_raw is None else plain_decode(output_raw)
     if output_schema is not None and not isinstance(output_schema, dict):
@@ -262,6 +315,11 @@ def _decode_tool(value) -> MCPToolBinding:
             ),
         ),
         input_schema=FrozenJsonObject.from_mapping(input_schema),
+        raw_input_schema=(
+            None
+            if raw_input_schema is None
+            else FrozenJsonObject.from_mapping(raw_input_schema)
+        ),
         input_schema_digest=text(
             fields["input_schema_digest"], "MCP input schema digest"
         ),

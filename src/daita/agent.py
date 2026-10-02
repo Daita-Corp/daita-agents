@@ -17,6 +17,7 @@ from .adapters.mcp import (
     MCPAuthentication,
     MCPBindingStatus,
     MCPClientFactory,
+    MCPConnectionProvider,
     MCPServerInspection,
     MCPToolSelection,
 )
@@ -168,6 +169,7 @@ class Agent:
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
         mcp_client_factory: MCPClientFactory | None = None,
+        mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -177,7 +179,11 @@ class Agent:
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
     ) -> Self:
-        """Create an agent; injected model providers remain caller-owned."""
+        """Create an agent; injected model providers remain caller-owned.
+
+        An injected MCP factory retains caller ownership; its created clients
+        are owned and closed by the agent. Omit it to use the built-in SDK client.
+        """
 
         _validate_downloads_directory(downloads_directory)
         return cls(
@@ -194,6 +200,7 @@ class Agent:
                 id_factory=id_factory,
                 secret_provider=secret_provider,
                 mcp_client_factory=mcp_client_factory,
+                mcp_connection_provider=mcp_connection_provider,
                 keychain=keychain,
                 model_validator=model_validator,
                 reviewer_model=reviewer_model,
@@ -221,6 +228,7 @@ class Agent:
         id_factory: Callable[[str], str] | None = None,
         secret_provider: SecretProvider | None = None,
         mcp_client_factory: MCPClientFactory | None = None,
+        mcp_connection_provider: MCPConnectionProvider | None = None,
         keychain: KeychainStore | None = None,
         model_validator: ModelProvider | None = None,
         reviewer_model: ModelProvider | None = None,
@@ -230,7 +238,11 @@ class Agent:
         approval_handler: ApprovalHandler | None = None,
         downloads_directory: Path | None = None,
     ) -> Self:
-        """Open an agent; injected model providers remain caller-owned."""
+        """Open an agent; injected model providers remain caller-owned.
+
+        An injected MCP factory retains caller ownership; its created clients
+        are owned and closed by the agent. Omit it to use the built-in SDK client.
+        """
 
         _validate_downloads_directory(downloads_directory)
         return cls(
@@ -247,6 +259,7 @@ class Agent:
                 id_factory=id_factory,
                 secret_provider=secret_provider,
                 mcp_client_factory=mcp_client_factory,
+                mcp_connection_provider=mcp_connection_provider,
                 keychain=keychain,
                 model_validator=model_validator,
                 reviewer_model=reviewer_model,
@@ -343,12 +356,14 @@ class Agent:
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
         files_only: bool = False,
+        caller_principal_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.run(
             message,
             conversation_id=conversation_id,
             source_scope_ids=source_scope_ids,
             files_only=files_only,
+            caller_principal_id=caller_principal_id,
         )
 
     async def learn(
@@ -357,6 +372,7 @@ class Agent:
         *,
         conversation_id: str | None = None,
         source_scope_ids: tuple[str, ...] = (),
+        caller_principal_id: str | None = None,
     ) -> LoopExit:
         """Run one explicit user-authorized foreground learning action."""
 
@@ -364,10 +380,15 @@ class Agent:
             message,
             conversation_id=conversation_id,
             source_scope_ids=source_scope_ids,
+            caller_principal_id=caller_principal_id,
         )
 
-    async def transcript(self, run_id: str) -> Transcript:
-        return await self._embedded.transcript(run_id)
+    async def transcript(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> Transcript:
+        return await self._embedded.transcript(
+            run_id, caller_principal_id=caller_principal_id
+        )
 
     async def inbox(
         self,
@@ -375,6 +396,7 @@ class Agent:
         conversation_id: str | None = None,
         include_acknowledged: bool = False,
         limit: int = 50,
+        caller_principal_id: str | None = None,
     ) -> tuple[InboxView, ...]:
         """Inspect bounded durable autonomous results for this agent."""
 
@@ -382,6 +404,7 @@ class Agent:
             conversation_id=conversation_id,
             include_acknowledged=include_acknowledged,
             limit=limit,
+            caller_principal_id=caller_principal_id,
         )
 
     async def distribution_destinations(
@@ -389,37 +412,55 @@ class Agent:
         conversation_id: str,
         *,
         sensitivity_ceiling: ModelSensitivity = ModelSensitivity.RESTRICTED,
+        caller_principal_id: str | None = None,
     ) -> tuple[DistributionDestination, ...]:
         """List exact destinations currently selectable for one conversation."""
 
         return await self._embedded.distribution_destinations(
             conversation_id,
             sensitivity_ceiling=sensitivity_ceiling,
+            caller_principal_id=caller_principal_id,
         )
 
     async def inspect_delivery(
         self,
         delivery_id: str,
+        *,
+        caller_principal_id: str | None = None,
     ) -> DeliveryInspection | None:
         """Inspect immutable safe facts for one exact logical delivery."""
 
-        return await self._embedded.inspect_delivery(delivery_id)
+        return await self._embedded.inspect_delivery(
+            delivery_id, caller_principal_id=caller_principal_id
+        )
 
-    async def acknowledge_inbox(self, delivery_id: str) -> InboxView | None:
+    async def acknowledge_inbox(
+        self, delivery_id: str, *, caller_principal_id: str | None = None
+    ) -> InboxView | None:
         """Idempotently acknowledge one exact inbox result."""
 
-        return await self._embedded.acknowledge_inbox(delivery_id)
+        return await self._embedded.acknowledge_inbox(
+            delivery_id, caller_principal_id=caller_principal_id
+        )
 
     async def conversation_runs(
         self,
         conversation_id: str,
+        *,
+        caller_principal_id: str | None = None,
     ) -> tuple[ConversationRun, ...]:
-        return await self._embedded.conversation_runs(conversation_id)
+        return await self._embedded.conversation_runs(
+            conversation_id, caller_principal_id=caller_principal_id
+        )
 
-    async def conversation_exists(self, conversation_id: str) -> bool:
+    async def conversation_exists(
+        self, conversation_id: str, *, caller_principal_id: str | None = None
+    ) -> bool:
         """Return whether one conversation ID belongs to this agent."""
 
-        return await self._embedded.conversation_exists(conversation_id)
+        return await self._embedded.conversation_exists(
+            conversation_id, caller_principal_id=caller_principal_id
+        )
 
     async def list_jobs(
         self,
@@ -429,16 +470,28 @@ class Agent:
     ) -> tuple[GraphJob, ...]:
         return await self._embedded.list_jobs(states=states, limit=limit)
 
-    async def inspect_effect(self, receipt_id: str) -> EffectReceipt | None:
+    async def inspect_effect(
+        self, receipt_id: str, *, caller_principal_id: str | None = None
+    ) -> EffectReceipt | None:
         """Inspect one exact agent-owned external-effect receipt."""
-        return await self._embedded.inspect_effect(receipt_id)
+        return await self._embedded.inspect_effect(
+            receipt_id, caller_principal_id=caller_principal_id
+        )
 
     async def list_effects(
-        self, *, unresolved_only: bool = False, limit: int = 20, offset: int = 0
+        self,
+        *,
+        unresolved_only: bool = False,
+        limit: int = 20,
+        offset: int = 0,
+        caller_principal_id: str | None = None,
     ) -> tuple[EffectReceipt, ...]:
         """Read one bounded page of external-effect evidence."""
         return await self._embedded.list_effects(
-            unresolved_only=unresolved_only, limit=limit, offset=offset
+            unresolved_only=unresolved_only,
+            limit=limit,
+            offset=offset,
+            caller_principal_id=caller_principal_id,
         )
 
     async def resolve_effect(
@@ -449,6 +502,7 @@ class Agent:
         decision: EffectResolutionDecision,
         note: str,
         evidence_references: tuple[str, ...] = (),
+        caller_principal_id: str | None = None,
     ) -> EffectReceipt:
         """Request exact foreground recovery approval without retrying any action."""
         return await self._embedded.resolve_effect(
@@ -457,6 +511,7 @@ class Agent:
             decision=decision,
             note=note,
             evidence_references=evidence_references,
+            caller_principal_id=caller_principal_id,
         )
 
     async def inspect_job(self, job_id: str) -> GraphInspection | None:
@@ -785,9 +840,13 @@ class Agent:
 
         return await self._embedded.clear_conversations()
 
-    async def read_artifact(self, artifact_id: str) -> ArtifactPayload:
+    async def read_artifact(
+        self, artifact_id: str, *, caller_principal_id: str | None = None
+    ) -> ArtifactPayload:
         _validate_artifact_id(artifact_id)
-        return await self._embedded.read_artifact(artifact_id)
+        return await self._embedded.read_artifact(
+            artifact_id, caller_principal_id=caller_principal_id
+        )
 
     async def save_artifact(
         self,
@@ -795,6 +854,7 @@ class Agent:
         destination: Path | None = None,
         *,
         filename: str | None = None,
+        caller_principal_id: str | None = None,
     ) -> ArtifactDeliveryReceipt:
         _validate_artifact_id(artifact_id)
         if destination is not None and not isinstance(destination, Path):
@@ -807,6 +867,7 @@ class Agent:
             artifact_id,
             destination,
             filename=filename,
+            caller_principal_id=caller_principal_id,
         )
 
     async def export_destination(self) -> ArtifactDestination:
@@ -891,11 +952,13 @@ class Agent:
         *,
         conversation_id: str | None = None,
         source_id: str | None = None,
+        caller_principal_id: str | None = None,
     ) -> LoopExit:
         return await self._embedded.accept_learning_candidate(
             candidate_id,
             conversation_id=conversation_id,
             source_id=source_id,
+            caller_principal_id=caller_principal_id,
         )
 
     async def clear_rejected_learning_candidates(self) -> int:
@@ -965,15 +1028,24 @@ class Agent:
     async def delete_skill(self, name: str) -> bool:
         return await self._embedded.delete_skill(name)
 
+    async def store_mcp_bearer(self, credential: str) -> SecretReference:
+        """Store a local MCP bearer credential; return only its secret reference."""
+        return await self._embedded.store_mcp_bearer(credential)
+
+    async def delete_mcp_bearer(self, reference: SecretReference) -> None:
+        await self._embedded.delete_mcp_bearer(reference)
+
     async def inspect_mcp_server(
         self,
         *,
         endpoint: str,
         authentication: MCPAuthentication | None = None,
+        caller_principal_id: str | None = None,
     ) -> MCPServerInspection:
         return await self._embedded.inspect_mcp_server(
             endpoint=endpoint,
             authentication=authentication,
+            caller_principal_id=caller_principal_id,
         )
 
     async def attach_mcp_server(
@@ -985,6 +1057,7 @@ class Agent:
         maximum_outbound_sensitivity: ModelSensitivity = ModelSensitivity.INTERNAL,
         local_label: str | None = None,
         binding_id: str | None = None,
+        caller_principal_id: str | None = None,
     ) -> MCPBindingStatus:
         """Admit exact locally classified tools; actions default to per-call approval.
 
@@ -998,6 +1071,7 @@ class Agent:
             maximum_outbound_sensitivity=maximum_outbound_sensitivity,
             local_label=local_label,
             binding_id=binding_id,
+            caller_principal_id=caller_principal_id,
         )
 
     async def update_mcp_discovery(
@@ -1007,10 +1081,15 @@ class Agent:
         summary: str,
         when_to_use: str,
         keywords: tuple[str, ...] = (),
+        caller_principal_id: str | None = None,
     ) -> MCPServerBinding:
-        """Edit local hints; reopened MCP discovery uses them without a new admission revision."""
+        """Edit local hints without changing the execution admission revision."""
         return await self._embedded.update_mcp_discovery(
-            binding_id, summary=summary, when_to_use=when_to_use, keywords=keywords
+            binding_id,
+            summary=summary,
+            when_to_use=when_to_use,
+            keywords=keywords,
+            caller_principal_id=caller_principal_id,
         )
 
     async def update_source_discovery(
@@ -1025,14 +1104,26 @@ class Agent:
             source_id, summary=summary, when_to_use=when_to_use, keywords=keywords
         )
 
-    async def list_mcp_servers(self) -> tuple[MCPBindingStatus, ...]:
-        return await self._embedded.list_mcp_servers()
+    async def list_mcp_servers(
+        self, *, caller_principal_id: str | None = None
+    ) -> tuple[MCPBindingStatus, ...]:
+        return await self._embedded.list_mcp_servers(
+            caller_principal_id=caller_principal_id
+        )
 
-    async def refresh_mcp_server(self, binding_id: str) -> MCPBindingStatus:
-        return await self._embedded.refresh_mcp_server(binding_id)
+    async def refresh_mcp_server(
+        self, binding_id: str, *, caller_principal_id: str | None = None
+    ) -> MCPBindingStatus:
+        return await self._embedded.refresh_mcp_server(
+            binding_id, caller_principal_id=caller_principal_id
+        )
 
-    async def revoke_mcp_server(self, binding_id: str) -> MCPBindingStatus:
-        return await self._embedded.revoke_mcp_server(binding_id)
+    async def revoke_mcp_server(
+        self, binding_id: str, *, caller_principal_id: str | None = None
+    ) -> MCPBindingStatus:
+        return await self._embedded.revoke_mcp_server(
+            binding_id, caller_principal_id=caller_principal_id
+        )
 
     async def attach(self, source: ResourceSource) -> SourceRegistration:
         return await self._embedded.attach(source)

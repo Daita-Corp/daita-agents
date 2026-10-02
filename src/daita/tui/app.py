@@ -1014,26 +1014,8 @@ class DaitaApp(App[int]):
 
     async def _complete_mcp_screen(self, result: str | None) -> None:
         chat = self.chat()
-        if result == "reopen":
-            await self.controller.reopen_agent(
-                observer=self._observer,
-                approval_handler=self.handle_approval,
-            )
-            self._reset_context_usage()
-            if chat is not None:
-                statuses = await self.controller.list_mcp_servers()
-                if any(status.reopen_required for status in statuses):
-                    chat.show_notice(
-                        "The agent runtime restarted, but some MCP tools could not "
-                        "be activated. Open /mcp to review their status."
-                    )
-                else:
-                    chat.show_notice("MCP tools activated.")
-        elif result == "restart_required" and chat is not None:
-            chat.show_notice(
-                "MCP changes saved. Restart the agent runtime from /mcp before "
-                "using the changed tools."
-            )
+        if result == "active" and chat is not None:
+            chat.show_notice("MCP tools activated.")
         await self._refresh_status()
 
     def _edit_document(self, seed: str) -> str:

@@ -67,12 +67,20 @@ async def test_acceptance_uses_fresh_foreground_approval_and_marks_only_on_succe
         workspace=workspace_for(tmp_path),
     )
     try:
-        await agent.run("Remember that booked revenue excludes completed refunds.")
+        await agent.run(
+            "Remember that booked revenue excludes completed refunds.",
+            caller_principal_id="alice",
+        )
         review = await agent.review_learning_candidates()
         candidate_id = review.candidates[0].candidate.id
 
-        result = await agent.accept_learning_candidate(candidate_id)
+        result = await agent.accept_learning_candidate(
+            candidate_id, caller_principal_id="alice"
+        )
         assert result.kind.value == "completed"
+        assert (
+            await agent.transcript(result.run_id, caller_principal_id="alice")
+        ).run.caller_principal_id == "alice"
         assert await agent.read_memory() == content
         accepted = await agent.read_learning_candidate(candidate_id)
         assert accepted is not None

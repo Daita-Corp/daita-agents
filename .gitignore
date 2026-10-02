@@ -53,6 +53,9 @@ coverage.xml
 test-results/
 cover/
 
+# Private live-service reports, transcripts, summaries, and disposable homes
+/live-evidence/
+
 # Translations
 *.mo
 *.pot

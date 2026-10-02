@@ -294,10 +294,7 @@ class RoutineOwner:
             ) from error
 
     def bind_capability_registry(self, capabilities: CapabilityRegistry) -> None:
-        """Bind the one complete immutable registry during composition."""
-
-        if self._capabilities is not None:
-            raise RuntimeError("routine owner capability registry is already bound")
+        """Bind the host's complete immutable registry between executions."""
         if not isinstance(capabilities, CapabilityRegistry):
             raise TypeError("routine owner requires CapabilityRegistry")
         self._capabilities = capabilities

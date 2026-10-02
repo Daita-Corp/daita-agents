@@ -7,11 +7,19 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC
 from hashlib import sha256
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
+
+if TYPE_CHECKING:
+    from .adapters.mcp import MCPServerBinding, MCPToolBinding
 
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import ArtifactDestination, artifact_destination_to_mapping
-from .capabilities import OperationalEffect, ToolLoadMode
+from .capabilities import (
+    AccessMode,
+    CapabilityRegistry,
+    OperationalEffect,
+    ToolLoadMode,
+)
 from .capability_runtime import (
     EffectReceiptStore,
     RunToolCatalog,
@@ -61,6 +69,7 @@ from .domains.data.file_capabilities import (
     LOCAL_FILE_SEARCH_CAPABILITY_ID,
 )
 from .domains.data.profile_jobs import START_DATA_PROFILE_CAPABILITY_ID
+from .domains.mcp import MCP_DOMAIN_OWNER_ID, MCP_OUTPUT_KIND
 from .jobs.capabilities import (
     JOB_CANCEL_CAPABILITY_ID,
     JOB_INSPECT_CAPABILITY_ID,
@@ -125,6 +134,7 @@ _HISTORICAL_ANSWER_EDGE_UTF8_BYTES = 256
 # A full-evidence upgrade must remain independently small; continuity retains
 # priority even when the aggregate history window has unused space.
 _MAXIMUM_FULL_HISTORY_TURN_UTF8_BYTES = 4_096
+_MAXIMUM_MCP_HISTORY_PREVIEW_UTF8_BYTES = 2_048
 _CATALOG_EVIDENCE_KINDS = frozenset(
     {
         CATALOG_SEARCH_EVIDENCE_KIND,
@@ -1626,6 +1636,10 @@ def _project_completed_history(
     runs: tuple[ConversationRun, ...],
     *,
     older_history_exists: bool = False,
+    capabilities: CapabilityRegistry | None = None,
+    mcp_tool_contract: (
+        Callable[[str], tuple[MCPServerBinding, MCPToolBinding] | None] | None
+    ) = None,
 ) -> tuple[CanonicalMessage, ...]:
     """Project one bounded completed tail without mutating durable transcripts."""
 
@@ -1634,6 +1648,8 @@ def _project_completed_history(
         _historical_turn_projection(
             item.transcript.run.id,
             item.transcript.messages,
+            capabilities=capabilities,
+            mcp_tool_contract=mcp_tool_contract,
         )
         for item in eligible
     ]
@@ -1676,17 +1692,26 @@ def _project_completed_history(
 def _historical_turn_projection(
     run_id: str,
     messages: tuple[CanonicalMessage, ...],
+    *,
+    capabilities: CapabilityRegistry | None = None,
+    mcp_tool_contract: (
+        Callable[[str], tuple[MCPServerBinding, MCPToolBinding] | None] | None
+    ) = None,
 ) -> _HistoricalTurnProjection:
     continuity, continuity_omitted, _ = _project_historical_turn(
         run_id,
         messages,
         continuity=True,
+        capabilities=capabilities,
+        mcp_tool_contract=mcp_tool_contract,
     )
     continuity, bounded_omitted = _bound_continuity_turn(continuity)
     full_candidate, full_omitted, useful_full = _project_historical_turn(
         run_id,
         messages,
         continuity=False,
+        capabilities=capabilities,
+        mcp_tool_contract=mcp_tool_contract,
     )
     full: tuple[CanonicalMessage, ...] | None = full_candidate
     if (
@@ -1762,6 +1787,10 @@ def _project_historical_turn(
     messages: tuple[CanonicalMessage, ...],
     *,
     continuity: bool,
+    capabilities: CapabilityRegistry | None = None,
+    mcp_tool_contract: (
+        Callable[[str], tuple[MCPServerBinding, MCPToolBinding] | None] | None
+    ) = None,
 ) -> tuple[tuple[CanonicalMessage, ...], bool, bool]:
     results_by_call_id: dict[str, list[ToolResultBlock]] = {}
     for historical_message in messages:
@@ -1785,6 +1814,9 @@ def _project_historical_turn(
                     call,
                     result,
                     continuity=continuity,
+                    capabilities=capabilities,
+                    mcp_tool_contract=mcp_tool_contract,
+                    already_projected=run_id is None,
                 )
                 if output is None:
                     omitted = True
@@ -1803,7 +1835,11 @@ def _project_historical_turn(
                     ToolCall(
                         id=rewritten_id,
                         name=call.name,
-                        arguments=_redacted_arguments(call),
+                        arguments=(
+                            {"redacted": "historical MCP arguments omitted"}
+                            if result.output.get("kind") == MCP_OUTPUT_KIND
+                            else _redacted_arguments(call)
+                        ),
                         provider_call_id=None,
                     )
                 )
@@ -1881,6 +1917,11 @@ def _project_historical_result(
     block: ToolResultBlock,
     *,
     continuity: bool,
+    capabilities: CapabilityRegistry | None = None,
+    mcp_tool_contract: (
+        Callable[[str], tuple[MCPServerBinding, MCPToolBinding] | None] | None
+    ) = None,
+    already_projected: bool = False,
 ) -> tuple[Mapping[str, object] | None, bool, bool]:
     if call.name in _SIDE_EFFECT_TOOL_NAMES or _approval_related_result(block):
         return None, True, False
@@ -1988,6 +2029,12 @@ def _project_historical_result(
                 "limitations",
             ),
         )
+    elif kind == MCP_OUTPUT_KIND:
+        if not _historical_mcp_read(
+            call, block, capabilities, mcp_tool_contract, already_projected
+        ):
+            return None, True, False
+        compact = _compact_historical_mcp_read(data)
     else:
         return None, True, False
     compact_output: dict[str, object] = {
@@ -2007,6 +2054,130 @@ def _project_historical_result(
         "data": data,
     }
     return full_output, False, full_output != compact_output
+
+
+def _historical_mcp_read(
+    call: ToolCall,
+    block: ToolResultBlock,
+    capabilities: CapabilityRegistry | None,
+    mcp_tool_contract: (
+        Callable[[str], tuple[MCPServerBinding, MCPToolBinding] | None] | None
+    ),
+    already_projected: bool,
+) -> bool:
+    if already_projected:
+        # Only the host-created historical envelope reaches this second pass.
+        # Raw domain results cannot produce these top-level projection fields.
+        return (
+            set(block.output) == {"kind", "historical_projection", "state", "data"}
+            and block.output.get("historical_projection") in {"continuity", "full"}
+            and block.output.get("state") == "success"
+        )
+    if (
+        capabilities is None
+        or mcp_tool_contract is None
+        or set(block.output) != {"kind", "data"}
+    ):
+        return False
+    try:
+        capability = capabilities.tool_capability(call.name)
+        owner = capabilities.resolve_domain_owner(capability.id)
+    except KeyError:
+        return False
+    if (
+        owner != MCP_DOMAIN_OWNER_ID
+        or capability.output_kind != MCP_OUTPUT_KIND
+        or capability.access_mode is not AccessMode.READ
+        or capability.operational_effect is not OperationalEffect.NONE
+        or block.capability_id != capability.id
+        or block.executor_id != capability.executor_id
+        or block.sensitivity is None
+        or block.output_sha256
+        != "sha256:" + sha256(canonical_json(block.output).encode("utf-8")).hexdigest()
+    ):
+        return False
+    data = block.output.get("data")
+    if not isinstance(data, Mapping) or set(data) not in (
+        {"text", "provenance"},
+        {"text", "structured", "provenance"},
+    ):
+        return False
+    admitted = mcp_tool_contract(capability.id)
+    if admitted is None:
+        return False
+    binding, tool = admitted
+    if (
+        tool.capability_id != capability.id
+        or tool.executor_id != capability.executor_id
+        or tool.local_name != call.name
+        or tool.access_mode is not capability.access_mode
+        or tool.operational_effect is not capability.operational_effect
+    ):
+        return False
+    provenance = data.get("provenance")
+    expected = {
+        "binding_id": binding.binding_id,
+        "binding_revision": binding.revision,
+        "remote_tool_name": tool.remote_name,
+        "input_schema_digest": tool.input_schema_digest,
+        "output_schema_digest": tool.output_schema_digest or "none",
+        "call_id": call.id,
+    }
+    return (
+        isinstance(provenance, Mapping)
+        and all(provenance.get(key) == value for key, value in expected.items())
+        and block.sensitivity_provenance.get("authority")
+        == "mcp_binding_admission_and_run_floor"
+        and block.sensitivity_provenance.get("binding_id") == binding.binding_id
+        and block.sensitivity_provenance.get("binding_revision") == binding.revision
+        and block.sensitivity_provenance.get("capability_id") == capability.id
+    )
+
+
+def _compact_historical_mcp_read(data: Mapping[str, object]) -> dict[str, object]:
+    if "historical_bounds" in data:
+        return dict(data)  # Idempotent when the context fitter projects it again.
+    text = data.get("text")
+    if not isinstance(text, (tuple, list)) or any(
+        not isinstance(item, str) for item in text
+    ):
+        return {
+            "provenance": data.get("provenance"),
+            "historical_bounds": {"content_omitted": True},
+        }
+    structured = data.get("structured")
+    preview = "\n".join(text)
+    structured_as_text = not preview and isinstance(structured, Mapping)
+    if structured_as_text:
+        preview = canonical_json(structured)
+    encoded = preview.encode("utf-8")
+    candidate = preview
+    if (
+        len(canonical_json(candidate).encode("utf-8"))
+        > _MAXIMUM_MCP_HISTORY_PREVIEW_UTF8_BYTES
+    ):
+        low, high = 0, len(encoded)
+        while low <= high:
+            middle = (low + high) // 2
+            proposed = encoded[:middle].decode("utf-8", errors="ignore")
+            if (
+                len(canonical_json(proposed).encode("utf-8"))
+                <= _MAXIMUM_MCP_HISTORY_PREVIEW_UTF8_BYTES
+            ):
+                candidate = proposed
+                low = middle + 1
+            else:
+                high = middle - 1
+    return {
+        "provenance": data.get("provenance"),
+        "text": (candidate,) if candidate else (),
+        "historical_bounds": {
+            "preview_format": "json_text" if structured_as_text else "text",
+            "original_utf8_bytes": len(encoded),
+            "preview_truncated": candidate != preview,
+            "structured_omitted": structured is not None,
+        },
+    }
 
 
 def _selected_result_fields(

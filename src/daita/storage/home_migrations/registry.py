@@ -9,8 +9,9 @@ from ..schema_contract import require_healthy, require_schema
 from .models import HomeMigration
 from .revision_0001 import REVISION_1
 from .revision_0002 import REVISION_2
+from .revision_0003 import REVISION_3
 
-HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2)
+HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2, REVISION_3)
 CURRENT_HOME_REVISION = HOME_MIGRATIONS[-1].revision
 # Production revisions in this inclusive range upgrade automatically. The
 # one preproduction bridge is admitted separately by revision 1.
@@ -39,7 +40,7 @@ def _require_registry() -> None:
         raise RuntimeError("agent-home migration revisions must be contiguous")
     if len({item.migration_id for item in HOME_MIGRATIONS}) != len(HOME_MIGRATIONS):
         raise RuntimeError("agent-home migration IDs must be unique")
-    if tuple(item.checksum for item in HOME_MIGRATIONS) != _RELEASED_CHECKSUMS:
+    if tuple(item.checksum for item in HOME_MIGRATIONS[:2]) != _RELEASED_CHECKSUMS:
         raise RuntimeError(
             "a released agent-home migration changed; append a new revision instead"
         )

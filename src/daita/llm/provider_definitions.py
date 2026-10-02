@@ -8,10 +8,27 @@ from dataclasses import dataclass
 from enum import Enum
 from types import MappingProxyType
 
+from .._json_schema import PROJECTED_SCHEMA_KEYWORDS
 from .models import ModelRequest
 from .protocols import ManagedModelProvider
 
 _PROVIDER_NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+_PORTABLE_TOOL_KEYWORDS = frozenset(
+    {
+        "type",
+        "enum",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "minItems",
+        "maxItems",
+    }
+)
 
 
 class AuthenticationMode(str, Enum):
@@ -55,6 +72,8 @@ class ProviderDefinition:
     default_endpoint: str | None = None
     subscription_client: str | None = None
     subscription_login_command: str | None = None
+    tool_schema_keywords: frozenset[str] = _PORTABLE_TOOL_KEYWORDS
+    tool_schema_nullable_types: bool = False
 
     @property
     def requires_saved_credential(self) -> bool:
@@ -204,6 +223,8 @@ PROVIDER_DEFINITIONS = (
         False,
         True,
         False,
+        tool_schema_keywords=PROJECTED_SCHEMA_KEYWORDS,
+        tool_schema_nullable_types=True,
     ),
     ProviderDefinition(
         "anthropic",
@@ -216,6 +237,8 @@ PROVIDER_DEFINITIONS = (
         False,
         True,
         False,
+        tool_schema_keywords=PROJECTED_SCHEMA_KEYWORDS,
+        tool_schema_nullable_types=True,
     ),
     ProviderDefinition(
         "gemini",
@@ -305,6 +328,50 @@ if len(_BY_ID) != len(PROVIDER_DEFINITIONS):
     raise RuntimeError("provider definitions contain duplicate IDs")
 
 BUILTIN_PROVIDER_IDS = frozenset(_BY_ID)
+
+
+def tool_schema_incompatibility(
+    schema: Mapping[str, object], model_ids: tuple[str, ...]
+) -> str | None:
+    """Check every route candidate without weakening the external contract.
+
+    OpenAI non-strict parameters and Anthropic input_schema pass reviewed JSON
+    Schema assertions intact. Other and custom adapters retain the conservative
+    portable subset until their additional constructs have been reviewed.
+    """
+    for model_id in model_ids:
+        definition = _BY_ID.get(model_id.partition(":")[0])
+        keywords = (
+            _PORTABLE_TOOL_KEYWORDS
+            if definition is None
+            else definition.tool_schema_keywords
+        )
+        pending: list[object] = [schema]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, bool):
+                continue
+            if not isinstance(node, Mapping):
+                return f"model_schema_unsupported:{model_id}"
+            if set(node) - keywords:
+                return f"model_schema_unsupported:{model_id}:{sorted(set(node) - keywords)[0]}"
+            if isinstance(node.get("type"), (list, tuple)) and (
+                definition is None or not definition.tool_schema_nullable_types
+            ):
+                return f"model_schema_unsupported:{model_id}:nullable_type"
+            properties = node.get("properties")
+            if isinstance(properties, Mapping):
+                pending.extend(properties.values())
+            for key in ("items", "additionalProperties", "propertyNames"):
+                if key in node:
+                    pending.append(node[key])
+            for key in ("anyOf", "oneOf", "allOf"):
+                branches = node.get(key)
+                if isinstance(branches, (list, tuple)):
+                    pending.extend(branches)
+    return None
+
+
 SUBSCRIPTION_PROVIDER_IDS = frozenset(
     definition.id
     for definition in PROVIDER_DEFINITIONS

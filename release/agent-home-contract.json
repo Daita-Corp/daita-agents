@@ -118,6 +118,15 @@
         "definition": "Atomically replace revision-1 single-job and autonomous-follow-up state with the ratified durable adaptive task graph, preserving terminal evidence and converting only provably safe queued profiles to runnable graph work.",
         "migration_id": "0002_durable_adaptive_task_graph",
         "revision": 2
+      },
+      {
+        "affected_paths": [
+          "state.db"
+        ],
+        "checksum": "db1e58e2ed98008dcf9764ff9115d555e298820cf5d910d01adad4ce7ee398b3",
+        "definition": "Add caller provenance, opaque personal MCP connection claims and SDK protocol facts and exact external schema contracts while preserving released revision-2 identities, grants, receipts and data.",
+        "migration_id": "0003_framework_caller_authority",
+        "revision": 3
       }
     ],
     "sqlite_record_fields": {
@@ -635,9 +644,14 @@
       ],
       "MCPServerBinding": [
         "endpoint",
+        "owner_principal_id",
         "authentication_mode",
         "secret_reference",
+        "connection_id",
+        "resource_uri",
+        "required_scopes",
         "protocol_version",
+        "protocol_capabilities_digest",
         "server_name",
         "server_version",
         "local_label",
@@ -666,6 +680,7 @@
         "presentation_when_to_use",
         "presentation_keywords",
         "input_schema",
+        "raw_input_schema",
         "input_schema_digest",
         "output_schema",
         "output_schema_digest",
@@ -820,6 +835,8 @@
       "RunInput": [
         "id",
         "agent_id",
+        "caller_principal_id",
+        "caller_principal_verified",
         "message",
         "created_at",
         "conversation_id",
@@ -3893,8 +3910,8 @@
       }
     }
   },
-  "contract_sha256": "950510639b534b3a58c74369c7ad3b1e2b66c9dcc67a44204a770720f99a3660",
-  "home_revision": 2,
+  "contract_sha256": "14f38ce43329bf44937ae71bc76466f92d049d3d91ef673dff97222be78e30ea",
+  "home_revision": 3,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1
 }

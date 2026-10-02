@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast, runtime_checkable
 from urllib.parse import urlsplit, urlunsplit
 
 from .._installation import repair_guidance
 from .._json import FrozenJsonObject, canonical_json
-from .._version import __version__
+from .._json_schema import project_json_schema, validate_json_schema_value
 from ..capabilities import (
+    MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS,
+    MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS,
     AccessMode,
     AutomationEligibility,
     OperationalEffect,
@@ -28,12 +28,9 @@ from ..capabilities import (
 )
 from ..errors import DaitaError, ErrorRetryability
 from ..llm.models import ModelSensitivity
-from ..security import SecretProvider, SecretReference, SecretResolutionError
+from ..security import SecretProvider, SecretReference
 
-if TYPE_CHECKING:
-    import httpx
-
-MCP_SUPPORTED_PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18")
+MCP_SUPPORTED_PROTOCOL_VERSIONS = ("2026-07-28", "2025-11-25", "2025-06-18")
 MCP_MAX_SCHEMA_BYTES = 64 * 1_024
 MCP_MAX_SCHEMA_DEPTH = 12
 MCP_MAX_DISCOVERED_TOOLS = 256
@@ -49,39 +46,14 @@ MCP_MAX_RESULT_CONTENT_ITEMS = 32
 MCP_MAX_TEXT_CHARACTERS = 256 * 1_024
 MCP_REQUEST_TIMEOUT_SECONDS = 15.0
 
+if TYPE_CHECKING:
+    import httpx2
+
 _BINDING_ID = re.compile(r"mcp-binding-[0-9a-f]{32}\Z")
 _REMOTE_TOOL_NAME = re.compile(r"[^\s\x00-\x1f\x7f]{1,256}\Z")
 _LOCAL_ALIAS = re.compile(r"[a-z][a-z0-9_]{0,39}\Z")
 _SCHEMA_DIGEST = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _SERVER_IDENTITY = re.compile(r"[^\r\n\x00]{1,256}\Z")
-_JSON_SCHEMA_2020_12 = "https://json-schema.org/draft/2020-12/schema"
-_SCHEMA_ANNOTATION_KEYS = frozenset({"description", "title", "examples"})
-_SCHEMA_ROOT_KEYS = (
-    frozenset({"$schema", "type", "properties", "required", "additionalProperties"})
-    | _SCHEMA_ANNOTATION_KEYS
-)
-_SCHEMA_RULE_KEYS = (
-    frozenset(
-        {
-            "type",
-            "enum",
-            "minLength",
-            "maxLength",
-            "minimum",
-            "maximum",
-            "pattern",
-            "items",
-            "minItems",
-            "maxItems",
-            "uniqueItems",
-            "properties",
-            "required",
-            "additionalProperties",
-        }
-    )
-    | _SCHEMA_ANNOTATION_KEYS
-)
-_SCHEMA_TYPES = frozenset({"array", "boolean", "integer", "number", "object", "string"})
 
 
 class MCPTransportKind(str, Enum):
@@ -91,6 +63,7 @@ class MCPTransportKind(str, Enum):
 class MCPAuthenticationMode(str, Enum):
     NONE = "none"
     BEARER = "bearer"
+    PERSONAL_CONNECTION = "personal_connection"
 
 
 class MCPBindingState(str, Enum):
@@ -150,15 +123,73 @@ class MCPRemoteToolError(MCPError):
 class MCPAuthentication:
     mode: MCPAuthenticationMode
     secret_reference: SecretReference | None = None
+    connection_id: str | None = None
+    owner_principal_id: str | None = None
+    resource_uri: str | None = None
+    required_scopes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, MCPAuthenticationMode):
             raise TypeError("MCP authentication mode is invalid")
-        if self.mode is MCPAuthenticationMode.NONE:
+        if self.mode is MCPAuthenticationMode.PERSONAL_CONNECTION:
             if self.secret_reference is not None:
-                raise ValueError("no-auth MCP configuration cannot contain a secret")
-        elif not isinstance(self.secret_reference, SecretReference):
-            raise ValueError("bearer MCP authentication requires a secret reference")
+                raise ValueError("personal MCP authentication cannot contain a secret")
+            for value, label in (
+                (self.connection_id, "connection ID"),
+                (self.owner_principal_id, "owner principal"),
+                (self.resource_uri, "resource URI"),
+            ):
+                if (
+                    not isinstance(value, str)
+                    or not value
+                    or len(value) > 512
+                    or any(character in value for character in "\r\n\x00")
+                ):
+                    raise ValueError(f"personal MCP {label} is invalid")
+            if (
+                not isinstance(self.required_scopes, tuple)
+                or len(self.required_scopes) > 64
+            ):
+                raise ValueError("personal MCP scopes are invalid")
+            if len(set(self.required_scopes)) != len(self.required_scopes) or any(
+                not isinstance(scope, str)
+                or not scope
+                or len(scope) > 256
+                or any(character in scope for character in "\r\n\x00")
+                for scope in self.required_scopes
+            ):
+                raise ValueError("personal MCP scopes are invalid")
+            resource = urlsplit(self.resource_uri or "")
+            if (
+                resource.scheme != "https"
+                or not resource.hostname
+                or resource.username is not None
+                or resource.password is not None
+                or resource.query
+                or resource.fragment
+            ):
+                raise ValueError("personal MCP resource URI must be HTTPS")
+        else:
+            if any(
+                (
+                    self.connection_id,
+                    self.owner_principal_id,
+                    self.resource_uri,
+                    self.required_scopes,
+                )
+            ):
+                raise ValueError(
+                    "non-personal MCP authentication cannot name a connection"
+                )
+            if self.mode is MCPAuthenticationMode.NONE:
+                if self.secret_reference is not None:
+                    raise ValueError(
+                        "no-auth MCP configuration cannot contain a secret"
+                    )
+            elif not isinstance(self.secret_reference, SecretReference):
+                raise ValueError(
+                    "bearer MCP authentication requires a secret reference"
+                )
 
     @classmethod
     def no_auth(cls) -> MCPAuthentication:
@@ -168,14 +199,98 @@ class MCPAuthentication:
     def bearer(cls, reference: SecretReference) -> MCPAuthentication:
         return cls(MCPAuthenticationMode.BEARER, reference)
 
+    @classmethod
+    def personal_connection(
+        cls,
+        connection_id: str,
+        owner_principal_id: str,
+        resource_uri: str,
+        required_scopes: tuple[str, ...] = (),
+    ) -> MCPAuthentication:
+        return cls(
+            MCPAuthenticationMode.PERSONAL_CONNECTION,
+            connection_id=connection_id,
+            owner_principal_id=owner_principal_id,
+            resource_uri=resource_uri,
+            required_scopes=required_scopes,
+        )
+
+
+class MCPConnectionProvider(Protocol):
+    """Host-owned personal connection policy and per-request credential source.
+
+    Implementations must raise MCPAuthenticationError with one of the four
+    connection status codes and never include credential material in errors.
+    """
+
+    async def check_access(
+        self,
+        *,
+        connection_id: str,
+        principal_id: str,
+        resource_uri: str,
+        required_scopes: tuple[str, ...],
+    ) -> None: ...
+
+    async def access_token(
+        self,
+        *,
+        connection_id: str,
+        principal_id: str,
+        resource_uri: str,
+        required_scopes: tuple[str, ...],
+    ) -> str: ...
+
+
+_PERSONAL_STATUS_MESSAGES = {
+    "needs_authorization": "The personal MCP connection needs authorization.",
+    "needs_scope_upgrade": "The personal MCP connection needs additional scope.",
+    "connection_revoked": "The personal MCP connection was revoked.",
+    "account_unavailable": "The personal MCP account is unavailable.",
+}
+
+
+async def check_personal_connection(
+    authentication: MCPAuthentication,
+    provider: MCPConnectionProvider | None,
+    principal_id: str | None,
+) -> None:
+    if authentication.mode is not MCPAuthenticationMode.PERSONAL_CONNECTION:
+        return
+    if principal_id != authentication.owner_principal_id or provider is None:
+        raise MCPAuthenticationError(
+            "needs_authorization", _PERSONAL_STATUS_MESSAGES["needs_authorization"]
+        )
+    assert authentication.connection_id is not None
+    assert authentication.resource_uri is not None
+    assert principal_id is not None
+    try:
+        await provider.check_access(
+            connection_id=authentication.connection_id,
+            principal_id=principal_id,
+            resource_uri=authentication.resource_uri,
+            required_scopes=authentication.required_scopes,
+        )
+    except MCPAuthenticationError as error:
+        code = (
+            error.code
+            if error.code in _PERSONAL_STATUS_MESSAGES
+            else "account_unavailable"
+        )
+        raise MCPAuthenticationError(code, _PERSONAL_STATUS_MESSAGES[code]) from None
+    except Exception:
+        raise MCPAuthenticationError(
+            "account_unavailable", _PERSONAL_STATUS_MESSAGES["account_unavailable"]
+        ) from None
+
 
 @dataclass(frozen=True, slots=True)
 class MCPToolSelection:
     """Local admission facts for one exact tool, independent of remote hints."""
 
     remote_name: str
-    local_alias: str
-    description: str
+    local_alias: str | None = None
+    description: str | None = None
     summary: str | None = None
     when_to_use: str | None = None
     keywords: tuple[str, ...] = ()
@@ -188,16 +303,28 @@ class MCPToolSelection:
 
     def __post_init__(self) -> None:
         _remote_tool_name(self.remote_name)
-        if (
+        if self.local_alias is not None and (
             not isinstance(self.local_alias, str)
             or _LOCAL_ALIAS.fullmatch(self.local_alias) is None
         ):
             raise ValueError(
                 "MCP local_alias must use lowercase letters, digits, and underscores"
             )
-        _bounded_text(self.description, "MCP tool description", maximum=1_024)
-        summary = self.description if self.summary is None else self.summary
-        when_to_use = self.description if self.when_to_use is None else self.when_to_use
+        if self.description is not None:
+            _bounded_text(self.description, "MCP tool description", maximum=1_024)
+        fallback = (
+            self.description or f"Use the admitted MCP tool {self.remote_name}."
+        ).strip()
+        summary = (
+            fallback[:MAX_TOOL_PRESENTATION_SUMMARY_CHARACTERS].rstrip()
+            if self.summary is None
+            else self.summary
+        )
+        when_to_use = (
+            fallback[:MAX_TOOL_PRESENTATION_GUIDANCE_CHARACTERS].rstrip()
+            if self.when_to_use is None
+            else self.when_to_use
+        )
         presentation = ToolPresentation(
             toolbox_id=ToolboxId.SOURCES,
             load_mode=ToolLoadMode.ON_DEMAND,
@@ -206,8 +333,10 @@ class MCPToolSelection:
             when_to_use=when_to_use,
             keywords=self.keywords,
         )
-        object.__setattr__(self, "summary", presentation.summary)
-        object.__setattr__(self, "when_to_use", presentation.when_to_use)
+        if self.description is not None or self.summary is not None:
+            object.__setattr__(self, "summary", presentation.summary)
+        if self.description is not None or self.when_to_use is not None:
+            object.__setattr__(self, "when_to_use", presentation.when_to_use)
         object.__setattr__(self, "keywords", presentation.keywords)
         if not isinstance(self.result_sensitivity, ModelSensitivity):
             raise TypeError("MCP result_sensitivity is invalid")
@@ -229,6 +358,67 @@ class MCPToolSelection:
             self.completion_semantics,
         )
 
+    @staticmethod
+    def generated_aliases(remote_names: tuple[str, ...]) -> tuple[str, ...]:
+        """Generate bounded aliases with order-independent collision handling."""
+        bases = tuple(
+            re.sub(r"[^a-z0-9]+", "_", name.casefold()).strip("_") or "remote_tool"
+            for name in remote_names
+        )
+        bases = tuple(
+            (base if base[0].isalpha() else "tool_" + base)[:40].rstrip("_")
+            for base in bases
+        )
+        return tuple(
+            (
+                base
+                if bases.count(base) == 1
+                else base[:31].rstrip("_") + "_" + sha256(name.encode()).hexdigest()[:8]
+            )
+            for name, base in zip(remote_names, bases, strict=True)
+        )
+
+    @staticmethod
+    def resolve(
+        selections: tuple[MCPToolSelection, ...],
+        inspection: MCPServerInspection,
+        prior: MCPServerBinding | None = None,
+    ) -> tuple[MCPToolSelection, ...]:
+        """Resolve presentation defaults once for API, CLI and TUI admission."""
+        names = tuple(tool.remote_name for tool in inspection.tools)
+        aliases = dict(
+            zip(names, MCPToolSelection.generated_aliases(names), strict=True)
+        )
+        inspected = {tool.remote_name: tool for tool in inspection.tools}
+        previous = (
+            {} if prior is None else {tool.remote_name: tool for tool in prior.tools}
+        )
+        resolved = []
+        for item in selections:
+            tool = inspected.get(item.remote_name)
+            old = previous.get(item.remote_name)
+            description = item.description or (
+                old.description
+                if old is not None
+                else (
+                    tool.remote_description.strip()[:1_024].rstrip()
+                    if tool is not None and tool.remote_description
+                    else f"Use the admitted MCP tool {item.remote_name}."
+                )
+            )
+            if not description:
+                description = f"Use the admitted MCP tool {item.remote_name}."
+            alias = item.local_alias or (
+                old.local_name.split("_", 2)[2]
+                if old is not None
+                else aliases.get(
+                    item.remote_name,
+                    MCPToolSelection.generated_aliases((item.remote_name,))[0],
+                )
+            )
+            resolved.append(replace(item, local_alias=alias, description=description))
+        return tuple(resolved)
+
 
 @dataclass(frozen=True, slots=True)
 class MCPInspectedTool:
@@ -241,6 +431,7 @@ class MCPInspectedTool:
     supported: bool
     unsupported_reason: str | None = None
     task_support: str = "forbidden"
+    raw_input_schema: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
         _remote_tool_name(self.remote_name)
@@ -259,6 +450,7 @@ class MCPInspectedTool:
             self.input_schema_digest,
             self.output_schema,
             self.output_schema_digest,
+            self.raw_input_schema,
         )
         if self.supported:
             if self.input_schema is None or self.input_schema_digest is None:
@@ -282,17 +474,25 @@ class MCPInspectedTool:
 class MCPServerInspection:
     endpoint: str
     protocol_version: str
-    server_name: str
-    server_version: str
+    server_name: str | None
+    server_version: str | None
     tools: tuple[MCPInspectedTool, ...]
     observed_at: datetime
+    protocol_capabilities_digest: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "endpoint", normalize_mcp_endpoint(self.endpoint))
         if self.protocol_version not in MCP_SUPPORTED_PROTOCOL_VERSIONS:
             raise ValueError("MCP inspection protocol version is unsupported")
-        _server_identity(self.server_name, "MCP server name")
-        _server_identity(self.server_version, "MCP server version")
+        if self.server_name is not None:
+            _server_identity(self.server_name, "MCP server name")
+        if self.server_version is not None:
+            _server_identity(self.server_version, "MCP server version")
+        if (
+            self.protocol_capabilities_digest is not None
+            and _SCHEMA_DIGEST.fullmatch(self.protocol_capabilities_digest) is None
+        ):
+            raise ValueError("MCP protocol capabilities digest is invalid")
         tools = tuple(self.tools)
         if len(tools) > MCP_MAX_DISCOVERED_TOOLS:
             raise ValueError("MCP inspection contains too many tools")
@@ -327,6 +527,7 @@ class MCPToolBinding:
     maximum_outbound_sensitivity: ModelSensitivity
     completion_semantics: MCPCompletionSemantics
     task_support: str
+    raw_input_schema: FrozenJsonObject | None = None
 
     def __post_init__(self) -> None:
         _validate_local_admission(
@@ -369,6 +570,14 @@ class MCPToolBinding:
                 "input_schema",
                 FrozenJsonObject.from_mapping(self.input_schema),
             )
+        if self.raw_input_schema is not None and not isinstance(
+            self.raw_input_schema, FrozenJsonObject
+        ):
+            object.__setattr__(
+                self,
+                "raw_input_schema",
+                FrozenJsonObject.from_mapping(self.raw_input_schema),
+            )
         for digest in (self.input_schema_digest, self.output_schema_digest):
             if digest is not None and _SCHEMA_DIGEST.fullmatch(digest) is None:
                 raise ValueError("MCP tool schema digest is invalid")
@@ -385,8 +594,8 @@ class MCPServerBinding:
     endpoint: str
     authentication: MCPAuthentication
     protocol_version: str
-    server_name: str
-    server_version: str
+    server_name: str | None
+    server_version: str | None
     local_label: str
     maximum_outbound_sensitivity: ModelSensitivity
     tools: tuple[MCPToolBinding, ...]
@@ -399,6 +608,8 @@ class MCPServerBinding:
     summary: str = ""
     when_to_use: str = ""
     keywords: tuple[str, ...] = ()
+    owner_principal_id: str | None = None
+    protocol_capabilities_digest: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -407,13 +618,28 @@ class MCPServerBinding:
         ):
             raise ValueError("MCP binding_id must use mcp-binding-<32 lowercase hex>")
         _bounded_text(self.agent_id, "MCP agent_id", maximum=256)
-        object.__setattr__(self, "endpoint", normalize_mcp_endpoint(self.endpoint))
         if not isinstance(self.authentication, MCPAuthentication):
             raise TypeError("MCP binding authentication is invalid")
+        owner = self.owner_principal_id or self.agent_id
+        _bounded_text(owner, "MCP owner principal", maximum=512)
+        if self.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION and (
+            self.authentication.owner_principal_id != owner
+        ):
+            raise ValueError("personal MCP connection owner differs from binding owner")
+        object.__setattr__(self, "owner_principal_id", owner)
+        object.__setattr__(self, "endpoint", normalize_mcp_endpoint(self.endpoint))
+        _require_personal_resource_origin(self.endpoint, self.authentication)
         if self.protocol_version not in MCP_SUPPORTED_PROTOCOL_VERSIONS:
             raise ValueError("MCP binding protocol version is unsupported")
-        _server_identity(self.server_name, "MCP server name")
-        _server_identity(self.server_version, "MCP server version")
+        if self.server_name is not None:
+            _server_identity(self.server_name, "MCP server name")
+        if self.server_version is not None:
+            _server_identity(self.server_version, "MCP server version")
+        if (
+            self.protocol_capabilities_digest is not None
+            and _SCHEMA_DIGEST.fullmatch(self.protocol_capabilities_digest) is None
+        ):
+            raise ValueError("MCP protocol capabilities digest is invalid")
         _bounded_text(self.local_label, "MCP local server label", maximum=128)
         object.__setattr__(
             self,
@@ -534,6 +760,15 @@ def mcp_execution_origin_digest(binding: MCPServerBinding, tool: MCPToolBinding)
         "completion_semantics": tool.completion_semantics.value,
         "task_support": tool.task_support,
     }
+    if binding.authentication.mode is MCPAuthenticationMode.PERSONAL_CONNECTION:
+        material.update(
+            owner_principal_id=binding.owner_principal_id,
+            connection_id=binding.authentication.connection_id,
+            resource_uri=binding.authentication.resource_uri,
+            required_scopes=binding.authentication.required_scopes,
+        )
+    if binding.protocol_capabilities_digest is not None:
+        material["protocol_capabilities_digest"] = binding.protocol_capabilities_digest
     return "sha256:" + sha256(canonical_json(material).encode("utf-8")).hexdigest()
 
 
@@ -594,6 +829,14 @@ class MCPToolResult:
 
 
 class MCPClient(Protocol):
+    """One endpoint's protocol client, owned and closed by its factory's caller.
+
+    Inspection must fetch current remote contracts without a tools/list cache.
+    A tool call sends at most one tools/call and never continues an input-required
+    or asynchronous result. Operations have finite bounds, propagate cancellation
+    and use MCPError for safe failures. close is terminal and idempotent.
+    """
+
     async def inspect(self, *, observed_at: datetime) -> MCPServerInspection: ...
 
     async def call_tool(
@@ -605,7 +848,36 @@ class MCPClient(Protocol):
     async def close(self) -> None: ...
 
 
+@runtime_checkable
+class MCPProtocolPinnedClient(MCPClient, Protocol):
+    """Optional client extension for an already admitted protocol version."""
+
+    def bind_protocol(self, protocol_version: str) -> None:
+        """Pin once before first use; never renegotiate into another era."""
+        ...
+
+
+@runtime_checkable
+class MCPPersonalConnectionClient(MCPClient, Protocol):
+    """Optional client extension for an exact host-owned personal connection."""
+
+    def bind_personal_connection(
+        self, provider: MCPConnectionProvider, principal_id: str
+    ) -> None:
+        """Bind once before first use; resolve credentials only per request."""
+        ...
+
+
 class MCPClientFactory(Protocol):
+    """Supported construction seam for Agent.create and Agent.open.
+
+    create performs no network or credential I/O and returns a new independently
+    owned client. Agent retains the factory but closes every client it creates,
+    including temporary inspection clients and clients rejected before use.
+    No-auth and bearer clients need only MCPClient; personal clients additionally
+    implement MCPPersonalConnectionClient.
+    """
+
     def create(
         self,
         *,
@@ -615,13 +887,17 @@ class MCPClientFactory(Protocol):
     ) -> MCPClient: ...
 
 
-class StreamableHTTPMCPClientFactory:
-    """Create clients that all use the same production protocol boundary."""
+class SDKMCPClientFactory:
+    """Configure the sole built-in SDK client without importing its integration.
+
+    Agent uses this factory by default. http_transport is an SDK-specific httpx2
+    test or transport configuration option, outside MCPClientFactory's contract.
+    """
 
     def __init__(
         self,
         *,
-        http_transport: object | None = None,
+        http_transport: httpx2.AsyncBaseTransport | None = None,
         timeout_seconds: float = MCP_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         if (
@@ -630,8 +906,8 @@ class StreamableHTTPMCPClientFactory:
             or not 0 < float(timeout_seconds) <= 60
         ):
             raise ValueError("MCP timeout must be positive and at most 60 seconds")
-        self._http_transport = http_transport
-        self._timeout_seconds = float(timeout_seconds)
+        self._transport = http_transport
+        self._timeout = float(timeout_seconds)
 
     def create(
         self,
@@ -640,499 +916,19 @@ class StreamableHTTPMCPClientFactory:
         authentication: MCPAuthentication,
         secrets: SecretProvider,
     ) -> MCPClient:
-        return StreamableHTTPMCPClient(
+        try:
+            from .mcp_sdk import SDKMCPClient
+        except ImportError as error:
+            raise ImportError(
+                "The MCP SDK integration is unavailable. " + repair_guidance()
+            ) from error
+        return SDKMCPClient(
             endpoint=endpoint,
             authentication=authentication,
             secrets=secrets,
-            http_transport=self._http_transport,
-            timeout_seconds=self._timeout_seconds,
+            http_transport=self._transport,
+            timeout_seconds=self._timeout,
         )
-
-
-class StreamableHTTPMCPClient:
-    """Small JSON-RPC client for the accepted remote Streamable HTTP surface."""
-
-    def __init__(
-        self,
-        *,
-        endpoint: str,
-        authentication: MCPAuthentication,
-        secrets: SecretProvider,
-        http_transport: object | None = None,
-        timeout_seconds: float = MCP_REQUEST_TIMEOUT_SECONDS,
-    ) -> None:
-        self.endpoint = normalize_mcp_endpoint(endpoint)
-        if not isinstance(authentication, MCPAuthentication):
-            raise TypeError("MCP authentication is invalid")
-        if not isinstance(secrets, SecretProvider):
-            raise TypeError("MCP secrets must implement SecretProvider")
-        self._authentication = authentication
-        self._secrets = secrets
-        self._http_transport = http_transport
-        self._timeout_seconds = timeout_seconds
-        self._http_client: httpx.AsyncClient | None = None
-        self._protocol_version: str | None = None
-        self._server_name: str | None = None
-        self._server_version: str | None = None
-        self._session_id: str | None = None
-        self._request_id = 0
-        self._initialize_lock = asyncio.Lock()
-        self._closed = False
-
-    async def inspect(self, *, observed_at: datetime) -> MCPServerInspection:
-        _aware(observed_at, "MCP observed_at")
-        await self._initialize()
-        tools: list[MCPInspectedTool] = []
-        cursor: str | None = None
-        seen_cursors: set[str] = set()
-        for _page in range(MCP_MAX_DISCOVERY_PAGES):
-            params = {} if cursor is None else {"cursor": cursor}
-            result = await self._request("tools/list", params)
-            raw_tools = result.get("tools")
-            if not isinstance(raw_tools, (tuple, list)):
-                raise MCPProtocolError(
-                    "mcp_protocol_invalid",
-                    "The MCP server returned an invalid tool list.",
-                )
-            for raw_tool in raw_tools:
-                tools.append(_inspect_tool(raw_tool))
-                if len(tools) > MCP_MAX_DISCOVERED_TOOLS:
-                    raise MCPProtocolError(
-                        "mcp_discovery_limit",
-                        "The MCP server advertised more tools than the fixed bound.",
-                    )
-            next_cursor = result.get("nextCursor")
-            if next_cursor is None:
-                break
-            if (
-                not isinstance(next_cursor, str)
-                or not next_cursor
-                or len(next_cursor) > 1_024
-                or next_cursor in seen_cursors
-            ):
-                raise MCPProtocolError(
-                    "mcp_protocol_invalid",
-                    "The MCP server returned an invalid pagination cursor.",
-                )
-            seen_cursors.add(next_cursor)
-            cursor = next_cursor
-        else:
-            raise MCPProtocolError(
-                "mcp_discovery_limit",
-                "The MCP server tool list exceeded the fixed page bound.",
-            )
-        assert self._protocol_version is not None
-        assert self._server_name is not None
-        assert self._server_version is not None
-        try:
-            return MCPServerInspection(
-                endpoint=self.endpoint,
-                protocol_version=self._protocol_version,
-                server_name=self._server_name,
-                server_version=self._server_version,
-                tools=tuple(tools),
-                observed_at=observed_at,
-            )
-        except ValueError as error:
-            raise MCPProtocolError(
-                "mcp_protocol_invalid",
-                "The MCP server returned invalid bounded identity or tool metadata.",
-            ) from error
-
-    async def call_tool(
-        self,
-        remote_name: str,
-        arguments: Mapping[str, object],
-    ) -> MCPToolResult:
-        _remote_tool_name(remote_name)
-        frozen_arguments = FrozenJsonObject.from_mapping(arguments)
-        result = await self._request(
-            "tools/call",
-            {"name": remote_name, "arguments": frozen_arguments.to_dict()},
-        )
-        # CreateTaskResult is protocol-level acceptance, not a CallToolResult.
-        # No task augmentation is sent and no task/result polling is supported.
-        if "task" in result:
-            task = result["task"]
-            handle = task.get("taskId") if isinstance(task, Mapping) else None
-            if (
-                not isinstance(handle, str)
-                or not handle
-                or len(handle) > 256
-                or "\x00" in handle
-            ):
-                raise MCPProtocolError(
-                    "mcp_result_malformed", "The MCP task acceptance handle is invalid."
-                )
-            return MCPToolResult(accepted_async=True, operation_handle=handle)
-        content = result.get("content")
-        if not isinstance(content, (tuple, list)):
-            raise MCPProtocolError(
-                "mcp_result_malformed",
-                "The MCP server returned a malformed tool result.",
-            )
-        if len(content) > MCP_MAX_RESULT_CONTENT_ITEMS:
-            raise MCPProtocolError(
-                "mcp_result_unsupported",
-                "The MCP tool result contains too many content items.",
-            )
-        texts: list[str] = []
-        for block in content:
-            if not isinstance(block, Mapping) or block.get("type") != "text":
-                raise MCPProtocolError(
-                    "mcp_result_unsupported",
-                    "The MCP tool result contains an unsupported content type.",
-                )
-            text = block.get("text")
-            if not isinstance(text, str) or len(text) > MCP_MAX_TEXT_CHARACTERS:
-                raise MCPProtocolError(
-                    "mcp_result_too_large",
-                    "The MCP tool result text exceeded its fixed bound.",
-                )
-            texts.append(text)
-        structured_raw = result.get("structuredContent")
-        if structured_raw is not None and not isinstance(structured_raw, Mapping):
-            raise MCPProtocolError(
-                "mcp_result_malformed",
-                "The MCP structured result must be a JSON object.",
-            )
-        is_error = result.get("isError", False)
-        if not isinstance(is_error, bool):
-            raise MCPProtocolError(
-                "mcp_result_malformed",
-                "The MCP tool error indicator is invalid.",
-            )
-        return MCPToolResult(
-            text=tuple(texts),
-            structured=(
-                None
-                if structured_raw is None
-                else FrozenJsonObject.from_mapping(structured_raw)
-            ),
-            is_error=is_error,
-        )
-
-    async def close(self) -> None:
-        self._closed = True
-        client = self._http_client
-        self._http_client = None
-        if client is not None:
-            await client.aclose()
-
-    async def _initialize(self) -> None:
-        if self._protocol_version is not None:
-            return
-        async with self._initialize_lock:
-            if self._protocol_version is not None:
-                return
-            request_id = self._next_request_id()
-            result, headers = await self._post_request(
-                {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": MCP_SUPPORTED_PROTOCOL_VERSIONS[0],
-                        "capabilities": {},
-                        "clientInfo": {"name": "daita", "version": __version__},
-                    },
-                },
-                include_protocol=False,
-                expected_id=request_id,
-            )
-            version = result.get("protocolVersion")
-            server_info = result.get("serverInfo")
-            capabilities = result.get("capabilities")
-            if (
-                version not in MCP_SUPPORTED_PROTOCOL_VERSIONS
-                or not isinstance(server_info, Mapping)
-                or not isinstance(capabilities, Mapping)
-                or not isinstance(capabilities.get("tools"), Mapping)
-            ):
-                raise MCPProtocolError(
-                    "mcp_protocol_unsupported",
-                    "The MCP server does not fit the supported protocol surface.",
-                )
-            name = server_info.get("name")
-            server_version = server_info.get("version")
-            try:
-                _server_identity(cast(str, name), "MCP server name")
-                _server_identity(
-                    cast(str, server_version),
-                    "MCP server version",
-                )
-            except (TypeError, ValueError):
-                raise MCPProtocolError(
-                    "mcp_protocol_invalid",
-                    "The MCP server identity is invalid.",
-                ) from None
-            session_id = headers.get("mcp-session-id")
-            if session_id is not None and (
-                not isinstance(session_id, str)
-                or not session_id
-                or len(session_id) > 1_024
-                or any(character in session_id for character in "\r\n\x00")
-            ):
-                raise MCPProtocolError(
-                    "mcp_protocol_invalid",
-                    "The MCP server session identity is invalid.",
-                )
-            self._protocol_version = cast(str, version)
-            self._server_name = cast(str, name)
-            self._server_version = cast(str, server_version)
-            self._session_id = session_id
-            try:
-                await self._post_notification("notifications/initialized", {})
-            except BaseException:
-                self._protocol_version = None
-                self._server_name = None
-                self._server_version = None
-                self._session_id = None
-                raise
-
-    async def _request(
-        self,
-        method: str,
-        params: Mapping[str, object],
-    ) -> FrozenJsonObject:
-        await self._initialize()
-        request_id = self._next_request_id()
-        result, _headers = await self._post_request(
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": method,
-                "params": dict(params),
-            },
-            include_protocol=True,
-            expected_id=request_id,
-        )
-        return FrozenJsonObject.from_mapping(result)
-
-    async def _post_notification(
-        self,
-        method: str,
-        params: Mapping[str, object],
-    ) -> None:
-        await self._post(
-            {
-                "jsonrpc": "2.0",
-                "method": method,
-                "params": dict(params),
-            },
-            include_protocol=True,
-            expect_response=False,
-        )
-
-    async def _post_request(
-        self,
-        payload: Mapping[str, object],
-        *,
-        include_protocol: bool,
-        expected_id: int | None = None,
-    ) -> tuple[Mapping[str, object], Mapping[str, str]]:
-        response, headers = await self._post(
-            payload,
-            include_protocol=include_protocol,
-            expect_response=True,
-        )
-        if not isinstance(response, Mapping):
-            raise MCPProtocolError(
-                "mcp_protocol_invalid",
-                "The MCP server returned malformed JSON-RPC data.",
-            )
-        if response.get("jsonrpc") != "2.0":
-            raise MCPProtocolError(
-                "mcp_protocol_invalid",
-                "The MCP server returned an invalid JSON-RPC version.",
-            )
-        if expected_id is not None and response.get("id") != expected_id:
-            raise MCPProtocolError(
-                "mcp_protocol_invalid",
-                "The MCP server returned a mismatched response identity.",
-            )
-        error = response.get("error")
-        if error is not None:
-            raise MCPProtocolError(
-                "mcp_remote_protocol_error",
-                "The MCP server rejected the protocol request.",
-            )
-        result = response.get("result")
-        if not isinstance(result, Mapping):
-            raise MCPProtocolError(
-                "mcp_protocol_invalid",
-                "The MCP server response omitted a result object.",
-            )
-        return result, headers
-
-    async def _post(
-        self,
-        payload: Mapping[str, object],
-        *,
-        include_protocol: bool,
-        expect_response: bool,
-    ) -> tuple[object, Mapping[str, str]]:
-        if self._closed:
-            raise MCPTransportError(
-                "mcp_client_closed",
-                "The MCP client is closed.",
-            )
-        client = self._client()
-        encoded_payload = json.dumps(
-            dict(payload),
-            ensure_ascii=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        if len(encoded_payload) > MCP_MAX_REQUEST_BYTES:
-            raise MCPProtocolError(
-                "mcp_request_too_large",
-                "The MCP request exceeded its fixed byte bound.",
-            )
-        headers = {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json",
-        }
-        if include_protocol:
-            assert self._protocol_version is not None
-            headers["MCP-Protocol-Version"] = self._protocol_version
-            if self._session_id is not None:
-                headers["Mcp-Session-Id"] = self._session_id
-        if self._authentication.mode is MCPAuthenticationMode.BEARER:
-            assert self._authentication.secret_reference is not None
-            try:
-                token = await self._secrets.resolve(
-                    self._authentication.secret_reference
-                )
-            except SecretResolutionError as error:
-                raise MCPAuthenticationError(
-                    "mcp_authentication_failed",
-                    "The MCP bearer credential is unavailable.",
-                ) from error
-            if (
-                not isinstance(token, str)
-                or not token
-                or len(token.encode("utf-8")) > 64 * 1_024
-                or "\r" in token
-                or "\n" in token
-            ):
-                raise MCPAuthenticationError(
-                    "mcp_authentication_failed",
-                    "The MCP bearer credential is invalid.",
-                )
-            headers["Authorization"] = f"Bearer {token}"
-        body_parts: list[bytes] = []
-        response_too_large = False
-        try:
-            async with asyncio.timeout(self._timeout_seconds):
-                async with client.stream(
-                    "POST",
-                    self.endpoint,
-                    content=encoded_payload,
-                    headers=headers,
-                ) as response:
-                    status = int(response.status_code)
-                    response_headers = {
-                        key.lower(): value for key, value in response.headers.items()
-                    }
-                    response_size = 0
-                    async for part in response.aiter_bytes():
-                        response_size += len(part)
-                        if response_size > MCP_MAX_RESPONSE_BYTES:
-                            response_too_large = True
-                            break
-                        body_parts.append(part)
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            raise MCPTransportError(
-                "mcp_timeout",
-                "The MCP request exceeded its fixed timeout.",
-                retryability=ErrorRetryability.TRANSIENT,
-            ) from None
-        except Exception:
-            raise MCPTransportError(
-                "mcp_transport_failed",
-                "The MCP endpoint could not be reached.",
-                retryability=ErrorRetryability.TRANSIENT,
-            ) from None
-        if response_too_large:
-            raise MCPProtocolError(
-                "mcp_response_too_large",
-                "The MCP response exceeded its fixed byte bound.",
-            )
-        if status in {401, 403}:
-            raise MCPAuthenticationError(
-                "mcp_authentication_failed",
-                "The MCP endpoint rejected the configured authentication.",
-            )
-        if 300 <= status < 400:
-            raise MCPTransportError(
-                "mcp_redirect_rejected",
-                "The MCP endpoint attempted a redirect.",
-            )
-        if status >= 400:
-            raise MCPTransportError(
-                "mcp_http_error",
-                "The MCP endpoint returned an unsuccessful HTTP status.",
-                {"status": status},
-                retryability=(
-                    ErrorRetryability.TRANSIENT
-                    if status >= 500
-                    else ErrorRetryability.PERMANENT
-                ),
-            )
-        body = b"".join(body_parts)
-        if not expect_response:
-            if status != 202 or body:
-                raise MCPProtocolError(
-                    "mcp_protocol_invalid",
-                    "The MCP server returned an invalid notification response.",
-                )
-            return {}, response_headers
-        content_type = response_headers.get("content-type", "").split(";", 1)[0]
-        try:
-            if content_type == "application/json":
-                decoded = json.loads(body)
-            elif content_type == "text/event-stream":
-                decoded = _decode_sse_response(body)
-            else:
-                raise MCPProtocolError(
-                    "mcp_content_type_unsupported",
-                    "The MCP endpoint returned an unsupported content type.",
-                )
-        except MCPError:
-            raise
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError):
-            raise MCPProtocolError(
-                "mcp_protocol_invalid",
-                "The MCP endpoint returned malformed protocol data.",
-            ) from None
-        if _json_depth(decoded) > MCP_MAX_SCHEMA_DEPTH + 8:
-            raise MCPProtocolError(
-                "mcp_response_too_deep",
-                "The MCP response exceeded its fixed nesting bound.",
-            )
-        return decoded, response_headers
-
-    def _client(self) -> httpx.AsyncClient:
-        if self._http_client is None:
-            try:
-                import httpx
-            except ImportError:
-                raise ImportError(
-                    "Daita's remote MCP runtime dependency is unavailable. "
-                    f"{repair_guidance()}"
-                ) from None
-            self._http_client = httpx.AsyncClient(
-                follow_redirects=False,
-                transport=cast(Any, self._http_transport),
-                timeout=None,
-            )
-        return self._http_client
-
-    def _next_request_id(self) -> int:
-        self._request_id += 1
-        return self._request_id
 
 
 def normalize_mcp_endpoint(value: str) -> str:
@@ -1159,6 +955,26 @@ def normalize_mcp_endpoint(value: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
 
+def _require_personal_resource_origin(
+    endpoint: str, authentication: MCPAuthentication
+) -> None:
+    if authentication.mode is not MCPAuthenticationMode.PERSONAL_CONNECTION:
+        return
+    assert authentication.resource_uri is not None
+    target = urlsplit(endpoint)
+    resource = urlsplit(authentication.resource_uri)
+    try:
+        same_origin = (
+            target.scheme == resource.scheme == "https"
+            and target.hostname == resource.hostname
+            and (target.port or 443) == (resource.port or 443)
+        )
+    except ValueError:
+        same_origin = False
+    if not same_origin:
+        raise ValueError("personal MCP resource and endpoint origins differ")
+
+
 def mcp_binding_from_inspection(
     *,
     binding_id: str,
@@ -1169,6 +985,7 @@ def mcp_binding_from_inspection(
     inspection: MCPServerInspection,
     local_label: str | None = None,
     prior: MCPServerBinding | None = None,
+    owner_principal_id: str | None = None,
 ) -> MCPServerBinding:
     if prior is not None:
         if prior.binding_id != binding_id or prior.agent_id != agent_id:
@@ -1176,10 +993,12 @@ def mcp_binding_from_inspection(
                 "mcp_binding_identity_mismatch",
                 "The existing MCP binding belongs to another identity.",
             )
-        if (
-            prior.endpoint != inspection.endpoint
-            or prior.server_name != inspection.server_name
-        ):
+        if prior.owner_principal_id != (owner_principal_id or agent_id):
+            raise MCPAdmissionError(
+                "mcp_binding_identity_mismatch",
+                "The existing MCP binding belongs to another caller.",
+            )
+        if prior.endpoint != inspection.endpoint:
             raise MCPAdmissionError(
                 "mcp_binding_remote_changed",
                 "An existing MCP binding cannot be redirected to another remote "
@@ -1192,7 +1011,7 @@ def mcp_binding_from_inspection(
                     "observed_server_name": inspection.server_name,
                 },
             )
-    selections = tuple(selections)
+    selections = MCPToolSelection.resolve(tuple(selections), inspection, prior)
     resolved_local_label = (
         prior.local_label
         if local_label is None and prior is not None
@@ -1251,7 +1070,7 @@ def mcp_binding_from_inspection(
                 executor_id=executor_id,
                 local_name=local_name,
                 remote_name=selection.remote_name,
-                description=selection.description,
+                description=cast(str, selection.description),
                 presentation=ToolPresentation(
                     toolbox_id=ToolboxId.SOURCES,
                     load_mode=ToolLoadMode.ON_DEMAND,
@@ -1261,6 +1080,7 @@ def mcp_binding_from_inspection(
                     keywords=selection.keywords,
                 ),
                 input_schema=inspected.input_schema,
+                raw_input_schema=inspected.raw_input_schema,
                 input_schema_digest=inspected.input_schema_digest,
                 output_schema=inspected.output_schema,
                 output_schema_digest=inspected.output_schema_digest,
@@ -1285,6 +1105,7 @@ def mcp_binding_from_inspection(
         protocol_version=inspection.protocol_version,
         server_name=inspection.server_name,
         server_version=inspection.server_version,
+        protocol_capabilities_digest=inspection.protocol_capabilities_digest,
         local_label=resolved_local_label,
         maximum_outbound_sensitivity=maximum_outbound_sensitivity,
         tools=tuple(tools),
@@ -1295,6 +1116,7 @@ def mcp_binding_from_inspection(
         summary="" if prior is None else prior.summary,
         when_to_use="" if prior is None else prior.when_to_use,
         keywords=() if prior is None else prior.keywords,
+        owner_principal_id=owner_principal_id or agent_id,
     )
 
 
@@ -1314,10 +1136,21 @@ def mcp_binding_drift_reason(
     if inspection.protocol_version != binding.protocol_version:
         return "protocol_version_changed"
     if (
-        inspection.server_name != binding.server_name
-        or inspection.server_version != binding.server_version
+        inspection.server_name is not None
+        and binding.server_name is not None
+        and inspection.server_name != binding.server_name
+    ) or (
+        inspection.server_version is not None
+        and binding.server_version is not None
+        and inspection.server_version != binding.server_version
     ):
         return "server_identity_changed"
+    if (
+        binding.protocol_capabilities_digest is not None
+        and inspection.protocol_capabilities_digest
+        != binding.protocol_capabilities_digest
+    ):
+        return "protocol_capabilities_changed"
     discovered = {tool.remote_name: tool for tool in inspection.tools}
     for accepted in binding.tools:
         current = discovered.get(accepted.remote_name)
@@ -1338,15 +1171,13 @@ def mcp_binding_drift_reason(
 def canonical_mcp_schema(
     schema: Mapping[str, object],
 ) -> tuple[FrozenJsonObject, str]:
-    raw = FrozenJsonObject.from_mapping(schema)
-    encoded = canonical_json(raw).encode("utf-8")
-    if len(encoded) > MCP_MAX_SCHEMA_BYTES:
-        raise ValueError("schema exceeds the fixed byte bound")
-    if _json_depth(raw) > MCP_MAX_SCHEMA_DEPTH:
-        raise ValueError("schema exceeds the fixed depth bound")
-    _validate_schema_node(raw, root=True)
-    projected = FrozenJsonObject.from_mapping(_strip_schema_annotations(raw))
-    return projected, f"sha256:{sha256(encoded).hexdigest()}"
+    return project_json_schema(schema)
+
+
+async def validate_mcp_schema_value(
+    schema: Mapping[str, object], value: Mapping[str, object]
+) -> None:
+    await validate_json_schema_value(schema, value)
 
 
 def _inspect_tool(value: object) -> MCPInspectedTool:
@@ -1389,7 +1220,8 @@ def _inspect_tool(value: object) -> MCPInspectedTool:
         else:
             if not isinstance(output_raw, Mapping):
                 raise ValueError("output schema must be an object")
-            output_schema, output_digest = canonical_mcp_schema(output_raw)
+            _, output_digest = canonical_mcp_schema(output_raw)
+            output_schema = FrozenJsonObject.from_mapping(output_raw)
     except (TypeError, ValueError) as error:
         return MCPInspectedTool(
             remote_name=cast(str, name),
@@ -1410,6 +1242,7 @@ def _inspect_tool(value: object) -> MCPInspectedTool:
         output_schema_digest=output_digest,
         supported=True,
         task_support=cast(str, task_support),
+        raw_input_schema=FrozenJsonObject.from_mapping(input_raw),
     )
 
 
@@ -1447,145 +1280,6 @@ def _validate_local_admission(
         and eligibility is AutomationEligibility.AUTOMATION_DIRECT
     ):
         raise ValueError("MCP unattended asynchronous completion is unsupported")
-
-
-def _validate_schema_node(value: Mapping[str, object], *, root: bool) -> None:
-    allowed = _SCHEMA_ROOT_KEYS if root else _SCHEMA_RULE_KEYS
-    unsupported = sorted(set(value) - allowed)
-    if unsupported:
-        raise ValueError(f"unsupported schema keyword: {unsupported[0]}")
-    if root:
-        dialect = value.get("$schema")
-        if "$schema" in value and dialect != _JSON_SCHEMA_2020_12:
-            raise ValueError("schema dialect is unsupported")
-    schema_type = value.get("type")
-    if root and schema_type != "object":
-        raise ValueError("schema root must have type object")
-    if schema_type is not None and schema_type not in _SCHEMA_TYPES:
-        raise ValueError("schema type is unsupported")
-    for annotation in _SCHEMA_ANNOTATION_KEYS:
-        item = value.get(annotation)
-        if item is not None and annotation != "examples" and not isinstance(item, str):
-            raise ValueError(f"schema {annotation} must be text")
-    properties = value.get("properties", {})
-    if not isinstance(properties, Mapping):
-        raise ValueError("schema properties must be an object")
-    if len(properties) > 128:
-        raise ValueError("schema contains too many properties")
-    for name, rule in properties.items():
-        if (
-            not isinstance(name, str)
-            or not name
-            or len(name) > 128
-            or not isinstance(rule, Mapping)
-        ):
-            raise ValueError("schema property declaration is invalid")
-        _validate_schema_node(rule, root=False)
-    required = value.get("required", [])
-    if (
-        not isinstance(required, (tuple, list))
-        or any(not isinstance(name, str) for name in required)
-        or len(required) != len(set(required))
-        or any(name not in properties for name in required)
-    ):
-        raise ValueError("schema required entries are invalid")
-    additional = value.get("additionalProperties", True)
-    if not isinstance(additional, bool):
-        raise ValueError("schema additionalProperties must be a boolean")
-    items = value.get("items")
-    if items is not None:
-        if not isinstance(items, Mapping):
-            raise ValueError("schema items must be an object rule")
-        _validate_schema_node(items, root=False)
-    for key in ("minLength", "maxLength", "minItems", "maxItems"):
-        bound = value.get(key)
-        if bound is not None and (
-            not isinstance(bound, int) or isinstance(bound, bool) or bound < 0
-        ):
-            raise ValueError(f"schema {key} must be a non-negative integer")
-    for minimum, maximum in (
-        ("minLength", "maxLength"),
-        ("minItems", "maxItems"),
-        ("minimum", "maximum"),
-    ):
-        low = value.get(minimum)
-        high = value.get(maximum)
-        if (
-            low is not None
-            and high is not None
-            and cast(float, low) > cast(float, high)
-        ):
-            raise ValueError(f"schema {minimum} cannot exceed {maximum}")
-    for key in ("minimum", "maximum"):
-        bound = value.get(key)
-        if bound is not None and (
-            not isinstance(bound, (int, float)) or isinstance(bound, bool)
-        ):
-            raise ValueError(f"schema {key} must be numeric")
-    pattern = value.get("pattern")
-    if pattern is not None:
-        if not isinstance(pattern, str) or len(pattern) > 1_024:
-            raise ValueError("schema pattern is invalid")
-        try:
-            re.compile(pattern)
-        except re.error:
-            raise ValueError("schema pattern is invalid") from None
-    unique = value.get("uniqueItems")
-    if unique is not None and not isinstance(unique, bool):
-        raise ValueError("schema uniqueItems must be a boolean")
-    enum = value.get("enum")
-    if enum is not None:
-        if not isinstance(enum, (tuple, list)) or not enum or len(enum) > 128:
-            raise ValueError("schema enum must be a bounded non-empty array")
-        try:
-            FrozenJsonObject.from_mapping({"enum": enum})
-        except (TypeError, ValueError):
-            raise ValueError("schema enum contains unsupported JSON") from None
-
-
-def _strip_schema_annotations(value: Mapping[str, object]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, item in value.items():
-        if key in _SCHEMA_ANNOTATION_KEYS or key == "$schema":
-            continue
-        if key == "properties" and isinstance(item, Mapping):
-            result[key] = {
-                name: _strip_schema_annotations(rule)
-                for name, rule in item.items()
-                if isinstance(name, str) and isinstance(rule, Mapping)
-            }
-        elif key == "items" and isinstance(item, Mapping):
-            result[key] = _strip_schema_annotations(item)
-        else:
-            result[key] = item
-    return result
-
-
-def _decode_sse_response(body: bytes) -> object:
-    text = body.decode("utf-8")
-    events: list[object] = []
-    data_lines: list[str] = []
-    for line in text.splitlines() + [""]:
-        if not line:
-            if data_lines:
-                events.append(json.loads("\n".join(data_lines)))
-                data_lines.clear()
-            continue
-        if line.startswith(":") or line.startswith("event:") or line.startswith("id:"):
-            continue
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
-    if len(events) != 1:
-        raise ValueError("MCP SSE response must contain exactly one JSON-RPC result")
-    return events[0]
-
-
-def _json_depth(value: object) -> int:
-    if isinstance(value, Mapping):
-        return 1 + max((_json_depth(item) for item in value.values()), default=0)
-    if isinstance(value, (tuple, list)):
-        return 1 + max((_json_depth(item) for item in value), default=0)
-    return 0
 
 
 def _bounded_text(value: str, label: str, *, maximum: int) -> None:
@@ -1627,9 +1321,12 @@ __all__ = [
     "MCPClient",
     "MCPClientFactory",
     "MCPCompletionSemantics",
+    "MCPConnectionProvider",
     "MCPError",
     "MCPInspectedTool",
     "MCPProtocolError",
+    "MCPPersonalConnectionClient",
+    "MCPProtocolPinnedClient",
     "MCPRemoteToolError",
     "MCPServerBinding",
     "MCPServerInspection",
@@ -1642,8 +1339,7 @@ __all__ = [
     "MCP_MAX_ACTIVE_TOOLS_PER_AGENT",
     "MCP_MAX_BINDINGS_PER_AGENT",
     "MCP_MAX_REQUEST_BYTES",
-    "StreamableHTTPMCPClient",
-    "StreamableHTTPMCPClientFactory",
+    "SDKMCPClientFactory",
     "canonical_mcp_schema",
     "mcp_binding_drift_reason",
     "mcp_binding_from_inspection",

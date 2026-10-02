@@ -312,6 +312,12 @@ class CredentialSession:
             self._cache[reference] = value
             return value
 
+    async def resolve_uncached(self, reference: SecretReference) -> str:
+        """Resolve integration credentials afresh without changing native caches."""
+
+        self._require_open()
+        return await default_secret_provider(self._keychain).resolve(reference)
+
     async def set(self, reference: SecretReference, value: str) -> None:
         _keychain_reference(reference)
         self._require_open()

@@ -6,7 +6,53 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 
-import httpx
+import httpx2 as httpx
+
+from daita.llm.models import (
+    FinishReason,
+    ModelProfile,
+    ModelRequest,
+    ModelResponse,
+    ToolCall,
+)
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider
+
+
+class MCPBatchProvider(ToolboxAwareMockModelProvider):
+    """Script one admitted batch, optionally gating it before runtime dispatch."""
+
+    def __init__(
+        self, calls: tuple[ToolCall, ...], *, block_first_response: bool = False
+    ) -> None:
+        provider_id = "mock:mcp-batch"
+        super().__init__(
+            (
+                ModelResponse(finish_reason=FinishReason.TOOL_CALLS, tool_calls=calls),
+                ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+            ),
+            provider_id=provider_id,
+            model_profile=ModelProfile(
+                id=provider_id,
+                context_window_tokens=128_000,
+                max_output_tokens=8_192,
+                supports_tools=True,
+                supports_parallel_tools=True,
+            ),
+        )
+        self.calls = calls
+        self._batch_started = False
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+        if not block_first_response:
+            self.release.set()
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        response = await super().generate(request)
+        if not self._batch_started and response.tool_calls == self.calls:
+            self._batch_started = True
+            self.started.set()
+            await self.release.wait()
+        return response
 
 
 @dataclass
@@ -25,6 +71,7 @@ class MCPFixtureIdentity:
     malformed_method: str | None = None
     initialized_notification_failures: int = 0
     initialize_client_info: dict[str, object] | None = None
+    omit_server_info: bool = False
 
     @property
     def endpoint(self) -> str:
@@ -43,6 +90,11 @@ class MCPConformanceTransport:
         identity = self.identities.get(request.url.host)
         if identity is None:
             return httpx.Response(404, request=request)
+        if request.method == "GET":
+            return httpx.Response(405, request=request)
+        if request.method == "DELETE":
+            identity.closed_sessions += 1
+            return httpx.Response(204, request=request)
         if (
             identity.bearer_token is not None
             and request.headers.get("Authorization")
@@ -59,6 +111,28 @@ class MCPConformanceTransport:
                 content=b"{broken",
                 headers={"content-type": "application/json"},
                 request=request,
+            )
+        if method == "server/discover":
+            if identity.protocol_version != "2026-07-28":
+                return _error_response(request, payload["id"], -32601)
+            result: dict[str, object] = {
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {"listChanged": True}},
+                "resultType": "complete",
+                "ttlMs": 0,
+                "cacheScope": "public",
+            }
+            if not identity.omit_server_info:
+                result["_meta"] = {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": identity.server_name,
+                        "version": identity.server_version,
+                    }
+                }
+            return _json_response(
+                request,
+                payload["id"],
+                result,
             )
         if method == "notifications/initialized":
             if identity.initialized_notification_failures > 0:
@@ -88,10 +162,13 @@ class MCPConformanceTransport:
             identity.protocol_version
         )
         if method == "tools/list":
+            result = {"tools": identity.tools}
+            if identity.protocol_version == "2026-07-28":
+                result.update(resultType="complete", ttlMs=0, cacheScope="public")
             return _json_response(
                 request,
                 payload["id"],
-                {"tools": identity.tools},
+                result,
             )
         if method == "tools/call":
             if identity.block_calls is not None:
@@ -102,10 +179,12 @@ class MCPConformanceTransport:
             assert isinstance(name, str)
             assert isinstance(arguments, dict)
             identity.calls.append((name, arguments))
-            result = identity.results.get(name)
-            if result is None:
+            tool_result = identity.results.get(name)
+            if tool_result is None:
                 return _error_response(request, payload["id"], -32602)
-            return _json_response(request, payload["id"], result)
+            if identity.protocol_version == "2026-07-28":
+                tool_result = {"resultType": "complete", **tool_result}
+            return _json_response(request, payload["id"], tool_result)
         return _error_response(request, payload.get("id"), -32601)
 
 
@@ -235,3 +314,31 @@ class MappingSecretProvider:
         uri = reference.to_uri()
         self.resolutions.append(uri)
         return self.values[uri]
+
+
+class MemoryKeychain(MappingSecretProvider):
+    """Explicit local keychain boundary for offline setup and cleanup tests."""
+
+    def __init__(self) -> None:
+        super().__init__({})
+        self.deleted: list[str] = []
+
+    async def resolve(self, reference) -> str:
+        from daita.security.secrets import SecretResolutionError
+
+        if reference.scheme != "keychain":
+            raise SecretResolutionError(
+                "secret_scheme_unsupported", "Keychain references only."
+            )
+        if reference.to_uri() not in self.values:
+            raise SecretResolutionError(
+                "secret_not_found", "Credential is unavailable."
+            )
+        return await super().resolve(reference)
+
+    async def set(self, reference, value: str) -> None:
+        self.values[reference.to_uri()] = value
+
+    async def delete(self, reference) -> None:
+        self.deleted.append(reference.to_uri())
+        self.values.pop(reference.to_uri(), None)

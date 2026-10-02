@@ -272,8 +272,7 @@ class DataCapabilityDomain:
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
     def bind_capability_registry(self, registry: CapabilityRegistry) -> None:
-        if self._registry is not None:
-            raise ValueError("data registry is already bound")
+        registry.validate_declarations(self._declarations)
         self._registry = registry
 
     @property
@@ -1484,7 +1483,7 @@ class DataCapabilityDomain:
                         is not OperationalEffect.NONE
                     ):
                         continue
-                    self._registry.validate_arguments(
+                    await self._registry.validate_arguments_async(
                         result_capability.id, calls[block.call_id].arguments
                     )
                     result_data = block.output.get("data")

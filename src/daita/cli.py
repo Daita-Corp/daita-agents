@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import shlex
@@ -296,7 +297,11 @@ def _learning_candidate_mapping(
     return value
 
 
-def _mcp_authentication(bearer_env: str | None) -> MCPAuthentication:
+def _mcp_authentication(
+    bearer_env: str | None, bearer_ref: str | None = None
+) -> MCPAuthentication:
+    if bearer_ref is not None:
+        return MCPAuthentication.bearer(SecretReference.parse(bearer_ref))
     return (
         MCPAuthentication.no_auth()
         if bearer_env is None
@@ -429,14 +434,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     mcp_inspect.add_argument("name")
     mcp_inspect.add_argument("endpoint")
-    mcp_inspect.add_argument("--bearer-env")
+    inspect_auth = mcp_inspect.add_mutually_exclusive_group()
+    inspect_auth.add_argument("--bearer-env")
+    inspect_auth.add_argument("--bearer-ref", help="env:NAME or keychain:ACCOUNT")
+    inspect_auth.add_argument(
+        "--bearer-prompt", action="store_true", help="enter a masked token"
+    )
     mcp_attach = mcp_commands.add_parser(
         "attach",
-        help="admit exact read-only tools for activation on reopen",
+        help="admit and activate exact read-only tools",
     )
     mcp_attach.add_argument("name")
     mcp_attach.add_argument("endpoint")
-    mcp_attach.add_argument("--bearer-env")
+    attach_auth = mcp_attach.add_mutually_exclusive_group()
+    attach_auth.add_argument("--bearer-env")
+    attach_auth.add_argument("--bearer-ref", help="env:NAME or keychain:ACCOUNT")
+    attach_auth.add_argument(
+        "--bearer-prompt",
+        action="store_true",
+        help="enter and save a masked token in keychain",
+    )
     mcp_attach.add_argument("--binding-id")
     mcp_attach.add_argument(
         "--maximum-outbound-sensitivity",
@@ -446,10 +463,10 @@ def build_parser() -> argparse.ArgumentParser:
     mcp_attach.add_argument(
         "--tool",
         action="append",
-        nargs=4,
+        nargs="+",
         required=True,
-        metavar=("REMOTE", "ALIAS", "DESCRIPTION", "RESULT_SENSITIVITY"),
-        help="repeat for each exact read tool; quote descriptions containing spaces",
+        metavar="REMOTE",
+        help="repeat --tool REMOTE; optionally supply ALIAS DESCRIPTION RESULT_SENSITIVITY",
     )
     mcp_status = mcp_commands.add_parser("status", help="show bounded binding status")
     mcp_status.add_argument("name")
@@ -1915,6 +1932,7 @@ async def _execute(args: argparse.Namespace) -> object:
         root=args.root,
         approval_handler=_prompt_for_exact_approval,
     )
+    owned_mcp_credential: SecretReference | None = None
     try:
         if args.command == "effects":
             if args.effects_command == "list":
@@ -1964,27 +1982,44 @@ async def _execute(args: argparse.Namespace) -> object:
                 "name": registration.display_name,
             }
         if args.command == "mcp":
+            if args.mcp_command in {"inspect", "attach"}:
+                mcp_authentication = _mcp_authentication(
+                    args.bearer_env, args.bearer_ref
+                )
+                if args.bearer_prompt:
+                    credential = await asyncio.to_thread(
+                        getpass.getpass, "MCP bearer token: "
+                    )
+                    owned_mcp_credential = await agent.store_mcp_bearer(credential)
+                    credential = ""
+                    mcp_authentication = MCPAuthentication.bearer(owned_mcp_credential)
             if args.mcp_command == "inspect":
                 inspection = await agent.inspect_mcp_server(
                     endpoint=args.endpoint,
-                    authentication=_mcp_authentication(args.bearer_env),
+                    authentication=mcp_authentication,
                 )
                 return _mcp_inspection_mapping(inspection)
             if args.mcp_command == "attach":
+                if any(len(item) not in {1, 4} for item in args.tool):
+                    raise ValueError(
+                        "--tool requires REMOTE or REMOTE ALIAS DESCRIPTION RESULT_SENSITIVITY"
+                    )
                 selections = tuple(
-                    MCPToolSelection(
-                        remote_name=remote_name,
-                        local_alias=local_alias,
-                        description=description,
-                        result_sensitivity=ModelSensitivity(result_sensitivity),
+                    (
+                        MCPToolSelection(item[0])
+                        if len(item) == 1
+                        else MCPToolSelection(
+                            item[0],
+                            item[1],
+                            item[2],
+                            result_sensitivity=ModelSensitivity(item[3]),
+                        )
                     )
-                    for remote_name, local_alias, description, result_sensitivity in (
-                        args.tool
-                    )
+                    for item in args.tool
                 )
                 attached_status = await agent.attach_mcp_server(
                     endpoint=args.endpoint,
-                    authentication=_mcp_authentication(args.bearer_env),
+                    authentication=mcp_authentication,
                     maximum_outbound_sensitivity=ModelSensitivity(
                         args.maximum_outbound_sensitivity
                     ),
@@ -2225,7 +2260,14 @@ async def _execute(args: argparse.Namespace) -> object:
             for item in await agent.list_sources()
         ]
     finally:
-        await agent.close()
+        try:
+            if owned_mcp_credential is not None and not any(
+                status.binding.authentication.secret_reference == owned_mcp_credential
+                for status in await agent.list_mcp_servers()
+            ):
+                await agent.delete_mcp_bearer(owned_mcp_credential)
+        finally:
+            await agent.close()
 
 
 def _source_from_attach_args(

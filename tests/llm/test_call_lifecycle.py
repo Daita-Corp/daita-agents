@@ -389,6 +389,7 @@ async def test_five_nested_owners_share_one_cleanup_deadline():
 
     release = asyncio.Event()
     owners = [NativeOwner() for _ in range(5)]
+    settled = [asyncio.Event() for _ in range(4)]
     observed = []
     tasks = []
     start = asyncio.get_running_loop().time()
@@ -401,9 +402,12 @@ async def test_five_nested_owners_share_one_cleanup_deadline():
         else:
             native = asyncio.create_task(close(index + 1, deadline))
             tasks.append(native)
-            await await_cleanup(
-                native, deadline=shutdown_deadline(deadline), owner=owners[index]
-            )
+            try:
+                await await_cleanup(
+                    native, deadline=shutdown_deadline(deadline), owner=owners[index]
+                )
+            finally:
+                settled[index].set()
 
     root = asyncio.create_task(close(0, limit))
     try:
@@ -412,7 +416,14 @@ async def test_five_nested_owners_share_one_cleanup_deadline():
         assert caught.value.code is ProviderErrorCode.CLEANUP_TIMEOUT
         assert asyncio.get_running_loop().time() - start < 0.2
         assert observed == [limit] * 5
+        # The outer timeout can win before descendant supervisors resume. Join
+        # their bounded observations while the unresolved leaf stays blocked.
+        assert owners[-1].poisoned
+        await asyncio.wait_for(
+            asyncio.gather(*(event.wait() for event in settled)), timeout=1
+        )
         assert all(owner.poisoned for owner in owners)
+        assert not tasks[-1].done() and tasks[-1] in owners[-2].tasks
     finally:
         release.set()
         await asyncio.gather(root, *tasks, return_exceptions=True)

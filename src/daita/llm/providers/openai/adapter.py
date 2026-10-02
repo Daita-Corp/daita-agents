@@ -64,6 +64,68 @@ from .._fields import (
 )
 from .messages import _response_input
 
+# Arbitrary SDK error codes can echo credentials. Only reviewed public
+# categories leave this boundary; unknown codes may retain a bounded digest.
+_SDK_ERROR_TYPES = frozenset(
+    {
+        "APIError",
+        "APIConnectionError",
+        "APITimeoutError",
+        "APIStatusError",
+        "InternalServerError",
+        "RateLimitError",
+        "BadRequestError",
+        "AuthenticationError",
+        "PermissionDeniedError",
+        "NotFoundError",
+        "ConflictError",
+        "UnprocessableEntityError",
+        "APIResponseValidationError",
+    }
+)
+_QUOTA_ERROR_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+    }
+)
+_UPSTREAM_ERROR_CODES = _QUOTA_ERROR_CODES | frozenset(
+    {
+        "server_error",
+        "internal_server_error",
+        "rate_limit_exceeded",
+        "rate_limit_error",
+        "insufficient_quota",
+        "authentication_error",
+        "invalid_api_key",
+        "permission_denied",
+        "invalid_request_error",
+        "invalid_request",
+        "model_not_found",
+        "unknown_model",
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "content_policy_violation",
+        "content_blocked",
+        "timeout",
+        "request_timeout",
+        "slow_down",
+    }
+)
+_UPSTREAM_ERROR_TYPES = frozenset(
+    {
+        "server_error",
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "rate_limit_error",
+        "insufficient_quota",
+    }
+)
+
 
 class _ResponsesResource(Protocol):
     async def create(self, **kwargs: object) -> object: ...
@@ -263,8 +325,18 @@ class OpenAIResponsesProvider:
         except ModelProviderError:
             raise
         except Exception as error:
+            self._observe_failure(
+                attempt, error, phase="generation", origin="sdk_error"
+            )
             attempt.transport_failure(error, phase="generation")
             raise _normalize_error(error) from error
+        if _safe_field(response, "status") == "failed":
+            self._observe_failure(
+                attempt,
+                _safe_field(response, "error"),
+                phase="generation",
+                origin="failed_response",
+            )
         try:
             return with_request_admission(
                 self._decode_response(response, requested_at=requested_at),
@@ -332,6 +404,9 @@ class OpenAIResponsesProvider:
         except ModelProviderError:
             raise
         except Exception as error:
+            self._observe_failure(
+                attempt, error, phase="generation", origin="sdk_error"
+            )
             response = _safe_field(error, "response")
             if response is not None:
                 self._observe_headers(attempt, "generation", response, arrived=False)
@@ -355,10 +430,53 @@ class OpenAIResponsesProvider:
                 yield event
 
     @staticmethod
+    def _observe_failure(
+        attempt: AttemptLifecycle, error: object, *, phase: str, origin: str
+    ) -> None:
+        """Keep safe error facts before normalization detaches native exceptions."""
+        try:
+            if phase not in {"count", "generation"} or origin not in {
+                "sdk_error",
+                "stream_error",
+                "failed_response",
+            }:
+                return
+            attempt.values["upstream_error_origin"] = origin
+            attempt.values["upstream_error_phase"] = phase
+            if origin == "sdk_error":
+                name = type(error).__name__
+                attempt.values["sdk_error_type"] = (
+                    name if name in _SDK_ERROR_TYPES else "other"
+                )
+            code = _safe_field(error, "code")
+            attempt.values["upstream_error_code"] = (
+                code
+                if isinstance(code, str) and code in _UPSTREAM_ERROR_CODES
+                else "unrecognized"
+            )
+            attempt.values["upstream_error_code_digest"] = (
+                "sha256:" + sha256(code.encode("utf-8")).hexdigest()
+                if isinstance(code, str)
+                and code not in _UPSTREAM_ERROR_CODES
+                and len(code) <= 256
+                else None
+            )
+            error_type = _safe_field(error, "type")
+            attempt.values["upstream_error_type"] = (
+                error_type
+                if isinstance(error_type, str) and error_type in _UPSTREAM_ERROR_TYPES
+                else "unrecognized"
+            )
+        except Exception:
+            pass  # Optional diagnostics cannot change provider execution.
+
+    @staticmethod
     def _observe_headers(
         attempt: AttemptLifecycle, phase: str, response: object, *, arrived: bool = True
     ) -> None:
         try:
+            if response is None:
+                return
             headers = getattr(response, "headers", None)
             request_id = (
                 headers.get("x-request-id") if isinstance(headers, Mapping) else None
@@ -512,6 +630,7 @@ class OpenAIResponsesProvider:
         except (TypeError, ValueError):
             raise token_count_error(invalid=True) from None
         except Exception as error:
+            self._observe_failure(attempt, error, phase="count", origin="sdk_error")
             attempt.transport_failure(error, phase="count")
             raise before_generation(
                 _normalize_error(error),
@@ -543,6 +662,8 @@ class OpenAIResponsesProvider:
         if status == "failed":
             failure = _field(response, "error", None)
             code = _optional_text(_field(failure, "code", None), "response error code")
+            if _safe_field(failure, "type") == "insufficient_quota":
+                code = "insufficient_quota"
             raise ModelProviderError(
                 _code_from_provider_value(code),
                 "OpenAI reported a failed response",
@@ -845,6 +966,10 @@ def _normalize_error(error: Exception) -> ModelProviderError:
         else None
     )
     code = _optional_text(_field(error, "code", None), "provider error code")
+    error_type = _safe_field(error, "type")
+    quota_failure = code in _QUOTA_ERROR_CODES or (
+        isinstance(error_type, str) and error_type == "insufficient_quota"
+    )
     name = type(error).__name__.lower()
     if (
         isinstance(error, (asyncio.TimeoutError, TimeoutError))
@@ -854,7 +979,13 @@ def _normalize_error(error: Exception) -> ModelProviderError:
         normalized = ProviderErrorCode.TIMEOUT
     elif status in {401, 403} or "authentication" in name or "permission" in name:
         normalized = ProviderErrorCode.AUTHENTICATION_ERROR
-    elif status == 429 or "ratelimit" in name or "rate_limit" in name:
+    elif (
+        status == 429
+        or "ratelimit" in name
+        or "rate_limit" in name
+        or quota_failure
+        or code in {"rate_limit_error", "rate_limit_exceeded", "slow_down"}
+    ):
         normalized = ProviderErrorCode.RATE_LIMIT_ERROR
     elif status == 404 or code in {"model_not_found", "unknown_model"}:
         normalized = ProviderErrorCode.MODEL_NOT_FOUND
@@ -870,7 +1001,11 @@ def _normalize_error(error: Exception) -> ModelProviderError:
         normalized = ProviderErrorCode.PROVIDER_UNAVAILABLE
     return ModelProviderError(
         normalized,
-        f"OpenAI request failed: {normalized.value}",
+        (
+            "OpenAI API quota is exhausted or unavailable."
+            if quota_failure
+            else f"OpenAI request failed: {normalized.value}"
+        ),
         retry_after_seconds=(
             retry_after_from_headers(
                 _field(_field(error, "response", None), "headers", None)
@@ -888,7 +1023,11 @@ def _normalize_error(error: Exception) -> ModelProviderError:
 def _code_from_provider_value(value: str | None) -> ProviderErrorCode:
     if value in {"authentication_error", "invalid_api_key", "permission_denied"}:
         return ProviderErrorCode.AUTHENTICATION_ERROR
-    if value in {"rate_limit_error", "rate_limit_exceeded"}:
+    if value in _QUOTA_ERROR_CODES or value in {
+        "rate_limit_error",
+        "rate_limit_exceeded",
+        "slow_down",
+    }:
         return ProviderErrorCode.RATE_LIMIT_ERROR
     if value in {"context_length_exceeded", "context_window_exceeded"}:
         return ProviderErrorCode.CONTEXT_OVERFLOW

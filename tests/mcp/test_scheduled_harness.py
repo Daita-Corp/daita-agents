@@ -229,7 +229,7 @@ async def test_routine_setup_context_follows_working_set_and_actual_usage(tmp_pa
         assert model.provider_id not in texts[0]
         assert model.provider_id in texts[1]
         assert '"maximum_per_run_tokens":100000' in texts[1]
-        assert '"maximum_per_run_cost_usd":"0.15"' in texts[1]
+        assert '"maximum_per_run_cost_usd":"0.50"' in texts[1]
         assert "Routine authoring choices" not in texts[3]
         assert model.provider_id not in transcript.run.message
         for request in requests:
@@ -806,7 +806,7 @@ def test_scheduled_mcp_explicit_profile_preserves_strict_defaults(
         24,
         100_000,
         300,
-        Decimal("0.50") if selected == "user_flow" else Decimal("0.15"),
+        Decimal("0.50"),
     )
 
 

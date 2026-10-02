@@ -1795,13 +1795,11 @@ class ArtifactCapabilityDomain:
         return self._declarations
 
     def bind_capability_registry(self, registry: CapabilityRegistry) -> None:
-        """Bind the one immutable registry used to revalidate snapshot evidence."""
+        """Bind the host's current immutable registry between executions."""
 
         if not isinstance(registry, CapabilityRegistry):
             raise TypeError("artifact capability registry is invalid")
         registry.validate_declarations(self._declarations)
-        if self._registry is not None and self._registry is not registry:
-            raise ValueError("artifact capability registry is already bound")
         self._registry = registry
 
     async def project(
@@ -2125,7 +2123,7 @@ class ArtifactCapabilityDomain:
                     or block.output_sha256 != _sha256_json(block.output)
                 ):
                     raise ValueError("result execution lineage differs")
-                registry.validate_arguments(
+                await registry.validate_arguments_async(
                     producer_capability.id,
                     producer_call.arguments,
                 )

@@ -172,7 +172,7 @@ async def _wait_terminal(agent: Agent, job_id: str) -> GraphInspection:
     raise AssertionError("production graph did not reach a terminal state")
 
 
-async def test_public_agent_executes_graph_model_task_in_revision_2_home(
+async def test_public_agent_executes_graph_model_task_in_revision_3_home(
     tmp_path: Path,
 ) -> None:
     home = await create_probe_home(
@@ -193,7 +193,7 @@ async def test_public_agent_executes_graph_model_task_in_revision_2_home(
     )
     try:
         status = await Agent.inspect_home(home.name, root=home.root)
-        assert status.found_revision == status.current_revision == 2
+        assert status.found_revision == status.current_revision == 3
         foreground = await agent.run(
             "Start a durable graph query over all five exact resources.",
             source_scope_ids=(home.source_id,),

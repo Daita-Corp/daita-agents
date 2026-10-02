@@ -12,7 +12,7 @@ from daita import (
     MCPToolSelection,
 )
 from daita.adapters import postgresql as pg, postgresql_write as native
-from daita.adapters.mcp import StreamableHTTPMCPClientFactory
+from daita.adapters.mcp import SDKMCPClientFactory
 from daita.adapters.models import DiscoveryRequest, SourceRegistration
 from daita.capabilities import (
     ApprovalDecision,
@@ -102,7 +102,7 @@ async def create_fixture(
         },
         "isError": False,
     }
-    factory = StreamableHTTPMCPClientFactory(http_transport=mock_transport(alpha))
+    factory = SDKMCPClientFactory(http_transport=mock_transport(alpha))
     provider = ScriptedResearchModel()
     approvals = []
 

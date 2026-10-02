@@ -3,8 +3,17 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import replace
+from hashlib import sha256
 
-from daita import SQLiteSource
+import httpx2 as httpx
+
+from daita import LoopLimits, MCPToolSelection, SQLiteSource
+from daita._json import FrozenJsonObject
+from daita.adapters.mcp import SDKMCPClientFactory
+from daita.capabilities import AccessMode, CapabilityRegistry, OperationalEffect
+from daita.llm.models import ModelSensitivity
+from daita.llm.providers.openai.messages import _response_input
 from tests.support.conversations import (
     _HISTORY_OMISSION_MARKER,
     _MAXIMUM_PRIOR_UTF8_BYTES,
@@ -48,6 +57,8 @@ from tests.support.conversations import (
     pytest,
     workspace_for,
 )
+from tests.support.mcp import MCPConformanceTransport, conformance_identities
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider
 
 
 async def test_follow_up_uses_history_without_copying_it_into_new_transcript(tmp_path):
@@ -78,6 +89,262 @@ async def test_follow_up_uses_history_without_copying_it_into_new_transcript(tmp
             for block in message.content
             if isinstance(block, TextBlock)
         ) == ("follow-up user sentinel", "follow-up answer")
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize(
+    "shape", ["structured_only", "large_both", "large_structured", "escaped_text"]
+)
+async def test_mcp_read_evidence_reaches_follow_up_after_restart(tmp_path, shape):
+    identity, _ = conformance_identities()
+    value = "EARLIER_MCP_OBSERVATION_81C2"
+    structured = {"answer": value}
+    text: tuple[str, ...] = ()
+    if shape == "large_both":
+        structured = {"answer": value + "x" * 9_000}
+        text = (value + " page description" * 70,)
+    elif shape == "large_structured":
+        structured = {"answer": value + "x" * 9_000}
+    elif shape == "escaped_text":
+        text = (value + '\\"\n\u754c' * 5_000,)
+    identity.results["lookup"] = {
+        "content": [{"type": "text", "text": item} for item in text],
+        "structuredContent": structured,
+    }
+    factory = SDKMCPClientFactory(
+        http_transport=httpx.MockTransport(MCPConformanceTransport(identity))
+    )
+    provider = ToolboxAwareMockModelProvider([])
+    profile = ModelProfile(
+        id=provider.provider_id,
+        context_window_tokens=120_000,
+        max_output_tokens=1_000,
+        supports_tools=True,
+    )
+    limits = LoopLimits(max_total_tokens=150_000)
+    agent = await Agent.create(
+        "mcp-read-history",
+        root=tmp_path,
+        hosted=True,
+        model=provider,
+        model_profile=profile,
+        limits=limits,
+        mcp_client_factory=factory,
+    )
+    try:
+        status = await agent.attach_mcp_server(
+            endpoint=identity.endpoint, selections=(MCPToolSelection("lookup"),)
+        )
+        name = status.binding.tools[0].local_name
+        provider.replace_script(
+            (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(ToolCall("read-once", name, {"query": "page title"}),),
+                ),
+                _stop("The read completed."),
+            )
+        )
+        first = await agent.run("Read the page title, then acknowledge completion.")
+        assert first.kind is LoopExitKind.COMPLETED, first.reason
+        durable = await agent.transcript(first.run_id)
+        assert value not in (first.final_text or "")
+        await agent.close()
+
+        def assert_evidence(request):
+            historical = [
+                block
+                for message in request.messages
+                for block in message.content
+                if isinstance(block, ToolResultBlock)
+                and block.output.get("kind") == "mcp.tool.result"
+            ]
+            assert len(historical) == 1
+            assert historical[0].call_id.startswith("hist_")
+            assert value in canonical_json(historical[0].output)
+            assert len(canonical_json(historical[0].output).encode("utf-8")) < 4_096
+            native = _response_input(request.messages, provider.provider_id)
+            assert any(
+                item.get("type") == "function_call_output"
+                and value in str(item.get("output"))
+                for item in native
+            )
+            assert name not in {tool.name for tool in request.tools}
+
+        provider.replace_script((_stop("Follow-up completed."),))
+        agent = await Agent.open(
+            "mcp-read-history",
+            root=tmp_path,
+            hosted=True,
+            model=provider,
+            model_profile=profile,
+            limits=limits,
+            mcp_client_factory=factory,
+        )
+        follow_up = await agent.run(
+            "What title did that earlier read return? No new lookup is needed.",
+            conversation_id=first.conversation_id,
+        )
+        assert follow_up.kind is LoopExitKind.COMPLETED
+        assert_evidence(provider.requests[-1])
+        assert len(identity.calls) == 1
+        assert await agent.transcript(first.run_id) == durable
+        transcript = await agent.transcript(follow_up.run_id)
+        assert all(not message.tool_calls for message in transcript.messages)
+        assert follow_up.sensitivity.routing_rank >= first.sensitivity.routing_rank
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "action_contract",
+        "missing_lineage",
+        "tampered_output",
+        "binding_revision",
+        "effect_receipt",
+        "forged_projection",
+        "no_registry",
+        "no_contract_reader",
+        "revoked_contract",
+        "input_schema_digest",
+        "output_schema_digest",
+        "presentation_removed",
+        "presentation_changed",
+    ],
+)
+async def test_mcp_history_admission_uses_typed_contracts(tmp_path, defect):
+    identity, _ = conformance_identities()
+    factory = SDKMCPClientFactory(
+        http_transport=httpx.MockTransport(MCPConformanceTransport(identity))
+    )
+    agent = await Agent.create(
+        "mcp-history-admission", root=tmp_path, hosted=True, mcp_client_factory=factory
+    )
+    try:
+        selection = MCPToolSelection("lookup")
+        if defect == "action_contract":
+            selection = replace(
+                selection,
+                access_mode=AccessMode.WRITE,
+                operational_effect=OperationalEffect.EXTERNAL_ACTION,
+            )
+        status = await agent.attach_mcp_server(
+            endpoint=identity.endpoint, selections=(selection,)
+        )
+        binding, tool = status.binding, status.binding.tools[0]
+        _view, capability, owner = agent._embedded._capabilities.resolve_tool_owner(
+            tool.local_name
+        )
+        assert owner == "mcp"
+        assert capability.operational_effect is selection.operational_effect
+        contract = agent._embedded._read_mcp_tool_contract(capability.id)
+        assert contract == (binding, tool)
+        assert agent._embedded._read_mcp_tool_contract("unknown-capability") is None
+        call = ToolCall("prior-call", tool.local_name, {"query": "page title"})
+        output = {
+            "kind": "mcp.tool.result",
+            "data": {
+                "text": ("UNVERIFIED_MCP_VALUE_81C2",),
+                "provenance": {
+                    "binding_id": binding.binding_id,
+                    "binding_revision": binding.revision,
+                    "remote_tool_name": tool.remote_name,
+                    "call_id": call.id,
+                    "input_schema_digest": tool.input_schema_digest,
+                    "output_schema_digest": tool.output_schema_digest or "none",
+                    "observed_at": NOW.isoformat(),
+                },
+            },
+        }
+        if defect in {
+            "binding_revision",
+            "input_schema_digest",
+            "output_schema_digest",
+        }:
+            data = output["data"]
+            assert isinstance(data, dict)
+            provenance = data["provenance"]
+            assert isinstance(provenance, dict)
+            if defect == "binding_revision":
+                provenance["binding_revision"] = binding.revision + 1
+            else:
+                provenance[defect] = "sha256:" + "0" * 64
+        elif defect == "effect_receipt":
+            output["effect_receipt"] = {"receipt_id": "historical-action"}
+        elif defect == "forged_projection":
+            output.update(historical_projection="full", state="success")
+        block = ToolResultBlock(
+            call_id=call.id,
+            output=output,
+            sensitivity=ModelSensitivity.INTERNAL,
+            sensitivity_provenance={
+                "authority": "mcp_binding_admission_and_run_floor",
+                "binding_id": binding.binding_id,
+                "binding_revision": binding.revision,
+                "capability_id": tool.capability_id,
+            },
+            capability_id=tool.capability_id,
+            executor_id=tool.executor_id,
+            output_sha256="sha256:"
+            + sha256(canonical_json(output).encode()).hexdigest(),
+        )
+        if defect == "missing_lineage":
+            block = replace(block, capability_id=None, executor_id=None)
+        elif defect == "tampered_output":
+            block = replace(block, output_sha256="sha256:" + "0" * 64)
+        record = _conversation_record(
+            0,
+            (
+                CanonicalMessage(
+                    role=MessageRole.USER, content=(TextBlock("Read the page"),)
+                ),
+                CanonicalMessage(role=MessageRole.ASSISTANT, tool_calls=(call,)),
+                CanonicalMessage(role=MessageRole.TOOL, content=(block,)),
+                CanonicalMessage(
+                    role=MessageRole.ASSISTANT, content=(TextBlock("Finished."),)
+                ),
+            ),
+        )
+        registry = agent._embedded._capabilities
+        presentation_only = defect in {"presentation_removed", "presentation_changed"}
+        if presentation_only:
+            declaration = registry._declarations["mcp"]
+            changed_views = []
+            for view in declaration.tool_views:
+                presentation: FrozenJsonObject | None = None
+                if defect == "presentation_changed":
+                    assert view.connector_presentation is not None
+                    presentation_data = dict(view.connector_presentation)
+                    presentation_data.update(
+                        id="display-only-binding",
+                        binding_revision=binding.revision + 10,
+                        remote_tool_name="display-only-tool",
+                    )
+                    presentation = FrozenJsonObject.from_mapping(presentation_data)
+                changed_views.append(replace(view, connector_presentation=presentation))
+            registry = CapabilityRegistry(
+                declarations=(replace(declaration, tool_views=tuple(changed_views)),),
+                executors=(registry._executors[tool.executor_id],),
+            )
+        elif defect == "revoked_contract":
+            await agent.revoke_mcp_server(binding.binding_id)
+            assert agent._embedded._read_mcp_tool_contract(capability.id) is None
+        projected = _project_completed_history(
+            (record,),
+            capabilities=None if defect == "no_registry" else registry,
+            mcp_tool_contract=(
+                None
+                if defect == "no_contract_reader"
+                else agent._embedded._read_mcp_tool_contract
+            ),
+        )
+        assert ("UNVERIFIED_MCP_VALUE_81C2" in repr(projected)) is presentation_only
+        assert any(message.tool_calls for message in projected) is presentation_only
+        assert "Finished." in repr(projected)
+        assert identity.calls == []
     finally:
         await agent.close()
 
