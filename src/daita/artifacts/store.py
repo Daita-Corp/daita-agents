@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn, Protocol, cast
+from typing import NoReturn, Protocol, cast
 from uuid import uuid4
 
 from .._json import canonical_json
@@ -26,15 +26,14 @@ from .models import (
     ArtifactDraft,
     ArtifactError,
     ArtifactPayload,
+    ArtifactRecord,
     ArtifactRef,
+    ArtifactState,
     artifact_provenance_to_mapping,
     artifact_ref_from_mapping,
     artifact_ref_to_mapping,
     canonical_artifact_filename,
 )
-
-if TYPE_CHECKING:
-    from ..distribution.models import OutcomeArtifactReference
 
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
 _ARTIFACT_ID = re.compile(r"artifact-[0-9a-f]{32}\Z")
@@ -53,33 +52,16 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid4().hex}"
 
 
-def _matches_delivery_reference(
-    ref: ArtifactRef,
-    expected: OutcomeArtifactReference,
-) -> bool:
-    provenance_digest = (
-        "sha256:"
-        + sha256(
-            canonical_json(artifact_provenance_to_mapping(ref.provenance)).encode(
-                "utf-8"
-            )
-        ).hexdigest()
-    )
-    return (
-        ref.artifact_id == expected.artifact_id
-        and ref.run_id == expected.producing_run_id
-        and ref.call_id == expected.producing_call_id
-        and ref.capability_id == expected.producer_capability_id
-        and ref.sha256 == expected.sha256
-        and ref.media_type == expected.media_type
-        and ref.byte_size == expected.byte_size
-        and ref.sensitivity.value == expected.sensitivity.value
-        and provenance_digest == expected.provenance_digest
-        and ref.provenance.authorship is expected.authorship
-    )
-
-
-class ArtifactReferenceReader(Protocol):
+class ArtifactRegistry(Protocol):
+    async def get_artifact_record(self, artifact_id: str) -> ArtifactRecord | None: ...
+    async def list_artifact_records(
+        self,
+        agent_id: str,
+        *,
+        state: ArtifactState | None = None,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[ArtifactRecord, ...]: ...
     async def list_artifact_refs(
         self,
         agent_id: str,
@@ -87,14 +69,26 @@ class ArtifactReferenceReader(Protocol):
         run_id: str | None = None,
         conversation_id: str | None = None,
     ) -> tuple[ArtifactRef, ...]: ...
+    async def begin_artifact_creation(
+        self, record: ArtifactRecord, *, reserved: bool = False
+    ) -> None: ...
+    async def transition_artifact(
+        self, record: ArtifactRecord, state: ArtifactState
+    ) -> ArtifactRecord: ...
+    async def finish_artifact_deletion(self, record: ArtifactRecord) -> None: ...
 
-    async def list_delivery_artifact_references(
-        self,
-        agent_id: str,
-        *,
-        run_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> tuple[OutcomeArtifactReference, ...]: ...
+
+async def _drain(operation: Awaitable[object]) -> None:
+    worker = asyncio.ensure_future(operation)
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+    worker.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 class _CancelledBeforePublication(BaseException):
@@ -133,7 +127,7 @@ class AgentHomeArtifactStore:
         *,
         agent_id: str,
         agent_home: Path,
-        references: ArtifactReferenceReader,
+        registry: ArtifactRegistry,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _new_id,
         admission_error: ArtifactError | None = None,
@@ -142,10 +136,11 @@ class AgentHomeArtifactStore:
         self.agent_home = agent_home
         self.root = agent_home / "artifacts"
         self.staging = self.root / ".staging"
-        self._references = references
+        self._registry = registry
         self._clock = clock
         self._id_factory = id_factory
         self._commit_lock = threading.Lock()
+        self._lifecycle_lock = asyncio.Lock()
         self._admission_error = admission_error
 
     @classmethod
@@ -154,34 +149,19 @@ class AgentHomeArtifactStore:
         *,
         agent_id: str,
         agent_home: Path,
-        references: ArtifactReferenceReader,
+        registry: ArtifactRegistry,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _new_id,
     ) -> AgentHomeArtifactStore:
         store = cls(
             agent_id=agent_id,
             agent_home=agent_home,
-            references=references,
+            registry=registry,
             clock=clock,
             id_factory=id_factory,
         )
         try:
-            refs = await references.list_artifact_refs(agent_id)
-            delivery_refs = await references.list_delivery_artifact_references(agent_id)
-            reservation_loader = getattr(
-                references,
-                "list_reserved_artifact_ids",
-                None,
-            )
-            reservations: frozenset[tuple[str, str]]
-            if callable(reservation_loader):
-                load_reservations = cast(
-                    Callable[[str], Awaitable[frozenset[tuple[str, str]]]],
-                    reservation_loader,
-                )
-                reservations = await load_reservations(agent_id)
-            else:
-                reservations = frozenset()
+            records = await registry.list_artifact_records(agent_id)
         except asyncio.CancelledError:
             raise
         except ArtifactError as error:
@@ -199,9 +179,7 @@ class AgentHomeArtifactStore:
         worker = asyncio.create_task(
             asyncio.to_thread(
                 store._admit_and_cleanup,
-                refs,
-                delivery_refs,
-                reservations,
+                records,
             )
         )
         cancelled = False
@@ -223,6 +201,13 @@ class AgentHomeArtifactStore:
                 {"stage": "admission"},
             )
             store._admission_error.__cause__ = error
+        if store.available:
+            try:
+                await _drain(store._recover_pending(records))
+            except asyncio.CancelledError:
+                raise
+            except ArtifactError as error:
+                store._admission_error = error
         if cancelled:
             raise asyncio.CancelledError
         return store
@@ -240,14 +225,19 @@ class AgentHomeArtifactStore:
         run_id: str | None = None,
         conversation_id: str | None = None,
     ) -> tuple[ArtifactRef, ...]:
-        self._require_available()
-        refs = await self._list_reachable_refs(
-            run_id=run_id,
-            conversation_id=conversation_id,
-        )
-        return tuple(sorted(refs, key=lambda item: (item.created_at, item.artifact_id)))
+        async with self._lifecycle_lock:
+            self._require_available()
+            return await self._registry.list_artifact_refs(
+                self.agent_id,
+                run_id=run_id,
+                conversation_id=conversation_id,
+            )
 
     async def find_ref(self, artifact_id: str) -> ArtifactRef:
+        async with self._lifecycle_lock:
+            return await self._find_ref(artifact_id)
+
+    async def _find_ref(self, artifact_id: str) -> ArtifactRef:
         self._require_available()
         if (
             not isinstance(artifact_id, str)
@@ -258,28 +248,108 @@ class AgentHomeArtifactStore:
                 "The requested artifact is not available.",
                 {"artifact_id": str(artifact_id)},
             )
-        return next(
-            (
-                item
-                for item in await self.list_refs()
-                if item.artifact_id == artifact_id
-            ),
-            None,
-        ) or _raise_missing(artifact_id)
+        record = await self._registry.get_artifact_record(artifact_id)
+        if (
+            record is None
+            or record.agent_id != self.agent_id
+            or record.state is not ArtifactState.READY
+        ):
+            _raise_missing(artifact_id)
+        return record.ref
 
     async def read(self, artifact_id: str) -> ArtifactPayload:
-        ref = await self.find_ref(artifact_id)
-        return await asyncio.to_thread(self._read_ref, ref)
+        async with self._lifecycle_lock:
+            ref = await self._find_ref(artifact_id)
+            return await asyncio.to_thread(self._read_ref, ref)
 
     async def read_ref(self, ref: ArtifactRef) -> ArtifactPayload:
-        self._require_available()
-        if ref not in await self.list_refs():
+        async with self._lifecycle_lock:
+            self._require_available()
+            if await self._find_ref(ref.artifact_id) != ref:
+                _raise_missing(ref.artifact_id)
+            return await asyncio.to_thread(self._read_ref, ref)
+
+    async def delete(self, artifact_id: str) -> bool:
+        """Remove files and their lifecycle row, retaining only unfinished cleanup."""
+        async with self._lifecycle_lock:
+            self._require_available()
+            record = await self._registry.get_artifact_record(artifact_id)
+            if record is None:
+                return False
+            if (
+                record.agent_id != self.agent_id
+                or record.state is ArtifactState.CREATING
+            ):
+                _raise_missing(artifact_id)
+            newly_deleted = record.state is ArtifactState.READY
+            if newly_deleted:
+                record = await self._registry.transition_artifact(
+                    record, ArtifactState.DELETING
+                )
+            await _drain(self._finish_cleanup(record))
+            return newly_deleted
+
+    async def _finish_cleanup(self, record: ArtifactRecord) -> None:
+        try:
+            await asyncio.to_thread(self._delete_sync, record)
+            await self._registry.finish_artifact_deletion(record)
+        except ArtifactError:
+            raise
+        except Exception as error:
             raise ArtifactError(
-                "artifact_missing",
-                "The requested artifact is not available.",
-                {"artifact_id": ref.artifact_id},
-            )
-        return await asyncio.to_thread(self._read_ref, ref)
+                "artifact_storage_failed",
+                "Artifact cleanup is incomplete. Retry deletion.",
+                {"artifact_id": record.ref.artifact_id, "stage": "delete_cleanup"},
+            ) from error
+
+    async def _recover_pending(self, records: tuple[ArtifactRecord, ...]) -> None:
+        for record in records:
+            if record.state is ArtifactState.DELETING:
+                await self._finish_cleanup(record)
+            elif record.state is ArtifactState.CREATING:
+                await self._recover_creation(record)
+
+    async def _recover_creation(self, record: ArtifactRecord) -> ArtifactRef | None:
+        ref = await asyncio.to_thread(
+            self._recover_reserved_sync, record.ref.run_id, record.ref.artifact_id
+        )
+        if ref is not None:
+            if ref != record.ref:
+                _corrupt(ref.artifact_id, "creating_manifest_mismatch")
+            await self._registry.transition_artifact(record, ArtifactState.READY)
+            return ref
+        pending = await self._registry.transition_artifact(
+            record, ArtifactState.DELETING
+        )
+        await self._finish_cleanup(pending)
+        return None
+
+    def _delete_sync(self, record: ArtifactRecord) -> None:
+        try:
+            self._verify_storage_roots()
+            run_path = self.root / record.ref.run_id
+            try:
+                facts = run_path.lstat()
+            except FileNotFoundError:
+                _fsync_directory(self.root)
+                return
+            if not stat.S_ISDIR(facts.st_mode) or run_path.is_symlink():
+                raise OSError("artifact run entry is not an exact directory")
+            with self._commit_lock:
+                path = run_path / record.ref.artifact_id
+                try:
+                    path.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    _remove_artifact_directory(path)
+                _fsync_directory(run_path)
+        except Exception as error:
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "The artifact is deleted, but file cleanup is incomplete. Retry deletion.",
+                {"artifact_id": record.ref.artifact_id, "stage": "delete_cleanup"},
+            ) from error
 
     async def recover_reserved(
         self,
@@ -288,12 +358,25 @@ class AgentHomeArtifactStore:
     ) -> ArtifactRef | None:
         """Recover one exactly reserved published artifact after host loss."""
 
+        async with self._lifecycle_lock:
+            return await self._recover_reserved(run_id, artifact_id)
+
+    async def _recover_reserved(
+        self, run_id: str, artifact_id: str
+    ) -> ArtifactRef | None:
         self._require_available()
-        return await asyncio.to_thread(
-            self._recover_reserved_sync,
-            run_id,
-            artifact_id,
-        )
+        record = await self._registry.get_artifact_record(artifact_id)
+        if (
+            record is None
+            or record.agent_id != self.agent_id
+            or record.ref.run_id != run_id
+            or record.state is ArtifactState.DELETING
+        ):
+            return None
+        if record.state is ArtifactState.CREATING:
+            return await self._recover_creation(record)
+        await asyncio.to_thread(self._read_ref, record.ref)
+        return record.ref
 
     async def read_reserved(
         self,
@@ -302,10 +385,11 @@ class AgentHomeArtifactStore:
     ) -> ArtifactPayload | None:
         """Read one restart-reserved artifact before its durable result promotion."""
 
-        ref = await self.recover_reserved(run_id, artifact_id)
-        if ref is None:
-            return None
-        return await asyncio.to_thread(self._read_ref, ref)
+        async with self._lifecycle_lock:
+            ref = await self._recover_reserved(run_id, artifact_id)
+            if ref is None:
+                return None
+            return await asyncio.to_thread(self._read_ref, ref)
 
     async def commit(
         self,
@@ -317,19 +401,51 @@ class AgentHomeArtifactStore:
         call_id: str,
         capability_id: str,
         reserved_artifact_id: str | None = None,
+        caller_principal_id: str | None = None,
     ) -> ArtifactRef:
-        self._require_available()
-        gate = _PublicationGate()
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                self._commit_sync,
+        async with self._lifecycle_lock:
+            self._require_available()
+            artifact_id = reserved_artifact_id or self._id_factory("artifact")
+            if (
+                not isinstance(artifact_id, str)
+                or _ARTIFACT_ID.fullmatch(artifact_id) is None
+            ):
+                raise ArtifactError(
+                    "artifact_storage_failed",
+                    "The artifact identity is invalid.",
+                    {"stage": "identity"},
+                )
+            ref = self._prepare_ref(
                 draft,
                 policy,
                 run_id,
                 conversation_id,
                 call_id,
                 capability_id,
-                reserved_artifact_id,
+                artifact_id,
+            )
+            record = ArtifactRecord(
+                ref,
+                self.agent_id,
+                caller_principal_id or self.agent_id,
+                ArtifactState.CREATING,
+            )
+            await self._registry.begin_artifact_creation(
+                record, reserved=reserved_artifact_id is not None
+            )
+            try:
+                return await self._commit(draft, ref)
+            finally:
+                await _drain(self._recover_creation(record))
+
+    async def _commit(self, draft: ArtifactDraft, ref: ArtifactRef) -> ArtifactRef:
+        self._require_available()
+        gate = _PublicationGate()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._commit_sync,
+                draft,
+                ref,
                 gate,
             )
         )
@@ -364,79 +480,6 @@ class AgentHomeArtifactStore:
             raise asyncio.CancelledError
         return ref
 
-    async def remove_unreferenced_run_artifacts(self) -> None:
-        """Remove only run artifacts no longer referenced by durable state."""
-
-        self._require_available()
-        refs = await self._list_reachable_refs()
-        retained = frozenset((ref.run_id, ref.artifact_id) for ref in refs)
-        await asyncio.to_thread(
-            self._remove_unreferenced_run_artifacts_sync,
-            retained,
-        )
-
-    async def _list_reachable_refs(
-        self,
-        *,
-        run_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> tuple[ArtifactRef, ...]:
-        transcript_and_job_refs = await self._references.list_artifact_refs(
-            self.agent_id,
-            run_id=run_id,
-            conversation_id=conversation_id,
-        )
-        delivery_refs = await self._references.list_delivery_artifact_references(
-            self.agent_id,
-            run_id=run_id,
-            conversation_id=conversation_id,
-        )
-        resolved_delivery_refs = await asyncio.to_thread(
-            self._resolve_delivery_refs,
-            delivery_refs,
-        )
-        return self._merge_reachable_refs(
-            transcript_and_job_refs,
-            resolved_delivery_refs,
-        )
-
-    def _resolve_delivery_refs(
-        self,
-        refs: tuple[OutcomeArtifactReference, ...],
-    ) -> tuple[ArtifactRef, ...]:
-        resolved: list[ArtifactRef] = []
-        for expected in refs:
-            ref = self._load_manifest_ref(
-                expected.producing_run_id,
-                expected.artifact_id,
-            )
-            if not _matches_delivery_reference(ref, expected):
-                _corrupt(expected.artifact_id, "delivery_reference_mismatch")
-            resolved.append(ref)
-        return tuple(resolved)
-
-    @staticmethod
-    def _merge_reachable_refs(
-        *groups: tuple[ArtifactRef, ...],
-    ) -> tuple[ArtifactRef, ...]:
-        merged: dict[str, ArtifactRef] = {}
-        for group in groups:
-            for ref in group:
-                current = merged.get(ref.artifact_id)
-                if current is not None and current != ref:
-                    raise ArtifactError(
-                        "artifact_corrupt",
-                        "The artifact identity is ambiguous in durable state.",
-                        {"artifact_id": ref.artifact_id},
-                    )
-                merged[ref.artifact_id] = ref
-        return tuple(
-            sorted(
-                merged.values(),
-                key=lambda item: (item.created_at, item.artifact_id),
-            )
-        )
-
     def _require_available(self) -> None:
         if self._admission_error is not None:
             raise ArtifactError(
@@ -447,9 +490,7 @@ class AgentHomeArtifactStore:
 
     def _admit_and_cleanup(
         self,
-        refs: tuple[ArtifactRef, ...],
-        delivery_refs: tuple[OutcomeArtifactReference, ...],
-        reservations: frozenset[tuple[str, str]],
+        records: tuple[ArtifactRecord, ...],
     ) -> None:
         try:
             home = self.agent_home.resolve(strict=True)
@@ -471,11 +512,7 @@ class AgentHomeArtifactStore:
             for entry in staging_entries:
                 _remove_staging_entry(Path(entry.path))
 
-            refs = self._merge_reachable_refs(
-                refs,
-                self._resolve_delivery_refs(delivery_refs),
-            )
-            referenced = {item.artifact_id: item for item in refs}
+            referenced = {item.ref.artifact_id: item.ref for item in records}
             final_count = 0
             for run_entry in _run_entries(self.root):
                 run_path = Path(run_entry.path)
@@ -500,8 +537,6 @@ class AgentHomeArtifactStore:
                         raise OSError("artifact directory has an invalid identity")
                     ref = referenced.get(artifact_entry.name)
                     if ref is None:
-                        if (run_entry.name, artifact_entry.name) in reservations:
-                            continue
                         _remove_artifact_directory(artifact_path)
                         continue
                     if ref.run_id != run_entry.name:
@@ -541,6 +576,9 @@ class AgentHomeArtifactStore:
         try:
             ref = self._load_manifest_ref(run_id, artifact_id)
             self._read_ref(ref)
+            _fsync_directory(directory)
+            _fsync_directory(directory.parent)
+            _fsync_directory(self.root)
             return ref
         except ArtifactError:
             raise
@@ -551,7 +589,7 @@ class AgentHomeArtifactStore:
                 {"artifact_id": artifact_id},
             ) from error
 
-    def _commit_sync(
+    def _prepare_ref(
         self,
         draft: ArtifactDraft,
         policy: ArtifactPolicy,
@@ -559,14 +597,12 @@ class AgentHomeArtifactStore:
         conversation_id: str,
         call_id: str,
         capability_id: str,
-        reserved_artifact_id: str | None,
-        gate: _PublicationGate,
+        artifact_id: str,
     ) -> ArtifactRef:
         if not isinstance(draft, ArtifactDraft):
             raise TypeError("artifact commit requires ArtifactDraft")
         if not isinstance(policy, ArtifactPolicy):
             raise TypeError("artifact commit requires ArtifactPolicy")
-        self._verify_storage_roots()
         if _RUN_ID.fullmatch(run_id) is None:
             raise ArtifactError(
                 "artifact_storage_failed",
@@ -605,41 +641,28 @@ class AgentHomeArtifactStore:
                     "attempted": size,
                 },
             )
+        return ArtifactRef(
+            artifact_id=artifact_id,
+            run_id=run_id,
+            conversation_id=conversation_id,
+            call_id=call_id,
+            capability_id=capability_id,
+            filename=filename,
+            media_type=draft.media_type,
+            byte_size=size,
+            sha256="sha256:" + sha256(draft.content).hexdigest(),
+            sensitivity=draft.sensitivity,
+            provenance=draft.provenance,
+            created_at=self._clock(),
+        )
+
+    def _commit_sync(
+        self, draft: ArtifactDraft, ref: ArtifactRef, gate: _PublicationGate
+    ) -> ArtifactRef:
+        self._verify_storage_roots()
+        artifact_id, run_id = ref.artifact_id, ref.run_id
         with self._commit_lock:
             gate.require_active()
-            run_count, run_bytes, agent_count, agent_bytes = self._quota_usage(run_id)
-            _check_quota("run", "count", MAX_ARTIFACTS_PER_RUN, run_count + 1)
-            _check_quota("run", "bytes", MAX_ARTIFACT_BYTES_PER_RUN, run_bytes + size)
-            _check_quota("agent", "count", MAX_ARTIFACTS_PER_AGENT, agent_count + 1)
-            _check_quota(
-                "agent", "bytes", MAX_ARTIFACT_BYTES_PER_AGENT, agent_bytes + size
-            )
-            artifact_id = reserved_artifact_id or self._id_factory("artifact")
-            if (
-                not isinstance(artifact_id, str)
-                or _ARTIFACT_ID.fullmatch(artifact_id) is None
-            ):
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "The artifact identity factory returned an invalid identity.",
-                    {"stage": "identity"},
-                )
-            digest = "sha256:" + sha256(draft.content).hexdigest()
-            created_at = self._clock()
-            ref = ArtifactRef(
-                artifact_id=artifact_id,
-                run_id=run_id,
-                conversation_id=conversation_id,
-                call_id=call_id,
-                capability_id=capability_id,
-                filename=filename,
-                media_type=draft.media_type,
-                byte_size=size,
-                sha256=digest,
-                sensitivity=draft.sensitivity,
-                provenance=draft.provenance,
-                created_at=created_at,
-            )
             run_path = self.root / run_id
             final = run_path / artifact_id
             staging = self.staging / f"{artifact_id}.{uuid4().hex}"
@@ -683,61 +706,6 @@ class AgentHomeArtifactStore:
                     "Artifact commit failed.",
                     {"stage": "publish" if published else "staging"},
                 ) from error
-
-    def _quota_usage(self, run_id: str) -> tuple[int, int, int, int]:
-        run_count = 0
-        run_bytes = 0
-        agent_count = 0
-        agent_bytes = 0
-        for run_entry in _run_entries(self.root):
-            if (
-                _RUN_ID.fullmatch(run_entry.name) is None
-                or run_entry.is_symlink()
-                or not run_entry.is_dir(follow_symlinks=False)
-            ):
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "Artifact quota accounting found an invalid entry.",
-                    {"stage": "quota"},
-                )
-            with os.scandir(run_entry.path) as artifact_iterator:
-                artifact_entries = tuple(artifact_iterator)
-            for artifact_entry in artifact_entries:
-                if (
-                    _ARTIFACT_ID.fullmatch(artifact_entry.name) is None
-                    or artifact_entry.is_symlink()
-                    or not artifact_entry.is_dir(follow_symlinks=False)
-                ):
-                    raise ArtifactError(
-                        "artifact_storage_failed",
-                        "Artifact quota accounting found an invalid artifact entry.",
-                        {"stage": "quota"},
-                    )
-                agent_count += 1
-                if agent_count > MAX_ARTIFACTS_PER_AGENT:
-                    return run_count, run_bytes, agent_count, agent_bytes
-                artifact_path = Path(artifact_entry.path)
-                payload = artifact_path / "payload"
-                try:
-                    facts = payload.lstat()
-                except OSError as error:
-                    raise ArtifactError(
-                        "artifact_storage_failed",
-                        "Artifact quota accounting found a missing payload.",
-                        {"stage": "quota"},
-                    ) from error
-                if not stat.S_ISREG(facts.st_mode) or payload.is_symlink():
-                    raise ArtifactError(
-                        "artifact_storage_failed",
-                        "Artifact quota accounting found an invalid payload.",
-                        {"stage": "quota"},
-                    )
-                payload_size = facts.st_size
-                agent_bytes += payload_size
-                if run_entry.name == run_id:
-                    run_count += 1
-                    run_bytes += payload_size
-        return run_count, run_bytes, agent_count, agent_bytes
 
     def _read_ref(self, ref: ArtifactRef) -> ArtifactPayload:
         stored_ref = self._load_manifest_ref(ref.run_id, ref.artifact_id)
@@ -798,56 +766,6 @@ class AgentHomeArtifactStore:
         ):
             _corrupt(artifact_id, "manifest_mismatch")
         return stored_ref
-
-    def _remove_unreferenced_run_artifacts_sync(
-        self,
-        retained: frozenset[tuple[str, str]],
-    ) -> None:
-        self._verify_storage_roots()
-        if any(
-            _RUN_ID.fullmatch(run_id) is None
-            or _ARTIFACT_ID.fullmatch(artifact_id) is None
-            for run_id, artifact_id in retained
-        ):
-            raise ArtifactError(
-                "artifact_storage_failed",
-                "Artifact conversation cleanup received an invalid retained identity.",
-                {"stage": "conversation_clear"},
-            )
-        count = 0
-        for entry in _run_entries(self.root):
-            if (
-                _RUN_ID.fullmatch(entry.name) is None
-                or entry.is_symlink()
-                or not entry.is_dir(follow_symlinks=False)
-            ):
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "Artifact conversation cleanup found an invalid entry.",
-                    {"stage": "conversation_clear"},
-                )
-            with os.scandir(entry.path) as artifact_entries:
-                artifacts = tuple(artifact_entries)
-            count += len(artifacts)
-            if count > MAX_ARTIFACTS_PER_AGENT:
-                raise ArtifactError(
-                    "artifact_storage_failed",
-                    "Artifact conversation cleanup exceeds its bound.",
-                    {"stage": "conversation_clear"},
-                )
-            for artifact_entry in artifacts:
-                if _ARTIFACT_ID.fullmatch(artifact_entry.name) is None:
-                    raise ArtifactError(
-                        "artifact_storage_failed",
-                        "Artifact conversation cleanup found an invalid identity.",
-                        {"stage": "conversation_clear"},
-                    )
-                if (entry.name, artifact_entry.name) in retained:
-                    continue
-                _remove_artifact_directory(Path(artifact_entry.path))
-            if not any(Path(entry.path).iterdir()):
-                Path(entry.path).rmdir()
-        _fsync_directory(self.root)
 
     def _verify_storage_roots(self) -> None:
         try:
@@ -1008,6 +926,7 @@ def _remove_artifact_directory(path: Path) -> None:
     for child in children:
         Path(child.path).unlink()
     path.rmdir()
+    _fsync_directory(path.parent)
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1027,9 +946,7 @@ def validate_artifact_home(
     *,
     agent_id: str,
     agent_home: Path,
-    references: tuple[ArtifactRef, ...],
-    delivery_references: tuple[OutcomeArtifactReference, ...],
-    reservations: frozenset[tuple[str, str]],
+    records: tuple[ArtifactRecord, ...],
 ) -> None:
     """Validate the complete current artifact tree without cleaning or changing it."""
 
@@ -1056,7 +973,7 @@ def validate_artifact_home(
         )
     root = home / "artifacts"
     if not root.exists():
-        if references or delivery_references:
+        if any(record.state is ArtifactState.READY for record in records):
             raise ArtifactError(
                 "artifact_corrupt",
                 "Referenced artifact storage is missing.",
@@ -1124,8 +1041,13 @@ def validate_artifact_home(
     store = AgentHomeArtifactStore(
         agent_id=agent_id,
         agent_home=home,
-        references=cast(ArtifactReferenceReader, object()),
+        registry=cast(ArtifactRegistry, object()),
     )
+    pending = {
+        (record.ref.run_id, record.ref.artifact_id)
+        for record in records
+        if record.state is not ArtifactState.READY
+    }
     stored: dict[str, ArtifactRef] = {}
     count = 0
     byte_total = 0
@@ -1155,6 +1077,32 @@ def validate_artifact_home(
                     "Artifact entry is invalid.",
                     {"stage": "home_validation"},
                 )
+            if (run_entry.name, entry.name) in pending:
+                # Interrupted deletion can leave either fixed file absent. Still
+                # enforce shape and quotas before startup removes the directory.
+                with os.scandir(entry.path) as children:
+                    remaining = tuple(children)
+                if len(remaining) > 2 or any(
+                    child.name not in {"payload", "manifest.json"}
+                    or child.is_symlink()
+                    or not child.is_file(follow_symlinks=False)
+                    for child in remaining
+                ):
+                    raise ArtifactError(
+                        "artifact_storage_failed",
+                        "Deleted artifact cleanup shape is invalid.",
+                        {"stage": "home_validation"},
+                    )
+                size = sum(
+                    child.stat(follow_symlinks=False).st_size
+                    for child in remaining
+                    if child.name == "payload"
+                )
+                count += 1
+                run_count += 1
+                byte_total += size
+                run_bytes += size
+                continue
             ref = store._load_manifest_ref(run_entry.name, entry.name)
             store._read_ref(ref)
             if ref.artifact_id in stored:
@@ -1173,23 +1121,18 @@ def validate_artifact_home(
     _check_quota("agent", "count", MAX_ARTIFACTS_PER_AGENT, count)
     _check_quota("agent", "bytes", MAX_ARTIFACT_BYTES_PER_AGENT, byte_total)
 
-    for expected in references:
-        if stored.get(expected.artifact_id) != expected:
-            _corrupt(expected.artifact_id, "referenced_manifest_mismatch")
-    for delivery_reference in delivery_references:
-        actual = stored.get(delivery_reference.artifact_id)
-        if actual is None or not _matches_delivery_reference(
-            actual, delivery_reference
+    for record in records:
+        if record.agent_id != agent_id:
+            _corrupt(record.ref.artifact_id, "registry_owner_mismatch")
+        if (
+            record.state is ArtifactState.READY
+            and stored.get(record.ref.artifact_id) != record.ref
         ):
-            _corrupt(delivery_reference.artifact_id, "delivery_manifest_mismatch")
-    for run_id, artifact_id in reservations:
-        actual = stored.get(artifact_id)
-        if actual is not None and actual.run_id != run_id:
-            _corrupt(artifact_id, "reservation_manifest_mismatch")
+            _corrupt(record.ref.artifact_id, "registered_manifest_mismatch")
 
 
 __all__ = [
     "AgentHomeArtifactStore",
-    "ArtifactReferenceReader",
+    "ArtifactRegistry",
     "validate_artifact_home",
 ]

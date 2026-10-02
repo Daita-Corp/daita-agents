@@ -142,6 +142,9 @@ class LocalArtifactDelivery:
         self.agent_id = agent_id
         self.agent_home = agent_home.resolve(strict=True)
         self.artifacts = artifacts
+        # Shared with the embedded owner's read/save/delete operations. Model
+        # deliveries must finish publication before deletion can mark the ID.
+        self.publication_lock = asyncio.Lock()
         self._sources = sources
         self._exact_target_resolver = exact_target_resolver
         self._clock = clock
@@ -384,30 +387,31 @@ class LocalArtifactDelivery:
         filename: str | None = None,
         one_time_grants: tuple[object, ...] = (),
     ) -> ArtifactDeliveryReceipt:
-        if mode == ArtifactDeliveryMode.REPLACE_BOUND_FILE.value:
-            if destination_id is not None or filename is not None:
+        async with self.publication_lock:
+            if mode == ArtifactDeliveryMode.REPLACE_BOUND_FILE.value:
+                if destination_id is not None or filename is not None:
+                    raise ArtifactError(
+                        "artifact_edit_binding_invalid",
+                        "Bound replacement does not accept a destination or filename.",
+                    )
+                return await self._replace_committed_bound_artifact(artifact_id)
+            if mode != ArtifactDeliveryMode.CREATE_NEW.value or destination_id is None:
                 raise ArtifactError(
-                    "artifact_edit_binding_invalid",
-                    "Bound replacement does not accept a destination or filename.",
+                    "artifact_delivery_invalid", "Artifact delivery mode is invalid."
                 )
-            return await self._replace_committed_bound_artifact(artifact_id)
-        if mode != ArtifactDeliveryMode.CREATE_NEW.value or destination_id is None:
-            raise ArtifactError(
-                "artifact_delivery_invalid", "Artifact delivery mode is invalid."
-            )
-        ref = await self.artifacts.find_ref(artifact_id)
-        requested = self._filename_for_ref(ref, filename)
-        try:
-            grant = self._resolve(
-                destination_id,
-                run_id=run_id,
-                one_time_grants=one_time_grants,
-            )
-            self._verify_grant(grant)
-        except ArtifactError as error:
-            raise _retained_artifact_error(error, ref.artifact_id) from error
-        payload = await self.artifacts.read_ref(ref)
-        return await self._deliver(payload, grant, requested)
+            ref = await self.artifacts.find_ref(artifact_id)
+            requested = self._filename_for_ref(ref, filename)
+            try:
+                grant = self._resolve(
+                    destination_id,
+                    run_id=run_id,
+                    one_time_grants=one_time_grants,
+                )
+                self._verify_grant(grant)
+            except ArtifactError as error:
+                raise _retained_artifact_error(error, ref.artifact_id) from error
+            payload = await self.artifacts.read_ref(ref)
+            return await self._deliver(payload, grant, requested)
 
     async def _preflight_bound_replacement(
         self,

@@ -1,10 +1,13 @@
 # Artifacts
 
 Daita keeps generated reports and exports as artifacts in the agent home. You
-can inspect or reuse them later. Creating an artifact does not save a copy to
-your computer; that requires explicit approval.
+can inspect or reuse them later. The payload and manifest live under
+`<state-root>/agents/<agent-name>/artifacts/<run-id>/<artifact-id>/`; the default
+state root is `~/.daita`. Saving an additional copy to a user-selected directory
+requires explicit approval. Opening the home recovers interrupted artifact
+creation and deletion.
 
-## Exact exports and derived findings
+## Creating artifacts
 
 Choose a tabular tool by the kind of evidence you need:
 
@@ -37,11 +40,12 @@ HTML tables escape all model-authored values and prohibit external content.
 Rows, columns, cell text, input bytes, output bytes, execution time, and
 per-run artifact totals remain bounded.
 
-`artifact_list` and `artifact_read` expose bounded artifact metadata and
-previews. `artifact_convert` converts only a verified exact Daita XLSX snapshot
-to CSV without rerunning its source. `artifact_save_local` remains the explicit
-approval-gated local delivery path; creating an internal artifact does not
-prove that a local file was saved.
+## Reading and saving artifacts
+
+`artifact_list` lists metadata for the current conversation. `artifact_read`
+previews an exact artifact ID. `artifact_convert` converts a verified exact
+Daita XLSX snapshot to CSV without rerunning its source. `artifact_save_local`
+saves a copy to an approved local destination.
 
 An edit artifact retains the exact physical anchor, anchor-relative path,
 revision, and original content hash authenticated by `file_read`. This applies
@@ -49,3 +53,31 @@ equally to the working directory and an external local location. Replacement
 approval displays the qualified target, then the delivery path reopens and
 revalidates that same anchor and file; it never rebases a failed external edit
 onto the working directory or Downloads.
+
+## Deleting an artifact
+
+Remove one committed artifact through the owner API:
+
+```python
+newly_deleted = await agent.delete_artifact(artifact_id)
+```
+
+In a hosted application, pass the authenticated `caller_principal_id` used for
+the producing run; the default is the agent owner. Model tools do not expose
+deletion.
+
+Deletion immediately blocks reads and saves, then removes the payload, manifest,
+and registry entry. It returns `True` for a new deletion and `False` if the ID is
+absent or cleanup was already pending. Errors use `ArtifactError`:
+
+- `artifact_missing`: a read or save targets an unavailable artifact.
+- `artifact_busy`: an active job still owns the artifact reservation; wait for
+  the attempt to finish before deleting it.
+- `artifact_storage_failed` with stage `delete_cleanup`: file cleanup is
+  incomplete. Retry deletion or reopen the home to resume cleanup.
+
+Clearing conversation history preserves stored artifacts. Deleting an artifact
+preserves historical transcripts, job results, and delivery outcomes, including
+embedded text previews. Exported files, application delivery copies, and backups
+also remain. Application hosts must delete their own copies and coordinate
+deletion with any publication of previously fetched bytes.

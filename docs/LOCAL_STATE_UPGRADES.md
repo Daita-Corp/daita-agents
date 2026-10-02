@@ -1,9 +1,14 @@
 # Agent-home compatibility and upgrades
 
 Daita versions its entire agent home as one unit. The home revision is separate
-from the package version, Git tag, and SQLite schema version. The current
-production home revision is `2`; revision `1` is the oldest production home
-that upgrades automatically.
+from the package version, Git tag, and SQLite schema version. Current revision
+`3` is unreleased; supported homes from revision `1` onward upgrade automatically.
+
+Revision `3` adds caller provenance, MCP service contracts, and an independent
+artifact registry. Upgrades preserve existing artifact bytes. Homes from the
+original revision-3 MCP development format also convert automatically, preserving
+caller and MCP records. Unrecognized development formats are rejected; contributor
+guidance in [`AGENTS.md`](../AGENTS.md) defines the exact supported source.
 
 One home revision covers every durable component whose shapes must remain
 compatible together, including:
@@ -28,7 +33,7 @@ migration declares:
 - one contiguous integer revision;
 - one stable migration ID;
 - the complete target SQLite schema;
-- every home-relative path it may change; and
+- every home-relative path it may change and any bounded read-only inputs; and
 - one checksum bound to its definition, implementation source, target schema,
   and other declared implementation material.
 
@@ -118,8 +123,8 @@ this sequence:
    backup, plus safety headroom.
 4. Copy every affected file beneath `.home-upgrade/`; SQLite databases are
    copied with SQLite's online backup API.
-5. Apply every required migration in order to the staged home and append its
-   ledger row only after that transition succeeds.
+5. Apply every required migration in order to the staged home and record each
+   completed transition in its ledger.
 6. Validate the complete staged target: database health and exact schema,
    identity, all current records and transcripts, model configuration, memory,
    user profile, skills, artifacts, and delivery configuration.

@@ -39,7 +39,10 @@ from daita.storage.home_migrations.revision_0001_schema import (
     SCHEMA_REVISION_1,
 )
 from daita.storage.home_migrations.revision_0002 import REVISION_2
-from daita.storage.home_migrations.revision_0003 import REVISION_3
+from daita.storage.home_migrations.revision_0003 import (
+    PRE_REGISTRY_REVISION_3_CHECKSUM,
+    REVISION_3,
+)
 from daita.storage.schema_contract import require_healthy, require_schema
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_schema import CURRENT_SCHEMA
@@ -121,7 +124,7 @@ def _patch_next_migration(
     monkeypatch: pytest.MonkeyPatch,
     migration: HomeMigration,
 ) -> None:
-    migrations = (REVISION_1, REVISION_2, REVISION_3, migration)
+    migrations = (*HOME_MIGRATIONS, migration)
     monkeypatch.setattr(migration_registry, "HOME_MIGRATIONS", migrations)
     monkeypatch.setattr(migration_registry, "CURRENT_HOME_REVISION", 4)
     monkeypatch.setattr(coordinator, "HOME_MIGRATIONS", migrations)
@@ -348,8 +351,10 @@ def _make_preproduction_home(home: Path, shape: str) -> None:
             )
 
 
-async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt(
+@pytest.mark.parametrize("source_revision", [2, 3])
+async def test_populated_prior_mcp_home_preserves_binding_grant_and_receipt(
     tmp_path: Path,
+    source_revision: int,
 ) -> None:
     action = await ActionFixture(tmp_path).start()
     try:
@@ -371,8 +376,8 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
     finally:
         await action.agent.close()
 
-    # Restore the released revision-2 run and binding shapes. The migration
-    # must keep identities, grants, receipts and all unrelated rows.
+    # Restore the released revision-2 or pushed development revision-3 format.
+    # Conversion must keep identities, grants, receipts and all unrelated rows.
     with sqlite3.connect(home / "state.db") as connection:
         preserved = {
             table: tuple(connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid'))
@@ -382,8 +387,9 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
         for run_id, encoded in connection.execute("SELECT id, input FROM runs"):
             payload = json.loads(encoded)
             fields = payload["fields"]
-            del fields["caller_principal_id"]
-            del fields["caller_principal_verified"]
+            if source_revision == 2:
+                del fields["caller_principal_id"]
+                del fields["caller_principal_verified"]
             connection.execute(
                 "UPDATE runs SET input = ? WHERE id = ?",
                 (json.dumps(payload, sort_keys=True, separators=(",", ":")), run_id),
@@ -394,16 +400,17 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
             payload = json.loads(encoded)
             fields = payload["fields"]
             assert fields["owner_principal_id"] == binding.agent_id
-            for field in (
-                "owner_principal_id",
-                "connection_id",
-                "resource_uri",
-                "required_scopes",
-                "protocol_capabilities_digest",
-            ):
-                del fields[field]
-            for tool in fields["tools"]:
-                del tool["fields"]["raw_input_schema"]
+            if source_revision == 2:
+                for field in (
+                    "owner_principal_id",
+                    "connection_id",
+                    "resource_uri",
+                    "required_scopes",
+                    "protocol_capabilities_digest",
+                ):
+                    del fields[field]
+                for tool in fields["tools"]:
+                    del tool["fields"]["raw_input_schema"]
             connection.execute(
                 "UPDATE mcp_server_bindings SET data = ? WHERE binding_id = ?",
                 (
@@ -411,23 +418,37 @@ async def test_populated_revision_2_mcp_home_preserves_binding_grant_and_receipt
                     binding_id,
                 ),
             )
-        assert (
+        if source_revision == 2:
+            assert (
+                connection.execute(
+                    "DELETE FROM agent_home_migrations WHERE revision = 3"
+                ).rowcount
+                == 1
+            )
+        else:
             connection.execute(
-                "DELETE FROM agent_home_migrations WHERE revision = 3"
-            ).rowcount
-            == 1
-        )
+                "UPDATE agent_home_migrations SET checksum = ? WHERE revision = 3",
+                (PRE_REGISTRY_REVISION_3_CHECKSUM,),
+            )
+        connection.execute("DROP TABLE artifacts")
     connection.close()
 
     before = await Agent.inspect_home("mcp-actions", root=tmp_path)
-    assert before.found_revision == 2 and before.upgrade_required
+    assert before.found_revision == source_revision and before.upgrade_required
     reopened = await Agent.open("mcp-actions", **action.kwargs())
     try:
-        assert (await reopened.list_mcp_servers())[0].binding == replace(
-            binding,
-            protocol_capabilities_digest=None,
-            tools=tuple(replace(tool, raw_input_schema=None) for tool in binding.tools),
+        expected_binding = (
+            binding
+            if source_revision == 3
+            else replace(
+                binding,
+                protocol_capabilities_digest=None,
+                tools=tuple(
+                    replace(tool, raw_input_schema=None) for tool in binding.tools
+                ),
+            )
         )
+        assert (await reopened.list_mcp_servers())[0].binding == expected_binding
         upgraded = await reopened.inspect_routine(routine.routine_id)
         assert upgraded is not None
         assert upgraded.routine.capability_grants == (grant,)

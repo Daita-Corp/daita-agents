@@ -20,13 +20,12 @@ Use this order of authority when repository material disagrees:
 Preserve unrelated working-tree changes. Historical code and documents can
 explain intent, but they do not define current behavior.
 
-## Architecture status: current revision 2
+## Architecture status: current revision 3
 
-The production code, current schema, tests and all ordinary statements in this file
-describe **current agent-home revision 2**. Revision 2 is the sole runnable/current
-format. Revision-1 records and decoders exist only inside the immutable revision-2
-migration and its fixtures; they are not runtime compatibility paths. There is no
-feature flag, fallback or dual-runtime interval selecting legacy or draft execution.
+The current agent-home format is unreleased **revision 3**, extending released
+revision 2 with caller/MCP contracts and an independent artifact registry.
+Released revisions 1 and 2 and their migrations remain immutable. Revision 3 is the
+sole current runnable format; legacy decoders remain migration-only.
 
 The current revision-2 graph has these non-negotiable boundaries:
 
@@ -58,7 +57,7 @@ The current revision-2 graph has these non-negotiable boundaries:
   single-job, connected-executor and autonomous-follow-up paths are deleted at the
   specified gates rather than retained as a selectable compatibility engine.
 
-## Current production architecture (revision 2)
+## Current production architecture (revision 3)
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
 explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL,
@@ -419,7 +418,16 @@ revalidates the unchanged bound file, and atomically publishes the artifact.
 Drift requires a fresh read and edit.
 
 The artifact store is the sole storage boundary for committed artifact bytes
-and manifests. `artifact_list` returns bounded safe metadata only for the
+and manifests. SQLite's `artifacts` table owns current identity, caller ownership,
+and `creating`/`ready`/`deleting` lifecycle state. Reads and listings query ready rows;
+transcripts, accepted job results and deliveries are historical evidence, not a
+live inventory. Creation reserves a row before filesystem publication. Deletion
+removes bytes before removing its pending row. Startup reconciles interrupted
+creation and deletion; there is no separate cleanup queue or permanent tombstone.
+Clearing transcripts preserves registered artifacts and their ownership.
+Active job artifact reservations block deletion until their attempt finishes.
+Job recovery can publish only under a currently active reservation.
+`artifact_list` returns bounded safe metadata only for the
 current conversation. `artifact_read` returns a bounded preview for an exact
 known artifact ID owned by the current agent home. `artifact_convert` supports
 only a verified Daita-generated XLSX `Data` snapshot converted to CSV and
@@ -653,12 +661,20 @@ immutable. The snapshot is release evidence, not a second runtime compatibility
 authority. A semantic durable-format change that the generator cannot infer
 still requires an explicit new home revision.
 
+The exact pre-registry revision-3 development home from commit `91e0f8ce` is an
+explicit migration input. Its original checksum, released prefix, and former
+schema must all match before a staged same-revision conversion. The conversion
+preserves caller and MCP records, backfills artifact metadata, and updates the
+revision-3 ledger checksum. It uses the ordinary staged upgrade and retains one
+rollback copy. Unknown development histories still fail closed; there is no
+legacy runtime path.
+
 Source read authority exists only in `source_read_scopes`. Native relational write
 authority exists only in `relational_write_scopes`. Connection JSON never
 owns either permission. Reconstruction fails closed, refresh preserves exact
 scopes, and detach revokes both scope families atomically.
 
-In current revision 2, all state mutation must be atomic and cancellation-safe. Do
+In current revision 3, all state mutation must be atomic and cancellation-safe. Do
 not add event sourcing, replay projections, another state abstraction or a second
 writer around SQLite. Only the normalized graph records, bounded task checkpoints/
 comments and audit event cursor defined by the current schema are permitted; those
@@ -779,7 +795,7 @@ Do not add provider branches to `AgentLoop`.
 
 ## Architectural constraints
 
-Current revision 2 has one `AgentLoop`, one `CapabilityRuntime`, one capability
+Current revision 3 has one `AgentLoop`, one `CapabilityRuntime`, one capability
 registry, one catalog, one artifact store, one graph-aware jobs supervisor, one
 routines supervisor, one SQLite state boundary, and one writer per agent home. The
 graph coordinator is inside `jobs`; it does not add a second execution runtime. Do
@@ -811,8 +827,8 @@ identity. Runtime version displays read installed `daita-agents` distribution
 metadata. Because editable metadata is an installation snapshot, rerun the
 editable install command after changing that value or checking out a commit
 with another value, before importing Daita or running tests. The agent-home
-revision remains independent and changes only through an appended durable-format
-migration.
+revision remains independent. Durable changes use an appended migration or amend
+the unreleased next migration under the release policy above.
 
 Python 3.11 and 3.12 are supported.
 

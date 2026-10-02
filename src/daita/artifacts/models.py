@@ -489,6 +489,32 @@ class ArtifactRef:
         _utc(self.created_at, "artifact created_at")
 
 
+class ArtifactState(str, Enum):
+    CREATING = "creating"
+    READY = "ready"
+    DELETING = "deleting"
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactRecord:
+    """Current artifact identity, ownership and filesystem lifecycle."""
+
+    ref: ArtifactRef
+    agent_id: str
+    caller_principal_id: str
+    state: ArtifactState
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ref, ArtifactRef):
+            raise TypeError("artifact record requires ArtifactRef")
+        if not re.fullmatch(r"run-[0-9a-f]{32}", self.ref.run_id):
+            raise ValueError("artifact record run identity is not path-safe")
+        _required_text(self.agent_id, "artifact owner")
+        _required_text(self.caller_principal_id, "artifact caller", maximum=512)
+        if not isinstance(self.state, ArtifactState):
+            raise TypeError("artifact lifecycle state must be ArtifactState")
+
+
 @dataclass(frozen=True, slots=True)
 class ArtifactPayload:
     ref: ArtifactRef

@@ -57,7 +57,7 @@ async def test_revision_1_golden_whole_home_upgrades_once_and_preserves_content(
     before = _sha256(home / "state.db")
 
     status = await Agent.inspect_home("golden", root=tmp_path)
-    assert status.current_revision == 3
+    assert status.current_revision == CURRENT_HOME_REVISION
     assert status.found_revision == 1
     assert status.minimum_supported_revision == 1
     assert status.upgrade_required
@@ -120,7 +120,7 @@ async def test_every_supported_golden_home_reaches_current_revision(
         root=tmp_path,
         workspace=workspace_for(tmp_path),
     )
-    if source_revision == 3:
+    if source_revision >= 3:
         servers = await agent.list_mcp_servers()
         assert len(servers) == 1
         tool = servers[0].binding.tools[0]
@@ -130,6 +130,15 @@ async def test_every_supported_golden_home_reaches_current_revision(
             == "http://json-schema.org/draft-07/schema#"
         )
         assert "$schema" not in tool.input_schema
+    if source_revision == 3:
+        (ref,) = await agent._embedded._artifact_store.list_refs()
+        assert (
+            await agent.read_artifact(ref.artifact_id)
+        ).content == b"Golden artifact 0."
+        historical = await agent._embedded._store.result(ref.run_id)
+        assert historical is not None
+        assert len(historical.artifacts) == 2
+        assert not await agent.delete_artifact(historical.artifacts[1].artifact_id)
     await agent.close()
 
     current = await Agent.inspect_home("golden", root=tmp_path)

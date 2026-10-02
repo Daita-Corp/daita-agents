@@ -123,8 +123,8 @@
         "affected_paths": [
           "state.db"
         ],
-        "checksum": "db1e58e2ed98008dcf9764ff9115d555e298820cf5d910d01adad4ce7ee398b3",
-        "definition": "Add caller provenance, opaque personal MCP connection claims and SDK protocol facts and exact external schema contracts while preserving released revision-2 identities, grants, receipts and data.",
+        "checksum": "3357ee7ad8153e5160d06133082be89dca1e868f1529029f5b63988fae5dca42",
+        "definition": "Add caller provenance, opaque personal MCP connection claims and SDK protocol facts and exact external schema contracts while preserving released revision-2 identities, grants, receipts and data. Register retained artifacts with independent ownership and lifecycle state. Convert the exact previously pushed pre-registry development format without rewriting caller or MCP records.",
         "migration_id": "0003_framework_caller_authority",
         "revision": 3
       }
@@ -171,6 +171,12 @@
         "parameters_sha256",
         "columns",
         "row_count"
+      ],
+      "ArtifactRecord": [
+        "ref",
+        "agent_id",
+        "caller_principal_id",
+        "state"
       ],
       "ArtifactRef": [
         "artifact_id",
@@ -1761,6 +1767,26 @@
         ]
       },
       "named_indexes": {
+        "artifacts_by_conversation": [
+          "artifacts",
+          false,
+          [
+            "agent_id",
+            "state",
+            "conversation_id",
+            "created_at_us",
+            "artifact_id"
+          ]
+        ],
+        "artifacts_by_run": [
+          "artifacts",
+          false,
+          [
+            "agent_id",
+            "run_id",
+            "state"
+          ]
+        ],
         "deliveries_conversation_history": [
           "deliveries",
           false,
@@ -1974,6 +2000,10 @@
         ]
       },
       "required_sql_fragments": {
+        "artifacts": [
+          "CHECK (state IN ('creating', 'ready', 'deleting'))",
+          "CHECK (byte_size >= 0)"
+        ],
         "deliveries": [
           "CHECK (json_valid(data))"
         ],
@@ -2087,6 +2117,71 @@
           ],
           [
             "checksum",
+            "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "artifacts": [
+          [
+            "artifact_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "run_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "conversation_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "caller_principal_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "state",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "byte_size",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "created_at_us",
+            "INTEGER",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
             "TEXT",
             1,
             null,
@@ -3910,7 +4005,7 @@
       }
     }
   },
-  "contract_sha256": "14f38ce43329bf44937ae71bc76466f92d049d3d91ef673dff97222be78e30ea",
+  "contract_sha256": "58a563758a0d3c22dfb78776a85d8aa04d6b7b590b47b29a1986151fedb3df29",
   "home_revision": 3,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1

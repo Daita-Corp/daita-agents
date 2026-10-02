@@ -63,6 +63,7 @@ class HomeMigration:
     target_schema: SQLiteSchema
     apply: HomeMigrationApply
     implementation_material: tuple[str, ...] = ()
+    read_only_globs: tuple[str, ...] = ()
     _checksum: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -89,6 +90,15 @@ class HomeMigration:
                 or candidate.as_posix() != relative
             ):
                 raise ValueError("home migration path is invalid")
+        for pattern in self.read_only_globs:
+            candidate = Path(pattern)
+            if (
+                candidate.is_absolute()
+                or ".." in candidate.parts
+                or "**" in pattern
+                or not candidate.parts
+            ):
+                raise ValueError("migration read-only input pattern is invalid")
         if any(
             not isinstance(item, str) or not item
             for item in self.implementation_material
@@ -110,6 +120,11 @@ class HomeMigration:
                 "migration_id": self.migration_id,
                 "revision": self.revision,
                 "target_schema": _schema_material(self.target_schema),
+                **(
+                    {"read_only_globs": self.read_only_globs}
+                    if self.read_only_globs
+                    else {}
+                ),
             },
             ensure_ascii=True,
             separators=(",", ":"),

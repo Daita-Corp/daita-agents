@@ -27,8 +27,8 @@ from daita.memory import (
     MemoryStore,
     MemoryValidationError,
 )
-from daita.storage.graph_schema import GRAPH_TABLE_NAMES
 from daita.storage.home_migrations import migration_rows
+from daita.storage.sqlite_schema import CURRENT_SCHEMA
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
 )
@@ -400,7 +400,7 @@ async def test_memory_is_files_only_and_sqlite_schema_is_unchanged(tmp_path):
                 "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
             )
         }
-        assert tables == GRAPH_TABLE_NAMES
+        assert tables == set(CURRENT_SCHEMA.tables)
         for table in tables:
             expected_rows = 1 if table == "metadata" else 0
             if table == "agent_home_migrations":

@@ -329,12 +329,11 @@ Delivery is acknowledged, its oldest retained history entry can be reclaimed
 inside a later producer finalization transaction; acknowledgment wakes both
 producer drivers so pending work can converge immediately.
 
-A Delivery stores a bounded immutable artifact reference rather than a second
-copy of the full artifact manifest. Artifact reads resolve the existing
-canonical manifest and require every projected identity, digest, provenance,
-authorship, sensitivity, and size fact to match. This lets terminal transcripts
-be cleared without losing an artifact that is still rooted by a retained
-Delivery.
+A Delivery stores a bounded immutable artifact reference rather than another
+copy of the full artifact manifest. Finalization verifies it against the artifact
+store. The independent artifact registry owns current availability and retains
+ownership after transcripts are cleared. Explicit artifact deletion preserves the
+historical Delivery but makes its attachment unavailable.
 
 ## Resident host and handoff
 

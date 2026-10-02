@@ -27,7 +27,14 @@ from ..adapters.mcp import (
 )
 from ..adapters.models import SourceRegistration
 from ..artifacts.models import (
+    MAX_ARTIFACT_BYTES_PER_AGENT,
+    MAX_ARTIFACT_BYTES_PER_RUN,
+    MAX_ARTIFACTS_PER_AGENT,
+    MAX_ARTIFACTS_PER_RUN,
+    ArtifactError,
+    ArtifactRecord,
     ArtifactRef,
+    ArtifactState,
     artifact_ref_from_mapping,
 )
 from ..capabilities import (
@@ -93,6 +100,7 @@ from ..jobs.graph.models import (
     TaskResult,
     TaskState,
     canonical_digest,
+    reserved_artifact_id,
 )
 from ..learning_candidates import (
     LEARNING_CANDIDATE_MAX_RECORDS,
@@ -155,7 +163,7 @@ from ..semantics import (
     semantic_annotation_sha256,
 )
 from . import sqlite_graph as _graph_store
-from .graph_schema import ClosingSQLiteConnection, connect_graph
+from .graph_schema import ClosingSQLiteConnection, configure_graph_connection
 from .home_migrations import (
     CURRENT_HOME_REVISION,
     HomeMigrationJournalError,
@@ -201,7 +209,15 @@ from .sqlite_codecs import (
     encode_source,
     encode_source_read_scope,
 )
-from .sqlite_codecs.graph import decode_graph_event, decode_graph_job_delivery
+from .sqlite_codecs.artifacts import (
+    decode_artifact_record,
+    encode_artifact_record,
+)
+from .sqlite_codecs.graph import (
+    decode_graph_event,
+    decode_graph_job,
+    decode_graph_job_delivery,
+)
 from .sqlite_codecs.mcp_bindings import decode_mcp_credential_reference_for_deletion
 from .sqlite_records import (
     EffectOutcome,
@@ -5437,6 +5453,42 @@ class SQLiteStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def get_artifact_record(self, artifact_id: str) -> ArtifactRecord | None:
+        return await _run_graph_read(
+            self.path, lambda connection: _get_artifact_record(connection, artifact_id)
+        )
+
+    async def list_artifact_records(
+        self,
+        agent_id: str,
+        *,
+        state: ArtifactState | None = None,
+        run_id: str | None = None,
+        conversation_id: str | None = None,
+    ) -> tuple[ArtifactRecord, ...]:
+        def read(connection: sqlite3.Connection) -> tuple[ArtifactRecord, ...]:
+            clauses = ["agent_id = ?"]
+            parameters: list[object] = [agent_id]
+            for column, value in (
+                ("state", state.value if state is not None else None),
+                ("run_id", run_id),
+                ("conversation_id", conversation_id),
+            ):
+                if value is not None:
+                    clauses.append(column + " = ?")
+                    parameters.append(value)
+            return tuple(
+                _artifact_record_from_row(row)
+                for row in connection.execute(
+                    "SELECT * FROM artifacts WHERE "
+                    + " AND ".join(clauses)
+                    + " ORDER BY created_at_us, artifact_id",
+                    parameters,
+                )
+            )
+
+        return await _run_graph_read(self.path, read)
+
     async def list_artifact_refs(
         self,
         agent_id: str,
@@ -5444,65 +5496,174 @@ class SQLiteStateStore:
         run_id: str | None = None,
         conversation_id: str | None = None,
     ) -> tuple[ArtifactRef, ...]:
-        """Derive reachable refs from persisted runs and successful jobs."""
-
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("agent_id must be non-empty text")
-        if run_id is not None and (not isinstance(run_id, str) or not run_id):
-            raise ValueError("run_id must be non-empty text or None")
-        if conversation_id is not None and (
-            not isinstance(conversation_id, str) or not conversation_id
-        ):
-            raise ValueError("conversation_id must be non-empty text or None")
-        return await _run_graph_read(
-            self.path,
-            lambda connection: _graph_store.list_graph_artifact_refs(
-                connection,
+        return tuple(
+            record.ref
+            for record in await self.list_artifact_records(
                 agent_id,
+                state=ArtifactState.READY,
                 run_id=run_id,
                 conversation_id=conversation_id,
-            ),
+            )
         )
 
-    async def list_delivery_artifact_references(
-        self,
-        agent_id: str,
-        *,
-        run_id: str | None = None,
-        conversation_id: str | None = None,
-    ) -> tuple[OutcomeArtifactReference, ...]:
-        """Return bounded artifact roots carried by retained logical deliveries."""
+    async def begin_artifact_creation(
+        self, record: ArtifactRecord, *, reserved: bool = False
+    ) -> None:
+        if record.state is not ArtifactState.CREATING:
+            raise ValueError("new artifact must be creating")
 
-        if not isinstance(agent_id, str) or not agent_id:
-            raise ValueError("agent_id must be non-empty text")
-        if run_id is not None and (not isinstance(run_id, str) or not run_id):
-            raise ValueError("run_id must be non-empty text or None")
-        if conversation_id is not None and (
-            not isinstance(conversation_id, str) or not conversation_id
+        def write(connection: sqlite3.Connection) -> None:
+            identity_row = connection.execute(
+                "SELECT data FROM metadata WHERE key = 'identity'"
+            ).fetchone()
+            if (
+                identity_row is None
+                or decode_identity(identity_row[0]).id != record.agent_id
+            ):
+                raise ArtifactError(
+                    "artifact_missing", "Artifact belongs to another agent.", {}
+                )
+            run_row = connection.execute(
+                "SELECT agent_id, input FROM runs WHERE id = ?", (record.ref.run_id,)
+            ).fetchone()
+            if run_row is not None:
+                run = decode_run_input(run_row[1])
+                if (
+                    run_row[0] != record.agent_id
+                    or run.caller_principal_id != record.caller_principal_id
+                    or (run.conversation_id or run.id) != record.ref.conversation_id
+                ):
+                    raise ArtifactError(
+                        "artifact_missing", "Artifact producer ownership differs.", {}
+                    )
+            if _get_artifact_record(connection, record.ref.artifact_id) is not None:
+                raise ArtifactError(
+                    "artifact_storage_failed",
+                    "Artifact identity is already registered.",
+                    {"stage": "identity"},
+                )
+            attempt_row = connection.execute(
+                "SELECT a.attempt_id, a.state, j.data FROM job_task_attempts AS a "
+                "JOIN job_runs AS j ON j.agent_id = a.agent_id AND j.job_id = a.job_id "
+                "WHERE a.agent_id = ? AND a.run_id = ?",
+                (record.agent_id, record.ref.run_id),
+            ).fetchone()
+            if reserved and not _active_artifact_reservation(connection, record):
+                raise ArtifactError(
+                    "artifact_storage_failed",
+                    "Artifact reservation is no longer active.",
+                    {"stage": "reservation"},
+                )
+            if attempt_row is not None:
+                job = decode_graph_job(attempt_row[2])
+                if (
+                    job.specification.principal_id != record.caller_principal_id
+                    or job.conversation_id != record.ref.conversation_id
+                ):
+                    raise ArtifactError(
+                        "artifact_missing", "Artifact job ownership differs.", {}
+                    )
+            rows = tuple(
+                connection.execute(
+                    "SELECT run_id, byte_size FROM artifacts WHERE agent_id = ?",
+                    (record.agent_id,),
+                )
+            )
+            run_rows = tuple(row for row in rows if row[0] == record.ref.run_id)
+            for scope, kind, used, added, ceiling in (
+                ("agent", "count", len(rows), 1, MAX_ARTIFACTS_PER_AGENT),
+                (
+                    "agent",
+                    "bytes",
+                    sum(row[1] for row in rows),
+                    record.ref.byte_size,
+                    MAX_ARTIFACT_BYTES_PER_AGENT,
+                ),
+                ("run", "count", len(run_rows), 1, MAX_ARTIFACTS_PER_RUN),
+                (
+                    "run",
+                    "bytes",
+                    sum(row[1] for row in run_rows),
+                    record.ref.byte_size,
+                    MAX_ARTIFACT_BYTES_PER_RUN,
+                ),
+            ):
+                if used + added > ceiling:
+                    raise ArtifactError(
+                        "artifact_quota_exceeded",
+                        "The artifact exceeds a storage limit.",
+                        {
+                            "scope": scope,
+                            "limit_kind": kind,
+                            "limit": ceiling,
+                            "attempted": used + added,
+                        },
+                    )
+            connection.execute(
+                "INSERT INTO artifacts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                _artifact_record_row(record),
+            )
+
+        await _run_cancellation_safe_graph_transaction(self.path, write)
+
+    async def transition_artifact(
+        self, record: ArtifactRecord, state: ArtifactState
+    ) -> ArtifactRecord:
+        if not (
+            (record.state is ArtifactState.CREATING and state is ArtifactState.READY)
+            or (
+                record.state is not ArtifactState.DELETING
+                and state is ArtifactState.DELETING
+            )
         ):
-            raise ValueError("conversation_id must be non-empty text or None")
-        return await _run_graph_read(
-            self.path,
-            lambda connection: _graph_store.list_current_delivery_artifact_references(
-                connection,
-                agent_id,
-                run_id=run_id,
-                conversation_id=conversation_id,
-            ),
-        )
+            raise ValueError("artifact lifecycle transition is invalid")
+        updated = replace(record, state=state)
 
-    async def list_reserved_artifact_ids(
-        self,
-        agent_id: str,
-    ) -> frozenset[tuple[str, str]]:
-        """Return exact live job artifact reservations for admission recovery."""
+        def write(connection: sqlite3.Connection) -> ArtifactRecord:
+            if (
+                record.state is ArtifactState.READY
+                and state is ArtifactState.DELETING
+                and _active_artifact_reservation(connection, record)
+            ):
+                raise ArtifactError(
+                    "artifact_busy",
+                    "An active job still owns this artifact reservation.",
+                    {},
+                )
+            changed = connection.execute(
+                "UPDATE artifacts SET state = ?, data = ? WHERE artifact_id = ? AND data = ?",
+                (
+                    state.value,
+                    encode_artifact_record(updated),
+                    record.ref.artifact_id,
+                    encode_artifact_record(record),
+                ),
+            ).rowcount
+            if changed != 1:
+                raise ArtifactError(
+                    "artifact_missing", "The artifact lifecycle changed.", {}
+                )
+            return updated
 
-        return await _run_graph_read(
-            self.path,
-            lambda connection: _graph_store.list_graph_reserved_artifact_ids(
-                connection, agent_id
-            ),
-        )
+        return await _run_cancellation_safe_graph_transaction(self.path, write)
+
+    async def finish_artifact_deletion(self, record: ArtifactRecord) -> None:
+        if record.state is not ArtifactState.DELETING:
+            raise ValueError("artifact deletion must be pending")
+
+        def write(connection: sqlite3.Connection) -> None:
+            if (
+                connection.execute(
+                    "DELETE FROM artifacts WHERE artifact_id = ? AND data = ?",
+                    (record.ref.artifact_id, encode_artifact_record(record)),
+                ).rowcount
+                != 1
+            ):
+                raise ArtifactError(
+                    "artifact_missing", "The artifact lifecycle changed.", {}
+                )
+
+        await _run_cancellation_safe_graph_transaction(self.path, write)
 
     async def conversation_runs(
         self,
@@ -6202,7 +6363,7 @@ async def _run_graph_read(
     callback: Callable[[sqlite3.Connection], _T],
 ) -> _T:
     def read() -> _T:
-        with connect_graph(path, read_only=True) as connection:
+        with _connect_read_only(path) as connection:
             connection.execute("BEGIN")
             return callback(connection)
 
@@ -6217,7 +6378,8 @@ async def _run_cancellation_safe_graph_transaction(
     cancelled_sentinel = object()
 
     def write() -> _T | object:
-        connection = connect_graph(path)
+        connection = _connect(path)
+        configure_graph_connection(connection)
         try:
             if not gate.start(connection):
                 return cancelled_sentinel
@@ -6280,6 +6442,51 @@ def _validate_current_mcp_binding_bounds(connection: sqlite3.Connection) -> None
                 )
 
 
+def _active_artifact_reservation(
+    connection: sqlite3.Connection, record: ArtifactRecord
+) -> bool:
+    row = connection.execute(
+        "SELECT attempt_id, state FROM job_task_attempts WHERE agent_id = ? AND run_id = ?",
+        (record.agent_id, record.ref.run_id),
+    ).fetchone()
+    return (
+        row is not None
+        and row[1] in {"claimed", "running"}
+        and reserved_artifact_id(row[0]) == record.ref.artifact_id
+    )
+
+
+def _artifact_record_row(record: ArtifactRecord) -> tuple[object, ...]:
+    ref = record.ref
+    return (
+        ref.artifact_id,
+        record.agent_id,
+        ref.run_id,
+        ref.conversation_id,
+        record.caller_principal_id,
+        record.state.value,
+        ref.byte_size,
+        int(ref.created_at.timestamp() * 1_000_000),
+        encode_artifact_record(record),
+    )
+
+
+def _artifact_record_from_row(row: tuple) -> ArtifactRecord:
+    record = decode_artifact_record(row[-1])
+    if tuple(row) != _artifact_record_row(record):
+        raise ValueError("stored artifact registry projection differs from its record")
+    return record
+
+
+def _get_artifact_record(
+    connection: sqlite3.Connection, artifact_id: str
+) -> ArtifactRecord | None:
+    row = connection.execute(
+        "SELECT * FROM artifacts WHERE artifact_id = ?", (artifact_id,)
+    ).fetchone()
+    return None if row is None else _artifact_record_from_row(row)
+
+
 def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity | None:
     _validate_current_mcp_binding_bounds(connection)
     identity: AgentIdentity | None = None
@@ -6299,6 +6506,17 @@ def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity |
             decode_review_stamps(data)
         else:
             raise ValueError("state metadata key is unsupported")
+
+    records = tuple(
+        _artifact_record_from_row(row)
+        for row in connection.execute("SELECT * FROM artifacts")
+    )
+    if len(records) > MAX_ARTIFACTS_PER_AGENT:
+        raise ValueError("stored artifact registry exceeds its fixed bound")
+    if records and (
+        identity is None or any(record.agent_id != identity.id for record in records)
+    ):
+        raise ValueError("stored artifact belongs to another agent")
 
     mcp_binding_counts: dict[str, int] = {}
     for agent_id, binding_id, data in connection.execute(
@@ -6774,35 +6992,17 @@ def _validate_current_records(connection: sqlite3.Connection) -> AgentIdentity |
 
 
 def load_current_artifact_inventory(
-    path: Path,
-    agent_id: str,
-) -> tuple[
-    tuple[ArtifactRef, ...],
-    tuple[OutcomeArtifactReference, ...],
-    frozenset[tuple[str, str]],
-]:
-    """Read exact artifact roots from an already validated revision-2 database."""
-
-    if not isinstance(agent_id, str) or not agent_id:
-        raise ValueError("agent_id must be non-empty text")
-    with connect_graph(path) as connection:
-        refs = _graph_store.list_graph_artifact_refs(connection, agent_id)
-        reservations = _graph_store.list_graph_reserved_artifact_ids(
-            connection, agent_id
-        )
-        delivery_references = _graph_store.list_current_delivery_artifact_references(
-            connection, agent_id
-        )
-    return (
-        refs,
-        tuple(
-            sorted(
-                delivery_references,
-                key=lambda item: (item.producing_run_id, item.artifact_id),
+    path: Path, agent_id: str
+) -> tuple[ArtifactRecord, ...]:
+    """Read authoritative lifecycle rows from an already validated current database."""
+    with _connect_read_only(path) as connection:
+        return tuple(
+            _artifact_record_from_row(row)
+            for row in connection.execute(
+                "SELECT * FROM artifacts WHERE agent_id = ? ORDER BY created_at_us, artifact_id",
+                (agent_id,),
             )
-        ),
-        reservations,
-    )
+        )
 
 
 def validate_current_state_database(path: Path) -> AgentIdentity | None:

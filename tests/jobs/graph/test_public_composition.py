@@ -172,7 +172,7 @@ async def _wait_terminal(agent: Agent, job_id: str) -> GraphInspection:
     raise AssertionError("production graph did not reach a terminal state")
 
 
-async def test_public_agent_executes_graph_model_task_in_revision_3_home(
+async def test_public_agent_executes_graph_model_task_in_current_home(
     tmp_path: Path,
 ) -> None:
     home = await create_probe_home(
