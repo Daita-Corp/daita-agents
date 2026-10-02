@@ -72,7 +72,13 @@ class ActionTransport(MCPConformanceTransport):
         self.dispatched.set()
         if self.mode == "disconnect":
             raise httpx.ReadError("response lost after applying", request=request)
-        if self.mode in {"timeout", "cancel"}:
+        if self.mode == "timeout":
+            # Receipt tests observe a timeout after possible application. Actual
+            # deadline expiry is exercised by the SDK transport tests.
+            raise httpx.ReadTimeout(
+                "response timed out after applying", request=request
+            )
+        if self.mode == "cancel":
             await self.release.wait()
         if self.mode == "malformed":
             return httpx.Response(
@@ -177,7 +183,7 @@ class ActionFixture:
         )
         self.transport = ActionTransport(self.server)
         self.factory = SDKMCPClientFactory(
-            http_transport=httpx.MockTransport(self.transport), timeout_seconds=0.2
+            http_transport=httpx.MockTransport(self.transport)
         )
 
     async def approve(self, request):

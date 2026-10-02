@@ -949,15 +949,21 @@ async def test_cancel_after_possible_dispatch_is_uncertain(action):
     action.transport.mode = "cancel"
     action.script()
     task = asyncio.create_task(action.agent.run("Send the notification."))
-    await asyncio.wait_for(action.transport.dispatched.wait(), timeout=5)
-    task.cancel()
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    receipts = await action.receipts()
-    assert len(action.server.calls) == len(receipts) == 1
-    assert receipts[0].outcome is EffectOutcome.UNCERTAIN
+        await asyncio.wait_for(action.transport.dispatched.wait(), timeout=5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        receipts = await action.receipts()
+        assert len(action.server.calls) == len(receipts) == 1
+        assert receipts[0].outcome is EffectOutcome.UNCERTAIN
+    finally:
+        action.transport.release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize(
