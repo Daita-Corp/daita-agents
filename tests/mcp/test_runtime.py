@@ -10,7 +10,7 @@ from hashlib import sha256
 
 import httpx2 as httpx
 import pytest
-from textual.widgets import Input, OptionList, Select, Static
+from textual.widgets import Button, Input, OptionList, Select, SelectionList, Static
 
 from daita import (
     Agent,
@@ -846,11 +846,182 @@ async def test_mcp_management_groups_legacy_bindings_by_server(tmp_path):
         app.exit(0)
 
 
-@pytest.mark.parametrize("auth_mode", ("none", "env", "token"))
+async def _wait_for_mcp_setup(screen: MCPSetupScreen) -> None:
+    workers = tuple(worker for worker in screen.workers if worker.node is screen)
+    if workers:
+        await asyncio.wait_for(screen.workers.wait_for_complete(workers), timeout=10)
+
+
+async def test_guided_mcp_setup_corrects_credentials_and_invalidates_changed_endpoint(
+    tmp_path,
+):
+    identity = _guided_mcp_identity()
+    identity.bearer_token = "correct-fixture-token"
+    keychain = MemoryKeychain()
+    opened = await Agent.create(
+        "mcp-correct-auth",
+        root=tmp_path,
+        keychain=keychain,
+        mcp_client_factory=SDKMCPClientFactory(http_transport=mock_transport(identity)),
+        workspace=workspace_for(tmp_path),
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
+    app.controller.agent = opened
+    async with app.run_test(size=(104, 38)) as pilot:
+        await app._show_chat()
+        command_task = asyncio.create_task(app._open_command_screen("mcp_setup", {}))
+        try:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MCPSetupScreen)
+            screen.query_one("#mcp-endpoint", Input).value = identity.endpoint
+            screen.query_one("#mcp-auth", Select).value = "token"
+            token = screen.query_one("#mcp-token", Input)
+            token.value = "wrong-fixture-token"
+            await pilot.pause()
+            assert await pilot.click("#mcp-inspect")
+            await _wait_for_mcp_setup(screen)
+            await pilot.pause()
+            assert "Check the credential and endpoint" in str(
+                screen.query_one("#mcp-error", Static).content
+            )
+            assert not screen.query_one("#mcp-review").display
+            assert token.value == ""
+            assert "Credential saved" in str(
+                screen.query_one("#mcp-credential-status", Static).content
+            )
+            old_reference = next(iter(keychain.values))
+
+            token.value = identity.bearer_token
+            await pilot.pause()
+            assert await pilot.click("#mcp-inspect")
+            await _wait_for_mcp_setup(screen)
+            await pilot.pause()
+            assert old_reference in keychain.deleted
+            assert tuple(keychain.values.values()) == (identity.bearer_token,)
+            listing = screen.query_one("#mcp-tools", SelectionList)
+            listing.select_all()
+            await pilot.pause()
+            assert not screen.query_one("#mcp-attach", Button).disabled
+
+            assert await pilot.click("#mcp-back")
+            await _wait_for_mcp_setup(screen)
+            await pilot.pause()
+            # A different endpoint must not inherit the previous tool selection.
+            screen.query_one("#mcp-endpoint", Input).value = (
+                "https://missing.fixture.test/mcp"
+            )
+            await pilot.pause()
+            assert listing.option_count == 0
+            assert screen.query_one("#mcp-attach", Button).disabled
+            assert await pilot.click("#mcp-inspect")
+            await _wait_for_mcp_setup(screen)
+            await pilot.pause()
+            assert not screen.query_one("#mcp-review").display
+            screen.query_one("#mcp-endpoint", Input).value = identity.endpoint
+            await pilot.pause()
+            assert await pilot.click("#mcp-inspect")
+            await _wait_for_mcp_setup(screen)
+            await pilot.pause()
+            # Retrying with a blank token uses the saved credential, without a new entry.
+            assert screen.query_one("#mcp-review").display
+            assert listing.selected == []
+            assert len(keychain.values) == 1
+            assert len(keychain.deleted) == 1
+            assert await pilot.click("#mcp-setup-cancel")
+            await asyncio.wait_for(command_task, 10)
+            assert keychain.values == {}
+            assert len(keychain.deleted) == 2
+            assert await opened.list_mcp_servers() == ()
+            assert not identity.calls
+        finally:
+            command_task.cancel()
+            await asyncio.gather(command_task, return_exceptions=True)
+            app.exit(0)
+
+
+@pytest.mark.parametrize("has_supported_tool", (True, False))
+async def test_guided_mcp_setup_disables_unsupported_tools_with_reasons(
+    tmp_path, has_supported_tool
+):
+    identity = _guided_mcp_identity()
+    if not has_supported_tool:
+        identity.tools.clear()
+    identity.tools.append(
+        {
+            "name": "unsupported",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"value": {"$ref": "https://invalid/schema"}},
+            },
+        }
+    )
+    opened = await Agent.create(
+        "mcp-unsupported-setup",
+        root=tmp_path,
+        mcp_client_factory=SDKMCPClientFactory(http_transport=mock_transport(identity)),
+        workspace=workspace_for(tmp_path),
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
+    app.controller.agent = opened
+    async with app.run_test(size=(80, 30)) as pilot:
+        await app._show_chat()
+        command_task = asyncio.create_task(app._open_command_screen("mcp_setup", {}))
+        try:
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MCPSetupScreen)
+            screen.query_one("#mcp-endpoint", Input).value = identity.endpoint
+            await pilot.pause()
+            assert await pilot.click("#mcp-inspect")
+            await _wait_for_mcp_setup(screen)
+            await pilot.pause()
+            listing = screen.query_one("#mcp-tools", SelectionList)
+            unsupported = listing.get_option_at_index(listing.option_count - 1)
+            assert unsupported.disabled
+            assert "local JSON Pointer" in str(unsupported.prompt)
+            listing.focus()
+            await pilot.press("space")
+            await pilot.pause()
+            assert "unsupported" not in listing.selected
+            if not has_supported_tool:
+                assert screen.query_one("#mcp-attach", Button).disabled
+                assert screen.query_one("#mcp-configure", Button).disabled
+            assert await pilot.click("#mcp-back")
+            await _wait_for_mcp_setup(screen)
+            await pilot.pause()
+            assert screen.query_one("#mcp-connect").display
+            await pilot.press("escape")
+            await asyncio.wait_for(command_task, 10)
+            assert await opened.list_mcp_servers() == ()
+            assert not identity.calls
+        finally:
+            command_task.cancel()
+            await asyncio.gather(command_task, return_exceptions=True)
+            app.exit(0)
+
+
+@pytest.mark.parametrize(
+    ("auth_mode", "size", "entrypoint", "activation_pending"),
+    (
+        ("none", (80, 24), "mcp_setup", False),
+        ("env", (104, 38), "mcp_setup", False),
+        ("keychain", (104, 38), "mcp_setup", False),
+        ("token", (80, 30), "mcp_management", False),
+        ("token", (104, 38), "mcp_setup", True),
+    ),
+)
 async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
     tmp_path,
     monkeypatch,
     auth_mode,
+    size,
+    entrypoint,
+    activation_pending,
 ):
     identity = _guided_mcp_identity()
     token = "tui-static-bearer-fixture"
@@ -858,6 +1029,8 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
         identity.bearer_token = token
         monkeypatch.setenv("TUI_MCP_TOKEN", token)
     keychain = MemoryKeychain()
+    if auth_mode == "keychain":
+        await keychain.set(SecretReference.keychain("shared-mcp"), token)
     factory = SDKMCPClientFactory(http_transport=mock_transport(identity))
     opened = await Agent.create(
         "mcp-guided-setup",
@@ -871,6 +1044,13 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
         root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
     )
     app.controller.agent = opened
+    if activation_pending:
+        attach = app.controller.attach_mcp_tools
+
+        async def attach_pending(*args, **kwargs):
+            return replace(await attach(*args, **kwargs), activated_revision=None)
+
+        monkeypatch.setattr(app.controller, "attach_mcp_tools", attach_pending)
     reopen_calls: list[bool] = []
 
     async def reopen_with_fixture(*, observer, approval_handler):
@@ -889,74 +1069,91 @@ async def test_guided_mcp_setup_attaches_one_multi_tool_binding_and_activates(
         return reopened
 
     app.controller.reopen_agent = reopen_with_fixture  # type: ignore[method-assign]
-    async with app.run_test(size=(104, 38)) as pilot:
+    async with app.run_test(size=size) as pilot:
         await app._show_chat()
-        command_task = asyncio.create_task(app._open_command_screen("mcp_setup", {}))
-        await pilot.pause()
+        command_task = asyncio.create_task(app._open_command_screen(entrypoint, {}))
+        try:
+            await pilot.pause()
+            if entrypoint == "mcp_management":
+                assert await pilot.click("#mcp-add")
+                await pilot.pause()
 
-        assert isinstance(app.screen, MCPSetupScreen)
-        app.screen.query_one("#mcp-endpoint", Input).value = identity.endpoint
-        app.screen.query_one("#mcp-auth", Select).value = auth_mode
-        if auth_mode == "env":
-            app.screen.query_one("#mcp-credential-ref", Input).value = "TUI_MCP_TOKEN"
-        elif auth_mode == "token":
-            token_input = app.screen.query_one("#mcp-token", Input)
-            assert token_input.password
-            token_input.value = token
-        assert await pilot.click("#mcp-inspect") is True
-        await pilot.pause()
-        inspection_text = str(
-            app.screen.query_one("#mcp-inspection-body", Static).content
-        )
-        assert "Context Fixture 4.0.1" in inspection_text
-        assert "Supported tools: 2" in inspection_text
-
-        assert await pilot.click("#mcp-select") is True
-        await pilot.pause()
-        picker = app.screen
-        assert isinstance(picker, SelectionScreen)
-        listing = picker.query_one("#picker-options", OptionList)
-        listing.highlighted = 0
-        picker.action_toggle_selected()
-        listing.highlighted = 1
-        picker.action_toggle_selected()
-        picker.action_confirm()
-        await pilot.pause()
-
-        assert isinstance(app.screen, MCPSetupScreen)
-        review = str(app.screen.query_one("#mcp-inspection-body", Static).content)
-        assert "Alias: query_docs" in review
-        assert "Alias: resolve_library_id" in review
-        assert "Result sensitivity: internal" in review
-        assert "Remote descriptions and annotations are untrusted" in review
-
-        assert await pilot.click("#mcp-attach") is True
-        await pilot.pause()
-        attestation = app.screen
-        assert isinstance(attestation, ConfirmScreen)
-        await pilot.press("y")
-        await asyncio.wait_for(command_task, timeout=10)
-
-        assert isinstance(app.screen, ChatScreen)
-        statuses = await app.controller.list_mcp_servers()
-        assert len(statuses) == 1
-        assert statuses[0].active_in_runtime
-        if auth_mode == "token":
-            reference = statuses[0].binding.authentication.secret_reference
-            assert reference is not None and reference.scheme == "keychain"
-            assert keychain.values == {reference.to_uri(): token}
-            assert app.controller.agent is not None
-            assert (
-                token.encode()
-                not in (app.controller.agent.home / "state.db").read_bytes()
+            assert isinstance(app.screen, MCPSetupScreen)
+            app.screen.query_one("#mcp-endpoint", Input).value = identity.endpoint
+            assert not app.screen.query_one("#mcp-token", Input).display
+            app.screen.query_one("#mcp-auth", Select).value = (
+                "reference" if auth_mode in {"env", "keychain"} else auth_mode
             )
-        assert reopen_calls == []
-        assert app.controller.agent is opened
-        assert {tool.remote_name for tool in statuses[0].binding.tools} == {
-            "query-docs",
-            "resolve-library-id",
-        }
-        app.exit(0)
+            if auth_mode in {"env", "keychain"}:
+                app.screen.query_one("#mcp-reference-kind", Select).value = auth_mode
+                app.screen.query_one("#mcp-credential-ref", Input).value = (
+                    "TUI_MCP_TOKEN" if auth_mode == "env" else "shared-mcp"
+                )
+            elif auth_mode == "token":
+                token_input = app.screen.query_one("#mcp-token", Input)
+                assert token_input.password
+                token_input.value = token
+            await pilot.pause()
+            assert await pilot.click("#mcp-inspect") is True
+            await pilot.pause()
+            await _wait_for_mcp_setup(app.screen)
+            await pilot.pause()
+            inspection_text = str(
+                app.screen.query_one("#mcp-inspection-body", Static).content
+            )
+            assert "Context Fixture 4.0.1" in inspection_text, str(
+                app.screen.query_one("#mcp-error", Static).content
+            )
+            assert not app.screen.query_one("#mcp-inspect", Button).display
+            assert app.screen.query_one("#mcp-attach", Button).disabled
+            listing = app.screen.query_one("#mcp-tools", SelectionList)
+            assert listing.option_count == 2
+            assert listing.size.height >= 5
+            listing.focus()
+            await pilot.press("space", "down", "space")
+            await pilot.pause()
+            assert len(listing.selected) == 2
+            assert str(app.screen.query_one("#mcp-attach", Button).label) == (
+                "Add server · 2 tools"
+            )
+            assert await opened.list_mcp_servers() == ()
+
+            assert await pilot.click("#mcp-attach") is True
+            await _wait_for_mcp_setup(app.screen)
+            await pilot.pause()
+            assert isinstance(app.screen, MCPSetupScreen)
+            success = str(app.screen.query_one("#mcp-success", Static).content)
+            assert (
+                "activation is pending" if activation_pending else "2 tools"
+            ) in success
+            assert not app.screen.query_one("#mcp-attach", Button).display
+            assert await pilot.click("#mcp-done")
+            await asyncio.wait_for(command_task, timeout=10)
+
+            assert isinstance(app.screen, ChatScreen)
+            statuses = await app.controller.list_mcp_servers()
+            assert len(statuses) == 1
+            assert statuses[0].active_in_runtime
+            if auth_mode == "token":
+                reference = statuses[0].binding.authentication.secret_reference
+                assert reference is not None and reference.scheme == "keychain"
+                assert keychain.values == {reference.to_uri(): token}
+                assert app.controller.agent is not None
+                assert (
+                    token.encode()
+                    not in (app.controller.agent.home / "state.db").read_bytes()
+                )
+            assert reopen_calls == []
+            assert app.controller.agent is opened
+            assert {tool.remote_name for tool in statuses[0].binding.tools} == {
+                "query-docs",
+                "resolve-library-id",
+            }
+            app.exit(0)
+        finally:
+            command_task.cancel()
+            await asyncio.gather(command_task, return_exceptions=True)
+            app.exit(0)
 
 
 async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_path):
@@ -1625,6 +1822,7 @@ async def test_cancelled_masked_mcp_setup_deletes_unused_credential(
         assert token_input.password
         token_input.value = token
         await pilot.click("#mcp-inspect")
+        await _wait_for_mcp_setup(app.screen)
         await pilot.pause()
         assert token_input.value == ""
         assert len(keychain.values) == 1

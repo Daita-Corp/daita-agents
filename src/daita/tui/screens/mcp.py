@@ -5,17 +5,20 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import cast
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Footer, Input, Label, Select, Static
+from textual.widgets import Button, Footer, Input, Label, Select, SelectionList, Static
+from textual.widgets.selection_list import Selection
 
 from daita import (
     MCPAuthentication,
     MCPBindingState,
     MCPBindingStatus,
     MCPCompletionSemantics,
+    MCPError,
     MCPServerInspection,
     MCPToolSelection,
 )
@@ -175,7 +178,7 @@ class MCPManagementScreen(ModalScreen[str | None]):
             with VerticalScroll(id="mcp-list"):
                 yield Static("", id="mcp-body", markup=False)
             yield Static(
-                "Only explicitly selected, operator-attested read tools are admitted.",
+                "Choose which tools your agent can use and review their permissions.",
                 id="mcp-help",
                 markup=False,
             )
@@ -226,9 +229,8 @@ class MCPManagementScreen(ModalScreen[str | None]):
         try:
             if button_id == "mcp-add":
                 result = await self.app._await_modal(MCPSetupScreen())  # type: ignore[attr-defined]
-                if result == "active":
-                    await self._load()
-                    self.query_one("#mcp-help", Static).update("MCP tools activated.")
+                if result is not None:
+                    self.dismiss(result)
                 return
             if button_id == "mcp-refresh":
                 await self._refresh_binding()
@@ -379,7 +381,7 @@ class MCPToolAdmissionScreen(ModalScreen[MCPToolSelection | None]):
             with VerticalScroll():
                 yield Label("Local alias")
                 yield Input(selected.local_alias, id="mcp-tool-alias")
-                yield Label("Local description")
+                yield Label("Description (untrusted tool guidance; editable)")
                 yield Input(selected.description, id="mcp-tool-description")
                 yield Label("Data access")
                 yield Select(
@@ -487,113 +489,158 @@ class MCPToolAdmissionScreen(ModalScreen[MCPToolSelection | None]):
 
 
 class MCPSetupScreen(ModalScreen[str | None]):
-    """Inspect, select, review, and attach one no-auth MCP server."""
+    """Connect, review exact tool permissions, and report activation."""
 
-    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+    BINDINGS = [Binding("escape", "cancel", "Back / Cancel", priority=True)]
 
     def __init__(self) -> None:
         super().__init__()
         self._inspection: MCPServerInspection | None = None
-        self._inspected_input: str | None = None
-        self._selections: tuple[MCPToolSelection, ...] = ()
-        self._tool_picker: dict[str, str] = {}
+        self._candidates: dict[str, MCPToolSelection] = {}
         self._busy = False
+        self._step = "connect"
         self._authentication = MCPAuthentication.no_auth()
         self._owned_credential: SecretReference | None = None
         self._attached = False
+        self._result: str | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mcp-setup"):
             yield Label("Add MCP server", id="mcp-title", markup=False)
-            yield Static(
-                "Step 1 of 3  ·  Enter an endpoint and credentials",
-                id="mcp-step",
-                markup=False,
-            )
-            yield Input(
-                placeholder="https://mcp.example.com/mcp",
-                id="mcp-endpoint",
-            )
-            with Horizontal():
+            yield Static("", id="mcp-step", markup=False)
+            with VerticalScroll(id="mcp-connect"):
+                yield Label("Server URL")
+                yield Input(
+                    placeholder="https://mcp.example.com/mcp", id="mcp-endpoint"
+                )
+                yield Label("Authentication")
                 yield Select(
                     [
-                        ("No authentication", "none"),
-                        ("Environment variable", "env"),
-                        ("Keychain reference", "keychain"),
-                        ("Save bearer token", "token"),
+                        ("None", "none"),
+                        ("API key / bearer token", "token"),
+                        ("Advanced: credential reference", "reference"),
                     ],
                     value="none",
                     allow_blank=False,
                     id="mcp-auth",
                 )
                 yield Input(
-                    placeholder="Credential reference name", id="mcp-credential-ref"
+                    placeholder="Paste key or token without the Bearer prefix",
+                    password=True,
+                    id="mcp-token",
                 )
-            yield Input(
-                placeholder="Bearer token (masked, saved in keychain)",
-                password=True,
-                id="mcp-token",
-            )
-            with VerticalScroll(id="mcp-inspection"):
+                with Vertical(id="mcp-reference-fields"):
+                    yield Select(
+                        [("Environment variable", "env"), ("Keychain", "keychain")],
+                        value="env",
+                        allow_blank=False,
+                        id="mcp-reference-kind",
+                    )
+                    yield Input(
+                        placeholder="Credential reference name", id="mcp-credential-ref"
+                    )
+                yield Static("", id="mcp-credential-status", markup=False)
                 yield Static(
-                    "Inspection is read-only and does not grant tool access.",
-                    id="mcp-inspection-body",
+                    "Keys and tokens are saved in your local keychain. Browser sign-in "
+                    "is not supported here. For API keys, use the server's API-key endpoint.\n"
+                    "Finding tools does not give your agent access to them.",
+                    id="mcp-auth-help",
                     markup=False,
                 )
-            with Horizontal(id="mcp-setup-actions"):
-                yield Button("Inspect", id="mcp-inspect", variant="primary")
-                yield Button("Select tools", id="mcp-select", disabled=True)
-                yield Button("Attach tools", id="mcp-attach", disabled=True)
-                yield Button("Cancel", id="mcp-setup-cancel")
-            yield Button(
-                "Configure selected tool permissions", id="mcp-configure", disabled=True
-            )
-            yield Label("Server outbound sensitivity ceiling")
-            yield Select(
-                [(item.value, item.value) for item in ModelSensitivity],
-                value=ModelSensitivity.INTERNAL.value,
-                allow_blank=False,
-                id="mcp-outbound",
-            )
+            with VerticalScroll(id="mcp-review"):
+                yield Static("", id="mcp-inspection-body", markup=False)
+                yield SelectionList[str](id="mcp-tools")
+                with Horizontal(id="mcp-tool-actions"):
+                    yield Button("Advanced / permissions", id="mcp-configure")
+                    yield Static("0 selected", id="mcp-selection-count", markup=False)
+                yield Label("What data may be sent to this server?")
+                yield Select(
+                    [
+                        ("Public only", "public"),
+                        ("Public and internal", "internal"),
+                        ("Up to confidential", "confidential"),
+                        ("Up to restricted (all levels)", "restricted"),
+                    ],
+                    value=ModelSensitivity.INTERNAL.value,
+                    allow_blank=False,
+                    id="mcp-outbound",
+                )
+                yield Static(
+                    "Verify each tool's access before adding. Defaults assume reads.\n"
+                    "Data limits cover the full request; stricter tool limits apply.",
+                    id="mcp-review-help",
+                    markup=False,
+                )
+            with VerticalScroll(id="mcp-finished"):
+                yield Static("", id="mcp-success", markup=False)
             yield Static("", id="mcp-error", markup=False)
+            with Horizontal(id="mcp-setup-actions"):
+                yield Button("Find tools", id="mcp-inspect", variant="primary")
+                yield Button("Add server", id="mcp-attach", variant="primary")
+                yield Button("Back", id="mcp-back")
+                yield Button("Cancel", id="mcp-setup-cancel")
+                yield Button("Return to chat", id="mcp-done", variant="primary")
             yield Footer()
 
     def on_mount(self) -> None:
+        self._update_auth_fields()
+        self._set_step("connect")
         self.query_one("#mcp-endpoint", Input).focus()
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        if (
-            event.input.id not in {"mcp-endpoint", "mcp-credential-ref", "mcp-token"}
-            or self._inspected_input is None
-        ):
-            return
-        if (
-            event.input.id == "mcp-endpoint"
-            and event.value.strip() == self._inspected_input
-        ):
-            return
-        self._clear_inspection()
-
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "mcp-auth" and self._inspected_input is not None:
-            self._clear_inspection()
-
-    def _clear_inspection(self) -> None:
-        self._inspection = None
-        self._inspected_input = None
-        self._selections = ()
-        self._tool_picker = {}
+    def _set_step(self, step: str) -> None:
+        self._step = step
+        self.query_one("#mcp-connect").display = step == "connect"
+        self.query_one("#mcp-review").display = step == "review"
+        self.query_one("#mcp-finished").display = step == "finished"
         self.query_one("#mcp-step", Static).update(
-            "Step 1 of 3  ·  Inspect the updated endpoint"
-        )
-        self.query_one("#mcp-inspection-body", Static).update(
-            "Inspection is read-only and does not grant tool access."
+            {
+                "connect": "Step 1 of 2 · Connect to a server",
+                "review": "Step 2 of 2 · Choose tools and review access",
+                "finished": (
+                    "Server added" if self._result == "active" else "Server saved"
+                ),
+            }[step]
         )
         self._update_actions()
 
+    def _update_auth_fields(self) -> None:
+        mode = self.query_one("#mcp-auth", Select).value
+        self.query_one("#mcp-token", Input).display = mode == "token"
+        self.query_one("#mcp-reference-fields").display = mode == "reference"
+        self.query_one("#mcp-credential-status", Static).update(
+            "Credential saved. Leave the token field empty to keep it."
+            if mode == "token" and self._owned_credential is not None
+            else ""
+        )
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id in {"mcp-endpoint", "mcp-credential-ref", "mcp-token"}:
+            self._clear_inspection()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id in {"mcp-auth", "mcp-reference-kind"}:
+            self._clear_inspection()
+            self._update_auth_fields()
+
+    def _clear_inspection(self) -> None:
+        if self._inspection is None or self._attached:
+            return
+        self._inspection = None
+        self._candidates = {}
+        self.query_one("#mcp-tools", SelectionList).clear_options()
+        self._set_step("connect")
+
     def action_cancel(self) -> None:
-        if not self._busy:
-            self.run_worker(self._cancel_setup(), name="mcp-cancel")
+        if self._busy:
+            return
+        if self._attached:
+            self.dismiss(self._result)
+        elif self._step == "review":
+            self._set_step("connect")
+            self.query_one("#mcp-endpoint", Input).focus()
+        else:
+            self._set_busy(True)
+            self.run_worker(self._handle_button("mcp-setup-cancel"), name="mcp-cancel")
 
     async def _cancel_setup(self) -> None:
         await self._discard_unused_credential()
@@ -609,10 +656,10 @@ class MCPSetupScreen(ModalScreen[str | None]):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id
-        if button_id == "mcp-setup-cancel":
-            self.action_cancel()
-            return
         if button_id is None or self._busy:
+            return
+        if button_id == "mcp-done":
+            self.dismiss(self._result)
             return
         self.run_worker(
             self._handle_button(button_id),
@@ -627,241 +674,227 @@ class MCPSetupScreen(ModalScreen[str | None]):
         try:
             if button_id == "mcp-inspect":
                 await self._inspect()
-            elif button_id == "mcp-select":
-                await self._select_tools()
             elif button_id == "mcp-attach":
                 await self._attach_tools()
             elif button_id == "mcp-configure":
                 await self._configure_tool()
+            elif button_id == "mcp-back":
+                self._set_step("connect")
+            elif button_id == "mcp-setup-cancel":
+                await self._cancel_setup()
         except (ValueError, RuntimeError, OSError) as error:
             self._show_error(error)
         finally:
             if self.is_mounted:
                 self._set_busy(False)
+        if self.is_mounted:
+            if self._step == "finished":
+                self.query_one("#mcp-done", Button).focus()
+            elif button_id in {"mcp-inspect", "mcp-back", "mcp-configure"}:
+                self.query_one(
+                    "#mcp-tools" if self._step == "review" else "#mcp-endpoint"
+                ).focus()
 
     async def _inspect(self) -> None:
         endpoint = self.query_one("#mcp-endpoint", Input).value.strip()
         if not endpoint:
-            raise ValueError("Enter an MCP endpoint first.")
+            raise ValueError("Enter an MCP server URL first.")
+        self._clear_inspection()
         mode = self.query_one("#mcp-auth", Select).value
         if mode == "none":
+            await self._discard_unused_credential()
             authentication = MCPAuthentication.no_auth()
-        elif mode in {"env", "keychain"}:
+        elif mode == "reference":
+            await self._discard_unused_credential()
             name = self.query_one("#mcp-credential-ref", Input).value.strip()
-            authentication = MCPAuthentication.bearer(
-                SecretReference(cast(str, mode), name)
-            )
+            scheme = cast(str, self.query_one("#mcp-reference-kind", Select).value)
+            authentication = MCPAuthentication.bearer(SecretReference(scheme, name))
         else:
             token_input = self.query_one("#mcp-token", Input)
             if token_input.value:
+                if token_input.value.lower().startswith("bearer "):
+                    raise ValueError(
+                        "Enter only the key or token, without the Bearer prefix."
+                    )
                 await self._discard_unused_credential()
                 self._owned_credential = await self.app.controller.store_mcp_bearer(token_input.value)  # type: ignore[attr-defined]
-                token_input.value = ""
+                with token_input.prevent(Input.Changed):
+                    token_input.value = ""
             if self._owned_credential is None:
-                raise ValueError("Enter a bearer token first.")
+                raise ValueError("Enter an API key or bearer token first.")
             authentication = MCPAuthentication.bearer(self._owned_credential)
+        self._update_auth_fields()
         inspection = await self.app.controller.inspect_mcp_server(endpoint, authentication=authentication)  # type: ignore[attr-defined]
         self._authentication = authentication
         self._inspection = inspection
-        self._inspected_input = endpoint
-        self._selections = ()
         supported = tuple(tool for tool in inspection.tools if tool.supported)
-        unsupported = tuple(tool for tool in inspection.tools if not tool.supported)
-        self._tool_picker = {
-            f"mcp-tool-{index}": tool.remote_name
-            for index, tool in enumerate(supported)
+        self._candidates = {
+            item.remote_name: item
+            for item in MCPToolSelection.resolve(
+                tuple(MCPToolSelection(tool.remote_name) for tool in supported),
+                inspection,
+            )
         }
-        self.query_one("#mcp-step", Static).update(
-            "Step 2 of 3  ·  Select supported tools, then configure local permissions"
-        )
-        lines = [
-            safe_display(inspection.server_name, fallback="Unknown server", maximum=256)
-            + " "
-            + safe_display(inspection.server_version, fallback="", maximum=256),
-            safe_display(
-                inspection.endpoint, fallback="Endpoint unavailable", maximum=2_048
-            ),
-            "",
-            f"Supported tools: {len(supported)}",
-        ]
-        lines.extend(
-            "  • " + safe_display(tool.remote_name, fallback="tool", maximum=256)
-            for tool in supported
-        )
-        if unsupported:
-            lines.extend(("", f"Unsupported tools: {len(unsupported)}"))
-            lines.extend(
-                "  • "
-                + safe_display(tool.remote_name, fallback="tool", maximum=256)
-                + " — "
-                + safe_display(
-                    tool.unsupported_reason or "unsupported schema",
-                    fallback="unsupported schema",
-                    maximum=512,
+        listing = self.query_one("#mcp-tools", SelectionList)
+        listing.clear_options()
+        for tool in inspection.tools:
+            candidate = self._candidates.get(tool.remote_name)
+            if candidate is not None:
+                listing.add_option(
+                    Selection(self._tool_prompt(candidate), tool.remote_name)
                 )
-                for tool in unsupported
-            )
+            else:
+                reason = safe_display(
+                    tool.unsupported_reason or "unsupported schema", maximum=512
+                )
+                name = safe_display(tool.remote_name, fallback="tool", maximum=256)
+                listing.add_option(
+                    Selection(
+                        Text(f"{name} · Unavailable: {reason}"),
+                        tool.remote_name,
+                        disabled=True,
+                    )
+                )
+        summary = (
+            safe_display(inspection.server_name, fallback="MCP server", maximum=256)
+            + " "
+            + safe_display(inspection.server_version, fallback="", maximum=256)
+            + f" · {len(supported)} tools available"
+            + "\n"
+            + safe_display(inspection.endpoint, fallback="MCP endpoint", maximum=2_048)
+        )
         if not supported:
-            lines.extend(("", "This server has no tools Daita can admit."))
-        self.query_one("#mcp-inspection-body", Static).update("\n".join(lines))
-        self._update_actions()
-
-    async def _select_tools(self) -> None:
-        inspection = self._inspection
-        if inspection is None or not self._tool_picker:
-            raise ValueError("Inspect a server with supported tools first.")
-        supported_by_name = {
-            tool.remote_name: tool for tool in inspection.tools if tool.supported
-        }
-        options = tuple(
-            PickerOption(
-                identity=picker_id,
-                label=safe_display(remote_name, fallback="tool", maximum=256),
-                description="Supported schema",
-            )
-            for picker_id, remote_name in self._tool_picker.items()
+            summary += "\nNo supported tools. Go back to use another endpoint."
+        self.query_one("#mcp-inspection-body", Static).update(summary)
+        listing.highlighted = next(
+            (index for index, tool in enumerate(inspection.tools) if tool.supported),
+            None,
         )
-        selected = await self.app._await_modal(  # type: ignore[attr-defined]
-            SelectionScreen(
-                title="Select tools (read-only admission by default)",
-                options=options,
-                multi=True,
-            )
-        )
-        if selected is None:
-            return
-        remote_names = tuple(
-            self._tool_picker[picker_id]
-            for picker_id in selected
-            if self._tool_picker[picker_id] in supported_by_name
-        )
-        self._selections = MCPToolSelection.resolve(
-            tuple(MCPToolSelection(name) for name in remote_names), inspection
-        )
+        self._set_step("review")
         self._render_selection()
 
+    def _tool_prompt(self, selection: MCPToolSelection) -> Text:
+        name = safe_display(selection.remote_name, fallback="tool", maximum=256)
+        effect = selection.operational_effect
+        permission = f"{selection.access_mode.value.capitalize()} access · " + (
+            "No effects"
+            if effect is OperationalEffect.NONE
+            else effect.value.replace("_", " ")
+        )
+        return Text(f"{name} · {permission}")
+
+    def on_selection_list_selected_changed(
+        self, event: SelectionList.SelectedChanged
+    ) -> None:
+        if event.selection_list.id == "mcp-tools":
+            self._render_selection()
+
+    def on_selection_list_selection_highlighted(
+        self, event: SelectionList.SelectionHighlighted
+    ) -> None:
+        if event.selection_list.id == "mcp-tools":
+            self._update_actions()
+
+    def _selected_tools(self) -> tuple[MCPToolSelection, ...]:
+        selected = set(self.query_one("#mcp-tools", SelectionList).selected)
+        return tuple(
+            item for name, item in self._candidates.items() if name in selected
+        )
+
     async def _configure_tool(self) -> None:
-        selected = await self.app._await_modal(  # type: ignore[attr-defined]
-            SelectionScreen(
-                title="Configure exact tool permissions",
-                options=tuple(
-                    PickerOption(
-                        identity=item.remote_name,
-                        label=safe_display(item.remote_name, fallback="tool"),
-                        description=item.operational_effect.value,
-                    )
-                    for item in self._selections
-                ),
-            )
-        )
-        if not selected:
+        listing = self.query_one("#mcp-tools", SelectionList)
+        index = listing.highlighted
+        if index is None:
             return
-        original = next(
-            item for item in self._selections if item.remote_name == selected[0]
-        )
+        name = listing.get_option_at_index(index).value
+        original = self._candidates.get(name)
+        if original is None:
+            return
         configured = await self.app._await_modal(MCPToolAdmissionScreen(original))  # type: ignore[attr-defined]
         if configured is not None:
-            self._selections = tuple(
-                configured if item.remote_name == original.remote_name else item
-                for item in self._selections
-            )
+            self._candidates[name] = configured
+            listing.replace_option_prompt_at_index(index, self._tool_prompt(configured))
             self._render_selection()
 
     def _render_selection(self) -> None:
-        inspection = self._inspection
-        assert inspection is not None
-        self.query_one("#mcp-step", Static).update(
-            "Step 3 of 3  ·  Review aliases, descriptions, and sensitivity"
+        count = len(self._selected_tools())
+        self.query_one("#mcp-selection-count", Static).update(f"{count} selected")
+        self.query_one("#mcp-attach", Button).label = f"Add server · {count} " + (
+            "tool" if count == 1 else "tools"
         )
-        lines = [
-            safe_display(
-                inspection.server_name, fallback="Unknown server", maximum=256
-            ),
-            safe_display(
-                inspection.endpoint, fallback="Endpoint unavailable", maximum=2_048
-            ),
-            "",
-            f"Selected tools: {len(self._selections)}",
-        ]
-        for selection in self._selections:
-            lines.extend(
-                (
-                    "",
-                    safe_display(selection.remote_name, fallback="tool", maximum=256),
-                    "  Alias: " + cast(str, selection.local_alias),
-                    "  Description: "
-                    + safe_display(
-                        selection.description, fallback="MCP read tool", maximum=512
-                    ),
-                    "  Result sensitivity: " + selection.result_sensitivity.value,
-                    "  Access / effect: "
-                    + selection.access_mode.value
-                    + " / "
-                    + selection.operational_effect.value,
-                    "  Unattended eligibility: "
-                    + cast(
-                        AutomationEligibility, selection.automation_eligibility
-                    ).value,
-                    "  Tool outbound ceiling: "
-                    + selection.maximum_outbound_sensitivity.value,
-                    "  Completion: " + selection.completion_semantics.value,
-                )
-            )
-        lines.extend(
-            (
-                "",
-                "Remote descriptions and annotations are untrusted and are not copied "
-                "into these tool definitions.",
-            )
-        )
-        self.query_one("#mcp-inspection-body", Static).update("\n".join(lines))
         self._update_actions()
 
     async def _attach_tools(self) -> None:
         inspection = self._inspection
-        if inspection is None or not self._selections:
-            raise ValueError("Select at least one supported tool first.")
-        accepted = await self.app._await_modal(  # type: ignore[attr-defined]
-            ConfirmScreen(
-                f"Attach {len(self._selections)} selected MCP "
-                + ("tool" if len(self._selections) == 1 else "tools")
-                + " with the reviewed local permissions?\n\nIndependently verify each tool's access, effect and direct-result semantics. Shell, infrastructure and arbitrary execution are unsupported. Remote metadata grants no authority. Actions require exact per-call approval or a separately approved standing grant. Normal results establish only server-reported invocation, not verified business completion. No automatic replay."
-            )
-        )
-        if not accepted:
-            return
+        selections = self._selected_tools()
+        if (
+            self._attached
+            or self._step != "review"
+            or inspection is None
+            or not selections
+        ):
+            raise ValueError("Choose at least one supported tool first.")
         status = await self.app.controller.attach_mcp_tools(  # type: ignore[attr-defined]
             inspection.endpoint,
-            self._selections,
+            selections,
             authentication=self._authentication,
             maximum_outbound_sensitivity=ModelSensitivity(
                 cast(str, self.query_one("#mcp-outbound", Select).value)
             ),
         )
-        if not status.active_in_runtime:
-            raise RuntimeError("MCP admission was saved but activation is pending.")
+        # Admission has persisted even if runtime activation needs attention. Never
+        # offer a duplicate attachment or delete the binding's credential afterward.
         self._attached = True
-        self.dismiss("active")
+        self._result = "active" if status.active_in_runtime else "saved"
+        count = len(selections)
+        message = (
+            f"Your agent can discover and use {count} "
+            + ("tool" if count == 1 else "tools")
+            + " in your next message."
+            if status.active_in_runtime
+            else "The server is saved, but activation is pending. Check its status in MCP servers."
+        )
+        self.query_one("#mcp-success", Static).update(message)
+        self._set_step("finished")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
+        for widget in self.query("Input, Select, SelectionList"):
+            widget.disabled = busy or self._attached
         self._update_actions()
 
     def _update_actions(self) -> None:
-        supported = bool(self._tool_picker)
-        selected = bool(self._selections)
-        self.query_one("#mcp-inspect", Button).disabled = self._busy
-        self.query_one("#mcp-select", Button).disabled = self._busy or not supported
-        self.query_one("#mcp-attach", Button).disabled = self._busy or not selected
-        self.query_one("#mcp-configure", Button).disabled = self._busy or not selected
-        self.query_one("#mcp-setup-cancel", Button).disabled = self._busy
+        for button_id, visible in {
+            "mcp-inspect": self._step == "connect",
+            "mcp-attach": self._step == "review",
+            "mcp-back": self._step == "review",
+            "mcp-setup-cancel": self._step != "finished",
+            "mcp-done": self._step == "finished",
+        }.items():
+            button = self.query_one(f"#{button_id}", Button)
+            button.display = visible
+            button.disabled = self._busy
+        self.query_one("#mcp-inspect", Button).label = (
+            "Finding tools…" if self._busy and self._step == "connect" else "Find tools"
+        )
+        self.query_one("#mcp-attach", Button).disabled = (
+            self._busy or not self._selected_tools()
+        )
+        listing = self.query_one("#mcp-tools", SelectionList)
+        highlighted = listing.highlighted
+        self.query_one("#mcp-configure", Button).disabled = (
+            self._busy
+            or highlighted is None
+            or listing.get_option_at_index(highlighted).value not in self._candidates
+        )
 
     def _show_error(self, error: Exception) -> None:
-        self.query_one("#mcp-error", Static).update(
-            sanitize_terminal_text(
-                str(error),
-                maximum=512,
-                preserve_lines=False,
-                fallback="MCP setup failed.",
-            )
+        message = sanitize_terminal_text(
+            str(error), maximum=512, preserve_lines=False, fallback="MCP setup failed."
         )
+        if isinstance(error, MCPError) and error.code == "mcp_authentication_failed":
+            message += (
+                " Check the credential and endpoint. API keys may use a different "
+                "URL from browser sign-in; this screen cannot sign in through a browser."
+            )
+        self.query_one("#mcp-error", Static).update(message)

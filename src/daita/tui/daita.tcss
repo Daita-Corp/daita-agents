@@ -407,9 +407,65 @@ ModelSetupScreen #model-help {
     padding-bottom: 1;
 }
 
-#mcp-management,
-#mcp-setup {
+#mcp-management {
     height: 88%;
+}
+
+#mcp-setup {
+    width: 94%;
+    height: 96%;
+    max-height: 96%;
+}
+
+#mcp-setup #mcp-title,
+#mcp-setup #mcp-step {
+    padding-bottom: 0;
+}
+
+#mcp-connect,
+#mcp-review,
+#mcp-finished {
+    height: 1fr;
+}
+
+#mcp-reference-fields {
+    height: auto;
+}
+
+#mcp-tools {
+    height: 1fr;
+    min-height: 5;
+    border: none;
+    background: $panel;
+    padding: 0;
+}
+
+#mcp-tools > .option-list--option-highlighted {
+    background: #343434;
+    color: $foreground;
+    text-style: bold;
+}
+
+#mcp-inspection-body,
+#mcp-auth-help,
+#mcp-review-help,
+#mcp-credential-status {
+    height: auto;
+}
+
+#mcp-auth-help,
+#mcp-review-help {
+    color: $text-muted;
+}
+
+#mcp-tool-actions {
+    height: 3;
+}
+
+#mcp-selection-count {
+    width: 1fr;
+    height: 3;
+    content-align: right middle;
 }
 
 #mcp-summary,
@@ -419,8 +475,7 @@ ModelSetupScreen #model-help {
     color: $text-muted;
 }
 
-#mcp-list,
-#mcp-inspection {
+#mcp-list {
     height: 1fr;
     padding: 1 0;
     background: $panel;
@@ -449,6 +504,10 @@ ModelSetupScreen #model-help {
     width: auto;
     min-width: 12;
     margin-right: 1;
+}
+
+#mcp-setup-actions {
+    margin-top: 0;
 }
 
 #mcp-error {
