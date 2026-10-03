@@ -44,6 +44,12 @@ from daita.agent import (
     HostActiveError,
     SourceRefreshError,
 )
+from daita.artifacts import (
+    ArtifactDeliveryReceipt,
+    ArtifactDestination,
+    ArtifactPayload,
+    ArtifactRef,
+)
 from daita.jobs import (
     GraphBoardProjection,
     GraphInspection,
@@ -658,6 +664,23 @@ class PresentationController:
     async def list_inbox(self) -> tuple[InboxView, ...]:
         return await self.require_agent().inbox(limit=50)
 
+    async def list_artifacts(
+        self, *, limit: int, offset: int
+    ) -> tuple[ArtifactRef, ...]:
+        return await self.require_agent().list_artifacts(limit=limit, offset=offset)
+
+    async def read_artifact(self, artifact_id: str) -> ArtifactPayload:
+        return await self.require_agent().read_artifact(artifact_id)
+
+    async def save_artifact(self, artifact_id: str) -> ArtifactDeliveryReceipt:
+        return await self.require_agent().save_artifact(artifact_id)
+
+    async def artifact_export_destination(self) -> ArtifactDestination:
+        return await self.require_agent().export_destination()
+
+    async def delete_artifact(self, artifact_id: str) -> bool:
+        return await self.require_agent().delete_artifact(artifact_id)
+
     async def list_distribution_destinations(
         self,
         conversation_id: str,
@@ -979,6 +1002,13 @@ class PresentationController:
             return CommandOutcome(
                 "notice",
                 "Usage: /inbox",
+                conversation_id=conversation_id,
+            )
+        if name == "/artifacts":
+            return CommandOutcome(
+                "screen" if len(parts) == 1 else "notice",
+                "" if len(parts) == 1 else "Usage: /artifacts",
+                screen="artifacts" if len(parts) == 1 else None,
                 conversation_id=conversation_id,
             )
         if name == "/catalog" and len(parts) == 1:

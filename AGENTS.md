@@ -431,9 +431,11 @@ Job recovery can publish only under a currently active reservation.
 current conversation. `artifact_read` returns a bounded preview for an exact
 known artifact ID owned by the current agent home. `artifact_convert` supports
 only a verified Daita-generated XLSX `Data` snapshot converted to CSV and
-records the parent artifact. There is no public agent-wide inventory, hidden
-current-file pointer, raw model path/byte interface, or alternate artifact
-execution path.
+records the parent artifact. The typed owner API `Agent.list_artifacts` supplies
+bounded pages across conversations for human management in the TUI's `/artifacts`
+screen; hosted listings retain caller isolation. Model inventory remains
+conversation-scoped. There is no hidden current-file pointer, raw model
+path/byte interface, or alternate artifact execution path.
 
 `artifact_create_tabular` creates one bounded model-authored CSV, XLSX, or
 HTML table from exact earlier successful tool-call IDs in the current run. The

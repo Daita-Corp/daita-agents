@@ -5465,6 +5465,9 @@ class SQLiteStateStore:
         state: ArtifactState | None = None,
         run_id: str | None = None,
         conversation_id: str | None = None,
+        caller_principal_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> tuple[ArtifactRecord, ...]:
         def read(connection: sqlite3.Connection) -> tuple[ArtifactRecord, ...]:
             clauses = ["agent_id = ?"]
@@ -5473,6 +5476,7 @@ class SQLiteStateStore:
                 ("state", state.value if state is not None else None),
                 ("run_id", run_id),
                 ("conversation_id", conversation_id),
+                ("caller_principal_id", caller_principal_id),
             ):
                 if value is not None:
                     clauses.append(column + " = ?")
@@ -5482,8 +5486,8 @@ class SQLiteStateStore:
                 for row in connection.execute(
                     "SELECT * FROM artifacts WHERE "
                     + " AND ".join(clauses)
-                    + " ORDER BY created_at_us, artifact_id",
-                    parameters,
+                    + " ORDER BY created_at_us, artifact_id LIMIT ? OFFSET ?",
+                    (*parameters, limit if limit is not None else -1, offset),
                 )
             )
 
@@ -5495,6 +5499,9 @@ class SQLiteStateStore:
         *,
         run_id: str | None = None,
         conversation_id: str | None = None,
+        caller_principal_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> tuple[ArtifactRef, ...]:
         return tuple(
             record.ref
@@ -5503,6 +5510,9 @@ class SQLiteStateStore:
                 state=ArtifactState.READY,
                 run_id=run_id,
                 conversation_id=conversation_id,
+                caller_principal_id=caller_principal_id,
+                limit=limit,
+                offset=offset,
             )
         )
 

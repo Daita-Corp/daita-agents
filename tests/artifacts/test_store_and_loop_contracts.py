@@ -76,6 +76,9 @@ class _Registry:
         state: ArtifactState | None = None,
         run_id: str | None = None,
         conversation_id: str | None = None,
+        caller_principal_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> tuple[ArtifactRecord, ...]:
         return tuple(
             record
@@ -86,7 +89,11 @@ class _Registry:
             and (
                 conversation_id is None or record.ref.conversation_id == conversation_id
             )
-        )
+            and (
+                caller_principal_id is None
+                or record.caller_principal_id == caller_principal_id
+            )
+        )[offset : None if limit is None else offset + limit]
 
     async def list_artifact_refs(
         self,
@@ -94,6 +101,9 @@ class _Registry:
         *,
         run_id: str | None = None,
         conversation_id: str | None = None,
+        caller_principal_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> tuple[ArtifactRef, ...]:
         return tuple(
             record.ref
@@ -102,6 +112,9 @@ class _Registry:
                 state=ArtifactState.READY,
                 run_id=run_id,
                 conversation_id=conversation_id,
+                caller_principal_id=caller_principal_id,
+                limit=limit,
+                offset=offset,
             )
         )
 

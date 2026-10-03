@@ -42,6 +42,22 @@ per-run artifact totals remain bounded.
 
 ## Reading and saving artifacts
 
+In the TUI, `/artifacts` opens all stored artifacts for the current agent,
+across conversations. Select an artifact to see its metadata; use **Preview**
+for bounded text or XLSX rows, **Save copy** for the configured export folder,
+or **Delete** to permanently remove it after confirmation. Use **Previous** and
+**Next** to browse pages and **Refresh** to reload the inventory. Saved copies
+and conversation history remain after deletion.
+
+The owner API provides the same paged inventory:
+
+```python
+artifacts = await agent.list_artifacts(limit=50, offset=0)
+```
+
+Hosted listings filter by authenticated `caller_principal_id`. Only ready
+artifacts appear; clearing conversation history does not remove them.
+
 `artifact_list` lists metadata for the current conversation. `artifact_read`
 previews an exact artifact ID. `artifact_convert` converts a verified exact
 Daita XLSX snapshot to CSV without rerunning its source. `artifact_save_local`

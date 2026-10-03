@@ -88,6 +88,9 @@ async def test_delete_hides_one_artifact_preserves_evidence_and_exports(
 ):
     agent, result, downloads = artifact_agent
     ref, other = result.artifacts
+    assert await agent.list_artifacts(limit=1) == (ref,)
+    assert await agent.list_artifacts(limit=1, offset=1) == (other,)
+    assert await agent.list_artifacts(limit=1, offset=2) == ()
     original = await agent.transcript(result.run_id)
     exported = await agent.save_artifact(ref.artifact_id)
     assert await agent.delete_artifact(ref.artifact_id) is True
@@ -96,6 +99,7 @@ async def test_delete_hides_one_artifact_preserves_evidence_and_exports(
     assert (await agent.read_artifact(other.artifact_id)).content == b"payload 1"
     assert Path(exported.saved_path).read_bytes() == b"payload 0"
     assert await agent._embedded._artifact_store.list_refs() == (other,)
+    assert await agent.list_artifacts() == (other,)
     for call in (agent.read_artifact, agent.save_artifact):
         with pytest.raises(ArtifactError) as error:
             await call(ref.artifact_id)
@@ -112,6 +116,7 @@ async def test_delete_hides_one_artifact_preserves_evidence_and_exports(
         assert (await reopened.read_artifact(other.artifact_id)).content == b"payload 1"
         # Completed deletion leaves no registry row, even after history is cleared.
         await reopened.clear_conversations()
+        assert await reopened.list_artifacts() == (other,)
         assert await reopened.delete_artifact(ref.artifact_id) is False
     finally:
         await reopened.close()

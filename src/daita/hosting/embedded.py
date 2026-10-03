@@ -64,6 +64,7 @@ from ..artifacts.models import (
     ArtifactDeliveryReceipt,
     ArtifactDestination,
     ArtifactPayload,
+    ArtifactRef,
     ArtifactState,
 )
 from ..artifacts.store import AgentHomeArtifactStore, validate_artifact_home
@@ -3435,6 +3436,22 @@ class EmbeddedAgent:
             self._require_open()
             cleared = await self._candidate_reviewer.clear_conversations()
             return cleared
+
+    async def list_artifacts(
+        self,
+        *,
+        limit: int,
+        offset: int,
+        caller_principal_id: str | None = None,
+    ) -> tuple[ArtifactRef, ...]:
+        async with self._artifact_publication_lock:
+            self._require_open()
+            principal_id = self._resolve_caller_principal(caller_principal_id)
+            return await self._artifact_store.list_refs(
+                caller_principal_id=principal_id if self._hosted else None,
+                limit=limit,
+                offset=offset,
+            )
 
     async def read_artifact(
         self, artifact_id: str, *, caller_principal_id: str | None = None

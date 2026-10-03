@@ -45,6 +45,7 @@ from .models import (
 from .observer import ObserverEvent, RunObserver
 from .projection import CAPABILITY_LABELS, project_conversation
 from .sanitization import render_model_answer, safe_display, sanitize_terminal_text
+from .screens.artifacts import ArtifactsScreen
 from .screens.catalog import CatalogScreen, SourceManagerAction
 from .screens.chat import ChatScreen
 from .screens.confirm import ConfirmScreen
@@ -773,6 +774,9 @@ class DaitaApp(App[int]):
         if screen_name == "inbox":
             await self._await_modal(InboxScreen())
             await self.refresh_background_status(notify_new=False)
+            return
+        if screen_name == "artifacts":
+            await self._await_modal(ArtifactsScreen())
             return
         if screen_name == "catalog":
             await self._manage_sources(

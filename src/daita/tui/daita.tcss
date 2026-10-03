@@ -199,6 +199,7 @@ PermissionsScreen {
 #jobs-manager,
 #routines-manager,
 #inbox-manager,
+#artifacts-manager,
 #mcp-management,
 #mcp-setup {
     width: 88%;
@@ -642,6 +643,66 @@ ModelSetupScreen #model-help {
 #routines-manager,
 #inbox-manager {
     height: 88%;
+}
+
+#artifacts-manager {
+    height: 90%;
+}
+
+#artifacts-summary, #artifacts-notice, #artifacts-error {
+    height: auto;
+}
+
+#artifacts-summary {
+    color: $text-muted;
+}
+
+#artifacts-list {
+    height: 6;
+    min-height: 3;
+    padding: 0;
+    background: $panel;
+    border: none;
+    border-top: solid #2A2A2A;
+}
+
+#artifacts-list > .option-list--option-highlighted {
+    color: $foreground;
+    background: #343434;
+    text-style: bold;
+}
+
+#artifacts-detail-scroll {
+    height: 1fr;
+    min-height: 2;
+    padding: 1 0;
+    border-top: solid #2A2A2A;
+}
+
+#artifacts-detail {
+    height: auto;
+}
+
+#artifacts-actions, #artifacts-navigation {
+    height: auto;
+}
+
+#artifacts-actions Button, #artifacts-navigation Button {
+    width: auto;
+    min-width: 8;
+    margin-right: 1;
+}
+
+#artifacts-error {
+    color: $error;
+}
+
+ArtifactsScreen.-compact #artifacts-list {
+    height: 3;
+}
+
+ArtifactsScreen.-compact #artifacts-detail-scroll {
+    padding: 0;
 }
 
 #jobs-summary,
