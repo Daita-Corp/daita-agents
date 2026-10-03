@@ -56,7 +56,6 @@ from ..jobs.graph.models import (
     TaskRole,
     TaskState,
     canonical_digest,
-    reserved_artifact_id,
     topology_digest,
 )
 from ..jobs.graph.reduction import reduce_attempt_failure

@@ -29,7 +29,6 @@ from .models import (
     ArtifactRecord,
     ArtifactRef,
     ArtifactState,
-    artifact_provenance_to_mapping,
     artifact_ref_from_mapping,
     artifact_ref_to_mapping,
     canonical_artifact_filename,
