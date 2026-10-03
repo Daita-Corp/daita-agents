@@ -649,21 +649,26 @@ ModelSetupScreen #model-help {
     height: 90%;
 }
 
-#artifacts-summary, #artifacts-notice, #artifacts-error {
+#artifacts-summary, #artifacts-list-heading, #artifacts-overview,
+#artifacts-notice, #artifacts-error, #artifacts-help {
     height: auto;
 }
 
-#artifacts-summary {
+#artifacts-summary, #artifacts-list-heading, #artifacts-help {
     color: $text-muted;
 }
 
 #artifacts-list {
-    height: 6;
+    height: 7;
     min-height: 3;
     padding: 0;
     background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    scrollbar-gutter: stable;
+}
+
+#artifacts-list-heading {
+    padding-right: 2;
 }
 
 #artifacts-list > .option-list--option-highlighted {
@@ -674,13 +679,42 @@ ModelSetupScreen #model-help {
 
 #artifacts-detail-scroll {
     height: 1fr;
-    min-height: 2;
+    min-height: 3;
     padding: 1 0;
     border-top: solid #2A2A2A;
 }
 
 #artifacts-detail {
     height: auto;
+}
+
+#artifacts-overview {
+    padding-top: 1;
+    text-style: bold;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+#artifacts-details {
+    height: auto;
+    padding: 0;
+    margin-top: 1;
+    background: $panel;
+    border: none;
+}
+
+#artifacts-metadata {
+    height: auto;
+    color: $text-muted;
+}
+
+#artifacts-details > CollapsibleTitle {
+    padding: 0;
+    color: $text-muted;
+}
+
+#artifacts-help {
+    padding-top: 1;
 }
 
 #artifacts-actions, #artifacts-navigation {
@@ -691,6 +725,42 @@ ModelSetupScreen #model-help {
     width: auto;
     min-width: 8;
     margin-right: 1;
+    color: $foreground;
+    background: #262626;
+    border: solid #5A5A5A;
+}
+
+#artifacts-actions Button:hover, #artifacts-actions Button:focus,
+#artifacts-navigation Button:hover, #artifacts-navigation Button:focus {
+    color: $foreground;
+    background: #3A3A3A;
+    border: solid $primary;
+}
+
+#artifacts-actions #artifacts-delete {
+    color: $foreground;
+    background: #2F1515;
+    border: solid #A54B4B;
+    text-style: bold;
+}
+
+#artifacts-actions #artifacts-delete:hover, #artifacts-actions #artifacts-delete:focus {
+    color: #FFFFFF;
+    background: #6B2525;
+    border: solid #FF7B7B;
+}
+
+#artifacts-actions Button:disabled, #artifacts-navigation Button:disabled {
+    color: #666666;
+    background: $panel;
+    border: solid #292929;
+}
+
+#artifacts-actions #artifacts-delete:disabled {
+    color: #666666;
+    background: $panel;
+    border: solid #292929;
+    text-style: none;
 }
 
 #artifacts-error {
@@ -698,11 +768,20 @@ ModelSetupScreen #model-help {
 }
 
 ArtifactsScreen.-compact #artifacts-list {
-    height: 3;
+    height: 2;
+    min-height: 2;
 }
 
 ArtifactsScreen.-compact #artifacts-detail-scroll {
     padding: 0;
+}
+
+ArtifactsScreen.-compact #artifacts-overview {
+    padding-top: 0;
+}
+
+ArtifactsScreen.-compact #artifacts-help {
+    padding-top: 0;
 }
 
 #jobs-summary,

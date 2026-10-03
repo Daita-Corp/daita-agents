@@ -43,11 +43,15 @@ per-run artifact totals remain bounded.
 ## Reading and saving artifacts
 
 In the TUI, `/artifacts` opens all stored artifacts for the current agent,
-across conversations. Select an artifact to see its metadata; use **Preview**
-for bounded text or XLSX rows, **Save copy** for the configured export folder,
-or **Delete** to permanently remove it after confirmation. Use **Previous** and
-**Next** to browse pages and **Refresh** to reload the inventory. Saved copies
-and conversation history remain after deletion.
+across conversations. The list shows short display names, format, size, and
+local creation time; full filenames and technical metadata are under **Details**.
+Use **↑/↓** to select and **Enter** to preview formatted JSON, Markdown, text,
+or CSV/XLSX tables. **Save copy** uses the configured export folder;
+**Delete** permanently removes the stored artifact after confirmation.
+Use **Previous** and **Next** to browse pages and **Refresh** to reload the
+inventory. Saved copies and conversation history remain after deletion.
+**PgUp/PgDn** scroll the preview;
+**i** toggles Details and **Esc** closes the screen.
 
 The owner API provides the same paged inventory:
 
