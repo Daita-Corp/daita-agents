@@ -58,7 +58,8 @@ Every Monday, summarize last week's revenue and put the result in my inbox.
 
 Use `/learn <material>` to teach Daita a business definition or procedure with
 approval. `/jobs` shows durable work, `/routines` manages saved assignments, and
-`/inbox` shows their results. `/sources` explores connections and relationships;
+`/inbox` shows their results. `/artifacts` previews, saves, and deletes stored
+files. `/sources` explores connections and relationships;
 `@` narrows a question to one source. Type `/help` for the full command list.
 
 Scheduled work progresses only while the terminal or `daita host --agent <name>`

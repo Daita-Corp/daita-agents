@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from tests.artifacts._public_surface_support import (
     Agent,
     Path,
     _create_artifact_agent,
+    pytest,
     workspace_for,
 )
 
@@ -18,6 +21,7 @@ async def test_public_known_id_read_and_save_work_after_restart_without_rerunnin
     agent, ref = await _create_artifact_agent(tmp_path, "public-restart", downloads)
     try:
         assert ref.conversation_id
+        await agent.clear_conversations()
     finally:
         await agent.close()
     reopened = await Agent.open(
@@ -27,6 +31,7 @@ async def test_public_known_id_read_and_save_work_after_restart_without_rerunnin
         workspace=workspace_for(tmp_path),
     )
     try:
+        assert await reopened.list_artifacts() == (ref,)
         assert (await reopened.read_artifact(ref.artifact_id)).content == (
             b"surface payload\n"
         )
@@ -34,6 +39,23 @@ async def test_public_known_id_read_and_save_work_after_restart_without_rerunnin
         assert Path(receipt.saved_path).read_bytes() == b"surface payload\n"
     finally:
         await reopened.close()
+
+
+async def test_artifact_inventory_rejects_unbounded_or_invalid_pages(tmp_path: Path):
+    agent = await Agent.create(
+        "inventory-bounds", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        invalid_limits: tuple[Any, ...] = (0, 101, True, "50")
+        for value in invalid_limits:
+            with pytest.raises(ValueError, match="limit"):
+                await agent.list_artifacts(limit=value)
+        invalid_offsets: tuple[Any, ...] = (-1, 10_001, True, "0")
+        for value in invalid_offsets:
+            with pytest.raises(ValueError, match="offset"):
+                await agent.list_artifacts(offset=value)
+    finally:
+        await agent.close()
 
 
 async def test_public_save_path_is_one_time_and_public_set_location_is_persistent(

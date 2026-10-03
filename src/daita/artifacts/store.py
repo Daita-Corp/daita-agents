@@ -29,7 +29,6 @@ from .models import (
     ArtifactRecord,
     ArtifactRef,
     ArtifactState,
-    artifact_provenance_to_mapping,
     artifact_ref_from_mapping,
     artifact_ref_to_mapping,
     canonical_artifact_filename,
@@ -61,6 +60,9 @@ class ArtifactRegistry(Protocol):
         state: ArtifactState | None = None,
         run_id: str | None = None,
         conversation_id: str | None = None,
+        caller_principal_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> tuple[ArtifactRecord, ...]: ...
     async def list_artifact_refs(
         self,
@@ -68,6 +70,9 @@ class ArtifactRegistry(Protocol):
         *,
         run_id: str | None = None,
         conversation_id: str | None = None,
+        caller_principal_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> tuple[ArtifactRef, ...]: ...
     async def begin_artifact_creation(
         self, record: ArtifactRecord, *, reserved: bool = False
@@ -224,6 +229,9 @@ class AgentHomeArtifactStore:
         *,
         run_id: str | None = None,
         conversation_id: str | None = None,
+        caller_principal_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> tuple[ArtifactRef, ...]:
         async with self._lifecycle_lock:
             self._require_available()
@@ -231,6 +239,9 @@ class AgentHomeArtifactStore:
                 self.agent_id,
                 run_id=run_id,
                 conversation_id=conversation_id,
+                caller_principal_id=caller_principal_id,
+                limit=limit,
+                offset=offset,
             )
 
     async def find_ref(self, artifact_id: str) -> ArtifactRef:

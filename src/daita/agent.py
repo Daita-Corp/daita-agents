@@ -32,9 +32,11 @@ from .adapters.protocols import (
     ResourceSource,
 )
 from .artifacts.models import (
+    MAX_ARTIFACTS_PER_AGENT,
     ArtifactDeliveryReceipt,
     ArtifactDestination,
     ArtifactPayload,
+    ArtifactRef,
 )
 from .capabilities import ApprovalHandler
 from .catalog.models import (
@@ -839,6 +841,36 @@ class Agent:
         """Delete transcripts and candidate records, not approved knowledge."""
 
         return await self._embedded.clear_conversations()
+
+    async def list_artifacts(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        caller_principal_id: str | None = None,
+    ) -> tuple[ArtifactRef, ...]:
+        """List a page of stored artifacts, including after history is cleared.
+
+        Local owners can browse the whole home. Hosted callers see only artifacts
+        produced under their authenticated principal. Pages use creation order.
+        """
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or not 1 <= limit <= 100
+        ):
+            raise ValueError("artifact list limit must be between 1 and 100")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or not 0 <= offset <= MAX_ARTIFACTS_PER_AGENT
+        ):
+            raise ValueError(
+                f"artifact list offset must be between 0 and {MAX_ARTIFACTS_PER_AGENT}"
+            )
+        return await self._embedded.list_artifacts(
+            limit=limit, offset=offset, caller_principal_id=caller_principal_id
+        )
 
     async def read_artifact(
         self, artifact_id: str, *, caller_principal_id: str | None = None

@@ -385,6 +385,14 @@ async def test_hosted_artifact_read_save_and_delete_follow_run_caller(tmp_path, 
     try:
         result = await agent.run("Create a text artifact.", caller_principal_id=caller)
         artifact_id = result.artifacts[0].artifact_id
+        assert (
+            await agent.list_artifacts(caller_principal_id=caller) == result.artifacts
+        )
+        assert await agent.list_artifacts(caller_principal_id="bob") == ()
+        assert (
+            await agent.list_artifacts(caller_principal_id="bob", limit=1, offset=1)
+            == ()
+        )
         with pytest.raises(ValueError, match="unavailable to this caller"):
             await agent.read_artifact(artifact_id, caller_principal_id="bob")
         with pytest.raises(ValueError, match="unavailable to this caller"):
@@ -395,6 +403,7 @@ async def test_hosted_artifact_read_save_and_delete_follow_run_caller(tmp_path, 
             await agent.read_artifact(artifact_id, caller_principal_id=caller)
         ).content == b"Alice owns this artifact."
         assert await agent.delete_artifact(artifact_id, caller_principal_id=caller)
+        assert await agent.list_artifacts(caller_principal_id=caller) == ()
         # Once physically deleted there is no owner metadata to disclose or retain.
         assert (
             await agent.delete_artifact(artifact_id, caller_principal_id="bob") is False

@@ -25,6 +25,7 @@ SLASH_COMMAND_COMPLETIONS = (
     ),
     ("/jobs", "/jobs", "Manage durable jobs"),
     ("/inbox", "/inbox", "Inspect and acknowledge completed background reports"),
+    ("/artifacts", "/artifacts", "View, save and delete stored artifacts"),
     ("/routines", "/routines", "Inspect and control saved assignments"),
     (
         "/routines create ",
@@ -108,6 +109,7 @@ HELP_TEXT = (
     "Ask across admitted connections without selecting a source.\n"
     'Use @"source name" <question> to narrow one request.\n'
     "Saved assignments: /routines · results: /inbox\n"
+    "Stored files: /artifacts\n"
     "Execution requires an open host; stop this TUI before starting daita host --agent <name>.\n"
     "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit\n"
     "Wheel or Page Up/Page Down review · Ctrl-Home start · Ctrl-End latest\n"
