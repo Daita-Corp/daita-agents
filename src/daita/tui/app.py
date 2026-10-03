@@ -1020,6 +1020,8 @@ class DaitaApp(App[int]):
         chat = self.chat()
         if result == "active" and chat is not None:
             chat.show_notice("MCP tools activated.")
+        elif result == "saved" and chat is not None:
+            chat.show_notice("MCP server saved. Activation is pending; check /mcp.")
         await self._refresh_status()
 
     def _edit_document(self, seed: str) -> str:

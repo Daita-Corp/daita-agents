@@ -285,14 +285,27 @@ management flow.
 
 Choose **Add server** (or run `/mcp add`) for guided setup:
 
-1. enter one Streamable HTTP endpoint and choose no auth, an environment/keychain
-   reference, or masked bearer entry saved to the local keychain; inspect it;
-2. review supported and unsupported tools with exact schema-rejection reasons;
-3. select exact tools; default selections admit reads only;
-4. use **Configure selected tool permissions** to review each alias, description,
-   access mode, operational effect, unattended eligibility, result/outbound
-   sensitivity and known completion semantics; choose the server outbound ceiling;
-5. confirm the exact local permissions; the tools activate before the next run.
+1. **Connect to a server:** enter its Streamable HTTP URL and select **None** or
+   **API key / bearer token**. Paste only the credential, without `Bearer `;
+   Daita saves it in the local keychain. **Advanced: credential reference** accepts
+   an environment variable or existing keychain reference. Choose **Find tools**.
+   This checks the connection without granting tool access. Browser sign-in is
+   not supported in this screen; an API key may require a different endpoint from
+   the server's OAuth URL. A saved-credential notice means an empty token field
+   keeps the credential for another attempt.
+2. **Choose tools and review access:** click checkboxes or use the arrow keys and
+   Space. Each row shows its local access and effect; unsupported tools are disabled
+   with their rejection reasons. Defaults assume reads, so independently verify
+   each selected tool. **Advanced / permissions** edits the highlighted tool's
+   alias, description, access, effect, unattended eligibility, result/outbound
+   sensitivity and completion semantics. Set **What data may be sent to this
+   server?**; this bounds the full request classification, and stricter per-tool
+   limits still apply. **Add server · N tools** confirms these exact permissions.
+
+The success screen reports that the selected tools are available in the next
+message and offers **Return to chat**. If admission was saved but activation is
+pending, it reports that state instead. **Back** returns to connection settings;
+changing them requires finding tools again. **Cancel** removes unused credentials.
 
 All tools selected in one guided admission are stored in one server binding, so
 refresh and revocation apply to that reviewed tool set. The manager uses

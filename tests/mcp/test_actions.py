@@ -1192,12 +1192,10 @@ async def test_binding_codec_and_origin_retain_authority_but_exclude_hints(actio
 
 
 async def test_guided_ui_explicit_action_permissions_reach_public_admission(tmp_path):
-    from textual.widgets import Input, OptionList, Select
+    from textual.widgets import Input, Select, SelectionList
 
     from daita.tui.app import DaitaApp
-    from daita.tui.screens.confirm import ConfirmScreen
     from daita.tui.screens.mcp import MCPSetupScreen, MCPToolAdmissionScreen
-    from daita.tui.screens.selection import SelectionScreen
 
     fixture = ActionFixture(tmp_path)
     opened = await Agent.create("mcp-ui-action", **fixture.kwargs())
@@ -1213,19 +1211,20 @@ async def test_guided_ui_explicit_action_permissions_reach_public_admission(tmp_
             assert isinstance(app.screen, MCPSetupScreen)
             app.screen.query_one("#mcp-endpoint", Input).value = fixture.server.endpoint
             assert await pilot.click("#mcp-inspect")
+            workers = tuple(
+                worker for worker in app.workers if worker.node is app.screen
+            )
+            if workers:
+                await asyncio.wait_for(
+                    app.workers.wait_for_complete(workers), timeout=10
+                )
             await pilot.pause()
-            assert await pilot.click("#mcp-select")
-            await pilot.pause()
-            assert isinstance(app.screen, SelectionScreen)
-            app.screen.query_one("#picker-options", OptionList).highlighted = 0
-            app.screen.action_toggle_selected()
-            app.screen.action_confirm()
+            listing = app.screen.query_one("#mcp-tools", SelectionList)
+            listing.highlighted = 0
+            listing.focus()
+            await pilot.press("space")
             await pilot.pause()
             assert await pilot.click("#mcp-configure")
-            await pilot.pause()
-            assert isinstance(app.screen, SelectionScreen)
-            app.screen.query_one("#picker-options", OptionList).highlighted = 0
-            app.screen.action_confirm()
             await pilot.pause()
             assert isinstance(app.screen, MCPToolAdmissionScreen)
             app.screen.query_one("#mcp-tool-description", Input).value = (
@@ -1243,11 +1242,21 @@ async def test_guided_ui_explicit_action_permissions_reach_public_admission(tmp_
             assert await pilot.click("#mcp-admission-save")
             await pilot.pause()
             assert isinstance(app.screen, MCPSetupScreen)
-            assert await pilot.click("#mcp-attach")
+            assert "external action" in str(listing.get_option_at_index(0).prompt)
+            # Changing the selection must not discard the reviewed permission.
+            listing.deselect_all()
+            listing.select_all()
             await pilot.pause()
-            attestation = app.screen
-            assert isinstance(attestation, ConfirmScreen)
-            await pilot.press("y")
+            assert await pilot.click("#mcp-attach")
+            workers = tuple(
+                worker for worker in app.workers if worker.node is app.screen
+            )
+            if workers:
+                await asyncio.wait_for(
+                    app.workers.wait_for_complete(workers), timeout=10
+                )
+            await pilot.pause()
+            assert await pilot.click("#mcp-done")
             await asyncio.wait_for(setup_task, timeout=10)
             statuses = await app.controller.list_mcp_servers()
             assert len(statuses) == 1 and statuses[0].active_in_runtime
