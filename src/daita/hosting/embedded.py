@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 from .._json import FrozenJsonObject, canonical_json
 from ..adapters.local_workspace import LocalWorkspaceBackend
 from ..adapters.mcp import (
+    MCPAdmissionError,
     MCPAuthentication,
     MCPAuthenticationError,
     MCPAuthenticationMode,
@@ -144,6 +145,7 @@ from ..domains.mcp import (
     MCP_DOMAIN_OWNER_ID,
     MCPActivatedBinding,
     activate_mcp_domain,
+    validate_mcp_model_compatibility,
 )
 from ..errors import AgentError, StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity
@@ -1737,19 +1739,32 @@ class EmbeddedAgent:
             resolved_mcp_client_factory = SDKMCPClientFactory()
         else:
             resolved_mcp_client_factory = mcp_client_factory
-        mcp_domain, mcp_activated_bindings, mcp_executors = await activate_mcp_domain(
-            agent_id=identity.id,
-            store=store,
-            client_factory=resolved_mcp_client_factory,
-            secrets=secret_provider,
-            connection_provider=mcp_connection_provider,
-            clock=clock,
-            model_ids=(
-                tuple(candidate.provider_id for candidate in model_route.candidates)
-                if model_route is not None
-                else (() if model_profile is None else (model_profile.id,))
-            ),
-        )
+        try:
+            mcp_domain, mcp_activated_bindings, mcp_executors = (
+                await activate_mcp_domain(
+                    agent_id=identity.id,
+                    store=store,
+                    client_factory=resolved_mcp_client_factory,
+                    secrets=secret_provider,
+                    connection_provider=mcp_connection_provider,
+                    clock=clock,
+                    model_ids=(
+                        tuple(
+                            candidate.provider_id
+                            for candidate in model_route.candidates
+                        )
+                        if model_route is not None
+                        else (() if model_profile is None else (model_profile.id,))
+                    ),
+                )
+            )
+        except MCPAdmissionError as error:
+            if model_route is None or error.code != "mcp_schema_unsupported":
+                raise
+            raise AgentModelConfigurationError(
+                "The saved model route is incompatible with attached MCP tools. "
+                "Choose a compatible model or update MCP access."
+            ) from error
         base_domains = (
             data_domain,
             memory_domain,
@@ -2280,6 +2295,8 @@ class EmbeddedAgent:
 
         The active loop is deliberately left unchanged. Callers close and reopen
         the agent before using the replacement route.
+        Omitting a subscription credential reuses the current primary route's
+        login only for the same subscription provider and endpoint.
         """
 
         provider_name, model_name, endpoint, requires_credential = (
@@ -2297,7 +2314,7 @@ class EmbeddedAgent:
         if requires_subscription_credential:
             if api_key is not None:
                 raise ValueError("Codex subscription login does not accept an API key")
-            if (
+            if subscription_credential is not None and (
                 not isinstance(subscription_credential, str)
                 or not subscription_credential
             ):
@@ -2338,7 +2355,20 @@ class EmbeddedAgent:
                 # replacement commit both succeed.
                 previous = None
             reference: SecretReference | None = None
-            if requires_credential:
+            reuse_subscription = (
+                requires_subscription_credential and credential_value is None
+            )
+            if reuse_subscription:
+                if previous is not None and previous.model_route is not None:
+                    candidate = previous.model_route.candidates[0]
+                    if (
+                        candidate.provider_id.partition(":")[0] == provider_name
+                        and candidate.base_url == endpoint
+                    ):
+                        reference = candidate.secret_reference
+                if reference is None:
+                    raise ValueError("Codex requires a Daita subscription login")
+            elif requires_credential:
                 reference = SecretReference.keychain(
                     _credential_account(
                         self.identity.id,
@@ -2354,6 +2384,10 @@ class EmbeddedAgent:
                 context_window_tokens=context_window_tokens,
                 max_output_tokens=max_output_tokens,
             )
+            validate_mcp_model_compatibility(
+                await self._store.list_mcp_bindings(self.identity.id),
+                tuple(candidate.provider_id for candidate in route.candidates),
+            )
             replacement = AgentConfig(
                 model_route=route,
                 limits=self._limits,
@@ -2361,7 +2395,7 @@ class EmbeddedAgent:
             )
             committed = False
             try:
-                if reference is not None:
+                if reference is not None and not reuse_subscription:
                     assert credential_value is not None
                     credential = credential_value
                     api_key = None
@@ -2397,7 +2431,7 @@ class EmbeddedAgent:
                             pass
                 return route
             except BaseException:
-                if reference is not None and not committed:
+                if reference is not None and not reuse_subscription and not committed:
                     try:
                         await self._keychain.delete(reference)
                     except BaseException:

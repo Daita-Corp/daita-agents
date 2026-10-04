@@ -607,6 +607,11 @@ class DaitaApp(App[int]):
         screen = self.chat()
         if screen is None or self._too_small:
             return
+        if self.controller.agent is None:
+            screen.show_notice(
+                "Waiting for the agent to reopen. Your input has been kept."
+            )
+            return
         if self._run_task is not None and not self._run_task.done():
             return
         text = raw.strip()
@@ -1020,6 +1025,8 @@ class DaitaApp(App[int]):
         chat = self.chat()
         if result == "active" and chat is not None:
             chat.show_notice("MCP tools activated.")
+        elif result == "saved" and chat is not None:
+            chat.show_notice("MCP server saved. Activation is pending; check /mcp.")
         await self._refresh_status()
 
     def _edit_document(self, seed: str) -> str:

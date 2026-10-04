@@ -1064,6 +1064,28 @@ class MCPCapabilityDomain:
         return None
 
 
+def validate_mcp_model_compatibility(
+    bindings: tuple[MCPServerBinding, ...], model_ids: tuple[str, ...]
+) -> None:
+    """Require each active tool contract to fit every selected model candidate."""
+    for binding in bindings:
+        if binding.state is not MCPBindingState.ACTIVE:
+            continue
+        for tool in binding.tools:
+            reason = tool_schema_incompatibility(tool.input_schema, model_ids)
+            if reason is not None:
+                raise MCPAdmissionError(
+                    "mcp_schema_unsupported",
+                    "The selected model route cannot represent MCP tool "
+                    f"{tool.remote_name!r}. Choose another model or update MCP access.",
+                    {
+                        "binding_id": binding.binding_id,
+                        "remote_name": tool.remote_name,
+                        "reason": reason,
+                    },
+                )
+
+
 async def activate_mcp_domain(
     *,
     agent_id: str,
@@ -1084,19 +1106,13 @@ async def activate_mcp_domain(
 
     activated: list[MCPActivatedBinding] = []
     reusable = {item.binding.binding_id: item for item in existing}
-    for binding in (
+    selected_bindings = (
         await store.list_mcp_bindings(agent_id) if bindings is None else bindings
-    ):
+    )
+    validate_mcp_model_compatibility(selected_bindings, model_ids)
+    for binding in selected_bindings:
         if binding.state is not MCPBindingState.ACTIVE:
             continue
-        for tool in binding.tools:
-            reason = tool_schema_incompatibility(tool.input_schema, model_ids)
-            if reason is not None:
-                raise MCPAdmissionError(
-                    "mcp_schema_unsupported",
-                    "The selected model route cannot represent this MCP contract.",
-                    {"remote_name": tool.remote_name, "reason": reason},
-                )
         previous = reusable.get(binding.binding_id)
         if previous is not None and previous.binding == binding:
             activated.append(previous)

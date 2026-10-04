@@ -331,7 +331,11 @@ class Agent:
         context_window_tokens: int | None = None,
         max_output_tokens: int | None = None,
     ) -> ModelRoute:
-        """Validate and persist one model route for the next open."""
+        """Validate and persist one model route for the next open.
+
+        Omit subscription_credential to reuse the current primary subscription
+        login for the same provider. Supply a new credential to replace it.
+        """
 
         credential = api_key
         subscription_secret = subscription_credential

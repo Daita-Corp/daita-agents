@@ -109,6 +109,8 @@ class ModelSetupScreen(Screen[bool]):
             yield Input(placeholder="Base URL", id="model-base-url")
             yield Input(placeholder="Context window tokens", id="model-context")
             yield Input(placeholder="Max output tokens", id="model-output")
+            yield Static("", id="model-login-status", markup=False)
+            yield Button("Reconnect / change account", id="model-reconnect")
             yield Label("", id="onboard-error", markup=False)
             yield Button("Validate and save", id="save-model", variant="success")
             yield Footer()
@@ -131,9 +133,9 @@ class ModelSetupScreen(Screen[bool]):
                 exclusive=True,
             )
             return
-        if event.button.id == "save-model":
+        if event.button.id in {"save-model", "model-reconnect"}:
             self.run_worker(
-                self._save_model(),
+                self._save_model(reconnect=event.button.id == "model-reconnect"),
                 name="model-configuration",
                 group="model-setup-interaction",
                 exclusive=True,
@@ -143,7 +145,7 @@ class ModelSetupScreen(Screen[bool]):
         if event.input.id == "model-id" and self._provider is not None:
             self._refresh_provider_fields()
 
-    async def _save_model(self) -> None:
+    async def _save_model(self, *, reconnect: bool = False) -> None:
         if self._provider is None:
             self.query_one("#onboard-error", Label).update("Choose a provider first.")
             return
@@ -201,11 +203,12 @@ class ModelSetupScreen(Screen[bool]):
             ):
                 api_key = None
                 self._subscription_prompt = None
-                subscription_credential = await self.app.controller.authenticate_model_subscription(  # type: ignore[attr-defined]
-                    provider=provider,
-                    on_verification=self._show_subscription_verification,
-                    on_progress=self._show_subscription_progress,
-                )
+                if reconnect or not self.app.controller.has_saved_model_login(provider=provider):  # type: ignore[attr-defined]
+                    subscription_credential = await self.app.controller.authenticate_model_subscription(  # type: ignore[attr-defined]
+                        provider=provider,
+                        on_verification=self._show_subscription_verification,
+                        on_progress=self._show_subscription_progress,
+                    )
             elif definition is not None and definition.authentication in {
                 AuthenticationMode.OFFICIAL_CLIENT,
                 AuthenticationMode.LOCAL,
@@ -247,6 +250,9 @@ class ModelSetupScreen(Screen[bool]):
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self.query_one("#choose-provider", Button).disabled = busy
+        self.query_one("#model-reconnect", Button).disabled = busy
+        for field in self.query(Input):
+            field.disabled = busy
         save = self.query_one("#save-model", Button)
         save.disabled = busy or self._provider is None
         save.label = "Validating…" if busy else "Validate and save"
@@ -278,6 +284,17 @@ class ModelSetupScreen(Screen[bool]):
         self.query_one("#model-base-url", Input).display = accepts_base_url
         self.query_one("#model-context", Input).display = requires_limits
         self.query_one("#model-output", Input).display = requires_limits
+        saved_subscription = bool(
+            definition is not None
+            and definition.authentication is AuthenticationMode.CODEX_SUBSCRIPTION
+            and self.app.controller.has_saved_model_login(provider=provider)  # type: ignore[attr-defined]
+        )
+        login_status = self.query_one("#model-login-status", Static)
+        login_status.display = saved_subscription
+        login_status.update(
+            "Your saved subscription login will be used for this model."
+        )
+        self.query_one("#model-reconnect", Button).display = saved_subscription
 
         choose = self.query_one("#choose-provider", Button)
         choose.label = (
