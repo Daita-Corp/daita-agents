@@ -298,7 +298,9 @@ def test_every_model_route_candidate_must_accept_projection_without_weakening_it
         }
     )
     assert (
-        tool_schema_incompatibility(projected, ("openai:fixture", "anthropic:fixture"))
+        tool_schema_incompatibility(
+            projected, ("openai:fixture", "anthropic:fixture", "codex:fixture")
+        )
         is None
     )
     assert (

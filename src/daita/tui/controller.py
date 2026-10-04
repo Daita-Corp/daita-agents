@@ -378,6 +378,17 @@ class PresentationController:
         provider, _sep, _model = candidate.provider_id.partition(":")
         return dict(PROVIDERS).get(provider, provider)
 
+    def has_saved_model_login(self, *, provider: str) -> bool:
+        """Project the current primary credential reference without resolving it."""
+        route = self.agent.model_route if self.agent is not None else None
+        if route is None:
+            return False
+        candidate = route.candidates[0]
+        return (
+            candidate.provider_id.partition(":")[0] == provider
+            and candidate.secret_reference is not None
+        )
+
     async def source_summary(self) -> str:
         agent = self.require_agent()
         sources = tuple(
@@ -1345,9 +1356,7 @@ class PresentationController:
             )
         return CommandOutcome(
             "notice",
-            "Usage: /mcp | /mcp add | /mcp status | /mcp inspect <endpoint> | "
-            "/mcp attach <endpoint> <remote-tool> <local-alias> | "
-            "/mcp refresh <binding-id> | /mcp revoke <binding-id>",
+            "Use /mcp to open the server manager and add, refresh, or revoke tool access.",
             conversation_id=conversation_id,
         )
 

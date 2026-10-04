@@ -31,9 +31,9 @@ before remote I/O. Optional `serverInfo` is a display and drift hint.
   worker: 64 KiB schemas, depth 12, 1,024 expansion nodes, 32 references, at most
   eight composition branches, and a five-second validation deadline. Values are
   separately bounded. No defaults are inserted. `format` remains an annotation.
-- Model admission checks every configured route candidate. Reviewed OpenAI
-  non-strict and Anthropic schemas preserve these assertions. Other and custom
-  adapters retain the previous portable primitive/object/array subset. Unsupported
+- Model admission checks every configured route candidate. Reviewed OpenAI and
+  Codex non-strict schemas and Anthropic schemas preserve these assertions. Other
+  and custom adapters retain the previous portable primitive/object/array subset. Unsupported
   model projections fail admission rather than dropping constraints. Server output
   validation is independent of model parameter projection.
 - Text content and optional structured JSON-object results only.
@@ -275,15 +275,17 @@ daita mcp refresh <agent> <binding-id>
 daita mcp revoke <agent> <binding-id> --yes
 ```
 
-In the TUI, `/mcp` opens the server-oriented MCP manager. It groups independently
-keyed bindings with the same trusted local label and endpoint for presentation, so
+In the TUI, `/mcp` is the single MCP entry in autocomplete and help. It opens the
+server manager, where you can view servers and tools, add a server, refresh tools,
+or revoke access. It groups independently keyed bindings with the same trusted
+local label and endpoint for presentation, so
 older one-tool bindings appear as one server without being merged or rewritten.
 The primary statuses are `Accepted (validated at call)`, `Activation pending`,
 `Needs refresh`, and `Revoked`; accepted does not claim a network check happened
 at open. Internal binding IDs and protocol details are not part of the normal
 management flow.
 
-Choose **Add server** (or run `/mcp add`) for guided setup:
+Open `/mcp` and choose **Add server** for guided setup:
 
 1. **Connect to a server:** enter its Streamable HTTP URL and select **None** or
    **API key / bearer token**. Paste only the credential, without `Bearer `;
@@ -310,8 +312,10 @@ changing them requires finding tools again. **Cancel** removes unused credential
 All tools selected in one guided admission are stored in one server binding, so
 refresh and revocation apply to that reviewed tool set. The manager uses
 descriptive server/tool pickers for refresh and revocation rather than asking
-the operator to copy a binding ID. `/mcp status`, `/mcp inspect`, `/mcp attach`,
-`/mcp refresh`, and `/mcp revoke` remain available as power-user commands.
+the operator to copy a binding ID. Existing `/mcp add`, `/mcp status`,
+`/mcp inspect`, `/mcp attach`, `/mcp refresh`, and `/mcp revoke` commands remain
+accepted as hidden compatibility shortcuts. They are omitted from autocomplete
+and normal help; use the CLI commands above for scripting.
 CLI `--bearer-env NAME` and `--bearer-ref env:NAME|keychain:ACCOUNT` use existing
 references. `--bearer-prompt` masks entry and saves an agent-owned credential when
 attaching; inspection-only credentials are deleted afterward. The TUI shares the

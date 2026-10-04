@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from daita import AgentConfig, MCPToolSelection
+from daita.adapters.mcp import SDKMCPClientFactory
+from daita.llm.models import FinishReason, ModelResponse, ToolCall
+from daita.llm.providers.mock import MockModelProvider
+from tests.support.mcp import MemoryKeychain, conformance_identities, mock_transport
 from tests.tui._support import (
     MIN_READY_ROWS,
     MIN_USABLE_COLUMNS,
@@ -239,22 +244,72 @@ async def test_agent_picker_enters_delete_mode_then_confirms_typed_name(
     assert app.return_value == 0
 
 
+@pytest.mark.parametrize("failure", ("malformed_config", "mcp_schema"))
 async def test_agent_picker_recovers_incompatible_model_settings_for_replacement(
     tmp_path: Path,
+    failure,
 ):
+    keychain = MemoryKeychain()
     legacy = await Agent.create(
-        "legacy-model", root=tmp_path, workspace=workspace_for(tmp_path)
+        "legacy-model",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        keychain=keychain,
+        model_validator=MockModelProvider(
+            (
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=(
+                        ToolCall("validation", "daita_validate_tool_support", {}),
+                    ),
+                ),
+            ),
+            provider_id="gemini:fixture",
+        ),
     )
+    if failure == "mcp_schema":
+        await legacy.configure_model(
+            provider="gemini",
+            model="fixture",
+            api_key="fixture-key",
+            context_window_tokens=8192,
+            max_output_tokens=1024,
+        )
     await legacy.close()
     other = await Agent.create(
         "other-agent", root=tmp_path, workspace=workspace_for(tmp_path)
     )
     await other.close()
     config_path = tmp_path / "agents" / "legacy-model" / "config.json"
-    config_path.write_text("{}", encoding="utf-8")
+    if failure == "malformed_config":
+        config_path.write_text("{}", encoding="utf-8")
+    else:
+        identity, _ = conformance_identities()
+        identity.tool("lookup")["inputSchema"] = {
+            "type": "object",
+            "properties": {"query": {"type": ["string", "null"]}},
+        }
+        # Reproduce an existing home admitted before model compatibility checks.
+        legacy = await Agent.open(
+            "legacy-model",
+            root=tmp_path,
+            workspace=workspace_for(tmp_path),
+            config=AgentConfig(),
+            keychain=keychain,
+            mcp_client_factory=SDKMCPClientFactory(
+                http_transport=mock_transport(identity)
+            ),
+        )
+        try:
+            await legacy.attach_mcp_server(
+                endpoint=identity.endpoint,
+                selections=(MCPToolSelection("lookup"),),
+            )
+        finally:
+            await legacy.close()
     before = config_path.read_bytes()
 
-    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path))
+    app = DaitaApp(root=tmp_path, workspace=workspace_for(tmp_path), keychain=keychain)
     async with app.run_test(size=(90, 28)) as pilot:
         # Screen selection precedes its mount handler populating the options.
         # Wait for the actual picker contents, not only the active screen type.
@@ -286,6 +341,7 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
             if isinstance(app.screen, ModelSetupScreen):
                 break
         setup = app.screen
+        assert app._startup_error is None
         assert isinstance(setup, ModelSetupScreen)
         assert "no longer compatible" in str(
             setup.query_one("#model-help", Static).content
@@ -297,9 +353,56 @@ async def test_agent_picker_recovers_incompatible_model_settings_for_replacement
         await pilot.press("escape")
         await pilot.pause()
         assert isinstance(app.screen, ChatScreen)
+        assert (
+            await app.controller.dispatch_command("/mcp")
+        ).screen == "mcp_management"
+        if failure == "mcp_schema":
+            statuses = await app.controller.list_mcp_servers()
+            assert len(statuses) == 1
+            assert statuses[0].active_in_runtime
         app.exit(0)
 
     assert config_path.read_bytes() == before
+
+
+async def test_chat_preserves_input_while_agent_reopens(tmp_path: Path, monkeypatch):
+    opened = await Agent.create(
+        "reopening", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    app = DaitaApp(
+        root=tmp_path, start_bootstrap=False, workspace=workspace_for(tmp_path)
+    )
+    app.controller.agent = opened
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_open = Agent.open
+
+    async def gated_open(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return await original_open(*args, **kwargs)
+
+    monkeypatch.setattr(Agent, "open", gated_open)
+    try:
+        async with app.run_test(size=(90, 28)) as pilot:
+            await app._show_chat()
+            reopening = asyncio.create_task(
+                app.controller.reopen_agent(observer=None, approval_handler=None)
+            )
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+                composer = app.screen.query_one(Composer)
+                composer.load_text("/mcp")
+                await app.submit_composer(composer.text)
+                assert composer.text == "/mcp"
+                assert app._exception is None
+            finally:
+                release.set()
+                await asyncio.wait_for(reopening, 5)
+            assert app.controller.require_agent().name == "reopening"
+            app.exit(0)
+    finally:
+        release.set()
+        await app.controller.close()
 
 
 async def test_app_resize_and_too_small_screen(tmp_path: Path):
@@ -530,12 +633,31 @@ async def test_tui_preloads_active_credentials_before_accepting_queries(
     await app.controller.close()
 
 
-async def test_model_setup_uses_codex_device_login_without_api_key():
+@pytest.mark.parametrize(
+    "login_mode", ("first_login", "reuse", "reconnect", "reuse_failure")
+)
+async def test_model_setup_uses_codex_device_login_without_api_key(login_mode):
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     configured: dict[str, object] = {}
     verification: list[tuple[str, str]] = []
     authentication_started = asyncio.Event()
     authorization_release = asyncio.Event()
+    if login_mode != "first_login":
+
+        class _OpenedAgent:
+            model_route = SimpleNamespace(
+                candidates=(
+                    SimpleNamespace(
+                        provider_id="codex:gpt-5.6-sol",
+                        secret_reference=SecretReference.keychain("saved-subscription"),
+                    ),
+                )
+            )
+
+            async def close(self):
+                return None
+
+        app.controller.agent = _OpenedAgent()  # type: ignore[assignment]
 
     app.controller.model_requires_explicit_limits = (  # type: ignore[method-assign]
         lambda **_kwargs: False
@@ -558,6 +680,11 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
         return "opaque-subscription-credential"
 
     async def configure(**kwargs: object) -> None:
+        if (
+            login_mode == "reuse_failure"
+            and kwargs.get("subscription_credential") is None
+        ):
+            raise ValueError("The saved subscription login was rejected.")
         configured.update(kwargs)
 
     app.controller.authenticate_model_subscription = authenticate  # type: ignore[method-assign]
@@ -589,6 +716,8 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
         assert choose_provider.styles.background.hex in {"#181818", "#303030"}
         assert screen.query_one(Footer).styles.background.hex == "#111111"
         screen._apply_provider_selection("codex", "gpt-5.6-sol")
+        if login_mode != "first_login":
+            screen.query_one("#model-id", Input).value = "gpt-5.6-terra"
         await pilot.pause()
         assert screen.query_one("#model-secret", Input).display is False
         assert screen.query_one("#save-model", Button).display is True
@@ -596,25 +725,51 @@ async def test_model_setup_uses_codex_device_login_without_api_key():
         screen.query_one("#model-base-url", Input).value = "https://must-not-be-used"
         screen.query_one("#model-context", Input).value = "1"
         screen.query_one("#model-output", Input).value = "1"
-        assert await pilot.click("#save-model") is True
-        await asyncio.wait_for(authentication_started.wait(), timeout=5)
-        await asyncio.wait_for(pilot.pause(), timeout=5)
-        auth_help = str(screen.query_one("#model-help", Static).content)
-        assert "Waiting for ChatGPT authorization" in auth_help
-        assert "https://auth.openai.com/codex/device" in auth_help
-        assert "ABCD-EFGH" in auth_help
-        authorization_release.set()
+        assert screen.query_one("#model-reconnect", Button).display == (
+            login_mode != "first_login"
+        )
+        assert await pilot.click(
+            "#model-reconnect" if login_mode == "reconnect" else "#save-model"
+        )
+        if login_mode == "reuse_failure":
+            workers = tuple(worker for worker in app.workers if worker.node is screen)
+            if workers:
+                await asyncio.wait_for(
+                    app.workers.wait_for_complete(workers), timeout=5
+                )
+            await pilot.pause()
+            assert app.screen is screen
+            assert not configured
+            assert not verification
+            assert not screen.query_one("#model-reconnect", Button).disabled
+            assert await pilot.click("#model-reconnect")
+        if login_mode != "reuse":
+            await asyncio.wait_for(authentication_started.wait(), timeout=5)
+            await asyncio.wait_for(pilot.pause(), timeout=5)
+            auth_help = str(screen.query_one("#model-help", Static).content)
+            assert "Waiting for ChatGPT authorization" in auth_help
+            assert "https://auth.openai.com/codex/device" in auth_help
+            assert "ABCD-EFGH" in auth_help
+            authorization_release.set()
         assert await asyncio.wait_for(modal_task, timeout=5) is True
         app.exit(0)
 
     assert configured["provider"] == "codex"
-    assert configured["model"] == "gpt-5.6-sol"
+    assert configured["model"] == (
+        "gpt-5.6-sol" if login_mode == "first_login" else "gpt-5.6-terra"
+    )
     assert configured["api_key"] is None
-    assert configured["subscription_credential"] == "opaque-subscription-credential"
+    assert configured["subscription_credential"] == (
+        None if login_mode == "reuse" else "opaque-subscription-credential"
+    )
     assert configured["base_url"] is None
     assert configured["context_window_tokens"] is None
     assert configured["max_output_tokens"] is None
-    assert verification == [("https://auth.openai.com/codex/device", "ABCD-EFGH")]
+    assert verification == (
+        []
+        if login_mode == "reuse"
+        else [("https://auth.openai.com/codex/device", "ABCD-EFGH")]
+    )
 
 
 async def test_model_setup_provider_and_model_pickers_do_not_block_each_other():

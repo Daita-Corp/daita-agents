@@ -32,6 +32,23 @@ The agent configuration stores only a reference to that keychain entry. Daita
 does not read or modify `~/.codex`, and it refreshes its own saved connection
 when necessary.
 
+To change models on the same Codex subscription, open model setup, choose the
+new model, and select **Validate and save**. Daita reuses the saved login and
+refreshes its token if needed; you do not need another browser sign-in.
+Use **Reconnect / change account** to sign in again explicitly. The replacement
+is saved only after validation succeeds. A failed model change keeps the previous
+configuration and saved login; a token refreshed during validation remains saved.
+Model changes also check the schemas of attached MCP tools before saving. If the
+selected provider cannot represent those tools, choose a compatible model or
+review their access in `/mcp`. An incompatible saved route opens model setup for
+recovery without discarding the agent's data or MCP bindings.
+
+Typed callers can likewise omit `subscription_credential` from
+`Agent.configure_model` when the current primary route already uses the same
+subscription provider and endpoint. A new credential explicitly replaces that
+connection. This does not reuse credentials across providers or add saved-account
+discovery.
+
 ## Configure Claude Code
 
 Install Claude Code using the
@@ -131,7 +148,8 @@ installed client does not expose the headless controls it requires.
 
 ### Authentication failed
 
-- For Codex, start model setup again and repeat the device-code sign-in.
+- For Codex, open model setup and select **Reconnect / change account** to repeat
+  the device-code sign-in. First-time setup starts sign-in when you validate.
 - For Claude Code, run `claude auth login` outside Daita.
 - For Grok Build, run `grok login` outside Daita.
 

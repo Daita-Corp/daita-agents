@@ -42,16 +42,7 @@ SLASH_COMMAND_COMPLETIONS = (
         "/routines update <routine-id> <instruction>",
         "Revise one scheduled routine through exact inspection and approval",
     ),
-    ("/mcp", "/mcp", "Manage admitted remote MCP tools and actions"),
-    ("/mcp add", "/mcp add", "Guided MCP server setup"),
-    ("/mcp inspect ", "/mcp inspect <endpoint>", "Inspect one no-auth endpoint"),
-    (
-        "/mcp attach ",
-        "/mcp attach <endpoint> <remote-tool> <local-alias>",
-        "Advanced: admit one exact no-auth read tool",
-    ),
-    ("/mcp refresh ", "/mcp refresh <binding-id>", "Refresh one MCP binding"),
-    ("/mcp revoke ", "/mcp revoke <binding-id>", "Revoke one MCP binding"),
+    ("/mcp", "/mcp", "Manage MCP servers and tool access"),
     ("/settings", "/settings", "Show agent and model settings"),
     ("/new", "/new", "Start a new conversation"),
     ("/resume ", "/resume <id>", "Resume a previous conversation"),
@@ -110,6 +101,7 @@ HELP_TEXT = (
     'Use @"source name" <question> to narrow one request.\n'
     "Saved assignments: /routines · results: /inbox\n"
     "Stored files: /artifacts\n"
+    "MCP servers and tool access: /mcp\n"
     "Execution requires an open host; stop this TUI before starting daita host --agent <name>.\n"
     "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit\n"
     "Wheel or Page Up/Page Down review · Ctrl-Home start · Ctrl-End latest\n"

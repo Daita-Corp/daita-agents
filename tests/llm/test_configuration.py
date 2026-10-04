@@ -9,7 +9,8 @@ from unittest.mock import patch
 import pytest
 
 import daita.hosting.embedded as embedded
-from daita import Agent, LoopLimits
+from daita import Agent, LoopLimits, MCPToolSelection
+from daita.adapters.mcp import MCPAdmissionError, SDKMCPClientFactory
 from daita.agent import AgentModelConfigurationError
 from daita.llm.errors import ModelProviderError, ProviderErrorCode
 from daita.llm.factory import create_model_route_provider
@@ -36,6 +37,7 @@ from daita.security import (
     SecretResolutionError,
     default_secret_provider,
 )
+from tests.support.mcp import conformance_identities, mock_transport
 from tests.support.workspace import workspace_for
 
 
@@ -126,9 +128,10 @@ async def _configure(
     provider_name: str = "openai",
     model: str = "test-model",
     api_key: str | None = "secret-value",
+    subscription_credential: str | None = None,
     base_url: str | None = None,
-    context_window_tokens: int = 8_192,
-    max_output_tokens: int = 1_024,
+    context_window_tokens: int | None = 8_192,
+    max_output_tokens: int | None = 1_024,
 ) -> ModelRoute:
     agent = await Agent.open(
         "atlas",
@@ -143,6 +146,7 @@ async def _configure(
             model=model,
             base_url=base_url,
             api_key=api_key,
+            subscription_credential=subscription_credential,
             context_window_tokens=context_window_tokens,
             max_output_tokens=max_output_tokens,
         )
@@ -495,6 +499,189 @@ async def test_failed_validation_preserves_previous_route_and_credential(tmp_pat
     assert caught.value.code is ProviderErrorCode.AUTHENTICATION_ERROR
     assert config_path.read_bytes() == before
     assert keychain.values == {old_reference.name: "old-secret"}
+
+
+@pytest.mark.parametrize(
+    "outcome", ("success", "validation_failure", "write_failure", "cancel")
+)
+async def test_subscription_model_change_reuses_and_preserves_saved_login(
+    tmp_path, monkeypatch, outcome
+):
+    await _create_unconfigured(tmp_path)
+    keychain = _FakeKeychain()
+    previous = await _configure(
+        tmp_path,
+        keychain,
+        _provider("codex:gpt-5.6-sol"),
+        provider_name="codex",
+        model="gpt-5.6-sol",
+        api_key=None,
+        context_window_tokens=None,
+        max_output_tokens=None,
+        subscription_credential="saved-subscription-credential",
+    )
+    reference = previous.candidates[0].secret_reference
+    assert reference is not None
+    config_path = tmp_path / "agents" / "atlas" / "config.json"
+    before = config_path.read_bytes()
+    keychain.events.clear()
+    validator = _provider(
+        "codex:gpt-5.6-terra",
+        (
+            ModelProviderError(ProviderErrorCode.MODEL_NOT_FOUND)
+            if outcome == "validation_failure"
+            else None
+        ),
+    )
+    if outcome in {"write_failure", "cancel"}:
+
+        def fail_commit(*_args):
+            if outcome == "cancel":
+                raise asyncio.CancelledError()
+            raise OSError("fixture write failure")
+
+        monkeypatch.setattr(embedded, "_write_model_configuration", fail_commit)
+    if outcome == "success":
+        replacement = await _configure(
+            tmp_path,
+            keychain,
+            validator,
+            provider_name="codex",
+            model="gpt-5.6-terra",
+            api_key=None,
+            context_window_tokens=None,
+            max_output_tokens=None,
+        )
+        assert replacement.candidates[0].secret_reference == reference
+        assert "codex:gpt-5.6-terra" in config_path.read_text()
+    else:
+        expected_error = {
+            "validation_failure": ModelProviderError,
+            "write_failure": OSError,
+            "cancel": asyncio.CancelledError,
+        }[outcome]
+        with pytest.raises(expected_error):
+            await _configure(
+                tmp_path,
+                keychain,
+                validator,
+                provider_name="codex",
+                model="gpt-5.6-terra",
+                api_key=None,
+                context_window_tokens=None,
+                max_output_tokens=None,
+            )
+        assert config_path.read_bytes() == before
+    assert len(validator.requests) == 1
+    assert keychain.events == []
+    assert keychain.values == {reference.name: "saved-subscription-credential"}
+
+
+@pytest.mark.parametrize("previous_provider", (None, "openai"))
+async def test_subscription_model_change_requires_a_matching_saved_login(
+    tmp_path, previous_provider
+):
+    await _create_unconfigured(tmp_path)
+    keychain = _FakeKeychain()
+    if previous_provider is not None:
+        await _configure(tmp_path, keychain, _provider("openai:test-model"))
+    existing_secrets = dict(keychain.values)
+    validator = _provider("codex:gpt-5.6-sol")
+    with pytest.raises(ValueError, match="subscription login"):
+        await _configure(
+            tmp_path,
+            keychain,
+            validator,
+            provider_name="codex",
+            model="gpt-5.6-sol",
+            api_key=None,
+            context_window_tokens=None,
+            max_output_tokens=None,
+        )
+    assert keychain.values == existing_secrets
+    assert not validator.requests
+
+
+@pytest.mark.parametrize("provider_name", ("codex", "gemini"))
+async def test_model_change_checks_attached_mcp_before_saving(tmp_path, provider_name):
+    identity, _ = conformance_identities()
+    identity.tool("lookup")["inputSchema"] = {
+        "type": "object",
+        "properties": {
+            "query": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "limit": {"type": "integer", "exclusiveMinimum": 0},
+        },
+    }
+    keychain = _FakeKeychain()
+    agent = await Agent.create(
+        "atlas",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        keychain=keychain,
+        model_validator=_provider("openai:test-model"),
+        mcp_client_factory=SDKMCPClientFactory(http_transport=mock_transport(identity)),
+    )
+    try:
+        status = await agent.attach_mcp_server(
+            endpoint=identity.endpoint, selections=(MCPToolSelection("lookup"),)
+        )
+        await agent.configure_model(
+            provider="openai",
+            model="test-model",
+            api_key="old-secret",
+            context_window_tokens=8192,
+            max_output_tokens=1024,
+        )
+    finally:
+        await agent.close()
+    config_path = tmp_path / "agents" / "atlas" / "config.json"
+    before = config_path.read_bytes()
+    secrets_before = dict(keychain.values)
+    keychain.events.clear()
+    validator = _provider(f"{provider_name}:test-model")
+    agent = await Agent.open(
+        "atlas",
+        root=tmp_path,
+        workspace=workspace_for(tmp_path),
+        keychain=keychain,
+        model_validator=validator,
+    )
+    try:
+        configuration = agent.configure_model(
+            provider=provider_name,
+            model="test-model",
+            api_key=None if provider_name == "codex" else "new-secret",
+            subscription_credential=(
+                "subscription-secret" if provider_name == "codex" else None
+            ),
+            context_window_tokens=8192,
+            max_output_tokens=1024,
+        )
+        if provider_name == "codex":
+            await configuration
+            assert len(validator.requests) == 1
+        else:
+            with pytest.raises(MCPAdmissionError, match="MCP tool"):
+                await configuration
+            assert config_path.read_bytes() == before
+            assert keychain.values == secrets_before
+            assert keychain.events == []
+            assert not validator.requests
+            assert (await agent.list_mcp_servers())[0].active_in_runtime
+    finally:
+        await agent.close()
+    # Opening the retained or replacement route reconstructs tools without I/O.
+    request_count = len(identity.request_methods)
+    reopened = await Agent.open(
+        "atlas", root=tmp_path, workspace=workspace_for(tmp_path), keychain=keychain
+    )
+    try:
+        restored = (await reopened.list_mcp_servers())[0]
+        assert restored.active_in_runtime
+        assert restored.binding == status.binding
+        assert len(identity.request_methods) == request_count
+    finally:
+        await reopened.close()
 
 
 async def test_successful_replacement_deletes_old_key_only_after_config_commit(

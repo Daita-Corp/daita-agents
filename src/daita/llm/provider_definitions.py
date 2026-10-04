@@ -290,6 +290,8 @@ PROVIDER_DEFINITIONS = (
         True,
         subscription_client="ChatGPT",
         subscription_login_command="sign in through Daita",
+        tool_schema_keywords=PROJECTED_SCHEMA_KEYWORDS,
+        tool_schema_nullable_types=True,
     ),
     ProviderDefinition(
         "claude-code",
@@ -335,8 +337,8 @@ def tool_schema_incompatibility(
 ) -> str | None:
     """Check every route candidate without weakening the external contract.
 
-    OpenAI non-strict parameters and Anthropic input_schema pass reviewed JSON
-    Schema assertions intact. Other and custom adapters retain the conservative
+    OpenAI and Codex non-strict parameters and Anthropic input_schema pass reviewed
+    JSON Schema assertions intact. Other and custom adapters retain the conservative
     portable subset until their additional constructs have been reviewed.
     """
     for model_id in model_ids:

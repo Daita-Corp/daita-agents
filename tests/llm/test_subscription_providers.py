@@ -94,6 +94,8 @@ class _Stream:
 class _Responses:
     def __init__(self) -> None:
         self.arguments: dict[str, object] | None = None
+        self.tool_name = "catalog_schema"
+        self.tool_arguments = '{"source_id":"source-1"}'
 
     async def create(self, **kwargs: object) -> _Stream:
         self.arguments = kwargs
@@ -121,13 +123,13 @@ class _Responses:
                     "item": {
                         "type": "function_call",
                         "call_id": "provider-call-1",
-                        "name": "catalog_schema",
+                        "name": self.tool_name,
                     },
                 },
                 {
                     "type": "response.function_call_arguments.delta",
                     "output_index": 0,
-                    "delta": '{"source_id":"source-1"}',
+                    "delta": self.tool_arguments,
                 },
                 {
                     "type": "response.output_item.done",
@@ -135,8 +137,8 @@ class _Responses:
                     "item": {
                         "type": "function_call",
                         "call_id": "provider-call-1",
-                        "name": "catalog_schema",
-                        "arguments": '{"source_id":"source-1"}',
+                        "name": self.tool_name,
+                        "arguments": self.tool_arguments,
                     },
                 },
                 {"type": "response.completed", "response": response},
@@ -191,7 +193,22 @@ async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
         client=client,
     )
 
-    response = await provider.generate(_request())
+    request = _request()
+    schema = {
+        "type": "object",
+        "properties": {
+            "source_id": {"type": ["string", "null"]},
+            "limit": {
+                "anyOf": [
+                    {"type": "integer", "exclusiveMinimum": 0},
+                    {"type": "null"},
+                ]
+            },
+        },
+        "additionalProperties": False,
+    }
+    request = replace(request, tools=(replace(request.tools[0], input_schema=schema),))
+    response = await provider.generate(request)
 
     assert response.finish_reason is FinishReason.TOOL_CALLS
     assert response.provider_id == "codex:gpt-test"
@@ -218,6 +235,15 @@ async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     assert "max_output_tokens" not in arguments
     assert arguments["tool_choice"] == "auto"
     assert arguments["parallel_tool_calls"] is False
+    assert arguments["tools"] == [
+        {
+            "type": "function",
+            "name": "catalog_schema",
+            "description": "Inspect the admitted catalog schema",
+            "parameters": schema,
+            "strict": False,
+        }
+    ]
 
 
 def test_codex_default_client_uses_bounded_transport_without_sdk_retries(monkeypatch):
@@ -615,7 +641,10 @@ class _FakeKeychain:
         self.values.pop(reference.name, None)
 
 
-async def test_codex_route_persists_only_a_keychain_reference(tmp_path):
+@pytest.mark.parametrize("expired", (False, True))
+async def test_codex_route_persists_and_reuses_only_a_keychain_reference(
+    tmp_path, monkeypatch, expired
+):
     created = await Agent.create(
         "atlas", root=tmp_path, workspace=workspace_for(tmp_path)
     )
@@ -637,7 +666,8 @@ async def test_codex_route_persists_only_a_keychain_reference(tmp_path):
         ),
         provider_id="codex:gpt-5.6-sol",
     )
-    secret = _credential().to_secret()
+    original = _credential(expired=expired)
+    secret = original.to_secret()
     agent = await Agent.open(
         "atlas",
         root=tmp_path,
@@ -659,6 +689,49 @@ async def test_codex_route_persists_only_a_keychain_reference(tmp_path):
     assert keychain.values[reference.name] == secret
     persisted = (tmp_path / "agents" / "atlas" / "config.json").read_text()
     assert secret not in persisted
+    assert reference.to_uri() in persisted
+
+    # Exercise the actual factory, subscription provider and refresh callback for
+    # the replacement; only the external SDK transport and token exchange are fakes.
+    refreshed = replace(_credential(), refresh_token="rotated-refresh-token")
+    refresh_calls = []
+
+    async def refresh(value):
+        refresh_calls.append(value)
+        return refreshed
+
+    client = _Client()
+    client.responses.tool_name = "daita_validate_tool_support"
+    client.responses.tool_arguments = "{}"
+    client_credentials = []
+
+    def sdk_client(**kwargs):
+        client_credentials.append(kwargs["api_key"])
+        return client
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", sdk_client)
+    monkeypatch.setattr(codex_provider, "refresh_codex_subscription", refresh)
+    agent = await Agent.open(
+        "atlas", root=tmp_path, keychain=keychain, workspace=workspace_for(tmp_path)
+    )
+    try:
+        replacement = await agent.configure_model(
+            provider="codex", model="gpt-5.6-terra"
+        )
+        assert replacement.candidates[0].secret_reference == reference
+    finally:
+        await agent.close()
+    expected = refreshed if expired else original
+    assert keychain.values == {reference.name: expected.to_secret()}
+    assert refresh_calls == ([original] if expired else [])
+    assert client_credentials == [expected.access_token]
+    assert client.responses.arguments is not None
+    assert client.responses.arguments["model"] == "gpt-5.6-terra"
+    assert client.close_calls == 1
+    persisted = (tmp_path / "agents" / "atlas" / "config.json").read_text()
+    assert "codex:gpt-5.6-terra" in persisted
+    assert expected.access_token not in persisted
+    assert expected.refresh_token not in persisted
     assert reference.to_uri() in persisted
 
 
