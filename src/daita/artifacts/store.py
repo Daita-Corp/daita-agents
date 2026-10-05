@@ -63,6 +63,7 @@ class ArtifactRegistry(Protocol):
         caller_principal_id: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> tuple[ArtifactRecord, ...]: ...
     async def list_artifact_refs(
         self,
@@ -73,6 +74,7 @@ class ArtifactRegistry(Protocol):
         caller_principal_id: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> tuple[ArtifactRef, ...]: ...
     async def begin_artifact_creation(
         self, record: ArtifactRecord, *, reserved: bool = False

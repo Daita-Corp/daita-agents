@@ -75,6 +75,7 @@ from ..distribution.models import (
 from ..distribution.owner import construct_logical_delivery
 from ..errors import StateCompatibilityCode, StateCompatibilityError
 from ..identity import AgentIdentity, AgentIdentityConflictError
+from ..jobs.graph.guard import GraphAttemptAuthority
 from ..jobs.graph.models import (
     ACTIVE_ATTEMPT_STATES,
     MAX_GRAPH_JOBS_PER_AGENT,
@@ -163,6 +164,7 @@ from ..semantics import (
     semantic_annotation_sha256,
 )
 from . import sqlite_graph as _graph_store
+from .errors import StorageUnavailableError
 from .graph_schema import ClosingSQLiteConnection, configure_graph_connection
 from .home_migrations import (
     CURRENT_HOME_REVISION,
@@ -625,7 +627,6 @@ class SQLiteStateStore:
                     raise ValueError("validated current state database is missing")
             else:
                 _initialize(resolved)
-            _recover_started_effect_receipts(resolved, resolved_clock)
 
         worker = asyncio.create_task(asyncio.to_thread(admit))
         cancelled = False
@@ -638,6 +639,24 @@ class SQLiteStateStore:
         if cancelled:
             raise asyncio.CancelledError
         return cls(resolved, clock=resolved_clock)
+
+    async def recover_started_effect_receipts(
+        self, agent_id: str, *, recovered_at: datetime
+    ) -> None:
+        """Recover abandoned effects only after acquiring exclusive agent ownership.
+
+        Opening a connection is passive. The admitted host calls this once before
+        starting any work, while retaining its writer lock through shutdown.
+        """
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be a non-empty string")
+        recovered_at = _effect_receipt_aware(recovered_at, "receipt recovery time")
+        await _run_cancellation_safe_graph_transaction(
+            self.path,
+            lambda connection: _recover_started_effect_receipts(
+                connection, agent_id, recovered_at
+            ),
+        )
 
     async def admit_graph(self, admission: GraphAdmission) -> GraphJob:
         if not isinstance(admission, GraphAdmission):
@@ -675,6 +694,16 @@ class SQLiteStateStore:
                 resolved_at=resolved_at,
                 expected_control_digest=expected_control_digest,
                 expected_task_revision=expected_task_revision,
+            ),
+        )
+
+    async def read_graph_attempt_authority(
+        self, agent_id: str, job_id: str, task_id: str, attempt_id: str
+    ) -> GraphAttemptAuthority | None:
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _graph_store.read_graph_attempt_authority(
+                connection, agent_id, job_id, task_id, attempt_id
             ),
         )
 
@@ -5468,7 +5497,27 @@ class SQLiteStateStore:
         caller_principal_id: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> tuple[ArtifactRecord, ...]:
+        if limit is not None and (type(limit) is not int or not 1 <= limit <= 1000):
+            raise ValueError("artifact page limit must be between 1 and 1000")
+        if type(offset) is not int or offset < 0:
+            raise ValueError("artifact offset must be non-negative")
+        if after is not None:
+            if offset or limit is None:
+                raise ValueError(
+                    "artifact cursor requires a bounded page without offset"
+                )
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not isinstance(after[0], datetime)
+                or after[0].tzinfo is None
+                or not isinstance(after[1], str)
+                or not after[1]
+            ):
+                raise ValueError("artifact cursor must contain timestamp and identity")
+
         def read(connection: sqlite3.Connection) -> tuple[ArtifactRecord, ...]:
             clauses = ["agent_id = ?"]
             parameters: list[object] = [agent_id]
@@ -5481,6 +5530,9 @@ class SQLiteStateStore:
                 if value is not None:
                     clauses.append(column + " = ?")
                     parameters.append(value)
+            if after is not None:
+                clauses.append("(created_at_us, artifact_id) > (?, ?)")
+                parameters.extend((_datetime_us(after[0]), after[1]))
             return tuple(
                 _artifact_record_from_row(row)
                 for row in connection.execute(
@@ -5502,6 +5554,7 @@ class SQLiteStateStore:
         caller_principal_id: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> tuple[ArtifactRef, ...]:
         return tuple(
             record.ref
@@ -5513,6 +5566,7 @@ class SQLiteStateStore:
                 caller_principal_id=caller_principal_id,
                 limit=limit,
                 offset=offset,
+                after=after,
             )
         )
 
@@ -5675,48 +5729,72 @@ class SQLiteStateStore:
 
         await _run_cancellation_safe_graph_transaction(self.path, write)
 
+    async def conversation_run_page(
+        self,
+        agent_id: str,
+        conversation_id: str,
+        *,
+        after_turn_index: int = -1,
+        limit: int = 100,
+    ) -> tuple[ConversationRun, ...]:
+        """Read at most 100 turns after an exclusive stable cursor in one snapshot."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("conversation page limit must be between 1 and 100")
+        if type(after_turn_index) is not int or after_turn_index < -1:
+            raise ValueError("conversation cursor must be at least -1")
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _conversation_records(
+                connection,
+                agent_id,
+                conversation_id,
+                after_turn_index=after_turn_index,
+                limit=limit,
+            ),
+        )
+
     async def conversation_runs(
         self,
         agent_id: str,
         conversation_id: str,
     ) -> tuple[ConversationRun, ...]:
-        """Return every run in one agent-scoped conversation in turn order."""
+        """Compatibility full-history read; interactive callers should use pages."""
+        return await _run_graph_read(
+            self.path,
+            lambda connection: _conversation_records(
+                connection, agent_id, conversation_id
+            ),
+        )
 
-        def read() -> tuple[ConversationRun, ...]:
-            with _connect(self.path) as connection:
-                rows = connection.execute(
-                    """SELECT id, turn_index, input, result
-                       FROM runs
-                       WHERE agent_id = ? AND conversation_id = ?
-                       ORDER BY turn_index""",
-                    (agent_id, conversation_id),
-                ).fetchall()
-                records: list[ConversationRun] = []
-                for run_id, turn_index, input_data, result_data in rows:
-                    message_rows = connection.execute(
-                        """SELECT data FROM messages
-                           WHERE run_id = ? ORDER BY position""",
-                        (run_id,),
-                    ).fetchall()
-                    transcript = Transcript(
-                        run=decode_run_input(input_data),
-                        messages=tuple(
-                            decode_message(message[0]) for message in message_rows
-                        ),
-                    )
-                    result = (
-                        None if result_data is None else decode_loop_exit(result_data)
-                    )
-                    records.append(
-                        ConversationRun(
-                            turn_index=int(turn_index),
-                            transcript=transcript,
-                            result=result,
-                        )
-                    )
-            return tuple(records)
+    async def conversation_access(
+        self,
+        agent_id: str,
+        conversation_id: str,
+        *,
+        caller_principal_id: str | None = None,
+    ) -> tuple[bool, bool]:
+        """Return existence and whole-conversation caller access without messages."""
 
-        return await asyncio.to_thread(read)
+        def read(connection: sqlite3.Connection) -> tuple[bool, bool]:
+            row = connection.execute(
+                """SELECT
+                    EXISTS(SELECT 1 FROM runs WHERE agent_id = ? AND conversation_id = ?),
+                    EXISTS(SELECT 1 FROM runs WHERE agent_id = ? AND conversation_id = ?
+                        AND json_extract(input, '$.fields.caller_principal_id') IS NOT ?)
+                """,
+                (
+                    agent_id,
+                    conversation_id,
+                    agent_id,
+                    conversation_id,
+                    caller_principal_id,
+                ),
+            ).fetchone()
+            assert row is not None
+            exists = bool(row[0])
+            return exists, exists and (caller_principal_id is None or not row[1])
+
+        return await _run_graph_read(self.path, read)
 
     async def conversation_exists(
         self,
@@ -6328,6 +6406,14 @@ def _require_candidate_transition(
         )
 
 
+def _storage_error(error: BaseException) -> BaseException:
+    if isinstance(error, sqlite3.OperationalError) and (
+        getattr(error, "sqlite_errorcode", 0) & 255
+    ) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+        return StorageUnavailableError("SQLite storage is temporarily busy")
+    return error
+
+
 async def _run_cancellation_safe_transaction(
     path: Path,
     callback: Callable[[sqlite3.Connection], _T],
@@ -6343,9 +6429,9 @@ async def _run_cancellation_safe_transaction(
             result = callback(connection)
             connection.commit()
             return result
-        except BaseException:
+        except BaseException as error:
             connection.rollback()
-            raise
+            raise _storage_error(error) from None
         finally:
             connection.close()
 
@@ -6368,14 +6454,58 @@ async def _run_cancellation_safe_transaction(
     return cast(_T, result)
 
 
+def _conversation_records(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    conversation_id: str,
+    *,
+    after_turn_index: int = -1,
+    limit: int | None = None,
+) -> tuple[ConversationRun, ...]:
+    # Both statements use the caller's read snapshot. Joining the selected turns
+    # fetches all messages in one query instead of one query per turn.
+    selection = """SELECT id, turn_index, input, result FROM runs
+        WHERE agent_id = ? AND conversation_id = ? AND turn_index > ?
+        ORDER BY turn_index LIMIT ?"""
+    parameters = (
+        agent_id,
+        conversation_id,
+        after_turn_index,
+        limit if limit is not None else -1,
+    )
+    rows = connection.execute(selection, parameters).fetchall()
+    messages: dict[str, list[CanonicalMessage]] = {row[0]: [] for row in rows}
+    if rows:
+        for run_id, data in connection.execute(
+            "WITH selected AS (" + selection + ") "
+            "SELECT m.run_id, m.data FROM messages AS m JOIN selected AS s ON s.id = m.run_id "
+            "ORDER BY s.turn_index, m.position",
+            parameters,
+        ):
+            messages[run_id].append(decode_message(data))
+    return tuple(
+        ConversationRun(
+            turn_index=int(turn_index),
+            transcript=Transcript(
+                run=decode_run_input(input_data), messages=tuple(messages[run_id])
+            ),
+            result=None if result_data is None else decode_loop_exit(result_data),
+        )
+        for run_id, turn_index, input_data, result_data in rows
+    )
+
+
 async def _run_graph_read(
     path: Path,
     callback: Callable[[sqlite3.Connection], _T],
 ) -> _T:
     def read() -> _T:
-        with _connect_read_only(path) as connection:
-            connection.execute("BEGIN")
-            return callback(connection)
+        try:
+            with _connect_read_only(path) as connection:
+                connection.execute("BEGIN")
+                return callback(connection)
+        except sqlite3.OperationalError as error:
+            raise _storage_error(error) from None
 
     return await asyncio.to_thread(read)
 
@@ -6396,9 +6526,9 @@ async def _run_cancellation_safe_graph_transaction(
             result = callback(connection)
             connection.commit()
             return result
-        except BaseException:
+        except BaseException as error:
             connection.rollback()
-            raise
+            raise _storage_error(error) from None
         finally:
             connection.close()
 
@@ -7214,88 +7344,75 @@ def _open_graph_effect_uncertain_control(
 
 
 def _recover_started_effect_receipts(
-    path: Path,
-    clock: Callable[[], datetime],
+    connection: sqlite3.Connection, agent_id: str, completed_at: datetime
 ) -> None:
-    try:
-        with _connect_read_only(path) as connection:
-            rows = tuple(
-                connection.execute(
-                    "SELECT agent_id, id, data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest FROM effect_receipts"
-                )
-            )
-        started = tuple(
-            (
-                agent_id,
-                receipt_id,
-                receipt,
-                job_id,
-                task_id,
-                attempt_id,
-                fencing_epoch,
-                task_spec_digest,
-            )
-            for (
-                agent_id,
-                receipt_id,
-                data,
-                job_id,
-                task_id,
-                attempt_id,
-                fencing_epoch,
-                task_spec_digest,
-            ) in rows
-            if (receipt := decode_receipt(data)).outcome is EffectOutcome.STARTED
+    rows = tuple(
+        connection.execute(
+            "SELECT agent_id, id, data, job_id, task_id, task_attempt_id, fencing_epoch, task_spec_digest FROM effect_receipts WHERE agent_id = ?",
+            (agent_id,),
         )
-        if not started:
-            return
-        completed_at = _effect_receipt_aware(clock(), "receipt recovery completed_at")
-        with _connect(path) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            for (
+    )
+    started = tuple(
+        (
+            agent_id,
+            receipt_id,
+            receipt,
+            job_id,
+            task_id,
+            attempt_id,
+            fencing_epoch,
+            task_spec_digest,
+        )
+        for (
+            agent_id,
+            receipt_id,
+            data,
+            job_id,
+            task_id,
+            attempt_id,
+            fencing_epoch,
+            task_spec_digest,
+        ) in rows
+        if (receipt := decode_receipt(data)).outcome is EffectOutcome.STARTED
+    )
+    for (
+        agent_id,
+        receipt_id,
+        receipt,
+        job_id,
+        task_id,
+        attempt_id,
+        fencing_epoch,
+        task_spec_digest,
+    ) in started:
+        recovered = receipt.finish(
+            EffectObservation(EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN),
+            finished_at=completed_at,
+        )
+        result = connection.execute(
+            """UPDATE effect_receipts SET data = ?
+               WHERE agent_id = ? AND id = ? AND data = ?""",
+            (
+                encode_receipt(recovered),
                 agent_id,
                 receipt_id,
-                receipt,
-                job_id,
-                task_id,
-                attempt_id,
-                fencing_epoch,
-                task_spec_digest,
-            ) in started:
-                recovered = receipt.finish(
-                    EffectObservation(
-                        EffectOutcome.UNCERTAIN, EffectEvidenceBasis.UNKNOWN
-                    ),
-                    finished_at=completed_at,
-                )
-                result = connection.execute(
-                    """UPDATE effect_receipts SET data = ?
-                       WHERE agent_id = ? AND id = ? AND data = ?""",
-                    (
-                        encode_receipt(recovered),
-                        agent_id,
-                        receipt_id,
-                        encode_receipt(receipt),
-                    ),
-                )
-                if result.rowcount != 1:
-                    raise RuntimeError("effect receipt changed during startup recovery")
-                _pause_effect_routine(connection, recovered, completed_at)
-                if job_id is not None:
-                    _open_graph_effect_uncertain_control(
-                        connection,
-                        receipt=recovered,
-                        job_id=str(job_id),
-                        task_id=str(task_id),
-                        attempt_id=str(attempt_id),
-                        fencing_epoch=int(fencing_epoch),
-                        task_spec_digest=str(task_spec_digest),
-                        opened_at=completed_at,
-                    )
-    except RuntimeError:
-        raise
-    except (OSError, sqlite3.Error, TypeError, ValueError):
-        raise _damaged_state_error(path, str(CURRENT_HOME_REVISION)) from None
+                encode_receipt(receipt),
+            ),
+        )
+        if result.rowcount != 1:
+            raise RuntimeError("effect receipt changed during startup recovery")
+        _pause_effect_routine(connection, recovered, completed_at)
+        if job_id is not None:
+            _open_graph_effect_uncertain_control(
+                connection,
+                receipt=recovered,
+                job_id=str(job_id),
+                task_id=str(task_id),
+                attempt_id=str(attempt_id),
+                fencing_epoch=int(fencing_epoch),
+                task_spec_digest=str(task_spec_digest),
+                opened_at=completed_at,
+            )
 
 
 def _connect(path: Path) -> sqlite3.Connection:

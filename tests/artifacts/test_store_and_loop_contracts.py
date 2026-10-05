@@ -79,11 +79,15 @@ class _Registry:
         caller_principal_id: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> tuple[ArtifactRecord, ...]:
         return tuple(
             record
             for record in self.records.values()
-            if record.agent_id == agent_id
+            if (
+                after is None or (record.ref.created_at, record.ref.artifact_id) > after
+            )
+            and record.agent_id == agent_id
             and (state is None or record.state is state)
             and (run_id is None or record.ref.run_id == run_id)
             and (
@@ -104,6 +108,7 @@ class _Registry:
         caller_principal_id: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        after: tuple[datetime, str] | None = None,
     ) -> tuple[ArtifactRef, ...]:
         return tuple(
             record.ref
@@ -115,6 +120,7 @@ class _Registry:
                 caller_principal_id=caller_principal_id,
                 limit=limit,
                 offset=offset,
+                after=after,
             )
         )
 

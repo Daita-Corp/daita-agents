@@ -1056,6 +1056,44 @@ def test_semantics_use_existing_storage_context_and_runtime_owners():
         assert forbidden not in _python_text(PACKAGE)
 
 
+def test_durable_state_contract_composes_domain_owned_interfaces():
+    from daita.artifacts.store import ArtifactRegistry
+    from daita.catalog.protocols import CatalogStore
+    from daita.jobs.owner import GraphJobStore, GraphSupervisorStore
+    from daita.loop.driver import TranscriptStore
+    from daita.routines.owner import RoutineStore, RoutineSupervisorStore
+    from daita.storage.protocols import StateStore
+
+    state_store_mro = inspect.getmro(StateStore)
+    for contract in (
+        ArtifactRegistry,
+        CatalogStore,
+        GraphJobStore,
+        GraphSupervisorStore,
+        TranscriptStore,
+        RoutineStore,
+        RoutineSupervisorStore,
+    ):
+        assert contract in state_store_mro
+    inherited = set().union(
+        *(
+            {
+                name
+                for name, member in vars(base).items()
+                if callable(member) and not name.startswith("_")
+            }
+            for base in state_store_mro[1:]
+        )
+    )
+    declared = _class_methods(PACKAGE / "storage/protocols.py", "StateStore")
+    # The composition extends snapshot publication with atomic registration.
+    assert declared & inherited == {"commit_snapshot"}
+    for path in ("jobs/supervisor.py", "routines/supervisor.py"):
+        assert "storage.sqlite" not in _imports(PACKAGE / path)
+        assert "storage.protocols" not in _imports(PACKAGE / path)
+    assert "sqlite" not in _imports(PACKAGE / "storage/protocols.py")
+
+
 def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")

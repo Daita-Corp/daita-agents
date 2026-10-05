@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
@@ -40,7 +41,12 @@ from ..loop.models import (
 )
 from ..loop.session import RunCancellationToken, RunSession, RunSessionOptions
 from ..loop.transcripts import RunSessionWriter
-from ..storage.sqlite import SQLiteStateStore
+from ..observation import SupervisorStatus
+from ..storage.errors import (
+    StorageError,
+    StorageOwnershipLostError,
+    StorageUnavailableError,
+)
 from .graph.execution import (
     GRAPH_RESULT_FINALIZER_KIND,
     PROFILE_WORK_KIND,
@@ -54,7 +60,7 @@ from .graph.execution import (
     task_context_bundle,
     task_conversation_id,
 )
-from .graph.guard import SQLiteTaskAttemptGuard
+from .graph.guard import TaskAttemptStateGuard
 from .graph.models import (
     AttemptState,
     BudgetAmount,
@@ -70,7 +76,10 @@ from .graph.models import (
     reserved_artifact_id,
 )
 from .graph.reduction import fair_graph_dispatch_order
-from .owner import JobOwner
+from .graph.validation import GraphValidationError
+from .owner import GraphSupervisorStore, JobOwner
+
+_logger = logging.getLogger(__name__)
 
 _ARTIFACT_ID = re.compile(r"artifact-[0-9a-f]{32}\Z")
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
@@ -88,7 +97,7 @@ class JobSupervisor:
         self,
         *,
         agent_id: str,
-        store: SQLiteStateStore,
+        store: GraphSupervisorStore,
         owner: JobOwner,
         runtime: CapabilityRuntime,
         artifacts: AgentHomeArtifactStore,
@@ -143,6 +152,45 @@ class JobSupervisor:
         self._last_graph_dispatch_job_id: str | None = None
         self._consecutive_graph_dispatches = 0
         self._closing = False
+        self._failed = False
+        self._failure_code: str | None = None
+        self._consecutive_failures = 0
+        self._retry_at = 0.0
+
+    @property
+    def status(self) -> SupervisorStatus:
+        return SupervisorStatus(
+            name="jobs",
+            state=(
+                "failed"
+                if self._failed
+                else (
+                    "stopped"
+                    if self._driver is None or self._driver.done()
+                    else "retrying" if self._consecutive_failures else "running"
+                )
+            ),
+            consecutive_failures=self._consecutive_failures,
+            failure_code=self._failure_code,
+        )
+
+    def _record_failure(self, error: BaseException) -> None:
+        if self._failed:
+            return
+        self._consecutive_failures += 1
+        self._failure_code = (
+            error.code if isinstance(error, StorageError) else "supervisor_failed"
+        )
+        if not isinstance(error, StorageUnavailableError):
+            self._failed = True
+            _logger.error("jobs supervisor stopped (%s)", self._failure_code)
+            if self._driver is not None and self._driver is not asyncio.current_task():
+                self._driver.cancel("supervisor_failed")
+        if isinstance(error, StorageUnavailableError):
+            self._retry_at = asyncio.get_running_loop().time() + min(
+                5.0, 0.1 * 2 ** min(self._consecutive_failures - 1, 6)
+            )
+        self._wake.set()
 
     async def start(self) -> None:
         if self._driver is not None:
@@ -321,26 +369,52 @@ class JobSupervisor:
             )
 
     async def _drive_graph(self) -> None:
+        # Workers wake this loop on completion; idle polling backs off to one
+        # second while explicit submissions still wake it immediately.
+        delay = self._poll_seconds
         try:
-            while not self._closing:
+            while not self._closing and not self._failed:
+                while (
+                    remaining := self._retry_at - asyncio.get_running_loop().time()
+                ) > 0:
+                    await asyncio.sleep(remaining)
+                failures_before_poll = self._consecutive_failures
                 self._wake.clear()
-                await self._recover_stale_graph_attempts()
-                await self._graph_store_call(
-                    lambda: self._store.expire_due_graphs(
-                        self._agent_id,
-                        expired_at=self._clock(),
-                    )
-                )
-                await self._launch_ready_graph_tasks()
                 try:
-                    await asyncio.wait_for(
-                        self._wake.wait(),
-                        timeout=self._poll_seconds,
+                    await self._recover_stale_graph_attempts()
+                    await self._graph_store_call(
+                        lambda: self._store.expire_due_graphs(
+                            self._agent_id, expired_at=self._clock()
+                        )
                     )
+                    await self._launch_ready_graph_tasks()
+                except StorageUnavailableError as error:
+                    self._record_failure(error)
+                    continue
+                except Exception as error:
+                    self._record_failure(error)
+                    break
+                if (
+                    not self._failed
+                    and self._consecutive_failures == failures_before_poll
+                    and not self._graph_workers
+                ):
+                    self._consecutive_failures = 0
+                    self._failure_code = None
+                try:
+                    await asyncio.wait_for(self._wake.wait(), timeout=delay)
+                    delay = self._poll_seconds
                 except TimeoutError:
-                    pass
+                    delay = min(1.0, delay * 2)
         except asyncio.CancelledError:
             return
+        finally:
+            if self._failed:
+                for worker in self._graph_workers.values():
+                    worker.cancel("supervisor_failed")
+                await asyncio.gather(
+                    *tuple(self._graph_workers.values()), return_exceptions=True
+                )
 
     async def _recover_stale_graph_attempts(self) -> None:
         stale = await self._graph_store_call(
@@ -382,6 +456,8 @@ class JobSupervisor:
                 limit=64,
             )
         )
+        if self._failed or self._retry_at > asyncio.get_running_loop().time():
+            return
         ready = fair_graph_dispatch_order(
             ready,
             last_job_id=self._last_graph_dispatch_job_id,
@@ -405,7 +481,14 @@ class JobSupervisor:
             def done(completed: asyncio.Task[None], *, key=key) -> None:
                 self._graph_workers.pop(key, None)
                 if not completed.cancelled():
-                    completed.exception()
+                    error = completed.exception()
+                    if error is not None:
+                        self._record_failure(error)
+                    elif not self._failed:
+                        # Launching a worker is not proof storage has recovered.
+                        # Reset its failure streak only after successful work.
+                        self._consecutive_failures = 0
+                        self._failure_code = None
                 self._wake.set()
 
             worker.add_done_callback(done)
@@ -453,6 +536,8 @@ class JobSupervisor:
                         budget_reservations=preparation.budget_reservations,
                     )
                 )
+            except StorageOwnershipLostError:
+                raise
             except Exception:
                 attempt = await self._find_graph_attempt(
                     current_task.job_id,
@@ -481,9 +566,23 @@ class JobSupervisor:
                 self._heartbeat_graph_attempt(started),
                 name=f"daita-graph-heartbeat:{started.attempt_id}",
             )
+            executing = asyncio.current_task()
+
+            def heartbeat_done(completed: asyncio.Task[None]) -> None:
+                if completed.cancelled():
+                    return
+                error = completed.exception()
+                if error is not None:
+                    self._record_failure(error)
+                    if executing is not None:
+                        executing.cancel("heartbeat_failed")
+
+            heartbeat.add_done_callback(heartbeat_done)
             try:
                 await self._execute_graph_attempt(inspection, current_task, started)
             except asyncio.CancelledError:
+                raise
+            except StorageError:
                 raise
             except Exception as error:
                 failure = error
@@ -571,6 +670,8 @@ class JobSupervisor:
                     claim_token=attempt.claim_token,
                 )
             )
+        except StorageOwnershipLostError:
+            raise
         except Exception:
             inspection = await self._graph_store_call(
                 lambda: self._store.inspect_graph(self._agent_id, attempt.job_id)
@@ -610,6 +711,35 @@ class JobSupervisor:
                 )
                 if renewed is None:
                     return
+        except GraphValidationError as error:
+            if error.code != "stale_attempt":
+                raise
+            # Completion can commit before an already-dispatched heartbeat
+            # reaches storage. Confirm that exact success before dismissing the
+            # rejected renewal; storage failures and other stale claims remain
+            # fatal, and no mutation is replayed.
+            current = await self._graph_store_call(
+                lambda: self._store.read_graph_attempt_authority(
+                    attempt.agent_id,
+                    attempt.job_id,
+                    attempt.task_id,
+                    attempt.attempt_id,
+                )
+            )
+            if (
+                current is None
+                or current.task is None
+                or current.attempt is None
+                or current.task.state is not TaskState.SUCCEEDED
+                or current.task.current_attempt_id is not None
+                or current.attempt.state is not AttemptState.SUCCEEDED
+                or current.attempt.claim_token != attempt.claim_token
+                or current.attempt.fencing_epoch != attempt.fencing_epoch
+                or current.attempt.run_id != attempt.run_id
+                or current.attempt.result_id is None
+                or current.task.latest_result_id != current.attempt.result_id
+            ):
+                raise
         except asyncio.CancelledError:
             return
 
@@ -1096,6 +1226,8 @@ class JobSupervisor:
                         usage=(BudgetAmount("work_units", 1),),
                     )
                 )
+            except StorageOwnershipLostError:
+                raise
             except Exception:
                 current = await self._graph_store_call(
                     lambda: self._store.inspect_graph(result.agent_id, result.job_id)
@@ -1199,6 +1331,8 @@ class JobSupervisor:
                     usage=(BudgetAmount("work_units", 1),),
                 )
             )
+        except StorageOwnershipLostError:
+            raise
         except Exception:
             current, deliveries = await asyncio.gather(
                 self._graph_store_call(
@@ -1229,15 +1363,15 @@ class JobSupervisor:
 
 
 def _graph_attempt_guard(
-    store: SQLiteStateStore,
+    store: GraphSupervisorStore,
     inspection: GraphInspection,
     task: GraphTask,
     attempt: TaskAttempt,
     *,
     clock: Callable[[], datetime],
-) -> SQLiteTaskAttemptGuard:
+) -> TaskAttemptStateGuard:
     binding = graph_task_binding(inspection, task, attempt)
-    return SQLiteTaskAttemptGuard(
+    return TaskAttemptStateGuard(
         store=store,
         binding=binding,
         claim_token=attempt.claim_token,

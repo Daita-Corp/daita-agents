@@ -45,6 +45,7 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.loop.models import Transcript
+from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_codecs import decode_message, encode_message
 from tests.support.mcp import MCPConformanceTransport, conformance_identities
 from tests.support.toolbox_model import ToolboxAwareMockModelProvider
@@ -424,6 +425,7 @@ async def test_artifact_create_tabular_rejects_tampered_execution_lineage(
         id_factory=_ids(),
         workspace=workspace_for(tmp_path),
     )
+    assert isinstance(agent._embedded._store, SQLiteStateStore)
     provider.state_path = agent._embedded._store.path
     try:
         result = await agent.run("Create a table from the prior result.")

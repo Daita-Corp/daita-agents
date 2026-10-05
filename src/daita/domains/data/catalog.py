@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from hashlib import sha256
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 from ..._json import FrozenJsonObject
+from ...adapters.protocols import SourceStore
 from ...catalog.models import (
     CatalogResource,
     CatalogSchemaRequest,
@@ -29,21 +30,19 @@ from ...storage.sqlite_records import (
 )
 from .sql import ResourceSchema
 
-if TYPE_CHECKING:
-    from ...adapters.protocols import SourceStore
 
-    class CatalogPermissionStore(SourceStore, Protocol):
-        async def load_source_read_scope(
-            self,
-            agent_id: str,
-            source_id: str,
-        ) -> SourceReadScope | None: ...
+class CatalogPermissionStore(SourceStore, Protocol):
+    async def load_source_read_scope(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> SourceReadScope | None: ...
 
-        async def list_relational_write_scopes(
-            self,
-            agent_id: str,
-            source_id: str,
-        ) -> tuple[RelationalWriteScope, ...]: ...
+    async def list_relational_write_scopes(
+        self,
+        agent_id: str,
+        source_id: str,
+    ) -> tuple[RelationalWriteScope, ...]: ...
 
 
 class CatalogDataView:

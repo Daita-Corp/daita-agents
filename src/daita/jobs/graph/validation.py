@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ...distribution.models import GraphJobDelivery
 
 from ...llm.models import ModelSensitivity
 from .models import (
@@ -12,6 +16,7 @@ from .models import (
     AttemptState,
     GraphAdmission,
     GraphAuthority,
+    GraphJob,
     GraphMutationRequest,
     GraphState,
     GraphTask,
@@ -791,3 +796,61 @@ __all__ = [
     "validate_graph_topology",
     "validate_mutation",
 ]
+
+
+def validate_attempt_result(
+    *,
+    task: GraphTask,
+    attempt: TaskAttempt,
+    result: TaskResult,
+    claim_token: str,
+    fencing_epoch: int,
+) -> None:
+    """Validate completion authority identically for every durable backend."""
+    require_current_attempt(
+        task=task,
+        attempt=attempt,
+        claim_token=claim_token,
+        fencing_epoch=fencing_epoch,
+    )
+    if attempt.state is not AttemptState.RUNNING:
+        raise GraphValidationError(
+            "attempt_not_running", "only running attempt completes"
+        )
+    if result.run_id != attempt.run_id:
+        raise GraphValidationError("result_run", "result belongs to another run")
+    if result.completed_at > attempt.absolute_deadline_at:
+        raise GraphValidationError("attempt_deadline", "result arrived after deadline")
+    if (
+        result.sensitivity.routing_rank
+        < task.specification.authority.sensitivity.routing_rank
+    ):
+        raise GraphValidationError(
+            "result_sensitivity", "result lowers task sensitivity"
+        )
+
+
+def validate_graph_delivery_result(
+    job: GraphJob,
+    task: GraphTask,
+    result: TaskResult,
+    delivery: GraphJobDelivery,
+) -> None:
+    """A finalizer delivery must authenticate the exact accepted result."""
+    if task.role is not TaskRole.FINALIZER:
+        raise GraphValidationError(
+            "delivery_task", "only the finalizer can publish a graph delivery"
+        )
+    if (
+        delivery.agent_id != job.agent_id
+        or delivery.job_id != job.job_id
+        or delivery.conversation_id != job.conversation_id
+        or delivery.outcome.conclusion_id != result.result_id
+        or delivery.outcome.conclusion_digest != result.result_digest
+        or tuple(item.artifact_id for item in delivery.outcome.artifact_references)
+        != result.artifact_ids
+        or delivery.outcome.effective_sensitivity != result.sensitivity
+    ):
+        raise GraphValidationError(
+            "delivery_result", "graph delivery differs from the finalizer result"
+        )

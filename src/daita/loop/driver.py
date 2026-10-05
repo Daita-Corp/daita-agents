@@ -75,7 +75,7 @@ from .models import (
     validate_completed_transcript,
 )
 from .session import RunCancellationToken, RunSession, RunSessionOptions
-from .transcripts import ConversationPredecessor, RunSessionWriter
+from .transcripts import ConversationPredecessor, RunSessionWriter, TranscriptWriteStore
 
 _T = TypeVar("_T")
 
@@ -156,30 +156,8 @@ class ToolRuntime(Protocol):
         ...
 
 
-class TranscriptStore(Protocol):
-    async def start(
-        self,
-        run: RunInput,
-        *,
-        predecessor: ConversationPredecessor | None = None,
-    ) -> Transcript: ...
-
+class TranscriptStore(TranscriptWriteStore, Protocol):
     async def append(self, run_id: str, message: CanonicalMessage) -> None: ...
-
-    async def append_at(
-        self,
-        run_id: str,
-        position: int,
-        message: CanonicalMessage,
-    ) -> None: ...
-
-    async def complete(
-        self,
-        result: LoopExit,
-        final_message: CanonicalMessage,
-    ) -> None: ...
-
-    async def finish(self, result: LoopExit) -> None: ...
 
 
 class InMemoryTranscriptStore:
