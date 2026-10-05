@@ -22,6 +22,7 @@ from daita.jobs.graph.models import (
     TaskRole,
     TaskState,
 )
+from daita.jobs.graph.validation import GraphValidationError
 from daita.llm.models import ModelSensitivity
 from daita.observation import AgentEvent, AgentEventKind
 from daita.storage.errors import (
@@ -769,6 +770,107 @@ async def test_heartbeat_and_checkpoint_are_durable(tmp_path: Path) -> None:
         assert worker.heartbeat_at > worker.started_at
         assert heartbeat_ticks >= 1
     finally:
+        await integration.close()
+
+
+@pytest.mark.parametrize("role", (TaskRole.INTERNAL, TaskRole.FINALIZER))
+async def test_heartbeat_racing_completion_keeps_supervisor_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, role: TaskRole
+) -> None:
+    integration = await StaticGraphIntegration.open(
+        tmp_path, (("source-a", "resource-a"),)
+    )
+    committed = asyncio.Event()
+    heartbeat_finished = asyncio.Event()
+    original_execute = integration.supervisor._execute_graph_attempt
+    original_heartbeat = integration.supervisor._heartbeat_graph_attempt
+    admission = await integration.build(("resource-a",))
+    target = next(task for task in admission.tasks if task.role is role)
+
+    async def complete_before_heartbeat(inspection, task, attempt):
+        await original_execute(inspection, task, attempt)
+        if task.task_id == target.task_id:
+            committed.set()
+            await asyncio.wait_for(heartbeat_finished.wait(), 2)
+
+    async def heartbeat_after_completion(attempt):
+        if attempt.task_id != target.task_id:
+            await original_heartbeat(attempt)
+            return
+        await asyncio.wait_for(committed.wait(), 2)
+        integration.supervisor._graph_heartbeat_seconds = 0.01
+        try:
+            await original_heartbeat(attempt)
+        finally:
+            integration.supervisor._graph_heartbeat_seconds = 10
+            heartbeat_finished.set()
+
+    monkeypatch.setattr(
+        integration.supervisor, "_execute_graph_attempt", complete_before_heartbeat
+    )
+    monkeypatch.setattr(
+        integration.supervisor, "_heartbeat_graph_attempt", heartbeat_after_completion
+    )
+    try:
+        await integration.admit_and_start(admission)
+        terminal = await integration.wait_terminal(admission.job.job_id)
+        await asyncio.wait_for(heartbeat_finished.wait(), 2)
+        await asyncio.gather(*tuple(integration.supervisor._graph_workers.values()))
+        assert heartbeat_finished.is_set()
+        assert terminal.job.state is GraphState.SUCCEEDED
+        assert len(terminal.attempts) == 2
+        assert len(terminal.delivery_ids) == 1
+        assert integration.backend.calls == {"resource-a": 1}
+        assert integration.supervisor.status.state == "running"
+        assert integration.supervisor.status.failure_code is None
+    finally:
+        await integration.close()
+
+
+@pytest.mark.parametrize(
+    "readback_error", (None, StorageCommitUnknownError, StorageOwnershipLostError)
+)
+async def test_stale_heartbeat_without_verified_completion_stops_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, readback_error
+) -> None:
+    integration = await StaticGraphIntegration.open(
+        tmp_path, (("source-a", "resource-a"),)
+    )
+    integration.backend.block_after = 0
+    integration.supervisor._graph_heartbeat_seconds = 0.01
+
+    async def reject_heartbeat(*args, **kwargs):
+        await asyncio.wait_for(integration.backend.blocked.wait(), 2)
+        if readback_error is not None:
+            monkeypatch.setattr(
+                integration.store, "read_graph_attempt_authority", fail_readback
+            )
+        raise GraphValidationError("stale_attempt", "injected stale heartbeat")
+
+    async def fail_readback(*args, **kwargs):
+        assert readback_error is not None
+        raise readback_error("private driver detail")
+
+    monkeypatch.setattr(integration.store, "heartbeat_graph_attempt", reject_heartbeat)
+    try:
+        admission = await integration.build(("resource-a",))
+        await integration.admit_and_start(admission)
+        driver = integration.supervisor._driver
+        assert driver is not None
+        await asyncio.wait_for(asyncio.shield(driver), 3)
+        assert integration.supervisor.status.state == "failed"
+        assert integration.supervisor.status.failure_code == (
+            "supervisor_failed" if readback_error is None else readback_error.code
+        )
+        assert not integration.supervisor._graph_workers
+        assert integration.backend.active_by_source["source-a"] == 0
+        assert not integration.backend.completed
+        current = await integration.owner.inspect_graph(admission.job.job_id)
+        assert current is not None and len(current.attempts) == 1
+        assert current.attempts[0].state is AttemptState.RUNNING
+        assert not current.results
+    finally:
+        integration.backend.release.set()
         await integration.close()
 
 

@@ -76,6 +76,7 @@ from .graph.models import (
     reserved_artifact_id,
 )
 from .graph.reduction import fair_graph_dispatch_order
+from .graph.validation import GraphValidationError
 from .owner import GraphSupervisorStore, JobOwner
 
 _logger = logging.getLogger(__name__)
@@ -710,6 +711,35 @@ class JobSupervisor:
                 )
                 if renewed is None:
                     return
+        except GraphValidationError as error:
+            if error.code != "stale_attempt":
+                raise
+            # Completion can commit before an already-dispatched heartbeat
+            # reaches storage. Confirm that exact success before dismissing the
+            # rejected renewal; storage failures and other stale claims remain
+            # fatal, and no mutation is replayed.
+            current = await self._graph_store_call(
+                lambda: self._store.read_graph_attempt_authority(
+                    attempt.agent_id,
+                    attempt.job_id,
+                    attempt.task_id,
+                    attempt.attempt_id,
+                )
+            )
+            if (
+                current is None
+                or current.task is None
+                or current.attempt is None
+                or current.task.state is not TaskState.SUCCEEDED
+                or current.task.current_attempt_id is not None
+                or current.attempt.state is not AttemptState.SUCCEEDED
+                or current.attempt.claim_token != attempt.claim_token
+                or current.attempt.fencing_epoch != attempt.fencing_epoch
+                or current.attempt.run_id != attempt.run_id
+                or current.attempt.result_id is None
+                or current.task.latest_result_id != current.attempt.result_id
+            ):
+                raise
         except asyncio.CancelledError:
             return
 
