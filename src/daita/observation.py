@@ -5,13 +5,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Protocol
+from typing import Literal, Protocol
 
 from ._json import FrozenJsonObject, FrozenJsonValue
 
 _MAX_IDENTIFIER_CHARACTERS = 256
 _MAX_DATA_KEY_CHARACTERS = 128
 _MAX_DATA_STRING_CHARACTERS = 1_024
+
+
+@dataclass(frozen=True, slots=True)
+class SupervisorStatus:
+    """Payload-free health of one background supervisor."""
+
+    name: str
+    state: Literal["running", "retrying", "failed", "stopped"]
+    consecutive_failures: int = 0
+    failure_code: str | None = None
 
 
 class AgentEventKind(str, Enum):

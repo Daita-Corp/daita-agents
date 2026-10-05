@@ -393,6 +393,9 @@ async def test_started_graph_receipt_recovers_uncertain_and_never_requeues(
         path, clock=lambda: GRAPH_NOW + timedelta(seconds=4)
     )
     try:
+        await reopened.recover_started_effect_receipts(
+            "agent-1", recovered_at=GRAPH_NOW + timedelta(seconds=4)
+        )
         recovered = await reopened.load_effect_receipt("agent-1", receipt.receipt_id)
         assert recovered is not None
         assert recovered.outcome is EffectOutcome.UNCERTAIN

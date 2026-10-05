@@ -611,6 +611,22 @@ async def test_personal_binding_isolated_across_projection_dispatch_management_a
             await agent.conversation_runs(
                 result.conversation_id, caller_principal_id="bob"
             )
+        with pytest.raises(ValueError, match="unavailable"):
+            await agent.conversation_run_page(
+                result.conversation_id, caller_principal_id="bob", limit=1
+            )
+        page = await agent.conversation_run_page(
+            result.conversation_id, caller_principal_id="alice", limit=1
+        )
+        assert len(page) == 1 and page[0].transcript == transcript
+        assert (
+            await agent.conversation_run_page(
+                result.conversation_id,
+                caller_principal_id="alice",
+                after_turn_index=page[-1].turn_index,
+            )
+            == ()
+        )
         assert not await agent.conversation_exists(
             result.conversation_id, caller_principal_id="bob"
         )

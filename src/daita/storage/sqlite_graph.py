@@ -23,6 +23,7 @@ from ..distribution.models import (
     target_fingerprint,
 )
 from ..distribution.owner import construct_graph_attention_delivery
+from ..jobs.graph.guard import GraphAttemptAuthority
 from ..jobs.graph.models import (
     ACTIVE_ATTEMPT_STATES,
     CONTROL_BUDGET_ROLES,
@@ -65,7 +66,9 @@ from ..jobs.graph.validation import (
     require_current_attempt,
     require_graph_transition,
     require_task_transition,
+    validate_attempt_result,
     validate_graph_admission,
+    validate_graph_delivery_result,
     validate_mutation,
 )
 from .errors import (
@@ -995,6 +998,25 @@ def _insert_graph_delivery(
             datetime_to_us(delivery.created_at),
             encode_graph_job_delivery(delivery),
         ),
+    )
+
+
+def read_graph_attempt_authority(
+    connection: sqlite3.Connection,
+    agent_id: str,
+    job_id: str,
+    task_id: str,
+    attempt_id: str,
+) -> GraphAttemptAuthority | None:
+    job = _load_job(connection, agent_id, job_id)
+    if job is None:
+        return None
+    task = _load_task(connection, agent_id, job_id, task_id)
+    attempt = _load_attempt(connection, agent_id, job_id, task_id, attempt_id)
+    return GraphAttemptAuthority(
+        job[0],
+        None if task is None else task[0],
+        None if attempt is None else attempt[0],
     )
 
 
@@ -2635,27 +2657,13 @@ def complete_attempt(
     graph, graph_data = loaded_graph
     task, task_data = loaded_task
     attempt, attempt_data = loaded_attempt
-    require_current_attempt(
+    validate_attempt_result(
         task=task,
         attempt=attempt,
+        result=result,
         claim_token=claim_token,
         fencing_epoch=fencing_epoch,
     )
-    if attempt.state is not AttemptState.RUNNING:
-        raise GraphValidationError(
-            "attempt_not_running", "only running attempt completes"
-        )
-    if result.run_id != attempt.run_id:
-        raise GraphValidationError("result_run", "result belongs to another run")
-    if result.completed_at > attempt.absolute_deadline_at:
-        raise GraphValidationError("attempt_deadline", "result arrived after deadline")
-    if (
-        result.sensitivity.routing_rank
-        < task.specification.authority.sensitivity.routing_rank
-    ):
-        raise GraphValidationError(
-            "result_sensitivity", "result lowers task sensitivity"
-        )
     raw_grants = task.specification.authority.contract_bindings.get("capability_grants")
     if raw_grants:
         if not isinstance(raw_grants, Mapping) or len(raw_grants) != 1:
@@ -2728,23 +2736,7 @@ def complete_attempt(
     ):
         raise GraphValidationError("finalizer_seal", "finalizer seal is stale")
     if delivery is not None:
-        if task.role is not TaskRole.FINALIZER:
-            raise GraphValidationError(
-                "delivery_task", "only the finalizer can publish a graph delivery"
-            )
-        if (
-            delivery.agent_id != job.agent_id
-            or delivery.job_id != job.job_id
-            or delivery.conversation_id != job.conversation_id
-            or delivery.outcome.conclusion_id != result.result_id
-            or delivery.outcome.conclusion_digest != result.result_digest
-            or tuple(item.artifact_id for item in delivery.outcome.artifact_references)
-            != result.artifact_ids
-            or delivery.outcome.effective_sensitivity != result.sensitivity
-        ):
-            raise GraphValidationError(
-                "delivery_result", "graph delivery differs from the finalizer result"
-            )
+        validate_graph_delivery_result(job, task, result, delivery)
     connection.execute(
         """INSERT INTO job_task_results(
                agent_id, job_id, task_id, result_id, attempt_id, completed_at_us,

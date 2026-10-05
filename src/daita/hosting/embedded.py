@@ -247,7 +247,7 @@ from ..memory.capabilities import (
     memory_set_declarations,
 )
 from ..memory.store import validate_memory_documents
-from ..observation import AgentObserver
+from ..observation import AgentObserver, SupervisorStatus
 from ..routines.capabilities import (
     ROUTINE_DOMAIN_OWNER_ID,
     RoutineCapabilityDomain,
@@ -1288,6 +1288,13 @@ class EmbeddedAgent:
                     "agent.toml does not match state.db identity"
                 )
             await store.list_sources(identity.id)
+            _, cancelled = await _await_async_completion(
+                lambda: store.recover_started_effect_receipts(
+                    identity.id, recovered_at=resolved_clock()
+                )
+            )
+            if cancelled:
+                raise asyncio.CancelledError
             _, cancelled = await _await_async_completion(
                 lambda: store.recover_unfinished_runs(
                     identity.id,
@@ -2654,14 +2661,14 @@ class EmbeddedAgent:
     async def _require_conversation_caller(
         self, conversation_id: str, principal_id: str
     ) -> bool:
-        records = await self._store.conversation_runs(self.identity.id, conversation_id)
-        if not records:
-            return False
-        if self._hosted and any(
-            item.transcript.run.caller_principal_id != principal_id for item in records
-        ):
+        exists, allowed = await self._store.conversation_access(
+            self.identity.id,
+            conversation_id,
+            caller_principal_id=principal_id if self._hosted else None,
+        )
+        if exists and not allowed:
             raise ValueError("conversation is unavailable to this caller")
-        return True
+        return exists
 
     async def inbox(
         self,
@@ -2748,6 +2755,35 @@ class EmbeddedAgent:
         if acknowledged is not None:
             self._routine_supervisor.wake()
         return acknowledged
+
+    def background_status(self) -> tuple[SupervisorStatus, ...]:
+        """Return payload-free health of background job and routine execution."""
+        return (self._job_supervisor.status, self._routine_supervisor.status)
+
+    async def conversation_run_page(
+        self,
+        conversation_id: str,
+        *,
+        after_turn_index: int = -1,
+        limit: int = 100,
+        caller_principal_id: str | None = None,
+    ) -> tuple[ConversationRun, ...]:
+        self._require_open()
+        _validate_conversation_id(conversation_id)
+        principal = self._resolve_caller_principal(caller_principal_id)
+        if not await self._require_conversation_caller(conversation_id, principal):
+            raise ValueError("unknown conversation for this agent")
+        records = await self._store.conversation_run_page(
+            self.identity.id,
+            conversation_id,
+            after_turn_index=after_turn_index,
+            limit=limit,
+        )
+        if self._hosted and any(
+            item.transcript.run.caller_principal_id != principal for item in records
+        ):
+            raise ValueError("conversation is unavailable to this caller")
+        return records
 
     async def conversation_runs(
         self,

@@ -90,7 +90,7 @@ from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
-from .observation import AgentObserver
+from .observation import AgentObserver, SupervisorStatus
 from .routines import (
     RoutineState,
     ScheduledRoutine,
@@ -447,6 +447,26 @@ class Agent:
 
         return await self._embedded.acknowledge_inbox(
             delivery_id, caller_principal_id=caller_principal_id
+        )
+
+    def background_status(self) -> tuple[SupervisorStatus, ...]:
+        """Return payload-free health of background job and routine execution."""
+        return self._embedded.background_status()
+
+    async def conversation_run_page(
+        self,
+        conversation_id: str,
+        *,
+        after_turn_index: int = -1,
+        limit: int = 100,
+        caller_principal_id: str | None = None,
+    ) -> tuple[ConversationRun, ...]:
+        """Read up to 100 turns; continue after the last returned turn_index."""
+        return await self._embedded.conversation_run_page(
+            conversation_id,
+            after_turn_index=after_turn_index,
+            limit=limit,
+            caller_principal_id=caller_principal_id,
         )
 
     async def conversation_runs(

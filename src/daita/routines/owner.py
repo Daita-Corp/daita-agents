@@ -25,7 +25,9 @@ from ..capabilities import (
 )
 from ..catalog.models import CatalogResource, Sensitivity
 from ..distribution import (
+    Delivery,
     DistributionOwner,
+    OutcomeArtifactReference,
     OutcomeContract,
     distribution_plan_projection,
     outcome_contract_projection,
@@ -52,6 +54,7 @@ from .models import (
     OnceSchedule,
     ReportingMode,
     RequestedCapabilityGrant,
+    ResourceRevisionObservation,
     ResourceRevisionPrecheck,
     RoutineControlAction,
     RoutineOccurrence,
@@ -134,7 +137,7 @@ class RoutineStore(Protocol):
         authorized_control_call_id: str,
         claimed_at: datetime,
         claim_token: str,
-    ) -> object | None: ...
+    ) -> RoutineOccurrence | None: ...
 
     async def conversation_exists(
         self, agent_id: str, conversation_id: str
@@ -169,6 +172,62 @@ class RoutineSkillStore(Protocol):
     async def read_retained_skill(
         self, name: str, content_digest: str
     ) -> Skill | None: ...
+
+
+class RoutineSupervisorStore(Protocol):
+    """Durable operations required by the routines supervisor."""
+
+    async def claim_due_routine_occurrence(
+        self,
+        agent_id: str,
+        routine_id: str,
+        *,
+        expected_revision: int,
+        expected_due_at: datetime,
+        claimed_at: datetime,
+        claim_token: str,
+    ) -> RoutineOccurrence | None: ...
+
+    async def finalize_routine_occurrence(
+        self,
+        agent_id: str,
+        occurrence_id: str,
+        *,
+        delivery_id: str,
+        finalized_at: datetime,
+        skipped_no_change_observation: ResourceRevisionObservation | None = ...,
+        failure_code: str | None = ...,
+        artifact_references: tuple[OutcomeArtifactReference, ...] = ...,
+        outcome_contract_failure_code: str | None = ...,
+    ) -> tuple[RoutineOccurrence, Delivery | None] | None: ...
+
+    async def list_scheduled_routines(
+        self, agent_id: str, *, states: frozenset[RoutineState] = ..., limit: int = ...
+    ) -> tuple[ScheduledRoutine, ...]: ...
+
+    async def load_routine_occurrence(
+        self, agent_id: str, occurrence_id: str
+    ) -> RoutineOccurrence | None: ...
+
+    async def load_scheduled_routine(
+        self, agent_id: str, routine_id: str
+    ) -> ScheduledRoutine | None: ...
+
+    async def mark_routine_occurrence_run_terminal(
+        self, agent_id: str, occurrence_id: str, *, run_id: str, terminal_at: datetime
+    ) -> RoutineOccurrence | None: ...
+
+    async def next_routine_deadline(self, agent_id: str) -> datetime | None: ...
+
+    async def recover_stale_routine_occurrences(
+        self,
+        agent_id: str,
+        *,
+        recovered_at: datetime,
+        claim_token_factory: Callable[[str], str],
+    ) -> tuple[RoutineOccurrence, ...]: ...
+
+    async def result(self, run_id: str) -> LoopExit | None: ...
 
 
 class RoutineOwner:

@@ -42,6 +42,7 @@ from daita.routines.models import (
 )
 from daita.routines.owner import RoutineOwner
 from daita.routines.supervisor import RoutineSupervisor
+from daita.storage.errors import StorageUnavailableError
 from daita.storage.sqlite import SQLiteStateStore
 from tests.routines._supervisor_support import _ids
 from tests.support.capability_runtime import frozen_execution_bindings
@@ -219,7 +220,10 @@ async def _wait_for_occurrence_id(store: SQLiteStateStore, routine_id: str) -> s
     raise AssertionError("routine occurrence was not claimed")
 
 
-async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
+@pytest.mark.parametrize("worker_read_failures", (0, 3))
+async def test_supervisor_runs_one_due_slot_and_delivers_once(
+    tmp_path, monkeypatch, worker_read_failures
+) -> None:
     store = await SQLiteStateStore.open(tmp_path / "state.db")
     await _seed_conversation(store)
     routine = await store.admit_scheduled_routine(_routine())
@@ -230,6 +234,18 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
         registry=store,
     )
     executed = 0
+    worker_reads: list[float] = []
+    original_load = store.load_scheduled_routine
+
+    async def load_with_transient_failure(*args, **kwargs):
+        task = asyncio.current_task()
+        if task is not None and task.get_name().startswith("daita-routine:"):
+            worker_reads.append(asyncio.get_running_loop().time())
+            if len(worker_reads) <= worker_read_failures:
+                raise StorageUnavailableError("injected read failure")
+        return await original_load(*args, **kwargs)
+
+    monkeypatch.setattr(store, "load_scheduled_routine", load_with_transient_failure)
 
     async def execute(
         occurrence: RoutineOccurrence,
@@ -290,6 +306,14 @@ async def test_supervisor_runs_one_due_slot_and_delivers_once(tmp_path) -> None:
         await asyncio.sleep(0.05)
         assert terminal.disposition is RoutineOccurrenceDisposition.COMPLETED
         assert executed == 1
+        if worker_read_failures:
+            assert len(worker_reads) == 4
+            assert all(
+                worker_reads[index + 1] - worker_reads[index] >= delay
+                for index, delay in enumerate((0.09, 0.19, 0.39))
+            )
+        assert supervisor.status.state == "running"
+        assert supervisor.status.failure_code is None
         assert (
             len(await store.list_routine_occurrences("agent-1", routine.routine_id))
             == 1

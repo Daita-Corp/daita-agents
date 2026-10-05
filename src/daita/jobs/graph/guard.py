@@ -12,20 +12,31 @@ from ...capabilities import CapabilityInputError, GraphTaskBinding
 from .models import (
     ACTIVE_ATTEMPT_STATES,
     GraphDesiredState,
-    GraphInspection,
+    GraphJob,
     GraphState,
+    GraphTask,
+    TaskAttempt,
     TaskState,
 )
 
 
+@dataclass(frozen=True, slots=True)
+class GraphAttemptAuthority:
+    """One consistent authority snapshot, without graph history or payloads."""
+
+    job: GraphJob
+    task: GraphTask | None
+    attempt: TaskAttempt | None
+
+
 class GraphAttemptStateReader(Protocol):
-    async def inspect_graph(
-        self, agent_id: str, job_id: str
-    ) -> GraphInspection | None: ...
+    async def read_graph_attempt_authority(
+        self, agent_id: str, job_id: str, task_id: str, attempt_id: str
+    ) -> GraphAttemptAuthority | None: ...
 
 
 @dataclass(frozen=True, slots=True)
-class SQLiteTaskAttemptGuard:
+class TaskAttemptStateGuard:
     """Read current durable authority before each meaningful attempt operation."""
 
     store: GraphAttemptStateReader
@@ -50,8 +61,11 @@ class SQLiteTaskAttemptGuard:
             raise ValueError("attempt guard capability_id must be non-empty")
         if not isinstance(point, str) or not point:
             raise ValueError("attempt guard point must be non-empty")
-        inspection = await self.store.inspect_graph(
-            self.binding.agent_id, self.binding.job_id
+        inspection = await self.store.read_graph_attempt_authority(
+            self.binding.agent_id,
+            self.binding.job_id,
+            self.binding.task_id,
+            self.binding.attempt_id,
         )
         now = self.clock()
         if inspection is None:
@@ -65,19 +79,7 @@ class SQLiteTaskAttemptGuard:
             or job.deadline_at <= now
         ):
             self._stale(point, "job_inactive")
-        task = next(
-            (item for item in inspection.tasks if item.task_id == self.binding.task_id),
-            None,
-        )
-        attempt = next(
-            (
-                item
-                for item in inspection.attempts
-                if item.task_id == self.binding.task_id
-                and item.attempt_id == self.binding.attempt_id
-            ),
-            None,
-        )
+        task, attempt = inspection.task, inspection.attempt
         if task is None or attempt is None:
             self._stale(point, "attempt_missing")
         assert task is not None and attempt is not None
@@ -114,4 +116,6 @@ class SQLiteTaskAttemptGuard:
         )
 
 
-__all__ = ["SQLiteTaskAttemptGuard"]
+SQLiteTaskAttemptGuard = TaskAttemptStateGuard
+
+__all__ = ["TaskAttemptStateGuard", "SQLiteTaskAttemptGuard"]

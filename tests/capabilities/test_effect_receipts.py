@@ -176,6 +176,9 @@ async def test_started_recovery_blocks_after_restart_and_history_clear_then_pres
     await store.close()
     reopened = await SQLiteStateStore.open(path, clock=lambda: COMPLETED_AT)
     try:
+        await reopened.recover_started_effect_receipts(
+            started.agent_id, recovered_at=COMPLETED_AT
+        )
         recovered = await reopened.load_effect_receipt(
             started.agent_id, started.receipt_id
         )

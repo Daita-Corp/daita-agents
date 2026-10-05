@@ -8,8 +8,13 @@ from datetime import datetime
 from typing import Protocol, cast
 
 from ..capabilities import ExecutionContractBindings
+from ..distribution.models import GraphJobDelivery
 from ..errors import DaitaError, ErrorRetryability
+from ..loop.models import Transcript
+from ..loop.transcripts import TranscriptWriteStore
+from .graph.guard import GraphAttemptStateReader
 from .graph.models import (
+    AttemptState,
     BudgetAmount,
     ControlKind,
     ControlState,
@@ -200,6 +205,132 @@ class GraphBlockerProjection:
     job_id: str
     graph_state: GraphState
     blockers: tuple[Mapping[str, object], ...]
+
+
+class GraphSupervisorStore(TranscriptWriteStore, GraphAttemptStateReader, Protocol):
+    """Durable operations required by the jobs supervisor."""
+
+    async def checkpoint_graph_attempt(
+        self, checkpoint: TaskCheckpoint, *, claim_token: str
+    ) -> TaskCheckpoint: ...
+
+    async def claim_graph_task(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        *,
+        attempt_id: str,
+        claim_token: str,
+        run_id: str,
+        executor_id: str,
+        claimed_at: datetime,
+        lease_seconds: int,
+        absolute_deadline_at: datetime,
+        budget_reservations: tuple[BudgetAmount, ...],
+    ) -> TaskAttempt | None: ...
+
+    async def complete_graph_attempt(
+        self,
+        result: TaskResult,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        usage: tuple[BudgetAmount, ...] | None,
+    ) -> TaskResult: ...
+
+    async def expire_due_graphs(
+        self, agent_id: str, *, expired_at: datetime, limit: int = ...
+    ) -> tuple[GraphJob, ...]: ...
+
+    async def fail_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        failed_at: datetime,
+        retryable: bool,
+        reason_code: str,
+        attempt_state: AttemptState = ...,
+    ) -> TaskAttempt | None: ...
+
+    async def fence_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        fencing_epoch: int,
+        fenced_at: datetime,
+        requeue: bool,
+        reason_code: str,
+    ) -> TaskAttempt | None: ...
+
+    async def finalize_graph_attempt(
+        self,
+        result: TaskResult,
+        delivery: GraphJobDelivery,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        usage: tuple[BudgetAmount, ...] | None,
+    ) -> TaskResult: ...
+
+    async def heartbeat_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        heartbeat_at: datetime,
+        lease_seconds: int = ...,
+    ) -> TaskAttempt | None: ...
+
+    async def inspect_graph(
+        self, agent_id: str, job_id: str
+    ) -> GraphInspection | None: ...
+
+    async def list_active_graph_attempts(
+        self, agent_id: str, *, limit: int = ...
+    ) -> tuple[TaskAttempt, ...]: ...
+
+    async def list_graph_deliveries(
+        self, agent_id: str, *, job_id: str | None = ..., limit: int = ...
+    ) -> tuple[GraphJobDelivery, ...]: ...
+
+    async def list_ready_graph_tasks(
+        self, agent_id: str, *, now: datetime, limit: int = ...
+    ) -> tuple[GraphTask, ...]: ...
+
+    async def list_stale_graph_attempts(
+        self, agent_id: str, *, now: datetime, limit: int = ...
+    ) -> tuple[TaskAttempt, ...]: ...
+
+    async def load(self, run_id: str) -> Transcript: ...
+
+    async def reconcile_graph_effect_attempt(
+        self, agent_id: str, job_id: str, task_id: str, attempt_id: str
+    ) -> bool: ...
+
+    async def start_graph_attempt(
+        self,
+        agent_id: str,
+        job_id: str,
+        task_id: str,
+        attempt_id: str,
+        *,
+        claim_token: str,
+        fencing_epoch: int,
+        started_at: datetime,
+    ) -> TaskAttempt | None: ...
 
 
 class JobOwner:

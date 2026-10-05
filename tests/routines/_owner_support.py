@@ -51,6 +51,7 @@ from daita.skills.capabilities import (
     SKILL_DOMAIN_OWNER_ID,
     skill_declarations,
 )
+from tests.routines._storage_support import occurrence_record
 from tests.support.distribution import (
     no_artifact_outcome_contract,
 )
@@ -292,7 +293,7 @@ class _Store:
         authorized_control_call_id: str,
         claimed_at: datetime,
         claim_token: str,
-    ) -> object | None:
+    ) -> RoutineOccurrence | None:
         del authorized_control_call_id, claimed_at, claim_token
         current = await self.load_scheduled_routine(agent_id, routine_id)
         if current is None or current.revision != expected_revision:
@@ -300,7 +301,7 @@ class _Store:
         self.routines[routine_id] = replace(
             current, active_occurrence_id="occurrence-manual"
         )
-        return object()
+        return occurrence_record(routine=current)
 
     async def conversation_exists(self, agent_id: str, conversation_id: str) -> bool:
         return agent_id == "agent-1" and conversation_id == "conversation-1"

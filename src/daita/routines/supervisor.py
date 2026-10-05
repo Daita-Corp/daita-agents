@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime
@@ -21,7 +22,12 @@ from ..loop.models import (
     RunOrigin,
     RunStartEnvelope,
 )
-from ..storage.protocols import StateStore
+from ..observation import SupervisorStatus
+from ..storage.errors import (
+    StorageError,
+    StorageUnavailableError,
+)
+from ..storage.sqlite_records import EffectUnresolvedError
 from .models import (
     ResourceRevisionObservation,
     RoutineOccurrence,
@@ -29,7 +35,9 @@ from .models import (
     RoutineState,
     ScheduledRoutine,
 )
-from .owner import RoutineOwner
+from .owner import RoutineOwner, RoutineSupervisorStore
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_POLL_SECONDS = 1.0
 _RUN_ID = re.compile(r"run-[0-9a-f]{32}\Z")
@@ -47,7 +55,7 @@ class RoutineSupervisor:
         self,
         *,
         agent_id: str,
-        store: StateStore,
+        store: RoutineSupervisorStore,
         owner: RoutineOwner,
         runtime: CapabilityRuntime,
         distribution: DistributionOwner,
@@ -77,6 +85,45 @@ class RoutineSupervisor:
         self._driver: asyncio.Task[None] | None = None
         self._worker: asyncio.Task[None] | None = None
         self._closing = False
+        self._failed = False
+        self._failure_code: str | None = None
+        self._consecutive_failures = 0
+        self._retry_at = 0.0
+
+    @property
+    def status(self) -> SupervisorStatus:
+        return SupervisorStatus(
+            name="routines",
+            state=(
+                "failed"
+                if self._failed
+                else (
+                    "stopped"
+                    if self._driver is None or self._driver.done()
+                    else "retrying" if self._consecutive_failures else "running"
+                )
+            ),
+            consecutive_failures=self._consecutive_failures,
+            failure_code=self._failure_code,
+        )
+
+    def _record_failure(self, error: BaseException) -> None:
+        if self._failed:
+            return
+        self._consecutive_failures += 1
+        self._failure_code = (
+            error.code if isinstance(error, StorageError) else "supervisor_failed"
+        )
+        if not isinstance(error, StorageUnavailableError):
+            self._failed = True
+            _logger.error("routines supervisor stopped (%s)", self._failure_code)
+            if self._driver is not None and self._driver is not asyncio.current_task():
+                self._driver.cancel("supervisor_failed")
+        if isinstance(error, StorageUnavailableError):
+            self._retry_at = asyncio.get_running_loop().time() + min(
+                5.0, 0.1 * 2 ** min(self._consecutive_failures - 1, 6)
+            )
+        self._wake.set()
 
     async def start(self) -> None:
         if self._driver is not None:
@@ -112,30 +159,50 @@ class RoutineSupervisor:
 
     async def _drive(self) -> None:
         try:
-            while not self._closing:
+            while not self._closing and not self._failed:
+                while (
+                    remaining := self._retry_at - asyncio.get_running_loop().time()
+                ) > 0:
+                    await asyncio.sleep(remaining)
+                failures_before_poll = self._consecutive_failures
                 self._wake.clear()
-                if self._execute_run is not None and (
-                    self._worker is None or self._worker.done()
-                ):
-                    await self._recover()
-                    if self._worker is None or self._worker.done():
-                        await self._claim_one_due()
-                timeout = self._poll_seconds
                 try:
+                    if self._execute_run is not None and (
+                        self._worker is None or self._worker.done()
+                    ):
+                        await self._recover()
+                        if self._worker is None or self._worker.done():
+                            await self._claim_one_due()
+                    timeout = self._poll_seconds
                     deadline = await self._store.next_routine_deadline(self._agent_id)
                     if deadline is not None:
                         timeout = min(
                             timeout,
                             max(0.05, (deadline - self._clock()).total_seconds()),
                         )
-                except Exception:
-                    pass
+                except StorageUnavailableError as error:
+                    self._record_failure(error)
+                    continue
+                except Exception as error:
+                    self._record_failure(error)
+                    break
+                if (
+                    not self._failed
+                    and self._consecutive_failures == failures_before_poll
+                    and (self._worker is None or self._worker.done())
+                ):
+                    self._consecutive_failures = 0
+                    self._failure_code = None
                 try:
                     await asyncio.wait_for(self._wake.wait(), timeout=timeout)
                 except TimeoutError:
                     pass
         except asyncio.CancelledError:
             return
+        finally:
+            if self._failed and self._worker is not None:
+                self._worker.cancel("supervisor_failed")
+                await asyncio.gather(self._worker, return_exceptions=True)
 
     async def _claim_one_due(self) -> None:
         now = self._clock()
@@ -185,7 +252,7 @@ class RoutineSupervisor:
                     claimed_at=now,
                     claim_token=self._id_factory("routine-claim"),
                 )
-            except Exception:
+            except (ValueError, EffectUnresolvedError):
                 continue
             if occurrence is None:
                 continue
@@ -193,6 +260,8 @@ class RoutineSupervisor:
             return
 
     def _launch(self, occurrence: RoutineOccurrence) -> None:
+        if self._failed or self._retry_at > asyncio.get_running_loop().time():
+            return
         task = asyncio.create_task(
             self._run_claimed(occurrence),
             name=f"daita-routine:{occurrence.occurrence_id}",
@@ -203,7 +272,12 @@ class RoutineSupervisor:
             if self._worker is completed:
                 self._worker = None
             if not completed.cancelled():
-                completed.exception()
+                error = completed.exception()
+                if error is not None:
+                    self._record_failure(error)
+                elif not self._failed:
+                    self._consecutive_failures = 0
+                    self._failure_code = None
             self._wake.set()
 
         task.add_done_callback(done)
@@ -276,6 +350,8 @@ class RoutineSupervisor:
                 outcome_contract_failure_code=outcome_contract_failure_code,
             )
         except asyncio.CancelledError:
+            raise
+        except StorageError:
             raise
         except Exception as error:
             await self._fail_unbound(occurrence, error)
@@ -388,7 +464,7 @@ class RoutineSupervisor:
                 elif self._execute_run is not None:
                     self._launch(occurrence)
                     break
-            except Exception:
+            except (ArtifactError, ValueError):
                 continue
 
     async def _recovered_artifact_references(

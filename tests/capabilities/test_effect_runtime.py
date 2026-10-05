@@ -216,6 +216,9 @@ async def test_terminal_persistence_failure_keeps_started_receipt_and_blocks_dis
         tmp_path / "state.db", clock=lambda: STARTED_AT
     )
     try:
+        await reopened.recover_started_effect_receipts(
+            run.agent_id, recovered_at=STARTED_AT
+        )
         receipt = await reopened.load_effect_receipt_for_call(
             run.agent_id, run.id, "first"
         )

@@ -28,7 +28,7 @@ unit/integration directory hierarchy.
 
 `tests/storage/contracts` is the portable durable-backend suite. It currently
 runs SQLite; see [storage contract](STORAGE_CONTRACT.md) for coverage and the
-remaining hosted-backend qualification gates.
+remaining additional-backend qualification gates.
 
 Use explicit imports such as `from tests.support.paths import REPO_ROOT`. Test
 and support modules must not import a `test_*.py` module or `conftest.py`.
