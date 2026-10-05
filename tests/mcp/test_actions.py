@@ -43,6 +43,7 @@ from daita.llm.models import (
 from daita.loop.models import LoopLimits
 from daita.routines.models import RoutineState
 from daita.routines.owner import RoutineError
+from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_records import EffectResolutionDecision
 from tests.support.workspace import workspace_for
 
@@ -171,6 +172,7 @@ async def test_exact_mcp_action_runs_once_as_a_grant_backed_graph_task(
         assert result.provenance["summary_authority"] == ("code_owned_effect_evidence")
         assert result.residual_risk is not None
         assert len(action.server.calls) == 1
+        assert isinstance(action.agent._embedded._store, SQLiteStateStore)
         with sqlite3.connect(action.agent._embedded._store.path) as connection:
             linkage = connection.execute(
                 "SELECT job_id, task_id, task_attempt_id FROM effect_receipts WHERE id = ?",

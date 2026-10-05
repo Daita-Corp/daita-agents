@@ -1056,6 +1056,17 @@ def test_semantics_use_existing_storage_context_and_runtime_owners():
         assert forbidden not in _python_text(PACKAGE)
 
 
+def test_durable_state_contract_covers_sqlite_operations_without_local_admission():
+    operations = _class_methods(PACKAGE / "storage/sqlite.py", "SQLiteStateStore")
+    operations = {name for name in operations if not name.startswith("_")} - {"open"}
+    assert _class_methods(PACKAGE / "storage/protocols.py", "StateStore") == operations
+    # Domain consumers must not regain a concrete SQLite dependency. Local
+    # construction and revision admission remain in the embedded composition root.
+    for path in ("jobs/supervisor.py", "routines/supervisor.py"):
+        assert "storage.sqlite" not in _imports(PACKAGE / path)
+    assert "sqlite" not in _imports(PACKAGE / "storage/protocols.py")
+
+
 def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")

@@ -168,6 +168,7 @@ async def test_catalog_preview_contains_only_active_current_snapshot_truth(
         )
 
         await agent.detach(first.id)
+        assert isinstance(agent._embedded._store, SQLiteStateStore)
         assert all(
             key[:2] != (agent.id, first.id)
             for key in agent._embedded._store._decoded_catalog_snapshots
@@ -1197,6 +1198,7 @@ async def test_failed_snapshot_commit_does_not_publish_candidate_cache(
     try:
         source = await agent.attach(SQLiteSource(database))
         store = agent._embedded._store
+        assert isinstance(store, SQLiteStateStore)
         cache_before = dict(store._decoded_catalog_snapshots)
         with sqlite3.connect(database) as connection:
             connection.execute("CREATE TABLE uncommitted (id INTEGER PRIMARY KEY)")
@@ -1306,6 +1308,7 @@ async def test_refresh_cancellation_before_transaction_keeps_old_snapshot(
     )
     source = await agent.attach(SQLiteSource(database))
     old_resources = await agent.list_catalog_resources(source_id=source.id)
+    assert isinstance(agent._embedded._store, SQLiteStateStore)
     cache_before = dict(agent._embedded._store._decoded_catalog_snapshots)
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE later (id INTEGER PRIMARY KEY)")

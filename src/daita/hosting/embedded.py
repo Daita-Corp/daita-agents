@@ -296,6 +296,7 @@ from ..skills.capabilities import (
     skill_declarations,
 )
 from ..skills.store import validate_skill_documents
+from ..storage.protocols import StateStore
 from ..storage.sqlite import (
     SQLiteStateStore,
     load_current_artifact_inventory,
@@ -528,7 +529,7 @@ def _encode_model_route_contract(route: ModelRoute) -> dict[str, object]:
 
 
 async def _current_execution_contracts(
-    store: SQLiteStateStore,
+    store: StateStore,
     registry: CapabilityRegistry,
     model_contracts: Mapping[str, str],
     *,
@@ -763,10 +764,10 @@ class EmbeddedAgent:
         workspace: LocalWorkspace | None,
         workspace_backend: LocalWorkspaceBackend | None,
         writer_lock: _WriterLock,
-        store: SQLiteStateStore,
+        store: StateStore,
         distribution_owner: DistributionOwner,
         loop: AgentLoop | None,
-        transcripts: SQLiteStateStore,
+        transcripts: StateStore,
         capabilities: CapabilityRegistry,
         catalog_service: CatalogService,
         data_view: CatalogDataView,
@@ -981,7 +982,7 @@ class EmbeddedAgent:
         (home, writer_lock), _cancelled = await _await_sync_completion(
             lambda: _admit_agent_home(name, root, False)
         )
-        store: SQLiteStateStore | None = None
+        store: StateStore | None = None
         try:
             manifest, _cancelled = await _await_sync_completion(
                 lambda: _read_manifest(home, name)
@@ -1085,7 +1086,7 @@ class EmbeddedAgent:
         if cancelled:
             writer_lock.release()
             raise asyncio.CancelledError
-        store: SQLiteStateStore | None = None
+        store: StateStore | None = None
         workspace_backend: LocalWorkspaceBackend | None = None
         published = False
         try:
@@ -1247,7 +1248,7 @@ class EmbeddedAgent:
         if cancelled:
             writer_lock.release()
             raise asyncio.CancelledError
-        store: SQLiteStateStore | None = None
+        store: StateStore | None = None
         workspace_backend: LocalWorkspaceBackend | None = None
         try:
             manifest, cancelled = await _await_sync_completion(
@@ -1380,7 +1381,7 @@ class EmbeddedAgent:
         workspace_backend: LocalWorkspaceBackend | None,
         hosted: bool,
         writer_lock: _WriterLock,
-        store: SQLiteStateStore,
+        store: StateStore,
         model: ModelProvider | None,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,

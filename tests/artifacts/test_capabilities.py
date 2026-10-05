@@ -49,6 +49,7 @@ from daita.llm.models import (
 )
 from daita.loop.models import RunInput, Transcript
 from daita.loop.session import RunSessionOptions
+from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_codecs import decode_message, encode_message
 from tests.support.capability_runtime import (
     ContextToolProjectionAdapter,
@@ -443,6 +444,7 @@ async def test_result_snapshot_rejects_tampered_execution_lineage(
         id_factory=_ids(),
         workspace=workspace_for(tmp_path),
     )
+    assert isinstance(agent._embedded._store, SQLiteStateStore)
     provider.state_path = agent._embedded._store.path
     try:
         result = await agent.run("Create a document and snapshot its exact result.")
@@ -481,6 +483,7 @@ async def test_result_snapshot_rejects_schema_valid_result_data_tampering(
         id_factory=_ids(),
         workspace=workspace_for(tmp_path),
     )
+    assert isinstance(agent._embedded._store, SQLiteStateStore)
     provider.state_path = agent._embedded._store.path
     try:
         result = await agent.run("Create a document and snapshot its exact result.")

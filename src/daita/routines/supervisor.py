@@ -21,7 +21,7 @@ from ..loop.models import (
     RunOrigin,
     RunStartEnvelope,
 )
-from ..storage.sqlite import SQLiteStateStore
+from ..storage.protocols import StateStore
 from .models import (
     ResourceRevisionObservation,
     RoutineOccurrence,
@@ -47,7 +47,7 @@ class RoutineSupervisor:
         self,
         *,
         agent_id: str,
-        store: SQLiteStateStore,
+        store: StateStore,
         owner: RoutineOwner,
         runtime: CapabilityRuntime,
         distribution: DistributionOwner,

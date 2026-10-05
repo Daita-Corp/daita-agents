@@ -416,6 +416,7 @@ async def test_reopened_foreground_context_reports_bounded_durable_effect_block(
                 ),
                 finished_at=COMPLETED_AT,
             )
+            assert isinstance(store, SQLiteStateStore)
             with sqlite3.connect(store.path) as connection:
                 connection.execute(
                     "INSERT INTO effect_receipts(agent_id,id,run_id,call_id,operation_key,routine_id,occurrence_id,grant_digest,unresolved,data) VALUES (?,?,?,?,?,NULL,NULL,NULL,1,?)",

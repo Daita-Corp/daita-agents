@@ -68,6 +68,10 @@ from ..jobs.graph.validation import (
     validate_graph_admission,
     validate_mutation,
 )
+from .errors import (
+    GraphBudgetError as GraphBudgetError,
+    GraphStoreConflictError as GraphStoreConflictError,
+)
 from .sqlite_codecs.distribution import decode_delivery, encode_delivery
 from .sqlite_codecs.graph import (
     decode_graph_event,
@@ -96,14 +100,6 @@ from .sqlite_codecs.graph import (
     encode_task_result,
 )
 from .sqlite_codecs.receipts import decode_receipt
-
-
-class GraphStoreConflictError(RuntimeError):
-    """A graph CAS or idempotency precondition did not match."""
-
-
-class GraphBudgetError(ValueError):
-    """A graph budget reservation or settlement would violate conservation."""
 
 
 def datetime_to_us(value: datetime | None) -> int | None:

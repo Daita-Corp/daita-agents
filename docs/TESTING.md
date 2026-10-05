@@ -26,6 +26,10 @@ unit/integration directory hierarchy.
   from default discovery.
 - `tests/diagnostics` and `tests/packaging` contain explicit module entry points.
 
+`tests/storage/contracts` is the portable durable-backend suite. It currently
+runs SQLite; see [storage contract](STORAGE_CONTRACT.md) for coverage and the
+remaining hosted-backend qualification gates.
+
 Use explicit imports such as `from tests.support.paths import REPO_ROOT`. Test
 and support modules must not import a `test_*.py` module or `conftest.py`.
 Fixtures belong in the narrowest applicable `conftest.py`; ordinary reusable

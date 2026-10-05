@@ -40,7 +40,7 @@ from ..loop.models import (
 )
 from ..loop.session import RunCancellationToken, RunSession, RunSessionOptions
 from ..loop.transcripts import RunSessionWriter
-from ..storage.sqlite import SQLiteStateStore
+from ..storage.protocols import StateStore
 from .graph.execution import (
     GRAPH_RESULT_FINALIZER_KIND,
     PROFILE_WORK_KIND,
@@ -88,7 +88,7 @@ class JobSupervisor:
         self,
         *,
         agent_id: str,
-        store: SQLiteStateStore,
+        store: StateStore,
         owner: JobOwner,
         runtime: CapabilityRuntime,
         artifacts: AgentHomeArtifactStore,
@@ -1229,7 +1229,7 @@ class JobSupervisor:
 
 
 def _graph_attempt_guard(
-    store: SQLiteStateStore,
+    store: StateStore,
     inspection: GraphInspection,
     task: GraphTask,
     attempt: TaskAttempt,
