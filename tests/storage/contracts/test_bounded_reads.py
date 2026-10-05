@@ -43,7 +43,7 @@ async def test_conversation_pages_preserve_exact_turns_and_caller_scope(
     while page := await state_store.conversation_run_page(
         "agent-1", "conversation-1", after_turn_index=cursor, limit=2
     ):
-        assert len(page) <= 2
+        assert 1 <= len(page) <= 2
         collected.extend(page)
         cursor = page[-1].turn_index
     assert tuple(collected) == await state_store.conversation_runs(

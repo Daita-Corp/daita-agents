@@ -1064,6 +1064,7 @@ def test_durable_state_contract_composes_domain_owned_interfaces():
     from daita.routines.owner import RoutineStore, RoutineSupervisorStore
     from daita.storage.protocols import StateStore
 
+    state_store_mro = inspect.getmro(StateStore)
     for contract in (
         ArtifactRegistry,
         CatalogStore,
@@ -1073,7 +1074,7 @@ def test_durable_state_contract_composes_domain_owned_interfaces():
         RoutineStore,
         RoutineSupervisorStore,
     ):
-        assert contract in StateStore.__mro__
+        assert contract in state_store_mro
     inherited = set().union(
         *(
             {
@@ -1081,7 +1082,7 @@ def test_durable_state_contract_composes_domain_owned_interfaces():
                 for name, member in vars(base).items()
                 if callable(member) and not name.startswith("_")
             }
-            for base in StateStore.__mro__[1:]
+            for base in state_store_mro[1:]
         )
     )
     declared = _class_methods(PACKAGE / "storage/protocols.py", "StateStore")

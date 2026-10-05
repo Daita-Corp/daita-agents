@@ -401,7 +401,9 @@ async def test_data_query_routes_each_catalog_binding_to_exactly_one_backend() -
 
 
 async def test_data_query_inline_byte_limit_reports_truncation() -> None:
-    rows = tuple({"id": index, "detail": "x" * 1_000} for index in range(100))
+    rows: tuple[dict[str, object], ...] = tuple(
+        {"id": index, "detail": "x" * 1_000} for index in range(100)
+    )
     sqlite = _ReadBackend("sqlite", rows)
     executor = DataQueryExecutor("agent-relational", sqlite, _ReadBackend("postgresql"))
 
