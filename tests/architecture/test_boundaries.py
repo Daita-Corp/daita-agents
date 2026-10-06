@@ -1095,16 +1095,13 @@ def test_durable_state_contract_composes_domain_owned_interfaces():
 
 
 def test_state_backends_share_domain_operations_without_driver_dependencies():
-    from daita.storage.postgres import PostgresStateStore
     from daita.storage.sql import SQLStateStore
     from daita.storage.sqlite import SQLiteStateStore
 
-    for backend in (SQLiteStateStore, PostgresStateStore):
-        assert issubclass(backend, SQLStateStore)
-        for name in _class_methods(PACKAGE / "storage/sql.py", "SQLStateStore"):
-            if not name.startswith("_") and name != "close":
-                assert getattr(backend, name) is getattr(SQLStateStore, name)
-    assert not issubclass(PostgresStateStore, SQLiteStateStore)
+    assert issubclass(SQLiteStateStore, SQLStateStore)
+    for name in _class_methods(PACKAGE / "storage/sql.py", "SQLStateStore"):
+        if not name.startswith("_") and name != "close":
+            assert getattr(SQLiteStateStore, name) is getattr(SQLStateStore, name)
     for module in ("storage/sql.py", "storage/sql_graph.py"):
         assert not _imports(PACKAGE / module) & {
             "sqlite",

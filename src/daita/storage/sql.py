@@ -580,7 +580,12 @@ class _CatalogCommitGate:
 
 
 class SQLStateStore:
-    """Shared domain operations; backend admission supplies the transaction boundary."""
+    """Shared domain operations over an explicitly supplied ``SQLDatabase``.
+
+    The caller admits and owns the database. This class does not provision it,
+    acquire execution ownership or close borrowed database resources. Its close
+    method clears local caches after the caller has drained active operations.
+    """
 
     def __init__(
         self, database: SQLDatabase, *, clock: Callable[[], datetime] | None = None
@@ -607,7 +612,7 @@ class SQLStateStore:
         if not isinstance(agent_id, str) or not agent_id:
             raise ValueError("agent_id must be a non-empty string")
         recovered_at = _effect_receipt_aware(recovered_at, "receipt recovery time")
-        await _run_cancellation_safe_transaction(
+        await run_sql_transaction(
             self._database,
             lambda connection: _recover_started_effect_receipts(
                 connection, agent_id, recovered_at
@@ -617,7 +622,7 @@ class SQLStateStore:
     async def admit_graph(self, admission: GraphAdmission) -> GraphJob:
         if not isinstance(admission, GraphAdmission):
             raise TypeError("graph admission must be GraphAdmission")
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.admit_graph(connection, admission),
         )
@@ -637,7 +642,7 @@ class SQLStateStore:
     ) -> GraphJob:
         if not isinstance(admission, GraphAdmission):
             raise TypeError("replacement graph admission must be GraphAdmission")
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.admit_replacement_graph(
                 connection,
@@ -691,7 +696,7 @@ class SQLStateStore:
     ) -> GraphMutation:
         if not isinstance(request, GraphMutationRequest):
             raise TypeError("graph mutation must be GraphMutationRequest")
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.apply_mutation(connection, request),
         )
@@ -704,7 +709,7 @@ class SQLStateStore:
         requested_at: datetime,
         requested_by_id: str,
     ) -> GraphJob | None:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.request_cancel(
                 connection,
@@ -736,7 +741,7 @@ class SQLStateStore:
         expired_at: datetime,
         limit: int = 64,
     ) -> tuple[GraphJob, ...]:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.expire_due_graphs(
                 connection,
@@ -788,7 +793,7 @@ class SQLStateStore:
         absolute_deadline_at: datetime,
         budget_reservations: tuple[BudgetAmount, ...],
     ) -> TaskAttempt | None:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.claim_task(
                 connection,
@@ -817,7 +822,7 @@ class SQLStateStore:
         fencing_epoch: int,
         started_at: datetime,
     ) -> TaskAttempt | None:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.start_attempt(
                 connection,
@@ -843,7 +848,7 @@ class SQLStateStore:
         heartbeat_at: datetime,
         lease_seconds: int = 30,
     ) -> TaskAttempt | None:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.heartbeat_attempt(
                 connection,
@@ -861,7 +866,7 @@ class SQLStateStore:
     async def checkpoint_graph_attempt(
         self, checkpoint: TaskCheckpoint, *, claim_token: str
     ) -> TaskCheckpoint:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.checkpoint_attempt(
                 connection, checkpoint, claim_token=claim_token
@@ -876,7 +881,7 @@ class SQLStateStore:
         claim_token: str | None = None,
         fencing_epoch: int | None = None,
     ) -> TaskComment:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.add_comment(
                 connection,
@@ -895,7 +900,7 @@ class SQLStateStore:
         fencing_epoch: int,
         usage: tuple[BudgetAmount, ...] | None,
     ) -> TaskResult:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.complete_attempt(
                 connection,
@@ -915,7 +920,7 @@ class SQLStateStore:
         fencing_epoch: int,
         usage: tuple[BudgetAmount, ...] | None,
     ) -> TaskResult:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.complete_attempt(
                 connection,
@@ -956,7 +961,7 @@ class SQLStateStore:
         requeue: bool,
         reason_code: str,
     ) -> TaskAttempt | None:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.fence_attempt(
                 connection,
@@ -985,7 +990,7 @@ class SQLStateStore:
         reason_code: str,
         attempt_state: AttemptState = AttemptState.FAILED,
     ) -> TaskAttempt | None:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.fail_attempt(
                 connection,
@@ -1011,7 +1016,7 @@ class SQLStateStore:
         replan_task: GraphTask | None = None,
         reviewer_task: GraphTask | None = None,
     ) -> TaskControl:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.open_control(
                 connection,
@@ -1039,7 +1044,7 @@ class SQLStateStore:
         expected_control_digest: str | None = None,
         expected_task_revision: int | None = None,
     ) -> TaskControl | None:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.resolve_control(
                 connection,
@@ -1077,7 +1082,7 @@ class SQLStateStore:
         claim_token: str | None = None,
         fencing_epoch: int | None = None,
     ) -> TaskResult:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.accept_review(
                 connection,
@@ -1116,7 +1121,7 @@ class SQLStateStore:
         claim_token: str | None = None,
         fencing_epoch: int | None = None,
     ) -> TaskControl:
-        return await _run_cancellation_safe_transaction(
+        return await run_sql_transaction(
             self._database,
             lambda connection: _graph_store.request_review_changes(
                 connection,
@@ -1199,7 +1204,7 @@ class SQLStateStore:
             )
             return identity
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def load_identity(self) -> AgentIdentity | None:
         def read() -> AgentIdentity | None:
@@ -1425,7 +1430,7 @@ class SQLStateStore:
                 raise RuntimeError("MCP binding changed during its transition")
             return binding
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def update_mcp_discovery(
         self,
@@ -1470,7 +1475,7 @@ class SQLStateStore:
             )
             return updated
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def update_source_discovery(
         self,
@@ -1506,7 +1511,7 @@ class SQLStateStore:
             )
             return updated
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def admit_scheduled_routine(
         self,
@@ -1622,7 +1627,7 @@ class SQLStateStore:
                 return claimed[0]
             return normalized
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def load_scheduled_routine(
         self,
@@ -1802,7 +1807,7 @@ class SQLStateStore:
             _replace_routine_row(connection, encoded, normalized)
             return normalized
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def transition_scheduled_routine(
         self,
@@ -1856,7 +1861,7 @@ class SQLStateStore:
             _replace_routine_row(connection, encoded, updated)
             return updated
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def next_routine_deadline(self, agent_id: str) -> datetime | None:
         def read() -> datetime | None:
@@ -1972,7 +1977,7 @@ class SQLStateStore:
             )
 
         del due_us
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def claim_manual_routine_occurrence(
         self,
@@ -2028,7 +2033,7 @@ class SQLStateStore:
                 claim_token=claim_token,
             )
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     def _claim_routine_slot_in_transaction(
         self,
@@ -2200,7 +2205,7 @@ class SQLStateStore:
             _replace_routine_occurrence_row(connection, encoded, updated)
             return updated
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def mark_routine_occurrence_run_terminal(
         self,
@@ -2249,7 +2254,7 @@ class SQLStateStore:
             _replace_routine_occurrence_row(connection, encoded, updated)
             return updated
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def finalize_routine_occurrence(
         self,
@@ -2807,7 +2812,7 @@ class SQLStateStore:
             _replace_routine_row(connection, routine_data, completed_routine)
             return completed_occurrence, delivery
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def recover_stale_routine_occurrences(
         self,
@@ -2932,7 +2937,7 @@ class SQLStateStore:
                 recovered.append(updated)
             return tuple(recovered)
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def load_delivery(
         self,
@@ -3018,7 +3023,7 @@ class SQLStateStore:
                 raise RuntimeError("delivery changed during acknowledgment")
             return updated
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def register_source(
         self, registration: SourceRegistration
@@ -3060,7 +3065,7 @@ class SQLStateStore:
                 )
             return stored
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def load_source(
         self, agent_id: str, source_id: str
@@ -3312,7 +3317,7 @@ class SQLStateStore:
                 )
             return registration
 
-        updated = await _run_cancellation_safe_transaction(self._database, write)
+        updated = await run_sql_transaction(self._database, write)
         return updated
 
     async def load_effect_receipt(
@@ -3709,7 +3714,7 @@ class SQLStateStore:
             )
             return receipt
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def finish_effect_receipt(self, receipt: EffectReceipt) -> EffectReceipt:
         if (
@@ -3763,7 +3768,7 @@ class SQLStateStore:
                     )
             return receipt
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def list_effect_receipts_for_graph_attempt(
         self,
@@ -3812,7 +3817,7 @@ class SQLStateStore:
             )
             return True
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def resolve_effect_receipt(
         self, agent_id: str, resolution: EffectResolution
@@ -3869,7 +3874,7 @@ class SQLStateStore:
                 )
             return resolved
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def detach_source(
         self, agent_id: str, source_id: str, detached_at: datetime
@@ -3899,7 +3904,7 @@ class SQLStateStore:
             )
             return detached
 
-        detached = await _run_cancellation_safe_transaction(self._database, write)
+        detached = await run_sql_transaction(self._database, write)
         async with self._decoded_catalog_snapshot_lock:
             self._evict_decoded_catalog_source(agent_id, source_id)
         return detached
@@ -3919,7 +3924,7 @@ class SQLStateStore:
             )
             return sync
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def commit_snapshot(
         self,
@@ -4034,7 +4039,7 @@ class SQLStateStore:
             )
             return snapshot
 
-        committed = await _run_cancellation_safe_transaction(
+        committed = await run_sql_transaction(
             self._database, write, commit=_commit_catalog_transaction
         )
         async with self._decoded_catalog_snapshot_lock:
@@ -4199,7 +4204,7 @@ class SQLStateStore:
             )
             return snapshot
 
-        committed = await _run_cancellation_safe_transaction(
+        committed = await run_sql_transaction(
             self._database, write, commit=_commit_catalog_transaction
         )
         async with self._decoded_catalog_snapshot_lock:
@@ -4525,7 +4530,7 @@ class SQLStateStore:
             )
             return changed
 
-        changed = await _run_cancellation_safe_transaction(self._database, write)
+        changed = await run_sql_transaction(self._database, write)
         return changed
 
     async def preflight_semantic_delete(
@@ -4572,7 +4577,7 @@ class SQLStateStore:
                 raise SemanticNotFoundError(annotation_id)
             return True
 
-        deleted = await _run_cancellation_safe_transaction(self._database, write)
+        deleted = await run_sql_transaction(self._database, write)
         return deleted
 
     async def recent_completed_runs(
@@ -4771,7 +4776,7 @@ class SQLStateStore:
             )
             return tuple(inserted)
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def edit_learning_candidate(
         self,
@@ -4841,7 +4846,7 @@ class SQLStateStore:
             )
             return candidate
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def reject_learning_candidate(
         self,
@@ -4881,7 +4886,7 @@ class SQLStateStore:
             )
             return rejected
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def accept_learning_candidate(
         self,
@@ -4917,7 +4922,7 @@ class SQLStateStore:
             )
             return accepted
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def clear_rejected_learning_candidates(self, agent_id: str) -> int:
         """Delete only explicit rejection tombstones and reset their review stamps."""
@@ -4942,7 +4947,7 @@ class SQLStateStore:
                 )
             return len(rejected_ids)
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     _UNSPECIFIED_PREDECESSOR = object()
 
@@ -5013,7 +5018,7 @@ class SQLStateStore:
                 raise ValueError(f"run already exists: {run.id}") from error
             return Transcript(run=run)
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def append(self, run_id: str, message: CanonicalMessage) -> None:
         def position() -> int:
@@ -5053,7 +5058,7 @@ class SQLStateStore:
                 (run_id, position, encode_message(message)),
             )
 
-        await _run_cancellation_safe_transaction(self._database, write)
+        await run_sql_transaction(self._database, write)
 
     async def finish(self, result: LoopExit) -> None:
         if result.kind is LoopExitKind.COMPLETED:
@@ -5072,7 +5077,7 @@ class SQLStateStore:
             if cursor.rowcount != 1:
                 raise KeyError(f"unknown run: {result.run_id}")
 
-        await _run_cancellation_safe_transaction(self._database, write)
+        await run_sql_transaction(self._database, write)
 
     async def complete(
         self,
@@ -5126,7 +5131,7 @@ class SQLStateStore:
             if cursor.rowcount != 1:
                 raise RuntimeError("run changed during atomic completion")
 
-        await _run_cancellation_safe_transaction(self._database, write)
+        await run_sql_transaction(self._database, write)
 
     async def recover_unfinished_runs(
         self,
@@ -5218,7 +5223,7 @@ class SQLStateStore:
                 recovered.append(result)
             return tuple(recovered)
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def load(self, run_id: str) -> Transcript:
         def read() -> Transcript:
@@ -5442,7 +5447,7 @@ class SQLStateStore:
                 _artifact_record_row(record),
             )
 
-        await _run_cancellation_safe_transaction(self._database, write)
+        await run_sql_transaction(self._database, write)
 
     async def transition_artifact(
         self, record: ArtifactRecord, state: ArtifactState
@@ -5483,7 +5488,7 @@ class SQLStateStore:
                 )
             return updated
 
-        return await _run_cancellation_safe_transaction(self._database, write)
+        return await run_sql_transaction(self._database, write)
 
     async def finish_artifact_deletion(self, record: ArtifactRecord) -> None:
         if record.state is not ArtifactState.DELETING:
@@ -5501,7 +5506,7 @@ class SQLStateStore:
                     "artifact_missing", "The artifact lifecycle changed.", {}
                 )
 
-        await _run_cancellation_safe_transaction(self._database, write)
+        await run_sql_transaction(self._database, write)
 
     async def conversation_run_page(
         self,
@@ -5680,7 +5685,7 @@ class SQLStateStore:
             )
             return len(run_ids)
 
-        cleared = await _run_cancellation_safe_transaction(self._database, write)
+        cleared = await run_sql_transaction(self._database, write)
         return cleared
 
     async def completed_conversation_tail(
@@ -6148,17 +6153,25 @@ def _require_candidate_transition(
         )
 
 
-async def _run_cancellation_safe_transaction(
-    path: SQLDatabase,
+async def run_sql_transaction(
+    database: SQLDatabase,
     callback: Callable[[SQLConnection], _T],
     *,
     commit: Callable[[SQLConnection], None] | None = None,
 ) -> _T:
+    """Run one short adapter transaction through the shared cancellation owner.
+
+    Cancellation before admission prevents the write; after admission the worker
+    settles exactly once and returns its result or storage failure. The callback
+    runs in a worker thread and must perform only bounded database work. No model,
+    source, artifact or other external I/O belongs inside this transaction.
+    ``commit`` permits an explicit commit boundary; it must never replay work.
+    """
     gate = _CatalogCommitGate()
     cancelled_sentinel = object()
 
     def write() -> _T | object:
-        connection = _connect(path)
+        connection = _connect(database)
         try:
             if not gate.start(connection):
                 return cancelled_sentinel
@@ -6170,7 +6183,7 @@ async def _run_cancellation_safe_transaction(
             return result
         except BaseException as error:
             connection.rollback()
-            raise path.normalize_error(error) from None
+            raise database.normalize_error(error) from None
         finally:
             connection.close()
 

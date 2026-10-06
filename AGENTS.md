@@ -20,6 +20,23 @@ Use this order of authority when repository material disagrees:
 Preserve unrelated working-tree changes. Historical code and documents can
 explain intent, but they do not define current behavior.
 
+## Extensibility boundary
+
+This repository is a broadly reusable open-source framework. Consumers should be
+able to supply their own infrastructure through narrow, documented interfaces.
+Keep agent semantics, validation, durable record formats, shared transformations,
+and the default local implementation here. Deployment-specific storage adapters,
+tenant mapping, provisioning, credential policy, distributed lease services and
+operational rollout belong to the consuming application, not this repository.
+Never include private deployment identifiers or internal infrastructure docs.
+
+Improve injection in the existing owners rather than adding a parallel runtime,
+copying feature logic or building a general plugin framework. `SQLStateStore`,
+its `SQLDatabase`/`SQLConnection` protocols and `ArtifactByteStorage` are supported
+component extension points. Public `Agent.create/open` still compose local homes;
+complete custom-home composition requires a separate generic lifecycle contract.
+Do not present these component interfaces as a complete remote agent API.
+
 ## Architecture status: current revision 3
 
 The current agent-home format is released **revision 3**, extending released
@@ -97,12 +114,6 @@ Agent identity, source registrations, current catalog snapshots, exact run
 transcripts, terminal results, jobs, routines, deliveries, permissions, and
 receipts are stored in one SQLite database inside the agent home.
 
-The standalone PostgreSQL StateStore implements those structured records through
-the same SQL operations, strict codecs and home revision,
-namespace/role isolation and writer-generation fencing. Public Agent composition
-still uses SQLite; remote home files and execution leases are separate owners.
-See `docs/POSTGRES_STATE.md` before changing PostgreSQL admission or security.
-
 ## Directory layout
 
 ```text
@@ -126,12 +137,10 @@ src/daita/
   distribution/              # outcomes, destinations, deliveries, inbox view
   memory/                     # bounded advisory memory
   skills/                     # bounded retained Markdown procedures
-  storage/sql.py              # shared durable state operation boundary
+  storage/sql.py              # shared state operations over supplied connections
+  storage/sql_connection.py   # supported database/connection adapter protocols
   storage/sql_graph.py        # shared graph transactions
-  storage/sqlite.py           # local database admission and connections
-  storage/postgres.py         # PostgreSQL admission, pool and transaction fencing
-  storage/postgres_admin.py   # explicit administrative schema/namespace provisioning
-  storage/postgres_schema.py  # PostgreSQL projection of the canonical home schema
+  storage/sqlite.py           # default local database admission and connections
   storage/sqlite_schema.py    # exact current physical schema
   storage/sqlite_codecs/      # strict current-record serializers
   storage/home_migrations/    # sole append-only agent-home revision registry
@@ -429,12 +438,10 @@ revalidates the unchanged bound file, and atomically publishes the artifact.
 Drift requires a fresh read and edit.
 
 The artifact store is the sole storage boundary for committed artifact bytes
-and manifests. `ArtifactByteStorage` supplies only exclusive publication, bounded
-read and idempotent deletion of remote bytes. S3 uses one payload object and the
-existing registry's reference; it does not maintain another remote manifest or
-inventory. Client credentials, finite transport timeouts, retry configuration and
-cleanup belong to the composing caller. Public agent composition still selects
-local artifact files; see `docs/ARTIFACT_STORAGE.md` for the integration boundary.
+and manifests. `ArtifactByteStorage` supplies only exclusive publication,
+bounded reads and idempotent deletion; the existing registry and lifecycle owner
+retain identity, quotas, validation and recovery. Consumers own concrete clients,
+credentials, storage layout and resource lifetime. See `docs/ARTIFACT_STORAGE.md`.
 The shared `artifacts` table owns current identity, caller ownership,
 and `creating`/`ready`/`deleting` lifecycle state. Reads and listings query ready rows;
 transcripts, accepted job results and deliveries are historical evidence, not a
@@ -619,11 +626,24 @@ not create durable events, telemetry, tracing, or replay state.
 
 ## Persistence and production upgrades
 
-`daita.storage.sql.SQLStateStore` owns shared state operations;
-`sql_graph` owns their graph transactions. SQLite and PostgreSQL admission supply
-the private connection boundary without duplicating domain decisions.
-`daita.storage.home_migrations` is the persistence-compatibility
-authority for the complete local agent home. One monotonic home revision covers the
+`daita.storage.sql.SQLStateStore` owns shared state operations and `sql_graph`
+owns graph transactions. The default SQLite adapter implements the supported
+`SQLDatabase` connection boundary. Custom adapters reuse these operations and
+strict codecs, with no copied state-transition logic. `run_sql_transaction` is
+the shared cancellation-safe transaction owner for adapter administrative writes.
+Adapters own physical admission, connection lifetime and error normalization.
+The caller must drain operations before closing its borrowed database resources.
+
+The canonical schema and existing home registry remain the single source of
+record formats and data transformations. Adapters may project the schema and
+execute those transformations using their own physical storage mechanics. Schema
+projection alone does not upgrade stored data. Adapter deployment/security/layout
+checks belong to the consuming application; do not add their implementation
+fingerprints or dependencies to the framework's release gate.
+
+`daita.storage.sqlite.SQLiteStateStore` is the default local admission wrapper.
+`daita.storage.home_migrations` is the sole persistence-compatibility
+authority for the complete agent home. One monotonic home revision covers the
 database, persisted records, model configuration, memory, user profile, skills,
 artifacts, and other durable files that must change together. It is independent
 of the package version and Git tag.
@@ -700,26 +720,6 @@ not add event sourcing, replay projections, another state abstraction or a secon
 writer around SQLite. Only the normalized graph records, bounded task checkpoints/
 comments and audit event cursor defined by the current schema are permitted; those
 records are not an event-sourced replay system and remain behind `SQLiteStateStore`.
-
-Both backends use `CURRENT_HOME_REVISION` and the existing
-`release/agent-home-contract.json` release gate. PostgreSQL tables, constraints
-and indexes are derived from the canonical home schema by `postgres_schema`;
-never introduce hand-maintained copies of those definitions, a PostgreSQL revision
-counter, or a parallel feature-migration registry. Backend-specific namespace,
-type, identity and security mechanics stay in the adapter. The release snapshot
-also fingerprints those mechanics; changes to an already released backend require
-the same home-revision advance as changes to the shared contract. Adding the first
-PostgreSQL baseline does not rewrite the released SQLite home contract.
-
-Author future home changes and data transformations once. The remaining remote
-upgrade implementation must consume the existing home registry and shared
-transformations; both backend upgrade paths must pass before a release. Do not
-claim that deriving fresh PostgreSQL DDL migrates existing data automatically.
-Runtime opening is
-passive and never installs schema. Administrative provisioning, runtime roles,
-namespace RLS and epoch fencing are owned by the PostgreSQL backend. Epochs are
-not execution leases. Preserve transaction-local settings, bounded pools and
-unknown-commit refusal; qualify changes against the disposable `--postgres` suite.
 
 ## Models and providers
 
@@ -965,11 +965,11 @@ daita
 ```
 
 `openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `httpx`,
-`keyring`, `textual`, `rich`, `XlsxWriter`, `psycopg[binary]`, `psycopg-pool`, and exact `duckdb==1.5.5` are
+`keyring`, `textual`, `rich`, `XlsxWriter`, and exact `duckdb==1.5.5` are
 default production dependencies. `dev` is the only optional dependency group.
 
 Default installation does not permit eager imports. Provider SDKs, `asyncpg`,
-`sqlglot`, `httpx`, `keyring`, `textual`, `rich`, Psycopg, its pool, and DuckDB remain imported lazily
+`sqlglot`, `httpx`, `keyring`, `textual`, `rich`, and DuckDB remain imported lazily
 at the boundary that first needs them. XlsxWriter is imported only by the XLSX
 renderer. Importing `daita` or `daita.cli`, and running headless commands, must
 not load those integrations early.
@@ -1035,11 +1035,7 @@ Do not commit changes unless the task explicitly requests a commit.
 | `src/daita/routines/` | scheduled routine records and supervision |
 | `src/daita/distribution/` | outcomes, destinations, and deliveries |
 | `src/daita/artifacts/store.py` | committed artifact storage boundary |
-| `src/daita/storage/sql.py` | shared durable state operations |
-| `src/daita/storage/sql_graph.py` | shared graph transactions |
-| `src/daita/storage/sqlite.py` | local database admission and connections |
-| `src/daita/storage/postgres.py` | PostgreSQL admission, connections and fencing |
-| `src/daita/storage/postgres_admin.py` | explicit schema and namespace provisioning |
+| `src/daita/storage/sqlite.py` | durable state operations |
 | `src/daita/storage/sqlite_schema.py` | current physical schema |
 | `src/daita/storage/sqlite_codecs/` | strict current-record serializers |
 | `src/daita/storage/home_migrations/` | whole-home revision registry and immutable transitions |

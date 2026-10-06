@@ -1,4 +1,4 @@
-"""One artifact lifecycle with remote bytes and either real state database."""
+"""One artifact lifecycle with caller-supplied bytes and durable state."""
 
 import asyncio
 import threading
@@ -17,7 +17,6 @@ from daita.capabilities import ArtifactPolicy
 from daita.catalog.models import Sensitivity
 from daita.identity import AgentIdentity
 from daita.storage.errors import StorageCommitUnknownError, StorageOwnershipLostError
-from tests.artifacts.byte_storage_support import ObjectClient, ObjectServiceError
 from tests.support.graph import GRAPH_NOW
 
 pytestmark = [pytest.mark.integration, pytest.mark.contract]
@@ -33,7 +32,7 @@ async def _open(registry, client):
         )
     return await AgentHomeArtifactStore.open(
         agent_id="agent-one",
-        byte_storage=client.storage(),
+        byte_storage=client,
         registry=registry,
         clock=lambda: GRAPH_NOW,
         id_factory=lambda _: ARTIFACT_ID,
@@ -68,8 +67,10 @@ async def _commit(store):
     )
 
 
-async def test_remote_bytes_reopen_and_delete_without_a_home(state_store_factory):
-    client = ObjectClient()
+async def test_remote_bytes_reopen_and_delete_without_a_home(
+    artifact_byte_storage, state_store_factory
+):
+    client = artifact_byte_storage
     async with state_store_factory() as registry:
         store = await _open(registry, client)
         ref = await _commit(store)
@@ -86,13 +87,12 @@ async def test_remote_bytes_reopen_and_delete_without_a_home(state_store_factory
         assert await registry.get_artifact_record(ref.artifact_id) is None
         assert not client.objects
     assert len(client.publications) == 1
-    assert all(body.closed for body in client.bodies)
 
 
 async def test_unknown_state_failure_during_admission_stops_open(
-    state_store_factory, monkeypatch
+    artifact_byte_storage, state_store_factory, monkeypatch
 ):
-    client = ObjectClient()
+    client = artifact_byte_storage
 
     async def unavailable(*args, **kwargs):
         raise StorageCommitUnknownError("state owner has an unresolved commit")
@@ -108,16 +108,18 @@ async def test_unknown_state_failure_during_admission_stops_open(
 
 
 async def test_lost_publication_ack_reconciles_exact_bytes_without_replay(
-    state_store_factory, monkeypatch
+    artifact_byte_storage, state_store_factory, monkeypatch
 ):
-    client = ObjectClient()
-    put = client.put_object
+    client = artifact_byte_storage
+    put = client.publish
 
-    def lose_ack(**kwargs):
-        put(**kwargs)
-        raise TimeoutError("response lost after object publication")
+    def lose_ack(*args):
+        put(*args)
+        raise ArtifactError(
+            "artifact_storage_failed", "Response lost after publication."
+        )
 
-    monkeypatch.setattr(client, "put_object", lose_ack)
+    monkeypatch.setattr(client, "publish", lose_ack)
     async with state_store_factory() as registry:
         store = await _open(registry, client)
         with pytest.raises(ArtifactError):
@@ -131,17 +133,17 @@ async def test_lost_publication_ack_reconciles_exact_bytes_without_replay(
 
 
 async def test_unavailable_readback_preserves_creation_for_recovery(
-    state_store_factory, monkeypatch
+    artifact_byte_storage, state_store_factory, monkeypatch
 ):
-    client = ObjectClient()
+    client = artifact_byte_storage
 
-    def unavailable(**kwargs):
-        raise ObjectServiceError("AccessDenied")
+    def unavailable(*args):
+        raise ArtifactError("artifact_storage_failed", "Storage access denied.")
 
     async with state_store_factory() as registry:
         store = await _open(registry, client)
         with monkeypatch.context() as patch:
-            patch.setattr(client, "get_object", unavailable)
+            patch.setattr(client, "read", unavailable)
             with pytest.raises(ArtifactError):
                 await _commit(store)
             record = await registry.get_artifact_record(ARTIFACT_ID)
@@ -156,18 +158,18 @@ async def test_unavailable_readback_preserves_creation_for_recovery(
 
 
 async def test_failed_deletion_stays_hidden_and_reopen_finishes_cleanup(
-    state_store_factory, monkeypatch
+    artifact_byte_storage, state_store_factory, monkeypatch
 ):
-    client = ObjectClient()
+    client = artifact_byte_storage
 
-    def unavailable(**kwargs):
-        raise ObjectServiceError("AccessDenied")
+    def unavailable(*args):
+        raise ArtifactError("artifact_storage_failed", "Storage access denied.")
 
     async with state_store_factory() as registry:
         store = await _open(registry, client)
         ref = await _commit(store)
         with monkeypatch.context() as patch:
-            patch.setattr(client, "delete_object", unavailable)
+            patch.setattr(client, "delete", unavailable)
             with pytest.raises(ArtifactError):
                 await store.delete(ref.artifact_id)
         assert await store.list_refs() == ()
@@ -184,9 +186,9 @@ async def test_failed_deletion_stays_hidden_and_reopen_finishes_cleanup(
     "failure", [StorageCommitUnknownError, StorageOwnershipLostError]
 )
 async def test_state_failure_during_cleanup_is_not_hidden(
-    state_store_factory, monkeypatch, failure
+    artifact_byte_storage, state_store_factory, monkeypatch, failure
 ):
-    client = ObjectClient()
+    client = artifact_byte_storage
 
     async def state_failed(record):
         raise failure("state owner cannot confirm cleanup")
@@ -208,9 +210,9 @@ async def test_state_failure_during_cleanup_is_not_hidden(
 
 @pytest.mark.parametrize("replacement", [None, b"tampered bytes"])
 async def test_missing_or_corrupt_ready_bytes_do_not_erase_registry(
-    state_store_factory, replacement
+    artifact_byte_storage, state_store_factory, replacement
 ):
-    client = ObjectClient()
+    client = artifact_byte_storage
     async with state_store_factory() as registry:
         store = await _open(registry, client)
         ref = await _commit(store)
@@ -230,18 +232,18 @@ async def test_missing_or_corrupt_ready_bytes_do_not_erase_registry(
 
 
 async def test_cancelled_remote_publication_drains_without_blocking_event_loop(
-    state_store_factory, monkeypatch
+    artifact_byte_storage, state_store_factory, monkeypatch
 ):
-    client = ObjectClient()
+    client = artifact_byte_storage
     started, release = threading.Event(), threading.Event()
-    put = client.put_object
+    put = client.publish
 
-    def blocked(**kwargs):
+    def blocked(*args):
         started.set()
         assert release.wait(5)
-        return put(**kwargs)
+        return put(*args)
 
-    monkeypatch.setattr(client, "put_object", blocked)
+    monkeypatch.setattr(client, "publish", blocked)
     async with state_store_factory() as registry:
         store = await _open(registry, client)
         task = asyncio.create_task(_commit(store))

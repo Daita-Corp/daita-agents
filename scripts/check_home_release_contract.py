@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import re
 from dataclasses import fields
 from hashlib import sha256
 from pathlib import Path
@@ -293,7 +292,6 @@ def make_snapshot(
     *,
     home_revision: int,
     minimum_supported_home_revision: int,
-    backend_contracts: dict[str, str] | None = None,
 ) -> dict[str, object]:
     return {
         "contract": contract,
@@ -303,36 +301,16 @@ def make_snapshot(
         "home_revision": home_revision,
         "minimum_supported_home_revision": minimum_supported_home_revision,
         "snapshot_format": SNAPSHOT_FORMAT,
-        **(
-            {"backend_contracts": backend_contracts}
-            if backend_contracts is not None
-            else {}
-        ),
     }
 
 
 def build_snapshot() -> dict[str, object]:
     """Build the current release snapshot from production persistence owners."""
 
-    from daita.artifacts.s3 import S3_ARTIFACT_KEY
-    from daita.storage.postgres_admin import postgres_schema_checksum
-
     return make_snapshot(
         build_contract(),
         home_revision=CURRENT_HOME_REVISION,
         minimum_supported_home_revision=MINIMUM_SUPPORTED_HOME_REVISION,
-        backend_contracts={
-            "postgresql": postgres_schema_checksum(),
-            "s3_artifacts": sha256(
-                _canonical_json(
-                    {
-                        "key": S3_ARTIFACT_KEY,
-                        "object": "raw_payload",
-                        "reference": "artifact_registry",
-                    }
-                ).encode("utf-8")
-            ).hexdigest(),
-        },
     )
 
 
@@ -341,18 +319,13 @@ def render_snapshot(snapshot: dict[str, object]) -> str:
 
 
 def _validated_snapshot(value: Any, *, label: str) -> dict[str, object]:
-    required = {
+    if not isinstance(value, dict) or set(value) != {
         "contract",
         "contract_sha256",
         "home_revision",
         "minimum_supported_home_revision",
         "snapshot_format",
-    }
-    if (
-        not isinstance(value, dict)
-        or not required <= set(value)
-        or set(value) - required - {"backend_contracts"}
-    ):
+    }:
         raise HomeReleaseContractError(f"{label} has an invalid snapshot shape")
     contract = value["contract"]
     digest = value["contract_sha256"]
@@ -360,15 +333,6 @@ def _validated_snapshot(value: Any, *, label: str) -> dict[str, object]:
     minimum = value["minimum_supported_home_revision"]
     if value["snapshot_format"] != SNAPSHOT_FORMAT:
         raise HomeReleaseContractError(f"{label} uses an unsupported snapshot format")
-    backends = value.get("backend_contracts", {})
-    if not isinstance(backends, dict) or any(
-        not isinstance(name, str)
-        or re.fullmatch(r"[a-z][a-z0-9_]*", name) is None
-        or not isinstance(checksum, str)
-        or re.fullmatch(r"[0-9a-f]{64}", checksum) is None
-        for name, checksum in backends.items()
-    ):
-        raise HomeReleaseContractError(f"{label} has invalid backend contracts")
     if not isinstance(contract, dict) or not contract:
         raise HomeReleaseContractError(f"{label} has no durable contract")
     if digest != sha256(_canonical_json(contract).encode("utf-8")).hexdigest():
@@ -428,15 +392,6 @@ def compare_snapshots(
     ):
         raise HomeReleaseContractError(
             "the durable agent-home contract changed without a new home revision"
-        )
-    prior_backends = base.get("backend_contracts", {})
-    next_backends = current.get("backend_contracts", {})
-    assert isinstance(prior_backends, dict) and isinstance(next_backends, dict)
-    if current_revision == base_revision and any(
-        checksum != next_backends.get(name) for name, checksum in prior_backends.items()
-    ):
-        raise HomeReleaseContractError(
-            "a released backend contract changed without a new home revision"
         )
 
 

@@ -96,8 +96,6 @@ def test_default_distribution_contains_every_supported_production_dependency():
     assert set(project["dependencies"]) == {
         "anthropic>=0.116.0,<1.0.0",
         "asyncpg>=0.30.0,<1.0.0",
-        "psycopg[binary]>=3.2.0,<4.0.0",
-        "psycopg-pool>=3.2.0,<4.0.0",
         "google-genai>=2.22.0,<3.0.0",
         "keyring>=25.0.0,<26.0.0",
         "openai>=2.45.0,<3.0.0",
@@ -248,6 +246,27 @@ def test_real_wheel_metadata_drives_installed_runtime_cli_tui_and_mcp(
     assert cli.returncode == 0, cli.stderr
     assert cli.stdout == f"daita {metadata.version}\n"
 
+    # Consumers must see the shipped adapter types, not an untyped/Any package.
+    consumer = tmp_path / "adapter_consumer.py"
+    consumer.write_text(
+        "from daita.storage.sql import SQLStateStore\n"
+        "from daita.storage.sql_connection import SQLDatabase\n"
+        "def compose(database: SQLDatabase) -> SQLStateStore:\n"
+        "    return SQLStateStore(database)\n",
+        encoding="utf-8",
+    )
+    check = [str(python), "-m", "mypy", "--follow-imports=silent", str(consumer)]
+    valid = subprocess.run(
+        check, capture_output=True, text=True, cwd=tmp_path, env=runtime_environment
+    )
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    consumer.write_text(consumer.read_text() + "SQLStateStore(object())\n")
+    invalid = subprocess.run(
+        check, capture_output=True, text=True, cwd=tmp_path, env=runtime_environment
+    )
+    assert invalid.returncode == 1, invalid.stdout + invalid.stderr
+    assert "SQLDatabase" in invalid.stdout and "[arg-type]" in invalid.stdout
+
 
 def test_documented_local_markdown_links_resolve() -> None:
     import re
@@ -359,15 +378,6 @@ def test_missing_default_runtime_dependencies_use_pipx_repair_guidance(
 ):
     error = _missing_import(module, action)
 
-    assert PIPX_REPAIR in str(error)
-    assert "daita-agents[" not in str(error)
-
-
-@pytest.mark.parametrize("module", ("psycopg", "psycopg_pool"))
-def test_missing_postgres_state_dependencies_use_pipx_repair_guidance(module):
-    from daita.storage.postgres import _load_driver
-
-    error = _missing_import(module, _load_driver)
     assert PIPX_REPAIR in str(error)
     assert "daita-agents[" not in str(error)
 
@@ -485,8 +495,6 @@ blocked = {
     "mcp",
     "openai",
     "prompt_toolkit",
-    "psycopg",
-    "psycopg_pool",
     "rich",
     "textual",
     "sqlglot",
@@ -503,7 +511,6 @@ def guarded(name, *args, **kwargs):
 builtins.__import__ = guarded
 import daita
 import daita.cli
-import daita.storage.postgres
 from daita.adapters.mcp import (
     MCPClient, MCPClientFactory, MCPPersonalConnectionClient, SDKMCPClientFactory,
 )

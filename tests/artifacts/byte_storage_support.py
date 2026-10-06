@@ -1,51 +1,29 @@
-"""Disposable object service dependency for real artifact lifecycle tests."""
+"""In-memory byte dependency for the real registry-owned artifact lifecycle."""
 
-from io import BytesIO
-from typing import Any
-
-from daita.artifacts.s3 import S3ArtifactByteStorage
+from daita.artifacts.models import ArtifactError, ArtifactRef
 
 
-class ObjectServiceError(Exception):
-    def __init__(self, code: str) -> None:
-        self.response = {"Error": {"Code": code}}
-        super().__init__(code)
-
-
-class ObjectClient:
-    """A test dependency, not evidence of deployed S3 or SDK behavior."""
-
+class MemoryByteStorage:
     def __init__(self) -> None:
-        self.objects: dict[tuple[str, str], bytes] = {}
-        self.publications: list[dict[str, Any]] = []
-        self.reads: list[tuple[str, str]] = []
-        self.deleted: list[tuple[str, str]] = []
-        self.bodies: list[BytesIO] = []
+        self.objects: dict[tuple[str, str, str], bytes] = {}
+        self.publications: list[tuple[str, str, str]] = []
+        self.reads: list[tuple[str, str, str]] = []
+        self.deleted: list[tuple[str, str, str]] = []
 
-    def storage(self, prefix: str = "homes/example") -> S3ArtifactByteStorage:
-        return S3ArtifactByteStorage(self, bucket="fixture-bucket", prefix=prefix)
-
-    def put_object(self, **kwargs: Any) -> dict[str, Any]:
-        assert kwargs["IfNoneMatch"] == "*"
-        assert kwargs["ContentLength"] == len(kwargs["Body"])
-        self.publications.append(kwargs)
-        key = (kwargs["Bucket"], kwargs["Key"])
+    def publish(self, agent_id: str, ref: ArtifactRef, content: bytes) -> None:
+        key = (agent_id, ref.run_id, ref.artifact_id)
+        self.publications.append(key)
         if key in self.objects:
-            raise ObjectServiceError("PreconditionFailed")
-        self.objects[key] = kwargs["Body"]
-        return {}
+            raise ArtifactError("artifact_storage_failed", "Identity already exists.")
+        self.objects[key] = content
 
-    def get_object(self, **kwargs: Any) -> dict[str, Any]:
-        key = (kwargs["Bucket"], kwargs["Key"])
+    def read(self, agent_id: str, ref: ArtifactRef) -> bytes | None:
+        key = (agent_id, ref.run_id, ref.artifact_id)
         self.reads.append(key)
-        if key not in self.objects:
-            raise ObjectServiceError("NoSuchKey")
-        body = BytesIO(self.objects[key])
-        self.bodies.append(body)
-        return {"ContentLength": len(self.objects[key]), "Body": body}
+        content = self.objects.get(key)
+        return None if content is None else content[: ref.byte_size + 1]
 
-    def delete_object(self, **kwargs: Any) -> dict[str, Any]:
-        key = (kwargs["Bucket"], kwargs["Key"])
+    def delete(self, agent_id: str, ref: ArtifactRef) -> None:
+        key = (agent_id, ref.run_id, ref.artifact_id)
         self.deleted.append(key)
         self.objects.pop(key, None)
-        return {}

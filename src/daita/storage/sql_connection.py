@@ -1,4 +1,4 @@
-"""Private DB-API boundary for the shared state operations.
+"""Supported adapter boundary for the shared SQL state operations.
 
 Queries use qmark parameters; dialect-specific expressions are selected explicitly.
 Only backend admission owns connections, credentials and physical schema changes.
@@ -27,6 +27,15 @@ class SQLCursor(Protocol):
 
 
 class SQLConnection(Protocol):
+    """One bounded, worker-thread connection to an already admitted logical home.
+
+    Use qmark parameters and tuple rows. Read connections must retain a consistent
+    snapshot through context exit. ``begin(write=True)`` must serialize state
+    mutations within a logical home; an adapter may add isolation and fencing.
+    Context exit must settle the transaction and release its connection. Dialect
+    expressions come from trusted adapter code, never caller or model input.
+    """
+
     insertion_order: str
     distinct_operator: str
 
@@ -61,6 +70,14 @@ class SQLConnection(Protocol):
 
 
 class SQLDatabase(Protocol):
+    """Caller-owned connection source; construction performs no recovery.
+
+    The adapter owns admission, physical schema installation, credentials and
+    resource cleanup. Normalize driver failures into the existing storage error
+    taxonomy, preserving ownership loss and unknown commit outcomes. Never replay
+    a mutation automatically. All connection and transport waits must be bounded.
+    """
+
     def connect(self, *, read_only: bool = False) -> SQLConnection: ...
 
     def normalize_error(self, error: BaseException) -> BaseException: ...

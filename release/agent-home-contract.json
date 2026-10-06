@@ -1,8 +1,4 @@
 {
-  "backend_contracts": {
-    "postgresql": "e38808ab3a2df0a0a6f0cf4e3302bd77c860514cf270eb6ada2181749291044b",
-    "s3_artifacts": "890e23ff64d5aca191cf9e0f5deb3b911f96f06c9e0528996418588aac1c31a7"
-  },
   "contract": {
     "home_files": {
       "agent_manifest": {

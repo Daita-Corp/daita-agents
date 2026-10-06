@@ -26,26 +26,27 @@ unit/integration directory hierarchy.
   from default discovery.
 - `tests/diagnostics` and `tests/packaging` contain explicit module entry points.
 
-`tests/storage/contracts` is the portable durable-backend suite. It runs SQLite
-by default. With Docker and OpenSSL available, qualify both implementations and
-PostgreSQL isolation/failure behavior with:
+`tests/storage/contracts` is the portable durable-backend suite. The framework
+runs it against SQLite and a disposable in-memory artifact-byte dependency:
 
 ```bash
-.venv/bin/python -m pytest tests/storage/contracts tests/storage/postgres --postgres
+.venv/bin/python -m pytest tests/storage/contracts
 .venv/bin/python scripts/check_home_release_contract.py check
 ```
 
-This command creates and removes a disposable PostgreSQL container, with TLS and
-restricted login roles. It never accepts an ambient database URL. Missing fixture
-prerequisites fail the command. The default suite excludes the PostgreSQL cases;
-report them separately. See [storage contract](STORAGE_CONTRACT.md) and
-[PostgreSQL state](POSTGRES_STATE.md) for remaining remote-home acceptance gates.
+Downstream qualification can reuse the same cases with an external pytest plugin.
+Indirectly parameterize `state_store_factory` with the name of a fixture returning
+an async context-manager factory; each call must open a new handle to the same
+disposable state. Indirectly parameterize `artifact_byte_storage` with the name of
+a byte-storage fixture exposing the test dependency's `objects`, `publications`,
+`reads` and `deleted` observations. Defaults use SQLite and in-memory bytes.
+Tests never select an infrastructure provider from ambient credentials.
 
-The same contracts include the artifact lifecycle with disposable injected object
-storage. This qualifies registry/byte coordination on both state databases;
-`tests/artifacts/test_s3_bytes.py` checks the S3 request and bounded-read contract.
-These fixtures do not contact AWS or qualify a real S3 SDK, bucket, IAM policy,
-version retention or deployed handover. See [artifact storage](ARTIFACT_STORAGE.md).
+Keep concrete driver, transport, isolation, provisioning and failure tests with
+the adapter. Missing required resources must fail that adapter's qualification,
+not silently skip it. The framework's in-memory byte cases establish lifecycle
+behavior, not external transport readiness. See [storage contract](STORAGE_CONTRACT.md)
+and [artifact storage](ARTIFACT_STORAGE.md).
 
 Use explicit imports such as `from tests.support.paths import REPO_ROOT`. Test
 and support modules must not import a `test_*.py` module or `conftest.py`.

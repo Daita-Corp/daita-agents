@@ -53,34 +53,6 @@ def test_changed_release_contract_requires_a_new_home_revision() -> None:
     compare_snapshots(baseline, _changed_snapshot(revision_offset=1))
 
 
-@pytest.mark.parametrize("backend", ["postgresql", "s3_artifacts"])
-def test_backend_contracts_use_the_same_home_revision_and_release_gate(backend) -> None:
-    baseline = build_snapshot()
-    changed = deepcopy(baseline)
-    contracts = changed["backend_contracts"]
-    assert isinstance(contracts, dict)
-    contracts[backend] = "0" * 64
-    with pytest.raises(HomeReleaseContractError, match="without a new home revision"):
-        compare_snapshots(baseline, changed)
-    revision = baseline["home_revision"]
-    assert isinstance(revision, int)
-    changed["home_revision"] = revision + 1
-    compare_snapshots(baseline, changed)
-
-
-def test_first_backend_snapshot_preserves_the_released_sqlite_contract() -> None:
-    candidate = build_snapshot()
-    released = deepcopy(candidate)
-    released.pop("backend_contracts")
-    compare_snapshots(released, candidate)
-    with pytest.raises(HomeReleaseContractError, match="backend contract changed"):
-        compare_snapshots(candidate, released)
-    malformed = deepcopy(candidate)
-    malformed["backend_contracts"] = {"postgresql": "not-a-checksum"}
-    with pytest.raises(HomeReleaseContractError, match="invalid backend contracts"):
-        compare_snapshots(released, malformed)
-
-
 def test_release_workflows_enforce_and_publish_the_home_contract() -> None:
     ci = (REPO_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     release = (REPO_ROOT / ".github/workflows/managed-release.yml").read_text(

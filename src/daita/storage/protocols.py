@@ -10,7 +10,7 @@ A successful await means durable commit; cancellation or lost acknowledgement
 must not cause blind replay of external effects. Identity, payload validation,
 bounds and domain errors have the same meaning for every backend.
 
-SQLite and PostgreSQL share the SQL operation implementation. Backend admission
+SQLite and custom SQL adapters can share the SQL operation implementation. Admission
 owns connections, schema validation and fencing. Agent composition still uses
 local homes; a state backend alone does not provide remote files or writer leases.
 """

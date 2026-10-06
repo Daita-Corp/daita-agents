@@ -13,6 +13,8 @@ class ArtifactByteStorage(Protocol):
     ``read`` returns ``None`` only for a confirmed absent object, never for an
     unavailable service or denied access, and must bound its response by
     ``ref.byte_size``. ``delete`` is idempotent for an absent object.
+    Translate storage-specific failures into ``ArtifactError``; denied or
+    unavailable reads must never masquerade as missing bytes.
 
     The artifact registry remains the authority for identity, ownership, quotas
     and lifecycle. This interface does not list objects or recover domain state.
