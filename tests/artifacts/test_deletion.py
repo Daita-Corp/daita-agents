@@ -601,7 +601,7 @@ async def test_pending_deletion_at_payload_quota_can_recover(
 async def test_registry_reads_and_lists_do_not_decode_historical_results(
     artifact_agent, monkeypatch
 ):
-    import daita.storage.sqlite as sqlite_store
+    import daita.storage.sql as sqlite_store
 
     agent, result, _ = artifact_agent
 

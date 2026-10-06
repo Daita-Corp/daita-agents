@@ -10,8 +10,9 @@ A successful await means durable commit; cancellation or lost acknowledgement
 must not cause blind replay of external effects. Identity, payload validation,
 bounds and domain errors have the same meaning for every backend.
 
-The SQLite implementation is the current reference. This protocol alone does not
-enable remote homes, distributed writer fencing or a Postgres backend.
+SQLite and PostgreSQL share the SQL operation implementation. Backend admission
+owns connections, schema validation and fencing. Agent composition still uses
+local homes; a state backend alone does not provide remote files or writer leases.
 """
 
 from __future__ import annotations

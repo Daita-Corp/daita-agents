@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-import daita.storage.sqlite as sqlite_module
+import daita.storage.sql as sqlite_module
 from daita.distribution import DeliverySubjectKind, OutcomeState
 from daita.llm.models import (
     CanonicalMessage,
@@ -689,7 +689,7 @@ async def test_immediate_first_creation_claims_once_with_normal_budget_and_next_
 async def test_immediate_first_claim_failure_rolls_back_the_whole_creation(
     tmp_path, monkeypatch
 ):
-    import daita.storage.sqlite as sqlite_module
+    import daita.storage.sql as sqlite_module
 
     store = await SQLiteStateStore.open(tmp_path / "state.db", clock=lambda: NOW)
     proposal = replace(routine_record(), run_immediately=True)

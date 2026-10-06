@@ -26,9 +26,26 @@ unit/integration directory hierarchy.
   from default discovery.
 - `tests/diagnostics` and `tests/packaging` contain explicit module entry points.
 
-`tests/storage/contracts` is the portable durable-backend suite. It currently
-runs SQLite; see [storage contract](STORAGE_CONTRACT.md) for coverage and the
-remaining additional-backend qualification gates.
+`tests/storage/contracts` is the portable durable-backend suite. It runs SQLite
+by default. With Docker and OpenSSL available, qualify both implementations and
+PostgreSQL isolation/failure behavior with:
+
+```bash
+.venv/bin/python -m pytest tests/storage/contracts tests/storage/postgres --postgres
+.venv/bin/python scripts/check_home_release_contract.py check
+```
+
+This command creates and removes a disposable PostgreSQL container, with TLS and
+restricted login roles. It never accepts an ambient database URL. Missing fixture
+prerequisites fail the command. The default suite excludes the PostgreSQL cases;
+report them separately. See [storage contract](STORAGE_CONTRACT.md) and
+[PostgreSQL state](POSTGRES_STATE.md) for remaining remote-home acceptance gates.
+
+The same contracts include the artifact lifecycle with disposable injected object
+storage. This qualifies registry/byte coordination on both state databases;
+`tests/artifacts/test_s3_bytes.py` checks the S3 request and bounded-read contract.
+These fixtures do not contact AWS or qualify a real S3 SDK, bucket, IAM policy,
+version retention or deployed handover. See [artifact storage](ARTIFACT_STORAGE.md).
 
 Use explicit imports such as `from tests.support.paths import REPO_ROOT`. Test
 and support modules must not import a `test_*.py` module or `conftest.py`.

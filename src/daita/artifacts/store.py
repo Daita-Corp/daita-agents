@@ -18,6 +18,8 @@ from uuid import uuid4
 
 from .._json import canonical_json
 from ..capabilities import ArtifactPolicy
+from ..storage.errors import StorageError
+from .bytes import ArtifactByteStorage
 from .models import (
     MAX_ARTIFACT_BYTES_PER_AGENT,
     MAX_ARTIFACT_BYTES_PER_RUN,
@@ -133,16 +135,18 @@ class AgentHomeArtifactStore:
         self,
         *,
         agent_id: str,
-        agent_home: Path,
+        agent_home: Path | None = None,
+        byte_storage: ArtifactByteStorage | None = None,
         registry: ArtifactRegistry,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _new_id,
         admission_error: ArtifactError | None = None,
     ) -> None:
+        if (agent_home is None) == (byte_storage is None):
+            raise ValueError("select exactly one artifact home or byte storage")
         self.agent_id = agent_id
-        self.agent_home = agent_home
-        self.root = agent_home / "artifacts"
-        self.staging = self.root / ".staging"
+        self._agent_home = agent_home
+        self._byte_storage = byte_storage
         self._registry = registry
         self._clock = clock
         self._id_factory = id_factory
@@ -155,7 +159,8 @@ class AgentHomeArtifactStore:
         cls,
         *,
         agent_id: str,
-        agent_home: Path,
+        agent_home: Path | None = None,
+        byte_storage: ArtifactByteStorage | None = None,
         registry: ArtifactRegistry,
         clock: Callable[[], datetime] = _utc_now,
         id_factory: Callable[[str], str] = _new_id,
@@ -163,13 +168,14 @@ class AgentHomeArtifactStore:
         store = cls(
             agent_id=agent_id,
             agent_home=agent_home,
+            byte_storage=byte_storage,
             registry=registry,
             clock=clock,
             id_factory=id_factory,
         )
         try:
             records = await registry.list_artifact_records(agent_id)
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, StorageError):
             raise
         except ArtifactError as error:
             store._admission_error = error
@@ -218,6 +224,20 @@ class AgentHomeArtifactStore:
         if cancelled:
             raise asyncio.CancelledError
         return store
+
+    @property
+    def agent_home(self) -> Path:
+        if self._agent_home is None:
+            raise ValueError("remote artifact storage has no local home")
+        return self._agent_home
+
+    @property
+    def root(self) -> Path:
+        return self.agent_home / "artifacts"
+
+    @property
+    def staging(self) -> Path:
+        return self.root / ".staging"
 
     @property
     def available(self) -> bool:
@@ -306,7 +326,8 @@ class AgentHomeArtifactStore:
         try:
             await asyncio.to_thread(self._delete_sync, record)
             await self._registry.finish_artifact_deletion(record)
-        except ArtifactError:
+        except (ArtifactError, StorageError):
+            # Ownership loss and unknown commits must reach the execution owner.
             raise
         except Exception as error:
             raise ArtifactError(
@@ -323,9 +344,7 @@ class AgentHomeArtifactStore:
                 await self._recover_creation(record)
 
     async def _recover_creation(self, record: ArtifactRecord) -> ArtifactRef | None:
-        ref = await asyncio.to_thread(
-            self._recover_reserved_sync, record.ref.run_id, record.ref.artifact_id
-        )
+        ref = await asyncio.to_thread(self._recover_reserved_sync, record.ref)
         if ref is not None:
             if ref != record.ref:
                 _corrupt(ref.artifact_id, "creating_manifest_mismatch")
@@ -338,6 +357,9 @@ class AgentHomeArtifactStore:
         return None
 
     def _delete_sync(self, record: ArtifactRecord) -> None:
+        if self._byte_storage is not None:
+            self._byte_storage.delete(self.agent_id, record.ref)
+            return
         try:
             self._verify_storage_roots()
             run_path = self.root / record.ref.run_id
@@ -505,13 +527,15 @@ class AgentHomeArtifactStore:
         self,
         records: tuple[ArtifactRecord, ...],
     ) -> None:
+        if self._byte_storage is not None:
+            # Registry rows own remote recovery. Never scan a shared bucket or
+            # infer ownership/availability from an object listing.
+            return
         try:
             home = self.agent_home.resolve(strict=True)
             if not home.is_dir() or self.agent_home.is_symlink():
                 raise OSError("agent home is not a contained directory")
-            self.agent_home = home
-            self.root = home / "artifacts"
-            self.staging = self.root / ".staging"
+            self._agent_home = home
             _mkdir_private(self.root)
             _mkdir_private(self.staging)
             with os.scandir(self.staging) as staging_iterator:
@@ -571,9 +595,15 @@ class AgentHomeArtifactStore:
 
     def _recover_reserved_sync(
         self,
-        run_id: str,
-        artifact_id: str,
+        expected: ArtifactRef,
     ) -> ArtifactRef | None:
+        run_id, artifact_id = expected.run_id, expected.artifact_id
+        if self._byte_storage is not None:
+            content = self._byte_storage.read(self.agent_id, expected)
+            if content is None:
+                return None
+            _verify_payload(expected, content)
+            return expected
         if (
             _RUN_ID.fullmatch(run_id) is None
             or _ARTIFACT_ID.fullmatch(artifact_id) is None
@@ -672,6 +702,13 @@ class AgentHomeArtifactStore:
     def _commit_sync(
         self, draft: ArtifactDraft, ref: ArtifactRef, gate: _PublicationGate
     ) -> ArtifactRef:
+        if self._byte_storage is not None:
+            gate.require_active()
+            # Once dispatched, settle the bounded request even on cancellation.
+            # Do not hold the gate's threading lock during network I/O: cancel()
+            # runs on the event loop. Registry reconciliation checks exact bytes.
+            self._byte_storage.publish(self.agent_id, ref, draft.content)
+            return ref
         self._verify_storage_roots()
         artifact_id, run_id = ref.artifact_id, ref.run_id
         with self._commit_lock:
@@ -721,17 +758,17 @@ class AgentHomeArtifactStore:
                 ) from error
 
     def _read_ref(self, ref: ArtifactRef) -> ArtifactPayload:
+        if self._byte_storage is not None:
+            content = self._byte_storage.read(self.agent_id, ref)
+            if content is None:
+                _raise_missing(ref.artifact_id)
+            return _verify_payload(ref, content)
         stored_ref = self._load_manifest_ref(ref.run_id, ref.artifact_id)
         if stored_ref != ref:
             _corrupt(ref.artifact_id, "manifest_mismatch")
         directory = self.root / ref.run_id / ref.artifact_id
         content = _read_regular(directory / "payload", ref.byte_size)
-        if len(content) != ref.byte_size:
-            _corrupt(ref.artifact_id, "size_mismatch")
-        digest = "sha256:" + sha256(content).hexdigest()
-        if digest != ref.sha256:
-            _corrupt(ref.artifact_id, "digest_mismatch")
-        return ArtifactPayload(ref=ref, content=content)
+        return _verify_payload(ref, content)
 
     def _load_manifest_ref(self, run_id: str, artifact_id: str) -> ArtifactRef:
         try:
@@ -807,6 +844,14 @@ class AgentHomeArtifactStore:
                 "Artifact storage identity changed.",
                 {"stage": "containment"},
             )
+
+
+def _verify_payload(ref: ArtifactRef, content: bytes) -> ArtifactPayload:
+    if not isinstance(content, bytes) or len(content) != ref.byte_size:
+        _corrupt(ref.artifact_id, "size_mismatch")
+    if "sha256:" + sha256(content).hexdigest() != ref.sha256:
+        _corrupt(ref.artifact_id, "digest_mismatch")
+    return ArtifactPayload(ref=ref, content=content)
 
 
 def _raise_missing(artifact_id: str) -> NoReturn:

@@ -1094,12 +1094,32 @@ def test_durable_state_contract_composes_domain_owned_interfaces():
     assert "sqlite" not in _imports(PACKAGE / "storage/protocols.py")
 
 
+def test_state_backends_share_domain_operations_without_driver_dependencies():
+    from daita.storage.postgres import PostgresStateStore
+    from daita.storage.sql import SQLStateStore
+    from daita.storage.sqlite import SQLiteStateStore
+
+    for backend in (SQLiteStateStore, PostgresStateStore):
+        assert issubclass(backend, SQLStateStore)
+        for name in _class_methods(PACKAGE / "storage/sql.py", "SQLStateStore"):
+            if not name.startswith("_") and name != "close":
+                assert getattr(backend, name) is getattr(SQLStateStore, name)
+    assert not issubclass(PostgresStateStore, SQLiteStateStore)
+    for module in ("storage/sql.py", "storage/sql_graph.py"):
+        assert not _imports(PACKAGE / module) & {
+            "sqlite",
+            "sqlite3",
+            "psycopg",
+            "psycopg_pool",
+        }
+
+
 def test_semantic_maintenance_is_read_time_and_evaluation_is_caller_owned():
     semantics = (PACKAGE / "semantics.py").read_text(encoding="utf-8")
     context = (PACKAGE / "context.py").read_text(encoding="utf-8")
     runtime = (PACKAGE / "capability_runtime.py").read_text(encoding="utf-8")
     learning = (PACKAGE / "domains" / "learning.py").read_text(encoding="utf-8")
-    storage = (PACKAGE / "storage" / "sqlite.py").read_text(encoding="utf-8")
+    storage = (PACKAGE / "storage" / "sql.py").read_text(encoding="utf-8")
     evaluation = (PACKAGE / "evaluation.py").read_text(encoding="utf-8")
     candidates = (PACKAGE / "learning_candidates.py").read_text(encoding="utf-8")
     package_text = _python_text(PACKAGE)

@@ -8,7 +8,7 @@ from typing import cast
 
 import pytest
 
-import daita.storage.sqlite as sqlite_module
+import daita.storage.sql as sqlite_module
 from daita._json import FrozenJsonObject
 from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import AccessMode, OperationalEffect, ToolOutput

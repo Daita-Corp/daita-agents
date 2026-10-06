@@ -40,7 +40,7 @@ async def test_sqlite_atomic_completion_rolls_back_both_values_on_encode_failure
     def fail_encode(_result):
         raise RuntimeError("injected terminal encoding failure")
 
-    monkeypatch.setattr("daita.storage.sqlite.encode_loop_exit", fail_encode)
+    monkeypatch.setattr("daita.storage.sql.encode_loop_exit", fail_encode)
     try:
         with pytest.raises(RuntimeError, match="injected terminal encoding failure"):
             await store.complete(result, final)

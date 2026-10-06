@@ -27,8 +27,9 @@ from daita.catalog.models import (
 from daita.catalog.service import CatalogService
 from daita.domains.data.catalog import CatalogDataView
 from daita.llm.models import ModelSensitivity
-from daita.storage import sqlite as sqlite_module
+from daita.storage import sql as sqlite_module
 from daita.storage.home_migrations import migration_rows
+from daita.storage.sql_connection import SQLConnection
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_records import (
     RelationalWriteScope,
@@ -602,7 +603,7 @@ async def test_cancel_before_scope_transaction_start_changes_nothing(
     release = threading.Event()
 
     class _ControlledGate(sqlite_module._CatalogCommitGate):
-        def start(self, connection: sqlite3.Connection) -> bool:
+        def start(self, connection: SQLConnection) -> bool:
             entered.set()
             assert release.wait(timeout=5)
             return super().start(connection)
@@ -650,7 +651,7 @@ async def test_cancel_before_source_edit_transaction_keeps_current_connection(
     release = threading.Event()
 
     class _ControlledGate(sqlite_module._CatalogCommitGate):
-        def start(self, connection: sqlite3.Connection) -> bool:
+        def start(self, connection: SQLConnection) -> bool:
             entered.set()
             assert release.wait(timeout=5)
             return super().start(connection)

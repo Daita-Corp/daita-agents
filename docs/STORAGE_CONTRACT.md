@@ -9,11 +9,16 @@ with their domain. Mypy checks implementation and consumer conformance; the
 architecture check verifies composition and dependency boundaries rather than
 requiring every public SQLite helper to become a backend operation.
 
-SQLite is currently the only durable backend. `Agent.create`, `Agent.open`,
-deletion and home upgrades still select local storage explicitly. This change
-does not implement PostgreSQL, a backend selector, or distributed writer leases.
-A PostgreSQL implementation must work with ordinary PostgreSQL and must not
-require a particular database provider or application deployment.
+SQLite and PostgreSQL implement this contract through the same SQL operations
+and strict record codecs. Backend-specific admission, connections and physical
+schemas stay separate. See [PostgreSQL state](POSTGRES_STATE.md) for provisioning,
+security, fencing, and failure handling. It uses ordinary PostgreSQL without a
+provider-specific client or deployment dependency.
+
+`Agent.create`, `Agent.open`, deletion and home upgrades still select local storage
+explicitly. Remote configuration, immutable bytes, a backend selector and a
+distributed execution lease are separate work. PostgreSQL state alone does not
+make a local agent home remotely runnable.
 
 ## Ownership and lifecycle
 
@@ -126,27 +131,39 @@ while waiting for a model, source, or artifact operation.
 
 ## Conformance and release gates
 
+Maintain the home contract once. PostgreSQL physical tables are projected from
+the canonical schema, both backends use `CURRENT_HOME_REVISION`, and the existing
+home release check covers both. Do not maintain a parallel PostgreSQL feature
+schema, migration counter or release checklist. Backend-specific infrastructure
+mechanics remain adapter-owned. Data transformations must be authored once and
+qualified on both backends as remote-home upgrades are integrated.
+
 ```bash
 .venv/bin/python -m pytest tests/storage/contracts
+# Real disposable TLS PostgreSQL plus SQLite; requires Docker and OpenSSL.
+.venv/bin/python -m pytest tests/storage/contracts tests/storage/postgres --postgres
 .venv/bin/python -m pytest tests/hosting/test_storage_resilience.py tests/storage/test_remote_readiness.py
 ```
 
-The portable factory opens independent handles to disposable state. It currently
-runs SQLite. Add PostgreSQL only with a real disposable database fixture; missing
-prerequisites must fail qualification rather than silently skipping that backend.
+The portable factory opens independent handles to disposable state. It runs SQLite
+by default and both SQLite and real PostgreSQL with `--postgres`. Missing Docker,
+OpenSSL or driver prerequisites fail PostgreSQL qualification rather than skipping it.
 The portable cases use logical operations without SQL or concrete store internals.
 
 Coverage includes graph claims/fences/budgets/replay/finalizers, identity and
 transcript recovery, passive connection setup, scoped effect recovery, transcript
 pages/access, artifact lifecycle/cursors, and routine authority/claims/budgets/
-recovery/delivery. SQLite-specific cases additionally exercise real process
+recovery/delivery, catalog/permission detach, semantic digest CAS, learning review
+stamps and connector revisions. PostgreSQL-specific cases cover actual restricted
+roles, forged namespace settings, colliding IDs, schema admission, writer epochs,
+cancellation, backend termination, and lost commit acknowledgements.
+SQLite-specific cases additionally exercise real process
 contention, transaction rollback, read snapshots and query-count budgets.
 Supervisor integration cases exercise transient and terminal storage failures,
 health reporting, idle polling and prompt wakeup without model calls.
 
-Before qualifying a second backend, run a behavior matrix for every reachable
-operation, extending source/scope, catalog, MCP, effect resolution, learning,
-semantics, artifact and deletion coverage as necessary. Mandatory fault cases:
+Before integrating a remote agent home, extend qualification to the complete
+composition and deployment. Mandatory remaining acceptance areas include:
 
 - Competing processes and connections claiming the same work.
 - Ownership takeover while the previous process is paused; rejection of every
@@ -159,9 +176,10 @@ semantics, artifact and deletion coverage as necessary. Mandatory fault cases:
 - Representative latency, query counts, connection peaks, retention growth and
   total database work across many active and idle agents.
 
-The current SQLite results do not prove PostgreSQL parity, distributed ownership,
-or remote storage capacity. Remote configuration, artifact/skill bytes and
-whole-home conversion remain separate implementation and qualification work.
+The backend contracts do not prove complete remote agent execution, distributed
+ownership, transaction-pooler compatibility or production capacity. Remote
+configuration, artifact/skill bytes and whole-home conversion remain separate
+implementation and qualification work.
 
 ## Test reconciliation
 

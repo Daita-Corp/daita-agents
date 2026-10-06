@@ -11,7 +11,7 @@ from typing import cast
 import pytest
 
 import daita.catalog.service as catalog_service
-import daita.storage.sqlite as sqlite_store
+import daita.storage.sql as sqlite_store
 from daita import Agent, CatalogSummary, SQLiteSource
 from daita.adapters.models import SourceRegistration
 from daita.catalog import (

@@ -96,6 +96,8 @@ def test_default_distribution_contains_every_supported_production_dependency():
     assert set(project["dependencies"]) == {
         "anthropic>=0.116.0,<1.0.0",
         "asyncpg>=0.30.0,<1.0.0",
+        "psycopg[binary]>=3.2.0,<4.0.0",
+        "psycopg-pool>=3.2.0,<4.0.0",
         "google-genai>=2.22.0,<3.0.0",
         "keyring>=25.0.0,<26.0.0",
         "openai>=2.45.0,<3.0.0",
@@ -361,6 +363,15 @@ def test_missing_default_runtime_dependencies_use_pipx_repair_guidance(
     assert "daita-agents[" not in str(error)
 
 
+@pytest.mark.parametrize("module", ("psycopg", "psycopg_pool"))
+def test_missing_postgres_state_dependencies_use_pipx_repair_guidance(module):
+    from daita.storage.postgres import _load_driver
+
+    error = _missing_import(module, _load_driver)
+    assert PIPX_REPAIR in str(error)
+    assert "daita-agents[" not in str(error)
+
+
 def test_missing_asyncpg_uses_pipx_repair_guidance():
     with patch.object(postgresql, "import_module", side_effect=ImportError):
         with pytest.raises(ImportError) as caught:
@@ -474,6 +485,8 @@ blocked = {
     "mcp",
     "openai",
     "prompt_toolkit",
+    "psycopg",
+    "psycopg_pool",
     "rich",
     "textual",
     "sqlglot",
@@ -490,6 +503,7 @@ def guarded(name, *args, **kwargs):
 builtins.__import__ = guarded
 import daita
 import daita.cli
+import daita.storage.postgres
 from daita.adapters.mcp import (
     MCPClient, MCPClientFactory, MCPPersonalConnectionClient, SDKMCPClientFactory,
 )

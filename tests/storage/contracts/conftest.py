@@ -12,19 +12,38 @@ from tests.storage._support import StateStoreFactory
 from tests.support.graph import GRAPH_NOW
 
 
-@pytest.fixture(params=["sqlite"])
+def pytest_generate_tests(metafunc):
+    if "state_store_backend" in metafunc.fixturenames:
+        backends = (
+            ["sqlite", "postgres"]
+            if metafunc.config.getoption("--postgres")
+            else ["sqlite"]
+        )
+        metafunc.parametrize("state_store_backend", backends)
+
+
+@pytest.fixture
 def state_store_factory(
-    request: pytest.FixtureRequest, tmp_path: Path
+    request: pytest.FixtureRequest, tmp_path: Path, state_store_backend: str
 ) -> StateStoreFactory:
-    # Add Postgres only with a real disposable database implementation. Missing
-    # prerequisites must fail qualification, never silently skip that backend.
-    assert request.param == "sqlite"
+    postgres_config = (
+        request.getfixturevalue("postgres_config")
+        if state_store_backend == "postgres"
+        else None
+    )
 
     @asynccontextmanager
     async def open_store() -> AsyncIterator[StateStore]:
-        store: StateStore = await SQLiteStateStore.open(
-            tmp_path / "state.db", clock=lambda: GRAPH_NOW
-        )
+        if postgres_config is not None:
+            from daita.storage.postgres import PostgresStateStore
+
+            store: StateStore = await PostgresStateStore.open(
+                postgres_config, clock=lambda: GRAPH_NOW
+            )
+        else:
+            store = await SQLiteStateStore.open(
+                tmp_path / "state.db", clock=lambda: GRAPH_NOW
+            )
         try:
             yield store
         finally:

@@ -94,6 +94,7 @@ See [relational writes](docs/RELATIONAL_WRITES.md),
 | Learning, business meaning, and procedures | [Learning and semantics](docs/LEARNING_AND_SEMANTICS.md) |
 | Model setup and subscriptions | [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
 | Python API walkthroughs | [Offline examples](examples/README.md) |
+| State backend contracts and PostgreSQL setup | [Storage contract](docs/STORAGE_CONTRACT.md) · [PostgreSQL state](docs/POSTGRES_STATE.md) |
 | Architecture and development | [Repository guide](AGENTS.md) · [Contributing](CONTRIBUTING.md) |
 | Private vulnerability reporting | [Security policy](SECURITY.md) |
 
