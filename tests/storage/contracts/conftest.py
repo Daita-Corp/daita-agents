@@ -10,6 +10,7 @@ from daita.storage.protocols import StateStore
 from daita.storage.sqlite import SQLiteStateStore
 from tests.artifacts.byte_storage_support import MemoryByteStorage
 from tests.storage._support import StateStoreFactory
+from tests.storage.advisory_support import MemoryAdvisoryStorage
 from tests.support.graph import GRAPH_NOW
 
 
@@ -50,3 +51,11 @@ def artifact_byte_storage(request: pytest.FixtureRequest):
     if backend_fixture is not None:
         return request.getfixturevalue(backend_fixture)
     return MemoryByteStorage()
+
+
+@pytest.fixture
+def advisory_storage(request: pytest.FixtureRequest):
+    backend_fixture = getattr(request, "param", None)
+    if backend_fixture is not None:
+        return request.getfixturevalue(backend_fixture)
+    return MemoryAdvisoryStorage()

@@ -39,7 +39,10 @@ Indirectly parameterize `state_store_factory` with the name of a fixture returni
 an async context-manager factory; each call must open a new handle to the same
 disposable state. Indirectly parameterize `artifact_byte_storage` with the name of
 a byte-storage fixture exposing the test dependency's `objects`, `publications`,
-`reads` and `deleted` observations. Defaults use SQLite and in-memory bytes.
+`reads` and `deleted` observations. `advisory_storage` accepts the name of a fixture
+implementing the document transaction contract. Its cases cover memory/skill
+semantics and public agent admission, tool execution, cancellation and reopening.
+Defaults use SQLite and in-memory byte/document dependencies.
 Tests never select an infrastructure provider from ambient credentials.
 
 Keep concrete driver, transport, isolation, provisioning and failure tests with

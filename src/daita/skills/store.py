@@ -14,6 +14,7 @@ from typing import TypeVar
 from uuid import uuid4
 
 from ..llm.models import ModelSensitivity
+from ..storage.advisory import AdvisoryDocument, AdvisoryStorage, AdvisoryTransaction
 
 SKILL_MAX_COUNT = 32
 SKILL_DESCRIPTION_MAX_CHARACTERS = 240
@@ -84,13 +85,28 @@ class Skill:
 class SkillStore:
     """Own one deterministic tree of bounded ``SKILL.md`` documents."""
 
-    def __init__(self, agent_home: Path, mutation_lock: asyncio.Lock) -> None:
+    def __init__(
+        self,
+        agent_home: Path | None,
+        mutation_lock: asyncio.Lock,
+        *,
+        storage: AdvisoryStorage | None = None,
+    ) -> None:
+        if (agent_home is None) == (storage is None):
+            raise ValueError("select exactly one skill home or storage")
+        if not isinstance(mutation_lock, asyncio.Lock):
+            raise TypeError("mutation_lock must be an asyncio.Lock")
+        self._storage = storage
+        self._mutation_lock = mutation_lock
+        self._closed = False
+        self._home: Path | None = None
+        self._home_identity: tuple[int, int] | None = None
+        if storage is not None:
+            return
         if not isinstance(agent_home, Path):
             raise TypeError("agent_home must be a Path")
         if not agent_home.is_absolute() or ".." in agent_home.parts:
             raise SkillPathError("agent home must be an absolute contained path")
-        if not isinstance(mutation_lock, asyncio.Lock):
-            raise TypeError("mutation_lock must be an asyncio.Lock")
         home = Path(os.path.abspath(os.fspath(agent_home)))
         try:
             home_state = os.lstat(home)
@@ -102,8 +118,6 @@ class SkillStore:
             raise SkillPathError("agent home cannot contain a symlink or path alias")
         self._home = home
         self._home_identity = (home_state.st_dev, home_state.st_ino)
-        self._mutation_lock = mutation_lock
-        self._closed = False
 
     async def list_skills(self) -> tuple[SkillSummary, ...]:
         skills = await self._run_locked(self._list_sync)
@@ -172,12 +186,12 @@ class SkillStore:
 
         skill = Skill(name, description, instructions, sensitivity)
         self._require_open()
-        _selected, exists, digest, state_digest, index_digest = await asyncio.to_thread(
-            self._inspect_sync,
-            name,
-            skill,
-            False,
+        inspected, cancelled = await _await_sync_completion(
+            lambda: self._inspect_sync(name, skill, False)
         )
+        if cancelled:
+            raise asyncio.CancelledError
+        _selected, exists, digest, state_digest, index_digest = inspected
         return exists, digest, state_digest, index_digest
 
     async def preflight_delete(self, name: str) -> tuple[bool, str, str, str]:
@@ -185,12 +199,12 @@ class SkillStore:
 
         validate_skill_name(name)
         self._require_open()
-        _selected, exists, digest, state_digest, index_digest = await asyncio.to_thread(
-            self._inspect_sync,
-            name,
-            None,
-            True,
+        inspected, cancelled = await _await_sync_completion(
+            lambda: self._inspect_sync(name, None, True)
         )
+        if cancelled:
+            raise asyncio.CancelledError
+        _selected, exists, digest, state_digest, index_digest = inspected
         return exists, digest, state_digest, index_digest
 
     async def save_from_tool(
@@ -208,7 +222,12 @@ class SkillStore:
         skill = Skill(name, description, instructions, sensitivity)
         rendered = _render_skill(skill)
         self._require_open()
-        return await asyncio.to_thread(self._save_sync, skill, rendered)
+        value, cancelled = await _await_sync_completion(
+            lambda: self._save_sync(skill, rendered)
+        )
+        if cancelled:
+            raise asyncio.CancelledError
+        return value
 
     async def delete_from_tool(self, name: str) -> bool:
         """Delete after runtime authorization while the shared lock is held."""
@@ -217,7 +236,10 @@ class SkillStore:
             raise SkillStoreError("tool deletion requires the mutation lock")
         validate_skill_name(name)
         self._require_open()
-        return await asyncio.to_thread(self._delete_sync, name)
+        value, cancelled = await _await_sync_completion(lambda: self._delete_sync(name))
+        if cancelled:
+            raise asyncio.CancelledError
+        return value
 
     async def close(self) -> None:
         async with self._mutation_lock:
@@ -236,6 +258,10 @@ class SkillStore:
             raise SkillStoreError("skill store is closed")
 
     def _list_sync(self) -> tuple[Skill, ...]:
+        if self._storage is not None:
+            with self._storage.transaction() as transaction:
+                skills, _ = _stored_skills(transaction)
+                return skills
         home = self._open_home()
         try:
             root, root_state = _open_directory(home, _SKILLS_DIRECTORY, required=False)
@@ -251,6 +277,10 @@ class SkillStore:
             os.close(home)
 
     def _read_sync(self, name: str) -> Skill | None:
+        if self._storage is not None:
+            return next(
+                (skill for skill in self._list_sync() if skill.name == name), None
+            )
         home = self._open_home()
         try:
             root, root_state = _open_directory(home, _SKILLS_DIRECTORY, required=False)
@@ -269,6 +299,31 @@ class SkillStore:
             os.close(home)
 
     def _retain_sync(self, name: str, digest: str) -> Skill:
+        if self._storage is not None:
+            with self._storage.transaction(write=True) as transaction:
+                skills, _ = _stored_skills(transaction)
+                current = next((skill for skill in skills if skill.name == name), None)
+                if current is None:
+                    raise SkillNotFoundError(name)
+                rendered = _render_skill(current)
+                if _rendered_document_sha256(rendered) != digest:
+                    raise SkillValidationError("current skill content digest changed")
+                retained_document = transaction.get(
+                    "retained-skills", digest, max_bytes=SKILL_RENDERED_MAX_UTF8_BYTES
+                )
+                if retained_document is not None:
+                    if (
+                        _decode_retained(retained_document.content, name, digest)
+                        != current
+                    ):
+                        raise SkillValidationError(
+                            "retained skill identity is inconsistent"
+                        )
+                    return current
+                count, size = transaction.usage("retained-skills")
+                _validate_retained_capacity(count, size, len(rendered))
+                transaction.put("retained-skills", digest, rendered)
+                return current
         current = self._read_sync(name)
         if current is None:
             raise SkillNotFoundError(name)
@@ -313,10 +368,7 @@ class SkillStore:
                 if retained != current:
                     raise SkillPathError("retained skill identity is inconsistent")
                 return retained
-            if len(entries) >= SKILL_RETAINED_MAX_COUNT:
-                raise SkillValidationError("retained skill count exceeds its limit")
-            if sum(sizes) + len(rendered) > SKILL_RETAINED_MAX_TOTAL_BYTES:
-                raise SkillValidationError("retained skill bytes exceed their limit")
+            _validate_retained_capacity(len(entries), sum(sizes), len(rendered))
             temporary = f".{digest}.{uuid4().hex}.tmp"
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
             flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
@@ -361,6 +413,16 @@ class SkillStore:
             os.close(home)
 
     def _read_retained_sync(self, name: str, digest: str) -> Skill | None:
+        if self._storage is not None:
+            with self._storage.transaction() as transaction:
+                document = transaction.get(
+                    "retained-skills", digest, max_bytes=SKILL_RENDERED_MAX_UTF8_BYTES
+                )
+                return (
+                    None
+                    if document is None
+                    else _decode_retained(document.content, name, digest)
+                )
         home = self._open_home()
         try:
             root, root_state = _open_directory(
@@ -407,9 +469,7 @@ class SkillStore:
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-        if _rendered_document_sha256(data) != digest:
-            raise SkillPathError("retained skill digest does not match its bytes")
-        return _parse_skill(data, name)
+        return _decode_retained(data, name, digest)
 
     def _inspect_sync(
         self,
@@ -417,13 +477,41 @@ class SkillStore:
         candidate: Skill | None,
         require_present: bool,
     ) -> tuple[Skill | None, bool, str, str, str]:
+        if self._storage is not None:
+            with self._storage.transaction() as transaction:
+                current, documents = _stored_skills(transaction)
+                selected = next(
+                    (skill for skill in current if skill.name == name), None
+                )
+                if selected is None and require_present:
+                    raise SkillNotFoundError(name)
+                if candidate is not None:
+                    _validate_skill_change(current, candidate)
+                document = documents.get(name)
+                return (
+                    selected,
+                    document is not None,
+                    _rendered_document_sha256(
+                        b"" if document is None else document.content
+                    ),
+                    (
+                        "absent"
+                        if document is None
+                        else sha256(document.revision.encode("utf-8")).hexdigest()
+                    ),
+                    sha256(
+                        render_skill_index(item.summary for item in current).encode(
+                            "utf-8"
+                        )
+                    ).hexdigest(),
+                )
         home = self._open_home()
         try:
             root, root_state = _open_directory(home, _SKILLS_DIRECTORY, required=False)
             if root is None:
                 if require_present:
                     raise SkillNotFoundError(name)
-                current: tuple[Skill, ...] = ()
+                current = ()
                 current_index = render_skill_index(())
                 selected = None
                 selected_bytes = b""
@@ -464,14 +552,7 @@ class SkillStore:
                     os.close(root)
 
             if candidate is not None:
-                by_name = {item.name: item for item in current}
-                proposed = dict(by_name)
-                proposed[candidate.name] = candidate
-                if candidate.name not in by_name and len(proposed) > SKILL_MAX_COUNT:
-                    raise SkillValidationError(
-                        f"skill count exceeds the {SKILL_MAX_COUNT} skill limit"
-                    )
-                render_skill_index(item.summary for item in proposed.values())
+                _validate_skill_change(current, candidate)
 
             return (
                 selected,
@@ -484,6 +565,15 @@ class SkillStore:
             os.close(home)
 
     def _save_sync(self, skill: Skill, rendered: bytes) -> bool:
+        if self._storage is not None:
+            with self._storage.transaction(write=True) as transaction:
+                current, documents = _stored_skills(transaction)
+                _validate_skill_change(current, skill)
+                prior = documents.get(skill.name)
+                if prior is not None and prior.content == rendered:
+                    return False
+                transaction.put("skills", skill.name, rendered)
+                return True
         home = self._open_home()
         root: int | None = None
         root_created = False
@@ -495,13 +585,7 @@ class SkillStore:
             root, root_state = _open_directory(home, _SKILLS_DIRECTORY, required=False)
             current = () if root is None else _list_from_root(root)
             by_name = {item.name: item for item in current}
-            candidate = dict(by_name)
-            candidate[skill.name] = skill
-            if skill.name not in by_name and len(candidate) > SKILL_MAX_COUNT:
-                raise SkillValidationError(
-                    f"skill count exceeds the {SKILL_MAX_COUNT} skill limit"
-                )
-            render_skill_index(item.summary for item in candidate.values())
+            _validate_skill_change(current, skill)
 
             if root is None:
                 try:
@@ -608,6 +692,16 @@ class SkillStore:
             os.close(home)
 
     def _delete_sync(self, name: str) -> bool:
+        if self._storage is not None:
+            with self._storage.transaction(write=True) as transaction:
+                current, documents = _stored_skills(transaction)
+                if name not in documents:
+                    return False
+                render_skill_index(
+                    item.summary for item in current if item.name != name
+                )
+                transaction.delete("skills", name)
+                return True
         home = self._open_home()
         try:
             root, root_state = _open_directory(home, _SKILLS_DIRECTORY, required=False)
@@ -652,6 +746,8 @@ class SkillStore:
             os.close(home)
 
     def _open_home(self) -> int:
+        if self._home is None:
+            raise SkillPathError("external skill storage has no local home")
         try:
             lexical = os.lstat(self._home)
             if (
@@ -676,6 +772,45 @@ class SkillStore:
             raise
         except OSError as error:
             raise SkillPathError("agent home path is invalid") from error
+
+
+def _stored_skills(
+    transaction: AdvisoryTransaction,
+) -> tuple[tuple[Skill, ...], dict[str, AdvisoryDocument]]:
+    documents = dict(
+        transaction.scan(
+            "skills", max_count=SKILL_MAX_COUNT, max_bytes=SKILL_RENDERED_MAX_UTF8_BYTES
+        )
+    )
+    if len(documents) > SKILL_MAX_COUNT:
+        raise SkillValidationError("skill count exceeds its limit")
+    skills = tuple(
+        _parse_skill(document.content, name)
+        for name, document in sorted(documents.items())
+    )
+    render_skill_index(item.summary for item in skills)
+    return skills, documents
+
+
+def _validate_skill_change(current: tuple[Skill, ...], candidate: Skill) -> None:
+    proposed = {item.name: item for item in current}
+    proposed[candidate.name] = candidate
+    render_skill_index(item.summary for item in proposed.values())
+
+
+def _validate_retained_capacity(count: int, size: int, additional_bytes: int) -> None:
+    if count < 0 or size < 0:
+        raise SkillValidationError("retained skill usage is invalid")
+    if count >= SKILL_RETAINED_MAX_COUNT:
+        raise SkillValidationError("retained skill count exceeds its limit")
+    if size + additional_bytes > SKILL_RETAINED_MAX_TOTAL_BYTES:
+        raise SkillValidationError("retained skill bytes exceed their limit")
+
+
+def _decode_retained(data: bytes, name: str, digest: str) -> Skill:
+    if _rendered_document_sha256(data) != digest:
+        raise SkillPathError("retained skill digest does not match its bytes")
+    return _parse_skill(data, name)
 
 
 def validate_skill_name(name: str) -> None:

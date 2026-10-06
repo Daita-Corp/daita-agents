@@ -15,7 +15,7 @@ import sqlite3
 import stat
 import tomllib
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -56,6 +56,7 @@ from ..adapters.postgresql_write import (
 from ..adapters.protocols import ResourceAdapter, ResourceAdapterError, ResourceSource
 from ..adapters.sqlite import SQLiteSource
 from ..adapters.sqlite_query import SQLiteQueryBackend
+from ..artifacts.bytes import ArtifactByteStorage
 from ..artifacts.delivery import (
     ArtifactDestinationGrant,
     LocalArtifactDelivery,
@@ -296,6 +297,7 @@ from ..skills.capabilities import (
     skill_declarations,
 )
 from ..skills.store import validate_skill_documents
+from ..storage.advisory import AdvisoryStorage
 from ..storage.protocols import StateStore
 from ..storage.sqlite import (
     SQLiteStateStore,
@@ -760,10 +762,10 @@ class EmbeddedAgent:
         self,
         *,
         identity: AgentIdentity,
-        home: Path,
+        home: Path | None,
         workspace: LocalWorkspace | None,
         workspace_backend: LocalWorkspaceBackend | None,
-        writer_lock: _WriterLock,
+        writer_lock: _WriterLock | None,
         store: StateStore,
         distribution_owner: DistributionOwner,
         loop: AgentLoop | None,
@@ -810,9 +812,11 @@ class EmbeddedAgent:
         hosted: bool,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
+        close_state: bool = True,
     ) -> None:
         self.identity = identity
-        self.home = home
+        self._home = home
+        self._close_state = close_state
         self._workspace = workspace
         self._workspace_backend = workspace_backend
         self.model_profile = model_profile
@@ -882,6 +886,14 @@ class EmbeddedAgent:
         self._closed = False
         self._close_task: asyncio.Task[None] | None = None
         self._model_reopen_required = False
+
+    @property
+    def home(self) -> Path:
+        if self._home is None:
+            raise AgentHomeError(
+                "externally stored agents have no local home; configuration belongs to the caller"
+            )
+        return self._home
 
     @property
     def workspace(self) -> LocalWorkspace:
@@ -1288,21 +1300,7 @@ class EmbeddedAgent:
                     "agent.toml does not match state.db identity"
                 )
             await store.list_sources(identity.id)
-            _, cancelled = await _await_async_completion(
-                lambda: store.recover_started_effect_receipts(
-                    identity.id, recovered_at=resolved_clock()
-                )
-            )
-            if cancelled:
-                raise asyncio.CancelledError
-            _, cancelled = await _await_async_completion(
-                lambda: store.recover_unfinished_runs(
-                    identity.id,
-                    created_at=resolved_clock(),
-                )
-            )
-            if cancelled:
-                raise asyncio.CancelledError
+            await _recover_agent_state(store, identity.id, resolved_clock)
             if not explicit_configuration:
                 persisted, cancelled = await _await_sync_completion(
                     lambda: _read_model_configuration(home, identity.id)
@@ -1379,15 +1377,127 @@ class EmbeddedAgent:
             raise
 
     @classmethod
+    async def from_storage(
+        cls,
+        *,
+        agent_id: str,
+        state: StateStore,
+        advisory_storage: AdvisoryStorage,
+        artifact_storage: ArtifactByteStorage,
+        config: AgentConfig | None = None,
+        model: ModelProvider | None = None,
+        model_profile: ModelProfile | None = None,
+        limits: LoopLimits | None = None,
+        clock: Callable[[], datetime] | None = None,
+        id_factory: Callable[[str], str] | None = None,
+        secret_provider: SecretProvider | None = None,
+        mcp_client_factory: MCPClientFactory | None = None,
+        mcp_connection_provider: MCPConnectionProvider | None = None,
+        keychain: KeychainStore | None = None,
+        reviewer_model: ModelProvider | None = None,
+        reviewer_profile: ModelProfile | None = None,
+        reviewer_max_estimated_cost_usd: Decimal | None = None,
+        observer: AgentObserver | None = None,
+        approval_handler: ApprovalHandler | None = None,
+    ) -> Self:
+        """Compose the existing runtime over caller-admitted, borrowed storage.
+
+        The caller must validate/upgrade all storage, initialize identity and hold
+        exclusive execution ownership before this call. Recovery runs here, once
+        before supervisors start. Keep supplied resources and ownership alive
+        throughout admission and, on success, until close succeeds. No local
+        home, configuration persistence, provisioning or lease is created here.
+        """
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError("agent_id must be non-empty text")
+        resolved_clock = clock or _utc_now
+        resolved_ids = id_factory or _new_id
+
+        async def compose() -> Self:
+            credential_session, owns_credentials = _resolve_credential_session(keychain)
+            runtime_secrets = secret_provider or credential_session
+            async with AsyncExitStack() as cleanup:
+                if owns_credentials:
+                    cleanup.push_async_callback(credential_session.close)
+                identity = await state.load_identity()
+                if identity is None or identity.id != agent_id:
+                    raise AgentIdentityMismatchError(
+                        "storage does not match the requested agent identity"
+                    )
+                resolved_model, profile, route, resolved_limits, policy = (
+                    _resolve_configuration(
+                        config,
+                        model=model,
+                        model_profile=model_profile,
+                        limits=limits,
+                        secret_provider=runtime_secrets,
+                    )
+                )
+                if route is not None:
+                    assert isinstance(resolved_model, ManagedModelProvider)
+                    cleanup.push_async_callback(resolved_model.close)
+                await state.list_sources(identity.id)
+                await _recover_agent_state(state, identity.id, resolved_clock)
+                artifact_store = await AgentHomeArtifactStore.open(
+                    agent_id=identity.id,
+                    registry=state,
+                    byte_storage=artifact_storage,
+                    clock=resolved_clock,
+                    id_factory=resolved_ids,
+                )
+                cleanup.push_async_callback(artifact_store.close)
+                return await cls._compose(
+                    identity=identity,
+                    home=None,
+                    workspace=None,
+                    workspace_backend=None,
+                    hosted=True,
+                    writer_lock=None,
+                    store=state,
+                    close_state=False,
+                    model=resolved_model,
+                    model_profile=profile,
+                    model_route=route,
+                    context_builder=None,
+                    tools=None,
+                    limits=resolved_limits,
+                    model_call_policy=policy,
+                    clock=resolved_clock,
+                    id_factory=resolved_ids,
+                    secret_provider=runtime_secrets,
+                    mcp_client_factory=mcp_client_factory,
+                    mcp_connection_provider=mcp_connection_provider,
+                    keychain=credential_session,
+                    owns_credential_session=owns_credentials,
+                    model_validator=None,
+                    reviewer_model=reviewer_model,
+                    reviewer_profile=reviewer_profile,
+                    reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
+                    observer=observer,
+                    approval_handler=approval_handler,
+                    artifact_store=artifact_store,
+                    artifact_delivery=None,
+                    advisory_storage=advisory_storage,
+                    admission_cleanup=cleanup,
+                )
+
+        embedded: Self
+        embedded, cancelled = await _await_async_completion(compose)
+        if cancelled:
+            await embedded.close()
+            raise asyncio.CancelledError
+        return embedded
+
+    @classmethod
     async def _compose(
         cls,
         *,
         identity: AgentIdentity,
-        home: Path,
+        home: Path | None,
         workspace: LocalWorkspace | None,
         workspace_backend: LocalWorkspaceBackend | None,
         hosted: bool,
-        writer_lock: _WriterLock,
+        writer_lock: _WriterLock | None,
         store: StateStore,
         model: ModelProvider | None,
         model_profile: ModelProfile | None,
@@ -1411,6 +1521,9 @@ class EmbeddedAgent:
         approval_handler: ApprovalHandler | None,
         artifact_store: AgentHomeArtifactStore,
         artifact_delivery: LocalArtifactDelivery | None,
+        advisory_storage: AdvisoryStorage | None = None,
+        close_state: bool = True,
+        admission_cleanup: AsyncExitStack | None = None,
     ) -> Self:
         owned_model_provider: ManagedModelProvider | None = None
         if model_route is not None:
@@ -1503,8 +1616,11 @@ class EmbeddedAgent:
             identity=identity.id,
             home=home,
         )
-        memory_store = MemoryStore(home, memory_lock)
-        skill_store = SkillStore(home, skill_lock)
+        memory_store = MemoryStore(home, memory_lock, storage=advisory_storage)
+        skill_store = SkillStore(home, skill_lock, storage=advisory_storage)
+        if advisory_storage is not None:
+            await memory_store.read_context()
+            await skill_store.list_skills()
         resolved_reviewer_model = reviewer_model
         resolved_reviewer_profile = reviewer_profile
         owned_reviewer_model: ManagedModelProvider | None = None
@@ -1522,6 +1638,8 @@ class EmbeddedAgent:
                 secret_provider=secret_provider or keychain,
             )
             owned_reviewer_model = resolved_reviewer_model
+            if admission_cleanup is not None:
+                admission_cleanup.push_async_callback(owned_reviewer_model.close)
         resolved_reviewer_profile = _resolve_candidate_reviewer_profile(
             resolved_reviewer_model,
             resolved_reviewer_profile,
@@ -1773,6 +1891,9 @@ class EmbeddedAgent:
                 "The saved model route is incompatible with attached MCP tools. "
                 "Choose a compatible model or update MCP access."
             ) from error
+        if admission_cleanup is not None:
+            for activated in mcp_activated_bindings:
+                admission_cleanup.push_async_callback(activated.executor.close)
         base_domains = (
             data_domain,
             memory_domain,
@@ -2248,12 +2369,19 @@ class EmbeddedAgent:
             mcp_connection_provider=mcp_connection_provider,
             mcp_activated_bindings=mcp_activated_bindings,
             stage_mcp_catalog=stage_mcp_catalog,
+            close_state=close_state,
             hosted=hosted,
             clock=clock,
             id_factory=id_factory,
         )
-        await job_supervisor.start()
-        await routine_supervisor.start()
+        if admission_cleanup is not None:
+            admission_cleanup.pop_all()  # The completed runtime now owns cleanup.
+        try:
+            await job_supervisor.start()
+            await routine_supervisor.start()
+        except BaseException:
+            await embedded.close()
+            raise
         return embedded
 
     def model_requires_explicit_limits(self, *, provider: str, model: str) -> bool:
@@ -3656,7 +3784,7 @@ class EmbeddedAgent:
                 model,
                 self._admission_coordinator,
                 identity=self.identity.id,
-                home=self.home,
+                home=self._home,
             )
             assert admitted_model is not None
             try:
@@ -5471,7 +5599,7 @@ class EmbeddedAgent:
                 else ()
             ),
             self._artifact_store,
-            self._store,
+            *((self._store,) if self._close_state else ()),
         ):
             try:
                 await store.close()
@@ -5484,7 +5612,8 @@ class EmbeddedAgent:
             except BaseException as error:
                 if first_error is None:
                     first_error = error
-        self._writer_lock.release()
+        if self._writer_lock is not None:
+            self._writer_lock.release()
         if first_error is not None:
             raise first_error
 
@@ -5509,7 +5638,7 @@ def _admit_host_model(
     coordinator: RunAdmissionCoordinator,
     *,
     identity: str,
-    home: Path,
+    home: Path | None,
 ) -> ModelProvider | None:
     """Bind one host-owned provider at its exact request-attempt boundary."""
 
@@ -5523,7 +5652,7 @@ def _admit_host_model(
         if not model.provider_admission_bound:
             model.bind_provider_admission(admit)
         return model
-    key = f"injected:{model.provider_id}:{home.resolve()}"
+    key = f"injected:{model.provider_id}:{home.resolve() if home is not None else identity}"
     return AdmittedModelProvider(
         model,
         concurrency_key=key,
@@ -6619,6 +6748,21 @@ async def _await_sync_completion(callback: Callable[[], _T]) -> tuple[_T, bool]:
             cancelled = True
             continue
     return worker.result(), cancelled
+
+
+async def _recover_agent_state(
+    store: StateStore, agent_id: str, clock: Callable[[], datetime]
+) -> None:
+    _, cancelled = await _await_async_completion(
+        lambda: store.recover_started_effect_receipts(agent_id, recovered_at=clock())
+    )
+    if cancelled:
+        raise asyncio.CancelledError
+    _, cancelled = await _await_async_completion(
+        lambda: store.recover_unfinished_runs(agent_id, created_at=clock())
+    )
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 async def _await_async_completion(

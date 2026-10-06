@@ -51,11 +51,12 @@ store may recover pending rows: its caller must already hold exclusive execution
 ownership and fence the previous writer. This component does not provide an
 execution lease or external garbage collector.
 
-Public `Agent.create/open` still select local homes. These component interfaces
-are not yet complete custom-home composition. Local manifests, released home
-revisions and the existing release snapshot remain unchanged. Concrete adapter
-layout compatibility and records-plus-bytes restoration require qualification in
-the consuming application.
+Public `Agent.create/open` select local homes. `Agent.from_storage` accepts this
+byte interface alongside caller-admitted state and advisory documents; see the
+[storage contract](STORAGE_CONTRACT.md). Local manifests, released home revisions
+and the existing release snapshot remain unchanged. Concrete adapter layout
+compatibility and records-plus-bytes restoration require qualification in the
+consuming application.
 
 `tests/storage/contracts/test_artifact_bytes.py` exercises the real lifecycle
 with a disposable byte dependency: reopen, caller filtering, publication
