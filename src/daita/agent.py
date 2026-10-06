@@ -31,6 +31,7 @@ from .adapters.protocols import (
     ResourceAdapterError as SourceRefreshError,
     ResourceSource,
 )
+from .artifacts.bytes import ArtifactByteStorage
 from .artifacts.models import (
     MAX_ARTIFACTS_PER_AGENT,
     ArtifactDeliveryReceipt,
@@ -106,6 +107,8 @@ from .semantics import (
     SemanticKind,
 )
 from .skills import Skill, SkillSummary
+from .storage.advisory import AdvisoryStorage
+from .storage.protocols import StateStore
 from .storage.sqlite_records import (
     EffectReceipt,
     EffectResolutionDecision,
@@ -270,6 +273,63 @@ class Agent:
                 observer=observer,
                 approval_handler=approval_handler,
                 downloads_directory=downloads_directory,
+            )
+        )
+
+    @classmethod
+    async def from_storage(
+        cls,
+        *,
+        agent_id: str,
+        state: StateStore,
+        advisory_storage: AdvisoryStorage,
+        artifact_storage: ArtifactByteStorage,
+        config: AgentConfig | None = None,
+        model: ModelProvider | None = None,
+        model_profile: ModelProfile | None = None,
+        limits: LoopLimits | None = None,
+        clock: Callable[[], datetime] | None = None,
+        id_factory: Callable[[str], str] | None = None,
+        secret_provider: SecretProvider | None = None,
+        mcp_client_factory: MCPClientFactory | None = None,
+        mcp_connection_provider: MCPConnectionProvider | None = None,
+        keychain: KeychainStore | None = None,
+        reviewer_model: ModelProvider | None = None,
+        reviewer_profile: ModelProfile | None = None,
+        reviewer_max_estimated_cost_usd: Decimal | None = None,
+        observer: AgentObserver | None = None,
+        approval_handler: ApprovalHandler | None = None,
+    ) -> Self:
+        """Open an admitted agent with caller-owned storage and execution ownership.
+
+        The caller initializes identity, upgrades/validates storage and fences
+        previous writers first. This method recovers state and starts the normal
+        runtime. Close the agent successfully before releasing ownership or any
+        supplied storage; state, document and byte transports remain borrowed.
+        Configuration is supplied for each open. Local files and persisted model
+        configuration controls are unavailable; ``home`` raises AgentHomeError.
+        """
+        return cls(
+            await EmbeddedAgent.from_storage(
+                agent_id=agent_id,
+                state=state,
+                advisory_storage=advisory_storage,
+                artifact_storage=artifact_storage,
+                config=config,
+                model=model,
+                model_profile=model_profile,
+                limits=limits,
+                clock=clock,
+                id_factory=id_factory,
+                secret_provider=secret_provider,
+                mcp_client_factory=mcp_client_factory,
+                mcp_connection_provider=mcp_connection_provider,
+                keychain=keychain,
+                reviewer_model=reviewer_model,
+                reviewer_profile=reviewer_profile,
+                reviewer_max_estimated_cost_usd=reviewer_max_estimated_cost_usd,
+                observer=observer,
+                approval_handler=approval_handler,
             )
         )
 

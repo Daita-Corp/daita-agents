@@ -3113,11 +3113,16 @@ class CapabilityRuntime:
         error: BaseException,
         domain: CapabilityDomain | None,
     ) -> ToolResultBlock:
+        from .storage.errors import StorageError
         from .storage.sqlite_records import (
             EffectReceiptConflictError,
             EffectUnresolvedError,
         )
 
+        if isinstance(error, StorageError):
+            # Storage uncertainty belongs to the execution owner, never to a
+            # model correction/retry loop. Preserve the typed failure.
+            raise error
         if isinstance(error, EffectUnresolvedError):
             return _error(
                 call,

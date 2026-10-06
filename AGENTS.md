@@ -33,9 +33,12 @@ Never include private deployment identifiers or internal infrastructure docs.
 Improve injection in the existing owners rather than adding a parallel runtime,
 copying feature logic or building a general plugin framework. `SQLStateStore`,
 its `SQLDatabase`/`SQLConnection` protocols and `ArtifactByteStorage` are supported
-component extension points. Public `Agent.create/open` still compose local homes;
-complete custom-home composition requires a separate generic lifecycle contract.
-Do not present these component interfaces as a complete remote agent API.
+component extension points. `Agent.create/open` compose local homes;
+`Agent.from_storage` composes the same runtime over caller-admitted state,
+artifact bytes and `AdvisoryStorage` documents. Keep configuration persistence,
+provisioning, upgrades and execution leases with the caller. No generic lifecycle
+framework is needed. Physical document persistence must preserve the existing
+memory/skill owners' validation, bounds and canonical bytes.
 
 ## Architecture status: current revision 3
 

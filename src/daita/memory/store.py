@@ -12,6 +12,7 @@ from typing import TypeVar
 from uuid import uuid4
 
 from ..llm.models import ModelSensitivity
+from ..storage.advisory import AdvisoryDocument, AdvisoryStorage
 
 MEMORY_MAX_CHARACTERS = 2_200
 MEMORY_MAX_UTF8_BYTES = 8_800
@@ -40,13 +41,28 @@ class MemoryPathError(MemoryStoreError):
 class MemoryStore:
     """Own exactly MEMORY.md and USER.md beneath one admitted agent home."""
 
-    def __init__(self, agent_home: Path, mutation_lock: asyncio.Lock) -> None:
+    def __init__(
+        self,
+        agent_home: Path | None,
+        mutation_lock: asyncio.Lock,
+        *,
+        storage: AdvisoryStorage | None = None,
+    ) -> None:
+        if (agent_home is None) == (storage is None):
+            raise ValueError("select exactly one memory home or storage")
+        if not isinstance(mutation_lock, asyncio.Lock):
+            raise TypeError("mutation_lock must be an asyncio.Lock")
+        self._storage = storage
+        self._mutation_lock = mutation_lock
+        self._closed = False
+        self._home: Path | None = None
+        self._home_identity: tuple[int, int] | None = None
+        if storage is not None:
+            return
         if not isinstance(agent_home, Path):
             raise TypeError("agent_home must be a Path")
         if not agent_home.is_absolute() or ".." in agent_home.parts:
             raise MemoryPathError("agent home must be an absolute contained path")
-        if not isinstance(mutation_lock, asyncio.Lock):
-            raise TypeError("mutation_lock must be an asyncio.Lock")
         home = Path(os.path.abspath(os.fspath(agent_home)))
         try:
             home_state = os.lstat(home)
@@ -58,8 +74,6 @@ class MemoryStore:
             raise MemoryPathError("agent home cannot contain a symlink or path alias")
         self._home = home
         self._home_identity = (home_state.st_dev, home_state.st_ino)
-        self._mutation_lock = mutation_lock
-        self._closed = False
 
     async def read_memory(self) -> str:
         return await self._read(
@@ -101,6 +115,35 @@ class MemoryStore:
         """Read both documents and their owner labels in one bounded snapshot."""
 
         def read() -> tuple[str, str, ModelSensitivity]:
+            if self._storage is not None:
+                with self._storage.transaction() as transaction:
+                    memory, memory_floor = _decode_stored(
+                        transaction.get(
+                            "memory",
+                            _MEMORY_NAME,
+                            max_bytes=MEMORY_MAX_UTF8_BYTES + _LABEL_MAX_BYTES,
+                        ),
+                        _MEMORY_NAME,
+                        MEMORY_MAX_CHARACTERS,
+                        MEMORY_MAX_UTF8_BYTES,
+                    )
+                    user, user_floor = _decode_stored(
+                        transaction.get(
+                            "memory",
+                            _USER_NAME,
+                            max_bytes=USER_MAX_UTF8_BYTES + _LABEL_MAX_BYTES,
+                        ),
+                        _USER_NAME,
+                        USER_MAX_CHARACTERS,
+                        USER_MAX_UTF8_BYTES,
+                    )
+                    return (
+                        memory,
+                        user,
+                        max(
+                            memory_floor, user_floor, key=lambda item: item.routing_rank
+                        ),
+                    )
             directory = self._open_home()
             try:
                 memory, _, memory_floor = _read_owned(
@@ -137,12 +180,12 @@ class MemoryStore:
         name, max_characters, max_bytes = _target_contract(target)
         _validate_text(content, max_characters, max_bytes)
         self._require_open()
-        return await asyncio.to_thread(
-            self._preflight_replacement_sync,
-            name,
-            max_characters,
-            max_bytes,
+        value, cancelled = await _await_sync_completion(
+            lambda: self._preflight_replacement_sync(name, max_characters, max_bytes)
         )
+        if cancelled:
+            raise asyncio.CancelledError
+        return value
 
     async def replace_from_tool(
         self, target: str, content: str, *, sensitivity: ModelSensitivity
@@ -154,14 +197,11 @@ class MemoryStore:
         name, max_characters, max_bytes = _target_contract(target)
         data = _render_document(content, max_characters, max_bytes, sensitivity)
         self._require_open()
-        await asyncio.to_thread(
-            self._write_sync,
-            name,
-            content,
-            data,
-            max_characters,
-            max_bytes,
+        _, cancelled = await _await_sync_completion(
+            lambda: self._write_sync(name, content, data, max_characters, max_bytes)
         )
+        if cancelled:
+            raise asyncio.CancelledError
 
     async def close(self) -> None:
         async with self._mutation_lock:
@@ -205,6 +245,16 @@ class MemoryStore:
             raise MemoryStoreError("memory store is closed")
 
     def _read_sync(self, name: str, max_characters: int, max_bytes: int) -> str:
+        if self._storage is not None:
+            with self._storage.transaction() as transaction:
+                return _decode_stored(
+                    transaction.get(
+                        "memory", name, max_bytes=max_bytes + _LABEL_MAX_BYTES
+                    ),
+                    name,
+                    max_characters,
+                    max_bytes,
+                )[0]
         directory = self._open_home()
         try:
             text, _, _ = _read_owned(directory, name, max_characters, max_bytes)
@@ -220,6 +270,18 @@ class MemoryStore:
         max_characters: int,
         max_bytes: int,
     ) -> None:
+        if self._storage is not None:
+            with self._storage.transaction(write=True) as transaction:
+                _decode_stored(
+                    transaction.get(
+                        "memory", name, max_bytes=max_bytes + _LABEL_MAX_BYTES
+                    ),
+                    name,
+                    max_characters,
+                    max_bytes,
+                )
+                transaction.put("memory", name, data)
+            return
         directory = self._open_home()
         temporary = f".{name}.{uuid4().hex}.tmp"
         temporary_created = False
@@ -280,6 +342,21 @@ class MemoryStore:
         max_characters: int,
         max_bytes: int,
     ) -> tuple[bool, str, str]:
+        if self._storage is not None:
+            with self._storage.transaction() as transaction:
+                document = transaction.get(
+                    "memory", name, max_bytes=max_bytes + _LABEL_MAX_BYTES
+                )
+                current, _ = _decode_stored(document, name, max_characters, max_bytes)
+                return (
+                    document is not None,
+                    sha256(current.encode("utf-8")).hexdigest(),
+                    (
+                        "absent"
+                        if document is None
+                        else sha256(document.revision.encode("utf-8")).hexdigest()
+                    ),
+                )
         directory = self._open_home()
         try:
             current, state, _ = _read_owned(
@@ -314,6 +391,8 @@ class MemoryStore:
             os.close(directory)
 
     def _open_home(self) -> int:
+        if self._home is None:
+            raise MemoryPathError("external memory storage has no local home")
         try:
             lexical = os.lstat(self._home)
             if (
@@ -436,6 +515,21 @@ def _read_owned(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    text, sensitivity = _decode_document(data, name, max_characters, max_bytes)
+    return text, state, sensitivity
+
+
+def _decode_stored(
+    document: AdvisoryDocument | None, name: str, max_characters: int, max_bytes: int
+) -> tuple[str, ModelSensitivity]:
+    if document is None:
+        return "", ModelSensitivity.PUBLIC
+    return _decode_document(document.content, name, max_characters, max_bytes)
+
+
+def _decode_document(
+    data: bytes, name: str, max_characters: int, max_bytes: int
+) -> tuple[str, ModelSensitivity]:
     if len(data) > max_bytes + _LABEL_MAX_BYTES:
         raise MemoryValidationError(f"{name} exceeds the {max_bytes} UTF-8 byte limit")
     try:
@@ -454,7 +548,7 @@ def _read_owned(
                 "memory sensitivity label is invalid"
             ) from error
     _validate_text(text, max_characters, max_bytes)
-    return text, state, sensitivity
+    return text, sensitivity
 
 
 def _target_state(directory: int, name: str) -> os.stat_result | None:

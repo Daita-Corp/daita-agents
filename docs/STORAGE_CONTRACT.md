@@ -15,10 +15,73 @@ Applications can supply a database adapter without copying those operations.
 `SQLStateStore` is optional: a non-SQL backend can implement the existing
 domain-owned protocols composed by `StateStore` and run the same contract suite.
 
-`Agent.create`, `Agent.open`, deletion and home upgrades still select local storage
-explicitly. These component extension points do not yet provide complete custom
-agent-home composition. Configuration, memory, skills and execution ownership
-must participate in that lifecycle before an application can replace the home.
+`Agent.create`, `Agent.open`, deletion and home upgrades select local storage.
+`Agent.from_storage` composes the same runtime over caller-admitted storage.
+
+## Opening supplied storage
+
+```python
+from daita import Agent
+
+# The application has acquired exclusive ownership, fenced prior writers,
+# validated/upgraded all storage and initialized the expected agent identity.
+agent = await Agent.from_storage(
+    agent_id=expected_agent_id,
+    state=state_store,
+    advisory_storage=documents,
+    artifact_storage=artifact_bytes,
+    config=agent_config,
+    secret_provider=secrets,
+    keychain=credentials,
+)
+try:
+    result = await agent.run("Summarize the current catalog.")
+finally:
+    await agent.close()
+# Only after successful close: close supplied resources and release ownership.
+```
+
+This entry point verifies the stored identity before recovery, recovers abandoned
+effects and unfinished transcripts, opens the existing artifact lifecycle, and
+starts the existing supervisors. It borrows all three supplied storage resources;
+closing the agent drains its runtime without closing their clients or state
+handle. Admission cancellation settles started work and closes a composed runtime
+before returning cancellation. Keep resources and ownership alive throughout that
+await. Failure to drain must not be followed by releasing ownership beneath work.
+
+No local home or workspace is created. `agent.home`, local-file delivery and
+persisted model-configuration controls are unavailable. Supply `AgentConfig` or
+an injected provider each time; the application owns configuration persistence.
+Creation, deletion, schema validation/upgrades, credentials, ownership renewal
+and fencing belong to the application. This API does not implement them.
+
+## Memory and skill documents
+
+`daita.storage.advisory.AdvisoryStorage` supplies synchronous transactions beneath
+the existing `MemoryStore` and `SkillStore`. It does not replace their semantics.
+The three collections contain canonical bytes:
+
+| Collection | Key | Content |
+| --- | --- | --- |
+| `memory` | `MEMORY.md` or `USER.md` | Existing UTF-8 document and sensitivity label |
+| `skills` | Valid skill name | Existing complete `SKILL.md` bytes |
+| `retained-skills` | SHA-256 hex digest, without prefix | Immutable rendered skill bytes |
+
+`get` reads one bounded document; `scan` returns the complete bounded collection
+or rejects overflow; `usage` returns count and total bytes without loading content.
+`put` and `delete` run only in write transactions. Reads see a consistent snapshot;
+writes serialize all affected reads, quota checks and mutations within the agent.
+Every changed/recreated document has a fresh opaque revision (1–256 characters),
+including restoration of earlier bytes. Preflight uses that revision to reject
+changes made while approval was pending. A document's revision is transport
+metadata, not a new home-format revision.
+
+The stores retain encoding, sensitivity, bounds, index validation, approval
+preflight and retained-skill digest checks. The caller owns physical schema and
+transport lifetime. Normalize transport failures to `StorageError`; an unknown
+commit or lost ownership propagates to the execution owner and stops the run,
+without becoming a model-visible retry opportunity. No adapter may blindly replay
+a write. Transactions and transport waits must have finite bounds.
 
 ## SQL adapter extension
 
@@ -71,8 +134,8 @@ The lifecycle owner must follow this order:
 4. Drain executions and storage operations, close resources, then release ownership.
 
 Local composition retains `run/host.lock` through this sequence. Direct store
-callers are responsible for ownership before invoking recovery. The portable
-factory opens handles only; it never implicitly takes over an agent.
+callers are responsible for ownership before invoking recovery. `Agent.from_storage`
+requires that ownership already be held; it does not acquire or renew it.
 
 A remote backend must bind each execution handle immutably to one agent and one
 writer epoch. Every mutation must validate current ownership in the same short

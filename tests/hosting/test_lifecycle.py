@@ -217,6 +217,7 @@ async def test_close_drains_admission_before_store_and_writer_lock_close(
     )
     events: list[str] = []
     original_store_close = embedded._store.close
+    assert embedded._writer_lock is not None
     original_writer_release = embedded._writer_lock.release
 
     async def close_store():
