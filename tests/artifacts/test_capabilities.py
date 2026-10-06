@@ -501,7 +501,7 @@ async def test_result_snapshot_obeys_the_existing_artifact_quota(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import daita.storage.sqlite as artifact_store_module
+    import daita.storage.sql as artifact_store_module
 
     monkeypatch.setattr(artifact_store_module, "MAX_ARTIFACTS_PER_RUN", 1)
     provider = MockModelProvider(

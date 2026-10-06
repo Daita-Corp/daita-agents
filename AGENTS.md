@@ -20,11 +20,28 @@ Use this order of authority when repository material disagrees:
 Preserve unrelated working-tree changes. Historical code and documents can
 explain intent, but they do not define current behavior.
 
+## Extensibility boundary
+
+This repository is a broadly reusable open-source framework. Consumers should be
+able to supply their own infrastructure through narrow, documented interfaces.
+Keep agent semantics, validation, durable record formats, shared transformations,
+and the default local implementation here. Deployment-specific storage adapters,
+tenant mapping, provisioning, credential policy, distributed lease services and
+operational rollout belong to the consuming application, not this repository.
+Never include private deployment identifiers or internal infrastructure docs.
+
+Improve injection in the existing owners rather than adding a parallel runtime,
+copying feature logic or building a general plugin framework. `SQLStateStore`,
+its `SQLDatabase`/`SQLConnection` protocols and `ArtifactByteStorage` are supported
+component extension points. Public `Agent.create/open` still compose local homes;
+complete custom-home composition requires a separate generic lifecycle contract.
+Do not present these component interfaces as a complete remote agent API.
+
 ## Architecture status: current revision 3
 
-The current agent-home format is unreleased **revision 3**, extending released
+The current agent-home format is released **revision 3**, extending released
 revision 2 with caller/MCP contracts and an independent artifact registry.
-Released revisions 1 and 2 and their migrations remain immutable. Revision 3 is the
+Released revisions 1 through 3 and their migrations remain immutable. Revision 3 is the
 sole current runnable format; legacy decoders remain migration-only.
 
 The current revision-2 graph has these non-negotiable boundaries:
@@ -120,7 +137,10 @@ src/daita/
   distribution/              # outcomes, destinations, deliveries, inbox view
   memory/                     # bounded advisory memory
   skills/                     # bounded retained Markdown procedures
-  storage/sqlite.py           # durable state operation boundary
+  storage/sql.py              # shared state operations over supplied connections
+  storage/sql_connection.py   # supported database/connection adapter protocols
+  storage/sql_graph.py        # shared graph transactions
+  storage/sqlite.py           # default local database admission and connections
   storage/sqlite_schema.py    # exact current physical schema
   storage/sqlite_codecs/      # strict current-record serializers
   storage/home_migrations/    # sole append-only agent-home revision registry
@@ -418,7 +438,11 @@ revalidates the unchanged bound file, and atomically publishes the artifact.
 Drift requires a fresh read and edit.
 
 The artifact store is the sole storage boundary for committed artifact bytes
-and manifests. SQLite's `artifacts` table owns current identity, caller ownership,
+and manifests. `ArtifactByteStorage` supplies only exclusive publication,
+bounded reads and idempotent deletion; the existing registry and lifecycle owner
+retain identity, quotas, validation and recovery. Consumers own concrete clients,
+credentials, storage layout and resource lifetime. See `docs/ARTIFACT_STORAGE.md`.
+The shared `artifacts` table owns current identity, caller ownership,
 and `creating`/`ready`/`deleting` lifecycle state. Reads and listings query ready rows;
 transcripts, accepted job results and deliveries are historical evidence, not a
 live inventory. Creation reserves a row before filesystem publication. Deletion
@@ -602,14 +626,29 @@ not create durable events, telemetry, tracing, or replay state.
 
 ## Persistence and production upgrades
 
-`daita.storage.sqlite.SQLiteStateStore` is the sole current SQLite operation
-boundary. `daita.storage.home_migrations` is the sole persistence-compatibility
+`daita.storage.sql.SQLStateStore` owns shared state operations and `sql_graph`
+owns graph transactions. The default SQLite adapter implements the supported
+`SQLDatabase` connection boundary. Custom adapters reuse these operations and
+strict codecs, with no copied state-transition logic. `run_sql_transaction` is
+the shared cancellation-safe transaction owner for adapter administrative writes.
+Adapters own physical admission, connection lifetime and error normalization.
+The caller must drain operations before closing its borrowed database resources.
+
+The canonical schema and existing home registry remain the single source of
+record formats and data transformations. Adapters may project the schema and
+execute those transformations using their own physical storage mechanics. Schema
+projection alone does not upgrade stored data. Adapter deployment/security/layout
+checks belong to the consuming application; do not add their implementation
+fingerprints or dependencies to the framework's release gate.
+
+`daita.storage.sqlite.SQLiteStateStore` is the default local admission wrapper.
+`daita.storage.home_migrations` is the sole persistence-compatibility
 authority for the complete agent home. One monotonic home revision covers the
 database, persisted records, model configuration, memory, user profile, skills,
 artifacts, and other durable files that must change together. It is independent
 of the package version and Git tag.
 
-Production home revisions 1 and 2 are frozen. The registry is ordered and append-only;
+Production home revisions 1 through 3 are frozen. The registry is ordered and append-only;
 released migration IDs, checksums, implementations, target schemas, historical
 decoders, and golden fixtures never change. `CURRENT_HOME_REVISION` derives from
 the last registry entry. A format change appends one owner-local home migration

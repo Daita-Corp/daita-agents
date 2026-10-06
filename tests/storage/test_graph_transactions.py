@@ -14,7 +14,7 @@ from daita.jobs.graph.models import (
     MutationDecision,
     TaskState,
 )
-from daita.storage import sqlite_graph
+from daita.storage import sql_graph as sqlite_graph
 from daita.storage.sqlite import SQLiteStateStore
 from tests.support.graph import GRAPH_NOW, graph_admission
 

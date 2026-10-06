@@ -62,6 +62,7 @@ where = ["src"]
 include = ["daita*"]
 
 [tool.setuptools.package-data]
+"daita" = ["py.typed"]
 "daita.llm" = ["pricing_schedules.json"]
 "daita.tui" = ["daita.tcss"]
 

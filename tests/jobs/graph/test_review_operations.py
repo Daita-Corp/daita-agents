@@ -25,8 +25,8 @@ from daita.jobs.graph.models import (
 from daita.jobs.owner import JobError, JobOwner
 from daita.llm.models import FinishReason, ModelResponse, ModelUsage, ToolCall
 from daita.llm.pricing import CostEstimate
+from daita.storage.errors import GraphStoreConflictError
 from daita.storage.sqlite import SQLiteStateStore
-from daita.storage.sqlite_graph import GraphStoreConflictError
 from tests.support.graph import GRAPH_NOW, graph_admission
 from tests.support.model_graph_integration import AGENT_ID, ModelGraphIntegration
 from tests.support.static_graph_integration import DeterministicIds

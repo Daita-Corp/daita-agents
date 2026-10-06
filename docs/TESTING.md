@@ -26,9 +26,27 @@ unit/integration directory hierarchy.
   from default discovery.
 - `tests/diagnostics` and `tests/packaging` contain explicit module entry points.
 
-`tests/storage/contracts` is the portable durable-backend suite. It currently
-runs SQLite; see [storage contract](STORAGE_CONTRACT.md) for coverage and the
-remaining additional-backend qualification gates.
+`tests/storage/contracts` is the portable durable-backend suite. The framework
+runs it against SQLite and a disposable in-memory artifact-byte dependency:
+
+```bash
+.venv/bin/python -m pytest tests/storage/contracts
+.venv/bin/python scripts/check_home_release_contract.py check
+```
+
+Downstream qualification can reuse the same cases with an external pytest plugin.
+Indirectly parameterize `state_store_factory` with the name of a fixture returning
+an async context-manager factory; each call must open a new handle to the same
+disposable state. Indirectly parameterize `artifact_byte_storage` with the name of
+a byte-storage fixture exposing the test dependency's `objects`, `publications`,
+`reads` and `deleted` observations. Defaults use SQLite and in-memory bytes.
+Tests never select an infrastructure provider from ambient credentials.
+
+Keep concrete driver, transport, isolation, provisioning and failure tests with
+the adapter. Missing required resources must fail that adapter's qualification,
+not silently skip it. The framework's in-memory byte cases establish lifecycle
+behavior, not external transport readiness. See [storage contract](STORAGE_CONTRACT.md)
+and [artifact storage](ARTIFACT_STORAGE.md).
 
 Use explicit imports such as `from tests.support.paths import REPO_ROOT`. Test
 and support modules must not import a `test_*.py` module or `conftest.py`.

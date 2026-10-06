@@ -246,6 +246,27 @@ def test_real_wheel_metadata_drives_installed_runtime_cli_tui_and_mcp(
     assert cli.returncode == 0, cli.stderr
     assert cli.stdout == f"daita {metadata.version}\n"
 
+    # Consumers must see the shipped adapter types, not an untyped/Any package.
+    consumer = tmp_path / "adapter_consumer.py"
+    consumer.write_text(
+        "from daita.storage.sql import SQLStateStore\n"
+        "from daita.storage.sql_connection import SQLDatabase\n"
+        "def compose(database: SQLDatabase) -> SQLStateStore:\n"
+        "    return SQLStateStore(database)\n",
+        encoding="utf-8",
+    )
+    check = [str(python), "-m", "mypy", "--follow-imports=silent", str(consumer)]
+    valid = subprocess.run(
+        check, capture_output=True, text=True, cwd=tmp_path, env=runtime_environment
+    )
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    consumer.write_text(consumer.read_text() + "SQLStateStore(object())\n")
+    invalid = subprocess.run(
+        check, capture_output=True, text=True, cwd=tmp_path, env=runtime_environment
+    )
+    assert invalid.returncode == 1, invalid.stdout + invalid.stderr
+    assert "SQLDatabase" in invalid.stdout and "[arg-type]" in invalid.stdout
+
 
 def test_documented_local_markdown_links_resolve() -> None:
     import re

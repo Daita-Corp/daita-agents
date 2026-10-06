@@ -9,11 +9,51 @@ with their domain. Mypy checks implementation and consumer conformance; the
 architecture check verifies composition and dependency boundaries rather than
 requiring every public SQLite helper to become a backend operation.
 
-SQLite is currently the only durable backend. `Agent.create`, `Agent.open`,
-deletion and home upgrades still select local storage explicitly. This change
-does not implement PostgreSQL, a backend selector, or distributed writer leases.
-A PostgreSQL implementation must work with ordinary PostgreSQL and must not
-require a particular database provider or application deployment.
+SQLite is the default durable backend. `SQLStateStore` implements the shared
+state operations and strict record codecs over an injected `SQLDatabase`.
+Applications can supply a database adapter without copying those operations.
+`SQLStateStore` is optional: a non-SQL backend can implement the existing
+domain-owned protocols composed by `StateStore` and run the same contract suite.
+
+`Agent.create`, `Agent.open`, deletion and home upgrades still select local storage
+explicitly. These component extension points do not yet provide complete custom
+agent-home composition. Configuration, memory, skills and execution ownership
+must participate in that lifecycle before an application can replace the home.
+
+## SQL adapter extension
+
+Supported imports are `SQLStateStore` and `run_sql_transaction` from
+`daita.storage.sql`, and `SQLDatabase`, `SQLConnection`, `SQLCursor` and
+`StateIntegrityError` from `daita.storage.sql_connection`. A custom adapter may
+instantiate `SQLStateStore(database)` or subclass it to own admission and cleanup.
+Do not override domain operations to change storage behavior.
+
+The synchronous connection contract runs in worker threads. It uses qmark
+parameters, tuple rows, consistent read snapshots and serialized short writes
+within a logical home. Trusted dialect expressions cover insertion ordering,
+null-safe comparison, conflict columns and caller extraction. Adapters own
+parameter translation, physical isolation, bounded waits and driver-error
+normalization. An unknown commit must stop further writes; never replay it.
+`run_sql_transaction` supplies the existing cancellation owner for adapter writes.
+
+The supplied database is borrowed: `SQLStateStore.close()` clears its own caches,
+not the database's pools or credentials. The composing caller must drain active
+operations, close the state handle, then release its owned resources. Opening a
+connection must not recover effects or acquire execution authority implicitly.
+
+The canonical `CURRENT_DATABASE_SQL`/`CURRENT_SCHEMA` in
+`daita.storage.sqlite_schema`, schema inspection in `daita.storage.schema_contract`,
+and the registry in `daita.storage.home_migrations` are the shared format sources.
+Schema projection must reject unsupported semantics rather than silently discard
+them. Released migration definitions remain immutable. Existing migrations and
+the whole-home upgrade runner currently use local files; a custom upgrade runner
+must reuse the definitions and transformations, and qualify its execution path.
+These interfaces do not make existing local upgrade code portable automatically.
+
+Keep concrete drivers, tenant/security policy, object layout, provisioning,
+lease services and deployment checks in the consuming application. The framework
+owns reusable semantics and local defaults, with no infrastructure-specific
+release fingerprint or second feature-migration sequence.
 
 ## Ownership and lifecycle
 
@@ -126,27 +166,32 @@ while waiting for a model, source, or artifact operation.
 
 ## Conformance and release gates
 
+Maintain the home contract and transformation sequence once. Backend physical
+execution remains adapter-owned. Qualify any custom implementation against the
+same logical cases, then add its own real transport and failure checks.
+
 ```bash
 .venv/bin/python -m pytest tests/storage/contracts
 .venv/bin/python -m pytest tests/hosting/test_storage_resilience.py tests/storage/test_remote_readiness.py
 ```
 
-The portable factory opens independent handles to disposable state. It currently
-runs SQLite. Add PostgreSQL only with a real disposable database fixture; missing
-prerequisites must fail qualification rather than silently skipping that backend.
-The portable cases use logical operations without SQL or concrete store internals.
+The portable factory opens independent handles to disposable state. The default
+is SQLite. Downstream pytest plugins can indirectly parameterize
+`state_store_factory` with their own fixture name without editing the shared
+cases; see [testing](TESTING.md). The cases use logical operations rather than
+concrete store internals. Missing adapter prerequisites must fail qualification.
 
 Coverage includes graph claims/fences/budgets/replay/finalizers, identity and
 transcript recovery, passive connection setup, scoped effect recovery, transcript
 pages/access, artifact lifecycle/cursors, and routine authority/claims/budgets/
-recovery/delivery. SQLite-specific cases additionally exercise real process
-contention, transaction rollback, read snapshots and query-count budgets.
+recovery/delivery, catalog/permission detach, semantic digest CAS, learning review
+stamps and connector revisions. SQLite-specific cases additionally exercise real
+process contention, transaction rollback, read snapshots and query-count budgets.
 Supervisor integration cases exercise transient and terminal storage failures,
 health reporting, idle polling and prompt wakeup without model calls.
 
-Before qualifying a second backend, run a behavior matrix for every reachable
-operation, extending source/scope, catalog, MCP, effect resolution, learning,
-semantics, artifact and deletion coverage as necessary. Mandatory fault cases:
+Before integrating a remote agent home, extend qualification to the complete
+composition and deployment. Mandatory remaining acceptance areas include:
 
 - Competing processes and connections claiming the same work.
 - Ownership takeover while the previous process is paused; rejection of every
@@ -159,9 +204,10 @@ semantics, artifact and deletion coverage as necessary. Mandatory fault cases:
 - Representative latency, query counts, connection peaks, retention growth and
   total database work across many active and idle agents.
 
-The current SQLite results do not prove PostgreSQL parity, distributed ownership,
-or remote storage capacity. Remote configuration, artifact/skill bytes and
-whole-home conversion remain separate implementation and qualification work.
+The backend contracts do not prove complete remote agent execution, distributed
+ownership, transaction-pooler compatibility or production capacity. Remote
+configuration, artifact/skill bytes and whole-home conversion remain separate
+implementation and qualification work.
 
 ## Test reconciliation
 
