@@ -26,6 +26,7 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExitKind
+from daita.storage.home_migrations import CURRENT_HOME_REVISION
 from tests.support.job_benchmarks import create_probe_home
 from tests.support.workspace import workspace_for
 
@@ -193,7 +194,7 @@ async def test_public_agent_executes_graph_model_task_in_current_home(
     )
     try:
         status = await Agent.inspect_home(home.name, root=home.root)
-        assert status.found_revision == status.current_revision == 3
+        assert status.found_revision == status.current_revision == CURRENT_HOME_REVISION
         foreground = await agent.run(
             "Start a durable graph query over all five exact resources.",
             source_scope_ids=(home.source_id,),

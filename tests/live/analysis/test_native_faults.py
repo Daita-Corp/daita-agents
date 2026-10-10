@@ -18,6 +18,7 @@ from daita._json import canonical_json
 from daita.adapters.analytical_workspace import NativePythonWorker
 from daita.adapters.mcp import SDKMCPClientFactory
 from daita.config import AnalysisLimits
+from daita.domains.analysis.domain import AnalysisCapabilityDomain
 from daita.llm.models import FinishReason, ModelResponse
 from daita.loop.models import LoopLimits
 from daita.observation import AgentEvent, AgentEventKind
@@ -153,18 +154,20 @@ async def test_artifact_quota_failure_preserves_execution_and_existing_candidate
             if call.name == "analysis_execute"
         ]
         assert len(result.artifacts) == 8
-        assert cells[8].output["data"]["save_status"] == "failed"
-        assert cells[8].output["data"]["save_error"] == "artifact_quota_exceeded"
-        assert dict(cells[8].output["data"]["expected_state"]) == {
+        assert cells[8] is not None and cells[9] is not None
+        failed_save = json.loads(canonical_json(cells[8].output))["data"]
+        continued = json.loads(canonical_json(cells[9].output))["data"]
+        assert failed_save["save_status"] == "failed"
+        assert failed_save["save_error"] == "artifact_quota_exceeded"
+        assert failed_save["expected_state"] == {
             "generation": 1,
             "revision": 9,
         }
-        assert cells[9].output["data"]["stdout"] == "10\n"
+        assert continued["stdout"] == "10\n"
         for item in result.artifacts:
             assert (await agent.read_artifact(item.artifact_id)).content == b"42"
-        assert (await agent.analysis_usage(result.run_id))[
-            "artifact_bytes_committed"
-        ] == 16
+        summary = await agent.analysis_usage(result.run_id)
+        assert summary is not None and summary["artifact_bytes_committed"] == 16
     finally:
         await agent.close()
 
@@ -238,7 +241,10 @@ async def test_cell_deadline_includes_waiting_for_worker_admission(
         assert cell.facts["status"] == "interrupted"
         assert cell.facts["completion_observed"] is False
         summary = next(record for record in records if record.kind == "run")
-        assert summary.facts["worker_queue_wait_seconds"] >= 0.1
+        assert (
+            json.loads(canonical_json(summary.facts))["worker_queue_wait_seconds"]
+            >= 0.1
+        )
         assert summary.facts["reservations_released"] is True
         analysis_report["queued_measurements"] = [
             dict(record.facts) for record in records
@@ -481,6 +487,7 @@ async def test_broken_worker_input_counts_actual_os_transfers(
         nonlocal observed
         written = actual_write(fd, data)
         domain = agent._embedded._capability_runtime._domains["analysis"]
+        assert isinstance(domain, AnalysisCapabilityDomain)
         for state in domain._runs.values():
             worker = state.worker
             if (
@@ -709,7 +716,7 @@ async def test_public_shared_child_budget_and_forbidden_targets(
         summary = await agent.analysis_usage(result.run_id)
         assert summary is not None
         assert summary["child_attempted"] == summary["child_denied"] == 5
-        assert summary["outer_tool_calls"]["attempted"] == 2
+        assert json.loads(canonical_json(summary))["outer_tool_calls"]["attempted"] == 2
         assert result.kind.value == "failed"
         assert result.reason == "tool_calls_per_run_exceeded"
     finally:
@@ -924,8 +931,11 @@ print(sum(Decimal(row['amount']) for row in rows if row['amount'] is not None))
         record = await agent._embedded._store.get_artifact_record(
             result.artifacts[0].artifact_id
         )
+        assert record is not None
         assert (
-            record.computation_evidence["children"][0]["evidence_id"]
+            json.loads(canonical_json(record.computation_evidence))["children"][0][
+                "evidence_id"
+            ]
             == child.evidence_id
         )
         analysis_report["data_oracle"] = {

@@ -1,4 +1,4 @@
-# Local Python analysis
+# Local Python workspace
 
 Local foreground sessions share one `analysis_execute` tool across the TUI,
 CLI and Python API. It runs ordinary Python with DuckDB, NumPy, pandas, SciPy,
@@ -8,8 +8,13 @@ not expose this capability. A source checkout needs `pip install -e '.[dev,analy
 Missing or mismatched packages make the tool unavailable; execution never installs
 packages or falls back to an uncontained interpreter.
 
-Ask Daita to analyze your files, combine datasets, calculate statistics or create
-a chart. The model discovers and loads Analysis through the ordinary toolbox.
+Ask Daita to compute a numerical result, simulate a bounded system, process text,
+validate structured data, transform authenticated tool results, analyze files,
+combine datasets, calculate statistics or create a chart. Ordinary Python and the
+installed libraries support both tabular and non-tabular work: for example,
+Monte Carlo sampling with NumPy, text normalization with Python's standard library,
+or checking required fields in captured JSON records. The model discovers and
+loads the existing Analysis toolbox and `analysis_execute` tool.
 `Agent.analysis_runtime()` reports availability, package versions and the hash
 of the interpreter, worker protocol and trusted launch helpers without starting
 a worker. Interpreter state lasts for one `Agent.run`, not across messages.
@@ -22,7 +27,10 @@ advances the revision and reports `state_may_have_changed`: assignments before
 the exception remain. Timeout, resource or protocol failure reports `state_lost`
 and closes the interpreter. An explicitly requested later cell can start a fresh
 generation using the returned state; the failed code is never replayed and its
-consumption remains charged.
+consumption remains charged. Reuse retained variables after successful cells and
+ordinary Python errors instead of rereading or recomputing sufficient inputs.
+Replacement is subject to remaining allowances and verified cleanup; it does not
+restore variables from the lost interpreter.
 
 The version-1 worker helpers are ordinary Python objects:
 
@@ -37,6 +45,11 @@ rows = json.loads(data["content"])
 ```
 
 `tools.call` returns `output`, `is_error`, `evidence_id` and `sensitivity`.
+Check `is_error` before using `output["data"]`, then use that tool's declared
+result shape: file content, query columns/rows and other structured results have
+different shapes. A failed child call is a structured result, not necessarily a
+Python exception. `inputs.get` for a tool-result input returns the captured
+`output` envelope itself, without the outer `tools.call` fields.
 Only already callable read tools from the cell's frozen surface can execute.
 It cannot load tools, call analysis recursively, publish artifacts, mutate local
 state, make external actions or invoke a model. Every attempt shares the run's
@@ -65,6 +78,62 @@ historical snapshot; request a new read for fresh values.
 Read authority stays bound to accepted candidates across interpreter replacement;
 state loss cannot make a revoked candidate eligible to save.
 
+## Relevant procedures
+
+The context builder supplies general Python operating guidance only while
+`analysis_execute` is callable. It adds fixed CSV, database, query-result or chart
+procedures when the current request names that work; successful typed file/query
+result metadata can also select the CSV or query/database procedures. Previous
+conversation tasks and arbitrary result text do not select these procedures.
+Selection is a presentation hint, not discovery, schema evidence or authority.
+Non-tabular computation has no mandatory CSV, database or chart checklist.
+
+For CSV work, parse the actual headers and validate required fields before
+computing, preferably in the computation cell. A captured read is sufficient
+when its coverage fits the task; avoid another read or an inspection-only cell.
+For example, with `file_read` already callable:
+
+```python
+import csv
+import io
+
+result = tools.call("file_read", {"path": "sales.csv"})
+if result["is_error"]:
+    raise ValueError(result["output"])
+data = result["output"]["data"]
+reader = csv.DictReader(io.StringIO(data["content"]))
+required = {"region", "amount"}
+missing = required - set(reader.fieldnames or ())
+if missing:
+    raise ValueError(f"Missing required fields: {sorted(missing)}")
+rows = list(reader)
+total = sum(int(row["amount"]) for row in rows)
+coverage = {"complete": data["complete"], "limitations": data["limitations"]}
+print({"total_in_returned_content": total, "coverage": coverage})
+```
+
+Choose types to match the task (for example `Decimal` for monetary decimals).
+An incomplete read can include an incomplete final record; validate it and obtain
+adequate coverage before claiming a total for the whole file. Retain completeness,
+truncation, per-root search coverage and other reported limitations in derived
+outputs and conclusions.
+
+For database work, reuse sufficient current catalog evidence. Obtain missing
+schemas and bounded relationship paths through `catalog_schema`, then use
+`catalog_traverse` only for paths still unresolved. Load these tools through the
+ordinary toolbox if needed. Matching field names alone do not establish a join;
+ambiguous mappings or relationships can require ordinary clarification.
+
+For query results, use the returned `columns` and `rows`, including aliases and
+projections. Do not substitute the base-table schema: projected fields can be
+absent or renamed. Validate the fields needed for computation in the same cell,
+and preserve the returned coverage without rereading sufficient evidence.
+
+For charts, use installed Matplotlib with retained data, write a supported PNG
+inside scratch, and register it with `outputs.add`. Select `save_output` to
+publish it through the same artifact contract described below. No extra plotting
+dependency or separate publication path is needed.
+
 ## Saving results
 
 Write a file inside scratch and register a candidate:
@@ -78,8 +147,9 @@ outputs.add("summary", "summary.json")
 
 The cell's `save_output="summary"` explicitly commits one candidate through the
 ordinary artifact store. A later cell may save an existing candidate without
-recomputing it. Four candidates per cell and sixteen per run are allowed; each
-call commits at most one artifact. Supported outputs are CSV, Parquet, JSON, PNG,
+recomputing it. Registration alone does not publish an artifact. Four candidates
+per cell and sixteen per run are allowed; each call commits at most one artifact.
+Supported outputs are CSV, Parquet, JSON, PNG,
 Markdown, UTF-8 text and Python/SQL source text. Source text is retained data.
 Host capture requires a bounded regular file inside scratch, rejects symlinks and
 traversal, and hashes bytes while the worker is demonstrably stopped. A separate
@@ -107,6 +177,9 @@ reserves completion capacity within four MiB and 256 records per run.
 Byte or record exhaustion terminates the run before another model request.
 Cell deadlines include worker admission, input validation and compute waits.
 Cleanup retains a separate bounded allowance after a cell times out.
+Use returned `remaining_allowances` when present and print bounded previews rather
+than full datasets, long texts or simulation traces. A preview does not change
+input completeness or authorize a larger computation.
 
 `AnalysisLimits` also configures code/log/result/RPC bytes, child calls, worker
 generations, input bytes, output file/count/run bounds, trace bytes/records and

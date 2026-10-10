@@ -121,9 +121,7 @@ async def recover_generation(facts: Mapping[str, object]) -> dict[str, object]:
                 or original.st_ino != facts["scratch_inode"]
             ):
                 raise ValueError("Native scratch remnant identity changed")
-            remove_owned_scratch(
-                scratch, int(facts["scratch_device"]), int(facts["scratch_inode"])
-            )
+            remove_owned_scratch(scratch, original.st_dev, original.st_ino)
         result = dict(facts)
         prior_usage = facts.get("usage")
         usage = dict(prior_usage) if isinstance(prior_usage, Mapping) else {}

@@ -63,6 +63,8 @@ from .domains.data.export_capabilities import (
 )
 from .domains.data.file_capabilities import (
     LOCAL_FILE_CAPABILITY_IDS,
+    LOCAL_FILE_QUERY_CAPABILITY_ID,
+    LOCAL_FILE_QUERY_OUTPUT_KIND,
     LOCAL_FILE_READ_CAPABILITY_ID,
     LOCAL_FILE_READ_OUTPUT_KIND as LOCAL_FILE_READ_EVIDENCE_KIND,
     LOCAL_FILE_READ_TOOL_NAME,
@@ -1188,6 +1190,7 @@ class AgentContextBuilder:
             snapshot.artifact_destinations,
             frozenset(entry.capability.id for entry in tool_context.catalog_entries),
             local_file_context=snapshot.local_file_context,
+            messages=messages,
             external_actions_callable=any(
                 entry.capability.operational_effect is OperationalEffect.EXTERNAL_ACTION
                 for entry in tool_context.callable_entries
@@ -2629,6 +2632,7 @@ def _request(
         artifact_destinations,
         candidate_ids,
         local_file_context=local_file_context,
+        messages=messages,
     )
     if guidance:
         system = CanonicalMessage(
@@ -2877,6 +2881,7 @@ def _tool_guidance(
     *,
     local_file_context: FrozenJsonObject | None = None,
     external_actions_callable: bool = False,
+    messages: tuple[CanonicalMessage, ...] = (),
 ) -> str:
     """Code-owned procedures for this authenticated tool working set only."""
     candidates = capability_ids if candidate_ids is None else candidate_ids
@@ -2922,6 +2927,140 @@ def _tool_guidance(
         }
     )
     instructions: list[str] = []
+    if "analysis.execute" in capability_ids:
+        instructions.append(
+            "Python workspace: variables persist within this run only. Start with "
+            "expected_state={generation:0,revision:0}; use the returned expected_state "
+            "for every later cell. A python_error can leave earlier assignments intact "
+            "(state_may_have_changed); correct the code using retained state. state_lost "
+            "means the interpreter closed: only an explicit later cell with the returned "
+            "state can request replacement, subject to remaining allowances and verified "
+            "cleanup. Failed code is never automatically replayed or refunded. "
+            "tools.call(name, arguments) returns a structured dict with is_error, output, "
+            "evidence_id and sensitivity. Check is_error before using output['data']; "
+            "use the tool's declared result shape, never assume text or rows. Only already "
+            "callable admitted reads can run inside a cell; load missing tools outside it. "
+            "Reuse retained variables and authenticated inputs instead of repeating reads. "
+            "Preserve reported completeness, truncation, coverage and limitations in "
+            "derived results and conclusions; a bounded sample cannot become complete data. "
+            "Respect cell/run time, CPU, memory, scratch, child-call and byte bounds and "
+            "returned remaining_allowances; print bounded previews. Register supported "
+            "scratch files with outputs.add(name, path); save_output explicitly selects "
+            "one candidate for artifact publication. Reuse retained output candidates "
+            "without recomputation; changed bytes require a new name. Local delivery "
+            "requires separately admitted artifact_save_local and ordinary approval. These procedures grant "
+            "no authority or exemption from validation. Apply specialized procedures only "
+            "to the corresponding requested work; they require no unrelated reads or outputs."
+        )
+        # Select fixed procedures from current-task hints and successful typed
+        # result metadata only. Never interpolate untrusted contents into guidance
+        # or let previous conversation tasks impose a checklist on this task.
+        start = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if messages[i].role is MessageRole.USER
+            ),
+            0,
+        )
+        current = messages[start:]
+        query = " ".join(
+            block.text
+            for message in current
+            if message.role is MessageRole.USER
+            for block in message.content
+            if isinstance(block, TextBlock)
+        ).lower()
+        results = tuple(
+            block
+            for message in current
+            if message.role is MessageRole.TOOL
+            for block in message.content
+            if isinstance(block, ToolResultBlock) and not block.is_error
+        )
+        query_results = tuple(
+            block
+            for block in results
+            if (block.capability_id, block.output.get("kind"))
+            in {
+                ("data.query", DATA_QUERY_EVIDENCE_KIND),
+                (LOCAL_FILE_QUERY_CAPABILITY_ID, LOCAL_FILE_QUERY_OUTPUT_KIND),
+            }
+        )
+        csv_result = any(
+            isinstance(data := block.output.get("data"), Mapping)
+            and (
+                (
+                    block.capability_id == LOCAL_FILE_READ_CAPABILITY_ID
+                    and block.output.get("kind") == LOCAL_FILE_READ_EVIDENCE_KIND
+                    and str(data.get("path", "")).lower().endswith(".csv")
+                )
+                or (block in query_results and data.get("format") == "csv")
+            )
+            for block in results
+        )
+        if re.search(r"\bcsv\b", query) or csv_result:
+            instructions.append(
+                "Python CSV: parse actual headers from the admitted content (csv or pandas), "
+                "validate required fields and explicit types before computing, preferably "
+                "in the same cell. Reuse a sufficient captured read; avoid a separate "
+                "inspection-only cell. Clarify ambiguous field mappings."
+            )
+        database = any(
+            block.capability_id == "data.query" for block in query_results
+        ) or (
+            "data.query" in candidates
+            and re.search(
+                r"\b(databases?|sql|sqlite|postgres(?:ql)?|schemas?|joins?|relationships?)\b",
+                query,
+            )
+            is not None
+        )
+        if database:
+            instructions.append(
+                "Python database: reuse sufficient current catalog evidence for schemas "
+                "and relationships; obtain only missing structure before a query. Matching "
+                "field names alone do not establish a valid join; clarify unresolved "
+                "mappings or relationships."
+            )
+            instructions.append(
+                reference(
+                    "catalog.schema",
+                    "catalog_schema",
+                    "missing database schemas and bounded relationship paths",
+                )
+            )
+            instructions.append(
+                reference(
+                    "catalog.traverse",
+                    "catalog_traverse",
+                    "relationship paths still unresolved after schema evidence",
+                )
+            )
+        if (
+            query_results
+            or database
+            or (
+                candidates & {"data.query", LOCAL_FILE_QUERY_CAPABILITY_ID}
+                and re.search(r"\bquer(?:y|ies)\b", query)
+            )
+        ):
+            instructions.append(
+                "Python query results: build computations from the returned columns and "
+                "rows, including aliases and projections; base-table fields may be absent. "
+                "Validate required fields in the computation cell and retain reported "
+                "coverage instead of rereading sufficient results."
+            )
+        if re.search(
+            r"\b(charts?|charting|plots?|plotting|histograms?|scatter|matplotlib|visuali[sz]ations?)\b",
+            query,
+        ):
+            instructions.append(
+                "Python charts: use installed Matplotlib "
+                "with retained data; save a supported PNG inside scratch, register it with "
+                "outputs.add and explicitly select save_output for artifact publication. "
+                "Reuse an existing candidate when only saving is needed."
+            )
     native_pairs = (
         (
             ("data.preview_update_rows", "data_preview_update_rows"),

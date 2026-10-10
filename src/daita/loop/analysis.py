@@ -89,11 +89,12 @@ class AnalysisEvidence:
             )
             if not required <= set(facts) or not set(facts) <= allowed:
                 raise ValueError("Invalid child invocation evidence contract")
+            sequence = facts["sequence"]
             if (
                 not isinstance(facts["parent_call_id"], str)
                 or not isinstance(facts["tool_name"], str)
-                or type(facts["sequence"]) is not int
-                or not 1 <= facts["sequence"] <= 1_000_000
+                or type(sequence) is not int
+                or not 1 <= sequence <= 1_000_000
                 or not isinstance(facts["arguments"], Mapping)
                 or type(facts["dispatched"]) is not bool
             ):
@@ -189,12 +190,10 @@ class AnalysisEvidence:
             ):
                 raise ValueError("Recovery closure remains incomplete")
             spawned = cleanup.get("process_spawned")
+            pid = recovery["pid"]
             if (
                 type(spawned) is not bool
-                or (
-                    spawned
-                    and (type(recovery["pid"]) is not int or recovery["pid"] <= 0)
-                )
+                or (spawned and (type(pid) is not int or pid <= 0))
                 or (
                     not spawned
                     and (

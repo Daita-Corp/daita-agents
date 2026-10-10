@@ -181,6 +181,7 @@ def test_event_contract_is_immutable_bounded_and_deeply_frozen():
         AgentEventKind.APPROVAL_REQUESTED,
         AgentEventKind.APPROVAL_DECIDED,
         AgentEventKind.TOOL_COMPLETED,
+        AgentEventKind.ANALYSIS_UPDATED,
         AgentEventKind.RUN_COMPLETED,
     )
     event = AgentEvent(

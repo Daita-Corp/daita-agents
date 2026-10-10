@@ -1269,15 +1269,19 @@ class DaitaApp(App[int]):
                 )
             )
         summary = await self.controller.require_agent().analysis_usage(result.run_id)
-        if summary is not None:
-            cpu = summary["user_cpu_seconds"]
-            cpu_text = "unavailable" if cpu is None else f"{cpu:.3f}s"
+        if summary is not None and not (
+            summary["processes_reaped"] and summary["scratch_deleted"]
+        ):
+            cleanup_issues = []
+            if not summary["processes_reaped"]:
+                cleanup_issues.append("worker shutdown could not be verified")
+            if not summary["scratch_deleted"]:
+                cleanup_issues.append("temporary file deletion could not be verified")
             screen.append_block(
                 TranscriptBlock(
                     "notice",
                     f"analysis-{result.run_id}",
-                    f"Python CPU {cpu_text}; worker closure {'verified' if summary['processes_reaped'] else 'incomplete'}; "
-                    f"scratch deletion {'verified' if summary['scratch_deleted'] else 'incomplete'}.",
+                    f"Python cleanup incomplete: {'; '.join(cleanup_issues)}.",
                 )
             )
 

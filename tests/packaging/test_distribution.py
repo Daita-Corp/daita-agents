@@ -108,7 +108,15 @@ def test_default_distribution_contains_every_supported_production_dependency():
         "mcp==2.2.0",
         "duckdb==1.5.5",
     }
-    assert set(project["optional-dependencies"]) == {"dev"}
+    assert set(project["optional-dependencies"]) == {"dev", "analysis"}
+    assert set(project["optional-dependencies"]["analysis"]) == {
+        "numpy==2.4.6",
+        "pandas==3.0.3",
+        "scipy==1.17.1",
+        "pyarrow==25.0.1",
+        "matplotlib==3.11.2",
+        "networkx==3.6.1",
+    }
     assert project["scripts"] == {"daita": "daita.cli:main"}
 
 

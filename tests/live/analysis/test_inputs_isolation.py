@@ -97,7 +97,11 @@ async def test_partial_broker_read_retains_coverage_and_contract_after_history_c
         assert json.loads(
             (await agent.read_artifact(artifact.artifact_id)).content
         ) == {"captured_bytes": 49152, "complete": False}
-        evidence = await agent.artifact_computation_evidence(artifact.artifact_id)
+        evidence = json.loads(
+            canonical_json(
+                await agent.artifact_computation_evidence(artifact.artifact_id)
+            )
+        )
         child = evidence["children"][0]
         assert child["coverage"]["complete"] is False
         assert child["capability_id"] == "data.local_file.read"
@@ -107,7 +111,11 @@ async def test_partial_broker_read_retains_coverage_and_contract_after_history_c
         assert child["evidence_id"] == issued.evidence_id
         assert child["result_sha256"] == issued.facts["result_digest"]
         await agent.clear_conversations()
-        retained = await agent.artifact_computation_evidence(artifact.artifact_id)
+        retained = json.loads(
+            canonical_json(
+                await agent.artifact_computation_evidence(artifact.artifact_id)
+            )
+        )
         assert retained == evidence
         analysis_report["retained_coverage"] = dict(child)
     finally:
@@ -209,7 +217,9 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
             if call.name == "analysis_execute"
         ]
         assert len(cells) == 2
-        assert all(block.output["data"]["stdout"] == "42\n" for block in cells)
+        for block in cells:
+            assert block is not None
+            assert json.loads(canonical_json(block.output))["data"]["stdout"] == "42\n"
         children = [record for record in records if record.kind == "child"]
         assert len(children) == 3
         assert [
@@ -358,15 +368,15 @@ async def test_invalid_inputs_and_candidates_never_publish(
             for call, block in (await agent.transcript(result.run_id)).tool_pairs
             if call.name == "analysis_execute"
         )
+        block = pair[1]
+        assert block is not None
+        output = json.loads(canonical_json(block.output))
         if failure == "stale_state":
-            assert (
-                pair[1].is_error
-                and pair[1].output["error"]["code"] == "analysis_stale_state"
-            )
+            assert block.is_error and output["error"]["code"] == "analysis_stale_state"
             assert not any(record.kind == "generation" for record in records)
         else:
             await capture_run(agent, result.run_id, analysis_report)
-            assert pair[1].output["data"]["state_lost"] is True
+            assert output["data"]["state_lost"] is True
     finally:
         await agent.close()
 

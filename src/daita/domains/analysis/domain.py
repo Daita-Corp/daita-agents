@@ -129,7 +129,9 @@ class AnalysisCapabilityDomain:
         self._limits = limits
         self._observer = observer
         description = (
-            "Run normal Python in a private macOS sandbox. Variables persist only within this run. "
+            "Run normal Python for computation, simulation, text processing, structured-data validation, "
+            "analysis and transformation of authenticated tool results in a private macOS sandbox. "
+            "Variables persist only within this run. "
             "Use expected_state={generation:0,revision:0} initially; then use the returned state. "
             "tools.call(name, arguments) returns a dict: r['is_error'], r['output']['data'], r['evidence_id']. "
             "Register a file with outputs.add('name','file.png'); save_output selects one named output. "
@@ -265,8 +267,12 @@ class AnalysisCapabilityDomain:
                         toolbox_id=ToolboxId.ANALYSIS,
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
-                        summary="Run Python and DuckDB analysis locally.",
-                        when_to_use="Substantial computation, cross-source analysis, charts and datasets.",
+                        summary="Run Python locally for tabular and non-tabular computation.",
+                        when_to_use=(
+                            "Computation, simulation, text processing, structured-data validation, "
+                            "transformation of authenticated tool results, cross-source analysis, "
+                            "statistics, charts and datasets."
+                        ),
                         keywords=(
                             "python",
                             "analysis",
@@ -274,6 +280,16 @@ class AnalysisCapabilityDomain:
                             "duckdb",
                             "pandas",
                             "chart",
+                            "computation",
+                            "simulation",
+                            "simulate",
+                            "text processing",
+                            "validation",
+                            "transformation",
+                            "transform",
+                            "statistics",
+                            "structured data validation",
+                            "scipy",
                         ),
                     ),
                 ),

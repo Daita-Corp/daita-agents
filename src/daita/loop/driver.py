@@ -876,80 +876,21 @@ class AgentLoop:
                     if receipt is not None:
                         artifact_deliveries.append(receipt)
 
-                if (
-                    session.evidence.analysis_budget_exhausted
-                    or writer.analysis_budget_exhausted
-                ):
-                    return await self._finish(
-                        run,
-                        writer,
-                        LoopExitKind.FAILED,
-                        writer.analysis_budget_reason
-                        or "analysis_compute_budget_exhausted",
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
-
-                if session.evidence.tool_budget_exhausted:
-                    return await self._finish(
-                        run,
-                        writer,
-                        LoopExitKind.FAILED,
-                        "tool_calls_per_run_exceeded",
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
-
-                if outcome.machine_run_directive is not None:
-                    return await self._finish(
-                        run,
-                        writer,
-                        LoopExitKind.MACHINE_TERMINATED,
-                        outcome.machine_run_directive.kind.value,
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
-
-                if outcome.interruption_kind is not None:
-                    if cancellation_requested:
-                        raise asyncio.CancelledError
-                    if outcome.interruption_kind is ToolBatchInterruption.DEADLINE:
-                        return await self._finish(
-                            run,
-                            writer,
-                            LoopExitKind.FAILED,
-                            "wall_time_exhausted",
-                            step,
-                            usage,
-                            run_started,
-                            artifacts=tuple(artifacts),
-                            artifact_deliveries=tuple(artifact_deliveries),
-                            sensitivity=sensitivity,
-                        )
-                    return await self._finish(
-                        run,
-                        writer,
-                        LoopExitKind.INTERRUPTED,
-                        "tool_batch_interrupted",
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
+                terminal_batch = await self._finish_terminal_tool_batch(
+                    outcome=outcome,
+                    cancellation_requested=cancellation_requested,
+                    session=session,
+                    run=run,
+                    writer=writer,
+                    step=step,
+                    usage=usage,
+                    run_started=run_started,
+                    artifacts=tuple(artifacts),
+                    artifact_deliveries=tuple(artifact_deliveries),
+                    sensitivity=sensitivity,
+                )
+                if terminal_batch is not None:
+                    return terminal_batch
 
                 if (
                     run.origin is RunOrigin.JOB_TASK
@@ -1267,6 +1208,61 @@ class AgentLoop:
             writer,
             LoopExitKind.FAILED,
             _finish_reason_failure(response.finish_reason),
+            step,
+            usage,
+            run_started,
+            artifacts=artifacts,
+            artifact_deliveries=artifact_deliveries,
+            sensitivity=sensitivity,
+        )
+
+    async def _finish_terminal_tool_batch(
+        self,
+        *,
+        outcome: ToolBatchOutcome,
+        cancellation_requested: bool,
+        session: RunSession,
+        run: RunInput,
+        writer: RunSessionWriter,
+        step: int,
+        usage: ModelUsage,
+        run_started: float,
+        artifacts: tuple[ArtifactRef, ...],
+        artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
+        sensitivity: ModelSensitivity,
+    ) -> LoopExit | None:
+        """Apply terminal batch conditions after every ordered result is retained."""
+
+        if (
+            session.evidence.analysis_budget_exhausted
+            or writer.analysis_budget_exhausted
+        ):
+            kind = LoopExitKind.FAILED
+            reason = (
+                writer.analysis_budget_reason or "analysis_compute_budget_exhausted"
+            )
+        elif session.evidence.tool_budget_exhausted:
+            kind = LoopExitKind.FAILED
+            reason = "tool_calls_per_run_exceeded"
+        elif outcome.machine_run_directive is not None:
+            kind = LoopExitKind.MACHINE_TERMINATED
+            reason = outcome.machine_run_directive.kind.value
+        elif outcome.interruption_kind is not None:
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            if outcome.interruption_kind is ToolBatchInterruption.DEADLINE:
+                kind = LoopExitKind.FAILED
+                reason = "wall_time_exhausted"
+            else:
+                kind = LoopExitKind.INTERRUPTED
+                reason = "tool_batch_interrupted"
+        else:
+            return None
+        return await self._finish(
+            run,
+            writer,
+            kind,
+            reason,
             step,
             usage,
             run_started,

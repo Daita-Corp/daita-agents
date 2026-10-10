@@ -828,7 +828,8 @@ def _computation_evidence(value: Mapping[str, object]) -> FrozenJsonObject:
             r"sha256:[0-9a-f]{64}", selected
         ):
             raise ValueError("Invalid computation digest")
-    if type(evidence["generation"]) is not int or not 1 <= evidence["generation"] <= 16:
+    generation = evidence["generation"]
+    if type(generation) is not int or not 1 <= generation <= 16:
         raise ValueError("Invalid computation generation")
     for name in ("source_available", "inputs_available"):
         if type(evidence[name]) is not bool:

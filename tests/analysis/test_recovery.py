@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from daita import Agent
+from daita._json import canonical_json
 from daita.adapters.analytical_workspace.native import NativePythonWorker
 from daita.artifacts.models import ArtifactAuthorship, ArtifactDraft, ArtifactProvenance
 from daita.capabilities import ArtifactPolicy
@@ -644,8 +645,8 @@ async def test_multiple_parsers_and_replacement_preserve_cumulative_cpu(
         ]
         assert len(cells) == 3
         assert cells[1] is not None and cells[2] is not None
-        assert cells[1].output["data"]["state_lost"] is True
-        assert cells[2].output["data"]["stdout"] == "42\n"
+        assert json.loads(canonical_json(cells[1].output))["data"]["state_lost"] is True
+        assert json.loads(canonical_json(cells[2].output))["data"]["stdout"] == "42\n"
         records = await agent.analysis_evidence(result.run_id)
         generations = [r for r in records if r.kind == "generation"]
         assert {r.evidence_id for r in generations} == {
