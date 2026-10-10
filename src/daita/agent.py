@@ -90,6 +90,7 @@ from .llm.models import ModelProfile, ModelSensitivity
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
+from .loop.analysis import AnalysisEvidence
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver, SupervisorStatus
 from .routines import (
@@ -627,6 +628,26 @@ class Agent:
     ) -> tuple[TaskAttempt, ...]:
         return await self._embedded.list_task_attempts(job_id, task_id, limit=limit)
 
+    async def analysis_evidence(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> tuple[AnalysisEvidence, ...]:
+        """Read host-authenticated computation, child and cleanup evidence for a run."""
+        return await self._embedded.analysis_evidence(
+            run_id, caller_principal_id=caller_principal_id
+        )
+
+    def analysis_runtime(self) -> dict[str, object]:
+        """Inspect scientific runtime availability without launching a worker."""
+        return self._embedded.analysis_runtime()
+
+    async def analysis_usage(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> dict[str, object] | None:
+        """Read the bounded host summary used by local frontends."""
+        return await self._embedded.analysis_usage(
+            run_id, caller_principal_id=caller_principal_id
+        )
+
     async def read_task_result(self, job_id: str, task_id: str) -> TaskResult | None:
         return await self._embedded.read_task_result(job_id, task_id)
 
@@ -974,6 +995,15 @@ class Agent:
         """
         _validate_artifact_id(artifact_id)
         return await self._embedded.delete_artifact(
+            artifact_id, caller_principal_id=caller_principal_id
+        )
+
+    async def artifact_computation_evidence(
+        self, artifact_id: str, *, caller_principal_id: str | None = None
+    ) -> FrozenJsonObject:
+        """Inspect retained bounded computation lineage, including after history deletion."""
+        _validate_artifact_id(artifact_id)
+        return await self._embedded.artifact_computation_evidence(
             artifact_id, caller_principal_id=caller_principal_id
         )
 

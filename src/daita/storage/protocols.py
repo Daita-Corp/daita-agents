@@ -17,6 +17,7 @@ state alongside advisory documents and artifact bytes; its caller owns writer le
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 
 from ..artifacts.store import ArtifactRegistry
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
         AttemptBudgetReservation,
         BudgetLedger,
     )
+    from ..loop.analysis import AnalysisEvidence
     from ..loop.models import ConversationRun, LoopExit
     from ..routines.models import (
         ResourceRevisionObservation,
@@ -75,6 +77,21 @@ class StateStore(
     Protocol,
 ):
     """Composition of domain contracts; consumers accept their narrow views."""
+
+    async def load_analysis_evidence(
+        self, agent_id: str, run_id: str
+    ) -> tuple[AnalysisEvidence, ...]: ...
+    async def pending_analysis_evidence(
+        self, agent_id: str, *, after: tuple[str, str] = ("", "")
+    ) -> tuple[AnalysisEvidence, ...]: ...
+    async def recover_analysis_evidence(
+        self,
+        agent_id: str,
+        expected: AnalysisEvidence,
+        recovery: Mapping[str, object] | None = None,
+        *,
+        proof_disposed: bool = False,
+    ) -> AnalysisEvidence: ...
 
     async def list_graph_budget_ledgers(
         self, agent_id: str, job_id: str

@@ -556,9 +556,11 @@ def test_run_without_model_opens_the_persisted_route_without_injection():
         steps=1,
         artifacts=(),
         artifact_deliveries=(),
+        usage=ModelUsage(),
     )
     agent = AsyncMock()
     agent.run.return_value = result
+    agent.analysis_usage.return_value = None
     arguments = cli.build_parser().parse_args(["run", "runner", "use persisted route"])
 
     with (
@@ -578,6 +580,7 @@ def test_run_without_model_opens_the_persisted_route_without_injection():
         workspace=cli._resolve_cli_workspace(arguments),
         root=None,
         observer=None,
+        limits=None,
     )
     agent.run.assert_awaited_once_with(
         "use persisted route",
@@ -715,6 +718,7 @@ def test_future_cli_1_parser_adds_only_explicit_run_continuation_flags():
                 "--context-window",
                 "--max-output",
                 "--conversation-id",
+                "--max-cost-usd",
                 "--events-jsonl",
                 "--files-only",
             }
@@ -1828,6 +1832,7 @@ def test_cli_stopped_run_retains_committed_routine_without_dumping_contract():
     agent = AsyncMock()
     agent.run.return_value = result
     agent.transcript.return_value = transcript
+    agent.analysis_usage.return_value = None
     args = cli.build_parser().parse_args(["run", "runner", "create routine"])
     with patch.object(Agent, "open", new=AsyncMock(return_value=agent)):
         record = asyncio.run(cli._execute(args))

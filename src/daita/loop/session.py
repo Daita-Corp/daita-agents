@@ -50,11 +50,61 @@ class RunCancellationToken:
 class RunSessionEvidence:
     """Current-run, once-set evidence; never an ambient run registry."""
 
-    __slots__ = ("_learning_mutation_call_id", "_lock")
+    __slots__ = (
+        "_learning_mutation_call_id",
+        "_lock",
+        "tool_calls_attempted",
+        "tool_budget_exhausted",
+        "analysis_budget_exhausted",
+        "run_started_monotonic",
+        "programmatic_tool_calls_attempted",
+        "_outer_dispatched",
+        "_outer_results",
+    )
 
     def __init__(self) -> None:
         self._learning_mutation_call_id: str | None = None
         self._lock = Lock()
+        self.tool_calls_attempted = 0
+        self.tool_budget_exhausted = False
+        self.analysis_budget_exhausted = False
+        self.run_started_monotonic: float | None = None
+        self.programmatic_tool_calls_attempted = 0
+        self._outer_dispatched: set[str] = set()
+        self._outer_results: dict[str, bool] = {}
+
+    def count_tool_attempts(
+        self, count: int, ceiling: int, *, programmatic: bool = False
+    ) -> bool:
+        with self._lock:
+            self.tool_calls_attempted += count
+            if programmatic:
+                self.programmatic_tool_calls_attempted += count
+            allowed = self.tool_calls_attempted <= ceiling
+            self.tool_budget_exhausted |= not allowed
+            return allowed
+
+    def record_outer_dispatch(self, call_id: str) -> None:
+        with self._lock:
+            self._outer_dispatched.add(call_id)
+
+    def record_outer_result(self, call_id: str, *, failed: bool) -> None:
+        with self._lock:
+            self._outer_results[call_id] = failed
+
+    def outer_tool_counts(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "attempted": self.tool_calls_attempted
+                - self.programmatic_tool_calls_attempted,
+                "dispatched": len(self._outer_dispatched),
+                "failed": sum(self._outer_results.values()),
+                "denied": sum(
+                    failed and call_id not in self._outer_dispatched
+                    for call_id, failed in self._outer_results.items()
+                ),
+                "unsettled": len(self._outer_dispatched - self._outer_results.keys()),
+            }
 
     @property
     def learning_mutation_succeeded(self) -> bool:

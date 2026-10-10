@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 from typing import Protocol
 
 from .._json import canonical_json
-from ..llm.models import CanonicalMessage
+from ..llm.models import CanonicalMessage, ModelSensitivity
+from .analysis import AnalysisEvidence, AnalysisTraceCapacityError
 from .models import ConversationRun, LoopExit, LoopExitKind, RunInput, Transcript
 
 _SHA256 = re.compile(r"sha256:[0-9a-f]{64}\Z")
@@ -78,6 +81,10 @@ class TranscriptWriteStore(Protocol):
 
     async def finish(self, result: LoopExit) -> None: ...
 
+    async def record_analysis_evidence(
+        self, agent_id: str, evidence: AnalysisEvidence
+    ) -> None: ...
+
 
 class RunSessionWriterState(str, Enum):
     NEW = "new"
@@ -95,6 +102,11 @@ class RunSessionWriter:
         "_store",
         "predecessor",
         "run",
+        "_analysis_cleanup",
+        "analysis_cleanup_failed",
+        "analysis_budget_exhausted",
+        "analysis_budget_reason",
+        "analysis_sensitivity",
     )
 
     def __init__(
@@ -127,6 +139,47 @@ class RunSessionWriter:
         self._bind_predecessor = bind_predecessor
         self._state = RunSessionWriterState.NEW
         self._next_position = 0
+        self._analysis_cleanup: Callable[[], Awaitable[None]] | None = None
+        self.analysis_cleanup_failed = False
+        self.analysis_budget_exhausted = False
+        self.analysis_budget_reason: str | None = None
+        self.analysis_sensitivity = ModelSensitivity.PUBLIC
+
+    def bind_analysis_cleanup(self, cleanup: Callable[[], Awaitable[None]]) -> None:
+        if self._analysis_cleanup is not None:
+            raise RuntimeError("analysis cleanup is already bound")
+        self._analysis_cleanup = cleanup
+
+    async def settle_analysis(self) -> None:
+        if self._analysis_cleanup is not None:
+            cleanup, self._analysis_cleanup = self._analysis_cleanup, None
+            task = asyncio.ensure_future(cleanup())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                raise
+            except BaseException:
+                self.analysis_cleanup_failed = True
+                raise
+
+    def retain_analysis_sensitivity(self, sensitivity: ModelSensitivity) -> None:
+        self.analysis_sensitivity = max(
+            self.analysis_sensitivity, sensitivity, key=lambda item: item.routing_rank
+        )
+
+    async def record_analysis(self, evidence: AnalysisEvidence) -> None:
+        if (
+            self._state is not RunSessionWriterState.STARTED
+            or evidence.run_id != self.run.id
+        ):
+            raise ValueError("Analysis evidence requires its live owning writer")
+        try:
+            await self._store.record_analysis_evidence(self.run.agent_id, evidence)
+        except AnalysisTraceCapacityError:
+            self.analysis_budget_exhausted = True
+            self.analysis_budget_reason = "analysis_trace_budget_exhausted"
+            raise
 
     @property
     def state(self) -> RunSessionWriterState:
@@ -165,11 +218,17 @@ class RunSessionWriter:
         final_message: CanonicalMessage,
     ) -> None:
         self._require_terminal_result(result, completed=True)
+        await self.settle_analysis()
+        if self.analysis_cleanup_failed:
+            raise RuntimeError(
+                "Analysis cleanup did not establish required postconditions"
+            )
         await self._store.complete(result, final_message)
         self._state = RunSessionWriterState.TERMINAL
 
     async def finish(self, result: LoopExit) -> None:
         self._require_terminal_result(result, completed=False)
+        await self.settle_analysis()
         await self._store.finish(result)
         self._state = RunSessionWriterState.TERMINAL
 

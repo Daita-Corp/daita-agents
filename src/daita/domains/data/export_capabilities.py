@@ -89,6 +89,7 @@ from ...capabilities import (
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
 from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
+from ...loop.analysis import AnalysisEvidence
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
 from ...scope import SourceScopeCatalog, resolve_effective_source_scope
@@ -1734,6 +1735,9 @@ class ArtifactDomainCatalog(SourceScopeCatalog, Protocol):
 
 class ArtifactTranscriptReader(Protocol):
     async def load(self, run_id: str) -> Transcript: ...
+    async def load_analysis_evidence(
+        self, agent_id: str, run_id: str
+    ) -> tuple[AnalysisEvidence, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -1749,6 +1753,11 @@ class ArtifactCapabilityDomain:
     """Own artifact availability, provenance, conversion, and delivery rules."""
 
     domain_owner_id = ARTIFACT_DOMAIN_OWNER_ID
+    # These local inventory/preview contracts intentionally have AccessMode.NONE:
+    # they do not grant catalog-source access. They are explicit effect-free reads.
+    programmatic_read_capability_ids = frozenset(
+        {ARTIFACT_LIST_CAPABILITY_ID, ARTIFACT_READ_CAPABILITY_ID}
+    )
 
     def __init__(
         self,
@@ -2025,6 +2034,56 @@ class ArtifactCapabilityDomain:
                 )
         return arguments
 
+    async def authenticate_analysis_inputs(
+        self, run: RunInput, call: ToolCall, call_ids: tuple[str, ...]
+    ):
+        """Authenticate source evidence without publishing or dispatching anything."""
+        validated = await self._validated_current_run_evidence(
+            run,
+            call,
+            call_ids,
+            error_code="analysis_input_invalid",
+            error_message="Analysis inputs require exact earlier successful owned results.",
+        )
+        for evidence in validated:
+            source_id = evidence.data.get("source_id")
+            if isinstance(source_id, str):
+                readable = await self._catalog.readable_resource_ids(
+                    run.agent_id, (source_id,)
+                )
+                schemas = {
+                    item.resource_id: item
+                    for item in await self._catalog.resource_schemas(
+                        run.agent_id, source_id
+                    )
+                }
+                revisions = evidence.data.get("resource_revisions", ())
+                if isinstance(evidence.data.get("resource_id"), str):
+                    revisions = (
+                        {
+                            "resource_id": evidence.data["resource_id"],
+                            "revision": evidence.data.get("resource_revision"),
+                        },
+                    )
+                if isinstance(revisions, (list, tuple)):
+                    for item in revisions:
+                        if not isinstance(item, Mapping):
+                            raise CapabilityInputError(
+                                "analysis_input_invalid",
+                                "Input resource lineage is invalid.",
+                            )
+                        resource_id = str(item.get("resource_id"))
+                        if (
+                            resource_id not in readable
+                            or resource_id not in schemas
+                            or schemas[resource_id].revision != item.get("revision")
+                        ):
+                            raise CapabilityInputError(
+                                "analysis_input_revoked",
+                                "The input resource authority or structural revision changed.",
+                            )
+        return validated
+
     async def _validated_current_run_evidence(
         self,
         run: RunInput,
@@ -2099,6 +2158,56 @@ class ArtifactCapabilityDomain:
                 and evidence_calls[0][0] < evidence_results[0][0] < current_index
             )
             block = evidence_results[0][1] if len(evidence_results) == 1 else None
+            producer_call = evidence_calls[0][1] if evidence_calls else None
+            if not evidence_calls:
+                children = await self._transcripts.load_analysis_evidence(
+                    run.agent_id, run.id
+                )
+                child = next(
+                    (
+                        record
+                        for record in children
+                        if record.kind == "child"
+                        and record.evidence_id == evidence_call_id
+                    ),
+                    None,
+                )
+                if child is not None and child.facts.get("status") == "succeeded":
+                    parent_id = child.facts.get("parent_call_id")
+                    parent_calls = [
+                        (index, candidate)
+                        for index, message in enumerate(transcript.messages)
+                        for candidate in message.tool_calls
+                        if candidate.id == parent_id
+                    ]
+                    parent_results = [
+                        (index, candidate)
+                        for index, message in enumerate(transcript.messages)
+                        for candidate in message.content
+                        if isinstance(candidate, ToolResultBlock)
+                        and candidate.call_id == parent_id
+                    ]
+                    ordered = (
+                        len(parent_calls) == len(parent_results) == 1
+                        and parent_calls[0][0] < parent_results[0][0] < current_index
+                    )
+                    facts = child.facts
+                    producer_call = ToolCall(
+                        id=child.evidence_id,
+                        name=str(facts["tool_name"]),
+                        arguments=cast(Mapping[str, object], facts["arguments"]),
+                    )
+                    block = ToolResultBlock(
+                        call_id=child.evidence_id,
+                        output=cast(Mapping[str, object], facts["result"]),
+                        sensitivity=ModelSensitivity(str(facts["result_sensitivity"])),
+                        sensitivity_provenance=cast(
+                            Mapping[str, object], facts["sensitivity_provenance"]
+                        ),
+                        capability_id=str(facts["capability_id"]),
+                        executor_id=str(facts["executor_id"]),
+                        output_sha256=str(facts["result_digest"]),
+                    )
             if (
                 not ordered
                 or block is None
@@ -2114,7 +2223,7 @@ class ArtifactCapabilityDomain:
                     error_message,
                     {"call_id": evidence_call_id},
                 )
-            producer_call = evidence_calls[0][1]
+            assert producer_call is not None
             try:
                 _view, producer_capability = registry.resolve_tool(producer_call.name)
                 if (

@@ -459,6 +459,10 @@ async def test_graph_and_delivery_artifact_deletion_survives_reopen(
         if source_revision != 3:
             await agent.close()
             with sqlite3.connect(agent.home / "state.db") as connection:
+                connection.execute("DROP TABLE analysis_evidence")
+                connection.execute(
+                    "DELETE FROM agent_home_migrations WHERE revision > 3"
+                )
                 connection.execute("DROP TABLE artifacts")
                 if source_revision == 2:
                     connection.execute(
@@ -629,6 +633,8 @@ async def test_prior_artifact_roots_are_backfilled_once_without_changing_bytes(
     home = agent.home
     await agent.close()
     with sqlite3.connect(home / "state.db") as connection:
+        connection.execute("DROP TABLE analysis_evidence")
+        connection.execute("DELETE FROM agent_home_migrations WHERE revision > 3")
         connection.execute("DROP TABLE artifacts")
         if source_revision == 2:
             connection.execute("DELETE FROM agent_home_migrations WHERE revision = 3")

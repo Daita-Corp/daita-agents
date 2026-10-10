@@ -69,6 +69,7 @@ from .llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
+from .loop.analysis import AnalysisEvidence, ProgrammaticReadResult
 from .loop.models import (
     LoopLimits,
     RunInput,
@@ -82,6 +83,7 @@ from .observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
 from .scope import EffectiveSourceScope
 
 if TYPE_CHECKING:
+    from .domains.analysis.domain import AnalysisCapabilityDomain
     from .storage.sqlite_records import EffectReceipt
 
 
@@ -1295,6 +1297,25 @@ class CapabilityRuntime:
             projection,
             sensitivity=sensitivity,
         )
+        if session is not None:
+            analysis = self._domains.get("analysis")
+            if analysis is not None:
+                for resolved in resolved_calls:
+                    if (
+                        resolved.entry is not None
+                        and resolved.entry.capability.id == "analysis.execute"
+                    ):
+                        cast("AnalysisCapabilityDomain", analysis).bind_parent(
+                            session,
+                            run,
+                            resolved.target_call,
+                            self._programmatic_reader(
+                                session, run, resolved.target_call, projection
+                            ),
+                            sensitivity,
+                            self._analysis_authority_reader(session, run),
+                            self._limits.max_tool_calls_per_run,
+                        )
         terminators = tuple(
             resolved
             for resolved in resolved_calls
@@ -1653,6 +1674,8 @@ class CapabilityRuntime:
             )
             return result
         if resolved.control_name is not None:
+            if session is not None:
+                session.evidence.record_outer_dispatch(resolved.outer_call.id)
             return await self._execute_control(
                 run,
                 resolved.target_call,
@@ -2041,6 +2064,215 @@ class CapabilityRuntime:
             catalog_digest=projection.catalog_digest,
         )
 
+    def _analysis_authority_reader(self, session: RunSession, run: RunInput):
+        async def revalidate(call: ToolCall, sensitivity: ModelSensitivity) -> None:
+            view, capability, owner = self._registry.resolve_tool_owner(call.name)
+            if not self._analysis_read_eligible(owner, capability):
+                raise CapabilityInputError(
+                    "analysis_authority_revoked",
+                    "An admitted input is outside the analytical read surface.",
+                )
+            domain = self._domains[owner]
+            if view.name not in await _domain_project(domain, run, session):
+                raise CapabilityInputError(
+                    "analysis_authority_revoked",
+                    "An admitted input is no longer readable.",
+                )
+            arguments = await self._registry.validate_arguments_async(
+                capability.id, domain.normalize_arguments(capability, call.arguments)
+            )
+            await _domain_prepare_call(
+                domain,
+                run,
+                call,
+                capability,
+                arguments,
+                request_sensitivity=sensitivity,
+                session=session,
+            )
+
+        return revalidate
+
+    async def handoff_analysis_recovery(self) -> None:
+        analysis = self._domains.get("analysis")
+        if analysis is not None:
+            await cast("AnalysisCapabilityDomain", analysis).handoff_recovery()
+
+    def _analysis_read_eligible(self, owner: str, capability: Capability) -> bool:
+        local_artifact_read = owner == "artifacts" and capability.id in getattr(
+            self._domains[owner], "programmatic_read_capability_ids", frozenset()
+        )
+        return (
+            owner in {"data", "artifacts", "mcp"}
+            and (
+                capability.access_mode is AccessMode.READ
+                or local_artifact_read
+                and capability.access_mode is AccessMode.NONE
+            )
+            and capability.operational_effect is OperationalEffect.NONE
+            and capability.artifact_policy is None
+            and capability.machine_run_directive_kind is None
+        )
+
+    def _programmatic_reader(
+        self,
+        session: RunSession,
+        run: RunInput,
+        parent: ToolCall,
+        projection: StepToolProjection,
+    ):
+        """Freeze one parent surface and share the ordinary single-call boundary."""
+        entries = {
+            entry.view.name: entry
+            for entry in projection.callable_entries
+            if self._analysis_read_eligible(entry.domain_owner_id, entry.capability)
+        }
+        sequence = 0
+        child_limit = cast(
+            "AnalysisCapabilityDomain", self._domains["analysis"]
+        ).child_call_limit
+
+        async def invoke(
+            name: str, arguments: Mapping[str, object], sensitivity: ModelSensitivity
+        ) -> ProgrammaticReadResult:
+            nonlocal sequence
+            sequence += 1
+            child = ToolCall(
+                id=f"analysis-child-{secrets.token_hex(16)}",
+                name=name,
+                arguments=arguments,
+            )
+            entry = entries.get(name)
+            allowed = session.evidence.count_tool_attempts(
+                1, self._limits.max_tool_calls_per_run, programmatic=True
+            )
+            facts = {
+                "status": "admitted",
+                "parent_call_id": parent.id,
+                "sequence": sequence,
+                "tool_name": name,
+                "arguments": child.arguments,
+                "capability_id": None if entry is None else entry.capability.id,
+                "executor_id": None if entry is None else entry.executor_id,
+                "contract_digest": (
+                    None if entry is None else entry.origin_revision_digest
+                ),
+                "sensitivity": sensitivity.value,
+                "dispatched": False,
+                "started_at": self._clock().isoformat(),
+                "input_schema_digest": (
+                    None
+                    if entry is None
+                    else entry.input_schema_digest
+                    or "sha256:"
+                    + sha256(
+                        canonical_json(entry.capability.input_schema).encode()
+                    ).hexdigest()
+                ),
+            }
+            await session.writer.record_analysis(
+                AnalysisEvidence(run.id, child.id, "child", facts)
+            )
+            started = asyncio.get_running_loop().time()
+            try:
+                session.cancellation.raise_if_cancelled()
+                if not allowed or sequence > child_limit:
+                    result = _error(
+                        child,
+                        "analysis_child_budget_exhausted",
+                        "The shared run or cell child-call allowance is exhausted.",
+                    )
+                elif entry is None:
+                    result = _error(
+                        child,
+                        "analysis_child_not_admitted",
+                        "The tool is outside this cell's frozen read surface.",
+                    )
+                elif name not in await _domain_project(
+                    self._domains[entry.domain_owner_id], run, session
+                ):
+                    result = _error(
+                        child,
+                        "analysis_child_revoked",
+                        "The tool is no longer applicable.",
+                    )
+                else:
+
+                    async def dispatched() -> None:
+                        facts.update({"status": "running", "dispatched": True})
+                        await session.writer.record_analysis(
+                            AnalysisEvidence(run.id, child.id, "child", facts)
+                        )
+
+                    result = await self._execute_one(
+                        run,
+                        child,
+                        entry,
+                        sensitivity=sensitivity,
+                        validated_arguments=None,
+                        session=session,
+                        dispatch_hook=dispatched,
+                    )
+                if len(canonical_json(result.output).encode()) > 60_000:
+                    original = result
+                    result = replace(
+                        _error(
+                            child,
+                            "analysis_child_result_limited",
+                            "The broker result exceeds its bounded delivery allowance; use a smaller read.",
+                        ),
+                        sensitivity=original.sensitivity,
+                        sensitivity_provenance=original.sensitivity_provenance,
+                    )
+                facts.update(
+                    {
+                        "status": "failed" if result.is_error else "succeeded",
+                        "result": result.output,
+                        "result_digest": result.output_sha256
+                        or "sha256:"
+                        + sha256(canonical_json(result.output).encode()).hexdigest(),
+                        "result_sensitivity": (
+                            None
+                            if result.sensitivity is None
+                            else result.sensitivity.value
+                        ),
+                        "sensitivity_provenance": result.sensitivity_provenance,
+                        "completed_at": self._clock().isoformat(),
+                        "wall_seconds": asyncio.get_running_loop().time() - started,
+                    }
+                )
+                evidence = AnalysisEvidence(run.id, child.id, "child", facts)
+                await session.writer.record_analysis(evidence)
+                return ProgrammaticReadResult(
+                    {
+                        "output": result.output,
+                        "is_error": result.is_error,
+                        "evidence_id": child.id,
+                        "sensitivity": (
+                            None
+                            if result.sensitivity is None
+                            else result.sensitivity.value
+                        ),
+                    },
+                    evidence,
+                )
+            except BaseException:
+                facts.update(
+                    {
+                        "status": "interrupted",
+                        "wall_seconds": asyncio.get_running_loop().time() - started,
+                    }
+                )
+                task = asyncio.create_task(
+                    session.writer.record_analysis(
+                        AnalysisEvidence(run.id, child.id, "child", facts)
+                    )
+                )
+                await asyncio.shield(task)
+                raise
+
+        return invoke
+
     async def _execute_one(
         self,
         run: RunInput,
@@ -2050,6 +2282,7 @@ class CapabilityRuntime:
         sensitivity: ModelSensitivity,
         validated_arguments: FrozenJsonObject | None,
         session: RunSession | None,
+        dispatch_hook: Callable[[], Awaitable[None]] | None = None,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
@@ -2203,6 +2436,7 @@ class CapabilityRuntime:
                     session=session,
                     task_attempt_guard=guard,
                     catalog_entry=entry,
+                    dispatch_hook=dispatch_hook,
                 )
                 result = _classified_success(call, output, artifact_ref=artifact_ref)
         except _ToolExecutionInterrupted:
@@ -2243,6 +2477,7 @@ class CapabilityRuntime:
         session: RunSession | None = None,
         task_attempt_guard: TaskAttemptGuard | None = None,
         catalog_entry: RunToolCatalogEntry | None = None,
+        dispatch_hook: Callable[[], Awaitable[None]] | None = None,
     ) -> tuple[ToolOutput, ArtifactRef | None]:
         if capability.operational_effect is not OperationalEffect.NONE:
             raise ValueError("non-effect execution requires operational effect none")
@@ -2273,12 +2508,20 @@ class CapabilityRuntime:
         )
         if permit is None:
             await _guard_attempt(task_attempt_guard, capability.id, "before_dispatch")
+            if dispatch_hook is not None:
+                await dispatch_hook()
+            elif session is not None:
+                session.evidence.record_outer_dispatch(call.id)
             candidate = await executor.execute(execution)
         else:
             async with permit:
                 await _guard_attempt(
                     task_attempt_guard, capability.id, "before_io_dispatch"
                 )
+                if dispatch_hook is not None:
+                    await dispatch_hook()
+                elif session is not None:
+                    session.evidence.record_outer_dispatch(call.id)
                 candidate = await executor.execute(execution)
         if not isinstance(candidate, ToolOutput):
             raise ToolOutputValidationError("executor did not return ToolOutput")
@@ -2302,13 +2545,21 @@ class CapabilityRuntime:
             await _guard_attempt(
                 task_attempt_guard, capability.id, "before_artifact_commit"
             )
-        artifact_ref = await self._commit_artifact_output(
-            run,
-            call,
-            capability,
-            output,
-            reserved_artifact_id=reserved_artifact_id,
-        )
+        try:
+            artifact_ref = await self._commit_artifact_output(
+                run, call, capability, output, reserved_artifact_id=reserved_artifact_id
+            )
+        except ArtifactError as error:
+            if capability.id != "analysis.execute":
+                raise
+            output = cast("AnalysisCapabilityDomain", domain).artifact_save_failed(
+                output, error.code
+            )
+            artifact_ref = None
+        if artifact_ref is not None and capability.id == "analysis.execute":
+            cast("AnalysisCapabilityDomain", domain).artifact_committed(
+                run.id, artifact_ref.byte_size
+            )
         return output, artifact_ref
 
     async def _call_io_permit(
@@ -2638,6 +2889,8 @@ class CapabilityRuntime:
                     sensitivity=sensitivity,
                     session=session,
                 )
+            if session is not None:
+                session.evidence.record_outer_dispatch(call.id)
             (
                 candidate,
                 execution_error,
@@ -2915,6 +3168,8 @@ class CapabilityRuntime:
             )
         else:
             try:
+                if session is not None:
+                    session.evidence.record_outer_dispatch(call.id)
                 (
                     candidate,
                     execution_error,

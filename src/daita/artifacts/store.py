@@ -464,6 +464,7 @@ class AgentHomeArtifactStore:
                 self.agent_id,
                 caller_principal_id or self.agent_id,
                 ArtifactState.CREATING,
+                computation_evidence=draft.computation_evidence,
             )
             await self._registry.begin_artifact_creation(
                 record, reserved=reserved_artifact_id is not None

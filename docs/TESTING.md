@@ -26,6 +26,47 @@ unit/integration directory hierarchy.
   from default discovery.
 - `tests/diagnostics` and `tests/packaging` contain explicit module entry points.
 
+## Local Python live acceptance
+
+`tests/analysis` covers the production native execution slice. The required
+opt-in acceptance suite is `tests/live/analysis`: real-model API, CLI and mounted
+TUI journeys plus real-worker faults, resource accounting, active revocation,
+crash/reopen, data fidelity, output formats and managed installation. Model turns
+may be scripted for deterministic faults; native execution and teardown are real.
+
+Run on macOS ARM64 with `.[dev,analysis]` installed. The live model defaults to
+reviewed `openai:gpt-5.6-terra`, reads configured repository `.env` credentials
+without displaying them, and permits at most $0.50 per paid run and $5.00 aggregate
+reserved model cost per invocation. Set `DAITA_ANALYSIS_LIVE_MODEL_ID`,
+`DAITA_ANALYSIS_LIVE_MAX_COST_USD`, `DAITA_ANALYSIS_LIVE_SUITE_MAX_COST_USD` or
+`DAITA_ANALYSIS_LIVE_LLM_API_KEY` explicitly when needed. All ceilings must be
+finite and positive. `DAITA_ANALYSIS_LIVE_DEADLINE_SECONDS` defaults to 900.
+
+Build the exact candidate wheel and supply the reviewed uv archive from
+`release/managed-installer.json`; the installer test verifies its checksum:
+
+```bash
+.venv/bin/python -m build --wheel --no-isolation --outdir /private/tmp/daita-analysis-wheel
+export DAITA_ANALYSIS_LIVE_WHEEL=/private/tmp/daita-analysis-wheel/daita_agents-VERSION-py3-none-any.whl
+export DAITA_ANALYSIS_LIVE_UV_ARCHIVE=/private/tmp/daita-analysis-uv-aarch64.tar.gz
+DAITA_RUN_LIVE_ANALYSIS=1 .venv/bin/python -m pytest tests/live/analysis \
+  -o addopts="--tb=short -q --strict-markers" \
+  --junitxml=/private/tmp/daita-analysis-live.xml
+```
+
+Replace `VERSION` with the actual wheel version authored in `pyproject.toml`. No candidate is
+published. The real installer downloads the pinned CPython and scientific
+dependencies into disposable binary generations; no cell installs packages.
+Missing configuration fails dedicated acceptance rather than skipping it.
+Ordinary offline CI does not opt into these live tests.
+
+Every call outcome writes JSON to `DAITA_ANALYSIS_LIVE_REPORT_DIR` (default
+`/private/tmp/daita-analysis-live-evidence`), including failures, usage, captured
+child evidence and actual cleanup. Prior results are archived in `history/`;
+JUnit is retained independently. Inspect both run status and measurement
+completeness. A mocked cleanup, absent worker measurement or model-written
+analytical claim is not successful live evidence.
+
 `tests/storage/contracts` is the portable durable-backend suite. The framework
 runs it against SQLite and a disposable in-memory artifact-byte dependency:
 

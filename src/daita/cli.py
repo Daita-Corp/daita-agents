@@ -35,6 +35,7 @@ from . import (
     LearningCandidateView,
     LocalFileAccess,
     LocalWorkspace,
+    LoopLimits,
     MCPAuthentication,
     MCPBindingStatus,
     MCPServerInspection,
@@ -570,6 +571,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--conversation-id")
     run.add_argument("--files-only", action="store_true")
     run.add_argument("--events-jsonl", action="store_true")
+    run.add_argument(
+        "--max-cost-usd",
+        type=Decimal,
+        help="finite positive estimated model-cost ceiling for this run",
+    )
 
     chat = commands.add_parser(
         "chat",
@@ -1787,6 +1793,7 @@ async def _execute(args: argparse.Namespace) -> object:
         finally:
             await agent.close()
     if args.command == "run":
+        _validate_candidate_review_cost_limit(args.max_cost_usd)
         if args.model is None and any(
             value is not None
             for value in (args.base_url, args.context_window, args.max_output)
@@ -1803,6 +1810,11 @@ async def _execute(args: argparse.Namespace) -> object:
                     workspace=workspace,
                     root=args.root,
                     observer=_write_event_jsonl if args.events_jsonl else None,
+                    limits=(
+                        None
+                        if args.max_cost_usd is None
+                        else LoopLimits(max_estimated_cost_usd=args.max_cost_usd)
+                    ),
                 )
             else:
                 provider, profile = _model_configuration(
@@ -1818,6 +1830,11 @@ async def _execute(args: argparse.Namespace) -> object:
                     model=provider,
                     model_profile=profile,
                     observer=_write_event_jsonl if args.events_jsonl else None,
+                    limits=(
+                        None
+                        if args.max_cost_usd is None
+                        else LoopLimits(max_estimated_cost_usd=args.max_cost_usd)
+                    ),
                 )
             result = (
                 await run_agent.run(
@@ -1832,6 +1849,7 @@ async def _execute(args: argparse.Namespace) -> object:
                 )
             )
             transcript = await run_agent.transcript(result.run_id)
+            analysis = await run_agent.analysis_usage(result.run_id)
             return {
                 "run_id": result.run_id,
                 "conversation_id": result.conversation_id,
@@ -1839,6 +1857,16 @@ async def _execute(args: argparse.Namespace) -> object:
                 "reason": result.reason,
                 "text": result.final_text,
                 "steps": result.steps,
+                "analysis_usage": analysis,
+                "model_usage": {
+                    "input_tokens": result.usage.input_tokens,
+                    "output_tokens": result.usage.output_tokens,
+                    "cost_usd": (
+                        None
+                        if result.usage.cost_estimate.amount_usd is None
+                        else str(result.usage.cost_estimate.amount_usd)
+                    ),
+                },
                 "notice": (
                     None
                     if result.kind.value == "completed"

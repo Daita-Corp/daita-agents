@@ -1268,6 +1268,18 @@ class DaitaApp(App[int]):
                     "notice", f"artifact-{result.run_id}-{id(notice)}", notice
                 )
             )
+        summary = await self.controller.require_agent().analysis_usage(result.run_id)
+        if summary is not None:
+            cpu = summary["user_cpu_seconds"]
+            cpu_text = "unavailable" if cpu is None else f"{cpu:.3f}s"
+            screen.append_block(
+                TranscriptBlock(
+                    "notice",
+                    f"analysis-{result.run_id}",
+                    f"Python CPU {cpu_text}; worker closure {'verified' if summary['processes_reaped'] else 'incomplete'}; "
+                    f"scratch deletion {'verified' if summary['scratch_deleted'] else 'incomplete'}.",
+                )
+            )
 
     async def on_observer_event(self, message: ObserverEvent) -> None:
         if self._shutting_down:
@@ -1290,6 +1302,17 @@ class DaitaApp(App[int]):
             return
         screen = self.chat()
         if screen is None:
+            return
+        if event.kind is AgentEventKind.ANALYSIS_UPDATED:
+            cpu = event.data.get("user_cpu_seconds")
+            memory = event.data.get("peak_rss_bytes")
+            cpu_text = f"{cpu:.2f}s" if isinstance(cpu, (int, float)) else "unavailable"
+            memory_text = (
+                f"{memory / (1024 * 1024):.1f} MiB"
+                if isinstance(memory, (int, float))
+                else "unavailable"
+            )
+            screen.set_activity(f"Python · CPU {cpu_text} · peak memory {memory_text}")
             return
         if event.kind is AgentEventKind.MODEL_TEXT_DELTA:
             fragment = event.data.get("text")

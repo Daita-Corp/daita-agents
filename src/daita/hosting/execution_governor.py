@@ -65,6 +65,9 @@ class PermitKind(str, Enum):
     MCP_BINDING = "mcp_binding"
     SQLITE_PRESSURE = "sqlite_pressure"
     EFFECT = "effect"
+    ANALYSIS_WORKER = "analysis_worker"
+    ANALYSIS_COMPUTE = "analysis_compute"
+    ANALYSIS_PARSER = "analysis_parser"
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,6 +256,7 @@ class RunAdmissionCoordinator:
         clock: Callable[[], float] | None = None,
         id_factory: Callable[[str], str] | None = None,
         cancellation_grace_seconds: float = 5.0,
+        analysis_worker_capacity: int = 1,
     ) -> None:
         if (
             not isinstance(execution_capacity, int)
@@ -301,6 +305,12 @@ class RunAdmissionCoordinator:
         ):
             raise ValueError("cancellation grace must be positive and at most 30")
         self._clock = clock or (lambda: asyncio.get_running_loop().time())
+        if (
+            type(analysis_worker_capacity) is not int
+            or not 1 <= analysis_worker_capacity <= 2
+        ):
+            raise ValueError("Analysis worker capacity must be one or two")
+        self._analysis_worker_capacity = analysis_worker_capacity
         self._id_factory = id_factory or (lambda prefix: f"{prefix}-{uuid4().hex}")
         self._cancellation_grace_seconds = float(cancellation_grace_seconds)
         self._execution_capacity = execution_capacity
@@ -606,6 +616,38 @@ class RunAdmissionCoordinator:
             cancellation=cancellation,
         )
 
+    async def analysis_worker_permit(
+        self, *, deadline: float, cancellation: RunCancellationToken
+    ) -> PermitLease:
+        """Reserve one bounded interpreter and its memory/scratch for its lifetime."""
+        return await self._acquire_permit(
+            PermitKind.ANALYSIS_WORKER,
+            "analysis:worker",
+            deadline=deadline,
+            cancellation=cancellation,
+        )
+
+    async def analysis_compute_permit(
+        self, *, deadline: float, cancellation: RunCancellationToken
+    ) -> PermitLease:
+        return await self._acquire_permit(
+            PermitKind.ANALYSIS_COMPUTE,
+            "analysis:cpu",
+            deadline=deadline,
+            cancellation=cancellation,
+        )
+
+    async def analysis_parser_permit(
+        self, *, deadline: float, cancellation: RunCancellationToken
+    ) -> PermitLease:
+        """Reserve the independent bounded parser lane while interpreters remain suspended."""
+        return await self._acquire_permit(
+            PermitKind.ANALYSIS_PARSER,
+            "analysis:parser",
+            deadline=deadline,
+            cancellation=cancellation,
+        )
+
     async def mcp_permit(
         self,
         key: str,
@@ -780,6 +822,8 @@ class RunAdmissionCoordinator:
         return self._provider_background_active.get(key, 0) < background_capacity
 
     def _permit_capacity(self, kind: PermitKind, key: str) -> int:
+        if kind is PermitKind.ANALYSIS_WORKER:
+            return self._analysis_worker_capacity
         if kind is PermitKind.SOURCE_RESOURCE:
             return self._source_resource_capacities.get(key, 1)
         if kind is PermitKind.SQLITE_PRESSURE:

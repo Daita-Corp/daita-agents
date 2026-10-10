@@ -39,9 +39,23 @@ CREATE INDEX artifacts_by_conversation ON artifacts
     (agent_id, state, conversation_id, created_at_us, artifact_id);
 CREATE INDEX artifacts_by_run ON artifacts (agent_id, run_id, state);
 """
-CURRENT_DATABASE_SQL = REVISION_2_DATABASE_SQL + ARTIFACT_REGISTRY_SQL
-SCHEMA_REVISION_3 = schema_from_sql(CURRENT_DATABASE_SQL)
-CURRENT_SCHEMA = SCHEMA_REVISION_3
+REVISION_3_DATABASE_SQL = REVISION_2_DATABASE_SQL + ARTIFACT_REGISTRY_SQL
+SCHEMA_REVISION_3 = schema_from_sql(REVISION_3_DATABASE_SQL)
+ANALYSIS_EVIDENCE_SQL = """
+CREATE TABLE analysis_evidence (
+    agent_id TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    evidence_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('generation', 'cell', 'child', 'run')),
+    data TEXT NOT NULL,
+    reserved_bytes INTEGER NOT NULL CHECK (reserved_bytes >= 0),
+    PRIMARY KEY (run_id, evidence_id)
+);
+CREATE INDEX analysis_evidence_by_agent_run ON analysis_evidence (agent_id, run_id);
+"""
+CURRENT_DATABASE_SQL = REVISION_3_DATABASE_SQL + ANALYSIS_EVIDENCE_SQL
+SCHEMA_REVISION_4 = schema_from_sql(CURRENT_DATABASE_SQL)
+CURRENT_SCHEMA = SCHEMA_REVISION_4
 
 __all__ = [
     "ARTIFACT_REGISTRY_SQL",

@@ -61,6 +61,7 @@ from ..llm.protocols import (
     provider_supports_request_policy,
 )
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
+from .analysis import AnalysisEvidence
 from .models import (
     ConversationRun,
     LoopExit,
@@ -169,6 +170,35 @@ class InMemoryTranscriptStore:
         self._transcripts: dict[str, Transcript] = {}
         self._results: dict[str, LoopExit] = {}
         self._turn_indexes: dict[str, int] = {}
+        self._analysis: dict[tuple[str, str], AnalysisEvidence] = {}
+
+    async def record_analysis_evidence(
+        self, agent_id: str, evidence: AnalysisEvidence
+    ) -> None:
+        transcript = self._transcripts.get(evidence.run_id)
+        if (
+            transcript is None
+            or transcript.run.agent_id != agent_id
+            or evidence.run_id in self._results
+        ):
+            raise ValueError("Analysis evidence requires its exact live run")
+        key = (evidence.run_id, evidence.evidence_id)
+        previous = self._analysis.get(key)
+        if previous is not None and previous.facts.get("status") not in {
+            "admitted",
+            "running",
+        }:
+            raise ValueError("Analysis evidence cannot be replayed")
+        self._analysis[key] = evidence
+
+    async def load_analysis_evidence(
+        self, agent_id: str, run_id: str
+    ) -> tuple[AnalysisEvidence, ...]:
+        if self._transcripts[run_id].run.agent_id != agent_id:
+            raise ValueError("Analysis evidence belongs to another agent")
+        return tuple(
+            record for (owner, _), record in self._analysis.items() if owner == run_id
+        )
 
     async def start(
         self,
@@ -494,6 +524,7 @@ class AgentLoop:
         writer = session.writer
         transcript = await writer.start()
         run_started = asyncio.get_running_loop().time()
+        session.evidence.run_started_monotonic = run_started
         if self._observer is not None:
             self._emit(
                 AgentEventKind.RUN_STARTED,
@@ -509,7 +540,6 @@ class AgentLoop:
         previous_request_input_tokens: int | None = None
         request_input_growth_tokens: int | None = None
         checkpoint_warning_emitted = False
-        tool_call_count = 0
         run_route: object | None = None if prepared is None else prepared.run_route
         limits = (
             _effective_run_limits(self._limits, run)
@@ -545,6 +575,11 @@ class AgentLoop:
                 context_snapshot = prepared.context_snapshot
             for step in range(1, limits.max_steps + 1):
                 session.cancellation.raise_if_cancelled()
+                sensitivity = max(
+                    sensitivity,
+                    writer.analysis_sensitivity,
+                    key=lambda value: value.routing_rank,
+                )
                 if limits.max_estimated_cost_usd == 0:
                     return await self._finish(
                         run,
@@ -715,11 +750,14 @@ class AgentLoop:
                     budget_reason = "tool_calls_per_response_exceeded"
                 if (
                     budget_reason is None
-                    and tool_call_count + len(response.tool_calls)
+                    and session.evidence.tool_calls_attempted + len(response.tool_calls)
                     > limits.max_tool_calls_per_run
                 ):
                     budget_reason = "tool_calls_per_run_exceeded"
                 if budget_reason is not None:
+                    session.evidence.count_tool_attempts(
+                        len(response.tool_calls), limits.max_tool_calls_per_run
+                    )
                     await writer.append(assistant, position=writer.next_position)
                     messages = (*messages, assistant)
                     for call in response.tool_calls:
@@ -773,7 +811,9 @@ class AgentLoop:
                     return terminal_response
 
                 assert response.tool_calls
-                tool_call_count += len(response.tool_calls)
+                session.evidence.count_tool_attempts(
+                    len(response.tool_calls), limits.max_tool_calls_per_run
+                )
                 await writer.append(assistant, position=writer.next_position)
                 messages = (*messages, assistant)
 
@@ -809,6 +849,9 @@ class AgentLoop:
                         "tool runtime must return one ordered result per tool call"
                     )
                 for result in results:
+                    session.evidence.record_outer_result(
+                        result.call_id, failed=result.is_error
+                    )
                     tool_message = CanonicalMessage(
                         role=MessageRole.TOOL,
                         content=(result,),
@@ -832,6 +875,38 @@ class AgentLoop:
                     receipt = _artifact_delivery(result)
                     if receipt is not None:
                         artifact_deliveries.append(receipt)
+
+                if (
+                    session.evidence.analysis_budget_exhausted
+                    or writer.analysis_budget_exhausted
+                ):
+                    return await self._finish(
+                        run,
+                        writer,
+                        LoopExitKind.FAILED,
+                        writer.analysis_budget_reason
+                        or "analysis_compute_budget_exhausted",
+                        step,
+                        usage,
+                        run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
+                    )
+
+                if session.evidence.tool_budget_exhausted:
+                    return await self._finish(
+                        run,
+                        writer,
+                        LoopExitKind.FAILED,
+                        "tool_calls_per_run_exceeded",
+                        step,
+                        usage,
+                        run_started,
+                        artifacts=tuple(artifacts),
+                        artifact_deliveries=tuple(artifact_deliveries),
+                        sensitivity=sensitivity,
+                    )
 
                 if outcome.machine_run_directive is not None:
                     return await self._finish(
@@ -1005,6 +1080,25 @@ class AgentLoop:
         artifacts: tuple[ArtifactRef, ...] = (),
         artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...] = (),
     ) -> LoopExit:
+        try:
+            await writer.settle_analysis()
+        except Exception:
+            kind = LoopExitKind.FAILED
+            reason = "analysis_cleanup_failed"
+            final_text = None
+            final_message = None
+        if writer.analysis_budget_exhausted:
+            kind = LoopExitKind.FAILED
+            reason = (
+                writer.analysis_budget_reason or "analysis_compute_budget_exhausted"
+            )
+            final_text = None
+            final_message = None
+        sensitivity = max(
+            sensitivity,
+            writer.analysis_sensitivity,
+            key=lambda value: value.routing_rank,
+        )
         result = LoopExit(
             run_id=run.id,
             conversation_id=run.conversation_id or run.id,

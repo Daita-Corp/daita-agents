@@ -32,6 +32,7 @@ class AgentEventKind(str, Enum):
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_DECIDED = "approval.decided"
     TOOL_COMPLETED = "tool.completed"
+    ANALYSIS_UPDATED = "analysis.updated"
     RUN_COMPLETED = "run.completed"
 
 

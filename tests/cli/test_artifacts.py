@@ -21,6 +21,9 @@ async def test_cli_run_json_contains_refs_and_receipts_but_no_payload_or_grant_m
     ref, receipt, result = _surface_records()
 
     class _FakeAgent:
+        async def analysis_usage(self, run_id: str):
+            return None
+
         async def run(self, message: str, *, conversation_id: str | None = None):
             del message, conversation_id
             return result

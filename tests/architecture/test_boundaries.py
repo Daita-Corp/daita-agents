@@ -200,9 +200,19 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
     assert "_scheduled_bindings" not in skills
     assert "self._one_time" not in delivery
     assert "_source_permission_lock" in embedded
-    assert (
-        "HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2, REVISION_3)"
-        in migrations
+    assignment = next(
+        node
+        for node in ast.parse(migrations).body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "HOME_MIGRATIONS"
+    )
+    assert isinstance(assignment.value, ast.Tuple)
+    assert tuple(ast.unparse(item) for item in assignment.value.elts) == (
+        "REVISION_1",
+        "REVISION_2",
+        "REVISION_3",
+        "REVISION_4",
     )
     assert "job_graphs" in CURRENT_SCHEMA.tables
     assert "autonomous_followups" not in CURRENT_SCHEMA.tables
@@ -527,6 +537,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         registry = agent._embedded._capabilities
         runtime = agent._embedded._capability_runtime
         expected_owners = {
+            "analysis",
             "artifacts",
             "data",
             "data_profile_jobs",
@@ -2121,6 +2132,7 @@ def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
         "revision_0002_legacy_job_codecs.py",
         "revision_0002_legacy_jobs.py",
         "revision_0003.py",
+        "revision_0004.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 

@@ -41,8 +41,8 @@ def test_revision_two_schema_is_the_only_current_contract(
         assert connection.execute("PRAGMA busy_timeout").fetchone() == (5000,)
         assert connection.execute("PRAGMA wal_autocheckpoint").fetchone() == (1000,)
 
-    assert CURRENT_HOME_REVISION == 3
-    assert tuple(item.revision for item in HOME_MIGRATIONS) == (1, 2, 3)
+    assert CURRENT_HOME_REVISION == 4
+    assert tuple(item.revision for item in HOME_MIGRATIONS) == (1, 2, 3, 4)
     assert "job_graphs" in CURRENT_SCHEMA.tables
     assert "autonomous_followups" not in CURRENT_SCHEMA.tables
 

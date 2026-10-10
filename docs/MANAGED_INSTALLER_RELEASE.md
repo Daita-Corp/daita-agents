@@ -19,6 +19,15 @@ value into source, policy, workflow configuration, tests, or documentation.
 The agent-home revision is independent and changes only through a reviewed,
 append-only durable-format migration.
 
+The candidate's `analysis` wheel extra pins the scientific packages used by
+local Python execution. Managed generations install that extra and independently
+verify exact declared versions before publication, repair and rollback. Runtime
+availability remains macOS ARM64 only; other supported installer targets retain
+the ordinary application without an execution fallback. The real installer
+qualification invokes the contained worker from installed CPython, imports every
+scientific package, runs DuckDB and verifies reaping and deletion. See
+[local Python acceptance](TESTING.md#local-python-live-acceptance).
+
 An editable installation stores a metadata snapshot. After changing
 `project.version` or checking out a commit with another value, refresh it before
 importing Daita or running tests:

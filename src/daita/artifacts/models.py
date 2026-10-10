@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
@@ -428,6 +428,7 @@ class ArtifactDraft:
     media_type: str
     sensitivity: Sensitivity
     provenance: ArtifactProvenance
+    computation_evidence: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.content, bytes):
@@ -440,6 +441,8 @@ class ArtifactDraft:
             raise TypeError("artifact sensitivity must be Sensitivity")
         if not isinstance(self.provenance, ArtifactProvenance):
             raise TypeError("artifact provenance must be ArtifactProvenance")
+        evidence = _computation_evidence(self.computation_evidence)
+        object.__setattr__(self, "computation_evidence", evidence)
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +506,7 @@ class ArtifactRecord:
     agent_id: str
     caller_principal_id: str
     state: ArtifactState
+    computation_evidence: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not isinstance(self.ref, ArtifactRef):
@@ -513,6 +517,8 @@ class ArtifactRecord:
         _required_text(self.caller_principal_id, "artifact caller", maximum=512)
         if not isinstance(self.state, ArtifactState):
             raise TypeError("artifact lifecycle state must be ArtifactState")
+        evidence = _computation_evidence(self.computation_evidence)
+        object.__setattr__(self, "computation_evidence", evidence)
 
 
 @dataclass(frozen=True, slots=True)
@@ -794,6 +800,46 @@ def _mapping_text(value: Mapping[str, object], key: str, name: str) -> str:
     if not isinstance(selected, str):
         raise ValueError(f"{name} {key} must be text")
     return selected
+
+
+def _computation_evidence(value: Mapping[str, object]) -> FrozenJsonObject:
+    evidence = FrozenJsonObject.from_mapping(value)
+    if not evidence:
+        return evidence
+    required = {
+        "authority",
+        "generation",
+        "runtime_identity",
+        "run_id",
+        "producing_call_id",
+        "output_sha256",
+        "children",
+        "inputs",
+        "cells",
+        "source_available",
+        "inputs_available",
+        "reproduction",
+    }
+    if set(evidence) != required or evidence["authority"] != "host_native_computation":
+        raise ValueError("Invalid computation provenance contract")
+    for name in ("runtime_identity", "output_sha256"):
+        selected = evidence[name]
+        if not isinstance(selected, str) or not re.fullmatch(
+            r"sha256:[0-9a-f]{64}", selected
+        ):
+            raise ValueError("Invalid computation digest")
+    if type(evidence["generation"]) is not int or not 1 <= evidence["generation"] <= 16:
+        raise ValueError("Invalid computation generation")
+    for name in ("source_available", "inputs_available"):
+        if type(evidence[name]) is not bool:
+            raise ValueError("Computation reproduction availability must be explicit")
+    for name in ("children", "inputs", "cells"):
+        selected_items = evidence[name]
+        if not isinstance(selected_items, tuple) or len(selected_items) > 256:
+            raise ValueError("Computation lineage exceeds its contract")
+    if len(canonical_json(evidence).encode()) > 256 * 1024:
+        raise ValueError("Artifact computation evidence exceeds its byte allowance")
+    return evidence
 
 
 def _mapping_int(value: Mapping[str, object], key: str, name: str) -> int:

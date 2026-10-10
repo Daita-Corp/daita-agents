@@ -38,6 +38,14 @@ dependencies = [
 daita = "daita.cli:main"
 
 [project.optional-dependencies]
+analysis = [
+    "numpy==2.4.6",
+    "pandas==3.0.3",
+    "scipy==1.17.1",
+    "pyarrow==25.0.1",
+    "matplotlib==3.11.2",
+    "networkx==3.6.1",
+]
 dev = [
     "black>=26.1.0",
     "build>=1.2.2",

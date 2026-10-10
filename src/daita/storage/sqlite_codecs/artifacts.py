@@ -47,6 +47,7 @@ def encode_artifact_record(value: ArtifactRecord) -> str:
                 "agent_id": value.agent_id,
                 "caller_principal_id": value.caller_principal_id,
                 "state": enum_encode(value.state, "ArtifactState"),
+                "computation_evidence": plain_encode(value.computation_evidence),
             },
         )
     )
@@ -61,13 +62,18 @@ def decode_artifact_record(value: str) -> ArtifactRecord:
             "agent_id",
             "caller_principal_id",
             "state",
+            "computation_evidence",
         ),
     )
+    computation_evidence = fields["computation_evidence"]
+    if not isinstance(computation_evidence, dict):
+        raise ValueError("Artifact computation evidence must be an object")
     return ArtifactRecord(
         ref=decode_artifact_ref(fields["ref"]),
         agent_id=text(fields["agent_id"], "artifact owner"),
         caller_principal_id=text(fields["caller_principal_id"], "artifact caller"),
         state=enum_decode(fields["state"], ArtifactState, "ArtifactState"),
+        computation_evidence=computation_evidence,
     )
 
 

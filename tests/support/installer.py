@@ -329,7 +329,7 @@ def _fake_uv_source() -> str:
             raise SystemExit(0)
 
         if args[:2] == ["tool", "install"]:
-            wheel = Path(args[-1])
+            wheel = Path(args[-1].removesuffix("[analysis]"))
             tool = Path(os.environ["UV_TOOL_DIR"]) / "daita-agents"
             venv.EnvBuilder(with_pip=True, system_site_packages=True).create(tool)
             python = tool / "bin" / "python"

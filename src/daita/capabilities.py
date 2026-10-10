@@ -919,6 +919,7 @@ class ToolboxId(str, Enum):
     KNOWLEDGE = "knowledge"
     JOBS = "jobs"
     ROUTINES = "routines"
+    ANALYSIS = "analysis"
 
 
 class ToolLoadMode(str, Enum):
@@ -986,6 +987,7 @@ TOOLBOX_DEFINITIONS = (
         "Routines",
         "Scheduled assignments and grants.",
     ),
+    ToolboxDefinition(ToolboxId.ANALYSIS, "Analysis", "Python."),
 )
 
 if tuple(item.id for item in TOOLBOX_DEFINITIONS) != tuple(ToolboxId):
