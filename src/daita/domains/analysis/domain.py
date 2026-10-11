@@ -29,9 +29,11 @@ from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
     ArtifactPolicy,
+    AutomationEligibility,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
+    ExecutionScopeKind,
     ToolboxId,
     ToolExecution,
     ToolLoadMode,
@@ -109,7 +111,7 @@ class _RunAnalysis:
 
 
 class AnalysisCapabilityDomain:
-    """One analysis capability, available only in local foreground sessions."""
+    """Run-scoped local computation for foreground and exactly admitted routines."""
 
     domain_owner_id = OWNER
     executor_id = "analysis.native_python"
@@ -134,7 +136,11 @@ class AnalysisCapabilityDomain:
             "Variables persist only within this run. "
             "Use expected_state={generation:0,revision:0} initially; then use the returned state. "
             "tools.call(name, arguments) returns a dict: r['is_error'], r['output']['data'], r['evidence_id']. "
-            "Register a file with outputs.add('name','file.png'); save_output selects one named output. "
+            "Write relative scratch filenames; outputs.add('name','file.png') registers a file. "
+            "Output names start with a letter and contain only letters, digits, '_' or '-'; "
+            "Registered files are temporary candidates, not retained artifacts. "
+            "Use save_outputs=[name,...] to publish all requested files in this call; "
+            "save_output selects one name. Check the returned artifact references before claiming retention. "
             "Print bounded previews. NumPy, pandas, SciPy, PyArrow, Matplotlib, NetworkX and DuckDB are installed."
         )
         capability = Capability(
@@ -166,6 +172,7 @@ class AnalysisCapabilityDomain:
             output_kind="analysis.cell",
             output_schema={"type": "object"},
             access_mode=AccessMode.READ,
+            automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
             artifact_policy=ArtifactPolicy(
                 allowed_media_types=frozenset(MEDIA_TYPES.values()),
                 allowed_authorships=frozenset(
@@ -183,14 +190,25 @@ class AnalysisCapabilityDomain:
                     for media in sorted(set(MEDIA_TYPES.values()))
                 ),
                 artifact_required=False,
-                max_artifact_count=1,
+                max_artifact_count=4,
                 max_bytes_per_artifact=limits.file_bytes,
-                max_total_bytes_per_call=limits.file_bytes,
+                max_total_bytes_per_call=limits.output_bytes_per_run,
             ),
         )
         schema = dict(capability.input_schema)
         properties = dict(cast(Mapping[str, object], schema["properties"]))
-        properties["save_output"] = {"type": "string", "minLength": 1, "maxLength": 64}
+        properties["save_output"] = {
+            "type": "string",
+            "pattern": r"^[A-Za-z][A-Za-z0-9_-]{0,63}$",
+            "maxLength": 64,
+        }
+        properties["save_outputs"] = {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 4,
+            "uniqueItems": True,
+            "items": properties["save_output"],
+        }
         properties["inputs"] = {
             "type": "object",
             "maxProperties": 16,
@@ -206,6 +224,7 @@ class AnalysisCapabilityDomain:
             },
         }
         schema["properties"] = properties
+        schema["not"] = {"required": ["save_output", "save_outputs"]}
         output_properties = {
             "status": {
                 "type": "string",
@@ -267,19 +286,20 @@ class AnalysisCapabilityDomain:
                         toolbox_id=ToolboxId.ANALYSIS,
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
-                        summary="Run Python locally for tabular and non-tabular computation.",
+                        summary="Run Python code for computation, query-result analysis and chart image artifacts.",
                         when_to_use=(
                             "Computation, simulation, text processing, structured-data validation, "
-                            "transformation of authenticated tool results, cross-source analysis, "
-                            "statistics, charts and datasets."
+                            "transformation of authenticated tool and query results, cross-source analysis, "
+                            "statistics and datasets. Create chart image artifacts with bar or line "
+                            "plots of weekly time-series data, or computed CSV outputs."
                         ),
                         keywords=(
                             "python",
                             "analysis",
-                            "compute",
+                            "compute code",
                             "duckdb",
                             "pandas",
-                            "chart",
+                            "chart charts image artifacts plotting visualization matplotlib",
                             "computation",
                             "simulation",
                             "simulate",
@@ -289,7 +309,7 @@ class AnalysisCapabilityDomain:
                             "transform",
                             "statistics",
                             "structured data validation",
-                            "scipy",
+                            "scipy csv query result data",
                         ),
                     ),
                 ),
@@ -323,10 +343,18 @@ class AnalysisCapabilityDomain:
         session.writer.retain_analysis_sensitivity(state.sensitivity)
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
+        return ("analysis_execute",) if self._admits_run(run) and available() else ()
+
+    def _admits_run(self, run: RunInput) -> bool:
+        if run.origin is RunOrigin.USER:
+            return run.execution_scope is None
+        scope = run.execution_scope
         return (
-            ("analysis_execute",)
-            if run.origin is RunOrigin.USER and available()
-            else ()
+            run.origin is RunOrigin.SCHEDULED_ROUTINE
+            and scope is not None
+            and scope.scope_kind is ExecutionScopeKind.SCHEDULED_ROUTINE
+            and scope.agent_id == run.agent_id
+            and scope.allows(self.declarations.capabilities[0])
         )
 
     def normalize_arguments(
@@ -345,7 +373,7 @@ class AnalysisCapabilityDomain:
     ) -> FrozenJsonObject:
         raise CapabilityInputError(
             "analysis_session_required",
-            "Analysis requires an admitted foreground run session.",
+            "Analysis requires an admitted local run session.",
         )
 
     async def prepare_session_call(
@@ -358,11 +386,25 @@ class AnalysisCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession,
     ) -> FrozenJsonObject:
-        if run.origin is not RunOrigin.USER or session.run.id != run.id:
+        if (
+            not self._admits_run(run)
+            or replace(run, resolved_source_scope=session.run.resolved_source_scope)
+            != session.run
+        ):
             raise CapabilityInputError(
                 "analysis_session_required",
-                "Analysis requires an admitted foreground run session.",
+                "Analysis requires an admitted local run session.",
             )
+        inputs: object = arguments.get("inputs", {})
+        if run.origin is not RunOrigin.USER and isinstance(inputs, Mapping):
+            if any(
+                isinstance(value, Mapping) and value.get("kind") == "artifact"
+                for value in inputs.values()
+            ):
+                raise CapabilityInputError(
+                    "analysis_input_not_admitted",
+                    "Scheduled analysis accepts only current-run read results, not retained artifact inputs.",
+                )
         if len(str(arguments["code"]).encode()) > self._limits.code_bytes:
             raise CapabilityInputError(
                 "analysis_code_limited",
@@ -875,26 +917,28 @@ class AnalysisCapabilityDomain:
                 )
             )
             state.pending_cells.pop(request.call_id, None)
-            draft = None
-            save = request.arguments.get("save_output")
-            if save is not None:
-                selected = state.candidates.get(str(save))
-                if selected is None:
+            drafts = []
+            saves = cast(tuple[str, ...], request.arguments.get("save_outputs", ()))
+            if "save_output" in request.arguments:
+                saves = (str(request.arguments["save_output"]),)
+            if saves:
+                selected_outputs = [state.candidates.get(str(name)) for name in saves]
+                if any(selected is None for selected in selected_outputs):
                     result["save_status"] = "candidate_not_found"
                 else:
-                    candidate, provenance = selected
-                    draft = ArtifactDraft(
-                        content=candidate.content,
-                        suggested_filename=candidate.filename,
-                        media_type=candidate.media_type,
-                        sensitivity=Sensitivity(state.sensitivity.value),
-                        provenance=ArtifactProvenance(
-                            authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
-                        ),
-                        computation_evidence=provenance,
-                    )
+                    for selected in selected_outputs:
+                        assert selected is not None
+                        candidate, provenance = selected
+                        drafts.append(
+                            self._artifact_draft(candidate, provenance, state)
+                        )
                     result["save_status"] = "requested"
-            return ToolOutput(kind="analysis.cell", data=result, artifact=draft)
+            return ToolOutput(
+                kind="analysis.cell",
+                data=result,
+                artifact=drafts[0] if drafts else None,
+                additional_artifacts=tuple(drafts[1:]),
+            )
         except BaseException as error:
 
             async def settle_failure() -> None:
@@ -1402,7 +1446,25 @@ class AnalysisCapabilityDomain:
         return replace(
             output,
             artifact=None,
+            additional_artifacts=(),
             data={**dict(output.data), "save_status": "failed", "save_error": code},
+        )
+
+    @staticmethod
+    def _artifact_draft(
+        candidate: OutputCandidate,
+        provenance: Mapping[str, object],
+        state: _RunAnalysis,
+    ) -> ArtifactDraft:
+        return ArtifactDraft(
+            content=candidate.content,
+            suggested_filename=candidate.filename,
+            media_type=candidate.media_type,
+            sensitivity=Sensitivity(state.sensitivity.value),
+            provenance=ArtifactProvenance(
+                authorship=ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS
+            ),
+            computation_evidence=provenance,
         )
 
     def normalize_error(
@@ -1416,7 +1478,7 @@ class AnalysisCapabilityDomain:
         return None
 
     async def prepare_automation_grant(self, *args, **kwargs):
-        raise ValueError("Analysis is foreground-only")
+        raise ValueError("Analysis has no external-effect standing grants")
 
     async def side_effect_plan(self, *args, **kwargs):
         raise ValueError("Analysis has no external effects")

@@ -117,7 +117,16 @@ class StatusBar(Horizontal):
         state_style = "bold #FBBF24" if safe_state == "approval" else "bold #ACFD21"
         message = Text("DAITA", style="bold #ACFD21")
         message.append(f"  {safe_agent} / {safe_model} / {safe_source}  ", style="dim")
-        message.append(f"[{safe_state}]", style=state_style)
+        # Foreground phases belong in the activity line. Keep only idle,
+        # approval and background coordination states in the header.
+        if safe_state in {
+            "ready",
+            "approval",
+            "edit approval",
+            "queued behind background",
+            "background running",
+        }:
+            message.append(f"[{safe_state}]", style=state_style)
         primary.update(message)
         context.update(context_window_text(context_used, context_total))
 

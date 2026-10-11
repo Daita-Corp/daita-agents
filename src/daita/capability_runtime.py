@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import (
+    ArtifactDraft,
     ArtifactError,
     ArtifactRef,
     artifact_ref_to_mapping,
@@ -282,6 +283,7 @@ class InternalCapabilityRequest:
 class InternalCapabilityOutcome:
     output: ToolOutput
     artifact_ref: ArtifactRef | None = None
+    additional_artifact_refs: tuple[ArtifactRef, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.output, ToolOutput):
@@ -290,6 +292,12 @@ class InternalCapabilityOutcome:
             self.artifact_ref, ArtifactRef
         ):
             raise TypeError("internal outcome artifact_ref must be ArtifactRef or None")
+        additional = tuple(self.additional_artifact_refs)
+        if any(not isinstance(ref, ArtifactRef) for ref in additional):
+            raise TypeError("additional_artifact_refs must contain ArtifactRef values")
+        if additional and self.artifact_ref is None:
+            raise ValueError("additional_artifact_refs require a primary artifact")
+        object.__setattr__(self, "additional_artifact_refs", additional)
 
 
 class CapabilityDomain(Protocol):
@@ -920,7 +928,7 @@ class CapabilityRuntime:
                 or current_owner != owner_id
             ):
                 raise ValueError("internal execution identity changed")
-            output, artifact_ref = await self._execute_no_effect(
+            output, artifact_refs = await self._execute_no_effect(
                 request.run,
                 call,
                 capability,
@@ -933,7 +941,7 @@ class CapabilityRuntime:
             )
             result = _bounded_tool_result(
                 call,
-                _classified_success(call, output, artifact_ref=artifact_ref),
+                _classified_success(call, output, artifact_refs=artifact_refs),
                 self._limits,
             )
             if result.is_error:
@@ -967,7 +975,11 @@ class CapabilityRuntime:
             catalog_entry=None,
             run_origin=request.observation_origin,
         )
-        return InternalCapabilityOutcome(output=output, artifact_ref=artifact_ref)
+        return InternalCapabilityOutcome(
+            output=output,
+            artifact_ref=artifact_refs[0] if artifact_refs else None,
+            additional_artifact_refs=artifact_refs[1:],
+        )
 
     async def prepare_run(self, run: RunInput) -> RunToolCatalog:
         """Prepare the complete immutable applicable catalog exactly once."""
@@ -2425,7 +2437,7 @@ class CapabilityRuntime:
                     session=session,
                 )
             else:
-                output, artifact_ref = await self._execute_no_effect(
+                output, artifact_refs = await self._execute_no_effect(
                     run,
                     call,
                     capability,
@@ -2438,7 +2450,7 @@ class CapabilityRuntime:
                     catalog_entry=entry,
                     dispatch_hook=dispatch_hook,
                 )
-                result = _classified_success(call, output, artifact_ref=artifact_ref)
+                result = _classified_success(call, output, artifact_refs=artifact_refs)
         except _ToolExecutionInterrupted:
             raise
         except asyncio.CancelledError:
@@ -2478,7 +2490,7 @@ class CapabilityRuntime:
         task_attempt_guard: TaskAttemptGuard | None = None,
         catalog_entry: RunToolCatalogEntry | None = None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
-    ) -> tuple[ToolOutput, ArtifactRef | None]:
+    ) -> tuple[ToolOutput, tuple[ArtifactRef, ...]]:
         if capability.operational_effect is not OperationalEffect.NONE:
             raise ValueError("non-effect execution requires operational effect none")
         execution = ToolExecution(
@@ -2545,22 +2557,53 @@ class CapabilityRuntime:
             await _guard_attempt(
                 task_attempt_guard, capability.id, "before_artifact_commit"
             )
+        drafts = (
+            () if output.artifact is None else (output.artifact,)
+        ) + output.additional_artifacts
+        policy = capability.artifact_policy
+        if drafts:
+            if policy is None or len(drafts) > policy.max_artifact_count:
+                raise ToolOutputValidationError(
+                    "artifact drafts exceed the capability count"
+                )
+            if (
+                sum(len(draft.content) for draft in drafts)
+                > policy.max_total_bytes_per_call
+            ):
+                raise ToolOutputValidationError(
+                    "artifact drafts exceed the per-call byte allowance"
+                )
+            if reserved_artifact_id is not None and len(drafts) != 1:
+                raise ToolOutputValidationError(
+                    "one reserved artifact cannot authorize multiple publications"
+                )
+            for draft in drafts:
+                self._validate_artifact_draft(capability, draft)
+        refs: list[ArtifactRef] = []
         try:
-            artifact_ref = await self._commit_artifact_output(
-                run, call, capability, output, reserved_artifact_id=reserved_artifact_id
-            )
+            if not drafts:
+                await self._commit_artifact_output(run, call, capability, output)
+            for draft in drafts:
+                ref = await self._commit_artifact_output(
+                    run,
+                    call,
+                    capability,
+                    replace(output, artifact=draft, additional_artifacts=()),
+                    reserved_artifact_id=reserved_artifact_id,
+                )
+                assert ref is not None
+                refs.append(ref)
+                if capability.id == "analysis.execute":
+                    cast("AnalysisCapabilityDomain", domain).artifact_committed(
+                        run.id, ref.byte_size
+                    )
         except ArtifactError as error:
             if capability.id != "analysis.execute":
                 raise
             output = cast("AnalysisCapabilityDomain", domain).artifact_save_failed(
                 output, error.code
             )
-            artifact_ref = None
-        if artifact_ref is not None and capability.id == "analysis.execute":
-            cast("AnalysisCapabilityDomain", domain).artifact_committed(
-                run.id, artifact_ref.byte_size
-            )
-        return output, artifact_ref
+        return output, tuple(refs)
 
     async def _call_io_permit(
         self,
@@ -2573,6 +2616,11 @@ class CapabilityRuntime:
     ) -> AdmissionPermit | None:
         coordinator = self._admission_coordinator
         if coordinator is None:
+            return None
+        # The interpreter performs no source I/O. Its brokered children acquire
+        # their own exact permits; holding a source permit here would deadlock a
+        # scheduled cell that reads its sole admitted source.
+        if capability.id == "analysis.execute":
             return None
         deadline = None if session is None else session.absolute_deadline
         cancellation = None if session is None else session.cancellation
@@ -3316,7 +3364,28 @@ class CapabilityRuntime:
                     "artifact-producing capability omitted its required draft"
                 )
             return None
-        if policy.max_artifact_count != 1:
+        self._validate_artifact_draft(capability, draft)
+        if self._artifacts is None:
+            raise ArtifactError(
+                "artifact_storage_failed",
+                "Artifact storage is unavailable.",
+                {"stage": "composition"},
+            )
+        return await self._artifacts.commit(
+            draft,
+            policy,
+            run_id=run.id,
+            conversation_id=run.conversation_id or run.id,
+            call_id=call.id,
+            capability_id=capability.id,
+            reserved_artifact_id=reserved_artifact_id,
+            caller_principal_id=run.caller_principal_id,
+        )
+
+    @staticmethod
+    def _validate_artifact_draft(capability: Capability, draft: ArtifactDraft) -> None:
+        policy = capability.artifact_policy
+        if policy is None or policy.max_artifact_count < 1:
             raise ToolOutputValidationError(
                 "artifact draft exceeds the capability artifact count"
             )
@@ -3345,22 +3414,6 @@ class CapabilityRuntime:
             raise ToolOutputValidationError(
                 "artifact draft filename or extension violates the capability policy"
             ) from error
-        if self._artifacts is None:
-            raise ArtifactError(
-                "artifact_storage_failed",
-                "Artifact storage is unavailable.",
-                {"stage": "composition"},
-            )
-        return await self._artifacts.commit(
-            draft,
-            policy,
-            run_id=run.id,
-            conversation_id=run.conversation_id or run.id,
-            call_id=call.id,
-            capability_id=capability.id,
-            reserved_artifact_id=reserved_artifact_id,
-            caller_principal_id=run.caller_principal_id,
-        )
 
     def _exception_result(
         self,
@@ -4673,7 +4726,7 @@ def _classified_success(
     call: ToolCall,
     output: ToolOutput,
     *,
-    artifact_ref: ArtifactRef | None = None,
+    artifact_refs: tuple[ArtifactRef, ...] = (),
 ) -> ToolResultBlock:
     if output.sensitivity is None or not output.sensitivity_provenance:
         return _error(
@@ -4683,8 +4736,12 @@ def _classified_success(
             {"capability_id": output.kind},
         )
     result: dict[str, object] = {"kind": output.kind, "data": output.data}
-    if artifact_ref is not None:
-        result["artifact"] = artifact_ref_to_mapping(artifact_ref)
+    if artifact_refs:
+        result["artifact"] = artifact_ref_to_mapping(artifact_refs[0])
+        if len(artifact_refs) > 1:
+            result["artifacts"] = [
+                artifact_ref_to_mapping(ref) for ref in artifact_refs
+            ]
         result["delivery_status"] = "not_delivered"
     return ToolResultBlock(
         call_id=call.id,

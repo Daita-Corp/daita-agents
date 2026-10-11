@@ -1,7 +1,11 @@
 # Local Python workspace
 
 Local foreground sessions share one `analysis_execute` tool across the TUI,
-CLI and Python API. It runs ordinary Python with DuckDB, NumPy, pandas, SciPy,
+CLI and Python API. Exactly admitted scheduled routines use the same tool and
+native worker, restricted to their frozen read capability and source scope.
+They cannot read local computer files, import retained artifacts, or publish local
+files. Scheduled artifacts use the ordinary outcome contract and inbox delivery.
+It runs ordinary Python with DuckDB, NumPy, pandas, SciPy,
 PyArrow, Matplotlib and NetworkX on macOS ARM64. Managed installation includes
 the pinned scientific environment. Other platforms and hosted compositions do
 not expose this capability. A source checkout needs `pip install -e '.[dev,analysis]'`.
@@ -17,7 +21,7 @@ or checking required fields in captured JSON records. The model discovers and
 loads the existing Analysis toolbox and `analysis_execute` tool.
 `Agent.analysis_runtime()` reports availability, package versions and the hash
 of the interpreter, worker protocol and trusted launch helpers without starting
-a worker. Interpreter state lasts for one `Agent.run`, not across messages.
+a worker. Interpreter state lasts for one run, not across messages or occurrences.
 
 ## Cells and read tools
 
@@ -31,6 +35,22 @@ consumption remains charged. Reuse retained variables after successful cells and
 ordinary Python errors instead of rereading or recomputing sufficient inputs.
 Replacement is subject to remaining allowances and verified cleanup; it does not
 restore variables from the lost interpreter.
+
+Write output files using relative flat filenames in the scratch current directory.
+Register them with `outputs.add('answer', 'answer.json')`: the logical name must
+start with a letter and contain only letters, digits, `_` or `-`. `save_output`
+selects that name, not the filename. Invalid names or paths produce recoverable
+Python errors; the host still validates containment, file bytes and formats.
+Registration creates a temporary candidate, which disappears at run completion.
+To retain a dataset, chart and computation together, pass
+`save_outputs=["dataset", "chart", "recipe"]` in the outer `analysis_execute`
+call. Select up to four distinct registered names; use either `save_outputs` or
+the single-name `save_output`, never both. All names and policy bounds are checked
+before publication. The ordinary artifact store publishes each file, and the
+tool result and terminal run retain every committed reference. If a later
+publication fails, earlier references remain available and `save_status="failed"`
+reports the incomplete set. Check references before claiming that every requested
+file was retained. Candidates alone are not delivered artifacts.
 
 The version-1 worker helpers are ordinary Python objects:
 
@@ -148,7 +168,11 @@ outputs.add("summary", "summary.json")
 The cell's `save_output="summary"` explicitly commits one candidate through the
 ordinary artifact store. A later cell may save an existing candidate without
 recomputing it. Registration alone does not publish an artifact. Four candidates
-per cell and sixteen per run are allowed; each call commits at most one artifact.
+per cell and sixteen per run are allowed. `save_outputs=["summary", "chart", "recipe"]`
+commits up to four selected candidates through that same boundary. All requested
+names must exist; a missing candidate publishes none. Publication is sequential,
+so a storage failure can leave a documented partial set rather than rolling back
+already published files.
 Supported outputs are CSV, Parquet, JSON, PNG,
 Markdown, UTF-8 text and Python/SQL source text. Source text is retained data.
 Host capture requires a bounded regular file inside scratch, rejects symlinks and
@@ -233,8 +257,9 @@ on host death and writes authenticated closure facts outside worker access.
 Reopen joins those facts to the abandoned run, removes only authenticated owned
 remnants and terminalizes once without replay. Unknown termination, changed
 remnant identity or failed deletion prevents successful acceptance and replacement.
-Analytics is foreground-only: routines, graph tasks, remote execution and cross-run
-interpreter caches remain deferred.
+Exactly admitted local routines share this lifecycle and their frozen read scope.
+Graph tasks, hosted or remote execution and cross-run interpreter caches remain
+unavailable.
 
 See [testing instructions](TESTING.md#local-python-live-acceptance) for the
 real-worker, real-model and managed-install qualification command and reports.

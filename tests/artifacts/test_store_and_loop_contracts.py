@@ -361,13 +361,13 @@ async def test_capability_without_artifact_policy_rejects_a_draft(
 
 
 def test_artifact_policy_rejects_media_extension_count_and_byte_violations() -> None:
-    with pytest.raises(ValueError, match="zero or one"):
+    with pytest.raises(ValueError, match="between zero and four"):
         ArtifactPolicy(
             allowed_media_types=frozenset({"text/plain"}),
             allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
             allowed_extensions=(("text/plain", (".txt",)),),
             artifact_required=True,
-            max_artifact_count=2,
+            max_artifact_count=5,
             max_bytes_per_artifact=1,
             max_total_bytes_per_call=1,
         )

@@ -578,17 +578,26 @@ def tool_outcome_summary(result: ToolResultBlock) -> str | None:
 def run_failure_notice(result: LoopExit, transcript: Transcript | None = None) -> str:
     """Describe a stopped run without treating completed tools as rolled back."""
     if result.reason == "timeout":
-        reason = "The model provider timed out after bounded retries."
+        diagnostic = result.provider_failure
+        if diagnostic is not None and diagnostic.code == "first_progress":
+            reason = "The model provider timed out before returning a response."
+        elif diagnostic is not None and diagnostic.code == "idle_progress":
+            reason = (
+                "The model provider stopped responding before completing its response."
+            )
+        else:
+            reason = "The model provider timed out."
     elif result.reason == "wall_time_exhausted":
         reason = "The run reached its overall time limit."
-    elif result.reason in {
-        "token_budget_insufficient",
-        "token_limit_reached",
-        "cost_limit_reached",
-    }:
+    elif result.reason == "token_limit_reached":
         reason = (
-            "The run stopped at its model budget limit before completing its answer."
+            "The run reached its cumulative model-token limit "
+            f"({result.usage.total_tokens:,} tokens used) before completing its answer."
         )
+    elif result.reason == "token_budget_insufficient":
+        reason = "The remaining token budget was too small for the next model request."
+    elif result.reason == "cost_limit_reached":
+        reason = "The run reached its model cost limit before completing its answer."
     else:
         reason = f"{result.kind.value}: {result.reason}."
     notice = (

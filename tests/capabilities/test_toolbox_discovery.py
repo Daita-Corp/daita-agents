@@ -252,6 +252,21 @@ async def test_production_intent_search_distinguishes_current_competing_tools(
         ("transform authenticated tool results", "analysis_execute", 1),
         ("cross source analysis statistics", "analysis_execute", 1),
         ("python pandas chart", "analysis_execute", 1),
+        (
+            "Create downloadable chart and CSV artifacts from query result data, e.g. chart spec or report CSV file",
+            "analysis_execute",
+            3,
+        ),
+        (
+            "Create chart artifact from summarized weekly time-series revenue and order count, bar or line chart image or HTML visualization",
+            "analysis_execute",
+            3,
+        ),
+        (
+            "Run Python code for plotting chart and creating chart image artifact from validated result rows",
+            "analysis_execute",
+            1,
+        ),
     )
     calls = tuple(
         ToolCall(

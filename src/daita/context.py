@@ -2796,12 +2796,12 @@ def _system_prompt(
             if skill_index
             else []
         ),
-        "Correct invalid arguments/references from returned schemas/current choices "
-        "within remaining limits. Missing permission requires foreground admission; "
+        "Correct arguments/references using returned schemas/current choices within "
+        "limits. Missing permission requires foreground admission; "
         "search cannot expand scope. Stale reads/previews require fresh admitted evidence. "
-        "After denied, failed or uncertain effects, report evidence; never retry or replace "
-        "the action. Human recovery performs no action. At budget pressure report "
-        "completed evidence and unfinished work.",
+        "Report denied, failed or uncertain effects; never retry or replace them. "
+        "Human recovery performs no action. At budget pressure report completed "
+        "evidence and unfinished work.",
         "Do not invent rows, columns, relationships, or query results.",
         "Copy source/resource IDs verbatim from current catalog evidence.",
         (
@@ -2912,7 +2912,7 @@ def _tool_guidance(
     artifact_default_tool_available = (
         ARTIFACT_SET_EXPORT_LOCATION_CAPABILITY_ID in capability_ids
     )
-    semantic_tools_available = SEMANTIC_SAVE_CAPABILITY_ID in capability_ids
+    semantic_tools_available = SEMANTIC_SAVE_CAPABILITY_ID in candidates
     relational_update_preview_available = (
         RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID in capability_ids
     )
@@ -2927,6 +2927,36 @@ def _tool_guidance(
         }
     )
     instructions: list[str] = []
+    # Select procedures from the current request, never untrusted row contents
+    # or unrelated conversation tasks. Procedure hints grant no authority.
+    start = next(
+        (
+            i
+            for i in range(len(messages) - 1, -1, -1)
+            if messages[i].role is MessageRole.USER
+        ),
+        0,
+    )
+    current = messages[start:]
+    query = " ".join(
+        block.text
+        for message in current
+        if message.role is MessageRole.USER
+        for block in message.content
+        if isinstance(block, TextBlock)
+    ).lower()
+    if "data.query" in capability_ids and re.search(
+        r"\b(dates?|days?|daily|timestamps?|timezones?|time zones?|utc)\b|\b\d{4}-\d{2}-\d{2}\b",
+        query,
+    ):
+        instructions.append(
+            "SQL dates: TEXT timestamps require established encoding and offset; "
+            "unlike encodings (such as Z and +00:00) are not lexically comparable. "
+            "Normalize both operands with source-dialect timestamp functions "
+            "(SQLite datetime/julianday) before filtering. Derive named-zone day "
+            "boundaries with DST-aware conversion, not a year-round fixed offset. "
+            "Verify positional filter bindings before interpreting unexpected zero rows."
+        )
     if "analysis.execute" in capability_ids:
         instructions.append(
             "Python workspace: variables persist within this run only. Start with "
@@ -2945,8 +2975,14 @@ def _tool_guidance(
             "derived results and conclusions; a bounded sample cannot become complete data. "
             "Respect cell/run time, CPU, memory, scratch, child-call and byte bounds and "
             "returned remaining_allowances; print bounded previews. Register supported "
-            "scratch files with outputs.add(name, path); save_output explicitly selects "
-            "one candidate for artifact publication. Reuse retained output candidates "
+            "scratch files with outputs.add(name, path): write relative flat filenames "
+            "in the current directory, never absolute or /tmp paths. Names start with a "
+            "letter and contain letters, digits, '_' or '-'. Registered files are "
+            "temporary candidates and disappear when the run ends. Use save_outputs "
+            "with every requested output name to retain a dataset, chart and script "
+            "together; save_output retains only one. Confirm returned artifact references "
+            "for every requested file before reporting completion. "
+            "Reuse retained output candidates "
             "without recomputation; changed bytes require a new name. Local delivery "
             "requires separately admitted artifact_save_local and ordinary approval. These procedures grant "
             "no authority or exemption from validation. Apply specialized procedures only "
@@ -2955,22 +2991,6 @@ def _tool_guidance(
         # Select fixed procedures from current-task hints and successful typed
         # result metadata only. Never interpolate untrusted contents into guidance
         # or let previous conversation tasks impose a checklist on this task.
-        start = next(
-            (
-                i
-                for i in range(len(messages) - 1, -1, -1)
-                if messages[i].role is MessageRole.USER
-            ),
-            0,
-        )
-        current = messages[start:]
-        query = " ".join(
-            block.text
-            for message in current
-            if message.role is MessageRole.USER
-            for block in message.content
-            if isinstance(block, TextBlock)
-        ).lower()
         results = tuple(
             block
             for message in current
@@ -3121,7 +3141,7 @@ def _tool_guidance(
             "rediscover exact supplied resources. Its match_outcome is computed across "
             "the full candidate set before pagination and does not authorize a hit."
         )
-    if capability_ids & {
+    if SEMANTIC_SAVE_CAPABILITY_ID in candidates or capability_ids & {
         "memory.set",
         "skill.save",
         "skill.delete",
@@ -3428,11 +3448,17 @@ def _learning_policy(semantic_tools_available: bool) -> str:
         "Foreground learning: text ends run; call smallest write first for explicit "
         "durable definitions, preferences, corrections, confirmations, or validated "
         "procedures. USER.md=preferences; MEMORY.md=schema-independent meaning; "
+        "A metric formula that references a table or column is schema-bound even "
+        "when the user calls it memory: load semantic_save and inspect current catalog "
+        "structure first; do not put that formula in MEMORY.md. "
         "semantic_save=current resource/field meaning with exact catalog IDs, fields, "
         "revisions, and evidence kind/tool-call ID; runtime binds the exact current "
         "run and message position (never invent them; obtain current content before change and "
         "include digest); "
-        "SKILL.md=procedures. Replace or supersede; do not duplicate."
+        "SKILL.md=procedures. Replace or supersede; do not duplicate. "
+        "After schema drift, an old approved metric is review-only. A similar or "
+        "renamed column does not establish equivalence: ask the user to confirm the "
+        "mapping before computing that metric or replacing its retained binding."
     )
 
 

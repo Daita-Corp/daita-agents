@@ -580,7 +580,11 @@ create only these artifacts:
 
 - `artifact.create_document`;
 - `data.export_tabular`;
-- `artifact.snapshot_result`.
+- `artifact.snapshot_result`;
+- `analysis.execute` in the existing local macOS ARM64 composition, using the
+  exact routine read scope and the same bounded native worker and artifact store.
+  Its brokered reads own source permits; the interpreter holds no source permit.
+  Scheduled analysis cannot use local computer files or retained artifact inputs.
 
 `artifact.snapshot_result` produces bounded canonical `application/json` from
 an exact earlier successful result in the same run. It performs no source I/O

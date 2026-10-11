@@ -97,6 +97,11 @@ fails closed and must be recreated or revised and approved again from the
 foreground. There is no compatibility decoder, digest bridge, or implicit
 acceptance of the replacement contract.
 
+The scheduled-analysis addition changes the `analysis.execute` contract, and
+the positional-binding guidance changes the `data.query` contract. Routines
+retaining older bindings fail closed and require foreground review and approval
+of a revised proposal. Existing bindings are never upgraded implicitly.
+
 If an artifact is required, admission also proves that at least one allowed
 producer can satisfy its media type, authorship, exact-source, sensitivity, and
 byte bounds. Impossible contracts fail before the routine is created.
@@ -106,7 +111,11 @@ The certified scheduled artifact surface is deliberately small:
 - `artifact.create_document` for model-authored text or Markdown;
 - `data.export_tabular` for exact source-data CSV or XLSX;
 - `artifact.snapshot_result` for canonical JSON from an exact earlier
-  successful result in the current scheduled run.
+  successful result in the current scheduled run;
+- `analysis.execute` for bounded computed datasets and charts on the existing
+  local macOS ARM64 runtime. Its read broker enforces the frozen routine source,
+  resource and capability scope. Local file access and retained artifact inputs
+  are unavailable; artifact publication uses the same outcome contract.
 
 Artifact inventory, reading, conversion, editing, local publication, and
 export-location capabilities remain interactive-only.

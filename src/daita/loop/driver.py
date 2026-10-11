@@ -869,9 +869,7 @@ class AgentLoop:
                             )
                         )
                     messages = (*messages, tool_message)
-                    artifact = _artifact_ref(result)
-                    if artifact is not None:
-                        artifacts.append(artifact)
+                    artifacts.extend(_artifact_refs(result))
                     receipt = _artifact_delivery(result)
                     if receipt is not None:
                         artifact_deliveries.append(receipt)
@@ -1580,17 +1578,23 @@ def _completed_steps(messages: tuple[CanonicalMessage, ...]) -> int:
     return sum(message.role is MessageRole.ASSISTANT for message in messages)
 
 
-def _artifact_ref(result: ToolResultBlock) -> ArtifactRef | None:
+def _artifact_refs(result: ToolResultBlock) -> tuple[ArtifactRef, ...]:
     if result.is_error:
-        return None
-    value = result.output.get("artifact")
-    if not isinstance(value, Mapping):
-        return None
-    try:
-        ref = artifact_ref_from_mapping(value)
-    except (TypeError, ValueError):
-        return None
-    return ref if ref.call_id == result.call_id else None
+        return ()
+    values = result.output.get("artifacts", (result.output.get("artifact"),))
+    if not isinstance(values, (tuple, list)) or len(values) > 4:
+        return ()
+    refs = []
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        try:
+            ref = artifact_ref_from_mapping(value)
+        except (TypeError, ValueError):
+            continue
+        if ref.call_id == result.call_id and ref not in refs:
+            refs.append(ref)
+    return tuple(refs)
 
 
 def _artifact_delivery(result: ToolResultBlock) -> ArtifactDeliveryReceipt | None:

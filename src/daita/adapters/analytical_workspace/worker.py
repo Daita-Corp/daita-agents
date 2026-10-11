@@ -7,6 +7,7 @@ import ctypes
 import io
 import json
 import os
+import re
 import resource
 import sys
 import threading
@@ -96,10 +97,20 @@ def main() -> None:
 
         def add_output(name: str, path: str) -> None:
             if (
-                len(outputs) >= bootstrap["outputs_per_cell"]
-                or not isinstance(name, str)
-                or not isinstance(path, str)
+                not isinstance(name, str)
+                or re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", name) is None
             ):
+                raise ValueError(
+                    "Output names must start with a letter and contain only letters, digits, '_' or '-'"
+                )
+            if (
+                not isinstance(path, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,119}", path) is None
+            ):
+                raise ValueError(
+                    "Output paths must be relative scratch filenames without directories"
+                )
+            if len(outputs) >= bootstrap["outputs_per_cell"]:
                 raise ValueError("Output candidate allowance exhausted")
             outputs[name] = path
 

@@ -29,8 +29,16 @@ ordinary checks and approval. Daita does not silently promote a model's
 inference into durable knowledge.
 
 Semantic annotations remain tied to current catalog identities and evidence.
+Metrics referencing a database table or column belong in semantic annotations,
+even when requested as “memory.” Daita inspects current catalog structure and
+saves the complete definition with exact resource, field, revision and evidence
+bindings. The memory tool rejects qualified or backticked references and exact
+underscore identifiers matching currently admitted catalog fields; this narrow
+structural check does not classify all free-form prose.
 If source structure changes, Daita must recheck that grounding before using
-the annotation. Saved text is classified for information handling and treated
+the annotation. A similar or renamed column does not prove the approved metric
+still applies; confirm the mapping before calculating or replacing its binding.
+Saved text is classified for information handling and treated
 as untrusted advice. It cannot override current schema, access permissions,
 model limits, or approval.
 

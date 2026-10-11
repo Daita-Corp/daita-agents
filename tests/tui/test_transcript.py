@@ -155,6 +155,8 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                     )
                 )
             )
+            pending_run.cancel()
+            await asyncio.gather(pending_run, return_exceptions=True)
             chat.set_activity("Thinking", restart=True)
             await app.on_observer_event(
                 ObserverEvent(
@@ -236,6 +238,7 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                 ("file_search", "Searching local files"),
                 ("file_read", "Reading local file"),
                 ("file_query", "Querying local file data"),
+                ("analysis_execute", "Running Python"),
                 ("artifact_edit_text", "Preparing local file edit"),
                 ("artifact_save_local", "Publishing local artifact"),
             ):
@@ -250,6 +253,47 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                 )
                 await app.on_observer_event(ObserverEvent(started))
                 assert expected in str(activity.content)
+                assert (
+                    expected.casefold()
+                    not in str(
+                        chat.query_one("#status-primary", Static).content
+                    ).casefold()
+                )
+                await app.on_observer_event(
+                    ObserverEvent(
+                        AgentEvent(
+                            kind=AgentEventKind.TOOL_COMPLETED,
+                            occurred_at=datetime.now(UTC),
+                            run_id="run-live",
+                            conversation_id="conversation-live",
+                            data=FrozenJsonObject.from_mapping(
+                                {"tool_name": tool_name, "call_id": f"call-{tool_name}"}
+                            ),
+                        )
+                    )
+                )
+                assert "Waiting for model" in str(activity.content)
+                assert "[working]" not in str(
+                    chat.query_one("#status-primary", Static).content
+                )
+
+            for tool_name, call_id in (
+                ("data_query", "call-live"),
+                ("file_query", "call-file"),
+            ):
+                await app.on_observer_event(
+                    ObserverEvent(
+                        AgentEvent(
+                            kind=AgentEventKind.TOOL_STARTED,
+                            occurred_at=datetime.now(UTC),
+                            run_id="run-live",
+                            conversation_id="conversation-live",
+                            data=FrozenJsonObject.from_mapping(
+                                {"tool_name": tool_name, "call_id": call_id}
+                            ),
+                        )
+                    )
+                )
 
             tool_completed = AgentEvent(
                 kind=AgentEventKind.TOOL_COMPLETED,
@@ -268,7 +312,21 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                 ),
             )
             await app.on_observer_event(ObserverEvent(tool_completed))
-            assert "Processing results" in str(activity.content)
+            assert "Querying local file data" in str(activity.content)
+            await app.on_observer_event(
+                ObserverEvent(
+                    AgentEvent(
+                        kind=AgentEventKind.TOOL_COMPLETED,
+                        occurred_at=datetime.now(UTC),
+                        run_id="run-live",
+                        conversation_id="conversation-live",
+                        data=FrozenJsonObject.from_mapping(
+                            {"tool_name": "file_query", "call_id": "call-file"}
+                        ),
+                    )
+                )
+            )
+            assert "Waiting for model" in str(activity.content)
 
             run_completed = AgentEvent(
                 kind=AgentEventKind.RUN_COMPLETED,
@@ -279,8 +337,6 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
             )
             await app.on_observer_event(ObserverEvent(run_completed))
             assert activity.display is False
-            pending_run.cancel()
-            await asyncio.gather(pending_run, return_exceptions=True)
             app.exit(0)
     finally:
         await opened.close()

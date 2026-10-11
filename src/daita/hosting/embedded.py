@@ -1884,10 +1884,6 @@ class EmbeddedAgent:
                 None if workspace_backend is None else workspace_backend.sensitivity
             ),
         )
-        memory_domain = MemoryCapabilityDomain(
-            memory_declarations,
-            learning_candidate_guard,
-        )
         skill_domain = SkillCapabilityDomain(
             skill_declaration_bundle,
             learning_candidate_guard,
@@ -1897,6 +1893,11 @@ class EmbeddedAgent:
             data_view,
             store,
             learning_candidate_guard,
+        )
+        memory_domain = MemoryCapabilityDomain(
+            memory_declarations,
+            learning_candidate_guard,
+            validate_schema_independent=semantic_domain.validate_schema_independent_memory,
         )
         artifact_domain = (
             None

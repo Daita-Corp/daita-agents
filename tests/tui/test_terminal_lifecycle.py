@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from daita.llm.errors import ProviderFailureDiagnostic, ProviderFailurePhase
+from daita.llm.models import ModelUsage
 from tests.tui._support import (
     UTC,
     Agent,
@@ -26,18 +28,42 @@ from tests.tui._support import (
 )
 
 
-def test_run_timeout_notice_explains_bounded_stop_and_retained_results():
+@pytest.mark.parametrize(
+    "reason,diagnostic_code,expected",
+    (
+        ("timeout", "first_progress", "before returning a response"),
+        ("timeout", "idle_progress", "stopped responding"),
+        ("timeout", None, "timed out"),
+        ("token_limit_reached", None, "226,575 tokens used"),
+        ("token_budget_insufficient", None, "remaining token budget"),
+        ("cost_limit_reached", None, "cost limit"),
+    ),
+)
+def test_run_failure_notice_distinguishes_limits_and_retains_result_warning(
+    reason, diagnostic_code, expected
+):
     notice = run_failure_notice(
         LoopExit(
             run_id="run-timeout",
             conversation_id="conversation-timeout",
             kind=LoopExitKind.FAILED,
-            reason="timeout",
+            reason=reason,
             created_at=datetime.now(UTC),
+            usage=ModelUsage(input_tokens=221_829, output_tokens=4_746),
+            provider_id="mock:timeout" if diagnostic_code is not None else None,
+            provider_failure=(
+                ProviderFailureDiagnostic(
+                    phase=ProviderFailurePhase.PROVIDER_BOUNDARY,
+                    code=diagnostic_code,
+                )
+                if diagnostic_code is not None
+                else None
+            ),
         )
     )
 
-    assert "timed out after bounded retries" in notice
+    assert expected in notice
+    assert "retries" not in notice
     assert "Completed tool results remain recorded" in notice
     assert "not rolled back" in notice
     with pytest.raises(ValueError, match="usage"):

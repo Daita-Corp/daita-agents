@@ -56,6 +56,59 @@ async def create(root, *turns):
     )
 
 
+@pytest.mark.parametrize(
+    "name,path",
+    [
+        ("answer.txt", "answer.txt"),
+        ("../answer", "answer.txt"),
+        ("answer", "/tmp/answer.txt"),
+        ("answer", "nested/answer.txt"),
+    ],
+)
+async def test_invalid_output_registration_preserves_state_for_correction(
+    tmp_path, name, path
+):
+    agent = await create(
+        tmp_path,
+        cell(
+            "invalid-output",
+            "answer = 42\nopen('answer.txt','w').write(str(answer))\n"
+            f"outputs.add({name!r}, {path!r})",
+        ),
+        _tool(
+            "corrected-output",
+            "analysis_execute",
+            {
+                "code": "assert answer == 42\noutputs.add('answer','answer.txt')",
+                "expected_state": {"generation": 1, "revision": 1},
+                "save_output": "answer",
+            },
+        ),
+    )
+    try:
+        result = await agent.run("Compute and save the answer.")
+        cells = [
+            json.loads(canonical_json(output.output))["data"]
+            for call, output in (await agent.transcript(result.run_id)).tool_pairs
+            if call.name == "analysis_execute" and output is not None
+        ]
+        assert cells[0]["status"] == "python_error"
+        assert cells[0]["state_lost"] is False
+        assert cells[1]["status"] == "success"
+        assert cells[1]["expected_state"] == {"generation": 1, "revision": 2}
+        assert len(result.artifacts) == 1
+        assert (
+            await agent.read_artifact(result.artifacts[0].artifact_id)
+        ).content == b"42"
+        records = await agent.analysis_evidence(result.run_id)
+        assert [r.evidence_id for r in records if r.kind == "generation"] == [
+            "generation-1",
+            "parser-1",
+        ]
+    finally:
+        await agent.close()
+
+
 async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
     tmp_path, monkeypatch
 ):

@@ -987,7 +987,9 @@ TOOLBOX_DEFINITIONS = (
         "Routines",
         "Scheduled assignments and grants.",
     ),
-    ToolboxDefinition(ToolboxId.ANALYSIS, "Analysis", "Python."),
+    ToolboxDefinition(
+        ToolboxId.ANALYSIS, "Analysis", "Python computation, data analysis and charts."
+    ),
 )
 
 if tuple(item.id for item in TOOLBOX_DEFINITIONS) != tuple(ToolboxId):
@@ -1140,7 +1142,7 @@ class ToolOutputValidationError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ArtifactPolicy:
-    """Stable capability metadata for its one optional artifact draft."""
+    """Stable capability metadata for a bounded set of artifact drafts."""
 
     allowed_media_types: frozenset[str]
     allowed_authorships: frozenset[ArtifactAuthorship]
@@ -1182,11 +1184,11 @@ class ArtifactPolicy:
         if (
             not isinstance(self.max_artifact_count, int)
             or isinstance(self.max_artifact_count, bool)
-            or self.max_artifact_count not in {0, 1}
+            or not 0 <= self.max_artifact_count <= 4
         ):
-            raise ValueError("max_artifact_count must be zero or one")
-        if self.artifact_required and self.max_artifact_count != 1:
-            raise ValueError("a required artifact needs max_artifact_count one")
+            raise ValueError("max_artifact_count must be between zero and four")
+        if self.artifact_required and self.max_artifact_count == 0:
+            raise ValueError("a required artifact needs a positive max_artifact_count")
         for value, name in (
             (self.max_bytes_per_artifact, "max_bytes_per_artifact"),
             (self.max_total_bytes_per_call, "max_total_bytes_per_call"),
@@ -1562,6 +1564,7 @@ class ToolOutput:
     sensitivity: ModelSensitivity | None = None
     sensitivity_provenance: Mapping[str, object] = field(default_factory=dict)
     effect_observation: EffectObservation | None = None
+    additional_artifacts: tuple[ArtifactDraft, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.kind, "tool output kind")
@@ -1571,6 +1574,12 @@ class ToolOutput:
             raise TypeError("effect_observation must be EffectObservation or None")
         if self.artifact is not None and not isinstance(self.artifact, ArtifactDraft):
             raise TypeError("artifact must be ArtifactDraft or None")
+        additional = tuple(self.additional_artifacts)
+        if any(not isinstance(item, ArtifactDraft) for item in additional):
+            raise TypeError("additional_artifacts must contain ArtifactDraft values")
+        if additional and self.artifact is None:
+            raise ValueError("additional_artifacts require a primary artifact")
+        object.__setattr__(self, "additional_artifacts", additional)
         if self.sensitivity is not None and not isinstance(
             self.sensitivity, ModelSensitivity
         ):

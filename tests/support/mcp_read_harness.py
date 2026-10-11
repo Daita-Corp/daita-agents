@@ -32,6 +32,7 @@ from daita.llm.profiles import reviewed_model_profile
 from daita.loop.models import LoopExit, LoopExitKind
 from daita.security import EmptySecretProvider, SecretProvider
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
+from daita.workspace import LocalWorkspace
 from tests.support.job_benchmarks import RecordingProvider, RunCapture
 from tests.support.mcp import MCPConformanceTransport, MCPFixtureIdentity
 
@@ -463,7 +464,13 @@ class ReadEvaluation:
         self._setup_started = perf_counter()
 
     async def run(
-        self, prompt: str, *, phase: str, conversation_id: str | None = None
+        self,
+        prompt: str,
+        *,
+        phase: str,
+        conversation_id: str | None = None,
+        source_scope_ids: tuple[str, ...] = (),
+        learning: bool = False,
     ) -> RunCapture:
         self.setup.setdefault(
             "attachment_seconds", perf_counter() - self._setup_started
@@ -477,7 +484,12 @@ class ReadEvaluation:
         failure_type = None
         transcript = None
         try:
-            result = await self.agent.run(prompt, conversation_id=conversation_id)
+            invoke = self.agent.learn if learning else self.agent.run
+            result = await invoke(
+                prompt,
+                conversation_id=conversation_id,
+                source_scope_ids=source_scope_ids,
+            )
             transcript = await self.agent.transcript(result.run_id)
             return RunCapture(
                 result, transcript, tuple(self.provider.requests[request_start:])
@@ -629,8 +641,10 @@ async def evaluate_reads(
     case_id: str,
     secrets: SecretProvider | None = None,
     timeout_seconds: float = 15,
+    workspace: LocalWorkspace | None = None,
+    provider_pair: tuple[ModelProfile, RecordingProvider] | None = None,
 ) -> AsyncIterator[ReadEvaluation]:
-    profile, provider = read_provider()
+    profile, provider = provider_pair if provider_pair is not None else read_provider()
     agent = None
     evaluation = None
     failure_type = None
@@ -638,7 +652,8 @@ async def evaluate_reads(
         agent = await Agent.create(
             "mcp-read-evaluation",
             root=root,
-            hosted=True,
+            hosted=workspace is None,
+            workspace=workspace,
             model=provider,
             model_profile=profile,
             limits=LoopLimits(max_estimated_cost_usd=budget.per_run),
