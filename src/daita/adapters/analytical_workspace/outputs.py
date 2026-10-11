@@ -97,7 +97,12 @@ def capture(
 
 VALIDATION_CODE = {
     ".arrow": "import pyarrow.ipc as ipc\nwith ipc.open_file('candidate.bin') as reader:\n if reader.num_record_batches > 4096 or len(reader.schema) > 256: raise ValueError('table bound exceeded')\n rows=0; size=0\n for i in range(reader.num_record_batches):\n  batch=reader.get_batch(i); rows+=batch.num_rows; size+=batch.nbytes\n  if rows > 1000000 or size > 134217728: raise ValueError('decoded table bound exceeded')",
-    ".json": "import json\njson.loads(open('candidate.bin', encoding='utf-8').read())",
+    ".json": (
+        "import json\n"
+        "def reject_constant(value):\n"
+        " raise ValueError('Nonstandard JSON constant: ' + value)\n"
+        "json.loads(open('candidate.bin', encoding='utf-8').read(), parse_constant=reject_constant)"
+    ),
     ".csv": "import csv\nwith open('candidate.bin', newline='', encoding='utf-8') as f:\n for index, row in enumerate(csv.reader(f)):\n  if index >= 1000000 or len(row) > 256: raise ValueError('table bound exceeded')",
     ".png": "from PIL import Image\nwith Image.open('candidate.bin') as image:\n if image.format != 'PNG' or image.width*image.height > 16777216: raise ValueError('image bound exceeded')\n image.verify()\nwith Image.open('candidate.bin') as image: image.load()",
     ".parquet": "import pyarrow.parquet as pq\np = pq.ParquetFile('candidate.bin')\nm=p.metadata\nif m.num_rows > 1000000 or m.num_columns > 256 or sum(m.row_group(i).total_byte_size for i in range(m.num_row_groups)) > 134217728: raise ValueError('decoded table bound exceeded')\nt=p.read()\nif t.nbytes > 134217728: raise ValueError('decoded table bound exceeded')",

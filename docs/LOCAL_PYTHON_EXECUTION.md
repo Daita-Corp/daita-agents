@@ -177,7 +177,8 @@ Supported outputs are CSV, Parquet, JSON, PNG,
 Markdown, UTF-8 text and Python/SQL source text. Source text is retained data.
 Host capture requires a bounded regular file inside scratch, rejects symlinks and
 traversal, and hashes bytes while the worker is demonstrably stopped. A separate
-contained parser validates the format. Changed candidate bytes need a new name.
+contained parser validates the format. JSON outputs reject `NaN`, `Infinity`, and
+`-Infinity`. Changed candidate bytes need a new name.
 
 Artifacts retain runtime identity, executed source or an explicit source omission,
 cell digests, authenticated child/input references, known coverage and output hash.

@@ -118,7 +118,7 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
     async def fault(worker):
         candidate = worker.scratch / "candidate.bin"
         if candidate.exists():
-            os.chflags(candidate, stat.UF_IMMUTABLE)
+            getattr(os, "chflags")(candidate, stat.UF_IMMUTABLE)
             parsers.append(worker)
         await original(worker)
 
@@ -145,7 +145,7 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
             await Agent.open(
                 "recovery", root=tmp_path, workspace=workspace_for(tmp_path)
             )
-        os.chflags(parsers[0].scratch / "candidate.bin", 0)
+        getattr(os, "chflags")(parsers[0].scratch / "candidate.bin", 0)
         agent = await Agent.open(
             "recovery", root=tmp_path, workspace=workspace_for(tmp_path)
         )
@@ -163,7 +163,7 @@ async def test_parser_cleanup_failure_blocks_success_and_recovers_terminal_run(
         await agent.close()
         for worker in parsers:
             if worker.scratch.exists():
-                os.chflags(worker.scratch / "candidate.bin", 0)
+                getattr(os, "chflags")(worker.scratch / "candidate.bin", 0)
                 from daita.adapters.analytical_workspace.cleanup import (
                     remove_owned_scratch,
                 )

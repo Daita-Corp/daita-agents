@@ -973,7 +973,10 @@ daita
 
 `openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `httpx`,
 `keyring`, `textual`, `rich`, `XlsxWriter`, and exact `duckdb==1.5.5` are
-default production dependencies. `dev` is the only optional dependency group.
+default production dependencies. `dev` supplies test and quality tools;
+`analysis` supplies the pinned scientific runtime for native macOS ARM64
+computation. Managed installation includes `analysis`; a source checkout uses
+`pip install -e '.[dev,analysis]'` to qualify that runtime.
 
 Default installation does not permit eager imports. Provider SDKs, `asyncpg`,
 `sqlglot`, `httpx`, `keyring`, `textual`, `rich`, and DuckDB remain imported lazily

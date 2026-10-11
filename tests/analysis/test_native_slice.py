@@ -336,6 +336,48 @@ async def test_explicit_analysis_save_commits_one_artifact_and_persists_provenan
         await agent.close()
 
 
+@pytest.mark.parametrize("constant", ("NaN", "Infinity", "-Infinity"))
+async def test_nonstandard_json_constants_never_publish_artifacts(tmp_path, constant):
+    payload = '{"value":' + constant + "}"
+    model = ToolboxAwareMockModelProvider(
+        (
+            _tool(
+                "nonstandard-json",
+                "analysis_execute",
+                {
+                    "code": f"open('dataset.json','w').write({payload!r})\n"
+                    "outputs.add('dataset','dataset.json')",
+                    "expected_state": {"generation": 0, "revision": 0},
+                    "save_output": "dataset",
+                },
+            ),
+            ModelResponse(finish_reason=FinishReason.STOP, text="Validation reviewed"),
+        )
+    )
+    agent = await Agent.create(
+        "json-publication",
+        root=tmp_path,
+        model=model,
+        model_profile=_profile(model),
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        result = await agent.run("Create a JSON dataset.")
+        assert result.artifacts == ()
+        assert await agent.list_artifacts() == ()
+        output = next(
+            output
+            for call, output in (await agent.transcript(result.run_id)).tool_pairs
+            if call.id == "nonstandard-json"
+        )
+        assert output is not None and not output.is_error
+        data = output.output["data"]
+        assert isinstance(data, Mapping)
+        assert data["status"] == "state_lost"
+    finally:
+        await agent.close()
+
+
 @pytest.mark.parametrize("failure", (None, "missing_candidate", "second_commit"))
 async def test_batch_publication_retains_exact_outputs_and_reports_partial_failure(
     tmp_path, monkeypatch, failure

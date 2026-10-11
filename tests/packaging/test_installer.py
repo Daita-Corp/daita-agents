@@ -148,6 +148,40 @@ def _install(tmp_path: Path) -> tuple[Path, dict[str, str], Path]:
     return fixture.installer, environment, home
 
 
+@pytest.mark.parametrize("drift", ("missing", "wrong_version"))
+def test_managed_install_verifies_declared_analysis_dependency_metadata(
+    tmp_path: Path, drift: str
+):
+    wheel = build_minimal_wheel(
+        tmp_path, analysis_requirements=("daita-fixture-numeric-runtime==4.2.0",)
+    )
+    fixture = create_installer_fixture(tmp_path / "fixture", wheel=wheel)
+    home = tmp_path / "home"
+    home.mkdir()
+    environment = fixture_environment(fixture, home)
+    installed = _run(
+        fixture.installer, "--no-onboard", "--no-modify-path", env=environment
+    )
+    assert installed.returncode == 0, installed.stderr
+    verified = _run(fixture.installer, "--verify", env=environment)
+    assert verified.returncode == 0, verified.stderr
+    metadata = tuple(
+        _current_generation(home).rglob(
+            "daita_fixture_numeric_runtime-4.2.0.dist-info/METADATA"
+        )
+    )
+    assert len(metadata) == 1
+    if drift == "missing":
+        shutil.rmtree(metadata[0].parent)
+    else:
+        metadata[0].write_text(
+            metadata[0].read_text().replace("Version: 4.2.0", "Version: 4.2.1")
+        )
+    before = _refusal_snapshot(home)
+    refused = _run(fixture.installer, "--verify", env=environment)
+    _assert_refused_without_mutation(refused, home, before)
+
+
 def test_canonical_installer_syntax_and_release_literals_fail_closed(tmp_path: Path):
     syntax = subprocess.run(
         ["bash", "-n", str(INSTALLER_SOURCE)],
