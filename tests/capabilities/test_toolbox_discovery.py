@@ -245,26 +245,28 @@ async def test_production_intent_search_distinguishes_current_competing_tools(
         ("export all database rows csv", "data_export_tabular", 1),
         ("schedule recurring report", "routine_create", 1),
         ("set default export directory", "artifact_set_export_location", 1),
-        ("python computation", "analysis_execute", 1),
-        ("simulate a system", "analysis_execute", 1),
-        ("text processing", "analysis_execute", 1),
-        ("structured data validation", "analysis_execute", 1),
-        ("transform authenticated tool results", "analysis_execute", 1),
-        ("cross source analysis statistics", "analysis_execute", 1),
-        ("python pandas chart", "analysis_execute", 1),
+        ("python_execute", "python_execute", 1),
+        ("python workspace", "python_execute", 1),
+        ("python computation", "python_execute", 1),
+        ("simulate a system", "python_execute", 1),
+        ("text processing", "python_execute", 1),
+        ("structured data validation", "python_execute", 1),
+        ("transform authenticated tool results", "python_execute", 1),
+        ("cross source analysis statistics", "python_execute", 1),
+        ("python pandas chart", "python_execute", 1),
         (
             "Create downloadable chart and CSV artifacts from query result data, e.g. chart spec or report CSV file",
-            "analysis_execute",
+            "python_execute",
             3,
         ),
         (
             "Create chart artifact from summarized weekly time-series revenue and order count, bar or line chart image or HTML visualization",
-            "analysis_execute",
+            "python_execute",
             3,
         ),
         (
             "Run Python code for plotting chart and creating chart image artifact from validated result rows",
-            "analysis_execute",
+            "python_execute",
             1,
         ),
     )
@@ -321,7 +323,7 @@ async def test_production_intent_search_distinguishes_current_competing_tools(
             assert isinstance(matches, tuple)
             names = tuple(match["tool_name"] for match in matches)
             assert expected in names[:rank_bound], (query, names)
-            if expected == "analysis_execute":
+            if expected == "python_execute":
                 assert (
                     next(match for match in matches if match["tool_name"] == expected)[
                         "capability_id"

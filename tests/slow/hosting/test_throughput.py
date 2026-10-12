@@ -14,6 +14,7 @@ import sqlite3
 import statistics
 import sys
 import tempfile
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict
 from hashlib import sha256
 from pathlib import Path
@@ -161,7 +162,9 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
 
     monkeypatch.setattr(SQLiteQueryBackend, "execute_read", fixture_read)
 
-    async def measure(name, operation, *, tasks=1):
+    async def measure(
+        name: str, operation: Callable[[], Awaitable[None]], *, tasks: int = 1
+    ) -> None:
         samples: list[float] = []
         requests_before = provider.request_count
         started = perf_counter()
@@ -343,7 +346,7 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
                 output = next(
                     output
                     for call, output in transcript.tool_pairs
-                    if call.name == "analysis_execute"
+                    if call.name == "python_execute"
                 )
                 assert output is not None
                 assert (
@@ -392,7 +395,7 @@ async def test_public_composition_throughput_campaign(tmp_path, monkeypatch):
                     cell = next(
                         output
                         for call, output in transcript.tool_pairs
-                        if call.name == "analysis_execute"
+                        if call.name == "python_execute"
                     )
                     assert cell is not None
                     data = json.loads(canonical_json(cell.output))["data"]
@@ -541,7 +544,7 @@ class _NativeProvider(_Provider):
             assert not results["python"].is_error, results["python"]
             return ModelResponse(finish_reason=FinishReason.STOP, text="verified")
         required = {
-            "analysis_execute",
+            "python_execute",
             *(
                 {"data_export_tabular"}
                 if self.mode in {"capture", "export_bind"}
@@ -597,7 +600,5 @@ class _NativeProvider(_Provider):
                     + "\nassert all(not r['is_error'] for r in rs), rs\nprint(sum(int(r['output']['data']['content']) for r in rs))"
                 )
             arguments["code"] = code
-            calls = (
-                ToolCall(id="python", name="analysis_execute", arguments=arguments),
-            )
+            calls = (ToolCall(id="python", name="python_execute", arguments=arguments),)
         return ModelResponse(finish_reason=FinishReason.TOOL_CALLS, tool_calls=calls)

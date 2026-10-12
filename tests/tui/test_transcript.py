@@ -238,7 +238,7 @@ async def test_live_activity_and_exact_model_context_update_from_observation(
                 ("file_search", "Searching local files"),
                 ("file_read", "Reading local file"),
                 ("file_query", "Querying local file data"),
-                ("analysis_execute", "Running Python"),
+                ("python_execute", "Running Python"),
                 ("artifact_edit_text", "Preparing local file edit"),
                 ("artifact_save_local", "Publishing local artifact"),
             ):

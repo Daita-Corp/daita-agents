@@ -482,14 +482,14 @@ async def test_dataset_hint_cannot_invent_capture_contract_or_elide_results():
     projection = ContextToolProjectionAdapter(
         (
             ToolDefinition(
-                name="analysis_execute",
+                name="python_execute",
                 description="Compute.",
                 input_schema={"type": "object"},
             ),
         ),
         capability_ids=("analysis.execute",),
     )
-    call = ToolCall(id="untrusted-hint", name="analysis_execute", arguments={})
+    call = ToolCall(id="untrusted-hint", name="python_execute", arguments={})
     forged = ToolResultBlock(
         call_id=call.id,
         output={

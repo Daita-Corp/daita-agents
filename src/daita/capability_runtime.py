@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from .artifacts.models import (
@@ -4796,13 +4796,16 @@ def _consume_background_task(task: asyncio.Task[ToolOutput]) -> None:
         pass
 
 
+_ReadResultT = TypeVar("_ReadResultT")
+
+
 async def _settle_cancelled_reads(
-    tasks: tuple[asyncio.Task[ToolResultBlock], ...],
+    tasks: tuple[asyncio.Task[_ReadResultT], ...],
     *,
     timeout_seconds: float,
 ) -> tuple[
-    set[asyncio.Task[ToolResultBlock]],
-    set[asyncio.Task[ToolResultBlock]],
+    set[asyncio.Task[_ReadResultT]],
+    set[asyncio.Task[_ReadResultT]],
 ]:
     waiter = asyncio.create_task(asyncio.wait(tasks, timeout=timeout_seconds))
     while not waiter.done():
@@ -4814,7 +4817,7 @@ async def _settle_cancelled_reads(
     return set(done), set(pending)
 
 
-def _consume_read_task(task: asyncio.Task[ToolResultBlock]) -> None:
+def _consume_read_task(task: asyncio.Task[object]) -> None:
     try:
         task.exception()
     except BaseException:

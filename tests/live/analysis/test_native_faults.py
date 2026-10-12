@@ -65,7 +65,7 @@ async def test_trace_exhaustion_stops_before_another_model_request(
         tuple(
             _tool(
                 f"trace-{index}",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": code,
                     "expected_state": {
@@ -101,7 +101,7 @@ async def test_trace_exhaustion_stops_before_another_model_request(
         cells = [
             (call, block)
             for call, block in transcript.tool_pairs
-            if call.name == "analysis_execute"
+            if call.name == "python_execute"
         ]
         assert result.reason == "analysis_trace_budget_exhausted"
         assert result.kind.value == "failed" and result.final_text is None
@@ -126,7 +126,7 @@ async def test_artifact_quota_failure_preserves_execution_and_existing_candidate
         script.append(
             _tool(
                 f"save-{index}",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": (
                         "n=0\nopen('value.txt','w').write('42')\noutputs.add('value','value.txt')\n"
@@ -151,7 +151,7 @@ async def test_artifact_quota_failure_preserves_execution_and_existing_candidate
         cells = [
             block
             for call, block in (await agent.transcript(result.run_id)).tool_pairs
-            if call.name == "analysis_execute"
+            if call.name == "python_execute"
         ]
         assert len(result.artifacts) == 8
         assert cells[8] is not None and cells[9] is not None
@@ -183,7 +183,7 @@ async def test_stale_raw_rpc_token_is_denied_before_read_dispatch(
         (
             _tool(
                 "forged",
-                "analysis_execute",
+                "python_execute",
                 {"code": code, "expected_state": {"generation": 0, "revision": 0}},
             ),
         ),
@@ -210,7 +210,7 @@ async def test_cell_deadline_includes_waiting_for_worker_admission(
         (
             _tool(
                 "occupy",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "while True: pass",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -218,7 +218,7 @@ async def test_cell_deadline_includes_waiting_for_worker_admission(
             ),
             _tool(
                 "queue-timeout",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "print(42)",
                     "timeout_seconds": 0.15,
@@ -310,12 +310,10 @@ async def test_revoked_candidate_cannot_be_saved_after_worker_replacement(
         name = attached.binding.tools[0].local_name
         models[0].replace_script(
             (
-                _tool(
-                    "load", "toolbox_load", {"tool_names": ["analysis_execute", name]}
-                ),
+                _tool("load", "toolbox_load", {"tool_names": ["python_execute", name]}),
                 _tool(
                     "candidate",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": f"import json\nr=tools.call({name!r}, {{'query':'fixture'}})\nassert not r['is_error']\nopen('derived.json','w').write(json.dumps(r['output']))\noutputs.add('derived','derived.json')",
                         "expected_state": {"generation": 0, "revision": 0},
@@ -323,7 +321,7 @@ async def test_revoked_candidate_cannot_be_saved_after_worker_replacement(
                 ),
                 _tool(
                     "wait-revocation",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": "while True: pass",
                         "expected_state": {"generation": 1, "revision": 1},
@@ -331,7 +329,7 @@ async def test_revoked_candidate_cannot_be_saved_after_worker_replacement(
                 ),
                 _tool(
                     "try-save-old",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": "print('fresh')",
                         "save_output": "derived",
@@ -393,7 +391,7 @@ async def test_python_threads_serialize_broker_channel_and_keep_response_identit
         (
             _tool(
                 "thread-reads",
-                "analysis_execute",
+                "python_execute",
                 {"code": code, "expected_state": {"generation": 0, "revision": 0}},
             ),
         ),
@@ -472,7 +470,7 @@ async def test_broken_worker_input_counts_actual_os_transfers(
         (
             _tool(
                 "close-input",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "import sys\nsys.stdin.close()\ntry: tools.call('file_read', {'path':'value.txt'})\nexcept ValueError:\n while True: pass",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -606,15 +604,13 @@ async def test_public_cancellation_settles_real_worker_and_child_io(
             http_transport=httpx.MockTransport(MCPConformanceTransport(identity))
         )
         script.append(
-            _tool(
-                "load", "toolbox_load", {"tool_names": ["analysis_execute", "lookup"]}
-            )
+            _tool("load", "toolbox_load", {"tool_names": ["python_execute", "lookup"]})
         )
         code = "r = tools.call('lookup', {'query':'isolated fixture'}); print(r)"
     script.append(
         _tool(
             "cancel-cell",
-            "analysis_execute",
+            "python_execute",
             {"code": code, "expected_state": {"generation": 0, "revision": 0}},
         )
     )
@@ -638,11 +634,11 @@ async def test_public_cancellation_settles_real_worker_and_child_io(
                     _tool(
                         "load",
                         "toolbox_load",
-                        {"tool_names": ["analysis_execute", local_name]},
+                        {"tool_names": ["python_execute", local_name]},
                     ),
                     _tool(
                         "cancel-cell",
-                        "analysis_execute",
+                        "python_execute",
                         {
                             "code": f"r = tools.call({local_name!r}, {{'query':'isolated fixture'}}); print(r)",
                             "expected_state": {"generation": 0, "revision": 0},
@@ -691,13 +687,13 @@ async def test_public_cancellation_settles_real_worker_and_child_io(
 async def test_public_shared_child_budget_and_forbidden_targets(
     tmp_path, analysis_report
 ):
-    code = "for name in ['analysis_execute','toolbox_load','artifact_save_local','data_update_rows','unloaded_fixture']:\n r=tools.call(name, {})\n assert r['is_error']"
+    code = "for name in ['python_execute','toolbox_load','artifact_save_local','data_update_rows','unloaded_fixture']:\n r=tools.call(name, {})\n assert r['is_error']"
     agent = await make_agent(
         tmp_path,
         (
             _tool(
                 "denials",
-                "analysis_execute",
+                "python_execute",
                 {"code": code, "expected_state": {"generation": 0, "revision": 0}},
             ),
         ),
@@ -735,7 +731,7 @@ from tests.support.workspace import workspace_for
 from pathlib import Path
 async def main():
  root=Path(sys.argv[1])
- model=ToolboxAwareMockModelProvider((_tool('abandoned','analysis_execute',{'code':'while True: pass','expected_state':{'generation':0,'revision':0}}),))
+ model=ToolboxAwareMockModelProvider((_tool('abandoned','python_execute',{'code':'while True: pass','expected_state':{'generation':0,'revision':0}}),))
  agent=await Agent.create('crashed', root=root, model=model, model_profile=_profile(model), workspace=workspace_for(root))
  task=asyncio.create_task(agent.run('Crash this disposable host.'))
  while True:
@@ -824,7 +820,7 @@ async def test_every_output_format_is_isolated_validated_saved_and_deleted(
         (
             _tool(
                 "produce",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": source + f"\noutputs.add('fixture','output{extension}')",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -832,7 +828,7 @@ async def test_every_output_format_is_isolated_validated_saved_and_deleted(
             ),
             _tool(
                 "save",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "",
                     "expected_state": {"generation": 1, "revision": 1},
@@ -889,7 +885,7 @@ print(sum(Decimal(row['amount']) for row in rows if row['amount'] is not None))
         (
             _tool(
                 "exact",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": code,
                     "expected_state": {"generation": 0, "revision": 0},
@@ -979,12 +975,10 @@ async def test_active_binding_revocation_closes_contaminated_interpreter(
         name = attached.binding.tools[0].local_name
         models[0].replace_script(
             (
-                _tool(
-                    "load", "toolbox_load", {"tool_names": ["analysis_execute", name]}
-                ),
+                _tool("load", "toolbox_load", {"tool_names": ["python_execute", name]}),
                 _tool(
                     "tainted",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": f"r=tools.call({name!r}, {{'query':'fixture'}})\nassert not r['is_error']\nwhile True: pass",
                         "expected_state": {"generation": 0, "revision": 0},
@@ -1025,7 +1019,7 @@ async def test_unrelated_foreground_read_progresses_with_running_and_queued_anal
         (
             _tool(
                 "busy",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "while True: pass",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -1033,7 +1027,7 @@ async def test_unrelated_foreground_read_progresses_with_running_and_queued_anal
             ),
             _tool(
                 "queued",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "print(9)",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -1124,12 +1118,10 @@ async def test_completed_cpu_and_broker_wait_have_distinct_host_measurements(
         name = attached.binding.tools[0].local_name
         models[0].replace_script(
             (
-                _tool(
-                    "load", "toolbox_load", {"tool_names": ["analysis_execute", name]}
-                ),
+                _tool("load", "toolbox_load", {"tool_names": ["python_execute", name]}),
                 _tool(
                     "measure",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": f"import time\nstarted=time.process_time()\nwhile time.process_time()-started < .15: total=sum(range(10000))\nr=tools.call({name!r}, {{'query':'fixture'}})\nassert not r['is_error']\nprint(total)",
                         "expected_state": {"generation": 0, "revision": 0},

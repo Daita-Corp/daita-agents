@@ -245,7 +245,7 @@ async def test_python_guidance_follows_applicable_loaded_projection(
     before = builder.project(
         snapshot, messages, step=1, tool_context=runtime.project(catalog, messages)
     )
-    assert "analysis_execute" not in {tool.name for tool in before.tools}
+    assert "python_execute" not in {tool.name for tool in before.tools}
     assert (
         "Python workspace:" not in cast(TextBlock, before.messages[0].content[0]).text
     )
@@ -256,7 +256,7 @@ async def test_python_guidance_follows_applicable_loaded_projection(
     call = ToolCall(
         id="load-python",
         name="toolbox_load",
-        arguments={"tool_names": ("analysis_execute",)},
+        arguments={"tool_names": ("python_execute",)},
     )
     outcome = await runtime.execute_all(
         run,
@@ -278,7 +278,7 @@ async def test_python_guidance_follows_applicable_loaded_projection(
         step=2,
         tool_context=runtime.project(catalog, messages),
     )
-    callable_python = "analysis_execute" in {tool.name for tool in request.tools}
+    callable_python = "python_execute" in {tool.name for tool in request.tools}
     assert callable_python is available
     system = cast(TextBlock, request.messages[0].content[0]).text
     assert ("Python workspace:" in system) is callable_python
@@ -376,7 +376,7 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
                 description="Read or compute.",
                 input_schema={"type": "object"},
             )
-            for name in ("analysis_execute", "data_query", "file_query")
+            for name in ("python_execute", "data_query", "file_query")
         ),
         capability_ids=ids,
     )
@@ -431,7 +431,7 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
         if f"Python {procedure}:" in system
     } == expected
     assert {tool.name for tool in request.tools} == {
-        "analysis_execute",
+        "python_execute",
         "data_query",
         "file_query",
         "toolbox_inspect",
@@ -455,7 +455,7 @@ async def test_python_guidance_is_counted_at_preparation_and_projection():
     projection = ContextToolProjectionAdapter(
         (
             ToolDefinition(
-                name="analysis_execute",
+                name="python_execute",
                 description="Compute.",
                 input_schema={"type": "object"},
             ),
@@ -607,7 +607,7 @@ async def test_dataset_guidance_requires_exact_loaded_export_metadata(
     messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
     catalog = await runtime.prepare_run(run)
     snapshot = await builder.prepare(run, messages, catalog)
-    for names in (("analysis_execute",), ("analysis_execute", "data_export_tabular")):
+    for names in (("python_execute",), ("python_execute", "data_export_tabular")):
         call = ToolCall(
             id=f"load-{len(names)}",
             name="toolbox_load",

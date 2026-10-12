@@ -64,7 +64,7 @@ async def test_partial_broker_read_retains_coverage_and_contract_after_history_c
         (
             _tool(
                 "partial",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "import json\nr=tools.call('file_read', {'path':'partial.txt'})\nassert not r['is_error']\nd=r['output']['data']\nsummary={'captured_bytes':len(d['content'].encode()), 'complete':d['complete']}\nprint(summary)\nopen('coverage.json','w').write(json.dumps(summary))\noutputs.add('coverage','coverage.json')",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -150,7 +150,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
     models: list[ToolboxAwareMockModelProvider] = []
     producer = _tool(
         "produce",
-        "analysis_execute",
+        "python_execute",
         {
             "code": "open('answer.txt','w').write('42')\noutputs.add('answer','answer.txt')",
             "expected_state": {"generation": 0, "revision": 0},
@@ -162,7 +162,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
         (
             _tool(
                 "produce",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "open('answer.txt','w').write('42')\noutputs.add('answer','answer.txt')",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -184,7 +184,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
             evidence_id = visible["data"]["child_calls"][0]["evidence_id"]
             return _tool(
                 "use-preview",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "print(inputs.get('preview')['data']['text'])",
                     "inputs": {
@@ -198,7 +198,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
             (
                 _tool(
                     "read-preview",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": f"r=tools.call('artifact_read', {{'artifact_id':{artifact.artifact_id!r}}})\nassert not r['is_error']\nprint(r['output']['data']['text'])\nlisting=tools.call('artifact_list', {{}})\nassert not listing['is_error']\ndenied=tools.call('artifact_create_document', {{}})\nassert denied['is_error']",
                         "expected_state": {"generation": 0, "revision": 0},
@@ -214,7 +214,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
         cells = [
             block
             for call, block in (await agent.transcript(result.run_id)).tool_pairs
-            if call.name == "analysis_execute"
+            if call.name == "python_execute"
         ]
         assert len(cells) == 2
         for block in cells:
@@ -288,7 +288,7 @@ async def test_arrow_input_preserves_schema_decimal_null_integer_timezone_duplic
             (
                 _tool(
                     "arrow-input",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": "import pyarrow.ipc as ipc\nwith ipc.open_file(inputs.path('fixture')) as reader: t=reader.read_all()\nprint(t.schema)\nprint(t.to_pylist())",
                         "inputs": {
@@ -353,9 +353,7 @@ async def test_invalid_inputs_and_candidates_never_publish(
         }
     else:
         arguments["expected_state"] = {"generation": 9, "revision": 99}
-    agent = await make_agent(
-        tmp_path, (_tool("invalid", "analysis_execute", arguments),)
-    )
+    agent = await make_agent(tmp_path, (_tool("invalid", "python_execute", arguments),))
     try:
         result = await agent.run("Reject invalid candidate and input references.")
         records = await agent.analysis_evidence(result.run_id)
@@ -366,7 +364,7 @@ async def test_invalid_inputs_and_candidates_never_publish(
         pair = next(
             (call, block)
             for call, block in (await agent.transcript(result.run_id)).tool_pairs
-            if call.name == "analysis_execute"
+            if call.name == "python_execute"
         )
         block = pair[1]
         assert block is not None
@@ -402,7 +400,7 @@ async def test_saved_input_new_run_and_active_artifact_deletion(
         (
             _tool(
                 "produce",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "open('retained.json','w').write('{\"value\":42}')\noutputs.add('retained','retained.json')",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -411,7 +409,7 @@ async def test_saved_input_new_run_and_active_artifact_deletion(
             ),
             _tool(
                 "produce-other",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "open('other.json','w').write('{\"value\":43}')\noutputs.add('other','other.json')",
                     "expected_state": {"generation": 1, "revision": 1},
@@ -436,7 +434,7 @@ async def test_saved_input_new_run_and_active_artifact_deletion(
             (
                 _tool(
                     "consume",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": "old = inputs.get('retained')['value']\nprint(old)",
                         "inputs": {
@@ -450,7 +448,7 @@ async def test_saved_input_new_run_and_active_artifact_deletion(
                 ),
                 _tool(
                     "replace-input-name",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "code": "assert inputs.get('retained')['value']==43\nprint(old)\nwhile True: pass",
                         "inputs": {

@@ -65,6 +65,7 @@ from ..data.export_capabilities import ArtifactCapabilityDomain
 
 OWNER = "analysis"
 CAPABILITY = "analysis.execute"
+TOOL_NAME = "python_execute"
 
 
 @dataclass(slots=True)
@@ -137,9 +138,9 @@ class AnalysisCapabilityDomain:
         self._limits = limits
         self._observer = observer
         description = (
-            "Run normal Python for computation, simulation, text processing, structured-data validation, "
-            "analysis and transformation of authenticated tool results in a private macOS sandbox. "
-            "Variables persist only within this run. "
+            "Execute Python in an isolated, bounded macOS workspace for computation, simulation, "
+            "text processing, structured-data validation, analysis and transformation of authenticated tool results. "
+            "Variables and scratch files persist only within this run. "
             "Use expected_state={generation:0,revision:0} initially; then use the returned state. "
             "tools.call(name, arguments) returns a dict: r['is_error'], r['output']['data'], r['evidence_id']. "
             "Write relative scratch filenames; outputs.add('name','file.png') registers a file. "
@@ -290,14 +291,14 @@ class AnalysisCapabilityDomain:
             executor_ids=(self.executor_id,),
             tool_views=(
                 ToolView(
-                    name="analysis_execute",
+                    name=TOOL_NAME,
                     capability_id=CAPABILITY,
                     description=description,
                     presentation=ToolPresentation(
                         toolbox_id=ToolboxId.ANALYSIS,
                         load_mode=ToolLoadMode.ON_DEMAND,
                         text_trust=ToolTextTrust.CODE,
-                        summary="Run Python code for computation, query-result analysis and chart image artifacts.",
+                        summary="Execute Python in a bounded workspace for computation, data transformation and chart artifacts.",
                         when_to_use=(
                             "Computation, simulation, text processing, structured-data validation, "
                             "transformation of authenticated tool and query results, cross-source analysis, "
@@ -305,7 +306,7 @@ class AnalysisCapabilityDomain:
                             "plots of weekly time-series data, or computed CSV outputs."
                         ),
                         keywords=(
-                            "python",
+                            "python workspace",
                             "analysis",
                             "compute code",
                             "duckdb",
@@ -354,7 +355,7 @@ class AnalysisCapabilityDomain:
         session.writer.retain_analysis_sensitivity(state.sensitivity)
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
-        return ("analysis_execute",) if self._admits_run(run) and available() else ()
+        return (TOOL_NAME,) if self._admits_run(run) and available() else ()
 
     def retain_child_tasks(
         self, run_id: str, tasks: tuple[asyncio.Task[ProgrammaticReadResult], ...]
@@ -859,7 +860,7 @@ class AnalysisCapabilityDomain:
             )
             current_call = ToolCall(
                 id=request.call_id,
-                name="analysis_execute",
+                name=TOOL_NAME,
                 arguments=request.arguments,
             )
             requested_inputs = request.arguments.get("inputs", {})

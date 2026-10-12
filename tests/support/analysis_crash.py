@@ -64,7 +64,7 @@ async def record(store, agent_id, evidence):
             await asyncio.Event().wait()
 SQLStateStore.record_analysis_evidence = record
 async def main():
-    model = ToolboxAwareMockModelProvider((_tool('crash', 'analysis_execute', {'code':'print(42)', 'expected_state':{'generation':0,'revision':0}}),))
+    model = ToolboxAwareMockModelProvider((_tool('crash', 'python_execute', {'code':'print(42)', 'expected_state':{'generation':0,'revision':0}}),))
     agent = await Agent.create('recovery', root=root, workspace=workspace_for(root), model=model, model_profile=_profile(model))
     await agent.run('Crash across launch ownership handoff.')
 asyncio.run(main())

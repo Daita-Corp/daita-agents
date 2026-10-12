@@ -193,7 +193,7 @@ async def test_real_model_dependent_cells_and_error_correction(
         cells = [
             output.output["data"]
             for call, output in transcript.tool_pairs
-            if call.name == "analysis_execute"
+            if call.name == "python_execute"
             and output is not None
             and not output.is_error
         ]
@@ -231,7 +231,7 @@ async def test_real_model_cli_python_and_broker(tmp_path, paid_case, analysis_re
         str(workspace),
         "run",
         "live-cli",
-        "Use analysis_execute. Inside Python, call tools.call('file_read', {'path': 'numbers.txt'}), inspect r['is_error'] and r['output']['data']['content'], then compute and print {'sum': the_sum}. Make the file_read call inside Python even if you already read it elsewhere. Report the sum.",
+        "Use python_execute. Inside Python, call tools.call('file_read', {'path': 'numbers.txt'}), inspect r['is_error'] and r['output']['data']['content'], then compute and print {'sum': the_sum}. Make the file_read call inside Python even if you already read it elsewhere. Report the sum.",
         "--model",
         profile.id,
         "--max-cost-usd",
@@ -319,7 +319,7 @@ async def test_real_model_tui_python_and_broker(tmp_path, paid_case, analysis_re
             try:
                 await app._show_chat()
                 await app.submit_composer(
-                    "Use analysis_execute. Inside Python, call tools.call('file_read', {'path': 'numbers.txt'}), inspect r['is_error'] and r['output']['data']['content'], then compute and print {'sum': the_sum}. Make the file_read call inside Python even if you already read the file elsewhere. Report the sum."
+                    "Use python_execute. Inside Python, call tools.call('file_read', {'path': 'numbers.txt'}), inspect r['is_error'] and r['output']['data']['content'], then compute and print {'sum': the_sum}. Make the file_read call inside Python even if you already read the file elsewhere. Report the sum."
                 )
                 assert app._run_task is not None
                 await asyncio.wait_for(app._run_task, 300)
@@ -393,7 +393,7 @@ async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
     try:
         source = await agent.attach_sqlite(database)
         method = (
-            "First export a complete Arrow query, then bind its exact artifact ID in analysis_execute.inputs."
+            "First export a complete Arrow query, then bind its exact artifact ID in python_execute.inputs."
             if handoff == "export_bind"
             else "Use tools.capture('data_export_tabular', ..., name='numbers') within Python after loading the exact export and analysis tools together."
         )

@@ -97,6 +97,11 @@ fails closed and must be recreated or revised and approved again from the
 foreground. There is no compatibility decoder, digest bridge, or implicit
 acceptance of the replacement contract.
 
+The model-facing Python tool is `python_execute`; its internal capability ID
+remains `analysis.execute`. Its updated description changes the exact capability
+contract digest, so routines retaining the previous binding require foreground
+review and approval of a revised proposal.
+
 The scheduled-analysis addition changes the `analysis.execute` contract, and
 the positional-binding guidance changes the `data.query` contract. Routines
 retaining older bindings fail closed and require foreground review and approval

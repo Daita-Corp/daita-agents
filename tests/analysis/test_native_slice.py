@@ -46,7 +46,7 @@ async def test_public_agent_runs_python_and_dependent_cell(tmp_path):
         (
             _tool(
                 "cell-one",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "answer = 6 * 7; print(answer)",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -54,7 +54,7 @@ async def test_public_agent_runs_python_and_dependent_cell(tmp_path):
             ),
             _tool(
                 "cell-two",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "print(answer + 1)",
                     "expected_state": {"generation": 1, "revision": 1},
@@ -77,7 +77,7 @@ async def test_public_agent_runs_python_and_dependent_cell(tmp_path):
         cells = [
             output
             for call, output in transcript.tool_pairs
-            if call.name == "analysis_execute"
+            if call.name == "python_execute"
         ]
         assert len(cells) == 2
         assert all(output is not None and output.is_error is False for output in cells)
@@ -147,7 +147,7 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                         "toolbox_load",
                         {
                             "tool_names": [
-                                "analysis_execute",
+                                "python_execute",
                                 *(["data_export_tabular"] if captured else []),
                             ]
                         },
@@ -157,7 +157,7 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                 replace(
                     _tool(
                         "retained-input",
-                        "analysis_execute",
+                        "python_execute",
                         {
                             "code": "raise AssertionError('must not execute')",
                             "expected_state": {"generation": 0, "revision": 0},
@@ -174,7 +174,7 @@ async def test_scheduled_analysis_reads_exact_scope_and_delivers_artifact(
                 replace(
                     _tool(
                         "scheduled-cell",
-                        "analysis_execute",
+                        "python_execute",
                         {
                             "code": "import json\n"
                             "assert tools.call('file_read', {'path':'values.sqlite'})['is_error']\n"
@@ -325,7 +325,7 @@ async def test_explicit_analysis_save_commits_one_artifact_and_persists_provenan
         (
             _tool(
                 "cell-save",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "open('answer.txt', 'w').write('42\\n')\noutputs.add('answer','answer.txt')",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -371,7 +371,7 @@ async def test_nonstandard_json_constants_never_publish_artifacts(tmp_path, cons
         (
             _tool(
                 "nonstandard-json",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": f"open('dataset.json','w').write({payload!r})\n"
                     "outputs.add('dataset','dataset.json')",
@@ -414,7 +414,7 @@ async def test_batch_publication_retains_exact_outputs_and_reports_partial_failu
         (
             _tool(
                 "cell-save-batch",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "open('answer.json','w').write('{\"n\":42}')\n"
                     "open('recipe.py','w').write('print(42)')\n"
@@ -511,7 +511,7 @@ async def test_batch_reads_overlap_finish_out_of_order_and_retain_individual_err
         (
             _tool(
                 "batch",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "rs = tools.batch([{'name':'file_read','arguments':{'path':p}} for p in ['one.txt','missing.txt','two.txt']])\nassert [r['is_error'] for r in rs] == [False,True,False], rs\nassert [rs[i]['output']['data']['content'] for i in [0,2]] == ['17','25'], rs\nprint('ordered')",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -602,7 +602,7 @@ async def test_batch_rejects_whole_envelopes_before_io_and_counts_attempts(
         (
             _tool(
                 "batch",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": f"rs = tools.batch({calls!r})\nassert len(rs) == 3 and all(r['is_error'] for r in rs), rs\nprint('denied')",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -668,7 +668,7 @@ async def test_batch_interruption_settles_dispatched_and_queued_children(
         (
             _tool(
                 "batch",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": code,
                     "expected_state": {"generation": 0, "revision": 0},
@@ -746,7 +746,7 @@ async def test_batch_trace_exhaustion_dispatches_nothing_and_retains_requested_u
         (
             _tool(
                 "batch",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "tools.batch([{'name':'file_read','arguments':{'path':'one.txt'}}]*3)",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -794,7 +794,7 @@ async def test_python_threads_serialize_batches_and_keep_each_response_identity(
         (
             _tool(
                 "batch",
-                "analysis_execute",
+                "python_execute",
                 {"code": code, "expected_state": {"generation": 0, "revision": 0}},
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="Read both."),
@@ -898,7 +898,7 @@ async def test_batch_uses_distinct_source_lanes_and_rechecks_revoked_authority(
         (
             _tool(
                 "batch",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": f"rs = tools.batch({children!r})\nassert [r['is_error'] for r in rs] == [True,True,False], rs\nassert rs[2]['output']['data']['rows'] == [{{'n':42}}]\nprint('revalidated')",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -978,7 +978,7 @@ async def test_worker_rejects_stale_batch_response_identity_without_replay(
         (
             _tool(
                 "batch",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "tools.batch([{'name':'file_read','arguments':{'path':'one.txt'}}])",
                     "expected_state": {"generation": 0, "revision": 0},
@@ -1030,11 +1030,11 @@ async def test_real_python_broker_reads_and_denies_recursive_calls(
         (
             _tool(
                 "cell-read",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": "r = tools.call('file_read', {'path': 'values.txt'})\nprint(r)\n"
                     "assert not r['is_error']\n"
-                    "denied = tools.call('analysis_execute', {})\nassert denied['is_error']",
+                    "denied = tools.call('python_execute', {})\nassert denied['is_error']",
                     "expected_state": {"generation": 0, "revision": 0},
                 },
             ),
@@ -1074,7 +1074,7 @@ async def test_real_python_broker_reads_and_denies_recursive_calls(
         cell = [
             output
             for call, output in transcript.tool_pairs
-            if call.name == "analysis_execute"
+            if call.name == "python_execute"
         ][0]
         assert cell is not None
         assert json.loads(canonical_json(cell.output))["data"]["status"] == "success"
@@ -1170,7 +1170,7 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
                 )
             return _tool(
                 "compute-arrow",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": prefix
                     + "import pyarrow.ipc as ipc\nfrom hashlib import sha256\n"
@@ -1189,7 +1189,7 @@ async def test_exact_arrow_export_bind_compute_and_reopen(tmp_path, handoff):
                 _tool(
                     "load-arrow",
                     "toolbox_load",
-                    {"tool_names": ["data_export_tabular", "analysis_execute"]},
+                    {"tool_names": ["data_export_tabular", "python_execute"]},
                 ),
                 *(
                     (
@@ -1367,14 +1367,14 @@ async def test_capture_failure_retains_publication_without_query_replay(
                 "toolbox_load",
                 {
                     "tool_names": [
-                        "analysis_execute",
+                        "python_execute",
                         *([] if failure == "unloaded" else ["data_export_tabular"]),
                     ]
                 },
             ),
             _tool(
                 "capture",
-                "analysis_execute",
+                "python_execute",
                 {
                     "code": f"r = tools.capture('data_export_tabular', {arguments!r}, name={name!r})\nassert r['is_error'], r\n"
                     + (
@@ -1535,11 +1535,11 @@ async def test_capture_metadata_delivery_bound_keeps_committed_reference(
                 _tool(
                     "load",
                     "toolbox_load",
-                    {"tool_names": ["analysis_execute", "data_export_tabular"]},
+                    {"tool_names": ["python_execute", "data_export_tabular"]},
                 ),
                 _tool(
                     "capture",
-                    "analysis_execute",
+                    "python_execute",
                     {
                         "expected_state": {"generation": 0, "revision": 0},
                         "code": f"r = tools.capture('data_export_tabular', {arguments!r}, name='wide')\nassert r['is_error'], r\nassert r['output']['artifact']['artifact_id']\nprint('reference retained')",

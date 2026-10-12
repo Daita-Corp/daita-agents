@@ -484,9 +484,10 @@ async def test_host_connection_budget_retires_idle_sources(transport):
             for i in (2, 3)
         ],
     ]
+    resource = (await backend._catalog.resource_schemas(first.agent_id, first.id))[0]
     resources = [
         replace(
-            backend._catalog.resources[0],
+            resource,
             source_id=registration.id,
             resource_id=f"resource-{i}",
         )

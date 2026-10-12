@@ -140,7 +140,7 @@ async def test_live_partial_file_does_not_establish_a_complete_total(dataops):
         "total_minor": None,
     }
     assert not any(
-        call.name in {"file_query", "analysis_execute"}
+        call.name in {"file_query", "python_execute"}
         for call, _ in capture.transcript.tool_pairs
     )
 
@@ -303,7 +303,7 @@ async def test_live_python_chart_dataset_and_retained_computation(dataops):
         'PNG chart, and a JSON dataset shaped as {"rows":[{"currency":"USD",'
         '"amount_minor":123}]}. Save both as artifacts through separate analysis '
         "calls. Read orders programmatically through tools.call('data_query', ...) "
-        "inside Python after loading its exact schema together with analysis_execute. "
+        "inside Python after loading its exact schema together with python_execute. "
         "Retain the returned coverage. Do not publish "
         "local files. Return the same JSON rows as your answer.",
         phase="python_report",
@@ -697,5 +697,5 @@ async def test_paired_python_relational_reads_preserve_independent_oracle(
     assert any(
         f"tools.{method}" in str(call.arguments.get("code", ""))
         for call, _ in capture.transcript.tool_pairs
-        if call.name == "analysis_execute"
+        if call.name == "python_execute"
     )

@@ -34,7 +34,7 @@ from tests.support.workspace import workspace_for
 def cell(name, code, **extra):
     return _tool(
         name,
-        "analysis_execute",
+        "python_execute",
         {
             "code": code,
             "expected_state": {"generation": 0, "revision": 0},
@@ -77,7 +77,7 @@ async def test_invalid_output_registration_preserves_state_for_correction(
         ),
         _tool(
             "corrected-output",
-            "analysis_execute",
+            "python_execute",
             {
                 "code": "assert answer == 42\noutputs.add('answer','answer.txt')",
                 "expected_state": {"generation": 1, "revision": 1},
@@ -90,7 +90,7 @@ async def test_invalid_output_registration_preserves_state_for_correction(
         cells = [
             json.loads(canonical_json(output.output))["data"]
             for call, output in (await agent.transcript(result.run_id)).tool_pairs
-            if call.name == "analysis_execute" and output is not None
+            if call.name == "python_execute" and output is not None
         ]
         assert cells[0]["status"] == "python_error"
         assert cells[0]["state_lost"] is False
@@ -494,7 +494,7 @@ async def test_parser_failures_keep_ownership_and_conserve_final_cpu(
                 (
                     _tool(
                         "blocked-replacement",
-                        "analysis_execute",
+                        "python_execute",
                         {
                             "code": "print('must not dispatch')",
                             "expected_state": {"generation": 1, "revision": 0},
@@ -669,7 +669,7 @@ async def test_multiple_parsers_and_replacement_preserve_cumulative_cpu(
         ),
         _tool(
             "timeout",
-            "analysis_execute",
+            "python_execute",
             {
                 "code": "lost = 19\nwhile True: pass",
                 "expected_state": {"generation": 1, "revision": 1},
@@ -678,7 +678,7 @@ async def test_multiple_parsers_and_replacement_preserve_cumulative_cpu(
         ),
         _tool(
             "replacement",
-            "analysis_execute",
+            "python_execute",
             {
                 "code": "assert 'lost' not in globals()\nprint(42)",
                 "expected_state": {"generation": 1, "revision": 0},
@@ -694,7 +694,7 @@ async def test_multiple_parsers_and_replacement_preserve_cumulative_cpu(
         cells = [
             block
             for call, block in transcript.tool_pairs
-            if call.name == "analysis_execute"
+            if call.name == "python_execute"
         ]
         assert len(cells) == 3
         assert cells[1] is not None and cells[2] is not None

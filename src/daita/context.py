@@ -2983,7 +2983,7 @@ def _tool_guidance(
         programmatic_reads_requested or (capture_requested and arrow_export_candidate)
     ):
         instructions.append(
-            "Python requested reads: load analysis_execute together with the needed "
+            "Python requested reads: load python_execute together with the needed "
             "read tools using toolbox_load. Perform the requested tools.call, "
             "tools.batch or admitted Arrow capture inside the computation cell, "
             "and compute from their returned results. Copied row literals do not "
@@ -3077,11 +3077,11 @@ def _tool_guidance(
             )
             if arrow_export_callable:
                 instructions.append(
-                    "Python Arrow: r = tools.capture('data_export_tabular', export_arguments, name='rows') accepts only format='arrow' on the already loaded contract. Check r['is_error'] and retain r['output']['artifact'], including a staging failure. After successful capture, read the installed dataset with pyarrow.ipc.open_file(inputs.path('rows')). The return value is structured evidence; inputs.path uses the exact name supplied to capture. No path is returned on r and directory scanning cannot resolve an authenticated input. Alternatively export, then bind the exact artifact ID in analysis_execute.inputs. A capture is an input, not a saved output; confirm every requested output reference separately. No automatic query/cell replay."
+                    "Python Arrow: r = tools.capture('data_export_tabular', export_arguments, name='rows') accepts only format='arrow' on the already loaded contract. Check r['is_error'] and retain r['output']['artifact'], including a staging failure. After successful capture, read the installed dataset with pyarrow.ipc.open_file(inputs.path('rows')). The return value is structured evidence; inputs.path uses the exact name supplied to capture. No path is returned on r and directory scanning cannot resolve an authenticated input. Alternatively export, then bind the exact artifact ID in python_execute.inputs. A capture is an input, not a saved output; confirm every requested output reference separately. No automatic query/cell replay."
                 )
             elif arrow_export_candidate:
                 instructions.append(
-                    "The exact Arrow export is discoverable but not loaded. Use toolbox_load with data_export_tabular and analysis_execute together before capture; known names need no search. Loading grants no source authority."
+                    "The exact Arrow export is discoverable but not loaded. Use toolbox_load with data_export_tabular and python_execute together before capture; known names need no search. Loading grants no source authority."
                 )
         csv_result = any(
             isinstance(data := block.output.get("data"), Mapping)

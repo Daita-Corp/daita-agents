@@ -1355,7 +1355,7 @@ class DaitaApp(App[int]):
                 "catalog_search": "Searching catalog",
                 "catalog_schema": "Reading catalog schema",
                 "data_query": "Querying data source",
-                "analysis_execute": "Running Python",
+                "python_execute": "Running Python",
                 "artifact_create_document": "Creating document",
                 "artifact_create_tabular": "Creating findings table",
                 "artifact_edit_text": "Preparing local file edit",

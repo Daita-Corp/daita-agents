@@ -1,8 +1,11 @@
 # Local Python workspace
 
-Local foreground sessions share one `analysis_execute` tool across the TUI,
-CLI and Python API. Exactly admitted scheduled routines use the same tool and
-native worker, restricted to their frozen read capability and source scope.
+Local foreground sessions share one `python_execute` tool across the TUI,
+CLI and Python API. It executes Python in an isolated, bounded workspace;
+variables and scratch files persist only within the current run. The internal
+capability identity remains `analysis.execute`. Exactly admitted scheduled
+routines use the same tool and native worker, restricted to their frozen read
+capability and source scope.
 They cannot read local computer files, import retained artifacts, or publish local
 files. Scheduled artifacts use the ordinary outcome contract and inbox delivery.
 It runs ordinary Python with DuckDB, NumPy, pandas, SciPy,
@@ -18,7 +21,7 @@ combine datasets, calculate statistics or create a chart. Ordinary Python and th
 installed libraries support both tabular and non-tabular work: for example,
 Monte Carlo sampling with NumPy, text normalization with Python's standard library,
 or checking required fields in captured JSON records. The model discovers and
-loads the existing Analysis toolbox and `analysis_execute` tool.
+loads the existing Analysis toolbox and `python_execute` tool.
 `Agent.analysis_runtime()` reports availability, package versions and the hash
 of the interpreter, worker protocol and trusted launch helpers without starting
 a worker. Interpreter state lasts for one run, not across messages or occurrences.
@@ -53,7 +56,7 @@ selects that name, not the filename. Invalid names or paths produce recoverable
 Python errors; the host still validates containment, file bytes and formats.
 Registration creates a temporary candidate, which disappears at run completion.
 To retain a dataset, chart and computation together, pass
-`save_outputs=["dataset", "chart", "recipe"]` in the outer `analysis_execute`
+`save_outputs=["dataset", "chart", "recipe"]` in the outer `python_execute`
 call. Select up to four distinct registered names; use either `save_outputs` or
 the single-name `save_output`, never both. All names and policy bounds are checked
 before publication. The ordinary artifact store publishes each file, and the
@@ -139,7 +142,7 @@ state loss cannot make a revoked candidate eligible to save.
 ## Relevant procedures
 
 The context builder supplies general Python operating guidance only while
-`analysis_execute` is callable. It adds fixed CSV, database, query-result or chart
+`python_execute` is callable. It adds fixed CSV, database, query-result or chart
 procedures when the current request names that work; successful typed file/query
 result metadata can also select the CSV or query/database procedures. Previous
 conversation tasks and arbitrary result text do not select these procedures.
@@ -313,7 +316,7 @@ real-worker, real-model and managed-install qualification command and reports.
 Use an exact Arrow export for dataset statistics, rather than treating bounded
 `data_query` rows as complete data. The two-call path exports with
 `data_export_tabular(format="arrow")`, then binds the returned exact artifact ID
-in `analysis_execute.inputs`. Within a cell, the loaded export can also be captured:
+in `python_execute.inputs`. Within a cell, the loaded export can also be captured:
 
 ```python
 captured = tools.capture("data_export_tabular", export_arguments, name="orders")
