@@ -24,7 +24,12 @@ from ...adapters.analytical_workspace.outputs import (
     capture,
 )
 from ...adapters.analytical_workspace.runtime import runtime_status
-from ...artifacts.models import ArtifactAuthorship, ArtifactDraft, ArtifactProvenance
+from ...artifacts.models import (
+    ArtifactAuthorship,
+    ArtifactDraft,
+    ArtifactError,
+    ArtifactProvenance,
+)
 from ...artifacts.store import AgentHomeArtifactStore
 from ...capabilities import (
     AccessMode,
@@ -50,6 +55,7 @@ from ...llm.models import ModelSensitivity, ToolCall
 from ...loop.analysis import (
     AnalysisEvidence,
     AnalysisTraceCapacityError,
+    ProgrammaticReadBroker,
     ProgrammaticReadResult,
 )
 from ...loop.models import RunInput, RunOrigin
@@ -79,9 +85,7 @@ class _RunAnalysis:
     generation: int = 0
     revision: int = 0
     records: list[dict[str, object]] = field(default_factory=list)
-    parents: dict[str, Callable[..., Awaitable[ProgrammaticReadResult]]] = field(
-        default_factory=dict
-    )
+    parents: dict[str, ProgrammaticReadBroker] = field(default_factory=dict)
     sensitivity: ModelSensitivity = ModelSensitivity.PUBLIC
     allocation: PermitLease | None = None
     candidates: dict[str, tuple[OutputCandidate, dict[str, object]]] = field(
@@ -94,6 +98,7 @@ class _RunAnalysis:
     input_facts: list[dict[str, object]] = field(default_factory=list)
     admitted_artifacts: set[str] = field(default_factory=set)
     input_bytes: int = 0
+    captures: list[dict[str, object]] = field(default_factory=list)
     closed_cpu_seconds: float = 0.0
     charged_generations: set[str] = field(default_factory=set)
     owned: dict[str, _OwnedGeneration] = field(default_factory=dict)
@@ -108,6 +113,7 @@ class _RunAnalysis:
     pending_cells: dict[str, dict[str, object]] = field(default_factory=dict)
     summary_admitted: bool = False
     max_run_calls: int = 64
+    child_tasks: set[asyncio.Task[ProgrammaticReadResult]] = field(default_factory=set)
 
 
 class AnalysisCapabilityDomain:
@@ -241,6 +247,11 @@ class AnalysisCapabilityDomain:
             "remaining_allowances": {"type": "object"},
             "cleanup": {"type": ["object", "null"]},
             "outputs": {"type": "array", "maxItems": 4, "items": {"type": "object"}},
+            "captured_inputs": {
+                "type": "array",
+                "maxItems": 16,
+                "items": {"type": "object"},
+            },
             "child_calls": {
                 "type": "array",
                 "maxItems": 16,
@@ -309,7 +320,7 @@ class AnalysisCapabilityDomain:
                             "transform",
                             "statistics",
                             "structured data validation",
-                            "scipy csv query result data",
+                            "scipy csv query result data batch arrow capture",
                         ),
                     ),
                 ),
@@ -322,7 +333,7 @@ class AnalysisCapabilityDomain:
         session: RunSession,
         run: RunInput,
         call: ToolCall,
-        broker: Callable[..., Awaitable[ProgrammaticReadResult]],
+        broker: ProgrammaticReadBroker,
         sensitivity: ModelSensitivity,
         authority: Callable[[ToolCall, ModelSensitivity], Awaitable[None]],
         max_run_calls: int,
@@ -344,6 +355,14 @@ class AnalysisCapabilityDomain:
 
     async def project(self, run: RunInput) -> tuple[str, ...]:
         return ("analysis_execute",) if self._admits_run(run) and available() else ()
+
+    def retain_child_tasks(
+        self, run_id: str, tasks: tuple[asyncio.Task[ProgrammaticReadResult], ...]
+    ) -> None:
+        state = self._runs[run_id]
+        state.child_tasks.update(tasks)
+        for task in tasks:
+            task.add_done_callback(state.child_tasks.discard)
 
     def _admits_run(self, run: RunInput) -> bool:
         if run.origin is RunOrigin.USER:
@@ -646,13 +665,9 @@ class AnalysisCapabilityDomain:
         )
         child_start = len(state.children)
 
-        async def broker(
-            name: str, arguments: Mapping[str, object]
+        def retain_read(
+            name: str, arguments: Mapping[str, object], read: ProgrammaticReadResult
         ) -> dict[str, object]:
-            await revalidate()
-            read = await state.parents[request.call_id](
-                name, arguments, state.sensitivity
-            )
             result = read.response
             facts = read.evidence.facts
             envelope = cast(Mapping[str, object], result["output"])
@@ -707,6 +722,132 @@ class AnalysisCapabilityDomain:
                 state.admitted_calls[str(result["evidence_id"])] = ToolCall(
                     id=str(result["evidence_id"]), name=name, arguments=arguments
                 )
+            return result
+
+        async def broker(
+            name: str, arguments: Mapping[str, object]
+        ) -> dict[str, object]:
+            await revalidate()
+            if name == "<analysis-capture>":
+                tool_name = arguments.get("tool_name")
+                export_arguments = arguments.get("arguments")
+                input_name = arguments.get("input_name")
+                valid = (
+                    set(arguments) == {"tool_name", "arguments", "input_name"}
+                    and isinstance(tool_name, str)
+                    and isinstance(export_arguments, Mapping)
+                    and isinstance(input_name, str)
+                    and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", input_name)
+                    is not None
+                    and input_name not in state.input_references
+                    and len(state.input_references) < 16
+                    and len(state.captures) < 16
+                    and state.input_bytes < self._limits.input_bytes
+                )
+                read = await state.parents[request.call_id].capture(
+                    (
+                        tool_name
+                        if isinstance(tool_name, str)
+                        else "<invalid-analysis-capture>"
+                    ),
+                    export_arguments if isinstance(export_arguments, Mapping) else {},
+                    state.sensitivity,
+                    None if valid else "analysis_capture_input_invalid",
+                )
+                result = retain_read(
+                    str(read.evidence.facts["tool_name"]),
+                    cast(Mapping[str, object], read.evidence.facts["arguments"]),
+                    read,
+                )
+                envelope = cast(Mapping[str, object], result["output"])
+                if result["is_error"]:
+                    if isinstance(envelope.get("artifact"), Mapping):
+                        state.captures.append(
+                            {
+                                "name": input_name,
+                                "evidence_id": result["evidence_id"],
+                                "artifact": dict(
+                                    cast(Mapping[str, object], envelope["artifact"])
+                                ),
+                                "installed": False,
+                            }
+                        )
+                    return result
+                ref = envelope.get("artifact")
+                if not isinstance(ref, Mapping) or not isinstance(
+                    ref.get("artifact_id"), str
+                ):
+                    raise RuntimeError(
+                        "Captured export did not return its authenticated artifact"
+                    )
+                captured = {
+                    "name": input_name,
+                    "evidence_id": result["evidence_id"],
+                    "artifact": dict(ref),
+                    "installed": False,
+                }
+                state.captures.append(captured)
+                await revalidate()
+                if not worker.suspended:
+                    raise RuntimeError("Capture requires observed worker suspension")
+                try:
+                    assert isinstance(input_name, str)
+                    manifest = await self._bind_inputs(
+                        state,
+                        current_run,
+                        current_call,
+                        {
+                            input_name: {
+                                "kind": "artifact",
+                                "artifact_id": ref["artifact_id"],
+                            }
+                        },
+                        compute,
+                        cell_deadline,
+                    )
+                except (ValueError, ArtifactError) as error:
+                    return {
+                        **result,
+                        "is_error": True,
+                        "output": {
+                            "error": {
+                                "code": "analysis_capture_input_failed",
+                                "message": type(error).__name__,
+                            },
+                            "artifact": dict(ref),
+                        },
+                        "input_name": input_name,
+                    }
+                await revalidate()
+                captured["installed"] = True
+                return {**result, "input_name": input_name, "input_manifest": manifest}
+            if name == "<analysis-batch>":
+                calls = arguments.get("calls")
+                if not isinstance(calls, (list, tuple)) or set(arguments) != {
+                    "calls",
+                    "response_budget",
+                }:
+                    calls = ({},)
+                reads = await state.parents[request.call_id].batch(
+                    calls,
+                    state.sensitivity,
+                    int(cast(int, arguments["response_budget"])),
+                )
+                results = [
+                    retain_read(
+                        str(read.evidence.facts["tool_name"]),
+                        cast(Mapping[str, object], read.evidence.facts["arguments"]),
+                        read,
+                    )
+                    for read in reads
+                ]
+                await revalidate()
+                return {"results": results}
+            read = await state.parents[request.call_id](
+                name, arguments, state.sensitivity
+            )
+            result = retain_read(name, arguments, read)
+            await revalidate()
             return result
 
         async def compute() -> PermitLease:
@@ -858,6 +999,7 @@ class AnalysisCapabilityDomain:
                     },
                 }
             )
+            result["captured_inputs"] = list(state.captures)
             result["child_calls"] = [
                 {
                     "evidence_id": child["evidence_id"],
@@ -958,6 +1100,7 @@ class AnalysisCapabilityDomain:
                                 "usage": dict(worker.usage),
                                 "cleanup": worker.cleanup,
                                 "inputs": list(state.input_facts),
+                                "result": {"captured_inputs": list(state.captures)},
                             },
                         )
                     )
@@ -984,6 +1127,7 @@ class AnalysisCapabilityDomain:
                     "usage": dict(worker.usage),
                     "cleanup": worker.cleanup,
                     "outputs": [],
+                    "captured_inputs": list(state.captures),
                 },
             )
         finally:
@@ -1042,7 +1186,10 @@ class AnalysisCapabilityDomain:
     async def _settle_generation(self, state: _RunAnalysis, key: str) -> None:
         owner = state.owned[key]
         worker = owner.worker
-        cleanup = await worker.close()
+        cleanup = dict(await worker.close())
+        if state.child_tasks:
+            cleanup["child_io_settled"] = False
+            state.session.writer.analysis_cleanup_failed = True
         measured = worker.usage.get("cpu_complete") is True
         if key not in state.charged_generations and measured:
             state.closed_cpu_seconds += float(worker.usage["user_cpu_seconds"]) + float(

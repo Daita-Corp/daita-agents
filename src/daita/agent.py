@@ -26,6 +26,7 @@ from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
 )
+from .adapters.postgresql_query import PostgreSQLReadDiagnostics
 from .adapters.postgresql_write import RelationalUpdateReadiness
 from .adapters.protocols import (
     ResourceAdapterError as SourceRefreshError,
@@ -62,6 +63,7 @@ from .hosting.embedded import (
     SourceEditPreview as SourceEditPreview,
     SourceEditResult,
 )
+from .hosting.execution_governor import CoordinatorDiagnostics
 from .hosting.home_upgrade import AgentHomeStatus
 from .jobs.graph.models import (
     GraphAdmission,
@@ -192,6 +194,7 @@ class Agent:
         """
 
         _validate_downloads_directory(downloads_directory)
+        _validate_config(config)
         return cls(
             await EmbeddedAgent.create(
                 name,
@@ -251,6 +254,7 @@ class Agent:
         """
 
         _validate_downloads_directory(downloads_directory)
+        _validate_config(config)
         return cls(
             await EmbeddedAgent.open(
                 name,
@@ -310,6 +314,7 @@ class Agent:
         Configuration is supplied for each open. Local files and persisted model
         configuration controls are unavailable; ``home`` raises AgentHomeError.
         """
+        _validate_config(config)
         return cls(
             await EmbeddedAgent.from_storage(
                 agent_id=agent_id,
@@ -639,6 +644,14 @@ class Agent:
     def analysis_runtime(self) -> dict[str, object]:
         """Inspect scientific runtime availability without launching a worker."""
         return self._embedded.analysis_runtime()
+
+    def postgresql_read_diagnostics(self) -> PostgreSQLReadDiagnostics:
+        """Read bounded payload-free metrics for the default PostgreSQL backend."""
+        return self._embedded.postgresql_read_diagnostics()
+
+    def admission_diagnostics(self) -> CoordinatorDiagnostics:
+        """Read bounded, payload-free host counters and the applied capacities."""
+        return self._embedded.admission_diagnostics()
 
     async def analysis_usage(
         self, run_id: str, *, caller_principal_id: str | None = None
@@ -1575,6 +1588,15 @@ def _validate_artifact_id(value: str) -> None:
 def _validate_downloads_directory(value: Path | None) -> None:
     if value is not None and not isinstance(value, Path):
         raise TypeError("downloads_directory must be pathlib.Path or None")
+
+
+def _validate_config(config: AgentConfig | None) -> None:
+    if config is not None:
+        if not isinstance(config, AgentConfig):
+            raise TypeError("config must be AgentConfig or None")
+        config.__post_init__()
+        config.host_capacity.__post_init__()
+        config.postgresql_reads.__post_init__()
 
 
 __all__ = [

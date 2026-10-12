@@ -187,10 +187,20 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
 
     assert "self._run_lock" not in embedded
     assert "def _run_locked" not in embedded
-    assert "execution_capacity=5" in embedded
-    assert "foreground_execution_reserve=1" in embedded
-    assert "provider_capacity=2" in embedded
-    assert "foreground_provider_reserve=1" in embedded
+    assert "execution_capacity=host_capacity.execution_capacity" in embedded
+    assert daita.HostCapacityLimits().execution_capacity == 5
+    assert (
+        "foreground_execution_reserve=host_capacity.foreground_execution_reserve"
+        in embedded
+    )
+    assert daita.HostCapacityLimits().foreground_execution_reserve == 1
+    assert "provider_capacity=host_capacity.provider_capacity" in embedded
+    assert daita.HostCapacityLimits().provider_capacity == 2
+    assert (
+        "foreground_provider_reserve=host_capacity.foreground_provider_reserve"
+        in embedded
+    )
+    assert daita.HostCapacityLimits().foreground_provider_reserve == 1
     assert "_files_only_runs" not in _python_text(PACKAGE)
     assert "_selected_learning_candidates" not in context
     assert "self._selected" not in learning
@@ -614,6 +624,8 @@ def test_public_surface_is_focused():
         "EffectEvidenceBasis",
         "Agent",
         "AgentConfig",
+        "HostCapacityLimits",
+        "PostgreSQLReadLimits",
         "AgentEvent",
         "AgentEventKind",
         "AgentObserver",

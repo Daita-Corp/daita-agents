@@ -143,7 +143,7 @@ class JobSupervisor:
         if graph_model_loop is not None and not isinstance(graph_model_loop, AgentLoop):
             raise TypeError("graph model loop must be AgentLoop or None")
         self._graph_model_loop = graph_model_loop
-        self._graph_model_gate = asyncio.Semaphore(2)
+        self._graph_model_gate = asyncio.Semaphore(graph_parallelism)
         self._graph_heartbeat_seconds = float(graph_heartbeat_seconds)
         self._poll_seconds = float(poll_seconds)
         self._driver: asyncio.Task[None] | None = None

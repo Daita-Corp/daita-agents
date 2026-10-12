@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import random
 import sqlite3
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -311,6 +313,16 @@ def benchmark_marks(
             ),
         ),
     ]
+
+
+def p95_bootstrap_interval(samples: list[float]) -> list[float]:
+    """Use the same fixed-seed nearest-rank bootstrap across component campaigns."""
+    rng = random.Random(7281)
+    rank = math.ceil(0.95 * len(samples)) - 1
+    estimates = sorted(
+        sorted(rng.choices(samples, k=len(samples)))[rank] for _ in range(1000)
+    )
+    return [estimates[24], estimates[974]]
 
 
 def configured_model_ids() -> tuple[str, ...]:
@@ -823,6 +835,7 @@ __all__ = [
     "live_provider",
     "logical_names",
     "open_live_home",
+    "p95_bootstrap_interval",
     "record_metrics",
     "results_for",
     "seed_completed_profile_agent",

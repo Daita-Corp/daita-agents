@@ -26,6 +26,44 @@ unit/integration directory hierarchy.
   from default discovery.
 - `tests/diagnostics` and `tests/packaging` contain explicit module entry points.
 
+## Offline throughput components
+
+The bounded public-composition campaign uses controlled model responses, three
+local SQLite fixtures and the real native Python worker when its pinned runtime
+is available. It checks values, artifact hashes, conversation order, graph
+completion and native cleanup independently of the scripted answer. Scripted
+models establish execution behavior; they provide no model-quality evidence.
+
+```bash
+DAITA_RUN_THROUGHPUT_COMPONENT=1 \
+DAITA_THROUGHPUT_CAMPAIGN=baseline \
+DAITA_THROUGHPUT_REPORT_DIR=/private/tmp/daita-throughput-evidence \
+  .venv/bin/python -m pytest tests/slow/hosting \
+  -o addopts="--tb=short -q --strict-markers" -s
+```
+
+Choose `final` for the integrated campaign. `DAITA_THROUGHPUT_SAMPLES` accepts
+30–100 repetitions (default 30). Compare the same fixture digest, configuration,
+host and workload; reports retain raw latency samples, p50/p95, a fixed-seed
+bootstrap interval, task throughput, model requests and process peak RSS. Missing
+model token/cost usage remains unknown. Reports must be outside the repository.
+Unperformed real-database and model checks remain explicitly labeled and require
+their existing live gates. An unavailable native runtime is unperformed evidence.
+Use at most one `additional` campaign when uncertainty overlaps; keep conservative
+defaults if that sampling remains inconclusive. Keep campaign reports private;
+published performance claims should state the tested configuration, correctness,
+usage, cleanup and uncertainty.
+
+`Agent.admission_diagnostics()` returns immutable, runtime-only counters aggregated
+by permit kind and workload class, plus applied host capacities. It retains no
+per-request samples or permit identities. Queue, lease holding and release cleanup
+times are separate cumulative measurements; lease holding time includes the work
+performed while the lease is held. Set `AgentConfig.admission_observations=True`
+to include `admission.updated` in the existing best-effort observer with payload-free
+host identifiers. The default observer stream remains unchanged. Observer failure cannot
+change admission or execution. Diagnostics survive close in memory and disappear
+with the composition; no telemetry or agent-home format change is introduced.
+
 ## Local Python live acceptance
 
 `tests/analysis` covers the production native execution slice. The required
@@ -204,6 +242,10 @@ one to six; default `openai:gpt-5.6-terra`). Export
 provider factory and does not load `.env` automatically. Set
 `DAITA_FIXTURE_POSTGRES_PASSWORD` and, when needed,
 `DAITA_FIXTURE_POSTGRES_PORT` (default `55432`) for the PostgreSQL case.
+That case compares cold connections with an opt-in one-connection pool over two
+fresh model runs per variant. Both answers use the same independent Decimal
+oracle; the pooled variant must reuse one connection, complete each checkout,
+and retain structural/query/cleanup diagnostics in its private report.
 
 `DAITA_DATAOPS_REPEATS` accepts one to five independent repetitions (default one).
 The default estimated-cost ceiling is $0.50 per run, configured through the
@@ -545,3 +587,21 @@ imports resolve from the repository root:
 The two packaging lifecycle modules require a candidate wheel for actual use.
 A local `--help` check validates relocation only; CI's clean lifecycle jobs
 remain the installed-wheel evidence.
+
+PostgreSQL pool boundaries are covered offline by
+`tests/data/postgresql/test_pool.py`, existing query/export tests and host lifecycle
+cases. The injected native-pool fixture proves reuse, fresh transactions, source
+and host bounds, admission retirement, cancellation, reset failure and safe close.
+It does not establish real PostgreSQL transport performance. Use
+`Agent.postgresql_read_diagnostics()` for aggregate checkout, structure, query and
+cleanup metrics; connection counts distinguish creation from per-read transactions.
+
+Paired real-model handoff cases are in
+`tests/live/analysis/test_public_journeys.py` (exact export/bind versus capture) and
+`tests/live/data_operations/test_workflows.py` (synchronous versus batched Python
+reads). They retain the existing explicit `DAITA_RUN_LIVE_ANALYSIS=1` and
+`DAITA_RUN_LIVE_DATA_OPERATIONS=1` authorization, credentials, per-run/aggregate
+cost bounds and private reports. Numerical correctness is scored against fixture
+oracles independently of latency, request count and usage. These cases remain
+unperformed until those gates are supplied; scripted component models do not
+qualify reasoning quality.

@@ -23,6 +23,16 @@ loads the existing Analysis toolbox and `analysis_execute` tool.
 of the interpreter, worker protocol and trusted launch helpers without starting
 a worker. Interpreter state lasts for one run, not across messages or occurrences.
 
+## Host resources
+
+`AnalysisLimits.worker_count` remains the sole interpreter residency setting
+(default one, at most two). Host capacity settings do not add computation lanes:
+there is one computation permit and one separately reserved parser permit. Each
+resident worker retains its finite memory and scratch reservation while suspended;
+parsers have an independent reservation and cannot be crowded out by residency.
+Changing any capacity requires the host to drain and reopen. Computation remains
+run-local, and raising host capacity does not admit Python into graph jobs.
+
 ## Cells and read tools
 
 The first call supplies `expected_state={"generation":0,"revision":0}`. Each
@@ -65,6 +75,34 @@ rows = json.loads(data["content"])
 ```
 
 `tools.call` returns `output`, `is_error`, `evidence_id` and `sensitivity`.
+`tools.batch` submits independent reads in one authenticated request and returns
+the same result shape for each element, in submission order:
+
+```python
+results = tools.batch([
+    {"name": "file_read", "arguments": {"path": "sales.json"}},
+    {"name": "file_read", "arguments": {"path": "rates.json"}},
+])
+for result in results:
+    if result["is_error"]:
+        raise ValueError(result["output"])
+```
+
+The worker channel permits one outstanding request, including Python threads.
+The host allocates child identities and ordinals and reserves completion evidence
+before dispatch, applies the existing run and source read gates, and revalidates
+each tool's frozen read authority. A child's ordinary failure leaves other reads
+running. Malformed envelopes and batches exceeding remaining call, cell or trace
+allowances dispatch no reads; requested attempts remain charged. RPC and aggregate
+response bounds also apply; excessive results return bounded errors. Trace
+exhaustion can terminate the cell before a response and retains bounded evidence
+and attempted usage. The interpreter is suspended and releases its computation
+permit while reads run. Classification and authority are checked before resuming.
+Cancellation or a deadline cancels and settles dispatched and queued children
+within the existing cleanup allowance. Unresolved closure blocks replacement
+workers and terminal success. Neither the reads nor the cell are automatically
+replayed. Synchronous `tools.call` retains its existing behavior.
+
 Check `is_error` before using `output["data"]`, then use that tool's declared
 result shape: file content, query columns/rows and other structured results have
 different shapes. A failed child call is a structured result, not necessarily a
@@ -107,6 +145,13 @@ result metadata can also select the CSV or query/database procedures. Previous
 conversation tasks and arbitrary result text do not select these procedures.
 Selection is a presentation hint, not discovery, schema evidence or authority.
 Non-tabular computation has no mandatory CSV, database or chart checklist.
+
+An explicit `tools.call`, `tools.batch` or admitted capture request also supplies
+loading guidance before Python becomes callable. Load Python and the required
+read contracts together, execute the requested reads inside the computation cell
+and calculate from their returned results. Copying earlier rows into Python does
+not create authenticated child-read evidence. Existing authenticated inputs can
+be reused when the task does not require a fresh programmatic read.
 
 For CSV work, parse the actual headers and validate required fields before
 computing, preferably in the computation cell. A captured read is sufficient
@@ -264,3 +309,50 @@ unavailable.
 
 See [testing instructions](TESTING.md#local-python-live-acceptance) for the
 real-worker, real-model and managed-install qualification command and reports.
+
+Use an exact Arrow export for dataset statistics, rather than treating bounded
+`data_query` rows as complete data. The two-call path exports with
+`data_export_tabular(format="arrow")`, then binds the returned exact artifact ID
+in `analysis_execute.inputs`. Within a cell, the loaded export can also be captured:
+
+```python
+captured = tools.capture("data_export_tabular", export_arguments, name="orders")
+if captured["is_error"]:
+    raise ValueError(captured["output"])
+import pyarrow.ipc as ipc
+with ipc.open_file(inputs.path("orders")) as reader:
+    orders = reader.read_all()
+```
+
+Capture accepts only the authenticated, loaded relational Arrow export. It uses
+one ordinary child call, suspends the interpreter, releases computation capacity,
+publishes through the artifact store, and validates the input through the reserved
+native parser before resume. Names are bounded and cannot replace an existing
+input. `inputs.path` returns a private relative filename. File and MCP capture,
+CSV/XLSX capture and general artifact creation through Python are unavailable.
+
+A successful export followed by failed staging remains a successful export in
+child evidence. The helper returns its committed artifact reference with the
+staging error. The cell's `captured_inputs` or terminal child evidence retains
+committed references when cancellation or authority loss prevents resume. Captures
+are source inputs,
+not automatically promoted to terminal output artifacts. Inspect their references
+or the ordinary artifact inventory; no query is automatically replayed. Revocation
+and artifact deletion are checked before resume and on later cells. Scheduled
+capture requires exact frozen export and analysis contracts and current source
+scope. It does not allow arbitrary retained artifact inputs in scheduled runs.
+
+Current tool procedures favor direct loading of known names, independent read
+batches, validation and calculation in the same cell, and reuse of sufficient
+current inputs. Dataset guidance is selected by the current task and typed result
+coverage. Arrow capture instructions require the authenticated Arrow export
+contract in the current callable set; explicit capture and every-row requests
+select them even without a dataset keyword. The capture return value is structured
+evidence; resolve installed bytes with `inputs.path` and the exact capture name.
+Untrusted hints cannot enable these instructions. Every
+requested output still needs its own committed reference. The current transcript
+and child evidence remain exact. Local-file child authority is rechecked through
+the data owner's exact file contract, independently of unrelated relational catalog
+and write-permission discovery. Relational child reads still revalidate their
+current frozen source/resource scope. No authority or source freshness result is
+cached between checks. These procedures grant no additional authority.

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import cast
 
 import pytest
 
+from daita._json import FrozenJsonObject
 from daita.capabilities import (
     CapabilityDeclarations,
     CapabilityInputError,
@@ -31,6 +33,7 @@ from daita.domains.data import (
     SQLiteReadResult,
     data_export_tabular_capability_declarations,
     data_query_capability_declarations,
+    local_file_capability_declarations,
     project_result_rows,
     relational_update_capability_declarations,
     relational_update_preview_capability_declarations,
@@ -39,6 +42,7 @@ from daita.domains.data import (
 )
 from daita.domains.data.routine_precheck import ResourceRevisionCatalog
 from daita.domains.learning import LearningCandidateGuard
+from daita.llm.models import ModelSensitivity, ToolCall
 from daita.loop.models import RunInput
 
 
@@ -98,6 +102,8 @@ def test_data_export_is_one_backend_neutral_model_tool() -> None:
 
 class _Catalog:
     def __init__(self) -> None:
+        self.write_applicability_calls: list[str] = []
+        self.routing_enabled = True
         self.schemas = {
             "source-sqlite": ResourceSchema(
                 resource_id="resource-sqlite",
@@ -141,6 +147,8 @@ class _Catalog:
         self, agent_id: str, source_ids: tuple[str, ...] = ()
     ) -> tuple[Mapping[str, object], ...]:
         del agent_id
+        if not self.routing_enabled:
+            return ()
         facts = (
             {"source_id": "source-sqlite", "adapter_id": "sqlite"},
             {"source_id": "source-postgresql", "adapter_id": "postgresql"},
@@ -157,6 +165,7 @@ class _Catalog:
         operation: str = "update",
     ) -> frozenset[str]:
         del agent_id, source_ids
+        self.write_applicability_calls.append(operation)
         return frozenset()
 
     async def resource_identity(
@@ -210,8 +219,7 @@ def _run() -> RunInput:
     )
 
 
-async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> None:
-    catalog = _Catalog()
+def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDomain:
     catalog_bundle = catalog_declarations(
         "agent-relational", cast(CatalogProjection, catalog)
     )
@@ -225,6 +233,7 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> No
         catalog=cast(ResourceRevisionCatalog, catalog),
         clock=lambda: datetime(2026, 9, 3, tzinfo=UTC),
     )
+    file_bundle = local_file_capability_declarations()
     capabilities = (
         *catalog_bundle.capabilities,
         *query_bundle.capabilities,
@@ -233,8 +242,9 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> No
         *update_bundle.capabilities,
         *upsert_bundle.capabilities,
         *revision_bundle.capabilities,
+        *(file_bundle.capabilities if local_files else ()),
     )
-    domain = DataCapabilityDomain(
+    return DataCapabilityDomain(
         CapabilityDeclarations(
             domain_owner_id="data",
             capabilities=capabilities,
@@ -246,16 +256,129 @@ async def test_mixed_relational_catalog_projects_each_semantic_tool_once() -> No
                 *preview_bundle.tool_views,
                 *update_bundle.tool_views,
                 *upsert_bundle.tool_views,
+                *(file_bundle.tool_views if local_files else ()),
             ),
         ),
         cast(DataDomainCatalog, catalog),
         LearningCandidateGuard(),
+        local_file_sensitivity=ModelSensitivity.RESTRICTED if local_files else None,
     )
 
-    projected = await domain.project(_run())
 
-    assert projected.count(DATA_QUERY_TOOL_NAME) == 1
-    assert projected.count(DATA_EXPORT_TABULAR_TOOL_NAME) == 1
+@pytest.mark.parametrize(
+    "tool_name", (None, DATA_QUERY_TOOL_NAME, DATA_EXPORT_TABULAR_TOOL_NAME)
+)
+async def test_mixed_relational_catalog_projects_each_semantic_tool_once(
+    tool_name,
+) -> None:
+    catalog = _Catalog()
+    domain = _domain(catalog)
+    run = _run()
+    projected = (
+        await domain.project(run)
+        if tool_name is None
+        else await domain.project_call(run, ToolCall(id="read", name=tool_name), None)
+    )
+    assert projected.count(DATA_QUERY_TOOL_NAME) == (
+        tool_name in {None, DATA_QUERY_TOOL_NAME}
+    )
+    assert projected.count(DATA_EXPORT_TABULAR_TOOL_NAME) == (
+        tool_name in {None, DATA_EXPORT_TABULAR_TOOL_NAME}
+    )
+    assert catalog.write_applicability_calls == (
+        ["update", "upsert"] if tool_name is None else []
+    )
+
+
+class _UnavailableCatalog(_Catalog):
+    async def source_routing_facts(self, *args, **kwargs):
+        raise AssertionError("Local files must not depend on relational catalog I/O")
+
+
+@pytest.mark.parametrize(
+    "tool_name", ("file_search", "file_read", "file_query", "unknown")
+)
+@pytest.mark.parametrize("local_files", (True, False))
+async def test_exact_local_file_projection_is_independent_of_relational_catalog(
+    tool_name,
+    local_files,
+):
+    domain = _domain(_UnavailableCatalog(), local_files=local_files)
+    projected = await domain.project_call(
+        _run(), ToolCall(id="local", name=tool_name), None
+    )
+    assert projected == (
+        () if tool_name == "unknown" or not local_files else (tool_name,)
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "arguments", "error"),
+    (
+        ("file_read", {"path": "x.txt"}, None),
+        ("file_search", {"query": "x"}, None),
+        ("file_query", {"path": "x.csv", "sql": "SELECT * FROM data"}, None),
+        (
+            "file_read",
+            {"path": "x", "source_id": "source-sqlite"},
+            "source_scope_violation",
+        ),
+        ("file_read", {"path": "x", "cursor": "cursor"}, "path_invalid"),
+        (
+            "file_query",
+            {"path": "x.csv", "sql": "DELETE FROM data"},
+            "file_query_invalid",
+        ),
+    ),
+)
+async def test_local_file_binding_keeps_validation_without_relational_catalog(
+    tool_name, arguments, error
+):
+    domain = _domain(_UnavailableCatalog(), local_files=True)
+    capability = next(
+        c
+        for c in domain.declarations.capabilities
+        if c.id
+        == next(
+            v.capability_id
+            for v in domain.declarations.tool_views
+            if v.name == tool_name
+        )
+    )
+    call = ToolCall(id="local", name=tool_name, arguments=arguments)
+    if error is None:
+        bound = await domain.prepare_call(
+            _run(),
+            call,
+            capability,
+            FrozenJsonObject.from_mapping(arguments),
+            request_sensitivity=ModelSensitivity.RESTRICTED,
+        )
+        if tool_name == "file_query":
+            assert bound["sql"] == "SELECT * FROM data"
+            assert isinstance(bound["sql_fingerprint"], str)
+        else:
+            assert bound.to_dict() == arguments
+    else:
+        with pytest.raises(CapabilityInputError) as raised:
+            await domain.prepare_call(
+                _run(),
+                call,
+                capability,
+                FrozenJsonObject.from_mapping(arguments),
+                request_sensitivity=ModelSensitivity.RESTRICTED,
+            )
+        assert raised.value.code == error
+
+
+async def test_exact_relational_projection_rechecks_current_source_admission():
+    catalog = _Catalog()
+    domain = _domain(catalog)
+    run = replace(_run(), source_scope_ids=("source-sqlite",))
+    call = ToolCall(id="read", name=DATA_QUERY_TOOL_NAME)
+    assert await domain.project_call(run, call, None) == (DATA_QUERY_TOOL_NAME,)
+    catalog.routing_enabled = False
+    assert await domain.project_call(run, call, None) == ()
 
 
 async def test_data_domain_derives_private_adapter_and_fails_closed() -> None:

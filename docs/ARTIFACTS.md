@@ -101,3 +101,25 @@ preserves historical transcripts, job results, and delivery outcomes, including
 embedded text previews. Exported files, application delivery copies, and backups
 also remain. Application hosts must delete their own copies and coordinate
 deletion with any publication of previously fetched bytes.
+
+Exact Arrow IPC exports are available as `data_export_tabular(format="arrow")`
+when the supported local scientific runtime is admitted. CSV/XLSX installations
+retain their existing declarations. Arrow reports projected column names and
+scalar types, row count, byte size, query/parameter digests, current resource
+revisions and `coverage="complete_query_result"`. Completeness applies to the
+selected SQL result, including its predicates and explicit limits.
+
+The uncompressed scalar encoding preserves ordered duplicates, nulls, signed
+64-bit integers, finite floats, UTF-8 text, binary bytes, dates, naive times and
+microsecond timestamps with one consistent timezone per column. Decimals retain
+one exact scale per column, up to 76 digits. PostgreSQL projected result types
+provide the schema; an empty/all-null numeric column without scale metadata,
+mixed SQLite scalar types, mixed decimal scales/timezones and unsupported types
+fail explicitly. No conversion to float or text supplies missing type information.
+Bounds intersect export/artifact limits with admitted Python file, input, row and
+column limits. Exhaustion publishes no partial exact dataset.
+
+Arrow uses the ordinary artifact lifecycle and exact-source provenance. These
+runtime-only renderer facts and generic result/evidence metadata need no home
+migration. Enabling Arrow changes the export contract digest: frozen machine
+contracts must explicitly authorize the current contract through normal admission.

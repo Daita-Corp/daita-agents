@@ -346,3 +346,132 @@ async def test_real_model_tui_python_and_broker(tmp_path, paid_case, analysis_re
     finally:
         await agent.close()
         await provider.close()
+
+
+@pytest.mark.parametrize("handoff", ("export_bind", "capture"))
+async def test_paired_exact_dataset_handoffs_have_independent_numeric_oracles(
+    tmp_path, paid_case, analysis_report, handoff
+):
+    import sqlite3
+    from collections.abc import Mapping
+    from hashlib import sha256
+    from time import perf_counter
+
+    from tests.support.job_benchmarks import RecordingProvider
+
+    profile, delegate, cost = paid_case
+    provider = RecordingProvider(delegate)
+    rows = [(i, 2**53 + 2 * i, None if i % 7 == 0 else "x" * 120) for i in range(301)]
+    expected = {
+        "count": len(rows),
+        "sum_int": sum(row[1] for row in rows),
+        "null_count": sum(row[2] is None for row in rows),
+    }
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    database = tmp_path / "numbers.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE numbers (sequence INTEGER, n INTEGER, label TEXT)"
+        )
+        connection.executemany("INSERT INTO numbers VALUES (?, ?, ?)", rows)
+    agent = await Agent.create(
+        f"live-dataset-{handoff}",
+        root=tmp_path / "homes",
+        model=provider,
+        model_profile=profile,
+        workspace=LocalWorkspace(workspace),
+        config=AgentConfig(
+            limits=LoopLimits(
+                max_steps=24,
+                max_total_tokens=100000,
+                max_wall_time_seconds=300,
+                max_estimated_cost_usd=cost,
+            )
+        ),
+    )
+    try:
+        source = await agent.attach_sqlite(database)
+        method = (
+            "First export a complete Arrow query, then bind its exact artifact ID in analysis_execute.inputs."
+            if handoff == "export_bind"
+            else "Use tools.capture('data_export_tabular', ..., name='numbers') within Python after loading the exact export and analysis tools together."
+        )
+        started = perf_counter()
+        result = await agent.run(
+            "Use Python to calculate count, sum_int of n, and null_count of label over every row of the connected numbers table. "
+            "Preserve exact integer values; a preview is insufficient. "
+            + method
+            + " Validate fields and calculate in the same cell. Save one JSON artifact with exactly those three keys, and report its reference. Do not write to the source or export to a local directory.",
+            source_scope_ids=(source.id,),
+        )
+        elapsed = perf_counter() - started
+        transcript = await agent.transcript(result.run_id)
+        records = await agent.analysis_evidence(result.run_id)
+        analysis_report.update(
+            {
+                "handoff": handoff,
+                "fixture_sha256": sha256(canonical_json(rows).encode()).hexdigest(),
+                "terminal_kind": result.kind.value,
+                "terminal_reason": result.reason,
+                "latency_seconds": elapsed,
+                "model_requests": len(provider.requests),
+                "model_usage": {
+                    "input_tokens": result.usage.input_tokens,
+                    "output_tokens": result.usage.output_tokens,
+                    "cost_usd": (
+                        None
+                        if result.usage.cost_estimate.amount_usd is None
+                        else str(result.usage.cost_estimate.amount_usd)
+                    ),
+                },
+                "calls": [
+                    {
+                        "name": call.name,
+                        "output": None if output is None else output.output,
+                    }
+                    for call, output in transcript.tool_pairs
+                ],
+                "measurements": [{"kind": r.kind, "facts": r.facts} for r in records],
+                "cleanup": [
+                    r.facts.get("cleanup") for r in records if r.kind == "generation"
+                ],
+            }
+        )
+        assert result.kind.value == "completed", analysis_report
+        datasets = [
+            ref for ref in result.artifacts if ref.media_type == "application/json"
+        ]
+        assert len(datasets) == 1, analysis_report
+        actual = json.loads(
+            (await agent.read_artifact(datasets[0].artifact_id)).content
+        )
+        analysis_report["correctness"] = {
+            "expected": expected,
+            "actual": actual,
+            "correct": actual == expected,
+        }
+        assert actual == expected
+        exports = [
+            output
+            for call, output in transcript.tool_pairs
+            if call.name == "data_export_tabular"
+            and output is not None
+            and not output.is_error
+        ]
+        captured = [
+            r
+            for r in records
+            if r.kind == "child"
+            and r.facts["tool_name"] == "data_export_tabular"
+            and r.facts["status"] == "succeeded"
+        ]
+        assert exports if handoff == "export_bind" else captured
+        for record in records:
+            if record.kind == "generation":
+                cleanup = record.facts["cleanup"]
+                assert isinstance(cleanup, Mapping)
+                assert cleanup["process_reaped"] and cleanup["scratch_deleted"]
+    finally:
+        await agent.close()
+        await provider.close()

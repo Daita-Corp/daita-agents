@@ -169,11 +169,17 @@ delegates to `EmbeddedAgent`; it does not implement model progression, catalog
 truth, capability execution, or persistence.
 
 `daita.hosting.embedded.EmbeddedAgent` is the composition root. It admits the
-agent home, holds the process-level writer lock, composes the capacity-one
-`RunAdmissionCoordinator` and retains the broad mutation lock, constructs the
+agent home, holds the process-level writer lock, composes the
+`RunAdmissionCoordinator` with immutable `AgentConfig.host_capacity` and retains
+the broad mutation lock, constructs the
 catalog, registry, domains, context builder, runtime, loop, artifact store, and
 supervisors, and closes them in drain-safe order. Composition belongs here rather
-than in the loop or a dependency-injection framework.
+than in the loop or a dependency-injection framework. The default
+PostgreSQL read backend owns optional lazy bounded native pools and closes them
+after drain, before credentials and state. Every read/export retains a fresh
+read-only transaction and full structural revalidation; reuse grants no authority.
+Pool configuration and resolved credentials are runtime-only; retired or uncertain
+connections are never reused or replayed.
 
 One open agent home has one writer. A foreground TUI or CLI process and the
 resident host must hand off that lock; they cannot open the same home
@@ -193,11 +199,14 @@ concurrently.
 Each host-owned loop invocation consumes one immutable, single-use `RunSession`.
 The session owns its cancellation/deadline state, immutable run options and exactly
 one `RunSessionWriter`; the writer alone starts, appends to and terminates that run's
-transcript with exact ordering and conversation-predecessor binding. The capacity-one
-coordinator preserves revision-1 serial behavior while owning execution admission,
-keyed conversation ordering, provider admission and shutdown drain. Conservative
-source/resource, MCP, SQLite-pressure and effect permit interfaces do not yet enable
-cross-run I/O concurrency or replace the mutation lock.
+transcript with exact ordering and conversation-predecessor binding. The coordinator
+owns bounded execution admission, keyed conversation ordering, provider admission
+and shutdown drain. Compatibility defaults are five executions, two provider
+requests, strict foreground reserves of one, one graph task, two PostgreSQL reads
+per source and four SQLite-pressure permits. Host capacity is runtime configuration,
+not execution authority. SQLite sources and MCP bindings remain capacity one;
+analysis retains one computation lane and an independent parser lane. Keyed
+permits do not replace the mutation lock.
 
 The loop depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
 transcript-store protocols through those session boundaries. Provider payloads,

@@ -30,6 +30,8 @@ from ...artifacts.models import (
     canonical_artifact_filename,
 )
 from ...artifacts.renderers import (
+    ARROW_ALLOWED_EXTENSIONS,
+    ARROW_MEDIA_TYPE,
     CSV_ALLOWED_EXTENSIONS,
     DOCUMENT_ALLOWED_EXTENSIONS,
     HTML_ALLOWED_EXTENSIONS,
@@ -184,9 +186,10 @@ class ExactTabularExportResult:
     row_count: int
     content: bytes
     sensitivity: Sensitivity
+    column_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if self.format not in {"csv", "xlsx"}:
+        if self.format not in {"csv", "xlsx", "arrow"}:
             raise ValueError("exact tabular format is invalid")
         if self.adapter_id not in {"sqlite", "postgresql"}:
             raise ValueError("exact tabular adapter_id is invalid")
@@ -236,6 +239,17 @@ class ExactTabularExportResult:
             raise ValueError("exact tabular sensitivity must be resolved")
         object.__setattr__(self, "resource_revisions", revisions)
         object.__setattr__(self, "columns", columns)
+        types = tuple(self.column_types)
+        if self.format == "arrow" and (
+            len(types) != len(columns)
+            or any(
+                not isinstance(item, str) or not 1 <= len(item) <= 256 for item in types
+            )
+        ):
+            raise ValueError("exact Arrow column types are invalid")
+        if self.format != "arrow" and types:
+            raise ValueError("column types require Arrow")
+        object.__setattr__(self, "column_types", types)
 
 
 ExactTabularProgress = Callable[[int, int, int], None]
@@ -432,6 +446,7 @@ class DataExportTabularExecutor:
         *,
         clock: Callable[[], datetime],
         max_seconds: float = MAX_CSV_SECONDS,
+        arrow_bounds: tuple[int, int, int] | None = None,
     ) -> None:
         self._agent_id = agent_id
         self._backends = {
@@ -440,6 +455,7 @@ class DataExportTabularExecutor:
         }
         self._clock = clock
         self._max_seconds = max_seconds
+        self._arrow_bounds = arrow_bounds
 
     async def execute(self, request: ToolExecution) -> ToolOutput:
         source_id = request.arguments["source_id"]
@@ -454,8 +470,11 @@ class DataExportTabularExecutor:
         assert isinstance(parameters, tuple)
         assert isinstance(resource_ids, tuple)
         assert isinstance(adapter_id, str)
-        assert isinstance(format_name, str) and format_name in {"csv", "xlsx"}
+        assert isinstance(format_name, str) and format_name in {"csv", "xlsx", "arrow"}
         assert filename is None or isinstance(filename, str)
+        if format_name == "arrow" and self._arrow_bounds is None:
+            raise ValueError("Arrow is not admitted by this runtime")
+        bounds = self._arrow_bounds if format_name == "arrow" else None
         completed = {"rows": 0, "columns": 0, "bytes": 0}
         backend = self._backends.get(adapter_id)
         if backend is None:
@@ -477,9 +496,19 @@ class DataExportTabularExecutor:
                     format_name=format_name,
                     parameters_sha256=parameters_sha256,
                     created_at=self._clock(),
-                    max_rows=MAX_CSV_ROWS,
-                    max_columns=MAX_CSV_COLUMNS,
-                    max_bytes=MAX_CSV_BYTES,
+                    max_rows=(
+                        MAX_CSV_ROWS if bounds is None else min(MAX_CSV_ROWS, bounds[0])
+                    ),
+                    max_columns=(
+                        MAX_CSV_COLUMNS
+                        if bounds is None
+                        else min(MAX_CSV_COLUMNS, bounds[1])
+                    ),
+                    max_bytes=(
+                        MAX_CSV_BYTES
+                        if bounds is None
+                        else min(MAX_CSV_BYTES, bounds[2])
+                    ),
                     timeout_seconds=self._max_seconds,
                     progress=progress,
                 )
@@ -502,10 +531,16 @@ class DataExportTabularExecutor:
             != frozenset(resource_ids)
         ):
             raise ValueError("exact tabular backend returned different execution facts")
-        media_type = "text/csv" if format_name == "csv" else XLSX_MEDIA_TYPE
-        extensions = (
-            CSV_ALLOWED_EXTENSIONS if format_name == "csv" else XLSX_ALLOWED_EXTENSIONS
-        )
+        media_type = {
+            "csv": "text/csv",
+            "xlsx": XLSX_MEDIA_TYPE,
+            "arrow": ARROW_MEDIA_TYPE,
+        }[format_name]
+        extensions = {
+            "csv": CSV_ALLOWED_EXTENSIONS,
+            "xlsx": XLSX_ALLOWED_EXTENSIONS,
+            "arrow": ARROW_ALLOWED_EXTENSIONS,
+        }[format_name]
         safe_filename = canonical_artifact_filename(
             filename or f"export.{format_name}",
             media_type,
@@ -548,6 +583,19 @@ class DataExportTabularExecutor:
                 ),
                 "row_count": result.row_count,
                 "column_count": len(result.columns),
+                **(
+                    {
+                        "columns": result.columns,
+                        "column_types": result.column_types,
+                        "byte_size": len(result.content),
+                        "complete": True,
+                        "coverage": "complete_query_result",
+                        "sql_fingerprint": result.sql_fingerprint,
+                        "parameters_sha256": parameters_sha256,
+                    }
+                    if format_name == "arrow"
+                    else {}
+                ),
             },
             artifact=draft,
         )
@@ -929,8 +977,12 @@ def data_export_tabular_declarations(
     sqlite_backend: ExactTabularExportBackend,
     postgresql_backend: ExactTabularExportBackend,
     clock: Callable[[], datetime],
+    *,
+    arrow_bounds: tuple[int, int, int] | None = None,
 ) -> DataExportTabularDeclarations:
-    declarations = data_export_tabular_capability_declarations()
+    declarations = data_export_tabular_capability_declarations(
+        allow_arrow=arrow_bounds is not None
+    )
     return DataExportTabularDeclarations(
         capabilities=declarations.capabilities,
         executors=(
@@ -939,6 +991,7 @@ def data_export_tabular_declarations(
                 sqlite_backend,
                 postgresql_backend,
                 clock=clock,
+                arrow_bounds=arrow_bounds,
             ),
         ),
         tool_views=declarations.tool_views,
@@ -979,8 +1032,10 @@ def artifact_declarations(
     )
 
 
-def data_export_tabular_capability_declarations() -> CapabilityDeclarations:
-    capability = _tabular_export_capability()
+def data_export_tabular_capability_declarations(
+    *, allow_arrow: bool = False
+) -> CapabilityDeclarations:
+    capability = _tabular_export_capability(allow_arrow=allow_arrow)
     view = ToolView(
         name=DATA_EXPORT_TABULAR_TOOL_NAME,
         capability_id=capability.id,
@@ -989,11 +1044,30 @@ def data_export_tabular_capability_declarations() -> CapabilityDeclarations:
             toolbox_id=ToolboxId.ARTIFACTS,
             load_mode=ToolLoadMode.ON_DEMAND,
             text_trust=ToolTextTrust.CODE,
-            summary="Export one exact relational query result as CSV or XLSX.",
-            when_to_use=(
-                "Use after catalog_schema provides the exact source and resource IDs."
+            summary=(
+                "Export one exact complete relational dataset as CSV, XLSX or Arrow for Python."
+                if allow_arrow
+                else "Export one exact relational query result as CSV or XLSX."
             ),
-            keywords=("artifact", "data", "export", "relational", "csv", "xlsx"),
+            when_to_use=(
+                "Use existing current catalog evidence for exact source/resource IDs; obtain only missing structure. Complete query results support dataset-wide statistics beyond bounded previews."
+            ),
+            keywords=(
+                "artifact",
+                "data",
+                "export",
+                "relational",
+                "csv",
+                "xlsx",
+                "complete dataset",
+                "all rows",
+                "statistics",
+                *(
+                    ("arrow ipc", "python capture", "typed dataset")
+                    if allow_arrow
+                    else ()
+                ),
+            ),
         ),
     )
     return CapabilityDeclarations(
@@ -2875,13 +2949,18 @@ def _sha256_json(value: object) -> str:
     return "sha256:" + sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _tabular_export_capability() -> Capability:
+def _tabular_export_capability(*, allow_arrow: bool = False) -> Capability:
+    formats = ["csv", "xlsx", *(["arrow"] if allow_arrow else [])]
     return Capability(
         id=DATA_EXPORT_TABULAR_CAPABILITY_ID,
         description=(
             "Run one fresh validated read-only relational query and create one "
-            "complete exact CSV or XLSX artifact without routing rows through the "
-            "model."
+            + (
+                "complete exact CSV, XLSX or Arrow artifact without routing rows through the "
+                if allow_arrow
+                else "complete exact CSV or XLSX artifact without routing rows through the "
+            )
+            + "model."
         ),
         input_schema={
             "type": "object",
@@ -2903,7 +2982,7 @@ def _tabular_export_capability() -> Capability:
                     "type": "array",
                     "maxItems": MAX_SQL_PARAMETERS,
                 },
-                "format": {"type": "string", "enum": ["csv", "xlsx"]},
+                "format": {"type": "string", "enum": formats},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
             "required": ["source_id", "resource_ids", "sql", "format"],
@@ -2913,7 +2992,31 @@ def _tabular_export_capability() -> Capability:
         output_schema={
             "type": "object",
             "properties": {
-                "format": {"type": "string", "enum": ["csv", "xlsx"]},
+                **(
+                    {
+                        "columns": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": MAX_CSV_COLUMNS,
+                        },
+                        "column_types": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": MAX_CSV_COLUMNS,
+                        },
+                        "byte_size": {"type": "integer", "minimum": 1},
+                        "complete": {"type": "boolean"},
+                        "coverage": {
+                            "type": "string",
+                            "enum": ["complete_query_result"],
+                        },
+                        "sql_fingerprint": {"type": "string"},
+                        "parameters_sha256": {"type": "string"},
+                    }
+                    if allow_arrow
+                    else {}
+                ),
+                "format": {"type": "string", "enum": formats},
                 "adapter_id": {
                     "type": "string",
                     "enum": ["sqlite", "postgresql"],
@@ -2958,9 +3061,17 @@ def _tabular_export_capability() -> Capability:
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
         artifact_policy=ArtifactPolicy(
-            allowed_media_types=frozenset({"text/csv", XLSX_MEDIA_TYPE}),
+            allowed_media_types=frozenset(
+                {
+                    "text/csv",
+                    XLSX_MEDIA_TYPE,
+                    *({ARROW_MEDIA_TYPE} if allow_arrow else set()),
+                }
+            ),
             allowed_authorships=frozenset({ArtifactAuthorship.EXACT_SOURCE_DATA}),
-            allowed_extensions=CSV_ALLOWED_EXTENSIONS + XLSX_ALLOWED_EXTENSIONS,
+            allowed_extensions=CSV_ALLOWED_EXTENSIONS
+            + XLSX_ALLOWED_EXTENSIONS
+            + (ARROW_ALLOWED_EXTENSIONS if allow_arrow else ()),
             artifact_required=True,
             max_artifact_count=1,
             max_bytes_per_artifact=max(MAX_CSV_BYTES, MAX_XLSX_BYTES),

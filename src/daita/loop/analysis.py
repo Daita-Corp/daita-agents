@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 
 from .._json import FrozenJsonObject, canonical_json
+from ..llm.models import ModelSensitivity
 
 
 class AnalysisTraceCapacityError(ValueError):
@@ -21,6 +22,29 @@ class ProgrammaticReadResult:
 
     response: dict[str, object]
     evidence: AnalysisEvidence
+
+
+@dataclass(frozen=True, slots=True)
+class ProgrammaticReadBroker:
+    """One frozen parent read surface; callbacks remain runtime-only."""
+
+    read: Callable[
+        [str, Mapping[str, object], ModelSensitivity], Awaitable[ProgrammaticReadResult]
+    ]
+    batch: Callable[
+        [Sequence[object], ModelSensitivity, int],
+        Awaitable[tuple[ProgrammaticReadResult, ...]],
+    ]
+
+    capture: Callable[
+        [str, Mapping[str, object], ModelSensitivity, str | None],
+        Awaitable[ProgrammaticReadResult],
+    ]
+
+    async def __call__(
+        self, name: str, arguments: Mapping[str, object], sensitivity: ModelSensitivity
+    ) -> ProgrammaticReadResult:
+        return await self.read(name, arguments, sensitivity)
 
 
 @dataclass(frozen=True, slots=True)

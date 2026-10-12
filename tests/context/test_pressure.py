@@ -212,8 +212,16 @@ async def test_context_owns_durable_job_handoff_guidance() -> None:
 
 
 @pytest.mark.parametrize("available", (False, True))
+@pytest.mark.parametrize(
+    "message,requested_reads",
+    (
+        ("Simulate a numerical system.", False),
+        ("Use Python and tools.batch for independent relational reads.", True),
+        ("Use tools.call for the read inside Python.", True),
+    ),
+)
 async def test_python_guidance_follows_applicable_loaded_projection(
-    monkeypatch, available
+    monkeypatch, available, message, requested_reads
 ):
     monkeypatch.setattr("daita.domains.analysis.domain.available", lambda: available)
     domain = AnalysisCapabilityDomain(RunAdmissionCoordinator())
@@ -230,9 +238,7 @@ async def test_python_guidance_follows_applicable_loaded_projection(
             supports_tools=True,
         ),
     )
-    run = replace(
-        _run("python-context"), message="Simulate a numerical system.", start=None
-    )
+    run = replace(_run("python-context"), message=message, start=None)
     messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
     catalog = await runtime.prepare_run(run)
     snapshot = await builder.prepare(run, messages, catalog)
@@ -243,6 +249,9 @@ async def test_python_guidance_follows_applicable_loaded_projection(
     assert (
         "Python workspace:" not in cast(TextBlock, before.messages[0].content[0]).text
     )
+    assert (
+        "Python requested reads:" in cast(TextBlock, before.messages[0].content[0]).text
+    ) is (available and requested_reads)
 
     call = ToolCall(
         id="load-python",
@@ -273,6 +282,7 @@ async def test_python_guidance_follows_applicable_loaded_projection(
     assert callable_python is available
     system = cast(TextBlock, request.messages[0].content[0]).text
     assert ("Python workspace:" in system) is callable_python
+    assert ("Python requested reads:" in system) is (available and requested_reads)
     assert not any(
         f"Python {procedure}:" in system
         for procedure in ("CSV", "database", "query results", "charts")
@@ -376,7 +386,12 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
     # Earlier tasks must not add procedures to the current computation.
     history = (
         CanonicalMessage(
-            MessageRole.USER, content=(TextBlock("Chart CSV database query results."),)
+            MessageRole.USER,
+            content=(
+                TextBlock(
+                    "Chart CSV database query results using tools.batch and tools.capture."
+                ),
+            ),
         ),
         CanonicalMessage(MessageRole.ASSISTANT, content=(TextBlock("Prior answer."),)),
     )
@@ -407,6 +422,7 @@ async def test_python_procedures_use_current_task_and_typed_metadata(
         tool_context=projection.project(catalog, messages),
     )
     system = cast(TextBlock, request.messages[0].content[0]).text
+    assert "Python requested reads:" not in system
     # Check selected procedure categories, not their exact prose or a scripted
     # model's reasoning. Selection cannot add callable tools or alter evidence.
     assert {
@@ -537,3 +553,91 @@ def test_token_estimate_is_conservative_accounting_not_raw_byte_count():
     estimate = _estimate_input_tokens(request)
 
     assert estimate > len(("a" * 3_000).encode("utf-8"))
+
+
+@pytest.mark.parametrize("arrow", (False, True))
+@pytest.mark.parametrize(
+    "message,dataset_requested",
+    (
+        ("Compute statistics from a complete dataset.", True),
+        ("Use Python to compute over every row of the connected table.", True),
+        ("Use tools.capture('data_export_tabular', args, name='numbers').", True),
+        ("Normalize retained JSON records.", False),
+    ),
+)
+async def test_dataset_guidance_requires_exact_loaded_export_metadata(
+    monkeypatch, arrow, message, dataset_requested
+):
+    from daita.capabilities import ToolExecution, ToolOutput
+    from daita.domains.data.export_capabilities import (
+        data_export_tabular_capability_declarations,
+    )
+    from tests.support.capability_runtime import StaticTestDomain
+
+    monkeypatch.setattr("daita.domains.analysis.domain.available", lambda: True)
+    analysis = AnalysisCapabilityDomain(RunAdmissionCoordinator())
+    exports = data_export_tabular_capability_declarations(allow_arrow=arrow)
+    data = StaticTestDomain(
+        exports.capabilities, exports.tool_views, domain_owner_id="data"
+    )
+
+    class Export:
+        executor_id = exports.executor_ids[0]
+
+        async def execute(self, request: ToolExecution) -> ToolOutput:
+            raise AssertionError("Guidance and loading cannot execute an export")
+
+    runtime = CapabilityRuntime(
+        CapabilityRegistry(
+            declarations=(analysis.declarations, exports),
+            executors=(analysis, Export()),
+        ),
+        (analysis, data),
+    )
+    builder = AgentContextBuilder(
+        _SnapshotCatalog(),
+        profile=ModelProfile(
+            id="mock:typed-dataset-context",
+            context_window_tokens=32000,
+            max_output_tokens=2000,
+            supports_tools=True,
+        ),
+    )
+    run = replace(_run("typed-dataset"), message=message, start=None)
+    messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
+    catalog = await runtime.prepare_run(run)
+    snapshot = await builder.prepare(run, messages, catalog)
+    for names in (("analysis_execute",), ("analysis_execute", "data_export_tabular")):
+        call = ToolCall(
+            id=f"load-{len(names)}",
+            name="toolbox_load",
+            arguments={"tool_names": names},
+        )
+        result = (
+            await runtime.execute_all(
+                run,
+                (call,),
+                projection=runtime.project(catalog, messages),
+                messages=messages,
+                sensitivity=ModelSensitivity.PUBLIC,
+            )
+        ).ordered_results[0]
+        assert not result.is_error
+        messages = (
+            *messages,
+            CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(call,)),
+            CanonicalMessage(MessageRole.TOOL, content=(result,)),
+        )
+        request = builder.project(
+            snapshot,
+            messages,
+            step=len(names) + 1,
+            tool_context=runtime.project(catalog, messages),
+        )
+        text = cast(TextBlock, request.messages[0].content[0]).text
+        assert "tools.batch" in text and "in submission order" in text
+        assert ("tools.capture(" in text) is (
+            arrow and len(names) == 2 and dataset_requested
+        )
+        assert request.messages[-len(messages) :] == messages
+        assert _estimate_input_tokens(request) <= snapshot.profile.maximum_input_tokens

@@ -10,9 +10,11 @@ import pytest
 
 from daita.jobs.graph.models import (
     BudgetAmount,
+    BudgetLimit,
     ControlKind,
     ControlState,
     EdgeKind,
+    GraphLimits,
     GraphMutationRequest,
     MutationDecision,
     TaskCheckpoint,
@@ -101,6 +103,63 @@ async def test_concurrent_claim_has_exactly_one_winner(
     assert inspection is not None
     assert len(inspection.attempts) == 1
     assert inspection.graph.active_attempt_count == 1
+
+
+@pytest.mark.parametrize("root_capacity", (1, 2))
+async def test_independent_task_claims_cannot_exceed_immutable_root_capacity(
+    state_store, root_capacity
+):
+    admission = graph_admission()
+    specification = replace(
+        admission.job.specification,
+        limits=GraphLimits(max_parallelism=root_capacity),
+        budgets=(BudgetLimit("work_units", 13, 1),),
+    )
+    job = replace(
+        admission.job,
+        specification=specification,
+        specification_digest=specification.digest,
+    )
+    workers = tuple(
+        replace(admission.tasks[0], task_id=f"worker-{index}") for index in range(4)
+    )
+    finalizer = admission.tasks[1]
+    tasks = (*workers, finalizer)
+    edges = tuple(
+        replace(admission.dependencies[0], upstream_task_id=worker.task_id)
+        for worker in workers
+    )
+    graph = replace(
+        admission.graph,
+        task_count=len(tasks),
+        edge_count=len(edges),
+        topology_digest=topology_digest(tasks, edges),
+    )
+    await state_store.admit_graph(
+        replace(admission, job=job, graph=graph, tasks=tasks, dependencies=edges)
+    )
+
+    async def claim(index):
+        return await state_store.claim_graph_task(
+            "agent-1",
+            "job-1",
+            f"worker-{index}",
+            attempt_id=f"attempt-{index}",
+            claim_token=f"claim-{index}",
+            run_id=f"run-{index}",
+            executor_id="executor-1",
+            claimed_at=GRAPH_NOW,
+            lease_seconds=30,
+            absolute_deadline_at=GRAPH_NOW + timedelta(minutes=2),
+            budget_reservations=(BudgetAmount("work_units", 1),),
+        )
+
+    outcomes = await asyncio.gather(*(claim(index) for index in range(4)))
+    assert sum(attempt is not None for attempt in outcomes) == root_capacity
+    retained = await state_store.inspect_graph("agent-1", "job-1")
+    assert retained is not None
+    assert retained.graph.active_attempt_count == root_capacity
+    assert retained.job.specification.limits.max_parallelism == root_capacity
 
 
 async def test_stale_fence_rejects_checkpoint_and_completion(state_store: StateStore):

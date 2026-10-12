@@ -73,6 +73,45 @@ def main() -> None:
             with broker_lock:
                 return invoke(name, arguments)
 
+        def batch(calls: list[dict[str, object]]) -> object:
+            with broker_lock:
+                response = invoke("<analysis-batch>", {"calls": calls})
+                if not isinstance(response, dict) or not isinstance(
+                    response.get("results"), list
+                ):
+                    raise ValueError("Invalid batch response")
+                return response["results"]
+
+        def capture(
+            tool_name: str, arguments: dict[str, object], *, name: str
+        ) -> object:
+            logical_name = name
+            with broker_lock:
+                response = invoke(
+                    "<analysis-capture>",
+                    {
+                        "tool_name": tool_name,
+                        "arguments": arguments,
+                        "input_name": logical_name,
+                    },
+                )
+                if not isinstance(response, dict):
+                    raise ValueError("Invalid capture response")
+                manifest = response.pop("input_manifest", {})
+                if not isinstance(manifest, dict) or set(manifest) - {logical_name}:
+                    raise ValueError("Invalid capture input manifest")
+                for logical, binding in manifest.items():
+                    if (
+                        not isinstance(binding, dict)
+                        or re.fullmatch(
+                            r"input-[0-9a-f]{32}\.arrow", str(binding.get("path"))
+                        )
+                        is None
+                    ):
+                        raise ValueError("Invalid capture input binding")
+                    admitted_inputs[logical] = binding
+                return response
+
         def invoke(name: str, arguments: dict[str, object]) -> object:
             nonlocal sequence
             sequence += 1
@@ -90,9 +129,21 @@ def main() -> None:
                 raise ValueError("Broker request byte allowance exhausted")
             channel.write(frame + "\n")
             channel.flush()
-            return json.loads(request_stream.readline(262_145))["result"]
+            raw_response = request_stream.readline(262_145)
+            if len(raw_response.encode()) > 262_144:
+                raise ValueError("Broker response byte allowance exhausted")
+            response = json.loads(raw_response)
+            if (
+                set(response) != {"kind", "token", "sequence", "result"}
+                or response["kind"] != "child_result"
+                or response["token"] != token
+                or type(response["sequence"]) is not int
+                or response["sequence"] != sequence
+            ):
+                raise ValueError("Invalid or stale broker response identity")
+            return response["result"]
 
-        namespace["tools"] = SimpleNamespace(call=call)
+        namespace["tools"] = SimpleNamespace(call=call, batch=batch, capture=capture)
         outputs: dict[str, str] = {}
 
         def add_output(name: str, path: str) -> None:

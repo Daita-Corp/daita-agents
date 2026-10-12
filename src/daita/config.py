@@ -11,6 +11,80 @@ from .loop.models import LoopLimits
 
 
 @dataclass(frozen=True, slots=True)
+class HostCapacityLimits:
+    """Fixed capacity for one open host, independent of execution grants."""
+
+    execution_capacity: int = 5
+    foreground_execution_reserve: int = 1
+    provider_capacity: int = 2
+    foreground_provider_reserve: int = 1
+    graph_parallelism: int = 1
+    postgresql_read_capacity: int = 2
+    sqlite_pressure_capacity: int = 4
+
+    def __post_init__(self) -> None:
+        for name, ceiling in (
+            ("execution_capacity", 16),
+            ("provider_capacity", 8),
+            ("graph_parallelism", 4),
+            ("postgresql_read_capacity", 8),
+            ("sqlite_pressure_capacity", 4),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not 1 <= value <= ceiling:
+                raise ValueError(
+                    f"{name} must be an integer from one through {ceiling}"
+                )
+        for name, capacity in (
+            ("foreground_execution_reserve", self.execution_capacity),
+            ("foreground_provider_reserve", self.provider_capacity),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not 0 <= value < capacity:
+                raise ValueError(f"{name} must be an integer below its capacity")
+
+
+@dataclass(frozen=True, slots=True)
+class PostgreSQLReadLimits:
+    """Runtime-only bounds for optional native source connection reuse."""
+
+    pool_enabled: bool = False
+    pool_size_per_source: int = 2
+    max_connections: int = 8
+    max_cached_sources: int = 8
+    acquire_timeout_seconds: float = 5.0
+    idle_timeout_seconds: float = 60.0
+    statement_timeout_seconds: float = 5.0
+    cleanup_timeout_seconds: float = 1.0
+
+    def __post_init__(self) -> None:
+        if type(self.pool_enabled) is not bool:
+            raise TypeError("pool_enabled must be bool")
+        for name in ("pool_size_per_source", "max_connections", "max_cached_sources"):
+            if (
+                type(getattr(self, name)) is not int
+                or not 1 <= getattr(self, name) <= 8
+            ):
+                raise ValueError(f"{name} must be an integer from one through eight")
+        for name, maximum in (
+            ("acquire_timeout_seconds", 60),
+            ("idle_timeout_seconds", 3600),
+            ("statement_timeout_seconds", 60),
+            ("cleanup_timeout_seconds", 10),
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or not 0 < value <= maximum
+            ):
+                raise ValueError(
+                    f"{name} must be finite, positive and at most {maximum}"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisLimits:
     cell_seconds: float = 30.0
     cpu_seconds: float = 120.0
@@ -113,6 +187,9 @@ class AgentConfig:
     limits: LoopLimits = LoopLimits()
     model_call_policy: ModelCallPolicy = field(default_factory=ModelCallPolicy)
     analysis_limits: AnalysisLimits = field(default_factory=AnalysisLimits)
+    host_capacity: HostCapacityLimits = field(default_factory=HostCapacityLimits)
+    postgresql_reads: PostgreSQLReadLimits = field(default_factory=PostgreSQLReadLimits)
+    admission_observations: bool = False
 
     def __post_init__(self) -> None:
         if self.model_route is not None and not isinstance(
@@ -125,6 +202,17 @@ class AgentConfig:
             raise TypeError("limits must be LoopLimits")
         if not isinstance(self.analysis_limits, AnalysisLimits):
             raise TypeError("analysis_limits must be AnalysisLimits")
+        if not isinstance(self.host_capacity, HostCapacityLimits):
+            raise TypeError("host_capacity must be HostCapacityLimits")
+        if not isinstance(self.postgresql_reads, PostgreSQLReadLimits):
+            raise TypeError("postgresql_reads must be PostgreSQLReadLimits")
+        if type(self.admission_observations) is not bool:
+            raise TypeError("admission_observations must be bool")
 
 
-__all__ = ["AgentConfig", "AnalysisLimits"]
+__all__ = [
+    "AgentConfig",
+    "AnalysisLimits",
+    "HostCapacityLimits",
+    "PostgreSQLReadLimits",
+]

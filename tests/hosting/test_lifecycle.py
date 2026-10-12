@@ -1,11 +1,14 @@
 import asyncio
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from daita import Agent
+from daita import Agent, AgentConfig, HostCapacityLimits
+from daita.adapters.models import DiscoveryResult, SourceRegistration
+from daita.catalog.models import CatalogSync, CatalogSyncStatus, SourceCatalogSnapshot
 from daita.hosting.embedded import AgentHomeError, HostActiveError
 from daita.hosting.execution_governor import PermitKind, WorkloadClass
 from daita.llm.models import (
@@ -361,3 +364,227 @@ async def test_foreground_run_does_not_hold_a_broad_host_mutation_lock(
     provider.release.set()
     await asyncio.wait_for(run, timeout=1)
     await asyncio.wait_for(agent.close(), timeout=1)
+
+
+@pytest.mark.parametrize("capacity", (1, 4, 8))
+async def test_public_capacity_uses_all_configured_lanes_and_reopens_without_persistence(
+    tmp_path, capacity
+):
+    class BarrierProvider(_BlockingProvider):
+        active = 0
+        peak = 0
+
+        async def generate(self, request):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            if self.active == capacity:
+                self.started.set()
+            try:
+                await self.release.wait()
+                return ModelResponse(finish_reason=FinishReason.STOP, text="done")
+            finally:
+                self.active -= 1
+
+    limits = HostCapacityLimits(
+        execution_capacity=capacity,
+        foreground_execution_reserve=0,
+        provider_capacity=capacity,
+        foreground_provider_reserve=0,
+    )
+    config = AgentConfig(host_capacity=limits)
+    provider = BarrierProvider()
+    agent = await Agent.create(
+        "capacity",
+        root=tmp_path,
+        config=config,
+        model=provider,
+        model_profile=provider.model_profile,
+        workspace=workspace_for(tmp_path),
+    )
+    runs = [
+        asyncio.create_task(agent.run(f"request {index}"))
+        for index in range(capacity + 1)
+    ]
+    try:
+        await asyncio.wait_for(provider.started.wait(), timeout=5)
+        assert provider.active == capacity
+        assert agent.admission_diagnostics().active_leases == capacity
+        assert agent.admission_diagnostics().waiting_admissions == 1
+        provider.release.set()
+        results = await asyncio.gather(*runs)
+        assert all(result.final_text == "done" for result in results)
+        assert len({result.run_id for result in results}) == capacity + 1
+        assert provider.peak == capacity
+    finally:
+        provider.release.set()
+        await asyncio.gather(*runs, return_exceptions=True)
+        await agent.close()
+    assert (
+        agent.admission_diagnostics().active_leases
+        == agent.admission_diagnostics().active_permits
+        == 0
+    )
+    assert not (agent._embedded.home / "config.json").exists()
+    reopened = await Agent.open(
+        "capacity", root=tmp_path, config=config, workspace=workspace_for(tmp_path)
+    )
+    try:
+        assert (
+            dict(reopened.admission_diagnostics().capacities)["execution"] == capacity
+        )
+    finally:
+        await reopened.close()
+
+
+async def test_postgresql_capacity_policy_applies_on_attach_and_reopen(tmp_path):
+    config = AgentConfig(host_capacity=HostCapacityLimits(postgresql_read_capacity=4))
+    agent = await Agent.create(
+        "source-capacity",
+        root=tmp_path,
+        config=config,
+        workspace=workspace_for(tmp_path),
+    )
+
+    class FixtureAdapter:
+        def __init__(self, registration):
+            self.registration = registration
+
+        async def discover(self, request):
+            now = datetime.now(UTC)
+            sync = CatalogSync(
+                id=request.sync_id,
+                agent_id=request.agent_id,
+                source_id=request.source_id,
+                adapter_id="postgresql",
+                status=CatalogSyncStatus.SUCCEEDED,
+                started_at=request.requested_at,
+                completed_at=now,
+                source_revision="catalog:sha256:" + "3" * 64,
+            )
+            return DiscoveryResult(
+                request=request,
+                snapshot=SourceCatalogSnapshot(sync=sync, resources=(), revisions=()),
+                completed_at=now,
+            )
+
+        async def inspect(self, resource):
+            raise AssertionError("empty fixture has no resources")
+
+        async def health(self):
+            raise AssertionError("attachment must not require a health call")
+
+        async def close(self):
+            pass
+
+    class FixtureSource:
+        async def open(self, *, agent_id, attached_at, clock):
+            return FixtureAdapter(
+                SourceRegistration.build(
+                    agent_id=agent_id,
+                    adapter_id="postgresql",
+                    native_identity="offline-capacity-source",
+                    display_name="Offline fixture",
+                    configuration={},
+                    attached_at=attached_at,
+                )
+            )
+
+    source = await agent.attach(FixtureSource())
+    try:
+        for opened in range(2):
+            coordinator = agent._embedded._admission_coordinator
+            permits = [
+                await coordinator.source_resource_permit(f"source:{source.id}")
+                for _ in range(4)
+            ]
+            waiting = asyncio.create_task(
+                coordinator.source_resource_permit(f"source:{source.id}")
+            )
+            await asyncio.sleep(0)
+            assert not waiting.done()
+            await permits.pop().release()
+            permits.append(await waiting)
+            for permit in permits:
+                await permit.release()
+            assert await agent.list_catalog_resources(source_id=source.id) == ()
+            await agent.close()
+            if opened == 0:
+                agent = await Agent.open(
+                    "source-capacity",
+                    root=tmp_path,
+                    config=config,
+                    workspace=workspace_for(tmp_path),
+                )
+    finally:
+        await agent.close()
+
+
+async def test_public_pool_policy_is_applied_closed_and_not_persisted(tmp_path):
+    from daita import AgentConfig, HostCapacityLimits, PostgreSQLReadLimits
+
+    config = AgentConfig(
+        host_capacity=HostCapacityLimits(postgresql_read_capacity=4),
+        postgresql_reads=PostgreSQLReadLimits(
+            pool_enabled=True,
+            pool_size_per_source=8,
+            max_connections=3,
+            max_cached_sources=2,
+        ),
+    )
+    agent = await Agent.create(
+        "pool-policy", root=tmp_path, config=config, workspace=workspace_for(tmp_path)
+    )
+    metrics = agent.postgresql_read_diagnostics()
+    assert (
+        metrics.limits == config.postgresql_reads and metrics.pool_size_per_source == 3
+    )
+    await agent.close()
+    assert agent.postgresql_read_diagnostics().cached_sources == 0
+    reopened = await Agent.open(
+        "pool-policy", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        assert not reopened.postgresql_read_diagnostics().limits.pool_enabled
+    finally:
+        await reopened.close()
+
+
+@pytest.mark.parametrize("failure", ("backend", "composition"))
+async def test_pool_backend_construction_owns_no_unclosed_resources(
+    tmp_path, monkeypatch, failure
+):
+    from daita.adapters.postgresql_query import PostgreSQLQueryBackend
+    from daita.hosting.execution_governor import RunAdmissionCoordinator
+
+    closed = []
+    original_close = PostgreSQLQueryBackend.close
+    original_init = PostgreSQLQueryBackend.__init__
+
+    async def close(self):
+        closed.append(self)
+        assert self.diagnostics().active == 0
+        await original_close(self)
+
+    def backend(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        assert self.diagnostics().reserved_connections == 0
+        raise RuntimeError("Injected backend construction failure")
+
+    def coordinator(self, *args, **kwargs):
+        raise RuntimeError("Injected composition failure")
+
+    monkeypatch.setattr(PostgreSQLQueryBackend, "close", close)
+    with monkeypatch.context() as patch:
+        if failure == "backend":
+            patch.setattr(PostgreSQLQueryBackend, "__init__", backend)
+        else:
+            patch.setattr(RunAdmissionCoordinator, "__init__", coordinator)
+        with pytest.raises(RuntimeError, match="Injected"):
+            await Agent.create(
+                "failed-pool", root=tmp_path, workspace=workspace_for(tmp_path)
+            )
+    assert len(closed) == (1 if failure == "composition" else 0)
+    agent = await Agent.create(
+        "recovered-pool", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    await agent.close()

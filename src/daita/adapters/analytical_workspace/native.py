@@ -109,6 +109,7 @@ class NativePythonWorker:
         self._closing: asyncio.Task[dict[str, object]] | None = None
         self.revalidate: Callable[[], Awaitable[None]] | None = None
         self.observe: Callable[[Mapping[str, object]], None] | None = None
+        self.suspended = False
         self._last_check = 0.0
         self._last_observation = 0.0
         self._created_at = asyncio.get_running_loop().time()
@@ -529,7 +530,18 @@ class NativePythonWorker:
                     permit = None
                 try:
                     async with asyncio.timeout_at(deadline):
-                        child_result = await broker(result["name"], result["arguments"])
+                        arguments = result["arguments"]
+                        if result["name"] == "<analysis-batch>":
+                            arguments = {
+                                **arguments,
+                                "response_budget": min(
+                                    240_000,
+                                    self.limits.rpc_bytes
+                                    - rpc_bytes
+                                    - len(json.dumps(result).encode()),
+                                ),
+                            }
+                        child_result = await broker(result["name"], arguments)
                 finally:
                     self.usage["broker_wait_seconds"] = (
                         float(self.usage["broker_wait_seconds"])
@@ -552,7 +564,12 @@ class NativePythonWorker:
                     raise TimeoutError("Analysis compute resume deadline expired")
                 self.resume()
                 await self._send(
-                    {"result": json.loads(canonical_json(child_result))},
+                    {
+                        "kind": "child_result",
+                        "token": token,
+                        "sequence": sequence,
+                        "result": json.loads(canonical_json(child_result)),
+                    },
                     deadline=deadline,
                 )
             if (
@@ -636,11 +653,14 @@ class NativePythonWorker:
                 "Worker suspension was not observed by its native parent"
             )
 
+        self.suspended = True
+
     def resume(self) -> None:
         # Recheck the newly admitted lifetime cap immediately before SIGCONT.
         self.sample()
         assert self._keepalive is not None
         os.write(self._keepalive, b"C")
+        self.suspended = False
 
     async def close(self) -> dict[str, object]:
         if self._closing is None:

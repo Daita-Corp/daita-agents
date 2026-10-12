@@ -6,7 +6,7 @@ import asyncio
 import hmac
 import re
 import secrets
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -18,6 +18,7 @@ from .artifacts.models import (
     ArtifactDraft,
     ArtifactError,
     ArtifactRef,
+    artifact_ref_from_mapping,
     artifact_ref_to_mapping,
     canonical_artifact_filename,
 )
@@ -70,7 +71,12 @@ from .llm.models import (
     ToolDefinition,
     ToolResultBlock,
 )
-from .loop.analysis import AnalysisEvidence, ProgrammaticReadResult
+from .loop.analysis import (
+    AnalysisEvidence,
+    AnalysisTraceCapacityError,
+    ProgrammaticReadBroker,
+    ProgrammaticReadResult,
+)
 from .loop.models import (
     LoopLimits,
     RunInput,
@@ -2079,13 +2085,16 @@ class CapabilityRuntime:
     def _analysis_authority_reader(self, session: RunSession, run: RunInput):
         async def revalidate(call: ToolCall, sensitivity: ModelSensitivity) -> None:
             view, capability, owner = self._registry.resolve_tool_owner(call.name)
-            if not self._analysis_read_eligible(owner, capability):
+            if not (
+                self._analysis_read_eligible(owner, capability)
+                or self._analysis_capture_eligible(owner, capability)
+            ):
                 raise CapabilityInputError(
                     "analysis_authority_revoked",
                     "An admitted input is outside the analytical read surface.",
                 )
             domain = self._domains[owner]
-            if view.name not in await _domain_project(domain, run, session):
+            if view.name not in await _domain_project(domain, run, session, call=call):
                 raise CapabilityInputError(
                     "analysis_authority_revoked",
                     "An admitted input is no longer readable.",
@@ -2126,6 +2135,19 @@ class CapabilityRuntime:
             and capability.machine_run_directive_kind is None
         )
 
+    def _analysis_capture_eligible(self, owner: str, capability: Capability) -> bool:
+        policy = capability.artifact_policy
+        return (
+            owner == "data"
+            and capability.id == "data.export_tabular"
+            and capability.access_mode is AccessMode.READ
+            and capability.operational_effect is OperationalEffect.NONE
+            and capability.machine_run_directive_kind is None
+            and policy is not None
+            and "application/vnd.apache.arrow.file" in policy.allowed_media_types
+            and policy.max_artifact_count == 1
+        )
+
     def _programmatic_reader(
         self,
         session: RunSession,
@@ -2138,15 +2160,16 @@ class CapabilityRuntime:
             entry.view.name: entry
             for entry in projection.callable_entries
             if self._analysis_read_eligible(entry.domain_owner_id, entry.capability)
+            or self._analysis_capture_eligible(entry.domain_owner_id, entry.capability)
         }
         sequence = 0
         child_limit = cast(
             "AnalysisCapabilityDomain", self._domains["analysis"]
         ).child_call_limit
 
-        async def invoke(
+        def allocate(
             name: str, arguments: Mapping[str, object], sensitivity: ModelSensitivity
-        ) -> ProgrammaticReadResult:
+        ):
             nonlocal sequence
             sequence += 1
             child = ToolCall(
@@ -2155,9 +2178,6 @@ class CapabilityRuntime:
                 arguments=arguments,
             )
             entry = entries.get(name)
-            allowed = session.evidence.count_tool_attempts(
-                1, self._limits.max_tool_calls_per_run, programmatic=True
-            )
             facts = {
                 "status": "admitted",
                 "parent_call_id": parent.id,
@@ -2182,26 +2202,107 @@ class CapabilityRuntime:
                     ).hexdigest()
                 ),
             }
-            await session.writer.record_analysis(
-                AnalysisEvidence(run.id, child.id, "child", facts)
+            return child, entry, facts
+
+        async def committed_capture(child: ToolCall) -> ArtifactRef | None:
+            if self._artifacts is None:
+                return None
+            return next(
+                (
+                    ref
+                    for ref in await self._artifacts.list_refs(
+                        run_id=run.id, caller_principal_id=run.caller_principal_id
+                    )
+                    if ref.call_id == child.id
+                    and ref.capability_id == "data.export_tabular"
+                ),
+                None,
             )
+
+        def capture_failure(
+            child: ToolCall, original: ToolResultBlock, ref: ArtifactRef
+        ) -> ToolResultBlock:
+            reference = {
+                key: value
+                for key, value in artifact_ref_to_mapping(ref).items()
+                if key != "provenance"
+            }
+            output = {
+                "error": original.output.get(
+                    "error",
+                    {
+                        "code": "analysis_capture_result_limited",
+                        "message": "The export committed, but its metadata exceeded broker delivery bounds.",
+                    },
+                ),
+                "artifact": reference,
+            }
+            return replace(
+                original,
+                output=output,
+                output_sha256=None,
+                is_error=True,
+                sensitivity=None,
+                sensitivity_provenance={},
+            )
+
+        async def invoke(
+            name: str,
+            arguments: Mapping[str, object],
+            sensitivity: ModelSensitivity,
+            *,
+            allocation=None,
+            allowed: bool | None = None,
+            recorded: bool = False,
+            denial: str | None = None,
+            result_bytes: int = 60_000,
+            capture: bool = False,
+        ) -> ProgrammaticReadResult:
+            child, entry, facts = allocation or allocate(name, arguments, sensitivity)
+            if allowed is None:
+                allowed = session.evidence.count_tool_attempts(
+                    1, self._limits.max_tool_calls_per_run, programmatic=True
+                )
+            if not recorded:
+                await session.writer.record_analysis(
+                    AnalysisEvidence(run.id, child.id, "child", facts)
+                )
+            captured_sensitivity: ModelSensitivity | None = None
             started = asyncio.get_running_loop().time()
             try:
                 session.cancellation.raise_if_cancelled()
-                if not allowed or sequence > child_limit:
+                if denial is not None:
+                    result = _error(
+                        child,
+                        denial,
+                        "The broker request or its bounded delivery allowance is invalid; no reads were dispatched.",
+                    )
+                elif not allowed or facts["sequence"] > child_limit:
                     result = _error(
                         child,
                         "analysis_child_budget_exhausted",
                         "The shared run or cell child-call allowance is exhausted.",
                     )
-                elif entry is None:
+                elif entry is None or (
+                    not self._analysis_read_eligible(
+                        entry.domain_owner_id, entry.capability
+                    )
+                    and not (
+                        capture
+                        and name == "data_export_tabular"
+                        and arguments.get("format") == "arrow"
+                        and self._analysis_capture_eligible(
+                            entry.domain_owner_id, entry.capability
+                        )
+                    )
+                ):
                     result = _error(
                         child,
                         "analysis_child_not_admitted",
                         "The tool is outside this cell's frozen read surface.",
                     )
                 elif name not in await _domain_project(
-                    self._domains[entry.domain_owner_id], run, session
+                    self._domains[entry.domain_owner_id], run, session, call=child
                 ):
                     result = _error(
                         child,
@@ -2225,7 +2326,24 @@ class CapabilityRuntime:
                         session=session,
                         dispatch_hook=dispatched,
                     )
-                if len(canonical_json(result.output).encode()) > 60_000:
+                if capture and (
+                    result.is_error
+                    or len(canonical_json(result.output).encode()) > result_bytes
+                ):
+                    value = result.output.get("artifact")
+                    ref = (
+                        artifact_ref_from_mapping(value)
+                        if isinstance(value, Mapping)
+                        else await committed_capture(child)
+                    )
+                    if ref is not None:
+                        captured_sensitivity = max(
+                            (ModelSensitivity(ref.sensitivity.value), sensitivity),
+                            key=lambda value: value.routing_rank,
+                        )
+                        session.writer.retain_analysis_sensitivity(captured_sensitivity)
+                        result = capture_failure(child, result, ref)
+                if len(canonical_json(result.output).encode()) > result_bytes:
                     original = result
                     result = replace(
                         _error(
@@ -2236,6 +2354,8 @@ class CapabilityRuntime:
                         sensitivity=original.sensitivity,
                         sensitivity_provenance=original.sensitivity_provenance,
                     )
+                if result.sensitivity is not None:
+                    session.writer.retain_analysis_sensitivity(result.sensitivity)
                 facts.update(
                     {
                         "status": "failed" if result.is_error else "succeeded",
@@ -2245,8 +2365,12 @@ class CapabilityRuntime:
                         + sha256(canonical_json(result.output).encode()).hexdigest(),
                         "result_sensitivity": (
                             None
-                            if result.sensitivity is None
-                            else result.sensitivity.value
+                            if (
+                                classification := captured_sensitivity
+                                or result.sensitivity
+                            )
+                            is None
+                            else classification.value
                         ),
                         "sensitivity_provenance": result.sensitivity_provenance,
                         "completed_at": self._clock().isoformat(),
@@ -2254,7 +2378,18 @@ class CapabilityRuntime:
                     }
                 )
                 evidence = AnalysisEvidence(run.id, child.id, "child", facts)
-                await session.writer.record_analysis(evidence)
+                terminal_write = asyncio.create_task(
+                    session.writer.record_analysis(evidence)
+                )
+                cancelled = False
+                while not terminal_write.done():
+                    try:
+                        await asyncio.shield(terminal_write)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                terminal_write.result()
+                if cancelled:
+                    raise asyncio.CancelledError
                 return ProgrammaticReadResult(
                     {
                         "output": result.output,
@@ -2262,28 +2397,236 @@ class CapabilityRuntime:
                         "evidence_id": child.id,
                         "sensitivity": (
                             None
-                            if result.sensitivity is None
-                            else result.sensitivity.value
+                            if (
+                                classification := captured_sensitivity
+                                or result.sensitivity
+                            )
+                            is None
+                            else classification.value
                         ),
                     },
                     evidence,
                 )
-            except BaseException:
+            except BaseException as error:
+                if isinstance(error, asyncio.CancelledError) and facts["status"] in {
+                    "succeeded",
+                    "failed",
+                }:
+                    # State writes settle before reporting cancellation; preserve
+                    # the terminal observation instead of attempting an overwrite.
+                    raise
+
+                async def settle_interruption() -> None:
+                    if capture and facts["dispatched"]:
+                        ref = await committed_capture(child)
+                        if ref is not None:
+                            partial = capture_failure(
+                                child,
+                                _error(
+                                    child,
+                                    "analysis_capture_interrupted",
+                                    "The capture was interrupted after publication; the query was not replayed.",
+                                ),
+                                ref,
+                            )
+                            session.writer.retain_analysis_sensitivity(
+                                max(
+                                    (
+                                        ModelSensitivity(ref.sensitivity.value),
+                                        sensitivity,
+                                    ),
+                                    key=lambda value: value.routing_rank,
+                                )
+                            )
+                            facts.update(
+                                result=partial.output,
+                                result_digest="sha256:"
+                                + sha256(
+                                    canonical_json(partial.output).encode()
+                                ).hexdigest(),
+                                result_sensitivity=(
+                                    None
+                                    if partial.sensitivity is None
+                                    else partial.sensitivity.value
+                                ),
+                                sensitivity_provenance=partial.sensitivity_provenance,
+                            )
+                    await session.writer.record_analysis(
+                        AnalysisEvidence(run.id, child.id, "child", facts)
+                    )
+
                 facts.update(
                     {
                         "status": "interrupted",
                         "wall_seconds": asyncio.get_running_loop().time() - started,
                     }
                 )
-                task = asyncio.create_task(
-                    session.writer.record_analysis(
-                        AnalysisEvidence(run.id, child.id, "child", facts)
-                    )
-                )
+                task = asyncio.create_task(settle_interruption())
                 await asyncio.shield(task)
                 raise
 
-        return invoke
+        async def batch(
+            calls: Sequence[object], sensitivity: ModelSensitivity, response_budget: int
+        ) -> tuple[ProgrammaticReadResult, ...]:
+            allowed = session.evidence.count_tool_attempts(
+                len(calls), self._limits.max_tool_calls_per_run, programmatic=True
+            )
+            if not calls or len(calls) > 64:
+                raise ValueError(
+                    "Analysis batches must contain a bounded nonempty call list"
+                )
+            malformed = any(
+                not isinstance(item, Mapping)
+                or set(item) != {"name", "arguments"}
+                or not isinstance(item["name"], str)
+                or not 0 < len(item["name"]) <= 256
+                or not item["name"].strip()
+                or not isinstance(item["arguments"], Mapping)
+                for item in calls
+            )
+            normalized = tuple(
+                (
+                    (
+                        str(item["name"]),
+                        (
+                            cast(Mapping[str, object], item.get("arguments", {}))
+                            if isinstance(item.get("arguments", {}), Mapping)
+                            else {}
+                        ),
+                    )
+                    if isinstance(item, Mapping)
+                    and isinstance(item.get("name"), str)
+                    and 0 < len(str(item["name"])) <= 256
+                    and str(item["name"]).strip()
+                    else ("<invalid-analysis-call>", {})
+                )
+                for item in calls
+            )
+            allocations = tuple(
+                allocate(name, arguments, sensitivity) for name, arguments in normalized
+            )
+            allowed = allowed and sequence <= child_limit
+            denial = "analysis_batch_invalid" if malformed else None
+            if response_budget < len(calls) * 2_048:
+                allowed = False
+                denial = "analysis_batch_result_budget_exhausted"
+            result_bytes = max(0, min(60_000, response_budget // len(calls) - 512))
+            reserved = 0
+            if allowed and denial is None:
+                try:
+                    # Reserve every completion before creating an I/O task.
+                    for child, entry, facts in allocations:
+                        await session.writer.record_analysis(
+                            AnalysisEvidence(run.id, child.id, "child", facts)
+                        )
+                        reserved += 1
+                except AnalysisTraceCapacityError:
+                    allowed = False
+                except asyncio.CancelledError:
+
+                    async def settle_admissions():
+                        for child, entry, facts in allocations:
+                            facts.update(
+                                status="interrupted",
+                                interruption="batch_cancelled_before_dispatch",
+                                wall_seconds=0.0,
+                            )
+                            await session.writer.record_analysis(
+                                AnalysisEvidence(run.id, child.id, "child", facts)
+                            )
+
+                    cleanup = asyncio.create_task(settle_admissions())
+                    while not cleanup.done():
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            continue
+                    cleanup.result()
+                    raise
+            if not allowed or denial is not None:
+                return tuple(
+                    [
+                        await invoke(
+                            name,
+                            arguments,
+                            sensitivity,
+                            allocation=allocation,
+                            allowed=False,
+                            recorded=index < reserved,
+                            denial=denial,
+                            result_bytes=result_bytes,
+                        )
+                        for index, ((name, arguments), allocation) in enumerate(
+                            zip(normalized, allocations, strict=True)
+                        )
+                    ]
+                )
+            read_gate = asyncio.Semaphore(self._limits.max_parallel_reads)
+            source_gates: dict[str, asyncio.Semaphore] = {}
+
+            async def read(name, arguments, allocation):
+                key = _source_pressure_key(run, allocation[0])
+                source_gate = source_gates.setdefault(
+                    key, asyncio.Semaphore(self._limits.max_parallel_reads_per_source)
+                )
+                async with read_gate:
+                    async with source_gate:
+                        return await invoke(
+                            name,
+                            arguments,
+                            sensitivity,
+                            allocation=allocation,
+                            allowed=True,
+                            recorded=True,
+                            result_bytes=result_bytes,
+                        )
+
+            tasks = tuple(
+                asyncio.create_task(read(name, arguments, allocation))
+                for (name, arguments), allocation in zip(
+                    normalized, allocations, strict=True
+                )
+            )
+            analysis = cast("AnalysisCapabilityDomain", self._domains["analysis"])
+            analysis.retain_child_tasks(run.id, tasks)
+            try:
+                await asyncio.wait(tasks)
+            except BaseException:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel("analysis_batch_interrupted")
+                settled, pending = await _settle_cancelled_reads(
+                    tasks, timeout_seconds=self._side_effect_recovery_timeout_seconds
+                )
+                # Children cancelled while queued never reached invoke's handler.
+                for task, (child, entry, facts) in zip(tasks, allocations, strict=True):
+                    if task in settled and facts["status"] == "admitted":
+                        facts.update(
+                            status="interrupted",
+                            interruption="batch_cancelled_before_dispatch",
+                            wall_seconds=0.0,
+                        )
+                        await session.writer.record_analysis(
+                            AnalysisEvidence(run.id, child.id, "child", facts)
+                        )
+                for task in pending:
+                    task.add_done_callback(_consume_read_task)
+                raise
+            return tuple(task.result() for task in tasks)
+
+        async def capture(
+            name: str,
+            arguments: Mapping[str, object],
+            sensitivity: ModelSensitivity,
+            denial: str | None,
+        ) -> ProgrammaticReadResult:
+            if name != "data_export_tabular" or arguments.get("format") != "arrow":
+                denial = "analysis_capture_not_admitted"
+            return await invoke(
+                name, arguments, sensitivity, capture=True, denial=denial
+            )
+
+        return ProgrammaticReadBroker(invoke, batch, capture)
 
     async def _execute_one(
         self,
@@ -4802,7 +5145,13 @@ async def _domain_project(
     domain: CapabilityDomain,
     run: RunInput,
     session: RunSession | None,
+    *,
+    call: ToolCall | None = None,
 ) -> tuple[str, ...]:
+    project_call = getattr(domain, "project_call", None)
+    if call is not None and callable(project_call):
+        project = cast(Callable[..., Awaitable[tuple[str, ...]]], project_call)
+        return await project(run, call, session)
     project_session = getattr(domain, "project_session", None)
     if session is not None and callable(project_session):
         project = cast(

@@ -17,6 +17,16 @@ validated subset of that authority. Source changes, expired contracts, budget
 limits, and requests for human input may leave a task needing attention. Daita
 does not treat a model's description of permission as a grant.
 
+## Host parallelism
+
+`AgentConfig(host_capacity=HostCapacityLimits(graph_parallelism=4))` opts into at
+most four concurrent graph attempts in the open host; the default is one. Host
+execution and provider capacity still apply, including strict foreground reserves.
+The supervisor's model-attempt gate uses the same graph capacity. Every SQLite
+claim also enforces the job's immutable root parallelism limit. Higher host
+capacity cannot enlarge a job's authority, budgets or parallelism contract.
+Capacity changes require drain and reopen and are not persisted as grants.
+
 ## Review progress and results
 
 Use `/jobs` in the terminal app to list jobs, inspect tasks and blockers,

@@ -13,6 +13,7 @@ import os
 import sqlite3
 from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -20,11 +21,13 @@ import pytest
 
 from daita import (
     Agent,
+    AgentConfig,
     ApprovalDecision,
     IntervalSchedule,
     LoopLimits,
     MCPToolSelection,
     MisfirePolicy,
+    PostgreSQLReadLimits,
     ReportingMode,
     ScheduledRoutineDraft,
     SemanticAnnotationState,
@@ -33,7 +36,7 @@ from daita.artifacts.models import ArtifactAuthorship
 from daita.distribution import ArtifactRequirement, OutcomeContract, OutcomeState
 from daita.llm.models import MessageRole, ModelSensitivity, TextBlock
 from daita.loop.models import LoopExitKind, RunOrigin, validate_completed_transcript
-from daita.security import SecretReference
+from daita.security import EnvironmentSecretProvider, SecretReference
 from daita.storage.sqlite_codecs.transcripts import encode_loop_exit, encode_message
 from tests.support.analysis import facts
 from tests.support.data_operations import (
@@ -565,7 +568,10 @@ async def test_live_foreground_to_scheduled_report(dataops, python):
 
 
 @pytest.mark.requires_db
-async def test_live_existing_postgresql_fixture_independent_oracle(dataops):
+@pytest.mark.parametrize("pool_enabled", (False, True), ids=("cold", "pooled"))
+async def test_live_existing_postgresql_fixture_independent_oracle(
+    dataops, pool_enabled
+):
     """Read the existing disposable analytics fixture; never provision or write it."""
     evaluation, _service = dataops
     password = os.environ.get("DAITA_FIXTURE_POSTGRES_PASSWORD")
@@ -602,6 +608,25 @@ async def test_live_existing_postgresql_fixture_independent_oracle(dataops):
         {"currency": currency, "amount_minor": int(amount * 100)}
         for currency, amount in sorted(totals.items())
     ]
+    agent = evaluation.agent
+    await agent.close()
+    evaluation.agent = await Agent.open(
+        agent.home.name,
+        root=agent.home.parent.parent,
+        workspace=agent.workspace,
+        model=evaluation.provider,
+        model_profile=agent.model_profile,
+        limits=LoopLimits(max_estimated_cost_usd=evaluation.budget.per_run),
+        secret_provider=EnvironmentSecretProvider(),
+        config=AgentConfig(
+            postgresql_reads=PostgreSQLReadLimits(
+                pool_enabled=pool_enabled,
+                pool_size_per_source=1,
+                max_connections=1,
+                max_cached_sources=1,
+            )
+        ),
+    )
     source = await evaluation.agent.attach_postgresql(
         host="127.0.0.1",
         port=port,
@@ -613,14 +638,64 @@ async def test_live_existing_postgresql_fixture_independent_oracle(dataops):
         name="Existing analytics fixture",
     )
     evaluation.setup["service_kind"] = "external_disposable_postgresql"
-    capture = await evaluation.run(
-        "Sum order_items.line_total for orders.status='paid', by the customer's region "
-        "currency_code. Join the current analytics tables using their relationships. "
-        "Return minor currency units (multiply the sum by 100), only as a JSON "
-        'object shaped as {"rows":[{"currency":"USD","amount_minor":123}]} '
-        "(never a bare array). Keep currencies separate.",
-        phase="postgresql_independent_oracle",
-        source_scope_ids=(source.id,),
-    )
-    record_score(evaluation, "postgresql_independent_oracle", capture, expected)
+    for repetition in range(2):
+        phase = f"postgresql_{'pooled' if pool_enabled else 'cold'}_{repetition}"
+        capture = await evaluation.run(
+            "Sum order_items.line_total for orders.status='paid', by the customer's region "
+            "currency_code. Join the current analytics tables using their relationships. "
+            "Return minor currency units (multiply the sum by 100), only as a JSON "
+            'object shaped as {"rows":[{"currency":"USD","amount_minor":123}]} '
+            "(never a bare array). Keep currencies separate.",
+            phase=phase,
+            source_scope_ids=(source.id,),
+        )
+        record_score(evaluation, phase, capture, expected)
+    diagnostics = evaluation.agent.postgresql_read_diagnostics()
+    evaluation.setup["postgresql_reads"] = asdict(diagnostics)
+    if pool_enabled:
+        assert diagnostics.acquired >= 2
+        assert diagnostics.connections_created == 1
+        assert diagnostics.active == diagnostics.waiting == 0
+        assert diagnostics.completed == diagnostics.acquired
+        assert diagnostics.structural_seconds > 0
     assert await evaluation.agent.list_effects() == ()
+
+
+@pytest.mark.parametrize("method", ("call", "batch"))
+async def test_paired_python_relational_reads_preserve_independent_oracle(
+    dataops, method
+):
+    evaluation, _service = dataops
+    case = AnalyticalCase("paid_count", 0)
+    capture = await evaluation.run(
+        case.prompt
+        + " Use Python and current relational read evidence. "
+        + (
+            "Issue independent reads through tools.batch and check each result before computing."
+            if method == "batch"
+            else "Use synchronous tools.call for each read and check each result before computing."
+        ),
+        phase=f"python-{method}",
+        source_scope_ids=source_scope(evaluation),
+    )
+    score = score_answer(
+        capture.result.final_text, expected_rows(case.kind, case.variant)
+    )
+    evaluation.setup["results"][f"python-{method}"] = score
+    assert_completed(capture)
+    assert score["correct"], score
+    records = await evaluation.agent.analysis_evidence(capture.result.run_id)
+    evaluation.setup["analysis_evidence"] = [facts(record) for record in records]
+    children = [
+        r
+        for r in records
+        if r.kind == "child"
+        and r.facts["tool_name"] == "data_query"
+        and r.facts["status"] == "succeeded"
+    ]
+    assert children, "Correctness requires current authenticated Python child reads"
+    assert any(
+        f"tools.{method}" in str(call.arguments.get("code", ""))
+        for call, _ in capture.transcript.tool_pairs
+        if call.name == "analysis_execute"
+    )

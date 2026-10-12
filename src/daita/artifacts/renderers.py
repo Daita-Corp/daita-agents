@@ -6,6 +6,7 @@ import base64
 import math
 import re
 import stat
+import sys
 import time as time_module
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -45,6 +46,8 @@ HTML_MEDIA_TYPE = "text/html"
 HTML_ALLOWED_EXTENSIONS = ((HTML_MEDIA_TYPE, (".html",)),)
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 XLSX_ALLOWED_EXTENSIONS = ((XLSX_MEDIA_TYPE, (".xlsx",)),)
+ARROW_MEDIA_TYPE = "application/vnd.apache.arrow.file"
+ARROW_ALLOWED_EXTENSIONS = ((ARROW_MEDIA_TYPE, (".arrow",)),)
 TEXT_EDIT_ALLOWED_EXTENSIONS = (
     (
         "text/plain",
@@ -706,6 +709,301 @@ def _render_model_tabular_html(
         lines.append("<tr>" + "".join(cells) + "</tr>")
     lines.extend(("</tbody>", "</table>", "</body>", "</html>", ""))
     return "\n".join(lines).encode("utf-8")
+
+
+class ExactArrowRenderer:
+    """Bounded Arrow IPC files with a strict, lossless scalar encoding contract."""
+
+    def __init__(
+        self,
+        columns: Sequence[str],
+        *,
+        max_rows: int = MAX_CSV_ROWS,
+        max_columns: int = MAX_CSV_COLUMNS,
+        max_bytes: int = 16 * 1024 * 1024,
+        max_seconds: float = MAX_CSV_SECONDS,
+        clock: Callable[[], float] = time_module.monotonic,
+        projected_types: Sequence[str | None] | None = None,
+    ) -> None:
+        for value in (max_rows, max_columns, max_bytes):
+            if type(value) is not int or value < 1:
+                raise ValueError("Arrow bounds must be positive integers")
+        if (
+            isinstance(max_seconds, bool)
+            or not isinstance(max_seconds, (int, float))
+            or not math.isfinite(max_seconds)
+            or max_seconds <= 0
+        ):
+            raise ValueError("Arrow time bound must be finite and positive")
+        self.columns = _validated_tabular_columns(
+            tuple(columns), max_columns, format_name="Arrow"
+        )
+        self.row_count = 0
+        self.byte_count = 0
+        self.column_types: tuple[str, ...] = ()
+        self._values: list[list[object]] = [[] for _ in self.columns]
+        self._types: list[type | None] = [None for _ in self.columns]
+        self._qualifiers: list[object] = [None for _ in self.columns]
+        self._decoded_bytes = 0
+        self._max_bytes = max_bytes
+        self._max_rows = max_rows
+        self._clock = clock
+        self._deadline = clock() + max_seconds
+        self._projected_types = tuple(projected_types or (None for _ in self.columns))
+        if len(self._projected_types) != len(self.columns):
+            raise ValueError("Arrow projected type metadata must match query columns")
+
+    def _check_time(self) -> None:
+        if self._clock() >= self._deadline:
+            self.incomplete("time_limit")
+
+    def incomplete(self, reason: str) -> NoReturn:
+        raise ArtifactError(
+            "artifact_incomplete_export",
+            "The exact Arrow export could not be completed within its fixed bounds.",
+            {
+                "reason": reason,
+                "completed_rows": self.row_count,
+                "completed_columns": len(self.columns),
+                "completed_bytes": self.byte_count,
+            },
+        )
+
+    def _unsupported(self, value: object, index: int, reason: str) -> NoReturn:
+        raise ArtifactError(
+            "artifact_unsupported_value",
+            "The source contains an unsupported or ambiguous Arrow scalar.",
+            {
+                "row_index": self.row_count,
+                "column_index": index,
+                "column_name": self.columns[index],
+                "runtime_type": _safe_runtime_type(value),
+                "reason": reason,
+            },
+        )
+
+    def append(self, row: Sequence[object]) -> None:
+        self._check_time()
+        if self.row_count >= self._max_rows:
+            self.incomplete("row_limit")
+        if isinstance(row, (str, bytes, bytearray, memoryview)) or len(row) != len(
+            self.columns
+        ):
+            raise ArtifactError(
+                "artifact_unsupported_value",
+                "The source returned an invalid Arrow row.",
+                {"reason": "row_shape"},
+            )
+        for index, value in enumerate(row):
+            if value is not None:
+                kind = type(value)
+                if kind not in {
+                    str,
+                    bytes,
+                    bool,
+                    int,
+                    float,
+                    Decimal,
+                    date,
+                    datetime,
+                    time,
+                }:
+                    self._unsupported(value, index, "scalar_type")
+                if self._types[index] is not None and self._types[index] is not kind:
+                    self._unsupported(value, index, "mixed_scalar_types")
+                self._types[index] = kind
+                if kind is int and not -(2**63) <= cast(int, value) < 2**63:
+                    self._unsupported(value, index, "integer_range")
+                if kind is float and not math.isfinite(cast(float, value)):
+                    self._unsupported(value, index, "nonfinite_float")
+                if kind is str and not _valid_utf8(cast(str, value)):
+                    self._unsupported(value, index, "invalid_unicode")
+                if kind is Decimal:
+                    decimal = cast(Decimal, value)
+                    if not decimal.is_finite():
+                        self._unsupported(value, index, "nonfinite_decimal")
+                    exponent = cast(int, decimal.as_tuple().exponent)
+                    if abs(exponent) > 76 or len(decimal.as_tuple().digits) > 76:
+                        self._unsupported(value, index, "decimal_range")
+                    prior = self._qualifiers[index]
+                    if prior is not None and prior != exponent:
+                        self._unsupported(value, index, "mixed_decimal_scales")
+                    self._qualifiers[index] = exponent
+                if kind is time and cast(time, value).tzinfo is not None:
+                    self._unsupported(value, index, "timezone_time")
+                if kind is datetime:
+                    stamp = cast(datetime, value)
+                    zone: str | None = None
+                    if stamp.tzinfo is not None:
+                        key = getattr(stamp.tzinfo, "key", None)
+                        offset = stamp.utcoffset()
+                        if offset is None:
+                            self._unsupported(value, index, "timezone_undefined")
+                        offset_seconds = offset.total_seconds()
+                        if offset_seconds % 60:
+                            self._unsupported(value, index, "timezone_precision")
+                        seconds = int(offset_seconds)
+                        zone = (
+                            key
+                            if isinstance(key, str)
+                            else (
+                                "UTC"
+                                if seconds == 0
+                                else f"{'+' if seconds > 0 else '-'}{abs(seconds)//3600:02d}:{abs(seconds)%3600//60:02d}"
+                            )
+                        )
+                    qualifier = (zone,)
+                    if (
+                        self._qualifiers[index] is not None
+                        and self._qualifiers[index] != qualifier
+                    ):
+                        self._unsupported(value, index, "mixed_timezones")
+                    self._qualifiers[index] = qualifier
+            self._decoded_bytes += sys.getsizeof(value) + 16
+            # This includes conservative Python container/scalar residency,
+            # independently of the bounded, uncompressed IPC publication.
+            if self._decoded_bytes > 128 * 1024 * 1024:
+                self.incomplete("decoded_byte_limit")
+            self._values[index].append(value)
+        self.row_count += 1
+
+    def finish(self) -> bytes:
+        self._check_time()
+        try:
+            pa = import_module("pyarrow")
+            ipc = import_module("pyarrow.ipc")
+        except ImportError:
+            raise ImportError(
+                "Exact Arrow exports require the admitted scientific runtime."
+            ) from None
+        arrays = []
+        for index, (values, kind) in enumerate(
+            zip(self._values, self._types, strict=True)
+        ):
+            declared = self._projected_types[index]
+            expected = {
+                "bool": bool,
+                "int2": int,
+                "int4": int,
+                "int8": int,
+                "float4": float,
+                "float8": float,
+                "numeric": Decimal,
+                "text": str,
+                "varchar": str,
+                "bpchar": str,
+                "name": str,
+                "bytea": bytes,
+                "date": date,
+                "time": time,
+                "timestamp": datetime,
+                "timestamptz": datetime,
+            }
+            if declared is not None:
+                if (
+                    declared not in expected
+                    or kind is not None
+                    and kind is not expected[declared]
+                ):
+                    self._unsupported(
+                        None, index, "projected_type_unsupported_or_inconsistent"
+                    )
+                kind = expected[declared]
+                if declared == "numeric" and self._types[index] is None:
+                    self._unsupported(None, index, "decimal_scale_unknown")
+                if declared in {"timestamp", "timestamptz"}:
+                    qualifier = self._qualifiers[index]
+                    if qualifier is None:
+                        self._qualifiers[index] = (
+                            "UTC" if declared == "timestamptz" else None,
+                        )
+                    elif (cast(tuple[object], qualifier)[0] is not None) != (
+                        declared == "timestamptz"
+                    ):
+                        self._unsupported(None, index, "timestamp_timezone_mismatch")
+            if kind is None:
+                data_type = pa.null()
+            elif kind is str:
+                data_type = pa.string()
+            elif kind is bytes:
+                data_type = pa.binary()
+            elif kind is bool:
+                data_type = pa.bool_()
+            elif kind is int:
+                data_type = {"int2": pa.int16(), "int4": pa.int32()}.get(
+                    declared or "", pa.int64()
+                )
+            elif kind is float:
+                data_type = pa.float32() if declared == "float4" else pa.float64()
+            elif kind is date:
+                data_type = pa.date32()
+            elif kind is time:
+                data_type = pa.time64("us")
+            elif kind is datetime:
+                data_type = pa.timestamp(
+                    "us", tz=cast(tuple[str | None], self._qualifiers[index])[0]
+                )
+            elif kind is Decimal:
+                scale = -cast(int, self._qualifiers[index])
+                precision = max(
+                    1,
+                    scale,
+                    *(
+                        len(cast(Decimal, value).as_tuple().digits)
+                        for value in values
+                        if value is not None
+                    ),
+                )
+                data_type = (
+                    pa.decimal128(precision, scale)
+                    if precision <= 38 and abs(scale) <= 38
+                    else pa.decimal256(precision, scale)
+                )
+            else:
+                raise AssertionError("unqualified Arrow scalar")
+            try:
+                array = pa.array(values, type=data_type, from_pandas=False, safe=True)
+            except (pa.ArrowException, ValueError, OverflowError):
+                self._unsupported(None, index, "scalar_encoding")
+            if (
+                kind in {bool, int, float, Decimal, str, bytes, date, time}
+                and array.to_pylist() != values
+            ):
+                self._unsupported(None, index, "scalar_encoding_loss")
+            arrays.append(array)
+        table = pa.Table.from_arrays(
+            arrays, names=self.columns
+        ).replace_schema_metadata({b"daita.scalar_encoding": b"1"})
+        if table.nbytes > self._max_bytes:
+            self.incomplete("byte_limit")
+        self.column_types = tuple(str(field.type) for field in table.schema)
+        owner = self
+
+        class BoundedBuffer(BytesIO):
+            def write(self, data) -> int:
+                if self.tell() + len(data) > owner._max_bytes:
+                    owner.incomplete("byte_limit")
+                return super().write(data)
+
+        buffer = BoundedBuffer()
+        with ipc.new_file(buffer, table.schema) as writer:
+            writer.write_table(table, max_chunksize=4096)
+        self._check_time()
+        content = buffer.getvalue()
+        self.byte_count = len(content)
+        if self.byte_count > self._max_bytes:
+            self.incomplete("byte_limit")
+        return content
+
+
+def arrow_schema(content: bytes) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Inspect metadata from a framework-rendered IPC file without projecting rows."""
+    pa = import_module("pyarrow")
+    ipc = import_module("pyarrow.ipc")
+    with ipc.open_file(pa.BufferReader(content)) as reader:
+        return tuple(reader.schema.names), tuple(
+            str(field.type) for field in reader.schema
+        )
 
 
 class ExactCsvRenderer:

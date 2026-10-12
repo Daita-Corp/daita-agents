@@ -376,7 +376,18 @@ async def test_invalid_inputs_and_candidates_never_publish(
             assert not any(record.kind == "generation" for record in records)
         else:
             await capture_run(agent, result.run_id, analysis_report)
-            assert output["data"]["state_lost"] is True
+            if failure == "traversal":
+                # Registration rejects the path before it reaches host output
+                # validation, so this is an ordinary correctable Python error.
+                assert output["data"]["status"] == "python_error"
+                assert (
+                    "Output paths must be relative scratch filenames"
+                    in output["data"]["traceback"]
+                )
+                assert output["data"]["outputs"] == []
+                assert output["data"]["state_lost"] is False
+            else:
+                assert output["data"]["state_lost"] is True
     finally:
         await agent.close()
 

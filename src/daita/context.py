@@ -23,6 +23,7 @@ from .capabilities import (
 from .capability_runtime import (
     EffectReceiptStore,
     RunToolCatalog,
+    RunToolCatalogEntry,
     StepToolProjection,
 )
 from .catalog.capabilities import (
@@ -1191,6 +1192,8 @@ class AgentContextBuilder:
             frozenset(entry.capability.id for entry in tool_context.catalog_entries),
             local_file_context=snapshot.local_file_context,
             messages=messages,
+            arrow_export_callable=_arrow_export_admitted(tool_context.callable_entries),
+            arrow_export_candidate=_arrow_export_admitted(tool_context.catalog_entries),
             external_actions_callable=any(
                 entry.capability.operational_effect is OperationalEffect.EXTERNAL_ACTION
                 for entry in tool_context.callable_entries
@@ -2824,10 +2827,10 @@ def _system_prompt(
     if has_on_demand_tools:
         instructions.extend(
             (
-                "Pinned tools are callable. toolbox_load exact names replaces the "
-                "on-demand set next step. Group independent reads/search/load calls. "
-                "toolbox_inspect reads exact input/output and grant contracts without "
-                "activation. Complete result contracts survive tool switching; incomplete "
+                "Pinned tools are callable. toolbox_load replaces on-demand tools next step; "
+                "load known names directly, no search. Group independent reads. "
+                "toolbox_inspect reads exact schemas and grants without activation. "
+                "Complete result contracts survive tool switching; incomplete "
                 "references require inspection. For partial inspection use returned "
                 "paths/offsets and exact contract_digest. Search automation_contract "
                 "supports scheduling; future tools need not be loaded. Manifest "
@@ -2874,6 +2877,31 @@ def _system_prompt(
     return "\n\n".join(instructions)
 
 
+def _arrow_export_admitted(entries: tuple[RunToolCatalogEntry, ...]) -> bool:
+    for entry in entries:
+        capability = entry.capability
+        if (
+            entry.domain_owner_id != "data"
+            or capability.id != DATA_EXPORT_TABULAR_CAPABILITY_ID
+            or capability.access_mode is not AccessMode.READ
+            or capability.operational_effect is not OperationalEffect.NONE
+        ):
+            continue
+        properties = capability.input_schema.get("properties")
+        format_schema = (
+            properties.get("format") if isinstance(properties, Mapping) else None
+        )
+        if (
+            isinstance(format_schema, Mapping)
+            and "arrow" in format_schema.get("enum", ())
+            and capability.artifact_policy is not None
+            and "application/vnd.apache.arrow.file"
+            in capability.artifact_policy.allowed_media_types
+        ):
+            return True
+    return False
+
+
 def _tool_guidance(
     capability_ids: frozenset[str],
     artifact_destinations: tuple[ArtifactDestination, ...],
@@ -2881,6 +2909,8 @@ def _tool_guidance(
     *,
     local_file_context: FrozenJsonObject | None = None,
     external_actions_callable: bool = False,
+    arrow_export_callable: bool = False,
+    arrow_export_candidate: bool = False,
     messages: tuple[CanonicalMessage, ...] = (),
 ) -> str:
     """Code-owned procedures for this authenticated tool working set only."""
@@ -2945,6 +2975,21 @@ def _tool_guidance(
         for block in message.content
         if isinstance(block, TextBlock)
     ).lower()
+    programmatic_reads_requested = (
+        re.search(r"\btools\.(?:call|batch)\b", query) is not None
+    )
+    capture_requested = re.search(r"\btools\.capture\b", query) is not None
+    if "analysis.execute" in candidates and (
+        programmatic_reads_requested or (capture_requested and arrow_export_candidate)
+    ):
+        instructions.append(
+            "Python requested reads: load analysis_execute together with the needed "
+            "read tools using toolbox_load. Perform the requested tools.call, "
+            "tools.batch or admitted Arrow capture inside the computation cell, "
+            "and compute from their returned results. Copied row literals do not "
+            "supply child-read evidence. Loading grants no authority; callable "
+            "scope and child limits still apply."
+        )
     if "data.query" in capability_ids and re.search(
         r"\b(dates?|days?|daily|timestamps?|timezones?|time zones?|utc)\b|\b\d{4}-\d{2}-\d{2}\b",
         query,
@@ -2970,7 +3015,13 @@ def _tool_guidance(
             "evidence_id and sensitivity. Check is_error before using output['data']; "
             "use the tool's declared result shape, never assume text or rows. Only already "
             "callable admitted reads can run inside a cell; load missing tools outside it. "
-            "Reuse retained variables and authenticated inputs instead of repeating reads. "
+            "tools.batch([{name: ..., arguments: ...}, ...]) waits once for independent "
+            "loaded reads and returns one result per item in submission order; check "
+            "each is_error. It shares cell/run call and byte limits. Dependent reads "
+            "remain sequential through tools.call. Batch cannot load tools or perform effects. "
+            "Validate input fields/types and compute in the same cell when possible. "
+            "Reuse sufficient retained variables and authenticated inputs when the task "
+            "does not require a fresh programmatic read. "
             "Preserve reported completeness, truncation, coverage and limitations in "
             "derived results and conclusions; a bounded sample cannot become complete data. "
             "Respect cell/run time, CPU, memory, scratch, child-call and byte bounds and "
@@ -3007,6 +3058,31 @@ def _tool_guidance(
                 (LOCAL_FILE_QUERY_CAPABILITY_ID, LOCAL_FILE_QUERY_OUTPUT_KIND),
             }
         )
+        dataset_requested = (
+            re.search(
+                r"\b(datasets?|statistics|statistical|percentiles?|medians?|averages?|aggregates?|complete query|(?:all|every) rows?)\b",
+                query,
+            )
+            is not None
+            or capture_requested
+            or any(
+                isinstance(data := block.output.get("data"), Mapping)
+                and (data.get("truncated") is True or data.get("complete") is False)
+                for block in query_results
+            )
+        )
+        if dataset_requested and DATA_EXPORT_TABULAR_CAPABILITY_ID in candidates:
+            instructions.append(
+                "Python datasets: use a complete exact query export before dataset-wide statistics when existing authenticated inputs are insufficient. Query predicates and explicit limits define its coverage; preview rows are bounded evidence. Preserve projected aliases, types, order and duplicates; validate and calculate together."
+            )
+            if arrow_export_callable:
+                instructions.append(
+                    "Python Arrow: r = tools.capture('data_export_tabular', export_arguments, name='rows') accepts only format='arrow' on the already loaded contract. Check r['is_error'] and retain r['output']['artifact'], including a staging failure. After successful capture, read the installed dataset with pyarrow.ipc.open_file(inputs.path('rows')). The return value is structured evidence; inputs.path uses the exact name supplied to capture. No path is returned on r and directory scanning cannot resolve an authenticated input. Alternatively export, then bind the exact artifact ID in analysis_execute.inputs. A capture is an input, not a saved output; confirm every requested output reference separately. No automatic query/cell replay."
+                )
+            elif arrow_export_candidate:
+                instructions.append(
+                    "The exact Arrow export is discoverable but not loaded. Use toolbox_load with data_export_tabular and analysis_execute together before capture; known names need no search. Loading grants no source authority."
+                )
         csv_result = any(
             isinstance(data := block.output.get("data"), Mapping)
             and (
@@ -3069,7 +3145,8 @@ def _tool_guidance(
                 "Python query results: build computations from the returned columns and "
                 "rows, including aliases and projections; base-table fields may be absent. "
                 "Validate required fields in the computation cell and retain reported "
-                "coverage instead of rereading sufficient results."
+                "coverage. Reuse sufficient results unless the task requires a fresh "
+                "programmatic read."
             )
         if re.search(
             r"\b(charts?|charting|plots?|plotting|histograms?|scatter|matplotlib|visuali[sz]ations?)\b",
