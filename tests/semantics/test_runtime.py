@@ -102,6 +102,74 @@ async def _seed_source(tmp_path, name: str):
     return database, source, resource
 
 
+@pytest.mark.parametrize(
+    "field_reference", ("invoices.booked_at", "booked_at", "`booked_at`")
+)
+async def test_schema_bound_memory_redirects_to_semantics_and_survives_restart(
+    tmp_path,
+    field_reference,
+):
+    database, source, resource = await _seed_source(tmp_path, "bound-memory")
+    approvals = []
+
+    async def approve(request):
+        approvals.append(request)
+        return ApprovalDecision.APPROVE
+
+    statement = f"Booked revenue uses {field_reference}."
+    provider = MockModelProvider(
+        (
+            _call(
+                ToolCall(
+                    id="plain-memory",
+                    name="memory_set",
+                    arguments={"target": "memory", "content": statement},
+                )
+            ),
+            _call(
+                _semantic_call(
+                    source.id,
+                    resource.id,
+                    resource.current_revision,
+                    statement=statement,
+                )
+            ),
+            _stop("Saved schema-bound meaning"),
+        )
+    )
+    agent = await Agent.open(
+        "bound-memory",
+        root=tmp_path,
+        model=provider,
+        model_profile=_profile(provider),
+        approval_handler=approve,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        await agent.learn("Remember: " + statement)
+        assert (
+            _error_code(_tool_results(provider)[0]) == "memory_schema_bound_definition"
+        )
+        assert await agent.read_memory() == ""
+        assert len(approvals) == 1
+        assert (await agent.list_semantic_annotations())[0].usable_as_current_meaning
+    finally:
+        await agent.close()
+    with sqlite3.connect(database) as connection:
+        connection.execute("ALTER TABLE invoices RENAME COLUMN booked_at TO posted_at")
+    agent = await Agent.open(
+        "bound-memory", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        await agent.refresh_source(source.id)
+        view = (await agent.list_semantic_annotations())[0]
+        assert not view.usable_as_current_meaning
+        assert view.requires_revalidation
+        assert view.annotation.subject.fields[0].field_name == "booked_at"
+    finally:
+        await agent.close()
+
+
 def _semantic_call(
     source_id: str,
     resource_id: str,

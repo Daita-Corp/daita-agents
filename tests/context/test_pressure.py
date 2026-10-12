@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+from daita.capabilities import CapabilityRegistry
+from daita.capability_runtime import CapabilityRuntime
+from daita.domains.analysis.domain import AnalysisCapabilityDomain
+from daita.hosting.execution_governor import RunAdmissionCoordinator
+from daita.llm.errors import ContextWindowExceeded
 from tests.support.kernel import (
     NOW,
     START_DATA_PROFILE_CAPABILITY_ID,
@@ -206,6 +211,296 @@ async def test_context_owns_durable_job_handoff_guidance() -> None:
     assert "code-owned terminal-job run" in system.text
 
 
+@pytest.mark.parametrize("available", (False, True))
+@pytest.mark.parametrize(
+    "message,requested_reads",
+    (
+        ("Simulate a numerical system.", False),
+        ("Use Python and tools.batch for independent relational reads.", True),
+        ("Use tools.call for the read inside Python.", True),
+    ),
+)
+async def test_python_guidance_follows_applicable_loaded_projection(
+    monkeypatch, available, message, requested_reads
+):
+    monkeypatch.setattr("daita.domains.analysis.domain.available", lambda: available)
+    domain = AnalysisCapabilityDomain(RunAdmissionCoordinator())
+    runtime = CapabilityRuntime(
+        CapabilityRegistry(declarations=(domain.declarations,), executors=(domain,)),
+        (domain,),
+    )
+    builder = AgentContextBuilder(
+        _SnapshotCatalog(),
+        profile=ModelProfile(
+            id="mock:python-context",
+            context_window_tokens=32_000,
+            max_output_tokens=2_000,
+            supports_tools=True,
+        ),
+    )
+    run = replace(_run("python-context"), message=message, start=None)
+    messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
+    catalog = await runtime.prepare_run(run)
+    snapshot = await builder.prepare(run, messages, catalog)
+    before = builder.project(
+        snapshot, messages, step=1, tool_context=runtime.project(catalog, messages)
+    )
+    assert "python_execute" not in {tool.name for tool in before.tools}
+    assert (
+        "Python workspace:" not in cast(TextBlock, before.messages[0].content[0]).text
+    )
+    assert (
+        "Python requested reads:" in cast(TextBlock, before.messages[0].content[0]).text
+    ) is (available and requested_reads)
+
+    call = ToolCall(
+        id="load-python",
+        name="toolbox_load",
+        arguments={"tool_names": ("python_execute",)},
+    )
+    outcome = await runtime.execute_all(
+        run,
+        (call,),
+        projection=runtime.project(catalog, messages),
+        messages=messages,
+        sensitivity=ModelSensitivity.PUBLIC,
+    )
+    result = outcome.ordered_results[0]
+    assert result.is_error is (not available)
+    messages = (
+        *messages,
+        CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(call,)),
+        CanonicalMessage(MessageRole.TOOL, content=(result,)),
+    )
+    request = builder.project(
+        snapshot,
+        messages,
+        step=2,
+        tool_context=runtime.project(catalog, messages),
+    )
+    callable_python = "python_execute" in {tool.name for tool in request.tools}
+    assert callable_python is available
+    system = cast(TextBlock, request.messages[0].content[0]).text
+    assert ("Python workspace:" in system) is callable_python
+    assert ("Python requested reads:" in system) is (available and requested_reads)
+    assert not any(
+        f"Python {procedure}:" in system
+        for procedure in ("CSV", "database", "query results", "charts")
+    )
+    assert request.messages[-len(messages) :] == messages
+    assert _estimate_input_tokens(request) <= snapshot.profile.maximum_input_tokens
+
+
+@pytest.mark.parametrize(
+    "message,capability_id,kind,data,is_error,expected",
+    (
+        ("Normalize text and validate JSON records.", None, None, {}, False, set()),
+        ("Compute from sales.csv.", None, None, {}, False, {"CSV"}),
+        (
+            "Compute from a SQLite database join.",
+            None,
+            None,
+            {},
+            False,
+            {"database", "query results"},
+        ),
+        ("Transform query results.", None, None, {}, False, {"query results"}),
+        ("Plot a histogram from retained values.", None, None, {}, False, {"charts"}),
+        (
+            "Compute from this input.",
+            "data.query",
+            "data.query_result",
+            {"columns": ["aliased_total"]},
+            False,
+            {"database", "query results"},
+        ),
+        (
+            "Compute from this input.",
+            "data.local_file.query",
+            "data.local_file.query_result",
+            {"format": "csv", "columns": ["aliased_total"]},
+            False,
+            {"CSV", "query results"},
+        ),
+        (
+            "Compute from this input.",
+            "data.local_file.read",
+            "data.local_file.read_result",
+            {"path": "sales.CSV"},
+            False,
+            {"CSV"},
+        ),
+        (
+            "Compute from this input.",
+            "data.local_file.read",
+            "data.local_file.read_result",
+            {"path": "notes.txt", "content": "CSV database query chart"},
+            False,
+            set(),
+        ),
+        (
+            "Compute from this input.",
+            "mcp.tool",
+            "data.query_result",
+            {"format": "csv", "columns": ["chart"]},
+            False,
+            set(),
+        ),
+        (
+            "Compute from this input.",
+            "data.query",
+            "data.query_result",
+            {},
+            True,
+            set(),
+        ),
+    ),
+)
+async def test_python_procedures_use_current_task_and_typed_metadata(
+    message, capability_id, kind, data, is_error, expected
+):
+    builder = AgentContextBuilder(
+        _SnapshotCatalog(),
+        profile=ModelProfile(
+            id="mock:python-procedures",
+            context_window_tokens=32_000,
+            max_output_tokens=2_000,
+            supports_tools=True,
+        ),
+    )
+    ids = ("analysis.execute", "data.query", "data.local_file.query")
+    projection = ContextToolProjectionAdapter(
+        tuple(
+            ToolDefinition(
+                name=name,
+                description="Read or compute.",
+                input_schema={"type": "object"},
+            )
+            for name in ("python_execute", "data_query", "file_query")
+        ),
+        capability_ids=ids,
+    )
+    run = replace(_run("python-procedures"), message=message, start=None)
+    user = run.start_message()
+    catalog = await projection.prepare_run(run)
+    # Earlier tasks must not add procedures to the current computation.
+    history = (
+        CanonicalMessage(
+            MessageRole.USER,
+            content=(
+                TextBlock(
+                    "Chart CSV database query results using tools.batch and tools.capture."
+                ),
+            ),
+        ),
+        CanonicalMessage(MessageRole.ASSISTANT, content=(TextBlock("Prior answer."),)),
+    )
+    snapshot = await builder.prepare(run, (*history, user), catalog)
+    messages: tuple[CanonicalMessage, ...] = (user,)
+    if capability_id is not None:
+        call = ToolCall(id="captured-input", name="lookup")
+        messages = (
+            user,
+            CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(call,)),
+            CanonicalMessage(
+                MessageRole.TOOL,
+                content=(
+                    ToolResultBlock(
+                        call_id=call.id,
+                        capability_id=capability_id,
+                        executor_id=f"{capability_id}.executor",
+                        output={"kind": kind, "data": data},
+                        is_error=is_error,
+                    ),
+                ),
+            ),
+        )
+    request = builder.project(
+        snapshot,
+        messages,
+        step=2,
+        tool_context=projection.project(catalog, messages),
+    )
+    system = cast(TextBlock, request.messages[0].content[0]).text
+    assert "Python requested reads:" not in system
+    # Check selected procedure categories, not their exact prose or a scripted
+    # model's reasoning. Selection cannot add callable tools or alter evidence.
+    assert {
+        procedure
+        for procedure in ("CSV", "database", "query results", "charts")
+        if f"Python {procedure}:" in system
+    } == expected
+    assert {tool.name for tool in request.tools} == {
+        "python_execute",
+        "data_query",
+        "file_query",
+        "toolbox_inspect",
+    }
+    assert request.messages[-len(messages) :] == messages
+
+
+async def test_python_guidance_is_counted_at_preparation_and_projection():
+    profile = ModelProfile(
+        id="mock:python-bounds",
+        context_window_tokens=32_000,
+        max_output_tokens=2_000,
+        supports_tools=True,
+    )
+    run = replace(
+        _run("python-bounds"),
+        message="Compute CSV and database query results and plot a chart.",
+        start=None,
+    )
+    messages = (run.start_message(),)
+    projection = ContextToolProjectionAdapter(
+        (
+            ToolDefinition(
+                name="python_execute",
+                description="Compute.",
+                input_schema={"type": "object"},
+            ),
+            ToolDefinition(
+                name="data_query", description="Read.", input_schema={"type": "object"}
+            ),
+        ),
+        capability_ids=("analysis.execute", "data.query"),
+    )
+    catalog = await projection.prepare_run(run)
+    tools = projection.project(catalog, messages)
+    builder = AgentContextBuilder(_SnapshotCatalog(), profile=profile)
+    snapshot = await builder.prepare(run, messages, catalog)
+    request = builder.project(snapshot, messages, step=1, tool_context=tools)
+    size = _estimate_input_tokens(request)
+    assert size <= profile.maximum_input_tokens
+    # A prepared projection still checks the whole request, including guidance,
+    # without truncating the current transcript or silently dropping procedures.
+    bounded = replace(
+        snapshot,
+        profile=replace(
+            profile, context_window_tokens=size + profile.max_output_tokens
+        ),
+    )
+    assert builder.project(bounded, messages, step=1, tool_context=tools) == request
+    with pytest.raises(ContextWindowExceeded):
+        builder.project(
+            replace(
+                bounded,
+                profile=replace(
+                    bounded.profile,
+                    context_window_tokens=bounded.profile.context_window_tokens - 1,
+                ),
+            ),
+            messages,
+            step=1,
+            tool_context=tools,
+        )
+    small_builder = AgentContextBuilder(
+        _SnapshotCatalog(), profile=replace(profile, context_window_tokens=6_000)
+    )
+    with pytest.raises(ContextWindowExceeded):
+        await small_builder.prepare(run, messages, catalog)
+
+
 async def test_context_owner_rejects_cumulative_evidence_pressure_explicitly():
     builder = AgentContextBuilder(
         _SnapshotCatalog(),
@@ -258,3 +553,91 @@ def test_token_estimate_is_conservative_accounting_not_raw_byte_count():
     estimate = _estimate_input_tokens(request)
 
     assert estimate > len(("a" * 3_000).encode("utf-8"))
+
+
+@pytest.mark.parametrize("arrow", (False, True))
+@pytest.mark.parametrize(
+    "message,dataset_requested",
+    (
+        ("Compute statistics from a complete dataset.", True),
+        ("Use Python to compute over every row of the connected table.", True),
+        ("Use tools.capture('data_export_tabular', args, name='numbers').", True),
+        ("Normalize retained JSON records.", False),
+    ),
+)
+async def test_dataset_guidance_requires_exact_loaded_export_metadata(
+    monkeypatch, arrow, message, dataset_requested
+):
+    from daita.capabilities import ToolExecution, ToolOutput
+    from daita.domains.data.export_capabilities import (
+        data_export_tabular_capability_declarations,
+    )
+    from tests.support.capability_runtime import StaticTestDomain
+
+    monkeypatch.setattr("daita.domains.analysis.domain.available", lambda: True)
+    analysis = AnalysisCapabilityDomain(RunAdmissionCoordinator())
+    exports = data_export_tabular_capability_declarations(allow_arrow=arrow)
+    data = StaticTestDomain(
+        exports.capabilities, exports.tool_views, domain_owner_id="data"
+    )
+
+    class Export:
+        executor_id = exports.executor_ids[0]
+
+        async def execute(self, request: ToolExecution) -> ToolOutput:
+            raise AssertionError("Guidance and loading cannot execute an export")
+
+    runtime = CapabilityRuntime(
+        CapabilityRegistry(
+            declarations=(analysis.declarations, exports),
+            executors=(analysis, Export()),
+        ),
+        (analysis, data),
+    )
+    builder = AgentContextBuilder(
+        _SnapshotCatalog(),
+        profile=ModelProfile(
+            id="mock:typed-dataset-context",
+            context_window_tokens=32000,
+            max_output_tokens=2000,
+            supports_tools=True,
+        ),
+    )
+    run = replace(_run("typed-dataset"), message=message, start=None)
+    messages: tuple[CanonicalMessage, ...] = (run.start_message(),)
+    catalog = await runtime.prepare_run(run)
+    snapshot = await builder.prepare(run, messages, catalog)
+    for names in (("python_execute",), ("python_execute", "data_export_tabular")):
+        call = ToolCall(
+            id=f"load-{len(names)}",
+            name="toolbox_load",
+            arguments={"tool_names": names},
+        )
+        result = (
+            await runtime.execute_all(
+                run,
+                (call,),
+                projection=runtime.project(catalog, messages),
+                messages=messages,
+                sensitivity=ModelSensitivity.PUBLIC,
+            )
+        ).ordered_results[0]
+        assert not result.is_error
+        messages = (
+            *messages,
+            CanonicalMessage(MessageRole.ASSISTANT, tool_calls=(call,)),
+            CanonicalMessage(MessageRole.TOOL, content=(result,)),
+        )
+        request = builder.project(
+            snapshot,
+            messages,
+            step=len(names) + 1,
+            tool_context=runtime.project(catalog, messages),
+        )
+        text = cast(TextBlock, request.messages[0].content[0]).text
+        assert "tools.batch" in text and "in submission order" in text
+        assert ("tools.capture(" in text) is (
+            arrow and len(names) == 2 and dataset_requested
+        )
+        assert request.messages[-len(messages) :] == messages
+        assert _estimate_input_tokens(request) <= snapshot.profile.maximum_input_tokens

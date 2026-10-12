@@ -7,6 +7,7 @@ import pytest
 
 from daita.identity import AgentIdentity, AgentIdentityConflictError
 from daita.llm.models import CanonicalMessage, MessageRole, TextBlock
+from daita.loop.analysis import AnalysisEvidence
 from daita.loop.models import LoopExit, LoopExitKind, RunInput
 from daita.loop.transcripts import ConversationPredecessor
 from tests.storage._support import StateStoreFactory
@@ -114,3 +115,108 @@ async def test_unfinished_recovery_is_durable_and_does_not_replay(
             == ()
         )
         assert (await reopened.load(run.id)).messages == (user,)
+
+
+async def test_terminal_cleanup_recovery_appends_once_under_exact_cas(
+    state_store_factory,
+):
+    run = RunInput(
+        id="cleanup-run",
+        agent_id="agent-1",
+        message="fixture",
+        conversation_id="cleanup-conversation",
+        created_at=GRAPH_NOW,
+    )
+    identity = {
+        "scratch": "/private/tmp/daita-analysis-fixture",
+        "scratch_device": 1,
+        "scratch_inode": 2,
+        "closure_path": "/private/tmp/daita-analysis-closure-fixture",
+        "closure_device": 1,
+        "closure_inode": 3,
+        "closure_nonce": "a" * 64,
+    }
+    original = AnalysisEvidence(
+        run.id,
+        "parser-1",
+        "generation",
+        {
+            "status": "cleanup_failed",
+            **identity,
+            "usage": {
+                "cpu_complete": False,
+                "user_cpu_seconds": None,
+                "system_cpu_seconds": None,
+            },
+            "cleanup": {"scratch_deleted": False, "failure": "PermissionError"},
+        },
+    )
+    native = {
+        "status": "recovered_closed",
+        **identity,
+        "pid": None,
+        "usage": {
+            "cpu_complete": True,
+            "user_cpu_seconds": 0.0,
+            "system_cpu_seconds": 0.0,
+        },
+        "cleanup": {
+            "process_reaped": True,
+            "process_spawned": False,
+            "scratch_deleted": True,
+            "descriptors_closed": True,
+            "child_io_settled": True,
+        },
+    }
+    result = LoopExit(
+        run_id=run.id,
+        conversation_id=run.conversation_id or run.id,
+        kind=LoopExitKind.FAILED,
+        reason="analysis_cleanup_failed",
+        created_at=GRAPH_NOW,
+    )
+    async with state_store_factory() as store:
+        await store.initialize_identity(AgentIdentity("agent-1", "Fixture", GRAPH_NOW))
+        await store.start(run)
+        await store.record_analysis_evidence(
+            "agent-1",
+            AnalysisEvidence(
+                run.id,
+                original.evidence_id,
+                original.kind,
+                {**original.facts, "status": "admitted"},
+            ),
+        )
+        await store.record_analysis_evidence("agent-1", original)
+        await store.finish(result)
+        with pytest.raises(ValueError, match="live"):
+            await store.record_analysis_evidence("agent-1", original)
+        with pytest.raises(ValueError, match="identity"):
+            await store.recover_analysis_evidence("other-agent", original, native)
+        with pytest.raises(ValueError, match="identity"):
+            await store.recover_analysis_evidence(
+                "agent-1", original, {**native, "closure_nonce": "b" * 64}
+            )
+        recovered = await store.recover_analysis_evidence("agent-1", original, native)
+        assert (
+            await store.recover_analysis_evidence("agent-1", original, native)
+            == recovered
+        )
+        assert recovered.facts["status"] == "cleanup_failed"
+        assert recovered.facts["cleanup"] == original.facts["cleanup"]
+        assert recovered.facts["usage"] == original.facts["usage"]
+        with pytest.raises(ValueError, match="once-only"):
+            await store.recover_analysis_evidence("agent-1", recovered, native)
+        disposed = await store.recover_analysis_evidence(
+            "agent-1", recovered, proof_disposed=True
+        )
+        assert (
+            await store.recover_analysis_evidence(
+                "agent-1", recovered, proof_disposed=True
+            )
+            == disposed
+        )
+        assert await store.result(run.id) == result
+    async with state_store_factory() as store:
+        assert await store.result(run.id) == result
+        assert await store.load_analysis_evidence("agent-1", run.id) == (disposed,)

@@ -80,6 +80,7 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.routines import RoutineOccurrenceDisposition
 from daita.routines.owner import RoutineError
+from daita.storage.home_migrations import CURRENT_HOME_REVISION
 from tests.support.mcp import (
     MCPConformanceTransport,
     MCPFixtureIdentity,
@@ -336,10 +337,14 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
         await reopened.close()
 
     # A released home can retain only the delivery after its transcript is cleared.
-    # Revision 3 must recover its full registry record from the owned manifest.
+    # Restore the revision-2 schema and contiguous ledger so revision 3 recovers
+    # its full registry record from the owned manifest before upgrading to current.
     with sqlite3.connect(reopened.home / "state.db") as connection:
+        connection.execute("DROP TABLE analysis_evidence")
         connection.execute("DROP TABLE artifacts")
-        connection.execute("DELETE FROM agent_home_migrations WHERE revision = 3")
+        connection.execute("DELETE FROM agent_home_migrations WHERE revision >= 3")
+    legacy = await Agent.inspect_home("d2-sqlite-csv", root=tmp_path)
+    assert legacy.found_revision == 2 and legacy.upgrade_required
     migrated = await Agent.open(
         "d2-sqlite-csv",
         root=tmp_path,
@@ -347,6 +352,10 @@ async def test_scheduled_sqlite_csv_uses_one_artifact_and_delivery_across_reopen
         clock=lambda: NOW,
     )
     try:
+        current = await Agent.inspect_home("d2-sqlite-csv", root=tmp_path)
+        assert (
+            current.found_revision == current.current_revision == CURRENT_HOME_REVISION
+        )
         assert (await migrated.read_artifact(artifact_id)).content == payload.content
         assert (await migrated.inbox())[0].delivery_id == delivery_id
     finally:

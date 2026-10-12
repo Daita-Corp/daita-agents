@@ -16,9 +16,11 @@ from pathlib import Path
 
 from ..artifacts.models import ArtifactError
 from ..artifacts.renderers import (
+    ExactArrowRenderer,
     ExactCsvRenderer,
     ExactXlsxProvenance,
     ExactXlsxRenderer,
+    arrow_schema,
 )
 from ..domains.data.capabilities import SQLiteReadResult
 from ..domains.data.controller import ReadScopedCatalogReader
@@ -289,6 +291,7 @@ class SQLiteQueryBackend:
             row_count=row_count,
             content=content,
             sensitivity=sensitivity,
+            column_types=arrow_schema(content)[1] if format_name == "arrow" else (),
         )
 
 
@@ -436,7 +439,7 @@ def _run_exact_tabular_sync(
     admitted_descriptor: int | None = None
     timed_out = threading.Event()
     deadline = time.monotonic() + timeout_seconds
-    renderer: ExactCsvRenderer | ExactXlsxRenderer | None = None
+    renderer: ExactArrowRenderer | ExactCsvRenderer | ExactXlsxRenderer | None = None
 
     def interrupted() -> int:
         if cancellation.is_set():
@@ -478,6 +481,14 @@ def _run_exact_tabular_sync(
         columns = tuple(item[0] for item in cursor.description)
         if format_name == "csv":
             renderer = ExactCsvRenderer(
+                columns,
+                max_rows=max_rows,
+                max_columns=max_columns,
+                max_bytes=max_bytes,
+                max_seconds=timeout_seconds,
+            )
+        elif format_name == "arrow":
+            renderer = ExactArrowRenderer(
                 columns,
                 max_rows=max_rows,
                 max_columns=max_columns,

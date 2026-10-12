@@ -932,7 +932,7 @@ def _query_declarations(
                 "parameters": {
                     "type": "array",
                     "maxItems": MAX_SQL_PARAMETERS,
-                    "description": "Positional values: PostgreSQL uses $1, $2, ...; SQLite uses ?. Match the current source's SQL dialect.",
+                    "description": "SQLite ? values follow SQL occurrence order; PostgreSQL $1, $2, ... by index. Verify filter bindings.",
                 },
             },
             "required": ["source_id", "resource_ids", "sql"],

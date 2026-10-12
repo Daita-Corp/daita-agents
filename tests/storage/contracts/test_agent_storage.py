@@ -6,7 +6,7 @@ from decimal import Decimal
 
 import pytest
 
-from daita import Agent, AgentConfig
+from daita import Agent, AgentConfig, HostCapacityLimits, PostgreSQLReadLimits
 from daita.hosting.embedded import (
     AgentHomeError,
     AgentIdentityMismatchError,
@@ -67,9 +67,16 @@ async def test_document_storage_failure_stops_the_run_before_another_model_call(
         artifact_storage=artifact_byte_storage,
         model=provider,
         model_profile=_profile(provider),
+        config=AgentConfig(
+            host_capacity=HostCapacityLimits(execution_capacity=8, provider_capacity=4),
+            postgresql_reads=PostgreSQLReadLimits(pool_enabled=True, max_connections=1),
+        ),
         approval_handler=approve,
     )
     try:
+        assert dict(agent.admission_diagnostics().capacities)["execution"] == 8
+        assert agent.postgresql_read_diagnostics().limits.pool_enabled
+        assert agent.postgresql_read_diagnostics().pool_size_per_source == 1
         with pytest.raises(error_type):
             await agent.run("Remember the new memory.")
         assert len(provider.logical_requests) == 1

@@ -56,9 +56,10 @@ def test_canonical_toolbox_records_are_closed_bounded_and_exact() -> None:
         "Knowledge",
         "Jobs",
         "Routines",
+        "Analysis",
     )
-    assert len({item.id for item in TOOLBOX_DEFINITIONS}) == 6
-    assert len({item.label for item in TOOLBOX_DEFINITIONS}) == 6
+    assert len({item.id for item in TOOLBOX_DEFINITIONS}) == 7
+    assert len({item.label for item in TOOLBOX_DEFINITIONS}) == 7
     assert tuple(item.value for item in ToolLoadMode) == ("pinned", "on_demand")
     assert tuple(item.value for item in ToolTextTrust) == (
         "code",

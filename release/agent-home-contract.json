@@ -127,6 +127,15 @@
         "definition": "Add caller provenance, opaque personal MCP connection claims and SDK protocol facts and exact external schema contracts while preserving released revision-2 identities, grants, receipts and data. Register retained artifacts with independent ownership and lifecycle state. Convert the exact previously pushed pre-registry development format without rewriting caller or MCP records.",
         "migration_id": "0003_framework_caller_authority",
         "revision": 3
+      },
+      {
+        "affected_paths": [
+          "state.db"
+        ],
+        "checksum": "696dc7820bd744aabd5214a71a1ae6bfb7517f405dc6887eefb9e41c414499f5",
+        "definition": "Add bounded run-owned child, cell and native cleanup evidence; historical records never authorize computation. Native allocation retains an inherited exclusive closure guard and authenticated launch phases. Durable allocations retain named proof; standalone guards are anonymous. Generation reservations retain capacity for once-only measured or proved non-spawn recovery facts and proof disposal. Recovery appends exact-identity CAS facts without replacing original observations or terminal runs.",
+        "migration_id": "0004_foreground_analysis_evidence",
+        "revision": 4
       }
     ],
     "sqlite_record_fields": {
@@ -134,6 +143,12 @@
         "id",
         "display_name",
         "created_at"
+      ],
+      "AnalysisEvidence": [
+        "run_id",
+        "evidence_id",
+        "kind",
+        "facts"
       ],
       "ArtifactDeliveryReceipt": [
         "artifact_id",
@@ -176,7 +191,8 @@
         "ref",
         "agent_id",
         "caller_principal_id",
-        "state"
+        "state",
+        "computation_evidence"
       ],
       "ArtifactRef": [
         "artifact_id",
@@ -1105,6 +1121,16 @@
     },
     "sqlite_schema": {
       "foreign_keys": {
+        "analysis_evidence": [
+          [
+            "runs",
+            "run_id",
+            "id",
+            "NO ACTION",
+            "CASCADE",
+            "NONE"
+          ]
+        ],
         "effect_receipts": [
           [
             "job_task_attempts",
@@ -1767,6 +1793,14 @@
         ]
       },
       "named_indexes": {
+        "analysis_evidence_by_agent_run": [
+          "analysis_evidence",
+          false,
+          [
+            "agent_id",
+            "run_id"
+          ]
+        ],
         "artifacts_by_conversation": [
           "artifacts",
           false,
@@ -2000,6 +2034,10 @@
         ]
       },
       "required_sql_fragments": {
+        "analysis_evidence": [
+          "CHECK (kind IN ('generation', 'cell', 'child', 'run'))",
+          "CHECK (reserved_bytes >= 0)"
+        ],
         "artifacts": [
           "CHECK (state IN ('creating', 'ready', 'deleting'))",
           "CHECK (byte_size >= 0)"
@@ -2118,6 +2156,50 @@
           [
             "checksum",
             "TEXT",
+            1,
+            null,
+            0
+          ]
+        ],
+        "analysis_evidence": [
+          [
+            "agent_id",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "run_id",
+            "TEXT",
+            1,
+            null,
+            1
+          ],
+          [
+            "evidence_id",
+            "TEXT",
+            1,
+            null,
+            2
+          ],
+          [
+            "kind",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "data",
+            "TEXT",
+            1,
+            null,
+            0
+          ],
+          [
+            "reserved_bytes",
+            "INTEGER",
             1,
             null,
             0
@@ -4005,8 +4087,8 @@
       }
     }
   },
-  "contract_sha256": "58a563758a0d3c22dfb78776a85d8aa04d6b7b590b47b29a1986151fedb3df29",
-  "home_revision": 3,
+  "contract_sha256": "99f3d28dbf9fb61d324f5da29d130ef01419e397aaaea0978464393b2c5d7a13",
+  "home_revision": 4,
   "minimum_supported_home_revision": 1,
   "snapshot_format": 1
 }

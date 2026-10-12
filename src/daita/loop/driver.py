@@ -61,6 +61,7 @@ from ..llm.protocols import (
     provider_supports_request_policy,
 )
 from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
+from .analysis import AnalysisEvidence
 from .models import (
     ConversationRun,
     LoopExit,
@@ -169,6 +170,35 @@ class InMemoryTranscriptStore:
         self._transcripts: dict[str, Transcript] = {}
         self._results: dict[str, LoopExit] = {}
         self._turn_indexes: dict[str, int] = {}
+        self._analysis: dict[tuple[str, str], AnalysisEvidence] = {}
+
+    async def record_analysis_evidence(
+        self, agent_id: str, evidence: AnalysisEvidence
+    ) -> None:
+        transcript = self._transcripts.get(evidence.run_id)
+        if (
+            transcript is None
+            or transcript.run.agent_id != agent_id
+            or evidence.run_id in self._results
+        ):
+            raise ValueError("Analysis evidence requires its exact live run")
+        key = (evidence.run_id, evidence.evidence_id)
+        previous = self._analysis.get(key)
+        if previous is not None and previous.facts.get("status") not in {
+            "admitted",
+            "running",
+        }:
+            raise ValueError("Analysis evidence cannot be replayed")
+        self._analysis[key] = evidence
+
+    async def load_analysis_evidence(
+        self, agent_id: str, run_id: str
+    ) -> tuple[AnalysisEvidence, ...]:
+        if self._transcripts[run_id].run.agent_id != agent_id:
+            raise ValueError("Analysis evidence belongs to another agent")
+        return tuple(
+            record for (owner, _), record in self._analysis.items() if owner == run_id
+        )
 
     async def start(
         self,
@@ -494,6 +524,7 @@ class AgentLoop:
         writer = session.writer
         transcript = await writer.start()
         run_started = asyncio.get_running_loop().time()
+        session.evidence.run_started_monotonic = run_started
         if self._observer is not None:
             self._emit(
                 AgentEventKind.RUN_STARTED,
@@ -509,7 +540,6 @@ class AgentLoop:
         previous_request_input_tokens: int | None = None
         request_input_growth_tokens: int | None = None
         checkpoint_warning_emitted = False
-        tool_call_count = 0
         run_route: object | None = None if prepared is None else prepared.run_route
         limits = (
             _effective_run_limits(self._limits, run)
@@ -545,6 +575,11 @@ class AgentLoop:
                 context_snapshot = prepared.context_snapshot
             for step in range(1, limits.max_steps + 1):
                 session.cancellation.raise_if_cancelled()
+                sensitivity = max(
+                    sensitivity,
+                    writer.analysis_sensitivity,
+                    key=lambda value: value.routing_rank,
+                )
                 if limits.max_estimated_cost_usd == 0:
                     return await self._finish(
                         run,
@@ -715,11 +750,14 @@ class AgentLoop:
                     budget_reason = "tool_calls_per_response_exceeded"
                 if (
                     budget_reason is None
-                    and tool_call_count + len(response.tool_calls)
+                    and session.evidence.tool_calls_attempted + len(response.tool_calls)
                     > limits.max_tool_calls_per_run
                 ):
                     budget_reason = "tool_calls_per_run_exceeded"
                 if budget_reason is not None:
+                    session.evidence.count_tool_attempts(
+                        len(response.tool_calls), limits.max_tool_calls_per_run
+                    )
                     await writer.append(assistant, position=writer.next_position)
                     messages = (*messages, assistant)
                     for call in response.tool_calls:
@@ -773,7 +811,9 @@ class AgentLoop:
                     return terminal_response
 
                 assert response.tool_calls
-                tool_call_count += len(response.tool_calls)
+                session.evidence.count_tool_attempts(
+                    len(response.tool_calls), limits.max_tool_calls_per_run
+                )
                 await writer.append(assistant, position=writer.next_position)
                 messages = (*messages, assistant)
 
@@ -809,6 +849,9 @@ class AgentLoop:
                         "tool runtime must return one ordered result per tool call"
                     )
                 for result in results:
+                    session.evidence.record_outer_result(
+                        result.call_id, failed=result.is_error
+                    )
                     tool_message = CanonicalMessage(
                         role=MessageRole.TOOL,
                         content=(result,),
@@ -826,55 +869,26 @@ class AgentLoop:
                             )
                         )
                     messages = (*messages, tool_message)
-                    artifact = _artifact_ref(result)
-                    if artifact is not None:
-                        artifacts.append(artifact)
+                    artifacts.extend(_artifact_refs(result))
                     receipt = _artifact_delivery(result)
                     if receipt is not None:
                         artifact_deliveries.append(receipt)
 
-                if outcome.machine_run_directive is not None:
-                    return await self._finish(
-                        run,
-                        writer,
-                        LoopExitKind.MACHINE_TERMINATED,
-                        outcome.machine_run_directive.kind.value,
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
-
-                if outcome.interruption_kind is not None:
-                    if cancellation_requested:
-                        raise asyncio.CancelledError
-                    if outcome.interruption_kind is ToolBatchInterruption.DEADLINE:
-                        return await self._finish(
-                            run,
-                            writer,
-                            LoopExitKind.FAILED,
-                            "wall_time_exhausted",
-                            step,
-                            usage,
-                            run_started,
-                            artifacts=tuple(artifacts),
-                            artifact_deliveries=tuple(artifact_deliveries),
-                            sensitivity=sensitivity,
-                        )
-                    return await self._finish(
-                        run,
-                        writer,
-                        LoopExitKind.INTERRUPTED,
-                        "tool_batch_interrupted",
-                        step,
-                        usage,
-                        run_started,
-                        artifacts=tuple(artifacts),
-                        artifact_deliveries=tuple(artifact_deliveries),
-                        sensitivity=sensitivity,
-                    )
+                terminal_batch = await self._finish_terminal_tool_batch(
+                    outcome=outcome,
+                    cancellation_requested=cancellation_requested,
+                    session=session,
+                    run=run,
+                    writer=writer,
+                    step=step,
+                    usage=usage,
+                    run_started=run_started,
+                    artifacts=tuple(artifacts),
+                    artifact_deliveries=tuple(artifact_deliveries),
+                    sensitivity=sensitivity,
+                )
+                if terminal_batch is not None:
+                    return terminal_batch
 
                 if (
                     run.origin is RunOrigin.JOB_TASK
@@ -1005,6 +1019,25 @@ class AgentLoop:
         artifacts: tuple[ArtifactRef, ...] = (),
         artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...] = (),
     ) -> LoopExit:
+        try:
+            await writer.settle_analysis()
+        except Exception:
+            kind = LoopExitKind.FAILED
+            reason = "analysis_cleanup_failed"
+            final_text = None
+            final_message = None
+        if writer.analysis_budget_exhausted:
+            kind = LoopExitKind.FAILED
+            reason = (
+                writer.analysis_budget_reason or "analysis_compute_budget_exhausted"
+            )
+            final_text = None
+            final_message = None
+        sensitivity = max(
+            sensitivity,
+            writer.analysis_sensitivity,
+            key=lambda value: value.routing_rank,
+        )
         result = LoopExit(
             run_id=run.id,
             conversation_id=run.conversation_id or run.id,
@@ -1173,6 +1206,61 @@ class AgentLoop:
             writer,
             LoopExitKind.FAILED,
             _finish_reason_failure(response.finish_reason),
+            step,
+            usage,
+            run_started,
+            artifacts=artifacts,
+            artifact_deliveries=artifact_deliveries,
+            sensitivity=sensitivity,
+        )
+
+    async def _finish_terminal_tool_batch(
+        self,
+        *,
+        outcome: ToolBatchOutcome,
+        cancellation_requested: bool,
+        session: RunSession,
+        run: RunInput,
+        writer: RunSessionWriter,
+        step: int,
+        usage: ModelUsage,
+        run_started: float,
+        artifacts: tuple[ArtifactRef, ...],
+        artifact_deliveries: tuple[ArtifactDeliveryReceipt, ...],
+        sensitivity: ModelSensitivity,
+    ) -> LoopExit | None:
+        """Apply terminal batch conditions after every ordered result is retained."""
+
+        if (
+            session.evidence.analysis_budget_exhausted
+            or writer.analysis_budget_exhausted
+        ):
+            kind = LoopExitKind.FAILED
+            reason = (
+                writer.analysis_budget_reason or "analysis_compute_budget_exhausted"
+            )
+        elif session.evidence.tool_budget_exhausted:
+            kind = LoopExitKind.FAILED
+            reason = "tool_calls_per_run_exceeded"
+        elif outcome.machine_run_directive is not None:
+            kind = LoopExitKind.MACHINE_TERMINATED
+            reason = outcome.machine_run_directive.kind.value
+        elif outcome.interruption_kind is not None:
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            if outcome.interruption_kind is ToolBatchInterruption.DEADLINE:
+                kind = LoopExitKind.FAILED
+                reason = "wall_time_exhausted"
+            else:
+                kind = LoopExitKind.INTERRUPTED
+                reason = "tool_batch_interrupted"
+        else:
+            return None
+        return await self._finish(
+            run,
+            writer,
+            kind,
+            reason,
             step,
             usage,
             run_started,
@@ -1490,17 +1578,23 @@ def _completed_steps(messages: tuple[CanonicalMessage, ...]) -> int:
     return sum(message.role is MessageRole.ASSISTANT for message in messages)
 
 
-def _artifact_ref(result: ToolResultBlock) -> ArtifactRef | None:
+def _artifact_refs(result: ToolResultBlock) -> tuple[ArtifactRef, ...]:
     if result.is_error:
-        return None
-    value = result.output.get("artifact")
-    if not isinstance(value, Mapping):
-        return None
-    try:
-        ref = artifact_ref_from_mapping(value)
-    except (TypeError, ValueError):
-        return None
-    return ref if ref.call_id == result.call_id else None
+        return ()
+    values = result.output.get("artifacts", (result.output.get("artifact"),))
+    if not isinstance(values, (tuple, list)) or len(values) > 4:
+        return ()
+    refs = []
+    for value in values:
+        if not isinstance(value, Mapping):
+            continue
+        try:
+            ref = artifact_ref_from_mapping(value)
+        except (TypeError, ValueError):
+            continue
+        if ref.call_id == result.call_id and ref not in refs:
+            refs.append(ref)
+    return tuple(refs)
 
 
 def _artifact_delivery(result: ToolResultBlock) -> ArtifactDeliveryReceipt | None:

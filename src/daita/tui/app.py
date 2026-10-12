@@ -141,6 +141,7 @@ class DaitaApp(App[int]):
         self._observer = RunObserver(self)
         self._run_task: asyncio.Task[None] | None = None
         self._foreground_run_id: str | None = None
+        self._foreground_tools: dict[str, str] = {}
         self._pending_user_identity: str | None = None
         self._partial_identity = "assistant.partial"
         self._partial_text = ""
@@ -1183,6 +1184,7 @@ class DaitaApp(App[int]):
         screen.set_activity("Thinking", restart=True)
         self._partial_text = ""
         self._foreground_run_id = None
+        self._foreground_tools.clear()
         self._run_task = asyncio.create_task(
             self._execute_run(
                 message,
@@ -1233,6 +1235,7 @@ class DaitaApp(App[int]):
                 )
         finally:
             self._foreground_run_id = None
+            self._foreground_tools.clear()
             self.invalidate_completion_cache()
             chat = self.chat()
             if chat is not None:
@@ -1268,6 +1271,22 @@ class DaitaApp(App[int]):
                     "notice", f"artifact-{result.run_id}-{id(notice)}", notice
                 )
             )
+        summary = await self.controller.require_agent().analysis_usage(result.run_id)
+        if summary is not None and not (
+            summary["processes_reaped"] and summary["scratch_deleted"]
+        ):
+            cleanup_issues = []
+            if not summary["processes_reaped"]:
+                cleanup_issues.append("worker shutdown could not be verified")
+            if not summary["scratch_deleted"]:
+                cleanup_issues.append("temporary file deletion could not be verified")
+            screen.append_block(
+                TranscriptBlock(
+                    "notice",
+                    f"analysis-{result.run_id}",
+                    f"Python cleanup incomplete: {'; '.join(cleanup_issues)}.",
+                )
+            )
 
     async def on_observer_event(self, message: ObserverEvent) -> None:
         if self._shutting_down:
@@ -1290,6 +1309,17 @@ class DaitaApp(App[int]):
             return
         screen = self.chat()
         if screen is None:
+            return
+        if event.kind is AgentEventKind.ANALYSIS_UPDATED:
+            cpu = event.data.get("user_cpu_seconds")
+            memory = event.data.get("peak_rss_bytes")
+            cpu_text = f"{cpu:.2f}s" if isinstance(cpu, (int, float)) else "unavailable"
+            memory_text = (
+                f"{memory / (1024 * 1024):.1f} MiB"
+                if isinstance(memory, (int, float))
+                else "unavailable"
+            )
+            screen.set_activity(f"Python · CPU {cpu_text} · peak memory {memory_text}")
             return
         if event.kind is AgentEventKind.MODEL_TEXT_DELTA:
             fragment = event.data.get("text")
@@ -1325,6 +1355,7 @@ class DaitaApp(App[int]):
                 "catalog_search": "Searching catalog",
                 "catalog_schema": "Reading catalog schema",
                 "data_query": "Querying data source",
+                "python_execute": "Running Python",
                 "artifact_create_document": "Creating document",
                 "artifact_create_tabular": "Creating findings table",
                 "artifact_edit_text": "Preparing local file edit",
@@ -1333,11 +1364,21 @@ class DaitaApp(App[int]):
                 tool_name,
                 f"Using {CAPABILITY_LABELS.get(tool_name, tool_name)}",
             )
+            call_id = event.data.get("call_id")
+            if isinstance(call_id, str):
+                self._foreground_tools[call_id] = activity
             screen.set_activity(activity)
             await self._refresh_status(running=True, state=activity.casefold())
             return
         if event.kind is AgentEventKind.TOOL_COMPLETED:
-            screen.set_activity("Processing results")
+            call_id = event.data.get("call_id")
+            if isinstance(call_id, str):
+                self._foreground_tools.pop(call_id, None)
+            screen.set_activity(
+                next(reversed(self._foreground_tools.values()))
+                if self._foreground_tools
+                else "Waiting for model"
+            )
             await self._refresh_status(running=True, state="working")
             return
         if event.kind is AgentEventKind.APPROVAL_REQUESTED:
@@ -1356,6 +1397,7 @@ class DaitaApp(App[int]):
             return
         if event.kind is AgentEventKind.RUN_COMPLETED:
             self._foreground_run_id = None
+            self._foreground_tools.clear()
             screen.clear_activity()
             await self._refresh_status(running=False)
 

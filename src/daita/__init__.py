@@ -41,7 +41,7 @@ from .capabilities import (
     ToolTextTrust,
 )
 from .catalog import CatalogSummary
-from .config import AgentConfig
+from .config import AgentConfig, HostCapacityLimits, PostgreSQLReadLimits
 from .distribution import (
     ArtifactRequirement,
     ConversationInboxTarget,
@@ -142,6 +142,8 @@ __all__ = [
     "EffectEvidenceBasis",
     "Agent",
     "AgentConfig",
+    "HostCapacityLimits",
+    "PostgreSQLReadLimits",
     "AgentEvent",
     "AgentEventKind",
     "AgentObserver",

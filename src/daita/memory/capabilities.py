@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 
 from .._json import FrozenJsonObject
@@ -170,6 +170,10 @@ class MemoryCapabilityDomain:
         self,
         declarations: CapabilityDeclarations,
         learning: LearningCandidateGuard,
+        *,
+        validate_schema_independent: (
+            Callable[[RunInput, str], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         if declarations.domain_owner_id != self.domain_owner_id:
             raise ValueError("memory declarations have the wrong domain owner")
@@ -179,6 +183,7 @@ class MemoryCapabilityDomain:
             raise ValueError("memory domain requires its exact capability")
         self._declarations = declarations
         self._learning = learning
+        self._validate_schema_independent = validate_schema_independent
         self._views = tuple(declarations.tool_views)
         self._capabilities = {item.id: item for item in declarations.capabilities}
 
@@ -225,6 +230,11 @@ class MemoryCapabilityDomain:
     ) -> FrozenJsonObject:
         del request_sensitivity
         self._learning.validate_effect(session, call)
+        if (
+            arguments["target"] == "memory"
+            and self._validate_schema_independent is not None
+        ):
+            await self._validate_schema_independent(run, str(arguments["content"]))
         return arguments
 
     prepare_session_call = prepare_call

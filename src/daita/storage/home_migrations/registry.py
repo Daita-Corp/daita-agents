@@ -10,8 +10,14 @@ from .models import HomeMigration
 from .revision_0001 import REVISION_1
 from .revision_0002 import REVISION_2
 from .revision_0003 import REVISION_3
+from .revision_0004 import REVISION_4
 
-HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2, REVISION_3)
+HOME_MIGRATIONS: tuple[HomeMigration, ...] = (
+    REVISION_1,
+    REVISION_2,
+    REVISION_3,
+    REVISION_4,
+)
 CURRENT_HOME_REVISION: int = HOME_MIGRATIONS[-1].revision
 # Production revisions in this inclusive range upgrade automatically. The
 # one preproduction bridge is admitted separately by revision 1.

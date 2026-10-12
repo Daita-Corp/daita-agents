@@ -25,6 +25,7 @@ class SupervisorStatus:
 
 
 class AgentEventKind(str, Enum):
+    ADMISSION_UPDATED = "admission.updated"
     RUN_STARTED = "run.started"
     MODEL_TEXT_DELTA = "model.text_delta"
     MODEL_COMPLETED = "model.completed"
@@ -32,6 +33,7 @@ class AgentEventKind(str, Enum):
     APPROVAL_REQUESTED = "approval.requested"
     APPROVAL_DECIDED = "approval.decided"
     TOOL_COMPLETED = "tool.completed"
+    ANALYSIS_UPDATED = "analysis.updated"
     RUN_COMPLETED = "run.completed"
 
 

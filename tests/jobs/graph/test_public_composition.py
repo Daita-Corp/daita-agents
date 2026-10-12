@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, GraphInspection, GraphState, LoopLimits
+from daita import (
+    Agent,
+    AgentConfig,
+    GraphInspection,
+    GraphState,
+    HostCapacityLimits,
+    LoopLimits,
+)
 from daita._json import canonical_json
 from daita.domains.data import (
     DATA_QUERY_CAPABILITY_ID,
@@ -26,6 +33,7 @@ from daita.llm.models import (
 from daita.llm.pricing import CostEstimate
 from daita.llm.providers.mock import MockModelProvider
 from daita.loop.models import LoopExitKind
+from daita.storage.home_migrations import CURRENT_HOME_REVISION
 from tests.support.job_benchmarks import create_probe_home
 from tests.support.workspace import workspace_for
 
@@ -193,7 +201,7 @@ async def test_public_agent_executes_graph_model_task_in_current_home(
     )
     try:
         status = await Agent.inspect_home(home.name, root=home.root)
-        assert status.found_revision == status.current_revision == 3
+        assert status.found_revision == status.current_revision == CURRENT_HOME_REVISION
         foreground = await agent.run(
             "Start a durable graph query over all five exact resources.",
             source_scope_ids=(home.source_id,),
@@ -244,3 +252,83 @@ async def test_public_agent_executes_graph_model_task_in_current_home(
         )
     finally:
         await agent.close()
+
+
+async def test_configured_graph_capacity_overlaps_four_model_attempts_and_preserves_root_limits(
+    tmp_path,
+):
+    home = await create_probe_home(
+        tmp_path, "parallel-public-graphs", distractor_tables=3
+    )
+    resources = tuple(sorted(home.resource_ids.items()))
+    ready = asyncio.Event()
+    release = asyncio.Event()
+
+    class ParallelProvider(_ProductionGraphProvider):
+        active = 0
+        peak = 0
+
+        async def generate(self, request):
+            if "task_complete" in {tool.name for tool in request.tools}:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+                if self.active == 4:
+                    ready.set()
+                try:
+                    await release.wait()
+                    return await super().generate(request)
+                finally:
+                    self.active -= 1
+            return await super().generate(request)
+
+    provider = ParallelProvider(source_id=home.source_id, resources=resources)
+    config = AgentConfig(
+        host_capacity=HostCapacityLimits(
+            execution_capacity=8, provider_capacity=5, graph_parallelism=4
+        )
+    )
+    agent = await Agent.open(
+        home.name,
+        root=home.root,
+        model=provider,
+        model_profile=provider.model_profile,
+        config=config,
+        limits=LoopLimits(max_estimated_cost_usd=Decimal("1")),
+        workspace=workspace_for(home.root),
+    )
+    try:
+        for _ in range(4):
+            result = await agent.run(
+                "Start a durable query graph.", source_scope_ids=(home.source_id,)
+            )
+            assert result.kind is LoopExitKind.COMPLETED
+        await asyncio.wait_for(ready.wait(), timeout=5)
+        assert provider.active == 4
+        jobs = await agent.list_jobs()
+        assert len(jobs) == 4
+        for job in jobs:
+            inspection = await agent.inspect_job(job.job_id)
+            assert inspection is not None
+            active = [
+                attempt
+                for attempt in inspection.attempts
+                if attempt.state.value in {"claimed", "running"}
+            ]
+            assert len(active) == 1
+            assert len(active) <= inspection.job.specification.limits.max_parallelism
+        release.set()
+        terminals = await asyncio.gather(
+            *(_wait_terminal(agent, job.job_id) for job in jobs)
+        )
+        assert all(
+            inspection.job.state is GraphState.SUCCEEDED for inspection in terminals
+        )
+        assert provider.peak == 4
+    finally:
+        release.set()
+        await agent.close()
+    assert (
+        agent.admission_diagnostics().active_leases
+        == agent.admission_diagnostics().active_permits
+        == 0
+    )

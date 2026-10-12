@@ -5,21 +5,26 @@ from __future__ import annotations
 import asyncio
 import base64
 import math
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import replace
-from datetime import date, datetime, time, timedelta
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from ipaddress import IPv4Address, IPv4Network, IPv6Address, IPv6Network
 from typing import Any, cast
 from uuid import UUID
 
-from .._json import canonical_json
+from .._json import FrozenJsonObject, canonical_json
 from ..artifacts.models import ArtifactError
 from ..artifacts.renderers import (
+    ExactArrowRenderer,
     ExactCsvRenderer,
     ExactXlsxProvenance,
     ExactXlsxRenderer,
+    arrow_schema,
 )
+from ..config import PostgreSQLReadLimits
 from ..domains.data.capabilities import PostgreSQLReadResult
 from ..domains.data.controller import ReadScopedCatalogReader
 from ..domains.data.export_capabilities import (
@@ -30,8 +35,10 @@ from ..domains.data.export_capabilities import (
 from ..domains.data.results import project_result_rows
 from ..domains.data.sql import validate_postgresql_read
 from ..errors import DaitaError, ErrorRetryability
-from ..security import SecretProvider, default_secret_provider
+from ..observation import AgentEvent, AgentEventKind, AgentObserver, _emit_safely
+from ..security import SecretProvider, SecretReference, default_secret_provider
 from ..storage.sqlite_records import SourcePermissionStateError
+from .models import SourceRegistration
 from .postgresql import (
     _DEFAULT_MAX_COLUMNS,
     _DEFAULT_MAX_INDEXES,
@@ -87,6 +94,56 @@ class PostgreSQLQueryError(DaitaError):
         )
 
 
+@dataclass(frozen=True, slots=True)
+class PostgreSQLReadDiagnostics:
+    limits: PostgreSQLReadLimits
+    pool_size_per_source: int
+    cached_sources: int
+    reserved_connections: int
+    high_water_reserved_connections: int
+    waiting: int
+    attempts: int
+    acquired: int
+    completed: int
+    active: int
+    high_water: int
+    timeouts: int
+    cancellations: int
+    connections_created: int
+    pools_created: int
+    pools_retired: int
+    discarded: int
+    queue_seconds: float
+    structural_seconds: float
+    query_seconds: float
+    cleanup_seconds: float
+
+
+@dataclass(eq=False, slots=True)
+class _ReadPool:
+    registration: SourceRegistration
+    readable: frozenset[str]
+    password: str | None = field(repr=False)
+    size: int = 1
+    pool: Any = None
+    users: int = 1
+    ready: bool = False
+    retired: bool = False
+    closing: bool = False
+    last_used: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedReadSecret:
+    reference: str | None
+    password: str | None = field(repr=False)
+
+    async def resolve(self, reference: SecretReference) -> str:
+        if reference.to_uri() != self.reference or self.password is None:
+            raise ValueError("The pooled credential admission is unavailable")
+        return self.password
+
+
 class PostgreSQLQueryBackend:
     """Revalidate catalog scope and structure, then run one bounded read."""
 
@@ -98,6 +155,10 @@ class PostgreSQLQueryBackend:
         *,
         statement_timeout_seconds: float = 5.0,
         cleanup_timeout_seconds: float = 1.0,
+        read_limits: PostgreSQLReadLimits | None = None,
+        source_capacity: int = 2,
+        deadline_reader: Callable[[], float | None] | None = None,
+        observer: AgentObserver | None = None,
     ) -> None:
         if not isinstance(sources, SourceStore):
             raise TypeError("sources must implement SourceStore")
@@ -119,11 +180,470 @@ class PostgreSQLQueryBackend:
             or not 0 < float(cleanup_timeout_seconds) <= 10
         ):
             raise ValueError("cleanup_timeout_seconds must be from 0 through 10")
+        if read_limits is not None and not isinstance(
+            read_limits, PostgreSQLReadLimits
+        ):
+            raise TypeError("read_limits must be PostgreSQLReadLimits")
+        self._read_limits = read_limits or PostgreSQLReadLimits(
+            statement_timeout_seconds=statement_timeout_seconds,
+            cleanup_timeout_seconds=cleanup_timeout_seconds,
+        )
+        self._read_limits.__post_init__()
+        if type(source_capacity) is not int or not 1 <= source_capacity <= 8:
+            raise ValueError(
+                "source_capacity must be an integer from one through eight"
+            )
+        self._pool_size = min(
+            source_capacity,
+            self._read_limits.pool_size_per_source,
+            self._read_limits.max_connections,
+        )
+        self._deadline_reader = deadline_reader
+        self._observer = observer
+        self._pool_condition = asyncio.Condition()
+        self._pools: dict[tuple[str, str], _ReadPool] = {}
+        self._owned_pools: set[_ReadPool] = set()
+        self._pool_closed = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._operation_deadline: ContextVar[float | None] = ContextVar(
+            "postgresql_read_deadline", default=None
+        )
+        self._checkout_waiting = 0
+        self._high_water_connections = 0
+        self._metrics: dict[str, Any] = {
+            name: 0
+            for name in (
+                "attempts",
+                "acquired",
+                "completed",
+                "active",
+                "high_water",
+                "timeouts",
+                "cancellations",
+                "connections_created",
+                "pools_created",
+                "pools_retired",
+                "discarded",
+            )
+        }
+        self._metrics.update(
+            {
+                name: 0.0
+                for name in (
+                    "queue_seconds",
+                    "structural_seconds",
+                    "query_seconds",
+                    "cleanup_seconds",
+                )
+            }
+        )
         self._sources = sources
         self._catalog = catalog
         self._secret_provider = provider
-        self._statement_timeout_seconds = float(statement_timeout_seconds)
-        self._cleanup_timeout_seconds = float(cleanup_timeout_seconds)
+        self._statement_timeout_seconds = float(
+            self._read_limits.statement_timeout_seconds
+        )
+        self._cleanup_timeout_seconds = float(self._read_limits.cleanup_timeout_seconds)
+
+    def diagnostics(self) -> PostgreSQLReadDiagnostics:
+        return PostgreSQLReadDiagnostics(
+            limits=self._read_limits,
+            pool_size_per_source=self._pool_size,
+            cached_sources=len(self._owned_pools),
+            reserved_connections=sum(entry.size for entry in self._owned_pools),
+            high_water_reserved_connections=self._high_water_connections,
+            waiting=self._checkout_waiting,
+            **self._metrics,
+        )
+
+    @asynccontextmanager
+    async def _operation(self, seconds: float):
+        if not self._read_limits.pool_enabled:
+            yield None
+            return
+        deadline = (
+            asyncio.get_running_loop().time()
+            + seconds
+            + self._read_limits.acquire_timeout_seconds
+        )
+        host_deadline = (
+            None if self._deadline_reader is None else self._deadline_reader()
+        )
+        if host_deadline is not None:
+            deadline = min(deadline, host_deadline)
+        token = self._operation_deadline.set(deadline)
+        try:
+            async with asyncio.timeout_at(deadline):
+                yield deadline
+        finally:
+            self._operation_deadline.reset(token)
+
+    def _remaining(self, maximum: float) -> float:
+        deadline = self._operation_deadline.get()
+        remaining = (
+            maximum
+            if deadline is None
+            else min(maximum, deadline - asyncio.get_running_loop().time())
+        )
+        if remaining <= 0:
+            raise TimeoutError("The admitted PostgreSQL read deadline expired")
+        return remaining
+
+    async def _password(self, registration: SourceRegistration) -> str | None:
+        reference = registration.configuration.get("credential_ref")
+        if reference is None:
+            return None
+        failed = False
+        try:
+            password = await self._secret_provider.resolve(
+                SecretReference.parse(cast(str, reference))
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            failed = True
+        if failed:
+            raise PostgreSQLQueryError(
+                "postgresql_credential_unavailable",
+                "PostgreSQL credential resolution failed.",
+            )
+        if not isinstance(password, str) or not password:
+            raise PostgreSQLQueryError(
+                "postgresql_credential_invalid",
+                "PostgreSQL credential resolution returned an invalid value.",
+            )
+        return password
+
+    def _retire_locked(self, entry: _ReadPool) -> None:
+        if not entry.retired:
+            entry.retired = True
+            self._metrics["pools_retired"] += 1
+        key = (entry.registration.agent_id, entry.registration.id)
+        if self._pools.get(key) is entry:
+            del self._pools[key]
+
+    async def _close_entry(self, entry: _ReadPool) -> None:
+        # The short bookkeeping lock is never held over native pool I/O.
+        try:
+            if entry.pool is not None:
+                try:
+                    async with asyncio.timeout(
+                        self._read_limits.cleanup_timeout_seconds
+                    ):
+                        await entry.pool.close()
+                except (Exception, asyncio.CancelledError):
+                    try:
+                        entry.pool.terminate()
+                    except Exception:
+                        pass  # min_size=0 initialization owns no connections before ready
+        finally:
+            entry.password = None
+            async with self._pool_condition:
+                self._owned_pools.discard(entry)
+                self._pool_condition.notify_all()
+
+    async def _drop_user(self, entry: _ReadPool) -> None:
+        async with self._pool_condition:
+            entry.users -= 1
+            entry.last_used = asyncio.get_running_loop().time()
+            close = entry.retired and entry.users == 0 and not entry.closing
+            if close:
+                entry.closing = True
+            self._pool_condition.notify_all()
+        if close:
+            await self._close_entry(entry)
+
+    async def _still_admitted(self, entry: _ReadPool) -> bool:
+        registration = entry.registration
+        current = await self._sources.load_source(
+            registration.agent_id, registration.id
+        )
+        readable = await self._catalog.readable_resource_ids(
+            registration.agent_id, (registration.id,)
+        )
+        return (
+            current == registration
+            and registration.active
+            and frozenset(readable) == entry.readable
+            and await self._password(registration) == entry.password
+        )
+
+    async def _connection(
+        self, registration: SourceRegistration, readable: frozenset[str]
+    ):
+        if self._pool_closed:
+            raise PostgreSQLQueryError(
+                "postgresql_pool_closed", "The PostgreSQL read backend is closed."
+            )
+        if not self._read_limits.pool_enabled:
+            return await _connect(registration, self._secret_provider), None
+        started = asyncio.get_running_loop().time()
+        self._metrics["attempts"] += 1
+        self._checkout_waiting += 1
+        entry = None
+        connection = None
+        try:
+            deadline = started + self._remaining(
+                self._read_limits.acquire_timeout_seconds
+            )
+            async with asyncio.timeout_at(deadline):
+                password = await self._password(registration)
+                key = (registration.agent_id, registration.id)
+                while True:
+                    closing = []
+                    create = False
+                    async with self._pool_condition:
+                        if self._pool_closed:
+                            raise PostgreSQLQueryError(
+                                "postgresql_pool_closed",
+                                "The PostgreSQL read backend is closed.",
+                            )
+                        now = asyncio.get_running_loop().time()
+                        current = self._pools.get(key)
+                        for cached in tuple(self._pools.values()):
+                            changed = cached is current and (
+                                cached.registration != registration
+                                or cached.password != password
+                                or cached.readable != readable
+                            )
+                            expired = (
+                                cached.users == 0
+                                and now - cached.last_used
+                                >= self._read_limits.idle_timeout_seconds
+                            )
+                            if changed or expired:
+                                self._retire_locked(cached)
+                        current = self._pools.get(key)
+                        for cached in self._owned_pools:
+                            if (
+                                cached.retired
+                                and cached.users == 0
+                                and not cached.closing
+                            ):
+                                cached.closing = True
+                                closing.append(cached)
+                        if current is not None and current.ready:
+                            current.users += 1
+                            entry = current
+                        elif current is None and not closing:
+                            reserved = sum(cached.size for cached in self._owned_pools)
+                            if (
+                                len(self._owned_pools)
+                                < self._read_limits.max_cached_sources
+                                and reserved + self._pool_size
+                                <= self._read_limits.max_connections
+                            ):
+                                entry = _ReadPool(
+                                    registration,
+                                    readable,
+                                    password,
+                                    self._pool_size,
+                                    last_used=now,
+                                )
+                                self._owned_pools.add(entry)
+                                self._pools[key] = entry
+                                self._high_water_connections = max(
+                                    self._high_water_connections, reserved + entry.size
+                                )
+                                create = True
+                            else:
+                                idle = [
+                                    cached
+                                    for cached in self._owned_pools
+                                    if cached.users == 0 and not cached.closing
+                                ]
+                                if idle:
+                                    cached = min(
+                                        idle, key=lambda value: value.last_used
+                                    )
+                                    self._retire_locked(cached)
+                                    cached.closing = True
+                                    closing.append(cached)
+                        if entry is None and not closing:
+                            await self._pool_condition.wait()
+                    for cached in closing:
+                        await self._close_entry(cached)
+                    if entry is not None:
+                        break
+                if create:
+                    from .postgresql import _load_asyncpg
+
+                    snapshot = _ResolvedReadSecret(
+                        cast(
+                            str | None, registration.configuration.get("credential_ref")
+                        ),
+                        password,
+                    )
+
+                    async def connect(*args: object, **kwargs: object):
+                        del args, kwargs
+                        created = await _connect(registration, snapshot)
+                        self._metrics["connections_created"] += 1
+                        return created
+
+                    entry.pool = _load_asyncpg().create_pool(
+                        min_size=0,
+                        max_size=entry.size,
+                        max_inactive_connection_lifetime=self._read_limits.idle_timeout_seconds,
+                        connect=connect,
+                    )
+                    await entry.pool
+                    async with self._pool_condition:
+                        entry.ready = True
+                        self._metrics["pools_created"] += 1
+                        self._pool_condition.notify_all()
+                connection = await entry.pool.acquire(
+                    timeout=max(0.001, deadline - asyncio.get_running_loop().time())
+                )
+                self._metrics["acquired"] += 1
+                self._metrics["active"] += 1
+                self._metrics["high_water"] = max(
+                    self._metrics["high_water"], self._metrics["active"]
+                )
+                if entry.retired or not await self._still_admitted(entry):
+                    async with self._pool_condition:
+                        self._retire_locked(entry)
+                    raise PostgreSQLQueryError(
+                        "postgresql_admission_changed",
+                        "PostgreSQL source or credential admission changed before dispatch.",
+                    )
+                return connection, entry
+        except BaseException as error:
+            if isinstance(error, PostgreSQLQueryError) and error.code in {
+                "postgresql_credential_unavailable",
+                "postgresql_credential_invalid",
+                "postgresql_admission_changed",
+            }:
+                await self.retire_source(registration.agent_id, registration.id)
+            if isinstance(error, TimeoutError):
+                self._metrics["timeouts"] += 1
+            if isinstance(error, asyncio.CancelledError):
+                self._metrics[
+                    (
+                        "timeouts"
+                        if asyncio.get_running_loop().time() >= deadline
+                        else "cancellations"
+                    )
+                ] += 1
+            if entry is not None:
+                if connection is not None:
+                    await self._release_pooled(connection, entry, discard=True)
+                else:
+                    if not entry.ready:
+                        async with self._pool_condition:
+                            self._retire_locked(entry)
+                    await self._drop_user(entry)
+            raise
+        finally:
+            self._checkout_waiting -= 1
+            self._metrics["queue_seconds"] += (
+                asyncio.get_running_loop().time() - started
+            )
+
+    async def _release_pooled(
+        self,
+        connection: Any,
+        entry: _ReadPool,
+        *,
+        discard: bool,
+        deadline: float | None = None,
+    ) -> None:
+        async def settle():
+            started = asyncio.get_running_loop().time()
+            try:
+                timeout = self._remaining(self._read_limits.cleanup_timeout_seconds)
+                if deadline is not None:
+                    timeout = min(timeout, deadline - asyncio.get_running_loop().time())
+                    if timeout <= 0:
+                        raise TimeoutError("The read deadline expired before reset")
+            except TimeoutError:
+                timeout = self._read_limits.cleanup_timeout_seconds
+                discard_connection = True
+            else:
+                discard_connection = discard or entry.retired
+            try:
+                if discard_connection:
+                    connection.terminate()
+                    self._metrics["discarded"] += 1
+                try:
+                    await entry.pool.release(connection, timeout=timeout)
+                except (Exception, asyncio.CancelledError):
+                    connection.terminate()
+                    if not discard_connection:
+                        self._metrics["discarded"] += 1
+            finally:
+                self._metrics["active"] -= 1
+                self._metrics["completed"] += 1
+                self._metrics["cleanup_seconds"] += (
+                    asyncio.get_running_loop().time() - started
+                )
+                await self._drop_user(entry)
+                if self._observer is not None:
+                    _emit_safely(
+                        self._observer,
+                        AgentEvent(
+                            kind=AgentEventKind.ADMISSION_UPDATED,
+                            occurred_at=datetime.now(UTC),
+                            run_id="host",
+                            conversation_id="host",
+                            data=FrozenJsonObject.from_mapping(
+                                {"permit_kind": "postgresql_checkout", **self._metrics}
+                            ),
+                        ),
+                    )
+
+        task = asyncio.create_task(settle())
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def retire_source(self, agent_id: str, source_id: str) -> None:
+        async with self._pool_condition:
+            entries = [
+                entry
+                for entry in self._owned_pools
+                if (entry.registration.agent_id, entry.registration.id)
+                == (agent_id, source_id)
+            ]
+            closing = []
+            for entry in entries:
+                self._retire_locked(entry)
+                if entry.users == 0 and not entry.closing:
+                    entry.closing = True
+                    closing.append(entry)
+            self._pool_condition.notify_all()
+        for entry in closing:
+            await self._close_entry(entry)
+
+    async def close(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        cancelled = False
+        while not self._close_task.done():
+            try:
+                await asyncio.shield(self._close_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        self._close_task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close(self) -> None:
+        async with self._pool_condition:
+            self._pool_closed = True
+            entries = tuple(self._owned_pools)
+            for entry in entries:
+                self._retire_locked(entry)
+                entry.closing = True
+            self._pool_condition.notify_all()
+        for entry in entries:
+            await self._close_entry(entry)
 
     async def execute_read(
         self,
@@ -154,6 +674,7 @@ class PostgreSQLQueryBackend:
             or registration.id != source_id
             or not registration.active
         ):
+            await self.retire_source(agent_id, source_id)
             raise PostgreSQLQueryError(
                 "source_not_available",
                 "The PostgreSQL source is not attached to this agent.",
@@ -174,6 +695,13 @@ class PostgreSQLQueryBackend:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from None
+        if self._read_limits.pool_enabled:
+            cached = self._pools.get((agent_id, source_id))
+            if cached is not None and (
+                cached.registration != registration
+                or cached.readable != frozenset(readable)
+            ):
+                await self.retire_source(agent_id, source_id)
         validation = validate_postgresql_read(
             sql,
             source_id=source_id,
@@ -206,6 +734,8 @@ class PostgreSQLQueryBackend:
             )
 
         connection = None
+        pool_entry = None
+        read_deadline = None
         transaction = None
         transaction_finished = False
         connection_failure: tuple[str, str] | None = None
@@ -213,48 +743,65 @@ class PostgreSQLQueryBackend:
         columns: tuple[str, ...] = ()
         rows: tuple[Mapping[str, object], ...] = ()
         try:
-            connection = await _connect(registration, self._secret_provider)
-            transaction = connection.transaction(
-                isolation="repeatable_read",
-                readonly=True,
-            )
-            await transaction.start()
-            timeout_milliseconds = max(
-                1,
-                int(self._statement_timeout_seconds * 1_000),
-            )
-            await connection.execute(
-                "SELECT set_config('statement_timeout', $1, true)",
-                f"{timeout_milliseconds}ms",
-            )
-            await connection.execute(
-                "SELECT set_config('search_path', $1, true)",
-                "pg_catalog",
-            )
-            structure = await _load_structure(
-                connection,
-                registration,
-                max_resources=_DEFAULT_MAX_RESOURCES,
-                max_columns=_DEFAULT_MAX_COLUMNS,
-                max_indexes=_DEFAULT_MAX_INDEXES,
-                max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
-            )
-            if structure.source_revision != validation.source_revision:
-                raise PostgreSQLQueryError(
-                    "catalog_source_stale",
-                    "PostgreSQL source structure changed after its catalog snapshot.",
+            async with self._operation(
+                self._statement_timeout_seconds
+            ) as read_deadline:
+                connection, pool_entry = await self._connection(
+                    registration, frozenset(readable)
                 )
-            columns, rows, value_limited = await _execute_user_query(
-                connection,
-                validation.analysis.canonical_sql,
-                parameters,
-                max_rows=max_rows,
-                max_bytes=max_bytes,
-                timeout_seconds=self._statement_timeout_seconds,
-            )
-            await transaction.commit()
-            transaction_finished = True
+                transaction = connection.transaction(
+                    isolation="repeatable_read",
+                    readonly=True,
+                )
+                await transaction.start()
+                timeout_milliseconds = max(
+                    1,
+                    int(self._statement_timeout_seconds * 1_000),
+                )
+                await connection.execute(
+                    "SELECT set_config('statement_timeout', $1, true)",
+                    f"{timeout_milliseconds}ms",
+                )
+                await connection.execute(
+                    "SELECT set_config('search_path', $1, true)",
+                    "pg_catalog",
+                )
+                structural_started = asyncio.get_running_loop().time()
+                structure = await _load_structure(
+                    connection,
+                    registration,
+                    max_resources=_DEFAULT_MAX_RESOURCES,
+                    max_columns=_DEFAULT_MAX_COLUMNS,
+                    max_indexes=_DEFAULT_MAX_INDEXES,
+                    max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
+                )
+                if self._read_limits.pool_enabled:
+                    self._metrics["structural_seconds"] += (
+                        asyncio.get_running_loop().time() - structural_started
+                    )
+                if structure.source_revision != validation.source_revision:
+                    raise PostgreSQLQueryError(
+                        "catalog_source_stale",
+                        "PostgreSQL source structure changed after its catalog snapshot.",
+                    )
+                query_started = asyncio.get_running_loop().time()
+                columns, rows, value_limited = await _execute_user_query(
+                    connection,
+                    validation.analysis.canonical_sql,
+                    parameters,
+                    max_rows=max_rows,
+                    max_bytes=max_bytes,
+                    timeout_seconds=self._statement_timeout_seconds,
+                )
+                if self._read_limits.pool_enabled:
+                    self._metrics["query_seconds"] += (
+                        asyncio.get_running_loop().time() - query_started
+                    )
+                await transaction.commit()
+                transaction_finished = True
         except asyncio.CancelledError:
+            if pool_entry is not None:
+                self._metrics["cancellations"] += 1
             raise
         except ImportError:
             # Optional-package admission must retain its actionable install hint.
@@ -272,19 +819,27 @@ class PostgreSQLQueryBackend:
             # exception context has ended so diagnostics retain none of it.
             query_failed = True
         finally:
-            try:
-                if transaction is not None and not transaction_finished:
-                    await _rollback_postgresql_transaction(
-                        transaction,
-                        connection,
-                        timeout_seconds=self._cleanup_timeout_seconds,
-                    )
-            finally:
-                if connection is not None:
-                    await _close_postgresql_connection(
-                        connection,
-                        timeout_seconds=self._cleanup_timeout_seconds,
-                    )
+            if pool_entry is not None and connection is not None:
+                await self._release_pooled(
+                    connection,
+                    pool_entry,
+                    discard=not transaction_finished,
+                    deadline=read_deadline,
+                )
+            else:
+                try:
+                    if transaction is not None and not transaction_finished:
+                        await _rollback_postgresql_transaction(
+                            transaction,
+                            connection,
+                            timeout_seconds=self._cleanup_timeout_seconds,
+                        )
+                finally:
+                    if connection is not None:
+                        await _close_postgresql_connection(
+                            connection,
+                            timeout_seconds=self._cleanup_timeout_seconds,
+                        )
 
         if connection_failure is not None:
             raise PostgreSQLQueryError(*connection_failure)
@@ -345,6 +900,7 @@ class PostgreSQLQueryBackend:
             or registration.id != source_id
             or not registration.active
         ):
+            await self.retire_source(agent_id, source_id)
             raise PostgreSQLQueryError(
                 "source_not_available",
                 "The PostgreSQL source is not attached to this agent.",
@@ -365,6 +921,13 @@ class PostgreSQLQueryBackend:
                 "source_permission_state_invalid",
                 "Stored source permission state is missing or invalid.",
             ) from None
+        if self._read_limits.pool_enabled:
+            cached = self._pools.get((agent_id, source_id))
+            if cached is not None and (
+                cached.registration != registration
+                or cached.readable != frozenset(readable)
+            ):
+                await self.retire_source(agent_id, source_id)
         validation = validate_postgresql_read(
             sql,
             source_id=source_id,
@@ -397,6 +960,8 @@ class PostgreSQLQueryBackend:
             )
 
         connection = None
+        pool_entry = None
+        read_deadline = None
         transaction = None
         transaction_finished = False
         connection_failure: tuple[str, str] | None = None
@@ -436,35 +1001,53 @@ class PostgreSQLQueryBackend:
                 progress(rows, column_count, byte_count)
 
         try:
-            connection = await _connect(registration, self._secret_provider)
-            transaction = connection.transaction(
-                isolation="repeatable_read",
-                readonly=True,
-            )
-            await transaction.start()
-            timeout_milliseconds = max(1, int(timeout_seconds * 1_000))
-            await connection.execute(
-                "SELECT set_config('statement_timeout', $1, true)",
-                f"{timeout_milliseconds}ms",
-            )
-            await connection.execute(
-                "SELECT set_config('search_path', $1, true)",
-                "pg_catalog",
-            )
-            structure = await _load_structure(
-                connection,
-                registration,
-                max_resources=_DEFAULT_MAX_RESOURCES,
-                max_columns=_DEFAULT_MAX_COLUMNS,
-                max_indexes=_DEFAULT_MAX_INDEXES,
-                max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
-            )
-            if structure.source_revision != validation.source_revision:
-                raise PostgreSQLQueryError(
-                    "catalog_source_stale",
-                    "PostgreSQL source structure changed after its catalog snapshot.",
+            async with self._operation(timeout_seconds) as read_deadline:
+                connection, pool_entry = await self._connection(
+                    registration, frozenset(readable)
                 )
-            async with asyncio.timeout(timeout_seconds):
+                transaction = connection.transaction(
+                    isolation="repeatable_read",
+                    readonly=True,
+                )
+                await transaction.start()
+                query_timeout = (
+                    min(
+                        timeout_seconds,
+                        self._statement_timeout_seconds,
+                        self._remaining(timeout_seconds),
+                    )
+                    if self._read_limits.pool_enabled
+                    else timeout_seconds
+                )
+                timeout_milliseconds = max(1, int(query_timeout * 1_000))
+                await connection.execute(
+                    "SELECT set_config('statement_timeout', $1, true)",
+                    f"{timeout_milliseconds}ms",
+                )
+                await connection.execute(
+                    "SELECT set_config('search_path', $1, true)",
+                    "pg_catalog",
+                )
+                structural_started = asyncio.get_running_loop().time()
+                structure = await _load_structure(
+                    connection,
+                    registration,
+                    max_resources=_DEFAULT_MAX_RESOURCES,
+                    max_columns=_DEFAULT_MAX_COLUMNS,
+                    max_indexes=_DEFAULT_MAX_INDEXES,
+                    max_relationships=_DEFAULT_MAX_RELATIONSHIPS,
+                )
+                if self._read_limits.pool_enabled:
+                    self._metrics["structural_seconds"] += (
+                        asyncio.get_running_loop().time() - structural_started
+                    )
+                if structure.source_revision != validation.source_revision:
+                    raise PostgreSQLQueryError(
+                        "catalog_source_stale",
+                        "PostgreSQL source structure changed after its catalog snapshot.",
+                    )
+                async with asyncio.timeout(timeout_seconds):
+                    query_started = asyncio.get_running_loop().time()
                 content, columns, row_count = await _execute_exact_tabular_query(
                     connection,
                     validation.analysis.canonical_sql,
@@ -474,12 +1057,18 @@ class PostgreSQLQueryBackend:
                     max_rows=max_rows,
                     max_columns=max_columns,
                     max_bytes=max_bytes,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=query_timeout,
                     progress=record_progress,
                 )
-            await transaction.commit()
-            transaction_finished = True
+                if self._read_limits.pool_enabled:
+                    self._metrics["query_seconds"] += (
+                        asyncio.get_running_loop().time() - query_started
+                    )
+                await transaction.commit()
+                transaction_finished = True
         except asyncio.CancelledError:
+            if pool_entry is not None:
+                self._metrics["cancellations"] += 1
             raise
         except TimeoutError as error:
             raise ArtifactError(
@@ -501,19 +1090,27 @@ class PostgreSQLQueryBackend:
         except Exception:
             query_failed = True
         finally:
-            try:
-                if transaction is not None and not transaction_finished:
-                    await _rollback_postgresql_transaction(
-                        transaction,
-                        connection,
-                        timeout_seconds=self._cleanup_timeout_seconds,
-                    )
-            finally:
-                if connection is not None:
-                    await _close_postgresql_connection(
-                        connection,
-                        timeout_seconds=self._cleanup_timeout_seconds,
-                    )
+            if pool_entry is not None and connection is not None:
+                await self._release_pooled(
+                    connection,
+                    pool_entry,
+                    discard=not transaction_finished,
+                    deadline=read_deadline,
+                )
+            else:
+                try:
+                    if transaction is not None and not transaction_finished:
+                        await _rollback_postgresql_transaction(
+                            transaction,
+                            connection,
+                            timeout_seconds=self._cleanup_timeout_seconds,
+                        )
+                finally:
+                    if connection is not None:
+                        await _close_postgresql_connection(
+                            connection,
+                            timeout_seconds=self._cleanup_timeout_seconds,
+                        )
         if connection_failure is not None:
             raise PostgreSQLQueryError(*connection_failure)
         if query_failed:
@@ -532,6 +1129,7 @@ class PostgreSQLQueryBackend:
             row_count=row_count,
             content=content,
             sensitivity=sensitivity,
+            column_types=arrow_schema(content)[1] if format_name == "arrow" else (),
         )
 
 
@@ -632,12 +1230,26 @@ async def _execute_exact_tabular_query(
     attributes = tuple(shape_statement.get_attributes())
     raw_names = tuple(attribute.name for attribute in attributes)
     if format_name == "csv":
-        renderer: ExactCsvRenderer | ExactXlsxRenderer = ExactCsvRenderer(
+        renderer: ExactArrowRenderer | ExactCsvRenderer | ExactXlsxRenderer = (
+            ExactCsvRenderer(
+                raw_names,
+                max_rows=max_rows,
+                max_columns=max_columns,
+                max_bytes=max_bytes,
+                max_seconds=timeout_seconds,
+            )
+        )
+    elif format_name == "arrow":
+        renderer = ExactArrowRenderer(
             raw_names,
             max_rows=max_rows,
             max_columns=max_columns,
             max_bytes=max_bytes,
             max_seconds=timeout_seconds,
+            projected_types=tuple(
+                getattr(getattr(attribute, "type", None), "name", None)
+                for attribute in attributes
+            ),
         )
     elif format_name == "xlsx" and xlsx_provenance is not None:
         renderer = ExactXlsxRenderer(

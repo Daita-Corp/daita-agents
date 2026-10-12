@@ -40,6 +40,7 @@ from daita.llm.models import (
     ToolCall,
 )
 from daita.llm.pricing import CostEstimate
+from daita.loop.models import LoopExit
 from tests.support.conversations import CatalogSpy
 from tests.support.graph import graph_admission
 from tests.support.model_graph_integration import (
@@ -117,12 +118,24 @@ class _BlockingReadModel:
 
 async def test_model_task_completes_only_through_exact_lifecycle_directive(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     integration = await ModelGraphIntegration.open(tmp_path)
+    finish_ready = asyncio.Event()
+    release_finish = asyncio.Event()
+    original_finish = integration.store.finish
+
+    async def finish_after_graph_completion(result: LoopExit) -> None:
+        finish_ready.set()
+        await release_finish.wait()
+        await original_finish(result)
+
+    monkeypatch.setattr(integration.store, "finish", finish_after_graph_completion)
     try:
         admission = integration.build()
         await integration.admit_and_start(admission)
         terminal = await integration.wait_terminal(admission.job.job_id)
+        await asyncio.wait_for(finish_ready.wait(), timeout=5)
 
         assert terminal.job.state is GraphState.SUCCEEDED
         work = next(item for item in terminal.tasks if item.role is TaskRole.WORKER)
@@ -136,6 +149,12 @@ async def test_model_task_completes_only_through_exact_lifecycle_directive(
         )
         assert model_attempt.state is AttemptState.SUCCEEDED
         assert len(integration.reader.calls) == 1
+        # Accepted graph results can precede the model worker's terminal transcript.
+        release_finish.set()
+        await asyncio.wait_for(
+            asyncio.gather(*tuple(integration.supervisor._graph_workers.values())),
+            timeout=5,
+        )
         transcript = await integration.store.load(model_attempt.run_id)
         result = await integration.store.result(model_attempt.run_id)
         assert result is not None
@@ -146,6 +165,7 @@ async def test_model_task_completes_only_through_exact_lifecycle_directive(
         assert len(terminal.delivery_ids) == 1
         integration.provider.assert_consumed()
     finally:
+        release_finish.set()
         await integration.close()
 
 

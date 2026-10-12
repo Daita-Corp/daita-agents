@@ -1224,3 +1224,140 @@ async def test_delivery_failure_after_csv_commit_retains_valid_internal_artifact
         assert payload.content == b'"label","number"\r\n"retained",1\r\n'
     finally:
         await agent.close()
+
+
+def test_exact_arrow_scalar_encoding_and_projected_types():
+    pa = pytest.importorskip("pyarrow")
+    from zoneinfo import ZoneInfo
+
+    from daita.artifacts.renderers import ExactArrowRenderer, arrow_schema
+
+    stamp = datetime(2026, 8, 1, 12, 3, 4, 567890, tzinfo=ZoneInfo("America/Chicago"))
+    rows = [
+        (
+            Decimal("12345678901234567890.1200"),
+            2**63 - 1,
+            stamp,
+            b"\x00\xff",
+            None,
+            True,
+        ),
+        (Decimal("-0.0001"), -(2**63), stamp, b"\x00\xff", None, False),
+    ]
+    renderer = ExactArrowRenderer(
+        ("amount_alias", "large", "zoned", "binary", "empty", "flag"),
+        projected_types=("numeric", "int8", "timestamptz", "bytea", "text", "bool"),
+    )
+    for row in rows:
+        renderer.append(row)
+    content = renderer.finish()
+    with pa.ipc.open_file(pa.BufferReader(content)) as reader:
+        table = reader.read_all()
+        assert table.column_names == list(renderer.columns)
+        assert table.column("amount_alias").to_pylist() == [row[0] for row in rows]
+        assert [value.as_tuple() for value in table.column(0).to_pylist()] == [
+            row[0].as_tuple() for row in rows
+        ]
+        assert table.column("large").to_pylist() == [2**63 - 1, -(2**63)]
+        assert (
+            str(table.schema.field("zoned").type) == "timestamp[us, tz=America/Chicago]"
+        )
+        assert table.column("zoned").to_pylist() == [stamp, stamp]
+        assert table.column("binary").to_pylist() == [b"\x00\xff", b"\x00\xff"]
+        assert table.column("empty").to_pylist() == [None, None]
+        assert str(table.schema.field("empty").type) == "string"
+        assert table.column("flag").to_pylist() == [True, False]
+    assert arrow_schema(content) == (renderer.columns, renderer.column_types)
+    assert renderer.byte_count == len(content)
+    assert content == renderer.finish()
+
+
+@pytest.mark.parametrize(
+    "rows,projected,reason",
+    [
+        ([(1,), ("1",)], None, "mixed_scalar_types"),
+        ([(2**63,)], None, "integer_range"),
+        ([(float("nan"),)], None, "nonfinite_float"),
+        ([(Decimal("1.20"),), (Decimal("1.2"),)], None, "mixed_decimal_scales"),
+        (
+            [(datetime(2026, 1, 1),), (datetime(2026, 1, 1, tzinfo=UTC),)],
+            None,
+            "mixed_timezones",
+        ),
+        ([(UUID(int=0),)], None, "scalar_type"),
+        (
+            [(datetime(2026, 1, 1, tzinfo=timezone(timedelta(microseconds=1))),)],
+            None,
+            "timezone_precision",
+        ),
+        ([(None,)], ("numeric",), "decimal_scale_unknown"),
+        ([(1,)], ("text",), "projected_type_unsupported_or_inconsistent"),
+    ],
+)
+def test_arrow_rejects_ambiguous_scalars(rows, projected, reason):
+    pytest.importorskip("pyarrow")
+    from daita.artifacts.renderers import ExactArrowRenderer
+
+    renderer = ExactArrowRenderer(("value",), projected_types=projected)
+    with pytest.raises(ArtifactError) as caught:
+        for row in rows:
+            renderer.append(row)
+        renderer.finish()
+    assert caught.value.code == "artifact_unsupported_value"
+    assert caught.value.details["reason"] == reason
+
+
+@pytest.mark.parametrize("bound", ("rows", "columns", "bytes", "time"))
+def test_arrow_never_publishes_partial_exports(bound):
+    pytest.importorskip("pyarrow")
+    from daita.artifacts.renderers import ExactArrowRenderer
+
+    ticks = [0.0]
+    with pytest.raises(ArtifactError) as caught:
+        renderer = ExactArrowRenderer(
+            ("a", "b"),
+            max_rows=1,
+            max_columns=1 if bound == "columns" else 2,
+            max_bytes=1 if bound == "bytes" else 16384,
+            clock=lambda: ticks[0],
+        )
+        if bound == "time":
+            ticks[0] = 60.0
+        renderer.append((1, "x"))
+        if bound == "rows":
+            renderer.append((2, "y"))
+        renderer.finish()
+    assert caught.value.code == (
+        "artifact_quota_exceeded"
+        if bound == "columns"
+        else "artifact_incomplete_export"
+    )
+
+
+async def test_postgresql_arrow_uses_projected_query_schema(monkeypatch):
+    pa = pytest.importorskip("pyarrow")
+    connection = _Connection(("alias", "total"), ((Decimal("1.2300"), 2**60, True),))
+    attributes = (
+        SimpleNamespace(name="alias", type=SimpleNamespace(name="numeric")),
+        SimpleNamespace(name="total", type=SimpleNamespace(name="int8")),
+    )
+    content, columns, count = (
+        await postgresql_query_module._execute_exact_tabular_query(
+            connection,
+            "SELECT amount AS alias, count(*) AS total FROM public.orders",
+            (),
+            format_name="arrow",
+            xlsx_provenance=None,
+            max_rows=100_000,
+            max_columns=256,
+            max_bytes=16 * 1024 * 1024,
+            timeout_seconds=60,
+        )
+    )
+    with pa.ipc.open_file(pa.BufferReader(content)) as reader:
+        assert reader.read_all().to_pydict() == {
+            "alias": [Decimal("1.2300")],
+            "total": [2**60],
+        }
+    assert columns == ("alias", "total") and count == 1
+    assert len(connection.prepared_sql) == 2

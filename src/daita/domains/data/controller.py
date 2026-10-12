@@ -16,6 +16,7 @@ from ...artifacts.models import (
     ArtifactError,
     ArtifactResourceBinding,
 )
+from ...artifacts.renderers import ARROW_MEDIA_TYPE, arrow_schema
 from ...capabilities import (
     AccessMode,
     AutomationScopeProposal,
@@ -40,7 +41,7 @@ from ...catalog.models import Sensitivity
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
-from ...scope import resolve_effective_source_scope
+from ...scope import EffectiveSourceScope, resolve_effective_source_scope
 from ...storage.sqlite_records import RelationalWriteScope, SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .file_capabilities import (
@@ -283,10 +284,26 @@ class DataCapabilityDomain:
         self,
         run: RunInput,
         session: RunSession | None = None,
+        *,
+        tool_names: frozenset[str] | None = None,
     ) -> tuple[str, ...]:
+        views = {
+            name: view
+            for name, view in self._views.items()
+            if tool_names is None or name in tool_names
+        }
+        source_capability_ids = {
+            view.capability_id
+            for view in views.values()
+            if view.capability_id not in LOCAL_FILE_CAPABILITY_IDS
+        }
         files_only = session is not None and session.options.files_only
-        scope = await resolve_effective_source_scope(
-            run, self._catalog, files_only=files_only
+        scope = (
+            await resolve_effective_source_scope(
+                run, self._catalog, files_only=files_only
+            )
+            if source_capability_ids
+            else EffectiveSourceScope(frozenset(), frozenset())
         )
         run = replace(run, resolved_source_scope=scope)
         facts: tuple[Mapping[str, object], ...]
@@ -304,12 +321,14 @@ class DataCapabilityDomain:
                     run.agent_id,
                     tuple(sorted(scope.source_ids)),
                 )
+                if source_capability_ids & _UPDATE_CAPABILITIES
+                else frozenset()
             )
         upsert_source_ids = (
             await self._catalog.relational_write_applicable_source_ids(
                 run.agent_id, tuple(sorted(scope.source_ids)), operation="upsert"
             )
-            if scope.source_ids
+            if scope.source_ids and source_capability_ids & _UPSERT_CAPABILITIES
             else frozenset()
         )
         active_adapter_ids: set[str] = set()
@@ -318,8 +337,8 @@ class DataCapabilityDomain:
             if isinstance(adapter_id, str):
                 active_adapter_ids.add(adapter_id)
         names: list[str] = []
-        for name in sorted(self._views):
-            view = self._views[name]
+        for name in sorted(views):
+            view = views[name]
             capability = self._capabilities[view.capability_id]
             if not self._learning.allows(
                 session,
@@ -362,6 +381,12 @@ class DataCapabilityDomain:
 
     project_session = project
 
+    async def project_call(
+        self, run: RunInput, call: ToolCall, session: RunSession | None
+    ) -> tuple[str, ...]:
+        """Revalidate one existing view without projecting unrelated contracts."""
+        return await self.project(run, session, tool_names=frozenset({call.name}))
+
     def normalize_arguments(
         self,
         capability: Capability,
@@ -379,12 +404,6 @@ class DataCapabilityDomain:
         request_sensitivity: ModelSensitivity,
         session: RunSession | None = None,
     ) -> FrozenJsonObject:
-        scope = await resolve_effective_source_scope(
-            run,
-            self._catalog,
-            files_only=session is not None and session.options.files_only,
-        )
-        run = replace(run, resolved_source_scope=scope)
         if capability.id in LOCAL_FILE_CAPABILITY_IDS:
             if (
                 self._local_file_sensitivity is None
@@ -427,6 +446,12 @@ class DataCapabilityDomain:
                 prepared["sql_fingerprint"] = validated.sql_fingerprint
                 return FrozenJsonObject.from_mapping(prepared)
             return arguments
+        scope = await resolve_effective_source_scope(
+            run,
+            self._catalog,
+            files_only=session is not None and session.options.files_only,
+        )
+        run = replace(run, resolved_source_scope=scope)
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(session, call)
         await self._validate_source_scope(run, capability, arguments)
@@ -834,13 +859,28 @@ class DataCapabilityDomain:
         valid = (
             bool(draft.provenance.resource_bindings)
             and output.data.get("adapter_id") in _RELATIONAL_ADAPTER_IDS
-            and output.data.get("format") in {"csv", "xlsx"}
+            and output.data.get("format") in {"csv", "xlsx", "arrow"}
             and output.data.get("filename") == draft.suggested_filename
             and output.data.get("source_id")
             == draft.provenance.resource_bindings[0].source_id
             and output.data.get("row_count") == draft.provenance.row_count
             and output.data.get("column_count") == len(draft.provenance.columns)
         )
+        if output.data.get("format") == "arrow":
+            columns, types = arrow_schema(draft.content)
+            valid = valid and (
+                draft.media_type == ARROW_MEDIA_TYPE
+                and columns == draft.provenance.columns
+                and output.data.get("columns") == columns
+                and output.data.get("column_types") == types
+                and output.data.get("byte_size") == len(draft.content)
+                and output.data.get("complete") is True
+                and output.data.get("coverage") == "complete_query_result"
+                and output.data.get("sql_fingerprint")
+                == draft.provenance.sql_fingerprint
+                and output.data.get("parameters_sha256")
+                == draft.provenance.parameters_sha256
+            )
         if not valid:
             raise ToolOutputValidationError(
                 "relational export summary differs from its execution provenance"

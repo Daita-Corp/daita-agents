@@ -174,6 +174,7 @@ def _kinds(events):
 
 def test_event_contract_is_immutable_bounded_and_deeply_frozen():
     assert tuple(AgentEventKind) == (
+        AgentEventKind.ADMISSION_UPDATED,
         AgentEventKind.RUN_STARTED,
         AgentEventKind.MODEL_TEXT_DELTA,
         AgentEventKind.MODEL_COMPLETED,
@@ -181,6 +182,7 @@ def test_event_contract_is_immutable_bounded_and_deeply_frozen():
         AgentEventKind.APPROVAL_REQUESTED,
         AgentEventKind.APPROVAL_DECIDED,
         AgentEventKind.TOOL_COMPLETED,
+        AgentEventKind.ANALYSIS_UPDATED,
         AgentEventKind.RUN_COMPLETED,
     )
     event = AgentEvent(
@@ -764,3 +766,52 @@ async def test_public_create_and_open_inject_the_observer(tmp_path):
     )
     assert _kinds(created_events) == expected
     assert _kinds(opened_events) == expected
+
+
+async def test_public_admission_observation_is_opt_in_and_payload_free(tmp_path):
+    from daita import AgentConfig
+
+    events: list[AgentEvent] = []
+    provider = MockModelProvider((_stop("observed"),))
+    profile = ModelProfile(
+        id=provider.provider_id,
+        context_window_tokens=20_000,
+        max_output_tokens=1_000,
+        supports_tools=True,
+    )
+    agent = await Agent.create(
+        "admission-observed",
+        root=tmp_path,
+        model=provider,
+        model_profile=profile,
+        workspace=workspace_for(tmp_path),
+        observer=events.append,
+        config=AgentConfig(admission_observations=True),
+    )
+    try:
+        result = await agent.run("observe permits")
+        assert result.kind is LoopExitKind.COMPLETED
+    finally:
+        await agent.close()
+    admissions = [
+        event for event in events if event.kind is AgentEventKind.ADMISSION_UPDATED
+    ]
+    assert {event.data["permit_kind"] for event in admissions} >= {
+        "execution",
+        "provider",
+    }
+    assert all(event.run_id == event.conversation_id == "host" for event in admissions)
+    assert all(
+        set(event.data)
+        == {
+            "permit_kind",
+            "workload_class",
+            "active",
+            "high_water",
+            "queue_seconds",
+            "execution_seconds",
+            "cleanup_seconds",
+        }
+        for event in admissions
+    )
+    assert str(tmp_path) not in repr(admissions)

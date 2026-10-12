@@ -61,7 +61,12 @@ def wheel_metadata(path: Path) -> tuple[str, str, str]:
     return one("Name"), one("Version"), one("Requires-Python")
 
 
-def build_minimal_wheel(directory: Path, *, version: str = "1.0.0") -> Path:
+def build_minimal_wheel(
+    directory: Path,
+    *,
+    version: str = "1.0.0",
+    analysis_requirements: tuple[str, ...] = (),
+) -> Path:
     wheel = directory / f"daita_agents-{version}-py3-none-any.whl"
     dist_info = f"daita_agents-{version}.dist-info"
     with zipfile.ZipFile(wheel, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -92,7 +97,12 @@ def build_minimal_wheel(directory: Path, *, version: str = "1.0.0") -> Path:
             "Metadata-Version: 2.4\n"
             "Name: daita-agents\n"
             f"Version: {version}\n"
-            "Requires-Python: >=3.11,<3.13\n",
+            "Requires-Python: >=3.11,<3.13\n"
+            + ("Provides-Extra: analysis\n" if analysis_requirements else "")
+            + "".join(
+                f'Requires-Dist: {requirement}; extra == "analysis"\n'
+                for requirement in analysis_requirements
+            ),
         )
         archive.writestr(
             f"{dist_info}/WHEEL",
@@ -277,12 +287,15 @@ def _fake_uv_source() -> str:
         from __future__ import annotations
 
         import os
+        import re
+        from email.parser import Parser
         from pathlib import Path
         import shutil
         import signal
         import subprocess
         import sys
         import venv
+        import zipfile
 
         args = sys.argv[1:]
         key = " ".join(args[:2])
@@ -329,7 +342,8 @@ def _fake_uv_source() -> str:
             raise SystemExit(0)
 
         if args[:2] == ["tool", "install"]:
-            wheel = Path(args[-1])
+            install_analysis = args[-1].endswith("[analysis]")
+            wheel = Path(args[-1].removesuffix("[analysis]"))
             tool = Path(os.environ["UV_TOOL_DIR"]) / "daita-agents"
             venv.EnvBuilder(with_pip=True, system_site_packages=True).create(tool)
             python = tool / "bin" / "python"
@@ -347,6 +361,34 @@ def _fake_uv_source() -> str:
                 check=True,
                 stdout=subprocess.DEVNULL,
             )
+            if install_analysis:
+                # This fixture models dependency installation metadata only.
+                # Native scientific execution is qualified with the real uv path.
+                with zipfile.ZipFile(wheel) as archive:
+                    metadata_name = next(
+                        name for name in archive.namelist()
+                        if name.endswith(".dist-info/METADATA")
+                    )
+                    metadata = Parser().parsestr(archive.read(metadata_name).decode())
+                site_packages = Path(subprocess.check_output(
+                    [str(python), "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                    text=True,
+                ).strip())
+                for requirement in metadata.get_all("Requires-Dist", []):
+                    pinned, separator, marker = requirement.partition(";")
+                    if not separator or marker.strip() != 'extra == "analysis"':
+                        continue
+                    matched = re.fullmatch(r"([A-Za-z0-9_-]+)==([0-9.]+)", pinned.strip())
+                    if matched is None:
+                        raise SystemExit("fixture analysis requirements must be exact version pins")
+                    name, version = matched.groups()
+                    normalized = name.replace("-", "_").lower()
+                    info = site_packages / f"{normalized}-{version}.dist-info"
+                    info.mkdir(exist_ok=True)
+                    (info / "METADATA").write_text(
+                        f"Metadata-Version: 2.4\nName: {name}\nVersion: {version}\n",
+                        encoding="utf-8",
+                    )
             public_bin = Path(os.environ["UV_TOOL_BIN_DIR"])
             public_bin.mkdir(parents=True, exist_ok=True)
             destination = public_bin / "daita"

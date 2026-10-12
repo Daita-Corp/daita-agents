@@ -309,7 +309,7 @@ class LoopLimits:
     max_tool_calls_per_run: int = 64
     max_run_tool_catalog_entries: int = 512
     max_run_tool_catalog_bytes: int = 2 * 1_024 * 1_024
-    max_toolbox_manifest_entries: int = 6
+    max_toolbox_manifest_entries: int = 7
     max_toolbox_manifest_bytes: int = 8 * 1_024
     max_toolbox_manifest_tokens: int = 2_000
     max_pinned_tools: int = 32
@@ -376,8 +376,8 @@ class LoopLimits:
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"{field_name} must be a positive integer")
-        if self.max_toolbox_manifest_entries > 6:
-            raise ValueError("max_toolbox_manifest_entries cannot exceed 6")
+        if self.max_toolbox_manifest_entries > 7:
+            raise ValueError("max_toolbox_manifest_entries cannot exceed 7")
         if (
             self.max_pinned_tools + self.max_loaded_tools + len(RESERVED_TOOL_NAMES)
             > self.max_step_tools

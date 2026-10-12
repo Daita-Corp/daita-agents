@@ -223,7 +223,12 @@ async def test_search_discovers_effects_across_toolboxes_but_cannot_approve_them
     assert all(executor.execute_calls == 0 for executor in executors)
 
 
-async def test_production_intent_search_distinguishes_current_competing_tools(tmp_path):
+async def test_production_intent_search_distinguishes_current_competing_tools(
+    tmp_path, monkeypatch
+):
+    # Discovery exercises production declarations without launching a worker or
+    # depending on this test host's scientific installation.
+    monkeypatch.setattr("daita.domains.analysis.domain.available", lambda: True)
     database = tmp_path / "discovery.db"
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE sales(amount INTEGER)")
@@ -240,6 +245,30 @@ async def test_production_intent_search_distinguishes_current_competing_tools(tm
         ("export all database rows csv", "data_export_tabular", 1),
         ("schedule recurring report", "routine_create", 1),
         ("set default export directory", "artifact_set_export_location", 1),
+        ("python_execute", "python_execute", 1),
+        ("python workspace", "python_execute", 1),
+        ("python computation", "python_execute", 1),
+        ("simulate a system", "python_execute", 1),
+        ("text processing", "python_execute", 1),
+        ("structured data validation", "python_execute", 1),
+        ("transform authenticated tool results", "python_execute", 1),
+        ("cross source analysis statistics", "python_execute", 1),
+        ("python pandas chart", "python_execute", 1),
+        (
+            "Create downloadable chart and CSV artifacts from query result data, e.g. chart spec or report CSV file",
+            "python_execute",
+            3,
+        ),
+        (
+            "Create chart artifact from summarized weekly time-series revenue and order count, bar or line chart image or HTML visualization",
+            "python_execute",
+            3,
+        ),
+        (
+            "Run Python code for plotting chart and creating chart image artifact from validated result rows",
+            "python_execute",
+            1,
+        ),
     )
     calls = tuple(
         ToolCall(
@@ -249,7 +278,13 @@ async def test_production_intent_search_distinguishes_current_competing_tools(tm
     )
     provider = MockModelProvider(
         (
-            ModelResponse(finish_reason=FinishReason.TOOL_CALLS, tool_calls=calls),
+            *(
+                ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=calls[index : index + 16],
+                )
+                for index in range(0, len(calls), 16)
+            ),
             ModelResponse(
                 finish_reason=FinishReason.STOP, text="Discovery only; nothing saved."
             ),
@@ -288,7 +323,15 @@ async def test_production_intent_search_distinguishes_current_competing_tools(tm
             assert isinstance(matches, tuple)
             names = tuple(match["tool_name"] for match in matches)
             assert expected in names[:rank_bound], (query, names)
+            if expected == "python_execute":
+                assert (
+                    next(match for match in matches if match["tool_name"] == expected)[
+                        "capability_id"
+                    ]
+                    == "analysis.execute"
+                )
         assert await agent.list_semantic_annotations() == ()
+        assert await agent.analysis_evidence(result.run_id) == ()
         assert all(
             call.name == "toolbox_search"
             for message in transcript.messages

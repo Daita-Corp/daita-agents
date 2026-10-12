@@ -40,11 +40,11 @@ provisioning, upgrades and execution leases with the caller. No generic lifecycl
 framework is needed. Physical document persistence must preserve the existing
 memory/skill owners' validation, bounds and canonical bytes.
 
-## Architecture status: current revision 3
+## Architecture status: current revision 4
 
-The current agent-home format is released **revision 3**, extending released
-revision 2 with caller/MCP contracts and an independent artifact registry.
-Released revisions 1 through 3 and their migrations remain immutable. Revision 3 is the
+The current agent-home format is **revision 4**, extending released revision 3
+with bounded foreground analytical evidence and retained artifact computation
+provenance. Released revisions 1 through 3 and their migrations remain immutable. Revision 4 is the
 sole current runnable format; legacy decoders remain migration-only.
 
 The current revision-2 graph has these non-negotiable boundaries:
@@ -77,7 +77,7 @@ The current revision-2 graph has these non-negotiable boundaries:
   single-job, connected-executor and autonomous-follow-up paths are deleted at the
   specified gates rather than retained as a selectable compatibility engine.
 
-## Current production architecture (revision 3)
+## Current production architecture (revision 4)
 
 Daita is a persistent, read-first data agent with a narrowly scoped,
 explicitly enabled native relational update/upsert capability, initially backed by PostgreSQL,
@@ -169,11 +169,17 @@ delegates to `EmbeddedAgent`; it does not implement model progression, catalog
 truth, capability execution, or persistence.
 
 `daita.hosting.embedded.EmbeddedAgent` is the composition root. It admits the
-agent home, holds the process-level writer lock, composes the capacity-one
-`RunAdmissionCoordinator` and retains the broad mutation lock, constructs the
+agent home, holds the process-level writer lock, composes the
+`RunAdmissionCoordinator` with immutable `AgentConfig.host_capacity` and retains
+the broad mutation lock, constructs the
 catalog, registry, domains, context builder, runtime, loop, artifact store, and
 supervisors, and closes them in drain-safe order. Composition belongs here rather
-than in the loop or a dependency-injection framework.
+than in the loop or a dependency-injection framework. The default
+PostgreSQL read backend owns optional lazy bounded native pools and closes them
+after drain, before credentials and state. Every read/export retains a fresh
+read-only transaction and full structural revalidation; reuse grants no authority.
+Pool configuration and resolved credentials are runtime-only; retired or uncertain
+connections are never reused or replayed.
 
 One open agent home has one writer. A foreground TUI or CLI process and the
 resident host must hand off that lock; they cannot open the same home
@@ -193,11 +199,14 @@ concurrently.
 Each host-owned loop invocation consumes one immutable, single-use `RunSession`.
 The session owns its cancellation/deadline state, immutable run options and exactly
 one `RunSessionWriter`; the writer alone starts, appends to and terminates that run's
-transcript with exact ordering and conversation-predecessor binding. The capacity-one
-coordinator preserves revision-1 serial behavior while owning execution admission,
-keyed conversation ordering, provider admission and shutdown drain. Conservative
-source/resource, MCP, SQLite-pressure and effect permit interfaces do not yet enable
-cross-run I/O concurrency or replace the mutation lock.
+transcript with exact ordering and conversation-predecessor binding. The coordinator
+owns bounded execution admission, keyed conversation ordering, provider admission
+and shutdown drain. Compatibility defaults are five executions, two provider
+requests, strict foreground reserves of one, one graph task, two PostgreSQL reads
+per source and four SQLite-pressure permits. Host capacity is runtime configuration,
+not execution authority. SQLite sources and MCP bindings remain capacity one;
+analysis retains one computation lane and an independent parser lane. Keyed
+permits do not replace the mutation lock.
 
 The loop depends on the small `ModelProvider`, `ContextBuilder`, `ToolRuntime`, and
 transcript-store protocols through those session boundaries. Provider payloads,
@@ -580,7 +589,11 @@ create only these artifacts:
 
 - `artifact.create_document`;
 - `data.export_tabular`;
-- `artifact.snapshot_result`.
+- `artifact.snapshot_result`;
+- `analysis.execute` in the existing local macOS ARM64 composition, using the
+  exact routine read scope and the same bounded native worker and artifact store.
+  Its brokered reads own source permits; the interpreter holds no source permit.
+  Scheduled analysis cannot use local computer files or retained artifact inputs.
 
 `artifact.snapshot_result` produces bounded canonical `application/json` from
 an exact earlier successful result in the same run. It performs no source I/O
@@ -718,7 +731,7 @@ authority exists only in `relational_write_scopes`. Connection JSON never
 owns either permission. Reconstruction fails closed, refresh preserves exact
 scopes, and detach revokes both scope families atomically.
 
-In current revision 3, all state mutation must be atomic and cancellation-safe. Do
+In current revision 4, all state mutation must be atomic and cancellation-safe. Do
 not add event sourcing, replay projections, another state abstraction or a second
 writer around SQLite. Only the normalized graph records, bounded task checkpoints/
 comments and audit event cursor defined by the current schema are permitted; those
@@ -969,7 +982,10 @@ daita
 
 `openai`, `anthropic`, `google-genai`, `asyncpg`, `sqlglot`, `httpx`,
 `keyring`, `textual`, `rich`, `XlsxWriter`, and exact `duckdb==1.5.5` are
-default production dependencies. `dev` is the only optional dependency group.
+default production dependencies. `dev` supplies test and quality tools;
+`analysis` supplies the pinned scientific runtime for native macOS ARM64
+computation. Managed installation includes `analysis`; a source checkout uses
+`pip install -e '.[dev,analysis]'` to qualify that runtime.
 
 Default installation does not permit eager imports. Provider SDKs, `asyncpg`,
 `sqlglot`, `httpx`, `keyring`, `textual`, `rich`, and DuckDB remain imported lazily

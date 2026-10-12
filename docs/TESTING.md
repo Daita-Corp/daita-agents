@@ -26,6 +26,85 @@ unit/integration directory hierarchy.
   from default discovery.
 - `tests/diagnostics` and `tests/packaging` contain explicit module entry points.
 
+## Offline throughput components
+
+The bounded public-composition campaign uses controlled model responses, three
+local SQLite fixtures and the real native Python worker when its pinned runtime
+is available. It checks values, artifact hashes, conversation order, graph
+completion and native cleanup independently of the scripted answer. Scripted
+models establish execution behavior; they provide no model-quality evidence.
+
+```bash
+DAITA_RUN_THROUGHPUT_COMPONENT=1 \
+DAITA_THROUGHPUT_CAMPAIGN=baseline \
+DAITA_THROUGHPUT_REPORT_DIR=/private/tmp/daita-throughput-evidence \
+  .venv/bin/python -m pytest tests/slow/hosting \
+  -o addopts="--tb=short -q --strict-markers" -s
+```
+
+Choose `final` for the integrated campaign. `DAITA_THROUGHPUT_SAMPLES` accepts
+30–100 repetitions (default 30). Compare the same fixture digest, configuration,
+host and workload; reports retain raw latency samples, p50/p95, a fixed-seed
+bootstrap interval, task throughput, model requests and process peak RSS. Missing
+model token/cost usage remains unknown. Reports must be outside the repository.
+Unperformed real-database and model checks remain explicitly labeled and require
+their existing live gates. An unavailable native runtime is unperformed evidence.
+Use at most one `additional` campaign when uncertainty overlaps; keep conservative
+defaults if that sampling remains inconclusive. Keep campaign reports private;
+published performance claims should state the tested configuration, correctness,
+usage, cleanup and uncertainty.
+
+`Agent.admission_diagnostics()` returns immutable, runtime-only counters aggregated
+by permit kind and workload class, plus applied host capacities. It retains no
+per-request samples or permit identities. Queue, lease holding and release cleanup
+times are separate cumulative measurements; lease holding time includes the work
+performed while the lease is held. Set `AgentConfig.admission_observations=True`
+to include `admission.updated` in the existing best-effort observer with payload-free
+host identifiers. The default observer stream remains unchanged. Observer failure cannot
+change admission or execution. Diagnostics survive close in memory and disappear
+with the composition; no telemetry or agent-home format change is introduced.
+
+## Local Python live acceptance
+
+`tests/analysis` covers the production native execution slice. The required
+opt-in acceptance suite is `tests/live/analysis`: real-model API, CLI and mounted
+TUI journeys plus real-worker faults, resource accounting, active revocation,
+crash/reopen, data fidelity, output formats and managed installation. Model turns
+may be scripted for deterministic faults; native execution and teardown are real.
+
+Run on macOS ARM64 with `.[dev,analysis]` installed. The live model defaults to
+reviewed `openai:gpt-5.6-terra`, reads configured repository `.env` credentials
+without displaying them, and permits at most $0.50 per paid run and $5.00 aggregate
+reserved model cost per invocation. Set `DAITA_ANALYSIS_LIVE_MODEL_ID`,
+`DAITA_ANALYSIS_LIVE_MAX_COST_USD`, `DAITA_ANALYSIS_LIVE_SUITE_MAX_COST_USD` or
+`DAITA_ANALYSIS_LIVE_LLM_API_KEY` explicitly when needed. All ceilings must be
+finite and positive. `DAITA_ANALYSIS_LIVE_DEADLINE_SECONDS` defaults to 900.
+
+Build the exact candidate wheel and supply the reviewed uv archive from
+`release/managed-installer.json`; the installer test verifies its checksum:
+
+```bash
+.venv/bin/python -m build --wheel --no-isolation --outdir /private/tmp/daita-analysis-wheel
+export DAITA_ANALYSIS_LIVE_WHEEL=/private/tmp/daita-analysis-wheel/daita_agents-VERSION-py3-none-any.whl
+export DAITA_ANALYSIS_LIVE_UV_ARCHIVE=/private/tmp/daita-analysis-uv-aarch64.tar.gz
+DAITA_RUN_LIVE_ANALYSIS=1 .venv/bin/python -m pytest tests/live/analysis \
+  -o addopts="--tb=short -q --strict-markers" \
+  --junitxml=/private/tmp/daita-analysis-live.xml
+```
+
+Replace `VERSION` with the actual wheel version authored in `pyproject.toml`. No candidate is
+published. The real installer downloads the pinned CPython and scientific
+dependencies into disposable binary generations; no cell installs packages.
+Missing configuration fails dedicated acceptance rather than skipping it.
+Ordinary offline CI does not opt into these live tests.
+
+Every call outcome writes JSON to `DAITA_ANALYSIS_LIVE_REPORT_DIR` (default
+`/private/tmp/daita-analysis-live-evidence`), including failures, usage, captured
+child evidence and actual cleanup. Prior results are archived in `history/`;
+JUnit is retained independently. Inspect both run status and measurement
+completeness. A mocked cleanup, absent worker measurement or model-written
+analytical claim is not successful live evidence.
+
 `tests/storage/contracts` is the portable durable-backend suite. The framework
 runs it against SQLite and a disposable in-memory artifact-byte dependency:
 
@@ -131,6 +210,83 @@ The live MCP action and scheduled execution suites default to a `$0.50`
 estimated cost cap per agent run in both evaluation profiles. Configure it with
 `DAITA_PHASE_F_LIVE_MAX_COST_USD`; it must remain finite and positive. These
 suites use real model providers with simulated MCP servers.
+
+### Live analytical and operational acceptance
+
+`tests/live/data_operations` exercises Daita's data and analytics workflows using the
+existing SQLite/PostgreSQL adapters, MCP SDK fixture, native macOS Python worker,
+scheduled routines and approved semantic annotations. With one model and one
+repetition it collects 58 cases:
+
+| Area | Checks and independent evidence |
+| --- | --- |
+| Analytical quality | 50 fixed cases: paid/refund totals, join multiplication, local-day boundaries and counts across ten datasets. Python fixture facts provide the numerical oracle; current successful SQL evidence is required. Separate cases require account clarification and honest partial-file coverage. |
+| Python and automation | Real foreground Python creates an independently scored JSON dataset and PNG chart, with child read evidence, measured resource use, cleanup and retained computation evidence. Public routine proposals execute scoped SQL and Python reports, deliver them to the inbox, and require a PNG artifact for Python. |
+| Existing connectivity | SQLite reads, the existing disposable PostgreSQL fixture with a separate raw-row oracle, and two overlapping MCP accounts through the production SDK. Exact account selection and schema drift must prevent dispatch under a changed binding. |
+| Retained business meaning | The same definition supplied in the prompt provides a control. One approved definition must survive reopen and produce the same correct result in three fresh conversations, leave an unrelated query correct, and become unusable after schema drift. |
+
+The 50 numerical cases cover five question families with varied fixture amounts;
+they are not 50 unrelated business problems. MCP transport and service responses
+are fixtures; their cases establish model/tool behavior, not readiness of a real
+remote service. The PostgreSQL case contacts the developer-operated
+[existing read fixture](../tests/fixtures/postgresql/README.md), reads it without
+mutation, and assumes it remains unchanged during evaluation. No infrastructure
+is provisioned by this suite.
+
+Run on the existing macOS ARM64 native analysis environment. Configure reviewed
+tool-capable API models through `DAITA_STAGE_B_BENCHMARK_MODEL_IDS` (comma-separated,
+one to six; default `openai:gpt-5.6-terra`). Export
+`DAITA_STAGE_B_BENCHMARK_LLM_API_KEY` or provider-specific
+`DAITA_STAGE_B_BENCHMARK_OPENAI_API_KEY`, `...ANTHROPIC_API_KEY`,
+`...GEMINI_API_KEY` or `...GROK_API_KEY` privately. The harness reuses the existing
+provider factory and does not load `.env` automatically. Set
+`DAITA_FIXTURE_POSTGRES_PASSWORD` and, when needed,
+`DAITA_FIXTURE_POSTGRES_PORT` (default `55432`) for the PostgreSQL case.
+That case compares cold connections with an opt-in one-connection pool over two
+fresh model runs per variant. Both answers use the same independent Decimal
+oracle; the pooled variant must reuse one connection, complete each checkout,
+and retain structural/query/cleanup diagnostics in its private report.
+
+`DAITA_DATAOPS_REPEATS` accepts one to five independent repetitions (default one).
+The default estimated-cost ceiling is $0.50 per run, configured through the
+existing `DAITA_STAGE_B_BENCHMARK_MAX_COST_USD`, and $10.00 aggregate, configured
+through `DAITA_DATAOPS_TOTAL_COST_USD`. Both must be finite and positive. Runs
+reserve before dispatch, charge measured consumption, and retain the reservation
+when usage is incomplete. The aggregate cap may prevent completion of the entire
+matrix; those failures do not count as successful qualification. Use a serial
+pytest invocation so this session budget is shared across all cases and models.
+
+Collect or qualify the harness without live calls:
+
+```bash
+.venv/bin/python -m pytest tests/live/data_operations --collect-only \
+  -o addopts="--tb=short -q --strict-markers"
+.venv/bin/python -m pytest tests/acceptance/test_data_operations_harness.py \
+  tests/mcp/test_read_harness.py
+```
+
+After explicit authorization and configuration of the existing resources:
+
+```bash
+DAITA_RUN_LIVE_DATA_OPERATIONS=1 \
+DAITA_DATAOPS_REPORT_DIR=/private/tmp/daita-dataops-evidence \
+.venv/bin/python -m pytest tests/live/data_operations \
+  -o addopts="--tb=short -q --strict-markers" \
+  --junitxml=/private/tmp/daita-dataops-live.xml -o junit_family=xunit1
+```
+
+Evidence is private JSON outside the repository. Without an explicit report
+directory, one unique `/private/tmp/daita-dataops-...` directory is created per
+invocation. JUnit properties identify each case report. Reports retain exact run
+transcripts and model requests, result scores, fixture hashes, token/cost usage,
+timings, scheduled run results and applicable Python computation evidence.
+Inspect JUnit alongside JSON: setup failures can occur before a run is captured.
+The authorization gate remains off during ordinary CI and collection.
+
+Scheduled Python requires the same native macOS runtime as foreground Python.
+The retained definition cases test advisory semantics within Daita; they do not
+qualify an executable metric compiler. Warehouse integrations and Linux support
+are outside this suite's scope.
 
 ### Real-model artifact lifecycle
 
@@ -431,3 +587,21 @@ imports resolve from the repository root:
 The two packaging lifecycle modules require a candidate wheel for actual use.
 A local `--help` check validates relocation only; CI's clean lifecycle jobs
 remain the installed-wheel evidence.
+
+PostgreSQL pool boundaries are covered offline by
+`tests/data/postgresql/test_pool.py`, existing query/export tests and host lifecycle
+cases. The injected native-pool fixture proves reuse, fresh transactions, source
+and host bounds, admission retirement, cancellation, reset failure and safe close.
+It does not establish real PostgreSQL transport performance. Use
+`Agent.postgresql_read_diagnostics()` for aggregate checkout, structure, query and
+cleanup metrics; connection counts distinguish creation from per-read transactions.
+
+Paired real-model handoff cases are in
+`tests/live/analysis/test_public_journeys.py` (exact export/bind versus capture) and
+`tests/live/data_operations/test_workflows.py` (synchronous versus batched Python
+reads). They retain the existing explicit `DAITA_RUN_LIVE_ANALYSIS=1` and
+`DAITA_RUN_LIVE_DATA_OPERATIONS=1` authorization, credentials, per-run/aggregate
+cost bounds and private reports. Numerical correctness is scored against fixture
+oracles independently of latency, request count and usage. These cases remain
+unperformed until those gates are supplied; scripted component models do not
+qualify reasoning quality.

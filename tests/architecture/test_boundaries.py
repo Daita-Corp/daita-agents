@@ -187,10 +187,20 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
 
     assert "self._run_lock" not in embedded
     assert "def _run_locked" not in embedded
-    assert "execution_capacity=5" in embedded
-    assert "foreground_execution_reserve=1" in embedded
-    assert "provider_capacity=2" in embedded
-    assert "foreground_provider_reserve=1" in embedded
+    assert "execution_capacity=host_capacity.execution_capacity" in embedded
+    assert daita.HostCapacityLimits().execution_capacity == 5
+    assert (
+        "foreground_execution_reserve=host_capacity.foreground_execution_reserve"
+        in embedded
+    )
+    assert daita.HostCapacityLimits().foreground_execution_reserve == 1
+    assert "provider_capacity=host_capacity.provider_capacity" in embedded
+    assert daita.HostCapacityLimits().provider_capacity == 2
+    assert (
+        "foreground_provider_reserve=host_capacity.foreground_provider_reserve"
+        in embedded
+    )
+    assert daita.HostCapacityLimits().foreground_provider_reserve == 1
     assert "_files_only_runs" not in _python_text(PACKAGE)
     assert "_selected_learning_candidates" not in context
     assert "self._selected" not in learning
@@ -200,9 +210,19 @@ def test_cutover_removed_global_run_state_and_registered_only_revision_two():
     assert "_scheduled_bindings" not in skills
     assert "self._one_time" not in delivery
     assert "_source_permission_lock" in embedded
-    assert (
-        "HOME_MIGRATIONS: tuple[HomeMigration, ...] = (REVISION_1, REVISION_2, REVISION_3)"
-        in migrations
+    assignment = next(
+        node
+        for node in ast.parse(migrations).body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "HOME_MIGRATIONS"
+    )
+    assert isinstance(assignment.value, ast.Tuple)
+    assert tuple(ast.unparse(item) for item in assignment.value.elts) == (
+        "REVISION_1",
+        "REVISION_2",
+        "REVISION_3",
+        "REVISION_4",
     )
     assert "job_graphs" in CURRENT_SCHEMA.tables
     assert "autonomous_followups" not in CURRENT_SCHEMA.tables
@@ -527,6 +547,7 @@ async def test_registry_assigns_every_native_tool_to_one_static_owner(
         registry = agent._embedded._capabilities
         runtime = agent._embedded._capability_runtime
         expected_owners = {
+            "analysis",
             "artifacts",
             "data",
             "data_profile_jobs",
@@ -603,6 +624,8 @@ def test_public_surface_is_focused():
         "EffectEvidenceBasis",
         "Agent",
         "AgentConfig",
+        "HostCapacityLimits",
+        "PostgreSQLReadLimits",
         "AgentEvent",
         "AgentEventKind",
         "AgentObserver",
@@ -2121,6 +2144,7 @@ def test_agent_home_journal_and_codecs_have_one_append_only_storage_owner():
         "revision_0002_legacy_job_codecs.py",
         "revision_0002_legacy_jobs.py",
         "revision_0003.py",
+        "revision_0004.py",
     }
     assert _class_owners("SQLiteStateStore") == {"storage/sqlite.py"}
 

@@ -208,6 +208,41 @@ def main() -> int:
 
         environment = fixture_environment(active_fixture, home)
         launcher = home / ".local" / "bin" / "daita"
+        if arguments.real_uv_archive is not None and sys.platform == "darwin":
+            installed_python = (
+                _current_generation(managed_root) / "tool/daita-agents/bin/python"
+            )
+            execution = _run(
+                [
+                    str(installed_python),
+                    "-I",
+                    "-c",
+                    """
+import asyncio, json, os
+from daita.adapters.analytical_workspace import NativePythonWorker
+from daita.adapters.analytical_workspace.runtime import runtime_status
+async def main():
+ assert runtime_status()['available']
+ worker=NativePythonWorker()
+ try:
+  await worker.start()
+  result=await worker.execute('import numpy,pandas,scipy,networkx,pyarrow,matplotlib,duckdb\\nprint(duckdb.sql("select 6*7").fetchone()[0])', deadline=asyncio.get_running_loop().time()+30)
+  assert result['status']=='success', result
+  assert result['stdout']=='42\\n', result
+ finally:
+  cleanup=await worker.close()
+ assert cleanup['process_reaped'] and cleanup['scratch_deleted'], cleanup
+ assert not worker.scratch.exists()
+ try: os.kill(worker.worker_pid, 0)
+ except ProcessLookupError: pass
+ else: raise AssertionError('installed native worker still exists')
+ print('ANALYSIS_EVIDENCE='+json.dumps({'runtime':runtime_status(), 'usage':worker.usage, 'cleanup':cleanup}))
+asyncio.run(main())
+""",
+                ],
+                env=environment,
+            )
+            print(execution.stdout, end="")
         _run(
             [
                 str(launcher),

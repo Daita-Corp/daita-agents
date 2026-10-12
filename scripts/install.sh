@@ -891,6 +891,7 @@ verify_generation() {
     scoped_uv "$UV_BIN" pip check --python "$python"
     installed_metadata_check "$python" "$expected_version" "$expected_python"
     lazy_import_check "$python"
+    "$python" -I -c 'from importlib.metadata import distribution, version; import re; requirements = [re.fullmatch(r"([A-Za-z0-9_-]+)==([0-9.]+); extra == \"analysis\"", value) for value in (distribution("daita-agents").requires or []) if "extra == \"analysis\"" in value]; assert all(value is not None and version(value[1]) == value[2] for value in requirements), "scientific dependency identity mismatch"'
 }
 
 write_generation_manifest() {
@@ -1245,7 +1246,7 @@ install_generation() {
     publish_bootstrap
     test_failpoint "after-bootstrap"
 
-    scoped_uv "$UV_BIN" tool install --python "$PYTHON_BIN" --force "$wheel"
+    scoped_uv "$UV_BIN" tool install --python "$PYTHON_BIN" --force "${wheel}[analysis]"
     local tool_entrypoint="$GENERATION_STAGE/tool/daita-agents/bin/daita"
     [[ -x "$tool_entrypoint" ]] || fail "uv did not install the expected Daita tool entry point"
     cp -- "$tool_entrypoint" "$GENERATION_STAGE/bin/.daita.tmp"

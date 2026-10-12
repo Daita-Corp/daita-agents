@@ -118,6 +118,7 @@ from ..llm.models import (
     ToolResultBlock,
 )
 from ..llm.pricing import CostEstimateStatus
+from ..loop.analysis import AnalysisEvidence, AnalysisTraceCapacityError
 from ..loop.models import (
     ConversationRun,
     LoopExit,
@@ -204,6 +205,7 @@ from .sqlite_codecs import (
     encode_source,
     encode_source_read_scope,
 )
+from .sqlite_codecs.analysis import decode_analysis_evidence, encode_analysis_evidence
 from .sqlite_codecs.artifacts import (
     decode_artifact_record,
     encode_artifact_record,
@@ -5594,6 +5596,249 @@ class SQLStateStore:
 
         return await asyncio.to_thread(read)
 
+    async def record_analysis_evidence(
+        self, agent_id: str, evidence: AnalysisEvidence
+    ) -> None:
+        encoded = encode_analysis_evidence(evidence)
+
+        def write(connection: SQLConnection) -> None:
+            row = connection.execute(
+                "SELECT agent_id, result FROM runs WHERE id = ?", (evidence.run_id,)
+            ).fetchone()
+            if row is None or row[0] != agent_id or row[1] is not None:
+                raise ValueError("Analysis evidence requires an exact live owned run")
+            summary = connection.execute(
+                "SELECT data FROM analysis_evidence WHERE run_id = ? AND evidence_id = 'run-summary'",
+                (evidence.run_id,),
+            ).fetchone()
+            trace_records = (
+                evidence.facts.get("trace_records", 256)
+                if evidence.kind == "run" and evidence.facts["status"] == "admitted"
+                else (
+                    decode_analysis_evidence(summary[0]).facts.get("trace_records", 256)
+                    if summary
+                    else 256
+                )
+            )
+            if type(trace_records) is not int or not 4 <= trace_records <= 256:
+                raise ValueError(
+                    "Analysis trace admission requires a bounded record ceiling"
+                )
+            existing = connection.execute(
+                "SELECT data FROM analysis_evidence WHERE run_id = ? AND evidence_id = ?",
+                (evidence.run_id, evidence.evidence_id),
+            ).fetchone()
+            if existing is not None:
+                prior = decode_analysis_evidence(existing[0])
+                if evidence.kind == "generation" and existing[0] == encoded:
+                    return  # Lost commit acknowledgement: exact settlement only.
+                disposal = (
+                    prior.kind == evidence.kind == "generation"
+                    and prior.facts["status"] == "closed"
+                    and dict(evidence.facts) == {**prior.facts, "proof_disposed": True}
+                )
+                if (
+                    prior.kind != evidence.kind
+                    or not disposal
+                    and prior.facts.get("status")
+                    not in {
+                        "admitted",
+                        "running",
+                    }
+                ):
+                    raise ValueError(
+                        "Analysis evidence cannot be replayed or overwritten"
+                    )
+                for identity in (
+                    "parent_call_id",
+                    "sequence",
+                    "tool_name",
+                    "arguments",
+                    "code",
+                    "scratch",
+                    "closure_nonce",
+                ):
+                    if identity in prior.facts and prior.facts[
+                        identity
+                    ] != evidence.facts.get(identity):
+                        raise ValueError("Analysis evidence identity changed")
+            else:
+                counted = connection.execute(
+                    "SELECT COUNT(*) FROM analysis_evidence WHERE run_id = ?",
+                    (evidence.run_id,),
+                ).fetchone()
+                assert counted is not None
+                count = counted[0]
+                if count >= trace_records:
+                    raise AnalysisTraceCapacityError(
+                        "Analysis evidence capacity exhausted"
+                    )
+            credit = (
+                max(len(encoded.encode()), 270_000)
+                if evidence.facts.get("status")
+                in {"admitted", "running", "cleanup_failed"}
+                or evidence.kind == "generation"
+                and evidence.facts.get("proof_disposed") is not True
+                else len(encoded.encode())
+            )
+            occupied = connection.execute(
+                "SELECT COALESCE(SUM(reserved_bytes), 0) FROM analysis_evidence WHERE run_id = ? AND evidence_id != ?",
+                (evidence.run_id, evidence.evidence_id),
+            ).fetchone()
+            assert occupied is not None
+            trace_limit = (
+                evidence.facts.get("trace_bytes", 4 * 1024 * 1024)
+                if evidence.kind == "run" and evidence.facts["status"] == "admitted"
+                else (
+                    decode_analysis_evidence(summary[0]).facts.get(
+                        "trace_bytes", 4 * 1024 * 1024
+                    )
+                    if summary
+                    else 4 * 1024 * 1024
+                )
+            )
+            if (
+                type(trace_limit) is not int
+                or not 1024 * 1024 <= trace_limit <= 4 * 1024 * 1024
+            ):
+                raise ValueError(
+                    "Analysis trace admission requires a bounded byte ceiling"
+                )
+            if occupied[0] + credit > trace_limit:
+                raise AnalysisTraceCapacityError(
+                    "Analysis trace byte reservation exhausted before dispatch"
+                )
+            connection.execute(
+                "INSERT INTO analysis_evidence(agent_id, run_id, evidence_id, kind, data, reserved_bytes) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(run_id, evidence_id) DO UPDATE SET data = excluded.data, reserved_bytes = excluded.reserved_bytes",
+                (
+                    agent_id,
+                    evidence.run_id,
+                    evidence.evidence_id,
+                    evidence.kind,
+                    encoded,
+                    credit,
+                ),
+            )
+
+        await run_sql_transaction(self._database, write)
+
+    async def load_analysis_evidence(
+        self, agent_id: str, run_id: str
+    ) -> tuple[AnalysisEvidence, ...]:
+        def read(connection: SQLConnection) -> tuple[AnalysisEvidence, ...]:
+            return tuple(
+                decode_analysis_evidence(row[0])
+                for row in connection.execute(
+                    "SELECT data FROM analysis_evidence WHERE agent_id = ? AND run_id = ? ORDER BY evidence_id LIMIT 256",
+                    (agent_id, run_id),
+                )
+            )
+
+        return await _run_graph_read(self._database, read)
+
+    async def pending_analysis_evidence(
+        self, agent_id: str, *, after: tuple[str, str] = ("", "")
+    ) -> tuple[AnalysisEvidence, ...]:
+        """Page candidate evidence, including terminal-run cleanup, before filtering.
+
+        The last returned identity is the next cursor even for wholly closed pages.
+        """
+
+        def read(connection: SQLConnection) -> tuple[AnalysisEvidence, ...]:
+            return tuple(
+                decode_analysis_evidence(row[0])
+                for row in connection.execute(
+                    "SELECT data FROM analysis_evidence WHERE agent_id = ? "
+                    "AND (run_id > ? OR (run_id = ? AND evidence_id > ?)) "
+                    "ORDER BY run_id, evidence_id LIMIT 256",
+                    (agent_id, after[0], after[0], after[1]),
+                )
+            )
+
+        return await _run_graph_read(self._database, read)
+
+    async def recover_analysis_evidence(
+        self,
+        agent_id: str,
+        expected: AnalysisEvidence,
+        recovery: Mapping[str, object] | None = None,
+        *,
+        proof_disposed: bool = False,
+    ) -> AnalysisEvidence:
+        """Append once-only authenticated cleanup facts, without rewriting history.
+
+        Only composition's native recovery calls this operation. Exact encoded CAS
+        binds the evidence identity and its retained proof, including terminal runs.
+        No native I/O is performed under the transaction.
+        """
+        before = encode_analysis_evidence(expected)
+        facts = dict(expected.facts)
+        if recovery is not None:
+            if expected.kind != "generation" or facts.get("recovery") is not None:
+                raise ValueError("Recovery is once-only native generation evidence")
+            if facts["status"] not in {"admitted", "running", "cleanup_failed"}:
+                raise ValueError("Recovery requires unresolved generation closure")
+            for name in (
+                "scratch",
+                "scratch_device",
+                "scratch_inode",
+                "closure_path",
+                "closure_device",
+                "closure_inode",
+                "closure_nonce",
+            ):
+                if recovery.get(name) != facts.get(name):
+                    raise ValueError("Recovery proof identity changed")
+            facts["recovery"] = {
+                name: recovery[name] for name in ("status", "pid", "usage", "cleanup")
+            }
+        if proof_disposed:
+            proved = facts.get("recovery", facts)
+            if expected.kind != "generation" or not isinstance(proved, Mapping):
+                raise ValueError("Proof disposal requires generation closure")
+            cleanup, usage = proved.get("cleanup"), proved.get("usage")
+            if (
+                not isinstance(cleanup, Mapping)
+                or not isinstance(usage, Mapping)
+                or cleanup.get("process_reaped") is not True
+                or cleanup.get("scratch_deleted") is not True
+                or usage.get("cpu_complete") is not True
+            ):
+                raise ValueError("Proof disposal requires durable complete closure")
+            facts["proof_disposed"] = True
+        updated = AnalysisEvidence(
+            expected.run_id, expected.evidence_id, expected.kind, facts
+        )
+        encoded = encode_analysis_evidence(updated)
+
+        def write(connection: SQLConnection) -> None:
+            row = connection.execute(
+                "SELECT a.data, a.reserved_bytes FROM analysis_evidence a JOIN runs r ON r.id = a.run_id "
+                "WHERE a.agent_id = ? AND r.agent_id = ? AND a.run_id = ? AND a.evidence_id = ?",
+                (agent_id, agent_id, expected.run_id, expected.evidence_id),
+            ).fetchone()
+            if row is None or row[0] not in {before, encoded}:
+                raise ValueError("Recovery evidence CAS identity changed")
+            if len(encoded.encode()) > row[1]:
+                raise AnalysisTraceCapacityError(
+                    "Recovery exceeded its pre-dispatch reservation"
+                )
+            connection.execute(
+                "UPDATE analysis_evidence SET data = ?, reserved_bytes = ? WHERE agent_id = ? AND run_id = ? AND evidence_id = ? AND data = ?",
+                (
+                    encoded,
+                    len(encoded.encode()) if proof_disposed else row[1],
+                    agent_id,
+                    expected.run_id,
+                    expected.evidence_id,
+                    before,
+                ),
+            )
+
+        await run_sql_transaction(self._database, write)
+        return updated
+
     async def clear_conversations(self, agent_id: str) -> int:
         """Delete transcripts and candidate records derived from them."""
 
@@ -5609,6 +5854,17 @@ class SQLStateStore:
                     (agent_id,),
                 )
             }
+            protected_run_ids.update(
+                record.run_id
+                for row in connection.execute(
+                    "SELECT data FROM analysis_evidence WHERE agent_id = ? AND kind = 'generation'",
+                    (agent_id,),
+                )
+                if (record := decode_analysis_evidence(row[0])).facts.get(
+                    "proof_disposed"
+                )
+                is not True
+            )
             occurrence_rows = connection.execute(
                 "SELECT occurrence_id, data FROM routine_occurrences "
                 "WHERE agent_id = ?",
@@ -6373,6 +6629,41 @@ def _validate_current_records(connection: SQLConnection) -> AgentIdentity | None
         identity is None or any(record.agent_id != identity.id for record in records)
     ):
         raise ValueError("stored artifact belongs to another agent")
+
+    analytical_counts: dict[str, int] = {}
+    analytical_bytes: dict[str, int] = {}
+    for (
+        agent_id,
+        run_id,
+        evidence_id,
+        kind,
+        data,
+        reserved_bytes,
+        run_owner,
+    ) in connection.execute(
+        "SELECT a.agent_id, a.run_id, a.evidence_id, a.kind, a.data, a.reserved_bytes, r.agent_id "
+        "FROM analysis_evidence a LEFT JOIN runs r ON r.id = a.run_id"
+    ):
+        evidence = decode_analysis_evidence(data)
+        if (
+            agent_id != run_owner
+            or identity is None
+            or agent_id != identity.id
+            or (evidence.run_id, evidence.evidence_id, evidence.kind)
+            != (run_id, evidence_id, kind)
+            or type(reserved_bytes) is not int
+            or reserved_bytes < len(data.encode())
+        ):
+            raise ValueError(
+                "Stored analytical evidence identity or byte reservation is invalid"
+            )
+        analytical_counts[run_id] = analytical_counts.get(run_id, 0) + 1
+        analytical_bytes[run_id] = analytical_bytes.get(run_id, 0) + reserved_bytes
+        if (
+            analytical_counts[run_id] > 256
+            or analytical_bytes[run_id] > 4 * 1024 * 1024
+        ):
+            raise ValueError("Stored analytical evidence exceeds its run bounds")
 
     mcp_binding_counts: dict[str, int] = {}
     for agent_id, binding_id, data in connection.execute(

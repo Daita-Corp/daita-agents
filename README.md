@@ -87,6 +87,7 @@ See [relational writes](docs/RELATIONAL_WRITES.md),
 | Topic | Guide |
 | --- | --- |
 | Local file access and edits | [Local computer files](docs/LOCAL_WORKSPACES.md) |
+| Python, DuckDB and charts | [Local Python analysis](docs/LOCAL_PYTHON_EXECUTION.md) |
 | Reports, exports, and provenance | [Artifacts](docs/ARTIFACTS.md) |
 | Source scope and retained context | [Context and scope](docs/CONTEXT_AND_SCOPE.md) |
 | Scheduled work, outcomes, and hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |

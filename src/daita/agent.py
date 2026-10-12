@@ -26,6 +26,7 @@ from .adapters.postgresql import (
     PostgreSQLProbeResult,
     PostgreSQLSourceError,
 )
+from .adapters.postgresql_query import PostgreSQLReadDiagnostics
 from .adapters.postgresql_write import RelationalUpdateReadiness
 from .adapters.protocols import (
     ResourceAdapterError as SourceRefreshError,
@@ -62,6 +63,7 @@ from .hosting.embedded import (
     SourceEditPreview as SourceEditPreview,
     SourceEditResult,
 )
+from .hosting.execution_governor import CoordinatorDiagnostics
 from .hosting.home_upgrade import AgentHomeStatus
 from .jobs.graph.models import (
     GraphAdmission,
@@ -90,6 +92,7 @@ from .llm.models import ModelProfile, ModelSensitivity
 from .llm.protocols import ModelProvider
 from .llm.routing import ModelRoute
 from .llm.subscription_auth import CodexDevicePrompt
+from .loop.analysis import AnalysisEvidence
 from .loop.models import ConversationRun, LoopExit, LoopLimits, Transcript
 from .observation import AgentObserver, SupervisorStatus
 from .routines import (
@@ -191,6 +194,7 @@ class Agent:
         """
 
         _validate_downloads_directory(downloads_directory)
+        _validate_config(config)
         return cls(
             await EmbeddedAgent.create(
                 name,
@@ -250,6 +254,7 @@ class Agent:
         """
 
         _validate_downloads_directory(downloads_directory)
+        _validate_config(config)
         return cls(
             await EmbeddedAgent.open(
                 name,
@@ -309,6 +314,7 @@ class Agent:
         Configuration is supplied for each open. Local files and persisted model
         configuration controls are unavailable; ``home`` raises AgentHomeError.
         """
+        _validate_config(config)
         return cls(
             await EmbeddedAgent.from_storage(
                 agent_id=agent_id,
@@ -626,6 +632,34 @@ class Agent:
         self, job_id: str, task_id: str, *, limit: int = 3
     ) -> tuple[TaskAttempt, ...]:
         return await self._embedded.list_task_attempts(job_id, task_id, limit=limit)
+
+    async def analysis_evidence(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> tuple[AnalysisEvidence, ...]:
+        """Read host-authenticated computation, child and cleanup evidence for a run."""
+        return await self._embedded.analysis_evidence(
+            run_id, caller_principal_id=caller_principal_id
+        )
+
+    def analysis_runtime(self) -> dict[str, object]:
+        """Inspect scientific runtime availability without launching a worker."""
+        return self._embedded.analysis_runtime()
+
+    def postgresql_read_diagnostics(self) -> PostgreSQLReadDiagnostics:
+        """Read bounded payload-free metrics for the default PostgreSQL backend."""
+        return self._embedded.postgresql_read_diagnostics()
+
+    def admission_diagnostics(self) -> CoordinatorDiagnostics:
+        """Read bounded, payload-free host counters and the applied capacities."""
+        return self._embedded.admission_diagnostics()
+
+    async def analysis_usage(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> dict[str, object] | None:
+        """Read the bounded host summary used by local frontends."""
+        return await self._embedded.analysis_usage(
+            run_id, caller_principal_id=caller_principal_id
+        )
 
     async def read_task_result(self, job_id: str, task_id: str) -> TaskResult | None:
         return await self._embedded.read_task_result(job_id, task_id)
@@ -974,6 +1008,15 @@ class Agent:
         """
         _validate_artifact_id(artifact_id)
         return await self._embedded.delete_artifact(
+            artifact_id, caller_principal_id=caller_principal_id
+        )
+
+    async def artifact_computation_evidence(
+        self, artifact_id: str, *, caller_principal_id: str | None = None
+    ) -> FrozenJsonObject:
+        """Inspect retained bounded computation lineage, including after history deletion."""
+        _validate_artifact_id(artifact_id)
+        return await self._embedded.artifact_computation_evidence(
             artifact_id, caller_principal_id=caller_principal_id
         )
 
@@ -1545,6 +1588,15 @@ def _validate_artifact_id(value: str) -> None:
 def _validate_downloads_directory(value: Path | None) -> None:
     if value is not None and not isinstance(value, Path):
         raise TypeError("downloads_directory must be pathlib.Path or None")
+
+
+def _validate_config(config: AgentConfig | None) -> None:
+    if config is not None:
+        if not isinstance(config, AgentConfig):
+            raise TypeError("config must be AgentConfig or None")
+        config.__post_init__()
+        config.host_capacity.__post_init__()
+        config.postgresql_reads.__post_init__()
 
 
 __all__ = [

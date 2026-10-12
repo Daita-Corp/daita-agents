@@ -5,6 +5,7 @@ import statistics
 
 import pytest
 
+from daita.config import AgentConfig, HostCapacityLimits
 from daita.hosting.execution_governor import (
     AdmissionClosedError,
     AdmissionDrainTimeout,
@@ -14,6 +15,7 @@ from daita.hosting.execution_governor import (
     WorkloadClass,
 )
 from daita.loop.session import RunCancellationToken
+from daita.observation import AgentEventKind
 
 
 def _deadline(seconds: float = 1.0) -> float:
@@ -340,12 +342,13 @@ async def test_background_admission_adds_bounded_thirty_second_aging_quanta():
     await coordinator.close(deadline=_deadline())
 
 
-async def test_provider_capacity_two_keeps_one_strict_foreground_reservation():
+@pytest.mark.parametrize("provider_capacity", (2, 4, 8))
+async def test_provider_capacity_keeps_strict_foreground_reservation(provider_capacity):
     coordinator = RunAdmissionCoordinator(
         execution_capacity=5,
         foreground_execution_reserve=1,
-        provider_capacity=2,
-        foreground_provider_reserve=1,
+        provider_capacity=provider_capacity,
+        foreground_provider_reserve=provider_capacity - 1,
     )
     first_background_ready = asyncio.Event()
     release_first_background = asyncio.Event()
@@ -462,3 +465,184 @@ async def test_saturated_graph_work_preserves_foreground_admission_p95():
     for lease in backgrounds:
         await lease.release()
     await coordinator.close(deadline=_deadline())
+
+
+async def test_diagnostics_account_wait_execution_failures_and_redact_keys():
+    now = [0.0]
+    events = []
+
+    def observer(event):
+        events.append(event)
+        raise RuntimeError("observer failure must not affect admission")
+
+    coordinator = RunAdmissionCoordinator(clock=lambda: now[0], observer=observer)
+    first = await coordinator.source_resource_permit("source:private-secret-path")
+    waiting = asyncio.create_task(
+        coordinator.source_resource_permit("source:private-secret-path")
+    )
+    await asyncio.sleep(0)
+    now[0] = 3.0
+    # Drain coordination may be busy while the keyed permit is handed off.
+    async with coordinator._condition:
+        releasing = asyncio.create_task(first.release())
+        second = await asyncio.wait_for(waiting, timeout=1)
+        snapshot = coordinator.diagnostics()
+    await releasing
+    metric = snapshot.metrics[0]
+    assert (metric.attempts, metric.acquired, metric.active, metric.high_water) == (
+        2,
+        2,
+        1,
+        1,
+    )
+    assert metric.queue_seconds == metric.maximum_queue_seconds == 3.0
+    assert metric.execution_seconds == 3.0
+    timed_out = asyncio.create_task(
+        coordinator.source_resource_permit(
+            "source:private-secret-path", deadline=_deadline(0.01)
+        )
+    )
+    with pytest.raises(TimeoutError):
+        await timed_out
+    cancelled = asyncio.create_task(
+        coordinator.source_resource_permit("source:private-secret-path")
+    )
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    now[0] = 5.0
+    await second.release()
+    final = coordinator.diagnostics().metrics[0]
+    assert (final.completed, final.active, final.waiting) == (2, 0, 0)
+    assert (final.timeouts, final.cancellations) == (1, 1)
+    assert final.execution_seconds == 5.0
+    assert metric.active == 1  # The earlier frozen snapshot does not change.
+    assert "private-secret-path" not in repr(coordinator.diagnostics()) + repr(events)
+    assert all(event.kind is AgentEventKind.ADMISSION_UPDATED for event in events)
+    await coordinator.close(deadline=_deadline())
+
+
+async def test_diagnostics_storage_is_bounded_by_kind_and_workload():
+    coordinator = RunAdmissionCoordinator()
+    for index in range(100):
+        permit = await coordinator.source_resource_permit(f"source:{index}")
+        await permit.release()
+    metrics = coordinator.diagnostics().metrics
+    assert len(metrics) == 1
+    assert metrics[0].completed == 100
+    await coordinator.close(deadline=_deadline())
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (field, value)
+        for field, ceiling in (
+            ("execution_capacity", 16),
+            ("provider_capacity", 8),
+            ("graph_parallelism", 4),
+            ("postgresql_read_capacity", 8),
+            ("sqlite_pressure_capacity", 4),
+        )
+        for value in (True, 1.5, float("inf"), float("nan"), 0, ceiling + 1)
+    ]
+    + [("foreground_execution_reserve", value) for value in (True, 1.0, -1, 5)]
+    + [("foreground_provider_reserve", value) for value in (True, 1.0, -1, 2)],
+)
+def test_host_capacity_rejects_unqualified_and_noninteger_limits(field, value):
+    with pytest.raises(ValueError):
+        HostCapacityLimits(**{field: value})
+
+
+def test_host_capacity_keeps_compatibility_defaults_and_typed_config():
+    default = AgentConfig().host_capacity
+    assert (
+        default.execution_capacity,
+        default.provider_capacity,
+        default.graph_parallelism,
+        default.postgresql_read_capacity,
+    ) == (5, 2, 1, 2)
+    assert (
+        default.foreground_execution_reserve,
+        default.foreground_provider_reserve,
+        default.sqlite_pressure_capacity,
+    ) == (1, 1, 4)
+    with pytest.raises(TypeError):
+        AgentConfig(host_capacity={})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("capacity", (1, 2, 4, 8))
+async def test_configured_source_capacity_overlaps_exactly_and_settles(capacity):
+    coordinator = RunAdmissionCoordinator(
+        source_resource_capacities={"source:exact": capacity}
+    )
+    arrived = asyncio.Event()
+    release = asyncio.Event()
+    active = 0
+    peak = 0
+
+    async def read():
+        nonlocal active, peak
+        permit = await coordinator.source_resource_permit("source:exact")
+        async with permit:
+            active += 1
+            peak = max(peak, active)
+            if active == capacity:
+                arrived.set()
+            await release.wait()
+            active -= 1
+
+    tasks = [asyncio.create_task(read()) for _ in range(capacity + 1)]
+    await asyncio.wait_for(arrived.wait(), timeout=1)
+    assert active == capacity
+    assert sum(task.done() for task in tasks) == 0
+    release.set()
+    await asyncio.gather(*tasks)
+    assert peak == capacity
+    await coordinator.close(deadline=_deadline())
+    assert coordinator.diagnostics().active_permits == 0
+
+
+async def test_child_permits_inherit_live_workload_during_drain_and_not_after_release():
+    coordinator = RunAdmissionCoordinator()
+    lease = await coordinator.admit_execution(WorkloadClass.FOREGROUND, "parent")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    async with lease:
+
+        async def child():
+            entered.set()
+            await release.wait()
+            permit = await coordinator.source_resource_permit("source:exact")
+            await permit.release()
+
+        task = asyncio.create_task(child())
+        await entered.wait()
+        await coordinator.begin_draining()
+        release.set()
+        await task
+    metric = next(
+        metric
+        for metric in coordinator.diagnostics().metrics
+        if metric.kind == "source_resource"
+    )
+    assert metric.workload_class is WorkloadClass.FOREGROUND
+    assert metric.completed == 1
+    await coordinator.close(deadline=_deadline())
+
+    other = RunAdmissionCoordinator()
+    late = asyncio.Event()
+    lease = await other.admit_execution(WorkloadClass.FOREGROUND, "released-parent")
+    async with lease:
+
+        async def after_release():
+            await late.wait()
+            return await other.source_resource_permit("source:exact")
+
+        pending = asyncio.create_task(after_release())
+    await other.begin_draining()
+    late.set()
+    with pytest.raises(AdmissionClosedError):
+        await pending
+    await other.close(deadline=_deadline())

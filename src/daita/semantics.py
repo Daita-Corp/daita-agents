@@ -1644,6 +1644,41 @@ class SemanticCapabilityDomain:
     def declarations(self) -> CapabilityDeclarations:
         return self._declarations
 
+    async def validate_schema_independent_memory(
+        self, run: RunInput, content: str
+    ) -> None:
+        """Reject explicit catalog-field references in schema-independent memory.
+
+        This is a narrow structural check, not a natural-language classifier.
+        Unqualified business prose remains advisory; field-bound definitions must
+        use the existing semantic owner and its exact revision/evidence checks.
+        """
+        scope = await resolve_effective_source_scope(run, self._catalog)
+        if not scope.resource_ids:
+            return
+        facts = await self._catalog.semantic_resource_facts(
+            run.agent_id, tuple(sorted(scope.resource_ids))
+        )
+        qualified_fields = set(re.findall(r"\b[A-Za-z_]\w*\.([A-Za-z_]\w*)\b", content))
+        quoted_identifiers = set(re.findall(r"`([A-Za-z_]\w*)`", content))
+        identifiers = set(re.findall(r"\b[A-Za-z_]\w*\b", content))
+        affected = [
+            fact
+            for fact in facts
+            if (qualified_fields | quoted_identifiers).intersection(fact.field_names)
+            or any(field in identifiers and "_" in field for field in fact.field_names)
+        ]
+        if affected:
+            raise CapabilityInputError(
+                "memory_schema_bound_definition",
+                "This memory names admitted catalog fields. Save the complete resource-bound definition with semantic_save, including all referenced fields, exact current catalog revisions and user_assertion evidence. MEMORY.md is for schema-independent meaning.",
+                {
+                    "resource_ids": [
+                        fact.resource_id for fact in affected[:SEMANTIC_MAX_RESOURCES]
+                    ]
+                },
+            )
+
     async def validate_annotation(
         self,
         agent_id: str,

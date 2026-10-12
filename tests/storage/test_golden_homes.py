@@ -32,7 +32,7 @@ def _materialize_fixture(fixture: Path, home: Path) -> None:
         if source.name == "state.sql":
             with sqlite3.connect(home / "state.db") as connection:
                 connection.executescript(source.read_text(encoding="utf-8"))
-                if fixture.name in {"revision-2", "revision-3"}:
+                if fixture.name in {"revision-2", "revision-3", "revision-4"}:
                     assert connection.execute(
                         "PRAGMA journal_mode = WAL"
                     ).fetchone() == ("wal",)

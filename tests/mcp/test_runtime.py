@@ -1198,52 +1198,65 @@ async def test_mcp_management_refresh_and_revoke_do_not_require_typed_ids(tmp_pa
         command_task = asyncio.create_task(
             app._open_command_screen("mcp_management", {})
         )
-        await pilot.pause()
-        assert isinstance(app.screen, MCPManagementScreen)
+        try:
+            await pilot.pause()
+            assert isinstance(app.screen, MCPManagementScreen)
 
-        assert await pilot.click("#mcp-refresh") is True
-        await pilot.pause()
-        picker = app.screen
-        assert isinstance(picker, SelectionScreen)
-        listing = picker.query_one("#picker-options", OptionList)
-        prompt = str(listing.get_option_at_index(0).prompt)
-        assert "MCP guided-mcp.fixture.test" in prompt
-        assert "query-docs" in prompt
-        assert attached.binding.binding_id not in prompt
-        listing.highlighted = 0
-        picker.action_confirm()
-        await pilot.pause()
-        assert isinstance(app.screen, MCPManagementScreen)
-        (refreshed,) = await app.controller.list_mcp_servers()
-        assert refreshed.active_in_runtime
-        assert app.controller.agent is reopened
+            assert await pilot.click("#mcp-refresh") is True
+            async with asyncio.timeout(5):
+                while not isinstance(app.screen, SelectionScreen):
+                    await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, SelectionScreen)
+            listing = picker.query_one("#picker-options", OptionList)
+            prompt = str(listing.get_option_at_index(0).prompt)
+            assert "MCP guided-mcp.fixture.test" in prompt
+            assert "query-docs" in prompt
+            assert attached.binding.binding_id not in prompt
+            listing.highlighted = 0
+            picker.action_confirm()
+            await pilot.pause()
+            assert isinstance(app.screen, MCPManagementScreen)
+            (refreshed,) = await app.controller.list_mcp_servers()
+            assert refreshed.active_in_runtime
+            assert app.controller.agent is reopened
 
-        assert await pilot.click("#mcp-revoke") is True
-        await pilot.pause()
-        picker = app.screen
-        assert isinstance(picker, SelectionScreen)
-        picker.query_one("#picker-options", OptionList).highlighted = 0
-        picker.action_confirm()
-        await pilot.pause()
-        confirmation = app.screen
-        assert isinstance(confirmation, ConfirmScreen)
-        message = str(confirmation.query_one("#confirm-message", Static).content)
-        assert "MCP guided-mcp.fixture.test" in message
-        assert "query-docs" in message
-        assert attached.binding.binding_id not in message
-        await pilot.press("y")
-        await pilot.pause()
+            async with asyncio.timeout(5):
+                while app.screen.query_one("#mcp-revoke").disabled:
+                    await pilot.pause()
+            assert await pilot.click("#mcp-revoke") is True
+            async with asyncio.timeout(5):
+                while not isinstance(app.screen, SelectionScreen):
+                    await pilot.pause()
+            picker = app.screen
+            assert isinstance(picker, SelectionScreen)
+            picker.query_one("#picker-options", OptionList).highlighted = 0
+            picker.action_confirm()
+            await pilot.pause()
+            confirmation = app.screen
+            assert isinstance(confirmation, ConfirmScreen)
+            message = str(confirmation.query_one("#confirm-message", Static).content)
+            assert "MCP guided-mcp.fixture.test" in message
+            assert "query-docs" in message
+            assert attached.binding.binding_id not in message
+            await pilot.press("y")
+            await pilot.pause()
 
-        assert isinstance(app.screen, MCPManagementScreen)
-        (revoked,) = await app.controller.list_mcp_servers()
-        assert revoked.binding.state is MCPBindingState.REVOKED
-        assert "Revoked" in str(app.screen.query_one("#mcp-body", Static).content)
-        assert attached.binding.binding_id not in str(
-            app.screen.query_one("#mcp-help", Static).content
-        )
-        app.screen.action_close()
-        await command_task
-        app.exit(0)
+            assert isinstance(app.screen, MCPManagementScreen)
+            (revoked,) = await app.controller.list_mcp_servers()
+            assert revoked.binding.state is MCPBindingState.REVOKED
+            assert "Revoked" in str(app.screen.query_one("#mcp-body", Static).content)
+            assert attached.binding.binding_id not in str(
+                app.screen.query_one("#mcp-help", Static).content
+            )
+            app.screen.action_close()
+            await command_task
+            app.exit(0)
+
+        finally:
+            command_task.cancel()
+            await asyncio.gather(command_task, return_exceptions=True)
+            app.exit(0)
 
 
 async def test_tui_attach_exposes_bounded_schema_rejection_reason(tmp_path):

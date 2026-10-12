@@ -1,0 +1,361 @@
+# Local Python workspace
+
+Local foreground sessions share one `python_execute` tool across the TUI,
+CLI and Python API. It executes Python in an isolated, bounded workspace;
+variables and scratch files persist only within the current run. The internal
+capability identity remains `analysis.execute`. Exactly admitted scheduled
+routines use the same tool and native worker, restricted to their frozen read
+capability and source scope.
+They cannot read local computer files, import retained artifacts, or publish local
+files. Scheduled artifacts use the ordinary outcome contract and inbox delivery.
+It runs ordinary Python with DuckDB, NumPy, pandas, SciPy,
+PyArrow, Matplotlib and NetworkX on macOS ARM64. Managed installation includes
+the pinned scientific environment. Other platforms and hosted compositions do
+not expose this capability. A source checkout needs `pip install -e '.[dev,analysis]'`.
+Missing or mismatched packages make the tool unavailable; execution never installs
+packages or falls back to an uncontained interpreter.
+
+Ask Daita to compute a numerical result, simulate a bounded system, process text,
+validate structured data, transform authenticated tool results, analyze files,
+combine datasets, calculate statistics or create a chart. Ordinary Python and the
+installed libraries support both tabular and non-tabular work: for example,
+Monte Carlo sampling with NumPy, text normalization with Python's standard library,
+or checking required fields in captured JSON records. The model discovers and
+loads the existing Analysis toolbox and `python_execute` tool.
+`Agent.analysis_runtime()` reports availability, package versions and the hash
+of the interpreter, worker protocol and trusted launch helpers without starting
+a worker. Interpreter state lasts for one run, not across messages or occurrences.
+
+## Host resources
+
+`AnalysisLimits.worker_count` remains the sole interpreter residency setting
+(default one, at most two). Host capacity settings do not add computation lanes:
+there is one computation permit and one separately reserved parser permit. Each
+resident worker retains its finite memory and scratch reservation while suspended;
+parsers have an independent reservation and cannot be crowded out by residency.
+Changing any capacity requires the host to drain and reopen. Computation remains
+run-local, and raising host capacity does not admit Python into graph jobs.
+
+## Cells and read tools
+
+The first call supplies `expected_state={"generation":0,"revision":0}`. Each
+accepted cell returns the exact state for the next call. A Python exception
+advances the revision and reports `state_may_have_changed`: assignments before
+the exception remain. Timeout, resource or protocol failure reports `state_lost`
+and closes the interpreter. An explicitly requested later cell can start a fresh
+generation using the returned state; the failed code is never replayed and its
+consumption remains charged. Reuse retained variables after successful cells and
+ordinary Python errors instead of rereading or recomputing sufficient inputs.
+Replacement is subject to remaining allowances and verified cleanup; it does not
+restore variables from the lost interpreter.
+
+Write output files using relative flat filenames in the scratch current directory.
+Register them with `outputs.add('answer', 'answer.json')`: the logical name must
+start with a letter and contain only letters, digits, `_` or `-`. `save_output`
+selects that name, not the filename. Invalid names or paths produce recoverable
+Python errors; the host still validates containment, file bytes and formats.
+Registration creates a temporary candidate, which disappears at run completion.
+To retain a dataset, chart and computation together, pass
+`save_outputs=["dataset", "chart", "recipe"]` in the outer `python_execute`
+call. Select up to four distinct registered names; use either `save_outputs` or
+the single-name `save_output`, never both. All names and policy bounds are checked
+before publication. The ordinary artifact store publishes each file, and the
+tool result and terminal run retain every committed reference. If a later
+publication fails, earlier references remain available and `save_status="failed"`
+reports the incomplete set. Check references before claiming that every requested
+file was retained. Candidates alone are not delivered artifacts.
+
+The version-1 worker helpers are ordinary Python objects:
+
+```python
+import json
+result = tools.call("file_read", {"path": "sales.json"})
+if result["is_error"]:
+    raise ValueError(result["output"])
+data = result["output"]["data"]
+print({"complete": data["complete"]})
+rows = json.loads(data["content"])
+```
+
+`tools.call` returns `output`, `is_error`, `evidence_id` and `sensitivity`.
+`tools.batch` submits independent reads in one authenticated request and returns
+the same result shape for each element, in submission order:
+
+```python
+results = tools.batch([
+    {"name": "file_read", "arguments": {"path": "sales.json"}},
+    {"name": "file_read", "arguments": {"path": "rates.json"}},
+])
+for result in results:
+    if result["is_error"]:
+        raise ValueError(result["output"])
+```
+
+The worker channel permits one outstanding request, including Python threads.
+The host allocates child identities and ordinals and reserves completion evidence
+before dispatch, applies the existing run and source read gates, and revalidates
+each tool's frozen read authority. A child's ordinary failure leaves other reads
+running. Malformed envelopes and batches exceeding remaining call, cell or trace
+allowances dispatch no reads; requested attempts remain charged. RPC and aggregate
+response bounds also apply; excessive results return bounded errors. Trace
+exhaustion can terminate the cell before a response and retains bounded evidence
+and attempted usage. The interpreter is suspended and releases its computation
+permit while reads run. Classification and authority are checked before resuming.
+Cancellation or a deadline cancels and settles dispatched and queued children
+within the existing cleanup allowance. Unresolved closure blocks replacement
+workers and terminal success. Neither the reads nor the cell are automatically
+replayed. Synchronous `tools.call` retains its existing behavior.
+
+Check `is_error` before using `output["data"]`, then use that tool's declared
+result shape: file content, query columns/rows and other structured results have
+different shapes. A failed child call is a structured result, not necessarily a
+Python exception. `inputs.get` for a tool-result input returns the captured
+`output` envelope itself, without the outer `tools.call` fields.
+Only already callable read tools from the cell's frozen surface can execute.
+It cannot load tools, call analysis recursively, publish artifacts, mutate local
+state, make external actions or invoke a model. Every attempt shares the run's
+tool-call allowance. The host uses the existing CapabilityRuntime for schema,
+permission, classification, permit, output and observer checks. Child results
+are durable typed run evidence, separate from assistant/tool messages; the model
+receives compact host-issued references rather than every intermediate result.
+The existing artifact inventory and preview reads are included through their
+owner's exact contracts. Creation, conversion and delivery remain outer calls.
+
+`inputs` maps logical names to exact earlier successful same-run references:
+`{"sales":{"kind":"tool_result","call_id":"..."}}` or
+`{"saved":{"kind":"artifact","artifact_id":"..."}}`. `inputs.get("sales")`
+reads the captured JSON result envelope; `inputs.path("saved")` supplies a private
+relative file for an installed reader. Inputs support structured JSON, UTF-8 text,
+CSV, Arrow IPC files and Parquet, with bounded isolated validation. JSON integers,
+strings and nulls retain their representations. CSV captures retain original bytes,
+not an inferred schema. Python must choose explicit decimal/time-zone/table types
+and preserve reported coverage. A partial read remains partial; there is no hidden
+pagination or shared transaction snapshot across separate reads.
+
+Admitted authorities are checked before cells, child calls and output acceptance,
+and periodically during computation. Revocation or artifact deletion closes the
+contaminated interpreter. Later row changes alone do not erase an authorized
+historical snapshot; request a new read for fresh values.
+Read authority stays bound to accepted candidates across interpreter replacement;
+state loss cannot make a revoked candidate eligible to save.
+
+## Relevant procedures
+
+The context builder supplies general Python operating guidance only while
+`python_execute` is callable. It adds fixed CSV, database, query-result or chart
+procedures when the current request names that work; successful typed file/query
+result metadata can also select the CSV or query/database procedures. Previous
+conversation tasks and arbitrary result text do not select these procedures.
+Selection is a presentation hint, not discovery, schema evidence or authority.
+Non-tabular computation has no mandatory CSV, database or chart checklist.
+
+An explicit `tools.call`, `tools.batch` or admitted capture request also supplies
+loading guidance before Python becomes callable. Load Python and the required
+read contracts together, execute the requested reads inside the computation cell
+and calculate from their returned results. Copying earlier rows into Python does
+not create authenticated child-read evidence. Existing authenticated inputs can
+be reused when the task does not require a fresh programmatic read.
+
+For CSV work, parse the actual headers and validate required fields before
+computing, preferably in the computation cell. A captured read is sufficient
+when its coverage fits the task; avoid another read or an inspection-only cell.
+For example, with `file_read` already callable:
+
+```python
+import csv
+import io
+
+result = tools.call("file_read", {"path": "sales.csv"})
+if result["is_error"]:
+    raise ValueError(result["output"])
+data = result["output"]["data"]
+reader = csv.DictReader(io.StringIO(data["content"]))
+required = {"region", "amount"}
+missing = required - set(reader.fieldnames or ())
+if missing:
+    raise ValueError(f"Missing required fields: {sorted(missing)}")
+rows = list(reader)
+total = sum(int(row["amount"]) for row in rows)
+coverage = {"complete": data["complete"], "limitations": data["limitations"]}
+print({"total_in_returned_content": total, "coverage": coverage})
+```
+
+Choose types to match the task (for example `Decimal` for monetary decimals).
+An incomplete read can include an incomplete final record; validate it and obtain
+adequate coverage before claiming a total for the whole file. Retain completeness,
+truncation, per-root search coverage and other reported limitations in derived
+outputs and conclusions.
+
+For database work, reuse sufficient current catalog evidence. Obtain missing
+schemas and bounded relationship paths through `catalog_schema`, then use
+`catalog_traverse` only for paths still unresolved. Load these tools through the
+ordinary toolbox if needed. Matching field names alone do not establish a join;
+ambiguous mappings or relationships can require ordinary clarification.
+
+For query results, use the returned `columns` and `rows`, including aliases and
+projections. Do not substitute the base-table schema: projected fields can be
+absent or renamed. Validate the fields needed for computation in the same cell,
+and preserve the returned coverage without rereading sufficient evidence.
+
+For charts, use installed Matplotlib with retained data, write a supported PNG
+inside scratch, and register it with `outputs.add`. Select `save_output` to
+publish it through the same artifact contract described below. No extra plotting
+dependency or separate publication path is needed.
+
+## Saving results
+
+Write a file inside scratch and register a candidate:
+
+```python
+import json
+with open("summary.json", "w", encoding="utf-8") as output:
+    json.dump({"total": 42}, output)
+outputs.add("summary", "summary.json")
+```
+
+The cell's `save_output="summary"` explicitly commits one candidate through the
+ordinary artifact store. A later cell may save an existing candidate without
+recomputing it. Registration alone does not publish an artifact. Four candidates
+per cell and sixteen per run are allowed. `save_outputs=["summary", "chart", "recipe"]`
+commits up to four selected candidates through that same boundary. All requested
+names must exist; a missing candidate publishes none. Publication is sequential,
+so a storage failure can leave a documented partial set rather than rolling back
+already published files.
+Supported outputs are CSV, Parquet, JSON, PNG,
+Markdown, UTF-8 text and Python/SQL source text. Source text is retained data.
+Host capture requires a bounded regular file inside scratch, rejects symlinks and
+traversal, and hashes bytes while the worker is demonstrably stopped. A separate
+contained parser validates the format. JSON outputs reject `NaN`, `Infinity`, and
+`-Infinity`. Changed candidate bytes need a new name.
+
+Artifacts retain runtime identity, executed source or an explicit source omission,
+cell digests, authenticated child/input references, known coverage and output hash.
+`Agent.artifact_computation_evidence(id)` exposes this retained evidence after
+history deletion. Raw input datasets are not automatically retained, so missing
+inputs may prevent reproduction. Execution success does not establish analytical
+correctness. A failed save reports the actual retained interpreter state and
+`save_status="failed"`; it does not rerun computation. Delivery to local files
+continues through existing artifact delivery and approval controls.
+
+## Bounds, measurement and closure
+
+`AgentConfig.analysis_limits` accepts `daita.config.AnalysisLimits`. Defaults are
+30 seconds per cell, 120 cumulative CPU seconds, 1.5 GiB RSS per worker, 64 MiB
+scratch and 256 scratch files. Call time is also bounded by the remaining run
+deadline. Captured inputs and immutable output snapshots each have a 64 MiB run
+ceiling; individual artifact/parser inputs are at most 16 MiB. Cells allow 64 KiB
+source, 16 KiB each stdout/stderr, sixteen child attempts and 1 MiB total RPC.
+Broker delivery is bounded to 60 KiB per normalized result. Trace admission
+reserves completion capacity within four MiB and 256 records per run.
+Byte or record exhaustion terminates the run before another model request.
+Cell deadlines include worker admission, input validation and compute waits.
+Cleanup retains a separate bounded allowance after a cell times out.
+Use returned `remaining_allowances` when present and print bounded previews rather
+than full datasets, long texts or simulation traces. A preview does not change
+input completeness or authorize a larger computation.
+
+`AnalysisLimits` also configures code/log/result/RPC bytes, child calls, worker
+generations, input bytes, output file/count/run bounds, trace bytes/records and
+parser seconds/decoded bytes/rows/columns. The table parser defaults to ten
+seconds, 128 MiB decoded data, one million rows and 256 columns. Individual
+trace records have a fixed 256 KiB ceiling. The protocol permits one outstanding
+child read; process creation is denied by the native policy.
+
+The existing admission coordinator holds one worker lifetime slot, a separate
+bounded parser slot and one shared computation lane. The computation lane is
+released while a suspended worker waits for a broker result. Numerical libraries
+receive one-thread settings; OS containment denies new processes, network, host
+credentials, state, sibling files, runtime writes and reusable host IPC. CPU and
+individual-file bounds also use kernel rlimits. RSS, aggregate scratch and file
+count are watchdog controls with 20 ms sampling; reported overshoot is real and
+these are not hard quotas. Authority polling defaults to 250 ms; cleanup is bounded
+to five seconds. Typed configuration can narrow bounds within their documented
+ceilings. `worker_count` selects one or two lifetime slots; the parser retains its
+separate single slot. Their finite memory/scratch reservations are retained until
+closure, and final evidence distinguishes them from measured usage.
+Numerical thread settings start at one and the host monitors a maximum of 32
+threads per worker, recording peak thread count and overshoot. Required native
+CPU, RSS and thread sampling must be available before admitting generated code.
+Scratch entry counts include directories and symlinks. Sampling stops at a quota
+breach and retains observed lower bounds; unreadable or incomplete samples expose
+unknown current/peak values. Cleanup restores permissions only on authenticated
+owned directories after reaping, and never follows scratch symlinks.
+
+`Agent.analysis_evidence(run_id)` returns host facts on success, error, timeout,
+cancellation and reopen. These include sampled/final user and system CPU, cell
+wall time, broker wait, per-worker peak RSS, current/peak scratch bytes/files,
+captured/protocol/output bytes, attempted/dispatched/failed child counts, observed
+exit status and deletion postconditions. A run summary reports wall time without
+adding overlapping workers, shared call attempts, committed artifact
+bytes and released reservations. Unavailable measurements are `null`, never
+measured zero. CPU/RSS are for the contained workers; trusted host/guardian CPU
+is outside that measurement. Peak RSS is a per-worker peak, not simultaneous
+whole-host memory. TUI observer updates are best effort; durable closure facts
+remain authoritative.
+Protocol input/output counters measure successful OS writes and received bytes,
+including failed cells. Captured payloads, format-validation copies and accepted
+result bytes are reported separately.
+Public summaries include outer attempted/dispatched/denied/failed/unsettled
+counts and separate child counts. Saved analytical evidence retains child
+contract/schema/argument/result digests and known coverage after history clears.
+
+Before accepting successful completion the host closes broker admission, settles
+child I/O/evidence, reaps owned processes, closes descriptors and verifies scratch
+absence and zero remaining bytes/files. A trusted native parent performs cleanup
+on host death and writes authenticated closure facts outside worker access.
+Reopen joins those facts to the abandoned run, removes only authenticated owned
+remnants and terminalizes once without replay. Unknown termination, changed
+remnant identity or failed deletion prevents successful acceptance and replacement.
+Exactly admitted local routines share this lifecycle and their frozen read scope.
+Graph tasks, hosted or remote execution and cross-run interpreter caches remain
+unavailable.
+
+See [testing instructions](TESTING.md#local-python-live-acceptance) for the
+real-worker, real-model and managed-install qualification command and reports.
+
+Use an exact Arrow export for dataset statistics, rather than treating bounded
+`data_query` rows as complete data. The two-call path exports with
+`data_export_tabular(format="arrow")`, then binds the returned exact artifact ID
+in `python_execute.inputs`. Within a cell, the loaded export can also be captured:
+
+```python
+captured = tools.capture("data_export_tabular", export_arguments, name="orders")
+if captured["is_error"]:
+    raise ValueError(captured["output"])
+import pyarrow.ipc as ipc
+with ipc.open_file(inputs.path("orders")) as reader:
+    orders = reader.read_all()
+```
+
+Capture accepts only the authenticated, loaded relational Arrow export. It uses
+one ordinary child call, suspends the interpreter, releases computation capacity,
+publishes through the artifact store, and validates the input through the reserved
+native parser before resume. Names are bounded and cannot replace an existing
+input. `inputs.path` returns a private relative filename. File and MCP capture,
+CSV/XLSX capture and general artifact creation through Python are unavailable.
+
+A successful export followed by failed staging remains a successful export in
+child evidence. The helper returns its committed artifact reference with the
+staging error. The cell's `captured_inputs` or terminal child evidence retains
+committed references when cancellation or authority loss prevents resume. Captures
+are source inputs,
+not automatically promoted to terminal output artifacts. Inspect their references
+or the ordinary artifact inventory; no query is automatically replayed. Revocation
+and artifact deletion are checked before resume and on later cells. Scheduled
+capture requires exact frozen export and analysis contracts and current source
+scope. It does not allow arbitrary retained artifact inputs in scheduled runs.
+
+Current tool procedures favor direct loading of known names, independent read
+batches, validation and calculation in the same cell, and reuse of sufficient
+current inputs. Dataset guidance is selected by the current task and typed result
+coverage. Arrow capture instructions require the authenticated Arrow export
+contract in the current callable set; explicit capture and every-row requests
+select them even without a dataset keyword. The capture return value is structured
+evidence; resolve installed bytes with `inputs.path` and the exact capture name.
+Untrusted hints cannot enable these instructions. Every
+requested output still needs its own committed reference. The current transcript
+and child evidence remain exact. Local-file child authority is rechecked through
+the data owner's exact file contract, independently of unrelated relational catalog
+and write-permission discovery. Relational child reads still revalidate their
+current frozen source/resource scope. No authority or source freshness result is
+cached between checks. These procedures grant no additional authority.

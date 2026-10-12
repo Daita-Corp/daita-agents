@@ -48,7 +48,10 @@ from ..adapters.mcp import (
 )
 from ..adapters.models import DiscoveryRequest, SourceRegistration
 from ..adapters.postgresql import PostgreSQLProbeResult, PostgreSQLSource
-from ..adapters.postgresql_query import PostgreSQLQueryBackend
+from ..adapters.postgresql_query import (
+    PostgreSQLQueryBackend,
+    PostgreSQLReadDiagnostics,
+)
 from ..adapters.postgresql_write import (
     PostgreSQLWriteBackend,
     RelationalUpdateReadiness,
@@ -100,7 +103,12 @@ from ..catalog.models import (
     SourceCatalogSnapshot,
 )
 from ..catalog.service import CatalogService
-from ..config import AgentConfig
+from ..config import (
+    AgentConfig,
+    AnalysisLimits,
+    HostCapacityLimits,
+    PostgreSQLReadLimits,
+)
 from ..context import AgentContextBuilder, _project_completed_history
 from ..distribution import (
     DISTRIBUTION_DOMAIN_OWNER_ID,
@@ -112,6 +120,7 @@ from ..distribution import (
     OutcomeContract,
     distribution_capability_declarations,
 )
+from ..domains.analysis import AnalysisCapabilityDomain
 from ..domains.data import (
     ARTIFACT_DOMAIN_OWNER_ID,
     DATA_QUERY_CAPABILITY_ID,
@@ -322,6 +331,7 @@ from ..storage.sqlite_records import (
 from ..workspace import LocalWorkspace
 from .execution_governor import (
     AdmissionClosedError,
+    CoordinatorDiagnostics,
     RunAdmissionCoordinator,
     WorkloadClass,
 )
@@ -793,6 +803,8 @@ class EmbeddedAgent:
         artifact_delivery: LocalArtifactDelivery | None,
         candidate_acceptance_supported: bool,
         admission_coordinator: RunAdmissionCoordinator,
+        host_capacity: HostCapacityLimits,
+        postgresql_backend: PostgreSQLQueryBackend,
         model_profile: ModelProfile | None,
         model_route: ModelRoute | None,
         owned_model_provider: ManagedModelProvider | None,
@@ -866,6 +878,8 @@ class EmbeddedAgent:
         self._clock = clock
         self._id_factory = id_factory
         self._admission_coordinator = admission_coordinator
+        self._host_capacity = host_capacity
+        self._postgresql_backend = postgresql_backend
         self._model_management_lock = asyncio.Lock()
         self._effect_resolution_lock = asyncio.Lock()
         self._routine_management_lock = asyncio.Lock()
@@ -1098,6 +1112,7 @@ class EmbeddedAgent:
         if cancelled:
             writer_lock.release()
             raise asyncio.CancelledError
+        composition_cleanup = AsyncExitStack()
         store: StateStore | None = None
         workspace_backend: LocalWorkspaceBackend | None = None
         published = False
@@ -1155,6 +1170,12 @@ class EmbeddedAgent:
                 context_builder=context_builder,
                 tools=tools,
                 limits=limits,
+                analysis_limits=None if config is None else config.analysis_limits,
+                host_capacity=None if config is None else config.host_capacity,
+                postgresql_reads=None if config is None else config.postgresql_reads,
+                admission_observations=(
+                    False if config is None else config.admission_observations
+                ),
                 model_call_policy=model_call_policy,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
@@ -1171,7 +1192,9 @@ class EmbeddedAgent:
                 approval_handler=approval_handler,
                 artifact_store=artifact_store,
                 artifact_delivery=artifact_delivery,
+                admission_cleanup=composition_cleanup,
             )
+            composition_cleanup.pop_all()
             _, cancelled = await _await_sync_completion(
                 lambda: _write_manifest(home, identity)
             )
@@ -1180,6 +1203,7 @@ class EmbeddedAgent:
                 raise asyncio.CancelledError
             return embedded
         except BaseException:
+            await composition_cleanup.aclose()
             try:
                 if workspace_backend is not None:
                     await workspace_backend.close()
@@ -1260,6 +1284,7 @@ class EmbeddedAgent:
         if cancelled:
             writer_lock.release()
             raise asyncio.CancelledError
+        composition_cleanup = AsyncExitStack()
         store: StateStore | None = None
         workspace_backend: LocalWorkspaceBackend | None = None
         try:
@@ -1300,6 +1325,68 @@ class EmbeddedAgent:
                     "agent.toml does not match state.db identity"
                 )
             await store.list_sources(identity.id)
+            from ..adapters.analytical_workspace.recovery import (
+                dispose_generation_proof,
+                recover_generation,
+            )
+            from ..loop.analysis import AnalysisEvidence
+
+            async def recover_analysis() -> None:
+                assert store is not None
+                after = ("", "")
+                while page := await store.pending_analysis_evidence(
+                    identity.id, after=after
+                ):
+                    for pending in page:
+                        facts = pending.facts
+                        if pending.kind == "generation":
+                            if facts.get("proof_disposed") is True:
+                                continue
+                            recovered = facts.get("recovery")
+                            if recovered is None and facts["status"] in {
+                                "admitted",
+                                "running",
+                                "cleanup_failed",
+                            }:
+                                recovery = await recover_generation(facts)
+                                pending = await store.recover_analysis_evidence(
+                                    identity.id, pending, recovery
+                                )
+                            elif recovered is None and facts["status"] != "closed":
+                                continue
+                            # Closure facts are durable before proof disposal. A
+                            # crash on either side of unlink can repeat this step.
+                            dispose_generation_proof(pending.facts)
+                            await store.recover_analysis_evidence(
+                                identity.id, pending, proof_disposed=True
+                            )
+                        elif (
+                            facts["status"] in {"admitted", "running"}
+                            and await store.result(pending.run_id) is None
+                        ):
+                            await store.record_analysis_evidence(
+                                identity.id,
+                                AnalysisEvidence(
+                                    pending.run_id,
+                                    pending.evidence_id,
+                                    pending.kind,
+                                    {
+                                        **facts,
+                                        "status": "interrupted",
+                                        "interruption": "host_crash",
+                                        "completion_observed": False,
+                                    },
+                                ),
+                            )
+                    last = page[-1]
+                    after = (last.run_id, last.evidence_id)
+
+            recovery_task = asyncio.create_task(recover_analysis())
+            try:
+                await asyncio.shield(recovery_task)
+            except asyncio.CancelledError:
+                await recovery_task
+                raise
             await _recover_agent_state(store, identity.id, resolved_clock)
             if not explicit_configuration:
                 persisted, cancelled = await _await_sync_completion(
@@ -1337,7 +1424,7 @@ class EmbeddedAgent:
                     id_factory=resolved_ids,
                 )
             )
-            return await cls._compose(
+            embedded = await cls._compose(
                 identity=identity,
                 home=home,
                 workspace=workspace,
@@ -1351,6 +1438,12 @@ class EmbeddedAgent:
                 context_builder=context_builder,
                 tools=tools,
                 limits=limits,
+                analysis_limits=None if config is None else config.analysis_limits,
+                host_capacity=None if config is None else config.host_capacity,
+                postgresql_reads=None if config is None else config.postgresql_reads,
+                admission_observations=(
+                    False if config is None else config.admission_observations
+                ),
                 model_call_policy=model_call_policy,
                 clock=resolved_clock,
                 id_factory=resolved_ids,
@@ -1367,8 +1460,12 @@ class EmbeddedAgent:
                 approval_handler=approval_handler,
                 artifact_store=artifact_store,
                 artifact_delivery=artifact_delivery,
+                admission_cleanup=composition_cleanup,
             )
+            composition_cleanup.pop_all()
+            return embedded
         except BaseException:
+            await composition_cleanup.aclose()
             if workspace_backend is not None:
                 await workspace_backend.close()
             if store is not None:
@@ -1461,6 +1558,13 @@ class EmbeddedAgent:
                     context_builder=None,
                     tools=None,
                     limits=resolved_limits,
+                    host_capacity=None if config is None else config.host_capacity,
+                    postgresql_reads=(
+                        None if config is None else config.postgresql_reads
+                    ),
+                    admission_observations=(
+                        False if config is None else config.admission_observations
+                    ),
                     model_call_policy=policy,
                     clock=resolved_clock,
                     id_factory=resolved_ids,
@@ -1505,6 +1609,10 @@ class EmbeddedAgent:
         context_builder: ContextBuilder | None,
         tools: ToolRuntime | None,
         limits: LoopLimits,
+        analysis_limits: AnalysisLimits | None = None,
+        host_capacity: HostCapacityLimits | None = None,
+        postgresql_reads: PostgreSQLReadLimits | None = None,
+        admission_observations: bool = False,
         model_call_policy: ModelCallPolicy,
         clock: Callable[[], datetime],
         id_factory: Callable[[str], str],
@@ -1536,20 +1644,47 @@ class EmbeddedAgent:
         data_view = CatalogDataView(store, catalog_service, store)
         catalog = catalog_declarations(identity.id, data_view)
         sqlite_backend = SQLiteQueryBackend(store, data_view)
+        host_capacity = host_capacity or HostCapacityLimits()
         postgresql_backend = PostgreSQLQueryBackend(
-            store, data_view, secret_provider or keychain
+            store,
+            data_view,
+            secret_provider or keychain,
+            read_limits=postgresql_reads,
+            source_capacity=host_capacity.postgresql_read_capacity,
+            deadline_reader=lambda: admission_coordinator.current_deadline(),
+            observer=observer if admission_observations else None,
         )
+        if admission_cleanup is not None:
+            admission_cleanup.push_async_callback(postgresql_backend.close)
         relational_query = data_query_declarations(
             identity.id,
             sqlite_backend,
             postgresql_backend,
         )
+        from ..adapters.analytical_workspace.runtime import runtime_status
+
+        scientific_admitted = not hosted and runtime_status()["available"] is True
+        admitted_analysis_limits = analysis_limits or AnalysisLimits()
         relational_export = (
             data_export_tabular_declarations(
                 identity.id,
                 sqlite_backend,
                 postgresql_backend,
                 clock,
+                arrow_bounds=(
+                    (
+                        min(100_000, admitted_analysis_limits.table_rows),
+                        min(256, admitted_analysis_limits.table_columns),
+                        min(
+                            admitted_analysis_limits.file_bytes,
+                            admitted_analysis_limits.input_bytes,
+                            admitted_analysis_limits.decoded_bytes,
+                            admitted_analysis_limits.scratch_bytes,
+                        ),
+                    )
+                    if scientific_admitted
+                    else None
+                ),
             )
             if artifact_store.available
             else None
@@ -1589,18 +1724,24 @@ class EmbeddedAgent:
         skill_lock = asyncio.Lock()
         source_capacities = {
             f"source:{registration.id}": (
-                2 if registration.adapter_id == "postgresql" else 1
+                host_capacity.postgresql_read_capacity
+                if registration.adapter_id == "postgresql"
+                else 1
             )
             for registration in await store.list_sources(identity.id)
             if registration.active
         }
         admission_coordinator = RunAdmissionCoordinator(
-            execution_capacity=5,
-            foreground_execution_reserve=1,
-            provider_capacity=2,
-            foreground_provider_reserve=1,
+            observer=observer if admission_observations else None,
+            execution_capacity=host_capacity.execution_capacity,
+            foreground_execution_reserve=host_capacity.foreground_execution_reserve,
+            provider_capacity=host_capacity.provider_capacity,
+            foreground_provider_reserve=host_capacity.foreground_provider_reserve,
             source_resource_capacities=source_capacities,
-            sqlite_pressure_capacity=4,
+            sqlite_pressure_capacity=host_capacity.sqlite_pressure_capacity,
+            analysis_worker_capacity=(
+                1 if analysis_limits is None else analysis_limits.worker_count
+            ),
         )
         model = _admit_host_model(
             model,
@@ -1815,10 +1956,6 @@ class EmbeddedAgent:
                 None if workspace_backend is None else workspace_backend.sensitivity
             ),
         )
-        memory_domain = MemoryCapabilityDomain(
-            memory_declarations,
-            learning_candidate_guard,
-        )
         skill_domain = SkillCapabilityDomain(
             skill_declaration_bundle,
             learning_candidate_guard,
@@ -1828,6 +1965,11 @@ class EmbeddedAgent:
             data_view,
             store,
             learning_candidate_guard,
+        )
+        memory_domain = MemoryCapabilityDomain(
+            memory_declarations,
+            learning_candidate_guard,
+            validate_schema_independent=semantic_domain.validate_schema_independent_memory,
         )
         artifact_domain = (
             None
@@ -1894,7 +2036,19 @@ class EmbeddedAgent:
         if admission_cleanup is not None:
             for activated in mcp_activated_bindings:
                 admission_cleanup.push_async_callback(activated.executor.close)
+        analysis_domain = (
+            None
+            if hosted
+            else AnalysisCapabilityDomain(
+                admission_coordinator,
+                artifact_domain,
+                artifact_store,
+                observer=observer,
+                **({"limits": analysis_limits} if analysis_limits is not None else {}),
+            )
+        )
         base_domains = (
+            *((analysis_domain,) if analysis_domain is not None else ()),
             data_domain,
             memory_domain,
             skill_domain,
@@ -1906,6 +2060,7 @@ class EmbeddedAgent:
             *((mcp_domain,) if mcp_domain is not None else ()),
         )
         base_executors = (
+            *((analysis_domain,) if analysis_domain is not None else ()),
             *catalog.executors,
             *relational_query.executors,
             *(relational_export.executors if relational_export is not None else ()),
@@ -2218,6 +2373,7 @@ class EmbeddedAgent:
             admission_coordinator=admission_coordinator,
             distribution=distribution_owner,
             graph_model_loop=loop,
+            graph_parallelism=host_capacity.graph_parallelism,
         )
         job_owner.bind_wake(job_supervisor.wake)
 
@@ -2356,6 +2512,8 @@ class EmbeddedAgent:
                 and resolved_tools is capability_runtime
             ),
             admission_coordinator=admission_coordinator,
+            host_capacity=host_capacity,
+            postgresql_backend=postgresql_backend,
             model_profile=model_profile,
             model_route=model_route,
             owned_model_provider=owned_model_provider,
@@ -2785,6 +2943,37 @@ class EmbeddedAgent:
         if self._hosted and transcript.run.caller_principal_id != principal_id:
             raise ValueError("run is unavailable to this caller")
         return transcript
+
+    async def analysis_evidence(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ):
+        await self.transcript(run_id, caller_principal_id=caller_principal_id)
+        return await self._store.load_analysis_evidence(self.identity.id, run_id)
+
+    def postgresql_read_diagnostics(self) -> PostgreSQLReadDiagnostics:
+        return self._postgresql_backend.diagnostics()
+
+    def admission_diagnostics(self) -> CoordinatorDiagnostics:
+        return self._admission_coordinator.diagnostics()
+
+    def analysis_runtime(self) -> dict[str, object]:
+        self._require_open()
+        if self._hosted:
+            return {"available": False, "reason": "hosted_analysis_not_admitted"}
+        from ..adapters.analytical_workspace.runtime import runtime_status
+
+        return runtime_status()
+
+    async def analysis_usage(
+        self, run_id: str, *, caller_principal_id: str | None = None
+    ) -> dict[str, object] | None:
+        from ..loop.analysis import analysis_summary
+
+        return analysis_summary(
+            await self.analysis_evidence(
+                run_id, caller_principal_id=caller_principal_id
+            )
+        )
 
     async def _require_conversation_caller(
         self, conversation_id: str, principal_id: str
@@ -3674,6 +3863,17 @@ class EmbeddedAgent:
                 raise ValueError("artifact is unavailable to this caller")
             return await self._artifact_store.delete(artifact_id)
 
+    async def artifact_computation_evidence(
+        self, artifact_id: str, *, caller_principal_id: str | None = None
+    ) -> FrozenJsonObject:
+        async with self._artifact_publication_lock:
+            self._require_open()
+            await self._require_artifact_caller(artifact_id, caller_principal_id)
+            record = await self._store.get_artifact_record(artifact_id)
+            if record is None or record.state is not ArtifactState.READY:
+                raise ValueError("artifact is unavailable to this caller")
+            return FrozenJsonObject.from_mapping(record.computation_evidence)
+
     async def _require_artifact_caller(
         self, artifact_id: str, caller_principal_id: str | None
     ) -> None:
@@ -4555,7 +4755,11 @@ class EmbeddedAgent:
             )
             self._admission_coordinator.configure_source_resource_capacity(
                 f"source:{registration.id}",
-                2 if registration.adapter_id == "postgresql" else 1,
+                (
+                    self._host_capacity.postgresql_read_capacity
+                    if registration.adapter_id == "postgresql"
+                    else 1
+                ),
             )
             return registration
         except BaseException as error:
@@ -4981,7 +5185,9 @@ class EmbeddedAgent:
                     preview.after.read_scope,
                     preview.after.relational_write_scopes,
                 )
-                return await self._inspect_source_permissions_locked(source_id)
+                inspection = await self._inspect_source_permissions_locked(source_id)
+            await self._postgresql_backend.retire_source(self.identity.id, source_id)
+            return inspection
 
     async def _inspect_source_permissions_locked(
         self,
@@ -5399,15 +5605,15 @@ class EmbeddedAgent:
                     detached,
                     agent_id=self.identity.id,
                 )
-                if reference is not None:
-                    try:
-                        await self._keychain.delete(reference)
-                    except Exception:
-                        raise AgentHomeError(
-                            "source was detached, but its stored credential "
-                            "could not be deleted"
-                        ) from None
-                return detached
+            await self._postgresql_backend.retire_source(self.identity.id, source_id)
+            if reference is not None:
+                try:
+                    await self._keychain.delete(reference)
+                except Exception:
+                    raise AgentHomeError(
+                        "source was detached, but its stored credential could not be deleted"
+                    ) from None
+            return detached
 
     async def refresh_source(self, source_id: str) -> SourceRegistration:
         """Refresh one active source using its exact admitted registration."""
@@ -5542,6 +5748,7 @@ class EmbeddedAgent:
         drain_deadline = (
             asyncio.get_running_loop().time() + _RUN_ADMISSION_DRAIN_SECONDS
         )
+        await self._capability_runtime.handoff_analysis_recovery()
         try:
             await self._admission_coordinator.close(deadline=drain_deadline)
         except BaseException as error:
@@ -5552,6 +5759,11 @@ class EmbeddedAgent:
             if first_error is not None:
                 raise error from first_error
             raise
+        try:
+            await self._postgresql_backend.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
         owned_model_provider = self._owned_model_provider
         model_shutdown_deadline = (
             asyncio.get_running_loop().time()
