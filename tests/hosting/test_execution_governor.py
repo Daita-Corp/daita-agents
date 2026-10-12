@@ -482,9 +482,12 @@ async def test_diagnostics_account_wait_execution_failures_and_redact_keys():
     )
     await asyncio.sleep(0)
     now[0] = 3.0
-    await first.release()
-    second = await waiting
-    snapshot = coordinator.diagnostics()
+    # Drain coordination may be busy while the keyed permit is handed off.
+    async with coordinator._condition:
+        releasing = asyncio.create_task(first.release())
+        second = await asyncio.wait_for(waiting, timeout=1)
+        snapshot = coordinator.diagnostics()
+    await releasing
     metric = snapshot.metrics[0]
     assert (metric.attempts, metric.acquired, metric.active, metric.high_water) == (
         2,

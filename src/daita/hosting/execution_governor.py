@@ -259,7 +259,13 @@ class PermitLease:
         self._released = True
         started = self._coordinator._clock()
         worker = asyncio.create_task(
-            self._coordinator._release_permit(self.kind, self.key, self._workload_class)
+            self._coordinator._release_permit(
+                self.kind,
+                self.key,
+                self._workload_class,
+                acquired_at=self._acquired_at,
+                started=started,
+            )
         )
         cancelled = False
         while not worker.done():
@@ -268,12 +274,6 @@ class PermitLease:
             except asyncio.CancelledError:
                 cancelled = True
         worker.result()
-        self._coordinator._record_completion(
-            self.kind.value,
-            self._workload_class or WorkloadClass.SYSTEM,
-            self._acquired_at,
-            started,
-        )
         if cancelled:
             raise asyncio.CancelledError
 
@@ -1041,6 +1041,9 @@ class RunAdmissionCoordinator:
         kind: PermitKind,
         key: str,
         workload_class: WorkloadClass | None,
+        *,
+        acquired_at: float,
+        started: float,
     ) -> None:
         permit_key = (kind, key)
         condition = self._permit_conditions.get(permit_key)
@@ -1066,6 +1069,10 @@ class RunAdmissionCoordinator:
                 else:
                     self._provider_background_active[key] = background - 1
             condition.notify_all()
+        # Settle metrics before drain coordination can yield to a new holder.
+        self._record_completion(
+            kind.value, workload_class or WorkloadClass.SYSTEM, acquired_at, started
+        )
         async with self._condition:
             self._condition.notify_all()
 
