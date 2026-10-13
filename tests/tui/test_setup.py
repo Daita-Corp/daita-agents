@@ -475,7 +475,8 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
     )
     app.controller.agent = opened
     try:
-        async with app.run_test(size=(110, 28)) as pilot:
+        # Leave room for the full branded welcome beside the command sidebar.
+        async with app.run_test(size=(140, 28)) as pilot:
             await app._show_chat()
             await pilot.pause()
             chat_welcome = app.screen.query_one("#welcome", WelcomeView)
