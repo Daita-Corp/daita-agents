@@ -80,8 +80,9 @@ class _Registry:
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRecord, ...]:
-        return tuple(
+        records = tuple(
             record
             for record in self.records.values()
             if (
@@ -97,7 +98,15 @@ class _Registry:
                 caller_principal_id is None
                 or record.caller_principal_id == caller_principal_id
             )
-        )[offset : None if limit is None else offset + limit]
+        )
+        records = tuple(
+            sorted(
+                records,
+                key=lambda record: (record.ref.created_at, record.ref.artifact_id),
+                reverse=newest_first,
+            )
+        )
+        return records[offset : None if limit is None else offset + limit]
 
     async def list_artifact_refs(
         self,
@@ -109,6 +118,7 @@ class _Registry:
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRef, ...]:
         return tuple(
             record.ref
@@ -121,6 +131,7 @@ class _Registry:
                 limit=limit,
                 offset=offset,
                 after=after,
+                newest_first=newest_first,
             )
         )
 

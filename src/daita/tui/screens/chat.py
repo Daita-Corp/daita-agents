@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from rich.cells import cell_len
+from rich.text import Text
 from textual.app import ComposeResult
-from textual.binding import Binding
+from textual.binding import ActiveBinding, Binding
 from textual.containers import Vertical
 from textual.screen import Screen
-from textual.widgets import Footer, OptionList, TextArea
+from textual.widgets import Button, Footer, OptionList, Static, Tab, Tabs, TextArea
 
 from daita import ApprovalDecision, ApprovalRequest
 
 from ..models import TranscriptBlock
 from ..widgets.approval import ApprovalPanel
+from ..widgets.command_center import (
+    CommandCenterNavigate,
+    CommandSections,
+)
 from ..widgets.composer import (
     CompletionPopup,
     Composer,
@@ -23,14 +30,23 @@ from ..widgets.composer import (
 )
 from ..widgets.status import ActivityBar, NoticeBar, StatusBar
 from ..widgets.transcript import TranscriptView
-from ..widgets.welcome import WelcomeView
 
 if TYPE_CHECKING:
     from ..app import DaitaApp
 
 
 class ChatScreen(Screen[None]):
+    AUTO_FOCUS = "#composer"
+
     BINDINGS = [
+        Binding("ctrl+1", "section('chat')", show=False, priority=True),
+        Binding("ctrl+2", "section('sources')", show=False, priority=True),
+        Binding("ctrl+3", "section('work')", show=False, priority=True),
+        Binding("ctrl+4", "section('inbox')", show=False, priority=True),
+        Binding("ctrl+5", "section('artifacts')", show=False, priority=True),
+        Binding("f6", "focus_tabs", "Tabs", priority=True),
+        Binding("f1", "help", "Help", priority=True),
+        Binding("escape", "focus_conversation", "Chat", show=False),
         Binding("ctrl+o", "toggle_tools", "Tools", priority=True),
         Binding("ctrl+end", "follow", "Latest", priority=True),
         Binding("ctrl+home", "start", "Start", priority=True),
@@ -42,29 +58,174 @@ class ChatScreen(Screen[None]):
     def __init__(self) -> None:
         super().__init__()
         self._accepted_completion_text: str | None = None
+        self.section = "chat"
 
     def compose(self) -> ComposeResult:
         with Vertical(id="chat"):
-            yield StatusBar()
-            with Vertical(id="welcome-region"):
-                yield WelcomeView(id="welcome")
-            yield TranscriptView()
-            yield ApprovalPanel()
-            yield ActivityBar()
-            yield NoticeBar()
-            yield CompletionPopup(id="completions")
-            yield Composer()
-            yield Footer()
+            navigation = Tabs(
+                *(
+                    Tab(label, id=f"tab-{section}")
+                    for section, label in (
+                        ("chat", "Chat"),
+                        ("sources", "Sources"),
+                        ("work", "Work"),
+                        ("inbox", "Inbox"),
+                        ("artifacts", "Artifacts"),
+                    )
+                ),
+                active="tab-chat",
+                id="main-tabs",
+            )
+            yield StatusBar(navigation)
+            with Vertical(id="main-view"):
+                with Vertical(id="conversation-pane"):
+                    with Vertical(id="welcome-region"):
+                        welcome = Text("What would you like to know?", style="bold")
+                        welcome.append(
+                            "\n\nAsk about your data or local files.\n",
+                            style="not bold",
+                        )
+                        welcome.append(
+                            "Type / for commands or @ to choose a source.",
+                            style="not bold",
+                        )
+                        yield Static(welcome, id="welcome", markup=False)
+                    yield TranscriptView()
+                    yield ApprovalPanel()
+                yield CommandSections()
+            with Vertical(id="chat-bottom"):
+                yield ActivityBar()
+                yield NoticeBar()
+                yield CompletionPopup(id="completions")
+                yield Composer()
+            yield Footer(show_command_palette=False, compact=True)
+
+    @property
+    def active_bindings(self) -> dict[str, ActiveBinding]:
+        # Retain every shortcut while showing only the current task's hints.
+        bindings = super().active_bindings
+        leading = (
+            ("y", "n", "escape")
+            if "y" in bindings
+            else (
+                ("enter", "f6", "f1")
+                if self.section == "chat"
+                else ("enter", "escape", "f1")
+            )
+        )
+        return {
+            key: value._replace(binding=replace(value.binding, show=key in leading))
+            for key in (*leading, *bindings)
+            if (value := bindings.get(key)) is not None
+        }
 
     def on_mount(self) -> None:
-        self.query_one(Composer).focus()
         self.query_one(CompletionPopup).display = False
         self.query_one(TranscriptView).display = False
+        self._show_section("chat")
+        self._apply_layout()
+
+    def on_resize(self) -> None:
+        if self.is_mounted:
+            self._apply_layout()
+
+    def _apply_layout(self) -> None:
+        self.set_class(self.app.size.width < 80, "-narrow")
+        # Size the strip to its labels so identity can use the remaining space.
+        # Below 80 columns, Tabs keeps its normal horizontal keyboard scrolling.
+        navigation = self.query_one(Tabs)
+        navigation.styles.width = sum(
+            cell_len(tab.label_text) + 2 for tab in navigation.query(Tab)
+        )
+
+    def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
+        event.stop()
+        self.action_section((event.tab.id or "tab-chat").removeprefix("tab-"))
+
+    def action_section(self, section: str) -> None:
+        if self.query_one(ApprovalPanel).active:
+            self.query_one(Tabs).active = "tab-chat"
+            self.action_focus_conversation()
+            return
+        self._show_section(section)
+        if section != "chat" and self.daita_app.controller.agent is not None:
+            self.run_worker(
+                self.daita_app.refresh_background_status(notify_new=False),
+                name="section-refresh",
+            )
+
+    def _show_section(self, section: str) -> None:
+        self.section = section
+        self.query_one(Tabs).active = f"tab-{section}"
+        is_chat = section == "chat"
+        self.query_one("#conversation-pane").display = is_chat
+        sections = self.query_one(CommandSections)
+        sections.display = not is_chat
+        if not is_chat:
+            sections.current = f"section-{section}"
+            self.dismiss_completions()
+        self.query_one(Composer).display = is_chat
+        if is_chat and self.composer().text:
+            self.run_worker(self._refresh_completions(), name="completion-refresh")
+        if not self.query_one(Tabs).has_focus:
+            self.focus_section()
+        self.refresh_bindings()
+
+    def focus_section(self) -> None:
+        if self.section == "chat":
+            self.query_one(Composer).focus()
+        else:
+            section = "jobs" if self.section == "work" else self.section
+            self.query_one(f"#command-{section}", OptionList).focus()
+
+    def action_focus_tabs(self) -> None:
+        if self.query_one(ApprovalPanel).active:
+            self.action_focus_conversation()
+        else:
+            self.query_one(Tabs).focus()
+
+    def action_help(self) -> None:
+        if self.query_one(ApprovalPanel).active:
+            self.action_focus_conversation()
+            return
+        self._show_section("chat")
+        self.focus_section()
+        self.run_worker(self.daita_app._handle_command("/help"), name="help")
+
+    def action_focus_conversation(self) -> None:
+        if self.section != "chat":
+            self._show_section("chat")
+        panel = self.query_one(ApprovalPanel)
+        if panel.active:
+            target = (
+                "#approval-inline-no"
+                if panel.query_one("#approval-inline-no").display
+                else "#approval-inline-close"
+            )
+            panel.query_one(target, Button).focus()
+        else:
+            self.query_one(Composer).focus()
+
+    def on_command_center_navigate(self, event: CommandCenterNavigate) -> None:
+        event.stop()
+        if self.query_one(ApprovalPanel).active:
+            self.action_focus_conversation()
+            return
+        self.run_worker(
+            self.daita_app.open_command_center_item(event.section, event.item_id),
+            name="command-center-navigation",
+            group="foreground-interaction",
+            exclusive=True,
+        )
 
     async def on_text_area_changed(self, event: TextArea.Changed) -> None:
-        composer = self.query_one(Composer)
-        if event.text_area is not composer:
+        if event.text_area is self.query_one(Composer):
+            await self._refresh_completions()
+
+    async def _refresh_completions(self) -> None:
+        if self.section != "chat" or self.query_one(ApprovalPanel).active:
             return
+        composer = self.query_one(Composer)
         prefix = composer.text
         if self._accepted_completion_text == prefix:
             self._accepted_completion_text = None
@@ -72,7 +233,11 @@ class ChatScreen(Screen[None]):
             return
         self._accepted_completion_text = None
         matches = await self.daita_app.completion_matches(prefix)
-        if composer.text != prefix:
+        if (
+            composer.text != prefix
+            or self.section != "chat"
+            or self.query_one(ApprovalPanel).active
+        ):
             return
         popup = self.query_one(CompletionPopup)
         popup.update_matches(matches)
@@ -154,6 +319,7 @@ class ChatScreen(Screen[None]):
         saved_routines: int = 0,
         active_reports: int = 0,
         inbox_items: int = 0,
+        source_count: int = 0,
         too_small: bool = False,
     ) -> None:
         self.query_one(StatusBar).update_status(
@@ -167,13 +333,21 @@ class ChatScreen(Screen[None]):
             saved_routines=saved_routines,
             active_reports=active_reports,
             inbox_items=inbox_items,
+            source_count=source_count,
             too_small=too_small,
         )
-        self.query_one(WelcomeView).update_identity(
-            agent=agent,
-            model=model,
-            source=source,
+        for section, label, count in (
+            ("sources", "Sources", source_count),
+            ("work", "Work", active_jobs),
+            ("inbox", "Inbox", inbox_items),
+        ):
+            self.query_one(f"#tab-{section}", Tab).label = (
+                f"{label} {count}" if count else label
+            )
+        self.query_one("#tab-work").tooltip = (
+            f"{active_jobs} active jobs · {saved_routines}{'+' if saved_routines == 50 else ''} saved routines"
         )
+        self._apply_layout()
 
     def show_notice(self, message: str) -> None:
         self.query_one(NoticeBar).show(message)
@@ -213,21 +387,35 @@ class ChatScreen(Screen[None]):
         self,
         request: ApprovalRequest,
     ) -> ApprovalDecision | None:
+        self._show_section("chat")
         self._show_conversation(True)
-        return await self.query_one(ApprovalPanel).request(request)
+        tabs = self.query_one(Tabs)
+        composer = self.query_one(Composer)
+        was_disabled = composer.disabled
+        tabs.disabled = composer.disabled = True
+        try:
+            return await self.query_one(ApprovalPanel).request(request)
+        finally:
+            tabs.disabled = False
+            composer.disabled = was_disabled
+            if not was_disabled:
+                self.action_focus_conversation()
 
     def _show_conversation(self, has_blocks: bool) -> None:
         self.query_one("#welcome-region", Vertical).display = not has_blocks
-        self.query_one(WelcomeView).display = not has_blocks
+        self.query_one("#welcome").display = not has_blocks
         self.query_one(TranscriptView).display = has_blocks
 
     def set_submitting(self, submitting: bool) -> None:
+        if self.query_one(ApprovalPanel).active and not submitting:
+            return
         if submitting:
             self.dismiss_completions()
         composer = self.query_one(Composer)
+        was_disabled = composer.disabled
         composer.set_submitting(submitting)
-        if not submitting:
-            composer.focus()
+        if not submitting and was_disabled and self.section == "chat":
+            self.action_focus_conversation()
 
     def composer(self) -> Composer:
         return self.query_one(Composer)

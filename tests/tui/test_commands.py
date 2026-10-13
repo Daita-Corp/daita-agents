@@ -62,77 +62,87 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
     app.controller.agent = opened
     try:
         async with app.run_test(size=(90, 28)) as pilot:
-            await app._show_chat()
-            await pilot.pause()
-            composer = app.screen.query_one(Composer)
-            popup = app.screen.query_one(CompletionPopup)
-            listing = popup.query_one(OptionList)
-            composer.focus()
-            assert composer.styles.border_top[0] == "round"
-            assert composer.styles.border_right[0] == "round"
+            try:
+                await app._show_chat()
+                await pilot.pause()
+                composer = app.screen.query_one(Composer)
+                popup = app.screen.query_one(CompletionPopup)
+                listing = popup.query_one(OptionList)
+                composer.focus()
+                assert composer.styles.border_top[0] == "heavy"
+                assert composer.styles.border_right[0] == "heavy"
 
-            await pilot.press("/")
-            await pilot.pause()
-            assert popup.display is True
-            assert popup.styles.border_left[0] == "solid"
-            assert popup.styles.background.hex == "#111111"
-            assert (
-                listing.get_component_styles(
-                    "option-list--option-highlighted"
-                ).background.hex
-                == "#343434"
-            )
-            assert listing.highlighted == 0
-            assert popup.selected_insertion() == "/model"
-            assert listing.option_count == len(SLASH_COMMAND_COMPLETIONS)
+                await pilot.press("/")
+                await pilot.pause()
+                assert popup.display is True
+                await pilot.press("ctrl+3")
+                await pilot.pause()
+                assert popup.display is False
+                assert composer.text == "/"
+                await pilot.press("ctrl+1")
+                await pilot.pause()
+                assert popup.display is True
+                assert popup.styles.border_left[0] == "solid"
+                assert popup.styles.background.ansi == -1
+                assert (
+                    listing.get_component_styles(
+                        "option-list--option-highlighted"
+                    ).text_style.reverse
+                    is True
+                )
+                assert listing.highlighted == 0
+                assert popup.selected_insertion() == "/model"
+                assert listing.option_count == len(SLASH_COMMAND_COMPLETIONS)
 
-            for _ in range(len(SLASH_COMMAND_COMPLETIONS) - 1):
-                popup.move_highlight(1)
-            assert popup.selected_insertion() == "/exit"
-            assert listing.scroll_offset.y > 0
-            for _ in range(len(SLASH_COMMAND_COMPLETIONS) - 1):
-                popup.move_highlight(-1)
-            assert popup.selected_insertion() == "/model"
+                for _ in range(len(SLASH_COMMAND_COMPLETIONS) - 1):
+                    popup.move_highlight(1)
+                assert popup.selected_insertion() == "/exit"
+                assert listing.scroll_offset.y > 0
+                for _ in range(len(SLASH_COMMAND_COMPLETIONS) - 1):
+                    popup.move_highlight(-1)
+                assert popup.selected_insertion() == "/model"
 
-            await pilot.press("down", "enter")
-            await pilot.pause()
-            assert composer.text == "/sources"
-            assert popup.display is False
-            assert app._run_task is None
+                await pilot.press("down", "enter")
+                await pilot.pause()
+                assert composer.text == "/sources"
+                assert popup.display is False
+                assert app._run_task is None
 
-            await pilot.press("enter")
-            await pilot.pause()
-            assert isinstance(app.screen, CatalogScreen)
-            await pilot.press("escape")
-            await pilot.pause()
-            assert composer.text == ""
-            assert app._run_task is None
+                await pilot.press("enter")
+                await pilot.pause()
+                assert isinstance(app.screen, CatalogScreen)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert composer.text == ""
+                assert app._run_task is None
 
-            await pilot.press("/", "s", "o", "u")
-            await pilot.pause()
-            assert popup.display is True
-            assert {shown for _insert, shown, _description in popup.matches} == {
-                "/sources"
-            }
+                await pilot.press("/", "s", "o", "u")
+                await pilot.pause()
+                assert popup.display is True
+                assert {shown for _insert, shown, _description in popup.matches} == {
+                    "/sources"
+                }
 
-            await pilot.press("escape")
-            await pilot.pause()
-            assert popup.display is False
-            assert composer.text == "/sou"
-            await pilot.press("escape", "escape")
-            await pilot.pause()
-            assert composer.text == ""
+                await pilot.press("escape")
+                await pilot.pause()
+                assert popup.display is False
+                assert composer.text == "/sou"
+                await pilot.press("escape", "escape")
+                await pilot.pause()
+                assert composer.text == ""
 
-            await pilot.resize_terminal(MIN_USABLE_COLUMNS, MIN_READY_ROWS)
-            await pilot.pause()
-            composer.focus()
-            await pilot.press("/")
-            await pilot.pause()
-            assert popup.display is True
-            assert composer.region.height >= 3
-            assert listing.region.height >= 1
-            assert popup.region.y < composer.region.y
-            app.exit(0)
+                await pilot.resize_terminal(MIN_USABLE_COLUMNS, MIN_READY_ROWS)
+                await pilot.pause()
+                composer.focus()
+                await pilot.press("/")
+                await pilot.pause()
+                assert popup.display is True
+                assert composer.region.height >= 3
+                assert listing.region.height >= 1
+                assert popup.region.y < composer.region.y
+                app.exit(0)
+            finally:
+                app.exit(0)
     finally:
         await opened.close()
 

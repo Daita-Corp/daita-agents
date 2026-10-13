@@ -16,31 +16,26 @@ _SCENE_WIDTH = 20
 _SCENE_GAP = 5
 _SCENE_MINIMUM = 76
 _LOGO_LINES = (
-    ("████████████▄", "bold #ACFD21"),
-    ("█████      ███▄", "bold #ACFD21"),
-    ("█████       ███", "bold #70DF43"),
-    ("█████       ███", "bold #70DF43"),
-    ("█████       ███", "bold #70DF43"),
-    ("█████       ███", "bold #46BF69"),
-    ("█████      ███▀", "bold #46BF69"),
-    ("████████████▀", "bold #46BF69"),
+    "████████████▄",
+    "█████      ███▄",
+    "█████       ███",
+    "█████       ███",
+    "█████       ███",
+    "█████       ███",
+    "█████      ███▀",
+    "████████████▀",
 )
-_SCENE_STYLES = {
-    "T": "#ACFD21",
-    "M": "#70DF43",
-    "B": "#46BF69",
-}
 _BRAILLE_SCENE = (
-    ("⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣤⡀", "TTTTTTTTTTTTTTTTTTT"),
-    ("⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄", "TTTTTTTTTTTTTTTTTTTT"),
-    ("⠿⠿⠿⠿⠿⠿⠏      ⠹⠿⠿⠿⠿⠿⠿", "TTTTTTT      TTTTTTT"),
-    ("⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤", "MMMMMMMMMMMMMMMMMMMM"),
-    ("⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿", "MMMMMMMMMMMMMMMMMMMM"),
-    ("⣿⣿⣿⣿⣿⣿⡿⠛⠛⠛⠛⠛⠛⢿⣿⣿⣿⣿⣿⣿", "MMMMMMMMMMMMMMMMMMMM"),
-    ("⠛⠛⠛⠛⠛⠛⠃      ⠘⠛⠛⠛⠛⠛⠛", "MMMMMMM      MMMMMMM"),
-    ("⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶", "BBBBBBBBBBBBBBBBBBBB"),
-    ("⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃", "BBBBBBBBBBBBBBBBBBBB"),
-    ("⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠛⠁", "BBBBBBBBBBBBBBBBBBB"),
+    "⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣤⡀",
+    "⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡄",
+    "⠿⠿⠿⠿⠿⠿⠏      ⠹⠿⠿⠿⠿⠿⠿",
+    "⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤",
+    "⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿",
+    "⣿⣿⣿⣿⣿⣿⡿⠛⠛⠛⠛⠛⠛⢿⣿⣿⣿⣿⣿⣿",
+    "⠛⠛⠛⠛⠛⠛⠃      ⠘⠛⠛⠛⠛⠛⠛",
+    "⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶⣶",
+    "⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃",
+    "⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠿⠛⠁",
 )
 
 
@@ -78,7 +73,7 @@ class WelcomeView(Static):
         lines = [
             heading,
             Text(),
-            Text("Your persistent data agent", style="bold #ACFD21"),
+            Text("Your persistent data agent", style="bold"),
         ]
         if self._booting:
             lines.extend((Text(), Text("Starting your workspace…", style="dim")))
@@ -109,10 +104,8 @@ class WelcomeView(Static):
         detail_width = min(52, available - _LOGO_WIDTH - _LOGO_GAP)
         content = Text(no_wrap=True, overflow="crop")
         details = self._detail_lines()
-        for index, ((logo, logo_style), detail) in enumerate(
-            zip(_LOGO_LINES, details, strict=True)
-        ):
-            content.append(logo.ljust(_LOGO_WIDTH), style=logo_style)
+        for index, (logo, detail) in enumerate(zip(_LOGO_LINES, details, strict=True)):
+            content.append(logo.ljust(_LOGO_WIDTH), style="bold")
             content.append(" " * _LOGO_GAP)
             detail.truncate(detail_width, overflow="ellipsis")
             content.append_text(detail)
@@ -128,20 +121,10 @@ class WelcomeView(Static):
         top_padding = max(0, (len(_BRAILLE_SCENE) - len(detail_lines)) // 2)
         details = (Text(),) * top_padding + detail_lines
         details += (Text(),) * (len(_BRAILLE_SCENE) - len(details))
-        for index, ((characters, palette), detail) in enumerate(
+        for index, (characters, detail) in enumerate(
             zip(_BRAILLE_SCENE, details, strict=True)
         ):
-            characters = characters.ljust(_SCENE_WIDTH)
-            palette = palette.ljust(_SCENE_WIDTH)
-            run_start = 0
-            for position in range(1, _SCENE_WIDTH + 1):
-                if position < _SCENE_WIDTH and palette[position] == palette[run_start]:
-                    continue
-                content.append(
-                    characters[run_start:position],
-                    style=_SCENE_STYLES.get(palette[run_start]),
-                )
-                run_start = position
+            content.append(characters.ljust(_SCENE_WIDTH), style="bold")
             content.append(" " * _SCENE_GAP)
             detail.truncate(detail_width, overflow="ellipsis")
             content.append_text(detail)
@@ -151,8 +134,8 @@ class WelcomeView(Static):
 
     def _compact_content(self) -> Text:
         content = Text(justify="center", no_wrap=True, overflow="crop")
-        for index, (line, style) in enumerate(_LOGO_LINES):
-            content.append(line, style=style)
+        for index, line in enumerate(_LOGO_LINES):
+            content.append(line, style="bold")
             if index < len(_LOGO_LINES) - 1:
                 content.append("\n")
         content.append("\n\nDAITA", style="bold")

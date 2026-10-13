@@ -7,7 +7,7 @@ import time
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal
-from textual.widgets import Static
+from textual.widgets import Static, Tabs
 
 from ..sanitization import sanitize_terminal_text
 
@@ -37,9 +37,7 @@ def context_window_text(used: int | None, total: int | None) -> Text:
     if used is None or used <= 0:
         return Text(f"ctx — / {total_label}", style="dim")
     percentage = used / total * 100
-    style = (
-        "#DE3535" if percentage >= 90 else "#FBBF24" if percentage >= 75 else "#ACFD21"
-    )
+    style = "red" if percentage >= 90 else "yellow" if percentage >= 75 else "dim"
     return Text(
         f"ctx {format_token_count(used)} / {total_label}",
         style=style,
@@ -47,22 +45,16 @@ def context_window_text(used: int | None, total: int | None) -> Text:
 
 
 class StatusBar(Horizontal):
-    def __init__(self) -> None:
+    """One header row with identity, caller-owned navigation, and context usage."""
+
+    def __init__(self, navigation: Tabs | None = None) -> None:
         super().__init__(id="status-bar")
+        self._navigation = navigation
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            Text("DAITA", style="bold #ACFD21"),
-            id="status-primary",
-        )
-        background = Static("", id="background-status")
-        background.display = False
-        background.tooltip = (
-            "Background jobs, autonomous reporting, and unacknowledged inbox "
-            "results. Saved assignments execute only while this host is open and share "
-            "the run lock. Use /jobs, /routines or /inbox."
-        )
-        yield background
+        yield Static(Text("DAITA", style="bold"), id="status-primary")
+        if self._navigation is not None:
+            yield self._navigation
         context = Static(context_window_text(None, None), id="context-window")
         context.tooltip = (
             "Exact input tokens in the latest model request / model context window"
@@ -82,25 +74,26 @@ class StatusBar(Horizontal):
         saved_routines: int = 0,
         active_reports: int = 0,
         inbox_items: int = 0,
+        source_count: int = 0,
         too_small: bool = False,
     ) -> None:
         primary = self.query_one("#status-primary", Static)
-        background = self.query_one("#background-status", Static)
         context = self.query_one("#context-window", Static)
         if too_small:
-            message = Text("DAITA", style="bold #ACFD21")
+            message = Text("DAITA", style="bold")
             message.append("  Terminal too small; 32x8 required", style="bold")
             primary.update(message)
-            background.display = False
+            primary.tooltip = message.copy()
             context.display = False
             return
-        context.display = True
-        self._update_background(
-            background,
-            active_jobs=active_jobs,
-            saved_routines=saved_routines,
-            active_reports=active_reports,
-            inbox_items=inbox_items,
+        context.display = self.app.size.width >= 100
+        safe_source = sanitize_terminal_text(
+            source, maximum=48, preserve_lines=False, fallback="none"
+        )
+        self.tooltip = (
+            f"{source_count} sources · {active_jobs} active jobs · "
+            f"{saved_routines}{'+' if saved_routines == 50 else ''} saved routines · "
+            f"{inbox_items} unread results. Sources: {safe_source}"
         )
         safe_agent = sanitize_terminal_text(
             agent, maximum=32, preserve_lines=False, fallback="agent"
@@ -108,68 +101,26 @@ class StatusBar(Horizontal):
         safe_model = sanitize_terminal_text(
             model, maximum=48, preserve_lines=False, fallback="model"
         )
-        safe_source = sanitize_terminal_text(
-            source, maximum=48, preserve_lines=False, fallback="source"
-        )
         safe_state = sanitize_terminal_text(
             state, maximum=32, preserve_lines=False, fallback="ready"
         )
-        state_style = "bold #FBBF24" if safe_state == "approval" else "bold #ACFD21"
-        message = Text("DAITA", style="bold #ACFD21")
-        message.append(f"  {safe_agent} / {safe_model} / {safe_source}  ", style="dim")
-        # Foreground phases belong in the activity line. Keep only idle,
-        # approval and background coordination states in the header.
+        state_style = "bold yellow" if "approval" in safe_state else "dim"
+        message = Text("DAITA", style="bold")
+        message.append(f"  {safe_agent}")
+        message.append(f" · {safe_model}", style="dim")
+        # Foreground phases belong in the activity line; idle needs no badge.
         if safe_state in {
-            "ready",
             "approval",
             "edit approval",
             "queued behind background",
             "background running",
         }:
-            message.append(f"[{safe_state}]", style=state_style)
-        primary.update(message)
-        context.update(context_window_text(context_used, context_total))
-
-    @staticmethod
-    def _update_background(
-        target: Static,
-        *,
-        active_jobs: int,
-        saved_routines: int,
-        active_reports: int,
-        inbox_items: int,
-    ) -> None:
-        for value, name in (
-            (active_jobs, "active_jobs"),
-            (saved_routines, "saved_routines"),
-            (active_reports, "active_reports"),
-            (inbox_items, "inbox_items"),
-        ):
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                raise ValueError(f"{name} must be a non-negative integer")
-        labels: list[tuple[str, str]] = []
-        if saved_routines:
-            count = (
-                f"{saved_routines}+" if saved_routines == 50 else str(saved_routines)
-            )
-            labels.append((f"assignments {count}", "bold #ACFD21"))
-        if active_jobs:
-            labels.append((f"jobs {active_jobs}", "bold #ACFD21"))
+            message.append(f"  [{safe_state}]", style=state_style)
         if active_reports:
-            labels.append((f"reporting {active_reports}", "bold #ACFD21"))
-        if inbox_items:
-            labels.append((f"inbox {inbox_items}", "bold #FBBF24"))
-        if not labels:
-            target.update("")
-            target.display = False
-            return
-        content = Text()
-        for index, (label, style) in enumerate(labels):
-            if index:
-                content.append("  ·  ", style="dim")
-            content.append(label, style=style)
-        target.update(content)
-        target.display = True
+            message.append(f"  reporting {active_reports}", style="dim")
+        primary.update(message)
+        primary.tooltip = message.copy()
+        context.update(context_window_text(context_used, context_total))
 
 
 class ActivityBar(Static):
@@ -224,7 +175,7 @@ class ActivityBar(Static):
         elapsed = 0.0
         if self._started_at is not None:
             elapsed = max(0.0, time.monotonic() - self._started_at)
-        content = Text(self._FRAMES[self._frame], style="bold #ACFD21")
+        content = Text(self._FRAMES[self._frame], style="bold")
         content.append(f"  {self._stage}", style="italic dim")
         content.append(f"  {elapsed:.1f}s", style="dim")
         self.update(content)

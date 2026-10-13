@@ -23,7 +23,7 @@ class Composer(TextArea):
     """Enter submits, Ctrl-J inserts a newline, Escape-Escape clears."""
 
     BINDINGS = [
-        ("enter", "submit", "Submit"),
+        ("enter", "submit", "Send"),
         ("ctrl+j", "newline", "Newline"),
         ("tab", "tab", "Complete"),
         ("escape", "escape", "Clear"),

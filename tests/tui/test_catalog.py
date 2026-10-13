@@ -42,43 +42,49 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
     app.controller.agent = opened
     try:
         async with app.run_test(size=(90, 28)) as pilot:
-            await app._show_chat()
-            composer = app.screen.query_one(Composer)
-            composer.load_text("/source permissions")
-            composer.action_submit()
-            await pilot.pause()
+            try:
+                await app._show_chat()
+                composer = app.screen.query_one(Composer)
+                composer.load_text("/source permissions")
+                composer.action_submit()
+                await pilot.pause()
 
-            permissions = app.screen
-            assert isinstance(permissions, PermissionsScreen)
-            assert await pilot.click("#perm-source") is True
-            await pilot.pause()
+                permissions = app.screen
+                assert isinstance(permissions, PermissionsScreen)
+                assert await pilot.click("#perm-source") is True
+                await pilot.pause()
 
-            picker = app.screen
-            assert isinstance(picker, SelectionScreen)
-            panel = picker.query_one("#picker")
-            assert panel.styles.border_left[0] == "solid"
-            assert panel.styles.background.hex == "#111111"
-            picker_filter = picker.query_one("#picker-filter", Input)
-            assert picker_filter.styles.border_left[0] == ""
-            assert picker_filter.styles.border_bottom[0] == "solid"
-            assert picker.query_one("#picker-title").styles.color.hex == "#FFFFFF"
-            listing = picker.query_one("#picker-options", OptionList)
-            assert listing.styles.border_left[0] == ""
-            assert listing.styles.background.hex == "#111111"
-            assert (
-                listing.get_component_styles(
-                    "option-list--option-highlighted"
-                ).background.hex
-                == "#343434"
-            )
-            assert await pilot.click(listing, offset=(2, 0)) is True
-            await pilot.pause()
+                picker = app.screen
+                assert isinstance(picker, SelectionScreen)
+                panel = picker.query_one("#picker")
+                assert panel.styles.border_left[0] == "solid"
+                assert panel.styles.background.ansi == -1
+                picker_filter = picker.query_one("#picker-filter", Input)
+                assert picker_filter.styles.border_left[0] == ""
+                assert picker_filter.has_focus
+                assert picker_filter.styles.border_bottom[0] == "heavy"
+                assert picker.query_one("#picker-title").styles.color.ansi == -1
+                listing = picker.query_one("#picker-options", OptionList)
+                assert listing.styles.border_left[0] == ""
+                assert listing.styles.background.ansi == -1
+                assert (
+                    listing.get_component_styles(
+                        "option-list--option-highlighted"
+                    ).text_style.reverse
+                    is True
+                )
+                assert await pilot.click(listing, offset=(2, 0)) is True
+                await pilot.pause()
 
-            assert app.screen is permissions
-            assert isinstance(permissions, PermissionsScreen)
-            assert permissions._source_id == source.id
-            assert "Records" in str(permissions.query_one("#perm-body", Static).content)
-            app.exit(0)
+                assert app.screen is permissions
+                assert isinstance(permissions, PermissionsScreen)
+                assert permissions._source_id == source.id
+                assert "Records" in str(
+                    permissions.query_one("#perm-body", Static).content
+                )
+                app.exit(0)
+            finally:
+                app.exit(0)
     finally:
         await opened.close()
 
@@ -373,102 +379,109 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
     app.controller.agent = opened
     try:
         async with app.run_test(size=(100, 34)) as pilot:
-            await app._show_chat()
-            await pilot.pause()
-            composer = app.screen.query_one(Composer)
-            composer.load_text("/sources")
-            composer.action_submit()
-            await pilot.pause()
+            try:
+                await app._show_chat()
+                await pilot.pause()
+                composer = app.screen.query_one(Composer)
+                composer.load_text("/sources")
+                composer.action_submit()
+                await pilot.pause()
 
-            assert isinstance(app.screen, CatalogScreen)
-            assert str(app.screen.query_one("#catalog-title").render()) == "Sources"
-            summary = app.screen.query_one("#catalog-summary", Static)
-            assert "2 sources  ·  2 resources  ·  0 relationships" in str(
-                summary.content
-            )
-            tree = app.screen.query_one("#catalog-tree", Tree)
-            browser = app.screen.query_one("#catalog-browser")
-            assert browser.styles.border_left[0] == "solid"
-            assert browser.styles.background.hex == "#111111"
-            assert tree.styles.border_left[0] == ""
-            assert tree.styles.border_top[0] == "solid"
-            assert tree.styles.background.hex == "#111111"
-            assert tree.get_component_styles("tree--cursor").background.hex == "#343434"
-            assert app.screen.query_one("#catalog-title").styles.color.hex == "#FFFFFF"
-            for button_id in (
-                "source-refresh",
-                "source-edit",
-                "source-permissions",
-                "source-detach",
-            ):
-                assert app.screen.query_one(f"#{button_id}", Button).disabled is False
-            assert tree.has_focus is True
-            assert tree.cursor_line == 0
-            source_labels = tuple(str(node.label) for node in tree.root.children)
-            assert source_labels[0] == "Sales  SQLite · 1 resource"
-            assert source_labels[1] == "Support  SQLite · 1 resource"
-            resource_labels = tuple(
-                str(node.label)
-                for source_node in tree.root.children
-                for node in source_node.children
-            )
-            assert resource_labels == ("main.orders  table", "main.tickets  table")
-            assert "resource" not in resource_labels
+                assert isinstance(app.screen, CatalogScreen)
+                assert str(app.screen.query_one("#catalog-title").render()) == "Sources"
+                summary = app.screen.query_one("#catalog-summary", Static)
+                assert "2 sources  ·  2 resources  ·  0 relationships" in str(
+                    summary.content
+                )
+                tree = app.screen.query_one("#catalog-tree", Tree)
+                browser = app.screen.query_one("#catalog-browser")
+                assert browser.styles.border_left[0] == "solid"
+                assert browser.styles.background.ansi == -1
+                assert tree.styles.border_left[0] == ""
+                assert tree.styles.border_top[0] == "solid"
+                assert tree.styles.background.ansi == -1
+                assert (
+                    tree.get_component_styles("tree--cursor").text_style.reverse is True
+                )
+                assert app.screen.query_one("#catalog-title").styles.color.ansi == -1
+                for button_id in (
+                    "source-refresh",
+                    "source-edit",
+                    "source-permissions",
+                    "source-detach",
+                ):
+                    assert (
+                        app.screen.query_one(f"#{button_id}", Button).disabled is False
+                    )
+                assert tree.has_focus is True
+                assert tree.cursor_line == 0
+                source_labels = tuple(str(node.label) for node in tree.root.children)
+                assert source_labels[0] == "Sales  SQLite · 1 resource"
+                assert source_labels[1] == "Support  SQLite · 1 resource"
+                resource_labels = tuple(
+                    str(node.label)
+                    for source_node in tree.root.children
+                    for node in source_node.children
+                )
+                assert resource_labels == ("main.orders  table", "main.tickets  table")
+                assert "resource" not in resource_labels
 
-            await pilot.press("down")
-            assert tree.cursor_line == 1
-            await pilot.press("up")
-            assert tree.cursor_line == 0
-            first_source = tree.root.children[0]
-            assert first_source.is_expanded is True
-            await pilot.press("enter")
-            assert first_source.is_expanded is False
-            await pilot.press("enter")
-            assert first_source.is_expanded is True
-            assert await pilot.click(tree, offset=(2, 1)) is True
-            await pilot.pause()
-            assert first_source.is_expanded is False
-            assert await pilot.click(tree, offset=(6, 1)) is True
-            await pilot.pause()
-            assert first_source.is_expanded is True
+                await pilot.press("down")
+                assert tree.cursor_line == 1
+                await pilot.press("up")
+                assert tree.cursor_line == 0
+                first_source = tree.root.children[0]
+                assert first_source.is_expanded is True
+                await pilot.press("enter")
+                assert first_source.is_expanded is False
+                await pilot.press("enter")
+                assert first_source.is_expanded is True
+                assert await pilot.click(tree, offset=(2, 1)) is True
+                await pilot.pause()
+                assert first_source.is_expanded is False
+                assert await pilot.click(tree, offset=(6, 1)) is True
+                await pilot.pause()
+                assert first_source.is_expanded is True
 
-            manager = app.screen
-            assert await pilot.click("#source-refresh") is True
-            for _ in range(20):
-                await pilot.pause(0.05)
-                current = app.screen
-                if isinstance(current, CatalogScreen) and current is not manager:
-                    break
-            assert isinstance(app.screen, CatalogScreen)
-            refresh_notice = app.screen.query_one("#catalog-notice", Static)
-            assert str(refresh_notice.content) == (
-                "Catalog refresh succeeded · Sales · 1 resource"
-            )
+                manager = app.screen
+                assert await pilot.click("#source-refresh") is True
+                for _ in range(20):
+                    await pilot.pause(0.05)
+                    current = app.screen
+                    if isinstance(current, CatalogScreen) and current is not manager:
+                        break
+                assert isinstance(app.screen, CatalogScreen)
+                refresh_notice = app.screen.query_one("#catalog-notice", Static)
+                assert str(refresh_notice.content) == (
+                    "Catalog refresh succeeded · Sales · 1 resource"
+                )
 
-            await pilot.press("escape")
-            await pilot.pause()
-            assert isinstance(app.screen, ChatScreen)
+                await pilot.press("escape")
+                await pilot.pause()
+                assert isinstance(app.screen, ChatScreen)
 
-            composer = app.screen.query_one(Composer)
-            composer.load_text("/catalog")
-            composer.action_submit()
-            await pilot.pause()
-            assert isinstance(app.screen, CatalogScreen)
-            assert await pilot.click("FooterKey") is True
-            await pilot.pause()
-            assert isinstance(app.screen, ChatScreen)
+                composer = app.screen.query_one(Composer)
+                composer.load_text("/catalog")
+                composer.action_submit()
+                await pilot.pause()
+                assert isinstance(app.screen, CatalogScreen)
+                assert await pilot.click("FooterKey") is True
+                await pilot.pause()
+                assert isinstance(app.screen, ChatScreen)
 
-            composer = app.screen.query_one(Composer)
-            composer.load_text(f"/source refresh {first.id}")
-            composer.action_submit()
-            await pilot.pause()
-            assert isinstance(app.screen, CatalogScreen)
-            refresh_notice = app.screen.query_one("#catalog-notice", Static)
-            assert str(refresh_notice.content) == (
-                "Catalog refresh succeeded · Sales · 1 resource"
-            )
-            assert refresh_notice.has_class("-warning") is False
-            app.exit(0)
+                composer = app.screen.query_one(Composer)
+                composer.load_text(f"/source refresh {first.id}")
+                composer.action_submit()
+                await pilot.pause()
+                assert isinstance(app.screen, CatalogScreen)
+                refresh_notice = app.screen.query_one("#catalog-notice", Static)
+                assert str(refresh_notice.content) == (
+                    "Catalog refresh succeeded · Sales · 1 resource"
+                )
+                assert refresh_notice.has_class("-warning") is False
+                app.exit(0)
+            finally:
+                app.exit(0)
     finally:
         await opened.close()
 

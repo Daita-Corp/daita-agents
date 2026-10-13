@@ -57,6 +57,7 @@ The owner API provides the same paged inventory:
 
 ```python
 artifacts = await agent.list_artifacts(limit=50, offset=0)
+recent = await agent.list_artifacts(limit=20, newest_first=True)
 ```
 
 Hosted listings filter by authenticated `caller_principal_id`. Only ready

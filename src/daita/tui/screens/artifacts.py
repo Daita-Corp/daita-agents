@@ -68,8 +68,10 @@ class ArtifactsScreen(ModalScreen[None]):
         ),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, *, artifact_id: str | None = None) -> None:
         super().__init__()
+        self._target_artifact_id = artifact_id
+        self._newest_first = artifact_id is not None
         self._items: tuple[ArtifactRef, ...] = ()
         self._offset = 0
         self._has_next = False
@@ -301,7 +303,22 @@ class ArtifactsScreen(ModalScreen[None]):
 
     async def _load(self, offset: int, selected: ArtifactRef | None) -> None:
         # One extra row determines whether the next page exists without a count query.
-        items = await self.app.controller.list_artifacts(limit=PAGE_SIZE + 1, offset=offset)  # type: ignore[attr-defined]
+        controller = self.app.controller  # type: ignore[attr-defined]
+        if self._newest_first:
+            items = await controller.list_artifacts(
+                limit=PAGE_SIZE + 1, offset=offset, newest_first=True
+            )
+        else:
+            items = await controller.list_artifacts(limit=PAGE_SIZE + 1, offset=offset)
+        if self._target_artifact_id is not None:
+            target = self._target_artifact_id
+            if not any(item.artifact_id == target for item in items[:PAGE_SIZE]):
+                if len(items) > PAGE_SIZE:
+                    await self._load(offset + PAGE_SIZE, selected)
+                    return
+            self._target_artifact_id = None
+        else:
+            target = None
         if not items and offset:
             await self._load(max(0, offset - PAGE_SIZE), selected)
             return
@@ -322,7 +339,8 @@ class ArtifactsScreen(ModalScreen[None]):
                 (
                     index
                     for index, item in enumerate(self._items)
-                    if selected and item.artifact_id == selected.artifact_id
+                    if item.artifact_id
+                    == (selected.artifact_id if selected else target)
                 ),
                 0,
             )
@@ -514,7 +532,9 @@ def render_artifact_preview(payload: ArtifactPayload) -> RenderableType:
         fallback="(empty artifact)",
     )
     if payload.ref.media_type == "text/markdown":
-        rendered: RenderableType = Markdown(preview, hyperlinks=False)
+        rendered: RenderableType = Markdown(
+            preview, hyperlinks=False, code_theme="ansi_dark"
+        )
     else:
         rendered = Text(preview)
     return (

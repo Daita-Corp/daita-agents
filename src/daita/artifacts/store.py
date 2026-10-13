@@ -66,6 +66,7 @@ class ArtifactRegistry(Protocol):
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRecord, ...]: ...
     async def list_artifact_refs(
         self,
@@ -77,6 +78,7 @@ class ArtifactRegistry(Protocol):
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRef, ...]: ...
     async def begin_artifact_creation(
         self, record: ArtifactRecord, *, reserved: bool = False
@@ -254,6 +256,7 @@ class AgentHomeArtifactStore:
         caller_principal_id: str | None = None,
         limit: int | None = None,
         offset: int = 0,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRef, ...]:
         async with self._lifecycle_lock:
             self._require_available()
@@ -264,6 +267,7 @@ class AgentHomeArtifactStore:
                 caller_principal_id=caller_principal_id,
                 limit=limit,
                 offset=offset,
+                newest_first=newest_first,
             )
 
     async def find_ref(self, artifact_id: str) -> ArtifactRef:

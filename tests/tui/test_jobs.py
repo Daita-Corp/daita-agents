@@ -221,15 +221,15 @@ async def test_background_status_notifies_once_and_remains_outside_transcript(
         async with app.run_test(size=(110, 32)) as pilot:
             await app._show_chat()
             await pilot.pause()
-            status = app.screen.query_one("#background-status", Static)
-            assert "jobs 1" in str(status.content)
+            status = app.screen.query_one("#status-bar")
+            assert "1 active jobs" in str(status.tooltip)
             assert status.display is True
 
             current_inbox.append(_tui_inbox_item())
             await app.refresh_background_status(notify_new=True)
             await pilot.pause()
-            assert "jobs 1" in str(status.content)
-            assert "inbox 1" in str(status.content)
+            assert "1 active jobs" in str(status.tooltip)
+            assert "1 unread results" in str(status.tooltip)
             assert notifications == [
                 ("1 background report is ready. Open /inbox to review.", "Inbox")
             ]
@@ -274,7 +274,7 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
                 )
             )
             assert "reporting 1" in str(
-                chat.query_one("#background-status", Static).content
+                chat.query_one("#status-primary", Static).content
             )
 
             await app.on_observer_event(
@@ -343,7 +343,7 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
                 )
             )
             assert "reporting" not in str(
-                chat.query_one("#background-status", Static).content
+                chat.query_one("#status-primary", Static).content
             )
             app.exit(0)
     finally:
@@ -496,97 +496,102 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
     monkeypatch.setattr(app.controller, "accept_job_review", accept_job_review)
 
     async with app.run_test(size=(110, 36)) as pilot:
-        await app.push_screen(JobsScreen())
-        for _ in range(20):
-            await pilot.pause(0.05)
-            if "2 jobs" in str(app.screen.query_one("#jobs-summary", Static).content):
-                break
-        manager = app.screen
-        assert isinstance(manager, JobsScreen)
-        panel = manager.query_one("#jobs-manager")
-        assert panel.styles.border_left[0] == "solid"
-        assert panel.styles.background.hex == "#111111"
-        listing = manager.query_one("#jobs-list", OptionList)
-        assert listing.option_count == 2
-        assert listing.has_focus is True
-        first_prompt = listing.get_option_at_index(0).prompt
-        assert isinstance(first_prompt, Text)
-        assert "ACTIVE" in first_prompt.plain
-        assert manager.query_one("#jobs-cancel", Button).disabled is False
-        assert manager.query_one("#jobs-results", Button).disabled is True
+        try:
+            await app.push_screen(JobsScreen())
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if "2 jobs" in str(
+                    app.screen.query_one("#jobs-summary", Static).content
+                ):
+                    break
+            manager = app.screen
+            assert isinstance(manager, JobsScreen)
+            panel = manager.query_one("#jobs-manager")
+            assert panel.styles.border_left[0] == "solid"
+            assert panel.styles.background.ansi == -1
+            listing = manager.query_one("#jobs-list", OptionList)
+            assert listing.option_count == 2
+            assert listing.has_focus is True
+            first_prompt = listing.get_option_at_index(0).prompt
+            assert isinstance(first_prompt, Text)
+            assert "ACTIVE" in first_prompt.plain
+            assert manager.query_one("#jobs-cancel", Button).disabled is False
+            assert manager.query_one("#jobs-results", Button).disabled is True
 
-        assert await pilot.click("#jobs-details") is True
-        await pilot.pause()
-        assert "Graph" in str(manager.query_one("#jobs-detail", Static).content)
+            assert await pilot.click("#jobs-details") is True
+            await pilot.pause()
+            assert "Graph" in str(manager.query_one("#jobs-detail", Static).content)
 
-        assert await pilot.click("#jobs-board") is True
-        await pilot.pause()
-        assert "worker -> finalizer" in str(
-            manager.query_one("#jobs-detail", Static).content
-        )
-
-        assert await pilot.click("#jobs-timeline") is True
-        await pilot.pause()
-        timeline_text = str(manager.query_one("#jobs-detail", Static).content)
-        assert "task_claimed" in timeline_text
-        assert "Current state: active" in timeline_text
-
-        assert await pilot.click("#jobs-controls") is True
-        for _ in range(20):
-            await pilot.pause(0.05)
-            if isinstance(app.screen, JobControlScreen):
-                break
-        assert isinstance(app.screen, JobControlScreen)
-        app.screen.query_one("#job-control-value", Input).value = (
-            "Authenticated candidate accepted."
-        )
-        assert await pilot.click("#job-control-submit") is True
-        for _ in range(20):
-            await pilot.pause(0.05)
-            if app.screen is manager and accepted_reviews:
-                break
-        assert accepted_reviews == [
-            (
-                running.job_id,
-                "worker",
-                "review-control",
-                "Authenticated candidate accepted.",
+            assert await pilot.click("#jobs-board") is True
+            await pilot.pause()
+            assert "worker -> finalizer" in str(
+                manager.query_one("#jobs-detail", Static).content
             )
-        ]
-        assert app.screen is manager
 
-        assert await pilot.click("#jobs-cancel") is True
-        for _ in range(20):
-            await pilot.pause(0.05)
-            if isinstance(app.screen, ConfirmScreen):
-                break
-        assert isinstance(app.screen, ConfirmScreen)
-        await pilot.press("y")
-        for _ in range(20):
-            await pilot.pause(0.05)
-            if app.screen is manager and cancel_calls:
-                break
-        assert app.screen is manager
-        assert cancel_calls == [running.job_id]
-        assert "Cancellation requested" in str(
-            manager.query_one("#jobs-notice", Static).content
-        )
-        assert manager.query_one("#jobs-cancel", Button).disabled is True
+            assert await pilot.click("#jobs-timeline") is True
+            await pilot.pause()
+            timeline_text = str(manager.query_one("#jobs-detail", Static).content)
+            assert "task_claimed" in timeline_text
+            assert "Current state: active" in timeline_text
 
-        listing.highlighted = 1
-        await pilot.pause()
-        assert manager.query_one("#jobs-results", Button).disabled is False
-        assert await pilot.click("#jobs-results") is True
-        await pilot.pause()
-        result_text = str(manager.query_one("#jobs-detail", Static).content)
-        assert "profiled_resources" in result_text
-        assert "Artifacts (0)" in result_text
+            assert await pilot.click("#jobs-controls") is True
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, JobControlScreen):
+                    break
+            assert isinstance(app.screen, JobControlScreen)
+            app.screen.query_one("#job-control-value", Input).value = (
+                "Authenticated candidate accepted."
+            )
+            assert await pilot.click("#job-control-submit") is True
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if app.screen is manager and accepted_reviews:
+                    break
+            assert accepted_reviews == [
+                (
+                    running.job_id,
+                    "worker",
+                    "review-control",
+                    "Authenticated candidate accepted.",
+                )
+            ]
+            assert app.screen is manager
 
-        assert await pilot.click("#jobs-refresh") is True
-        await pilot.pause()
-        assert list_calls >= 3
-        assert "Job statuses refreshed" in str(
-            manager.query_one("#jobs-notice", Static).content
-        )
-        assert await pilot.click("#jobs-close") is True
-        app.exit(0)
+            assert await pilot.click("#jobs-cancel") is True
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if isinstance(app.screen, ConfirmScreen):
+                    break
+            assert isinstance(app.screen, ConfirmScreen)
+            await pilot.press("y")
+            for _ in range(20):
+                await pilot.pause(0.05)
+                if app.screen is manager and cancel_calls:
+                    break
+            assert app.screen is manager
+            assert cancel_calls == [running.job_id]
+            assert "Cancellation requested" in str(
+                manager.query_one("#jobs-notice", Static).content
+            )
+            assert manager.query_one("#jobs-cancel", Button).disabled is True
+
+            listing.highlighted = 1
+            await pilot.pause()
+            assert manager.query_one("#jobs-results", Button).disabled is False
+            assert await pilot.click("#jobs-results") is True
+            await pilot.pause()
+            result_text = str(manager.query_one("#jobs-detail", Static).content)
+            assert "profiled_resources" in result_text
+            assert "Artifacts (0)" in result_text
+
+            assert await pilot.click("#jobs-refresh") is True
+            await pilot.pause()
+            assert list_calls >= 3
+            assert "Job statuses refreshed" in str(
+                manager.query_one("#jobs-notice", Static).content
+            )
+            assert await pilot.click("#jobs-close") is True
+            app.exit(0)
+        finally:
+            app.exit(0)

@@ -56,8 +56,9 @@ class JobsScreen(ModalScreen[None]):
         Binding("c", "cancel_job", "Cancel", priority=True),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, *, job_id: str | None = None) -> None:
         super().__init__()
+        self._target_job_id = job_id
         self._jobs: tuple[GraphJob, ...] = ()
         self._notice = ""
         self._busy = False
@@ -210,7 +211,7 @@ class JobsScreen(ModalScreen[None]):
                 self._set_busy(False)
 
     async def _load_jobs(self) -> None:
-        selected = self._selected_job_id()
+        selected = self._selected_job_id() or self._target_job_id
         self._jobs = await self.app.controller.list_jobs()  # type: ignore[attr-defined]
         listing = self.query_one("#jobs-list", OptionList)
         listing.clear_options()

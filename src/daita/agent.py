@@ -966,11 +966,13 @@ class Agent:
         limit: int = 50,
         offset: int = 0,
         caller_principal_id: str | None = None,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRef, ...]:
         """List a page of stored artifacts, including after history is cleared.
 
         Local owners can browse the whole home. Hosted callers see only artifacts
-        produced under their authenticated principal. Pages use creation order.
+        produced under their authenticated principal. Pages use creation order;
+        newest_first reverses that order for bounded recent inventory views.
         """
         if (
             isinstance(limit, bool)
@@ -986,8 +988,13 @@ class Agent:
             raise ValueError(
                 f"artifact list offset must be between 0 and {MAX_ARTIFACTS_PER_AGENT}"
             )
+        if not isinstance(newest_first, bool):
+            raise ValueError("artifact newest_first must be a boolean")
         return await self._embedded.list_artifacts(
-            limit=limit, offset=offset, caller_principal_id=caller_principal_id
+            limit=limit,
+            offset=offset,
+            caller_principal_id=caller_principal_id,
+            newest_first=newest_first,
         )
 
     async def read_artifact(
