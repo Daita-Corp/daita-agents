@@ -74,6 +74,13 @@ async def test_typed_command_palette_navigates_and_inserts_without_submitting(
             await pilot.press("/")
             await pilot.pause()
             assert popup.display is True
+            await pilot.press("ctrl+3")
+            await pilot.pause()
+            assert popup.display is False
+            assert composer.text == "/"
+            await pilot.press("ctrl+1")
+            await pilot.pause()
+            assert popup.display is True
             assert popup.styles.border_left[0] == "solid"
             assert popup.styles.background.hex == "#111111"
             assert (

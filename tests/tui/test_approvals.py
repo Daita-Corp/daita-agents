@@ -81,9 +81,9 @@ def test_tool_projection_and_approval_document():
 
 
 @pytest.mark.parametrize(
-    "size,drawer", [((80, 24), False), ((80, 24), True), ((140, 32), True)]
+    "size,section", [((80, 24), "chat"), ((80, 24), "inbox"), ((140, 32), "work")]
 )
-async def test_approval_approve_deny_cancel_and_unreviewable(size, drawer):
+async def test_approval_approve_deny_cancel_and_unreviewable(size, section):
     request = ApprovalRequest(
         run_id="run-1",
         call_id="call-1",
@@ -111,12 +111,10 @@ async def test_approval_approve_deny_cancel_and_unreviewable(size, drawer):
 
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=size) as pilot:
-        await app.push_screen(ChatScreen())
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        if drawer:
-            await pilot.press("ctrl+r")
-            await pilot.pause()
+        chat = ChatScreen()
+        await app.push_screen(chat)
+        chat.action_section(section)
+        await pilot.pause()
         panel = chat.query_one(ApprovalPanel)
 
         approved = asyncio.create_task(app.handle_approval(request))
@@ -128,7 +126,8 @@ async def test_approval_approve_deny_cancel_and_unreviewable(size, drawer):
         approve_button = panel.query_one("#approval-inline-yes")
         assert panel.region.contains_region(approve_button.region)
         assert approve_button.region.bottom <= chat.query_one(Composer).region.y
-        await pilot.press("ctrl+b", "ctrl+r")
+        assert chat.section == "chat"
+        await pilot.press("ctrl+3", "ctrl+4", "f6", "f1")
         await pilot.pause()
         assert chat.focused is panel.query_one("#approval-inline-no")
         await pilot.press("y")

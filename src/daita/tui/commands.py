@@ -103,6 +103,7 @@ HELP_TEXT = (
     "Stored files: /artifacts\n"
     "MCP servers and tool access: /mcp\n"
     "Execution requires an open host; stop this TUI before starting daita host --agent <name>.\n"
+    "F6 focus tabs · Ctrl-1…5 switch Chat, Sources, Work, Inbox, Artifacts · F1 help\n"
     "Enter submit · Ctrl-J newline · Esc Esc clear input · Ctrl-D exit\n"
     "Wheel or Page Up/Page Down review · Ctrl-Home start · Ctrl-End latest\n"
     "Ctrl-O show/hide tool results · Ctrl-C copy selection or cancel the run\n"

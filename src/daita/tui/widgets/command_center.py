@@ -8,7 +8,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.message import Message
-from textual.widgets import Button, OptionList, Static
+from textual.widgets import Button, ContentSwitcher, OptionList, Static
 from textual.widgets.option_list import Option
 
 from daita import GraphState, RoutineState, ScheduledRoutineSummary
@@ -76,27 +76,63 @@ class ProjectionList(OptionList):
             self.post_message(CommandCenterNavigate(self.section, event.option.id))
 
 
-class CommandSidebar(Vertical):
-    """Compact catalog and work navigation; never changes source scope."""
+class CommandSections(ContentSwitcher):
+    """One read-only section at a time, with owner screens for deeper controls.
+
+    A future evidence view can add a page here using the same controller reads
+    and exact-item navigation, without changing execution or approval owners.
+    """
 
     def __init__(self) -> None:
-        super().__init__(id="command-sidebar")
+        super().__init__(initial="section-sources", id="command-sections")
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="sidebar-rail"):
-            toggle = Button("›", id="sidebar-expand")
-            toggle.tooltip = "Toggle sidebar (Ctrl+B)"
-            yield toggle
-            yield Static("S\n0\n\nJ\n0\n\nR\n0", id="sidebar-counts", markup=False)
-        with Vertical(id="sidebar-content"):
-            yield Button("Sources ›", id="open-sources", classes="pane-heading")
-            yield ProjectionList("sources", "No connected sources")
-            yield Button("Active jobs ›", id="open-jobs", classes="pane-heading")
+        with Vertical(id="section-sources", classes="command-section"):
+            yield Button(
+                "Manage sources ›", id="open-sources", classes="section-action"
+            )
+            yield Static(
+                "Connected sources available for questions. Sources are optional.",
+                classes="section-description",
+                markup=False,
+            )
+            yield ProjectionList(
+                "sources", "No connected sources. Open Manage sources to add one."
+            )
+        with Vertical(id="section-work", classes="command-section"):
+            yield Button(
+                "Active jobs · View all ›", id="open-jobs", classes="section-action"
+            )
             yield ProjectionList("jobs", "No active jobs")
             yield Button(
-                "Upcoming routines ›", id="open-routines", classes="pane-heading"
+                "Upcoming routines · Manage ›",
+                id="open-routines",
+                classes="section-action",
             )
             yield ProjectionList("routines", "No upcoming routines")
+            yield Static(
+                "Scheduled work progresses while this host is open.",
+                classes="section-description",
+                markup=False,
+            )
+        with Vertical(id="section-inbox", classes="command-section"):
+            yield Button("Review inbox ›", id="open-inbox", classes="section-action")
+            yield Static(
+                "Unread results from background work.",
+                classes="section-description",
+                markup=False,
+            )
+            yield ProjectionList("inbox", "You're all caught up. No unread results.")
+        with Vertical(id="section-artifacts", classes="command-section"):
+            yield Button(
+                "Manage artifacts ›", id="open-artifacts", classes="section-action"
+            )
+            yield Static(
+                "Recent stored files. Open a file to preview, save, or delete it.",
+                classes="section-description",
+                markup=False,
+            )
+            yield ProjectionList("artifacts", "No stored artifacts")
 
     def update_sources(self, sources: tuple[Any, ...]) -> None:
         self.query_one("#command-sources", ProjectionList).update_rows(
@@ -141,39 +177,6 @@ class CommandSidebar(Vertical):
                 if item.next_due_at is not None
             )
         )
-
-    def update_counts(self, *, sources: int, jobs: int, routines: int) -> None:
-        self.query_one("#sidebar-counts", Static).update(
-            f"S\n{sources}\n\nJ\n{jobs}\n\nR\n{routines}"
-        )
-        self.query_one("#sidebar-counts").tooltip = (
-            f"{sources} sources · {jobs} active jobs · {routines} saved routines"
-        )
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "sidebar-expand":
-            return
-        self.post_message(
-            CommandCenterNavigate((event.button.id or "").removeprefix("open-"))
-        )
-        event.stop()
-
-
-class ResultsDrawer(Vertical):
-    """Attention and artifact metadata; future live evidence can add a section here.
-
-    Projections come from controller reads. Item activation delegates to the
-    existing detail screens, which retain evidence rendering and owner controls.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(id="results-drawer")
-
-    def compose(self) -> ComposeResult:
-        yield Button("Inbox ›", id="open-inbox", classes="pane-heading")
-        yield ProjectionList("inbox", "No unread deliveries")
-        yield Button("Recent artifacts ›", id="open-artifacts", classes="pane-heading")
-        yield ProjectionList("artifacts", "No stored artifacts")
 
     def update_inbox(self, items: tuple[InboxView, ...]) -> None:
         # The existing inbox read returns only unacknowledged deliveries.

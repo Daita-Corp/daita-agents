@@ -62,7 +62,7 @@ from .screens.routines import RoutinesScreen
 from .screens.selection import SelectionScreen
 from .screens.source_edit import SourceEditScreen
 from .widgets.approval import ApprovalPanel
-from .widgets.command_center import ACTIVE_JOB_STATES, CommandSidebar, ResultsDrawer
+from .widgets.command_center import ACTIVE_JOB_STATES, CommandSections
 from .widgets.composer import (
     ComposerExitRequested,
     ComposerLimitReached,
@@ -381,20 +381,11 @@ class DaitaApp(App[int]):
         sources = tuple(
             source for source in await self.controller.list_sources() if source.active
         )
-        workspace = self.controller.workspace
-        workspace_status = (
-            f"Files: {workspace.root.name} ({workspace.sensitivity.value})"
-        )
-        if not sources:
-            source_status = "Sources: none connected (sources are optional)"
-        else:
-            source_status = f"Sources: {len(sources)} admitted"
-            if (await self.controller.catalog_summary()).is_empty:
-                setup_guidance.append(
-                    "catalog has 0 resources · open /sources and choose Edit"
-                )
-        status = "  ·  ".join((workspace_status, source_status, *setup_guidance))
-        chat.show_notice(status)
+        if sources and (await self.controller.catalog_summary()).is_empty:
+            setup_guidance.append(
+                "catalog has 0 resources · open /sources and choose Edit"
+            )
+        chat.show_notice("  ·  ".join(setup_guidance))
 
     async def _show_chat(self) -> None:
         self.invalidate_completion_cache()
@@ -432,7 +423,7 @@ class DaitaApp(App[int]):
                 routines = await self.controller.list_routines()
                 self._routine_count = len(routines)
                 if screen is not None:
-                    screen.query_one(CommandSidebar).update_routines(routines)
+                    screen.query_one(CommandSections).update_routines(routines)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -454,11 +445,11 @@ class DaitaApp(App[int]):
                     item.state in ACTIVE_JOB_STATES for item in jobs
                 )
                 if screen is not None:
-                    screen.query_one(CommandSidebar).update_jobs(jobs)
+                    screen.query_one(CommandSections).update_jobs(jobs)
             new_delivery_ids: set[str] = set()
             if inbox is not None:
                 if screen is not None:
-                    screen.query_one(ResultsDrawer).update_inbox(inbox)
+                    screen.query_one(CommandSections).update_inbox(inbox)
                 current_ids = {item.delivery_id for item in inbox}
                 self._inbox_item_count = len(current_ids)
                 if self._known_inbox_ids is None:
@@ -470,20 +461,15 @@ class DaitaApp(App[int]):
                 try:
                     sources = await self.controller.list_sources()
                     self._source_count = sum(item.active for item in sources)
-                    screen.query_one(CommandSidebar).update_sources(sources)
+                    screen.query_one(CommandSections).update_sources(sources)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     pass
-                screen.query_one(CommandSidebar).update_counts(
-                    sources=self._source_count,
-                    jobs=self._active_job_count,
-                    routines=self._routine_count,
-                )
-                drawer = screen.query_one(ResultsDrawer)
-                if drawer.display:
+                sections = screen.query_one(CommandSections)
+                if screen.section == "artifacts":
                     try:
-                        drawer.update_artifacts(
+                        sections.update_artifacts(
                             await self.controller.list_artifacts(
                                 limit=20, offset=0, newest_first=True
                             )

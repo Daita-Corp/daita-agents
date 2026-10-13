@@ -44,79 +44,63 @@ Screen {
     text-align: right;
 }
 
-#background-status {
-    width: 1fr;
-    height: 1;
-    padding: 0 1;
-    text-overflow: ellipsis;
+#main-tabs {
+    height: 3;
+    margin-bottom: 1;
+    background: $background;
 }
 
-#command-panes {
+#main-tabs Tab {
+    color: $text-muted;
+    background: $background;
+    padding: 0 2;
+}
+
+#main-tabs Tab.-active {
+    color: $primary;
+    text-style: bold;
+}
+
+#main-tabs Underline {
+    background: $background;
+    color: $border;
+}
+
+#main-view, #conversation-pane, #command-sections {
+    width: 1fr;
     height: 1fr;
     min-height: 1;
-}
-
-#conversation-pane {
-    width: 1fr;
-    height: 1fr;
 }
 
 #chat-bottom {
     height: auto;
 }
 
-#command-sidebar {
-    width: 24;
-    height: 1fr;
-    background: $panel;
-    border-right: solid $border;
+.command-section {
+    padding: 0 1;
 }
 
-#command-sidebar.-collapsed {
-    width: 4;
-}
-
-#sidebar-content, #sidebar-rail {
-    height: 1fr;
-}
-
-#sidebar-counts {
-    height: 1fr;
-    color: $text-muted;
-    text-align: center;
-}
-
-#sidebar-expand {
-    width: 3;
-    min-width: 3;
-    height: 3;
-    padding: 0;
-    color: $primary;
-    background: $panel;
-    border: none;
-}
-
-#results-drawer {
-    display: none;
-    width: 26;
-    height: 1fr;
-    background: $panel;
-    border-left: solid $border;
-}
-
-.pane-heading {
+.section-action {
     width: 1fr;
     min-width: 0;
-    height: 2;
+    height: 3;
     padding: 0 1;
     border: none;
-    color: $primary;
-    background: $panel;
+    color: $foreground;
+    text-style: bold;
+    background: $background;
     content-align: left middle;
+    text-align: left;
 }
 
-.pane-heading:hover, .pane-heading:focus, #sidebar-expand:focus {
+.section-action:hover, .section-action:focus {
     background: $boost;
+}
+
+.section-description {
+    height: auto;
+    padding: 0 1 1 1;
+    color: $text-muted;
 }
 
 ProjectionList {
@@ -125,7 +109,7 @@ ProjectionList {
     padding: 0 1;
     border: none;
     color: $foreground;
-    background: $panel;
+    background: $background;
     scrollbar-size-vertical: 1;
     text-wrap: nowrap;
     text-overflow: ellipsis;
@@ -140,6 +124,10 @@ ChatScreen.-narrow #context-window {
     display: none;
 }
 
+ChatScreen.-narrow #main-tabs Tab {
+    padding: 0 1;
+}
+
 #welcome-region {
     width: 1fr;
     height: 1fr;
@@ -148,13 +136,12 @@ ChatScreen.-narrow #context-window {
 }
 
 #welcome {
-    width: 80%;
-    max-width: 120;
+    width: 1fr;
     height: auto;
     padding: 1;
     content-align: center middle;
+    color: $text-muted;
     background: $background;
-    border: round #2A2A2A;
 }
 
 #activity-bar {
@@ -1145,7 +1132,7 @@ SourceSetupScreen #onboard-error.-error {
 
 #approval-inline {
     display: none;
-    height: 65%;
+    height: 3fr;
     min-height: 8;
     max-height: 18;
     margin-top: 1;

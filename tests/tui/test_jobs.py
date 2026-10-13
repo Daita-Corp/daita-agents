@@ -221,15 +221,15 @@ async def test_background_status_notifies_once_and_remains_outside_transcript(
         async with app.run_test(size=(110, 32)) as pilot:
             await app._show_chat()
             await pilot.pause()
-            status = app.screen.query_one("#background-status", Static)
-            assert "jobs 1" in str(status.content)
+            status = app.screen.query_one("#status-bar")
+            assert "1 active jobs" in str(status.tooltip)
             assert status.display is True
 
             current_inbox.append(_tui_inbox_item())
             await app.refresh_background_status(notify_new=True)
             await pilot.pause()
-            assert "jobs 1" in str(status.content)
-            assert "inbox 1" in str(status.content)
+            assert "1 active jobs" in str(status.tooltip)
+            assert "1 unread results" in str(status.tooltip)
             assert notifications == [
                 ("1 background report is ready. Open /inbox to review.", "Inbox")
             ]
@@ -274,7 +274,7 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
                 )
             )
             assert "reporting 1" in str(
-                chat.query_one("#background-status", Static).content
+                chat.query_one("#status-primary", Static).content
             )
 
             await app.on_observer_event(
@@ -343,7 +343,7 @@ async def test_machine_origin_observations_do_not_project_into_foreground_chat(
                 )
             )
             assert "reporting" not in str(
-                chat.query_one("#background-status", Static).content
+                chat.query_one("#status-primary", Static).content
             )
             app.exit(0)
     finally:

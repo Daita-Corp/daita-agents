@@ -102,7 +102,7 @@ def test_context_window_copy_is_compact_exact_and_warns_near_capacity():
     warning = context_window_text(25_000, 32_000)
     critical = context_window_text(30_000, 32_000)
     assert healthy.plain == "ctx 8.5K / 32K"
-    assert healthy.style == "#ACFD21"
+    assert healthy.style == "dim"
     assert warning.style == "#FBBF24"
     assert critical.style == "#DE3535"
     with pytest.raises(ValueError):

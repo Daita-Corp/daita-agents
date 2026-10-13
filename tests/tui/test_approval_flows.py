@@ -28,17 +28,19 @@ async def test_background_refresh_preserves_foreground_approval_state(tmp_path):
     app.controller.agent = agent
     try:
         async with app.run_test(size=(110, 36)):
-            await app.push_screen(ChatScreen())
-            await app._refresh_status(running=True, state="approval")
-            await app.refresh_background_status(notify_new=False)
-            assert "approval" in str(
-                app.screen.query_one("#status-primary", Static).content
-            )
-            await app._refresh_status(running=False)
-            assert "ready" in str(
-                app.screen.query_one("#status-primary", Static).content
-            )
-            app.exit(0)
+            try:
+                await app.push_screen(ChatScreen())
+                await app._refresh_status(running=True, state="approval")
+                await app.refresh_background_status(notify_new=False)
+                assert "approval" in str(
+                    app.screen.query_one("#status-primary", Static).content
+                )
+                await app._refresh_status(running=False)
+                assert "approval" not in str(
+                    app.screen.query_one("#status-primary", Static).content
+                )
+            finally:
+                app.exit(0)
     finally:
         await agent.close()
 

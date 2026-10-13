@@ -430,8 +430,8 @@ async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path:
             assert isinstance(app.screen, ChatScreen)
             notice = str(app.screen.query_one("#notice-bar", Static).content)
             assert "no model · use /model" in notice
-            assert "Files:" in notice
-            assert "Sources: none connected (sources are optional)" in notice
+            assert "Files:" not in notice
+            assert "Sources:" not in notice
             assert "no source · use /source add" not in notice
             assert app.screen.query_one(Composer).disabled is False
             app.exit(0)
@@ -475,11 +475,10 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
     )
     app.controller.agent = opened
     try:
-        # Leave room for the full branded welcome beside the command sidebar.
         async with app.run_test(size=(140, 28)) as pilot:
             await app._show_chat()
             await pilot.pause()
-            chat_welcome = app.screen.query_one("#welcome", WelcomeView)
+            chat_welcome = app.screen.query_one("#welcome", Static)
             welcome_region = app.screen.query_one("#welcome-region")
             transcript = app.screen.query_one(TranscriptView)
             composer = app.screen.query_one(Composer)
@@ -488,8 +487,8 @@ async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: P
             assert welcome_region.display is True
             assert transcript.display is False
             assert footer.region.y == composer.region.y + composer.region.height + 1
-            assert "welcome-agent" in str(chat_welcome.content)
-            assert "⣾⣿⣿" in str(chat_welcome.content)
+            assert "What would you like to know?" in str(chat_welcome.content)
+            assert "Ask about your data or local files." in str(chat_welcome.content)
             assert "Type / for commands" in str(chat_welcome.content)
 
             chat = app.chat()

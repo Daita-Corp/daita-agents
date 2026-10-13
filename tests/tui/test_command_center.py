@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from textual.widgets import OptionList, Static
+from textual.widgets import OptionList, Tab, Tabs
 
 from daita import Agent, GraphState, RoutineState, ScheduledRoutineSummary
 from daita.llm.models import ModelSensitivity
@@ -19,9 +19,8 @@ from daita.tui.screens.inbox import InboxScreen
 from daita.tui.screens.jobs import JobsScreen
 from daita.tui.screens.routines import RoutinesScreen
 from daita.tui.widgets.command_center import (
-    CommandSidebar,
+    CommandSections,
     ProjectionList,
-    ResultsDrawer,
 )
 from daita.tui.widgets.composer import Composer
 from daita.tui.widgets.transcript import TranscriptView
@@ -37,7 +36,7 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.parametrize("size", [(80, 24), (100, 24), (140, 40)])
-async def test_panes_resize_without_covering_chat_or_composer(tmp_path, size):
+async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size):
     agent = await Agent.create(
         "geometry", root=tmp_path, workspace=workspace_for(tmp_path)
     )
@@ -53,44 +52,53 @@ async def test_panes_resize_without_covering_chat_or_composer(tmp_path, size):
             chat.set_blocks(
                 (TranscriptBlock("assistant", "answer", "Retained answer"),)
             )
-            chat.composer().load_text("unsent question")
-            await pilot.press("ctrl+r")
-            await pilot.pause()
-            drawer = chat.query_one(ResultsDrawer)
-            sidebar = chat.query_one(CommandSidebar)
-            transcript = chat.query_one(TranscriptView)
             composer = chat.composer()
-            status = chat.query_one("#status-bar")
-            assert drawer.display
-            assert transcript.region.width >= 48
-            assert transcript.region.right <= drawer.region.x
-            assert drawer.region.bottom <= composer.region.y
-            assert sidebar.region.bottom <= composer.region.y
-            assert status.region.bottom <= transcript.region.y
-            assert composer.region.right <= size[0]
-            assert composer.region.bottom < size[1]
-            assert chat.focused is composer
-            hints = list(chat.query("FooterKey"))[:2]
-            assert [getattr(hint, "key") for hint in hints] == ["ctrl+b", "ctrl+r"]
+            composer.load_text("unsent question")
+            await pilot.pause()
+            transcript = chat.query_one(TranscriptView)
+            sections = chat.query_one(CommandSections)
+            assert transcript.region.width == size[0] - 2
+            assert transcript.region.bottom <= composer.region.y
+            assert not sections.display
+            hints = list(chat.query("FooterKey"))
+            assert [getattr(hint, "key") for hint in hints] == ["enter", "f6", "f1"]
             assert all(hint.region.right <= size[0] for hint in hints)
 
-            await pilot.resize_terminal(70, 20)
+            for number, section in enumerate(
+                ("sources", "work", "inbox", "artifacts"), 2
+            ):
+                await pilot.press(f"ctrl+{number}")
+                await pilot.pause()
+                assert chat.section == section
+                assert sections.current == f"section-{section}"
+                assert sections.display and not composer.display
+                assert not chat.query_one("#conversation-pane").display
+                assert sections.region.width == size[0] - 2
+                assert chat.query_one(Tabs).region.bottom <= sections.region.y
+                assert sections.region.bottom <= size[1] - 1
+                assert composer.text == "unsent question"
+
+            chat.append_block(TranscriptBlock("assistant", "new", "A live update"))
+            assert chat.section == "artifacts"
+            assert not chat.query_one("#conversation-pane").display
+            await pilot.resize_terminal(40, 16)
+            await pilot.press("ctrl+1")
             await pilot.pause()
-            assert not drawer.display
-            assert sidebar.region.width == 4
-            assert composer.text == "unsent question"
             assert not composer.disabled
-
-            await pilot.resize_terminal(*size)
+            assert composer.text == "unsent question"
+            assert composer.region.right <= 40
+            await pilot.press("f6", "right", "right", "right", "right")
             await pilot.pause()
-            assert drawer.display
-            await pilot.press("ctrl+r", "ctrl+b")
+            assert chat.section == "artifacts"
+            await pilot.press("escape")
             await pilot.pause()
-            assert not drawer.display
-            assert sidebar.region.width == 4
-            assert chat.focused is composer
+            assert chat.section == "chat" and chat.focused is composer
             assert not transcript.is_empty
-
+            assert composer.text == "unsent question"
+            await pilot.press("f1")
+            await pilot.pause()
+            assert composer.text == "unsent question"
+            assert app._run_task is None
         finally:
             app.exit(0)
 
@@ -142,6 +150,8 @@ async def test_projection_refresh_preserves_focus_selection_and_untrusted_labels
             await pilot.pause()
             chat = app.chat()
             assert chat is not None
+            await pilot.press("ctrl+3")
+            await pilot.pause()
             listing = chat.query_one("#command-jobs", ProjectionList)
             assert listing.option_count == 2
             prompt = listing.get_option_at_index(0).prompt
@@ -160,7 +170,7 @@ async def test_projection_refresh_preserves_focus_selection_and_untrusted_labels
             assert [
                 routines.get_option_at_index(i).id for i in range(routines.option_count)
             ] == ["early", "late"]
-            assert "jobs 3" in str(chat.query_one("#background-status", Static).content)
+            assert str(chat.query_one("#tab-work", Tab).label) == "Work 3"
             await pilot.press("escape")
             assert chat.focused is chat.composer()
 
@@ -224,7 +234,7 @@ async def test_projection_opens_exact_owner_item_and_restores_composer(
             chat = app.chat()
             assert chat is not None
             chat.composer().load_text("keep this draft")
-            await pilot.press("ctrl+r")
+            chat.action_section("work" if section in {"jobs", "routines"} else section)
             await app.refresh_background_status(notify_new=False)
             await pilot.pause()
             listing = chat.query_one(f"#command-{section}", ProjectionList)
