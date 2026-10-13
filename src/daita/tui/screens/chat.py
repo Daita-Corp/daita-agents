@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import ActiveBinding, Binding
@@ -61,8 +62,7 @@ class ChatScreen(Screen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="chat"):
-            yield StatusBar()
-            yield Tabs(
+            navigation = Tabs(
                 *(
                     Tab(label, id=f"tab-{section}")
                     for section, label in (
@@ -76,6 +76,7 @@ class ChatScreen(Screen[None]):
                 active="tab-chat",
                 id="main-tabs",
             )
+            yield StatusBar(navigation)
             with Vertical(id="main-view"):
                 with Vertical(id="conversation-pane"):
                     with Vertical(id="welcome-region"):
@@ -130,6 +131,12 @@ class ChatScreen(Screen[None]):
 
     def _apply_layout(self) -> None:
         self.set_class(self.app.size.width < 80, "-narrow")
+        # Size the strip to its labels so identity can use the remaining space.
+        # Below 80 columns, Tabs keeps its normal horizontal keyboard scrolling.
+        navigation = self.query_one(Tabs)
+        navigation.styles.width = sum(
+            cell_len(tab.label_text) + 2 for tab in navigation.query(Tab)
+        )
 
     def on_tabs_tab_activated(self, event: Tabs.TabActivated) -> None:
         event.stop()
@@ -340,6 +347,7 @@ class ChatScreen(Screen[None]):
         self.query_one("#tab-work").tooltip = (
             f"{active_jobs} active jobs · {saved_routines}{'+' if saved_routines == 50 else ''} saved routines"
         )
+        self._apply_layout()
 
     def show_notice(self, message: str) -> None:
         self.query_one(NoticeBar).show(message)

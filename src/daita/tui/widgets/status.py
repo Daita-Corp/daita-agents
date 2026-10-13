@@ -6,8 +6,8 @@ import time
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Static
+from textual.containers import Horizontal
+from textual.widgets import Static, Tabs
 
 from ..sanitization import sanitize_terminal_text
 
@@ -37,28 +37,29 @@ def context_window_text(used: int | None, total: int | None) -> Text:
     if used is None or used <= 0:
         return Text(f"ctx — / {total_label}", style="dim")
     percentage = used / total * 100
-    style = "#DE3535" if percentage >= 90 else "#FBBF24" if percentage >= 75 else "dim"
+    style = "red" if percentage >= 90 else "yellow" if percentage >= 75 else "dim"
     return Text(
         f"ctx {format_token_count(used)} / {total_label}",
         style=style,
     )
 
 
-class StatusBar(Vertical):
-    def __init__(self) -> None:
+class StatusBar(Horizontal):
+    """One header row with identity, caller-owned navigation, and context usage."""
+
+    def __init__(self, navigation: Tabs | None = None) -> None:
         super().__init__(id="status-bar")
+        self._navigation = navigation
 
     def compose(self) -> ComposeResult:
-        with Horizontal(id="status-identity"):
-            yield Static(
-                Text("DAITA", style="bold #ACFD21"),
-                id="status-primary",
-            )
-            context = Static(context_window_text(None, None), id="context-window")
-            context.tooltip = (
-                "Exact input tokens in the latest model request / model context window"
-            )
-            yield context
+        yield Static(Text("DAITA", style="bold"), id="status-primary")
+        if self._navigation is not None:
+            yield self._navigation
+        context = Static(context_window_text(None, None), id="context-window")
+        context.tooltip = (
+            "Exact input tokens in the latest model request / model context window"
+        )
+        yield context
 
     def update_status(
         self,
@@ -79,12 +80,13 @@ class StatusBar(Vertical):
         primary = self.query_one("#status-primary", Static)
         context = self.query_one("#context-window", Static)
         if too_small:
-            message = Text("DAITA", style="bold #ACFD21")
+            message = Text("DAITA", style="bold")
             message.append("  Terminal too small; 32x8 required", style="bold")
             primary.update(message)
+            primary.tooltip = message.copy()
             context.display = False
             return
-        context.display = self.app.size.width >= 80
+        context.display = self.app.size.width >= 100
         safe_source = sanitize_terminal_text(
             source, maximum=48, preserve_lines=False, fallback="none"
         )
@@ -102,7 +104,7 @@ class StatusBar(Vertical):
         safe_state = sanitize_terminal_text(
             state, maximum=32, preserve_lines=False, fallback="ready"
         )
-        state_style = "bold #FBBF24" if "approval" in safe_state else "dim"
+        state_style = "bold yellow" if "approval" in safe_state else "dim"
         message = Text("DAITA", style="bold")
         message.append(f"  {safe_agent}")
         message.append(f" · {safe_model}", style="dim")
@@ -117,6 +119,7 @@ class StatusBar(Vertical):
         if active_reports:
             message.append(f"  reporting {active_reports}", style="dim")
         primary.update(message)
+        primary.tooltip = message.copy()
         context.update(context_window_text(context_used, context_total))
 
 
@@ -172,7 +175,7 @@ class ActivityBar(Static):
         elapsed = 0.0
         if self._started_at is not None:
             elapsed = max(0.0, time.monotonic() - self._started_at)
-        content = Text(self._FRAMES[self._frame], style="bold #ACFD21")
+        content = Text(self._FRAMES[self._frame], style="bold")
         content.append(f"  {self._stage}", style="italic dim")
         content.append(f"  {elapsed:.1f}s", style="dim")
         self.update(content)

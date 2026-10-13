@@ -1,8 +1,61 @@
-/* Style the Daita terminal application's layout, widgets, and visual states. */
+/* Layout belongs to Daita; colors and window opacity belong to the terminal. */
+
+/* Cover native widget surfaces without adding a second background palette. */
+.modal-panel,
+.control-panel,
+CompletionPopup,
+Button,
+Button.-primary,
+Button.-success,
+Button.-warning,
+Button.-error,
+Input,
+Select,
+SelectCurrent,
+SelectOverlay,
+OptionList,
+Tree,
+DataTable,
+Footer,
+FooterKey,
+Collapsible,
+CollapsibleTitle,
+Contents,
+MarkdownFence {
+    color: $foreground;
+    background: $background;
+}
+
+Button:hover,
+Button:focus {
+    text-style: bold reverse;
+}
+
+#main-tabs:focus Tab.-active {
+    text-style: bold underline reverse;
+}
+
+TextArea > .text-area--selection {
+    color: $foreground;
+    background: $background;
+    text-style: reverse;
+}
+
+Screen > .screen--selection {
+    color: $foreground;
+    background: $background;
+    text-style: reverse;
+}
+
+MarkdownBlock > .code_inline {
+    color: $foreground;
+    background: $background;
+    text-style: bold;
+}
 
 Screen {
-    background: $background;
     color: $foreground;
+    background: $background;
 }
 
 #boot {
@@ -11,28 +64,24 @@ Screen {
     margin: 1 2;
     padding: 1 2;
     content-align: center middle;
-    background: $background;
-    border: round #2A2A2A;
+    border: round $border;
 }
 
 #chat {
     padding: 0 1;
-    background: $background;
 }
 
 #status-bar {
-    height: auto;
-    background: $panel;
-}
-
-#status-identity {
     height: 1;
+    margin: 0 0 1 0;
 }
 
 #status-primary {
     width: 1fr;
+    min-width: 12;
     height: 1;
     padding-left: 1;
+    text-wrap: nowrap;
     text-overflow: ellipsis;
 }
 
@@ -45,28 +94,29 @@ Screen {
 }
 
 #main-tabs {
-    height: 3;
-    margin-bottom: 1;
-    background: $background;
+    width: auto;
+    max-width: 65%;
+    height: 1;
+    margin-left: 1;
 }
 
 #main-tabs Tab {
     color: $text-muted;
-    background: $background;
-    padding: 0 2;
+    padding: 0 1;
 }
 
 #main-tabs Tab.-active {
     color: $primary;
-    text-style: bold;
+    text-style: bold underline;
 }
 
 #main-tabs Underline {
-    background: $background;
-    color: $border;
+    display: none;
 }
 
-#main-view, #conversation-pane, #command-sections {
+#main-view,
+#conversation-pane,
+#command-sections {
     width: 1fr;
     height: 1fr;
     min-height: 1;
@@ -88,13 +138,13 @@ Screen {
     border: none;
     color: $foreground;
     text-style: bold;
-    background: $background;
     content-align: left middle;
     text-align: left;
 }
 
-.section-action:hover, .section-action:focus {
-    background: $boost;
+.section-action:hover,
+.section-action:focus {
+    text-style: bold reverse;
 }
 
 .section-description {
@@ -109,7 +159,6 @@ ProjectionList {
     padding: 0 1;
     border: none;
     color: $foreground;
-    background: $background;
     scrollbar-size-vertical: 1;
     text-wrap: nowrap;
     text-overflow: ellipsis;
@@ -117,7 +166,7 @@ ProjectionList {
 
 ProjectionList > .option-list--option-highlighted {
     color: $foreground;
-    background: $boost;
+    text-style: bold reverse;
 }
 
 ChatScreen.-narrow #context-window {
@@ -132,7 +181,6 @@ ChatScreen.-narrow #main-tabs Tab {
     width: 1fr;
     height: 1fr;
     align: center middle;
-    background: $background;
 }
 
 #welcome {
@@ -141,15 +189,13 @@ ChatScreen.-narrow #main-tabs Tab {
     padding: 1;
     content-align: center middle;
     color: $text-muted;
-    background: $background;
 }
 
 #activity-bar {
     height: 1;
     padding: 0 1;
     color: $text-muted;
-    background: $background;
-    border-left: solid $primary 55%;
+    border-left: solid $primary;
 }
 
 #notice-bar {
@@ -157,7 +203,6 @@ ChatScreen.-narrow #main-tabs Tab {
     max-height: 8;
     padding: 0 1;
     color: $warning;
-    background: $panel;
     border-left: solid $warning;
 }
 
@@ -168,24 +213,22 @@ ChatScreen.-narrow #main-tabs Tab {
     margin-bottom: 1;
     padding: 0 1;
     color: $foreground;
-    background: $boost;
     border: round $border;
 }
 
 #composer:focus {
-    border: round $primary;
+    border: heavy $border;
 }
 
 #transcript {
     height: 1fr;
     padding: 0 1;
-    background: $background;
 }
 
 .transcript-user {
     color: $text-muted;
     padding: 1 0 0 1;
-    border-left: solid $primary 45%;
+    border-left: solid $primary;
 }
 
 .transcript-assistant {
@@ -197,7 +240,7 @@ ChatScreen.-narrow #main-tabs Tab {
 .transcript-notice {
     color: $warning;
     padding: 1 0 0 1;
-    border-left: solid $warning 60%;
+    border-left: solid $warning;
 }
 
 ToolCard,
@@ -206,32 +249,28 @@ ToolCard Collapsible Contents,
 ToolCard Collapsible Contents Static,
 ToolCard DataTable {
     color: $foreground;
-    background: $surface;
 }
 
 ToolCard CollapsibleTitle {
     width: 1fr;
     color: $text-muted;
-    background: $surface;
     text-style: none;
 }
 
 ToolCard CollapsibleTitle:hover {
     color: $foreground;
-    background: $boost;
+    text-style: bold reverse;
 }
 
 ToolCard CollapsibleTitle:focus {
-    color: $background;
-    background: $primary;
-    text-style: bold;
+    color: $foreground;
+    text-style: bold reverse;
 }
 
 #completions {
     height: auto;
     max-height: 12;
-    background: $panel;
-    border: solid #343434;
+    border: solid $border;
     display: none;
 }
 
@@ -239,8 +278,7 @@ ToolCard CollapsibleTitle:focus {
     height: 2;
     padding: 0 1;
     color: $text-muted;
-    background: $panel;
-    border-bottom: solid #2A2A2A;
+    border-bottom: solid $border;
     text-style: bold;
 }
 
@@ -248,19 +286,17 @@ ToolCard CollapsibleTitle:focus {
     height: auto;
     max-height: 9;
     padding: 0 1;
-    background: $panel;
     border: none;
 }
 
 #completion-list > .option-list--option-highlighted {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
+    text-style: bold reverse;
 }
 
 ModalScreen {
     align: center middle;
-    background: $background 88%;
+    background: $background;
 }
 
 AgentCreateScreen,
@@ -269,7 +305,6 @@ SourceSetupScreen,
 SourceEditScreen,
 PermissionsScreen {
     align: center middle;
-    background: $background;
 }
 
 .modal-panel,
@@ -287,8 +322,8 @@ PermissionsScreen {
     height: auto;
     max-height: 90%;
     padding: 1 2;
-    background: $panel;
-    border: solid #343434;
+    background: $background;
+    border: solid $border;
 }
 
 #confirm {
@@ -301,8 +336,7 @@ PermissionsScreen {
     max-width: 100;
     height: 88%;
     padding: 1 2;
-    background: $panel;
-    border: solid #343434;
+    border: solid $border;
 }
 
 .control-panel.compact-panel {
@@ -321,86 +355,49 @@ ModalScreen Input,
     height: 2;
     padding: 0 1;
     color: $foreground;
-    background: $panel;
     border: none;
-    border-bottom: solid #343434;
+    border-bottom: solid $border;
 }
 
 ModalScreen Input:focus,
 .control-panel Input:focus {
-    background: $panel;
-    background-tint: $foreground 3%;
     border: none;
-    border-bottom: solid #5A5A5A;
+    border-bottom: heavy $border;
 }
 
 ModalScreen Button,
-ModalScreen Button.-primary,
-ModalScreen Button.-success,
-ModalScreen Button.-warning,
-ModalScreen Button.-error,
-.control-panel Button,
-.control-panel Button.-primary,
-.control-panel Button.-success,
-.control-panel Button.-warning,
-.control-panel Button.-error {
+.control-panel Button {
     min-width: 10;
     color: $text-muted;
-    background: #181818;
-    border: solid #343434;
+    border: solid $border;
     text-style: none;
 }
 
 ModalScreen Button:hover,
 ModalScreen Button:focus,
-ModalScreen Button.-primary:hover,
-ModalScreen Button.-primary:focus,
-ModalScreen Button.-success:hover,
-ModalScreen Button.-success:focus,
-ModalScreen Button.-warning:hover,
-ModalScreen Button.-warning:focus,
-ModalScreen Button.-error:hover,
-ModalScreen Button.-error:focus,
 .control-panel Button:hover,
-.control-panel Button:focus,
-.control-panel Button.-primary:hover,
-.control-panel Button.-primary:focus,
-.control-panel Button.-success:hover,
-.control-panel Button.-success:focus,
-.control-panel Button.-warning:hover,
-.control-panel Button.-warning:focus,
-.control-panel Button.-error:hover,
-.control-panel Button.-error:focus {
+.control-panel Button:focus {
     color: $foreground;
-    background: #303030;
-    border: solid #505050;
-    text-style: none;
+    border: solid $border;
+    text-style: bold reverse;
 }
 
 ModalScreen Button.-active,
-ModalScreen Button.-primary.-active,
-ModalScreen Button.-success.-active,
-ModalScreen Button.-warning.-active,
-ModalScreen Button.-error.-active,
-.control-panel Button.-active,
-.control-panel Button.-primary.-active,
-.control-panel Button.-success.-active,
-.control-panel Button.-warning.-active,
-.control-panel Button.-error.-active {
+.control-panel Button.-active {
     color: $foreground;
-    background: #3A3A3A;
-    border: solid #5A5A5A;
+    border: solid $border;
+    text-style: bold reverse;
 }
 
 ModalScreen Button:disabled,
 .control-panel Button:disabled {
-    color: #666666;
-    background: $panel;
-    border: solid #292929;
+    color: $text-muted;
+    border: solid $border;
+    text-style: dim;
 }
 
 #confirm-yes {
-    color: #D87979;
+    color: $error;
 }
 
 ModalScreen Footer,
@@ -408,16 +405,6 @@ ModalScreen Footer,
     height: 1;
     margin-top: 1;
     color: $text-muted;
-    background: $panel;
-}
-
-ModalScreen FooterKey,
-ModalScreen FooterKey > .footer-key--key,
-ModalScreen FooterKey > .footer-key--description,
-.control-panel FooterKey,
-.control-panel FooterKey > .footer-key--key,
-.control-panel FooterKey > .footer-key--description {
-    background: $panel;
 }
 
 ModalScreen FooterKey > .footer-key--key,
@@ -433,35 +420,29 @@ ModalScreen FooterKey > .footer-key--description,
 .control-panel Select {
     height: 2;
     color: $foreground;
-    background: $panel;
 }
 
 .control-panel Select > SelectCurrent {
     height: 2;
     padding: 0 1;
-    background: $panel;
     border: none;
-    border-bottom: solid #343434;
+    border-bottom: solid $border;
 }
 
 .control-panel Select:focus > SelectCurrent {
-    background: $panel;
-    background-tint: $foreground 3%;
     border: none;
-    border-bottom: solid #5A5A5A;
+    border-bottom: heavy $border;
 }
 
 .control-panel Select > SelectOverlay {
     padding: 0;
     color: $foreground;
-    background: $panel;
-    border: solid #343434;
+    border: solid $border;
 }
 
 .control-panel Select > SelectOverlay > .option-list--option-highlighted {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
+    text-style: bold reverse;
 }
 
 ModelSetupScreen #model-help {
@@ -516,14 +497,12 @@ ModelSetupScreen #model-help {
     height: 1fr;
     min-height: 5;
     border: none;
-    background: $panel;
     padding: 0;
 }
 
 #mcp-tools > .option-list--option-highlighted {
-    background: #343434;
     color: $foreground;
-    text-style: bold;
+    text-style: bold reverse;
 }
 
 #mcp-inspection-body,
@@ -558,9 +537,8 @@ ModelSetupScreen #model-help {
 #mcp-list {
     height: 1fr;
     padding: 1 0;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #mcp-endpoint {
@@ -598,18 +576,12 @@ ModelSetupScreen #model-help {
 #picker-options {
     height: 1fr;
     padding: 0;
-    background: $panel;
     border: none;
 }
 
 #picker-options > .option-list--option-highlighted {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
-}
-
-#picker-options > .option-list--option-hover {
-    background: #242424;
+    text-style: bold reverse;
 }
 
 #picker-actions {
@@ -623,7 +595,7 @@ ModelSetupScreen #model-help {
 }
 
 #picker-tertiary {
-    color: #D87979;
+    color: $error;
 }
 
 #catalog-summary {
@@ -636,12 +608,12 @@ ModelSetupScreen #model-help {
     height: auto;
     padding: 0 1 1 1;
     color: $foreground;
-    border-left: solid #505050;
+    border-left: solid $border;
 }
 
 #catalog-notice.-warning {
     color: $warning;
-    border-left: solid $warning 60%;
+    border-left: solid $warning;
 }
 
 #catalog-browser {
@@ -662,63 +634,54 @@ ModelSetupScreen #model-help {
 #catalog-tree {
     height: 1fr;
     padding: 0 1;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #catalog-tree:focus {
-    background: $panel;
-    background-tint: $foreground 2%;
     border: none;
-    border-top: solid #343434;
+    border-top: solid $border;
 }
 
 #catalog-tree > .tree--cursor,
 #catalog-tree:focus > .tree--cursor {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
+    text-style: bold reverse;
 }
 
 #catalog-tree > .tree--guides-selected,
 #catalog-tree:focus > .tree--guides-selected {
-    color: #6A6A6A;
+    color: $text-muted;
 }
 
 #catalog-graph-view {
     display: none;
     height: 1fr;
-    background: $panel;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #catalog-graph-tree {
     width: 2fr;
     height: 1fr;
     padding: 0 1;
-    background: $panel;
     border: none;
-    border-right: solid #2A2A2A;
+    border-right: solid $border;
 }
 
 #catalog-graph-tree:focus {
-    background: $panel;
-    background-tint: $foreground 2%;
     border: none;
-    border-right: solid #343434;
+    border-right: solid $border;
 }
 
 #catalog-graph-tree > .tree--cursor,
 #catalog-graph-tree:focus > .tree--cursor {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
+    text-style: bold reverse;
 }
 
 #catalog-graph-tree > .tree--guides-selected,
 #catalog-graph-tree:focus > .tree--guides-selected {
-    color: #6A6A6A;
+    color: $text-muted;
 }
 
 #catalog-graph-detail {
@@ -727,7 +690,6 @@ ModelSetupScreen #model-help {
     height: 1fr;
     padding: 1 2;
     color: $text-muted;
-    background: $panel;
     overflow-y: auto;
 }
 
@@ -739,7 +701,7 @@ ModelSetupScreen #model-help {
     width: 1fr;
     height: 2fr;
     border: none;
-    border-bottom: solid #2A2A2A;
+    border-bottom: solid $border;
 }
 
 #catalog-graph-view.-compact #catalog-graph-detail {
@@ -788,12 +750,18 @@ ModelSetupScreen #model-help {
     height: 90%;
 }
 
-#artifacts-summary, #artifacts-list-heading, #artifacts-overview,
-#artifacts-notice, #artifacts-error, #artifacts-help {
+#artifacts-summary,
+#artifacts-list-heading,
+#artifacts-overview,
+#artifacts-notice,
+#artifacts-error,
+#artifacts-help {
     height: auto;
 }
 
-#artifacts-summary, #artifacts-list-heading, #artifacts-help {
+#artifacts-summary,
+#artifacts-list-heading,
+#artifacts-help {
     color: $text-muted;
 }
 
@@ -801,7 +769,6 @@ ModelSetupScreen #model-help {
     height: 7;
     min-height: 3;
     padding: 0;
-    background: $panel;
     border: none;
     scrollbar-gutter: stable;
 }
@@ -812,15 +779,14 @@ ModelSetupScreen #model-help {
 
 #artifacts-list > .option-list--option-highlighted {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
+    text-style: bold reverse;
 }
 
 #artifacts-detail-scroll {
     height: 1fr;
     min-height: 3;
     padding: 1 0;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #artifacts-detail {
@@ -838,7 +804,6 @@ ModelSetupScreen #model-help {
     height: auto;
     padding: 0;
     margin-top: 1;
-    background: $panel;
     border: none;
 }
 
@@ -856,50 +821,53 @@ ModelSetupScreen #model-help {
     padding-top: 1;
 }
 
-#artifacts-actions, #artifacts-navigation {
+#artifacts-actions,
+#artifacts-navigation {
     height: auto;
 }
 
-#artifacts-actions Button, #artifacts-navigation Button {
+#artifacts-actions Button,
+#artifacts-navigation Button {
     width: auto;
     min-width: 8;
     margin-right: 1;
     color: $foreground;
-    background: #262626;
-    border: solid #5A5A5A;
+    border: solid $border;
 }
 
-#artifacts-actions Button:hover, #artifacts-actions Button:focus,
-#artifacts-navigation Button:hover, #artifacts-navigation Button:focus {
+#artifacts-actions Button:hover,
+#artifacts-actions Button:focus,
+#artifacts-navigation Button:hover,
+#artifacts-navigation Button:focus {
     color: $foreground;
-    background: #3A3A3A;
     border: solid $primary;
+    text-style: bold reverse;
 }
 
 #artifacts-actions #artifacts-delete {
-    color: $foreground;
-    background: #2F1515;
-    border: solid #A54B4B;
+    color: $error;
+    border: solid $error;
     text-style: bold;
 }
 
-#artifacts-actions #artifacts-delete:hover, #artifacts-actions #artifacts-delete:focus {
-    color: #FFFFFF;
-    background: #6B2525;
-    border: solid #FF7B7B;
+#artifacts-actions #artifacts-delete:hover,
+#artifacts-actions #artifacts-delete:focus {
+    color: $error;
+    border: solid $error;
+    text-style: bold reverse;
 }
 
-#artifacts-actions Button:disabled, #artifacts-navigation Button:disabled {
-    color: #666666;
-    background: $panel;
-    border: solid #292929;
+#artifacts-actions Button:disabled,
+#artifacts-navigation Button:disabled {
+    color: $text-muted;
+    border: solid $border;
+    text-style: dim;
 }
 
 #artifacts-actions #artifacts-delete:disabled {
-    color: #666666;
-    background: $panel;
-    border: solid #292929;
-    text-style: none;
+    color: $text-muted;
+    border: solid $border;
+    text-style: dim;
 }
 
 #artifacts-error {
@@ -938,28 +906,21 @@ ArtifactsScreen.-compact #artifacts-help {
     height: 9;
     min-height: 4;
     padding: 0;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #jobs-list > .option-list--option-highlighted {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
-}
-
-#jobs-list > .option-list--option-hover {
-    background: #242424;
+    text-style: bold reverse;
 }
 
 #jobs-detail-scroll {
     height: 1fr;
     min-height: 5;
     padding: 1 0;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #jobs-detail {
@@ -1045,28 +1006,21 @@ ArtifactsScreen.-compact #artifacts-help {
     height: 9;
     min-height: 4;
     padding: 0;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #inbox-list > .option-list--option-highlighted {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
-}
-
-#inbox-list > .option-list--option-hover {
-    background: #242424;
+    text-style: bold reverse;
 }
 
 #inbox-detail-scroll {
     height: 1fr;
     min-height: 5;
     padding: 1 0;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #inbox-detail {
@@ -1114,9 +1068,8 @@ ArtifactsScreen.-compact #artifacts-help {
 #perm-preview {
     height: 1fr;
     padding: 1 0;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 SourceSetupScreen #onboard-error {
@@ -1138,8 +1091,7 @@ SourceSetupScreen #onboard-error.-error {
     margin-top: 1;
     padding: 0 1 1 1;
     color: $foreground;
-    background: $panel;
-    border-left: solid $warning 70%;
+    border-left: solid $warning;
 }
 
 #approval-inline-title {
@@ -1154,7 +1106,6 @@ SourceSetupScreen #onboard-error.-error {
     max-height: 12;
     padding: 0 1;
     color: $foreground;
-    background: $panel;
 }
 
 #approval-inline-unreviewable {
@@ -1171,7 +1122,6 @@ SourceSetupScreen #onboard-error.-error {
     width: auto;
     min-width: 14;
     margin-right: 1;
-    background: $boost;
     border: round $border;
 }
 
@@ -1194,14 +1144,8 @@ SourceSetupScreen #onboard-error.-error {
     margin-right: 1;
 }
 
-Input,
-Select {
-    background: $boost;
-}
-
 .too-small {
     color: $foreground;
-    background: $error;
 }
 
 #routines-summary {
@@ -1214,28 +1158,21 @@ Select {
     height: 9;
     min-height: 4;
     padding: 0;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #routines-list > .option-list--option-highlighted {
     color: $foreground;
-    background: #343434;
-    text-style: bold;
-}
-
-#routines-list > .option-list--option-hover {
-    background: #242424;
+    text-style: bold reverse;
 }
 
 #routines-detail-scroll {
     height: 1fr;
     min-height: 5;
     padding: 1 0;
-    background: $panel;
     border: none;
-    border-top: solid #2A2A2A;
+    border-top: solid $border;
 }
 
 #routines-detail {

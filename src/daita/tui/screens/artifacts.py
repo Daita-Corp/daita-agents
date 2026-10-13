@@ -532,7 +532,9 @@ def render_artifact_preview(payload: ArtifactPayload) -> RenderableType:
         fallback="(empty artifact)",
     )
     if payload.ref.media_type == "text/markdown":
-        rendered: RenderableType = Markdown(preview, hyperlinks=False)
+        rendered: RenderableType = Markdown(
+            preview, hyperlinks=False, code_theme="ansi_dark"
+        )
     else:
         rendered = Text(preview)
     return (

@@ -62,8 +62,9 @@ approval. `/jobs` shows durable work, `/routines` manages saved assignments, and
 files. `/sources` explores connections and relationships;
 `@` narrows a question to one source. Type `/help` for the full command list.
 
-The main view has five tabs: Chat, Sources, Work, Inbox, and Artifacts. Work
-combines active jobs and upcoming routines. Click a tab, use `F6` and the arrow
+The header has five tabs on the same row as the agent and model: Chat, Sources,
+Work, Inbox, and Artifacts. Work combines active jobs and upcoming routines.
+Click a tab, use `F6` and the arrow
 keys, or press `Ctrl+1` through `Ctrl+5`. Select a row to open its existing detail
 screen; closing it returns to your chat draft. `F1` shows the full controls.
 Approvals bring Chat into focus and stay above the composer until resolved.
@@ -90,19 +91,19 @@ See [relational writes](docs/RELATIONAL_WRITES.md),
 
 ## Guides
 
-| Topic | Guide |
-| --- | --- |
-| Local file access and edits | [Local computer files](docs/LOCAL_WORKSPACES.md) |
-| Python, DuckDB and charts | [Local Python analysis](docs/LOCAL_PYTHON_EXECUTION.md) |
-| Reports, exports, and provenance | [Artifacts](docs/ARTIFACTS.md) |
-| Source scope and retained context | [Context and scope](docs/CONTEXT_AND_SCOPE.md) |
-| Scheduled work, outcomes, and hosting | [Scheduled routines](docs/SCHEDULED_ROUTINES.md) |
-| Durable investigations and task graphs | [Durable jobs](docs/DURABLE_JOBS.md) |
-| Learning, business meaning, and procedures | [Learning and semantics](docs/LEARNING_AND_SEMANTICS.md) |
-| Model setup and subscriptions | [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md) |
-| Python API walkthroughs | [Offline examples](examples/README.md) |
-| Architecture and development | [Repository guide](AGENTS.md) · [Contributing](CONTRIBUTING.md) |
-| Private vulnerability reporting | [Security policy](SECURITY.md) |
+| Topic                                      | Guide                                                           |
+| ------------------------------------------ | --------------------------------------------------------------- |
+| Local file access and edits                | [Local computer files](docs/LOCAL_WORKSPACES.md)                |
+| Python, DuckDB and charts                  | [Local Python analysis](docs/LOCAL_PYTHON_EXECUTION.md)         |
+| Reports, exports, and provenance           | [Artifacts](docs/ARTIFACTS.md)                                  |
+| Source scope and retained context          | [Context and scope](docs/CONTEXT_AND_SCOPE.md)                  |
+| Scheduled work, outcomes, and hosting      | [Scheduled routines](docs/SCHEDULED_ROUTINES.md)                |
+| Durable investigations and task graphs     | [Durable jobs](docs/DURABLE_JOBS.md)                            |
+| Learning, business meaning, and procedures | [Learning and semantics](docs/LEARNING_AND_SEMANTICS.md)        |
+| Model setup and subscriptions              | [Model sources](docs/SUBSCRIPTION_MODEL_SOURCES.md)             |
+| Python API walkthroughs                    | [Offline examples](examples/README.md)                          |
+| Architecture and development               | [Repository guide](AGENTS.md) · [Contributing](CONTRIBUTING.md) |
+| Private vulnerability reporting            | [Security policy](SECURITY.md)                                  |
 
 ## Upgrade or uninstall
 

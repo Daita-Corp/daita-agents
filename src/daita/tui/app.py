@@ -70,32 +70,41 @@ from .widgets.composer import (
 )
 from .widgets.welcome import WelcomeView
 
+# ANSI defaults defer foreground, background, and opacity to the terminal.
+# Daita supplies layout and semantic states, rather than a second color palette.
 DAITA_THEME = Theme(
     name="daita",
-    primary="#ACFD21",
-    secondary="#111111",
-    warning="#FBBF24",
-    error="#DE3535",
-    success="#ACFD21",
-    accent="#ACFD21",
-    foreground="#FFFFFF",
-    background="#000000",
-    surface="#0D0D0D",
-    panel="#111111",
-    boost="#191C1F",
-    dark=True,
-    text_alpha=1.0,
+    primary="ansi_default",
+    secondary="ansi_default",
+    accent="ansi_default",
+    foreground="ansi_default",
+    background="ansi_default",
+    warning="ansi_yellow",
+    error="ansi_red",
+    success="ansi_green",
+    ansi=True,
     variables={
-        "block-cursor-background": "#ACFD21",
-        "block-cursor-foreground": "#000000",
-        "block-cursor-text-style": "bold",
-        "block-cursor-blurred-background": "#ACFD21",
-        "block-cursor-blurred-foreground": "#000000",
-        "block-cursor-blurred-text-style": "bold",
-        "input-cursor-background": "#ACFD21",
-        "input-cursor-foreground": "#000000",
-        "input-selection-background": "#3E5A12",
-        "input-selection-foreground": "#FFFFFF",
+        "ansi-background": "ansi_default",
+        "ansi-foreground": "ansi_default",
+        "surface": "ansi_default",
+        "panel": "ansi_default",
+        "boost": "ansi_default",
+        "border": "ansi_default",
+        "border-blurred": "ansi_default",
+        "block-cursor-background": "ansi_default",
+        "block-cursor-foreground": "ansi_default",
+        "block-cursor-text-style": "bold reverse",
+        "block-cursor-blurred-background": "ansi_default",
+        "block-cursor-blurred-foreground": "ansi_default",
+        "block-cursor-blurred-text-style": "reverse",
+        "footer-key-foreground": "ansi_default",
+        "scrollbar-background": "ansi_default",
+        "scrollbar-background-hover": "ansi_default",
+        "scrollbar-background-active": "ansi_default",
+        "scrollbar": "ansi_default",
+        "scrollbar-hover": "ansi_default",
+        "scrollbar-active": "ansi_default",
+        **{f"markdown-h{level}-color": "ansi_default" for level in range(1, 7)},
     },
 )
 
@@ -123,7 +132,7 @@ class DaitaApp(App[int]):
         model_profile: Any = None,
         start_bootstrap: bool = True,
     ) -> None:
-        super().__init__()
+        super().__init__(ansi_color=True)
         self.register_theme(DAITA_THEME)
         self.theme = DAITA_THEME.name
         validate_candidate_review_cost_limit(reviewer_max_estimated_cost_usd)

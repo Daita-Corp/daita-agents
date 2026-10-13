@@ -7,6 +7,7 @@ from dataclasses import replace
 from io import StringIO
 
 import pytest
+from rich.color import ColorType
 from rich.console import Console, RenderableType
 from textual.widgets import Button, Collapsible, OptionList, Static
 
@@ -474,11 +475,12 @@ async def test_artifact_manager_gives_previews_space_and_supports_keyboard_brows
             assert scrolling.scroll_y > 0
             delete = manager.query_one("#artifacts-delete", Button)
             assert not delete.disabled
-            assert delete.styles.background.r > delete.styles.background.g
-            assert (
-                manager.query_one("#artifacts-preview", Button).styles.color
-                != manager.query_one("#artifacts-next", Button).styles.color
-            )
+            assert delete.styles.background.ansi == -1
+            assert delete.styles.color.ansi == 1
+            assert not manager.query_one("#artifacts-preview", Button).disabled
+            next_page = manager.query_one("#artifacts-next", Button)
+            assert next_page.disabled
+            assert next_page.styles.text_style.dim
             await pilot.press("down", "enter")
             await _wait_for_actions(manager)
             await pilot.pause()
@@ -509,7 +511,7 @@ async def test_artifact_manager_gives_previews_space_and_supports_keyboard_brows
         ),
         (
             "text/markdown",
-            b"# Quarterly report\n\n**Revenue** is growing.",
+            b"# Quarterly report\n\n**Revenue** is growing.\n\n```python\ncount = 14\n```",
             "Quarterly report",
         ),
     ],
@@ -518,13 +520,12 @@ def test_artifact_preview_formats_supported_content_without_treating_values_as_m
     media_type, content, expected
 ):
     ref, _, _ = _surface_records()
-    rendered = _render_text(
-        render_artifact_preview(
-            ArtifactPayload(
-                replace(ref, media_type=media_type, byte_size=len(content)), content
-            )
+    preview = render_artifact_preview(
+        ArtifactPayload(
+            replace(ref, media_type=media_type, byte_size=len(content)), content
         )
     )
+    rendered = _render_text(preview)
     assert expected in rendered
     if media_type == "text/csv":
         assert "name,count" not in rendered
@@ -532,6 +533,13 @@ def test_artifact_preview_formats_supported_content_without_treating_values_as_m
     if media_type == "text/markdown":
         assert "# Quarterly report" not in rendered
         assert "**Revenue**" not in rendered
+        assert "count = 14" in rendered
+        console = Console(force_terminal=True, color_system="truecolor")
+        for segment in console.render(preview):
+            if segment.style:
+                for color in (segment.style.color, segment.style.bgcolor):
+                    if color:
+                        assert color.type in (ColorType.DEFAULT, ColorType.STANDARD)
 
 
 def test_artifact_preview_reads_verified_xlsx_rows_and_marks_truncation():

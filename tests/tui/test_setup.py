@@ -439,19 +439,87 @@ async def test_agent_home_is_available_without_model_source_or_catalog(tmp_path:
         await opened.close()
 
 
-def test_daita_theme_uses_the_official_terminal_palette():
+@pytest.mark.integration
+@pytest.mark.parametrize("no_color", [False, True])
+async def test_terminal_defaults_preserve_markdown_and_focus_without_rgb_paint(
+    monkeypatch, no_color: bool
+):
+    from io import StringIO
+
+    from rich.color import ColorType
+    from rich.console import Console
+    from textual.widgets import Markdown, Tabs
+
+    if no_color:
+        monkeypatch.setenv("NO_COLOR", "1")
+    else:
+        monkeypatch.delenv("NO_COLOR", raising=False)
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
-    theme = app.get_theme("daita")
-    assert app.theme == "daita"
-    assert theme is not None
-    assert theme.primary == "#ACFD21"
-    assert theme.background == "#000000"
-    assert theme.surface == "#0D0D0D"
-    assert theme.panel == "#111111"
-    assert theme.boost == "#191C1F"
-    assert theme.foreground == "#FFFFFF"
-    assert theme.error == "#DE3535"
-    assert theme.variables["block-cursor-background"] == "#ACFD21"
+    async with app.run_test(size=(100, 32)) as pilot:
+        try:
+            await app.push_screen(ChatScreen())
+            chat = app.screen
+            assert isinstance(chat, ChatScreen)
+            chat.set_blocks(
+                (
+                    TranscriptBlock(
+                        "assistant",
+                        "native-markdown",
+                        "# Report\n\n**Revenue** and `count`\n\n"
+                        "- First item\n- Second item\n\n"
+                        "| Region | Total |\n| --- | --- |\n| West | 14 |\n\n"
+                        "```python\ncount = 14\nprint(count)\n```",
+                    ),
+                )
+            )
+            await pilot.pause()
+            assert app.native_ansi_color
+            assert app.no_color is no_color
+            assert chat.styles.color.ansi == -1
+            assert chat.styles.background.ansi == -1
+            markdown = chat.query_one(Markdown)
+            assert markdown.query("MarkdownH1")
+            assert markdown.query("MarkdownBulletList")
+            assert markdown.query("MarkdownTable")
+            assert markdown.query("MarkdownFence")
+            composer = chat.query_one(Composer)
+            assert composer.get_component_styles("text-area--cursor").text_style.reverse
+            composer.load_text("draft")
+            await pilot.press("f6")
+            assert chat.query_one(Tabs).has_focus
+            selected = chat.query_one("Tab.-active")
+            assert selected.styles.text_style.bold
+            assert selected.styles.text_style.underline
+            assert selected.styles.text_style.reverse
+            assert composer.text == "draft"
+            # Render the actual screen to ANSI, independent of screenshot palettes.
+            output = StringIO()
+            console = Console(
+                file=output,
+                force_terminal=True,
+                color_system="truecolor",
+                no_color=False,
+            )
+            frame = chat._compositor.render_update(full=True, simplify=True)
+            assert frame is not None
+            segments = list(console.render(frame))
+            for segment in segments:
+                if segment.style:
+                    for color in (segment.style.color, segment.style.bgcolor):
+                        if color:
+                            assert color.type in (ColorType.DEFAULT, ColorType.STANDARD)
+                            if no_color:
+                                assert color.type == ColorType.DEFAULT
+            console.print(frame)
+            ansi = output.getvalue()
+            assert "38;2;" not in ansi
+            assert "48;2;" not in ansi
+            assert "Revenue" in ansi
+            assert "West" in ansi
+            assert "print" in ansi
+            assert any(segment.style and segment.style.reverse for segment in segments)
+        finally:
+            app.exit(0)
 
 
 async def test_boot_and_empty_chat_show_the_responsive_daita_welcome(tmp_path: Path):
@@ -691,69 +759,76 @@ async def test_model_setup_uses_codex_device_login_without_api_key(login_mode):
     app.controller.configure_model = configure  # type: ignore[method-assign]
 
     async with app.run_test(size=(90, 30)) as pilot:
-        modal_task = asyncio.create_task(app._await_modal(ModelSetupScreen()))
-        await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, ModelSetupScreen)
-        panel = screen.query_one("#onboard")
-        assert panel.styles.border_left[0] == "solid"
-        assert panel.styles.background.hex == "#111111"
-        assert screen.query_one("#onboard-title").styles.color.hex == "#FFFFFF"
-        assert screen.query_one("#model-help").styles.color.hex == "#FFFFFF99"
-        model_id = screen.query_one("#model-id", Input)
-        assert model_id.display is False
-        assert screen.query_one("#model-provider-id", Input).display is False
-        assert screen.query_one("#model-secret", Input).display is False
-        assert screen.query_one("#model-base-url", Input).display is False
-        assert screen.query_one("#model-context", Input).display is False
-        assert screen.query_one("#model-output", Input).display is False
-        assert screen.query_one("#save-model", Button).display is False
-        assert model_id.styles.border_left[0] == ""
-        assert model_id.styles.border_bottom[0] == "solid"
-        assert model_id.styles.background.hex == "#111111"
-        choose_provider = screen.query_one("#choose-provider", Button)
-        assert choose_provider.styles.border_left[0] == "solid"
-        assert choose_provider.styles.background.hex in {"#181818", "#303030"}
-        assert screen.query_one(Footer).styles.background.hex == "#111111"
-        screen._apply_provider_selection("codex", "gpt-5.6-sol")
-        if login_mode != "first_login":
-            screen.query_one("#model-id", Input).value = "gpt-5.6-terra"
-        await pilot.pause()
-        assert screen.query_one("#model-secret", Input).display is False
-        assert screen.query_one("#save-model", Button).display is True
-        screen.query_one("#model-secret", Input).value = "must-not-be-used"
-        screen.query_one("#model-base-url", Input).value = "https://must-not-be-used"
-        screen.query_one("#model-context", Input).value = "1"
-        screen.query_one("#model-output", Input).value = "1"
-        assert screen.query_one("#model-reconnect", Button).display == (
-            login_mode != "first_login"
-        )
-        assert await pilot.click(
-            "#model-reconnect" if login_mode == "reconnect" else "#save-model"
-        )
-        if login_mode == "reuse_failure":
-            workers = tuple(worker for worker in app.workers if worker.node is screen)
-            if workers:
-                await asyncio.wait_for(
-                    app.workers.wait_for_complete(workers), timeout=5
-                )
+        try:
+            modal_task = asyncio.create_task(app._await_modal(ModelSetupScreen()))
             await pilot.pause()
-            assert app.screen is screen
-            assert not configured
-            assert not verification
-            assert not screen.query_one("#model-reconnect", Button).disabled
-            assert await pilot.click("#model-reconnect")
-        if login_mode != "reuse":
-            await asyncio.wait_for(authentication_started.wait(), timeout=5)
-            await asyncio.wait_for(pilot.pause(), timeout=5)
-            auth_help = str(screen.query_one("#model-help", Static).content)
-            assert "Waiting for ChatGPT authorization" in auth_help
-            assert "https://auth.openai.com/codex/device" in auth_help
-            assert "ABCD-EFGH" in auth_help
-            authorization_release.set()
-        assert await asyncio.wait_for(modal_task, timeout=5) is True
-        app.exit(0)
+            screen = app.screen
+            assert isinstance(screen, ModelSetupScreen)
+            panel = screen.query_one("#onboard")
+            assert panel.styles.border_left[0] == "solid"
+            assert panel.styles.background.ansi == -1
+            assert screen.query_one("#onboard-title").styles.color.ansi == -1
+            assert screen.query_one("#model-help").styles.color.ansi == -1
+            model_id = screen.query_one("#model-id", Input)
+            assert model_id.display is False
+            assert screen.query_one("#model-provider-id", Input).display is False
+            assert screen.query_one("#model-secret", Input).display is False
+            assert screen.query_one("#model-base-url", Input).display is False
+            assert screen.query_one("#model-context", Input).display is False
+            assert screen.query_one("#model-output", Input).display is False
+            assert screen.query_one("#save-model", Button).display is False
+            assert model_id.styles.border_left[0] == ""
+            assert model_id.styles.border_bottom[0] == "solid"
+            assert model_id.styles.background.ansi == -1
+            choose_provider = screen.query_one("#choose-provider", Button)
+            assert choose_provider.styles.border_left[0] == "solid"
+            assert choose_provider.styles.background.ansi == -1
+            assert screen.query_one(Footer).styles.background.ansi == -1
+            screen._apply_provider_selection("codex", "gpt-5.6-sol")
+            if login_mode != "first_login":
+                screen.query_one("#model-id", Input).value = "gpt-5.6-terra"
+            await pilot.pause()
+            assert screen.query_one("#model-secret", Input).display is False
+            assert screen.query_one("#save-model", Button).display is True
+            screen.query_one("#model-secret", Input).value = "must-not-be-used"
+            screen.query_one("#model-base-url", Input).value = (
+                "https://must-not-be-used"
+            )
+            screen.query_one("#model-context", Input).value = "1"
+            screen.query_one("#model-output", Input).value = "1"
+            assert screen.query_one("#model-reconnect", Button).display == (
+                login_mode != "first_login"
+            )
+            assert await pilot.click(
+                "#model-reconnect" if login_mode == "reconnect" else "#save-model"
+            )
+            if login_mode == "reuse_failure":
+                workers = tuple(
+                    worker for worker in app.workers if worker.node is screen
+                )
+                if workers:
+                    await asyncio.wait_for(
+                        app.workers.wait_for_complete(workers), timeout=5
+                    )
+                await pilot.pause()
+                assert app.screen is screen
+                assert not configured
+                assert not verification
+                assert not screen.query_one("#model-reconnect", Button).disabled
+                assert await pilot.click("#model-reconnect")
+            if login_mode != "reuse":
+                await asyncio.wait_for(authentication_started.wait(), timeout=5)
+                await asyncio.wait_for(pilot.pause(), timeout=5)
+                auth_help = str(screen.query_one("#model-help", Static).content)
+                assert "Waiting for ChatGPT authorization" in auth_help
+                assert "https://auth.openai.com/codex/device" in auth_help
+                assert "ABCD-EFGH" in auth_help
+                authorization_release.set()
+            assert await asyncio.wait_for(modal_task, timeout=5) is True
+            app.exit(0)
 
+        finally:
+            app.exit(0)
     assert configured["provider"] == "codex"
     assert configured["model"] == (
         "gpt-5.6-sol" if login_mode == "first_login" else "gpt-5.6-terra"
@@ -835,95 +910,110 @@ async def test_model_setup_reveals_only_custom_provider_fields_when_selected():
         app.exit(0)
 
 
-async def test_source_setup_matches_the_muted_onboarding_treatment():
+async def test_source_setup_uses_terminal_defaults_and_visible_selection():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
 
     async with app.run_test(size=(100, 32)) as pilot:
-        await app.push_screen(SourceSetupScreen())
-        await pilot.pause()
-        screen = app.screen
-        assert isinstance(screen, SourceSetupScreen)
+        try:
+            await app.push_screen(SourceSetupScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, SourceSetupScreen)
 
-        panel = screen.query_one("#onboard")
-        assert panel.styles.border_left[0] == "solid"
-        assert panel.styles.background.hex == "#111111"
-        assert screen.query_one("#onboard-title").styles.color.hex == "#FFFFFF"
+            panel = screen.query_one("#onboard")
+            assert panel.styles.border_left[0] == "solid"
+            assert panel.styles.background.ansi == -1
+            assert screen.query_one("#onboard-title").styles.color.ansi == -1
 
-        source_name = screen.query_one("#source-name", Input)
-        assert source_name.styles.border_left[0] == ""
-        assert source_name.styles.border_bottom[0] == "solid"
-        assert source_name.styles.background.hex == "#111111"
+            source_name = screen.query_one("#source-name", Input)
+            assert source_name.styles.border_left[0] == ""
+            assert source_name.styles.border_bottom[0] == "solid"
+            assert source_name.styles.background.ansi == -1
 
-        source_type = screen.query_one("#source-type", Select)
-        select_current = source_type.query_one("SelectCurrent")
-        assert select_current.styles.border_left[0] == ""
-        assert select_current.styles.border_bottom[0] == "solid"
-        assert select_current.styles.background.hex == "#111111"
-        await pilot.click("#source-type")
-        await pilot.pause()
-        assert source_type.expanded is True
-        select_overlay = source_type.query_one("SelectOverlay")
-        assert select_overlay.styles.border_left[0] == "solid"
-        assert select_overlay.styles.background.hex == "#111111"
-        assert (
-            select_overlay.get_component_styles(
-                "option-list--option-highlighted"
-            ).background.hex
-            == "#343434"
-        )
+            source_type = screen.query_one("#source-type", Select)
+            select_current = source_type.query_one("SelectCurrent")
+            assert select_current.styles.border_left[0] == ""
+            assert source_type.has_focus
+            assert select_current.styles.border_bottom[0] == "heavy"
+            assert select_current.styles.background.ansi == -1
+            await pilot.click("#source-type")
+            await pilot.pause()
+            assert source_type.expanded is True
+            select_overlay = source_type.query_one("SelectOverlay")
+            assert select_overlay.styles.border_left[0] == "solid"
+            assert select_overlay.styles.background.ansi == -1
+            assert (
+                select_overlay.get_component_styles(
+                    "option-list--option-highlighted"
+                ).text_style.reverse
+                is True
+            )
 
-        attach = screen.query_one("#attach-source", Button)
-        assert attach.styles.border_left[0] == "solid"
-        assert attach.styles.background.hex in {"#181818", "#303030"}
-        footer = screen.query_one(Footer)
-        assert footer.styles.background.hex == "#111111"
-        assert attach.region.bottom <= footer.region.y
-        app.exit(0)
+            attach = screen.query_one("#attach-source", Button)
+            assert attach.styles.border_left[0] == "solid"
+            assert attach.styles.background.ansi == -1
+            footer = screen.query_one(Footer)
+            assert footer.styles.background.ansi == -1
+            assert attach.region.bottom <= footer.region.y
+            app.exit(0)
+
+        finally:
+            app.exit(0)
 
 
-async def test_remaining_control_screens_share_the_muted_minimal_treatment():
+async def test_control_screens_use_terminal_defaults_and_retain_dialog_geometry():
     create_app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with create_app.run_test(size=(100, 32)) as pilot:
-        await create_app.push_screen(AgentCreateScreen())
-        await pilot.pause()
-        panel = create_app.screen.query_one("#onboard")
-        assert panel.styles.border_left[0] == "solid"
-        assert panel.styles.background.hex == "#111111"
-        assert panel.region.height < create_app.size.height
-        name = create_app.screen.query_one("#agent-name", Input)
-        assert name.styles.border_left[0] == ""
-        assert name.styles.border_bottom[0] == "solid"
-        create = create_app.screen.query_one("#create-agent", Button)
-        assert create.styles.background.hex in {"#181818", "#303030"}
-        create_app.exit(0)
+        try:
+            await create_app.push_screen(AgentCreateScreen())
+            await pilot.pause()
+            panel = create_app.screen.query_one("#onboard")
+            assert panel.styles.border_left[0] == "solid"
+            assert panel.styles.background.ansi == -1
+            assert panel.region.height < create_app.size.height
+            name = create_app.screen.query_one("#agent-name", Input)
+            assert name.styles.border_left[0] == ""
+            assert name.has_focus
+            assert name.styles.border_bottom[0] == "heavy"
+            create = create_app.screen.query_one("#create-agent", Button)
+            assert create.styles.background.ansi == -1
+            create_app.exit(0)
 
+        finally:
+            create_app.exit(0)
     permissions_app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with permissions_app.run_test(size=(100, 32)) as pilot:
-        await permissions_app.push_screen(PermissionsScreen())
-        await pilot.pause()
-        panel = permissions_app.screen.query_one("#permissions")
-        assert panel.styles.border_left[0] == "solid"
-        assert panel.styles.background.hex == "#111111"
-        assert (
-            permissions_app.screen.query_one("#perm-help").styles.color.hex
-            == "#FFFFFF99"
-        )
-        apply = permissions_app.screen.query_one("#perm-apply", Button)
-        assert apply.styles.background.hex in {"#181818", "#303030"}
-        permissions_app.exit(0)
+        try:
+            await permissions_app.push_screen(PermissionsScreen())
+            await pilot.pause()
+            panel = permissions_app.screen.query_one("#permissions")
+            assert panel.styles.border_left[0] == "solid"
+            assert panel.styles.background.ansi == -1
+            assert (
+                permissions_app.screen.query_one("#perm-help").styles.color.ansi == -1
+            )
+            apply = permissions_app.screen.query_one("#perm-apply", Button)
+            assert apply.styles.background.ansi == -1
+            permissions_app.exit(0)
 
+        finally:
+            permissions_app.exit(0)
     confirm_app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with confirm_app.run_test(size=(100, 32)) as pilot:
-        await confirm_app.push_screen(ConfirmScreen("Apply this change?"))
-        await pilot.pause()
-        panel = confirm_app.screen.query_one("#confirm")
-        actions = confirm_app.screen.query_one("#confirm-actions")
-        assert panel.styles.border_left[0] == "solid"
-        assert panel.styles.background.hex == "#111111"
-        assert panel.region.width <= 88
-        assert panel.region.height <= 10
-        assert actions.region.height == 3
-        confirm_app.exit(0)
+        try:
+            await confirm_app.push_screen(ConfirmScreen("Apply this change?"))
+            await pilot.pause()
+            panel = confirm_app.screen.query_one("#confirm")
+            actions = confirm_app.screen.query_one("#confirm-actions")
+            assert panel.styles.border_left[0] == "solid"
+            assert panel.styles.background.ansi == -1
+            assert panel.region.width <= 88
+            assert panel.region.height <= 10
+            assert actions.region.height == 3
+            confirm_app.exit(0)
+
+        finally:
+            confirm_app.exit(0)
 
 
 async def test_source_setup_accepts_a_successfully_attached_empty_catalog(monkeypatch):

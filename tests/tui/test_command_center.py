@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from rich.text import Text
 from textual.widgets import OptionList, Tab, Tabs
 
 from daita import Agent, GraphState, RoutineState, ScheduledRoutineSummary
@@ -55,6 +56,21 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
             composer = chat.composer()
             composer.load_text("unsent question")
             await pilot.pause()
+            navigation = chat.query_one(Tabs)
+            identity = chat.query_one("#status-primary")
+            context = chat.query_one("#context-window")
+            assert navigation.region.y == identity.region.y
+            assert navigation.region.height == identity.region.height == 1
+            assert identity.region.right <= navigation.region.x
+            assert context.display is (size[0] >= 100)
+            if context.display:
+                assert context.region.y == identity.region.y
+                assert navigation.region.right <= context.region.x
+                assert context.region.right <= size[0]
+            for tab in navigation.query(Tab):
+                assert tab.region.y == identity.region.y
+                assert navigation.region.x <= tab.region.x
+                assert tab.region.right <= navigation.region.right
             transcript = chat.query_one(TranscriptView)
             sections = chat.query_one(CommandSections)
             assert transcript.region.width == size[0] - 2
@@ -84,6 +100,9 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
             await pilot.resize_terminal(40, 16)
             await pilot.press("ctrl+1")
             await pilot.pause()
+            assert navigation.region.y == identity.region.y
+            assert not context.display
+            assert navigation.region.right <= 40
             assert not composer.disabled
             assert composer.text == "unsent question"
             assert composer.region.right <= 40
@@ -95,6 +114,22 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
             assert chat.section == "chat" and chat.focused is composer
             assert not transcript.is_empty
             assert composer.text == "unsent question"
+            await pilot.resize_terminal(*size)
+            chat.set_status(
+                agent="A long agent name that needs truncation",
+                model="provider/long-model-name-with-extra-identifiers",
+                source="All readable sources",
+                state="ready",
+                source_count=50,
+                active_jobs=50,
+                inbox_items=50,
+            )
+            await pilot.pause()
+            assert navigation.region.y == identity.region.y
+            assert isinstance(identity.tooltip, Text)
+            assert "provider/long-model-name" in identity.tooltip.plain
+            for tab in navigation.query(Tab):
+                assert tab.region.right <= navigation.region.right
             await pilot.press("f1")
             await pilot.pause()
             assert composer.text == "unsent question"

@@ -103,8 +103,8 @@ def test_context_window_copy_is_compact_exact_and_warns_near_capacity():
     critical = context_window_text(30_000, 32_000)
     assert healthy.plain == "ctx 8.5K / 32K"
     assert healthy.style == "dim"
-    assert warning.style == "#FBBF24"
-    assert critical.style == "#DE3535"
+    assert warning.style == "yellow"
+    assert critical.style == "red"
     with pytest.raises(ValueError):
         format_token_count(-1)
 
@@ -485,64 +485,56 @@ async def test_transcript_history_supports_review_and_latest_navigation():
 async def test_ctrl_o_toggles_tool_calls_without_exiting_chat():
     app = DaitaApp(start_bootstrap=False, workspace=workspace_for(None))
     async with app.run_test(size=(80, 24)) as pilot:
-        await app.push_screen(ChatScreen())
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        chat.set_blocks(
-            (
-                TranscriptBlock("user", "user-one", "Inspect the records"),
-                TranscriptBlock(
-                    "tool",
-                    "tool-one",
-                    tool_card=ToolCardState(
-                        run_id="run-one",
-                        call_id="call-one",
-                        capability_id="data.query",
-                        label="Query records",
-                        state="done",
-                        details=ToolCardDetails(summary="Returned one record"),
+        try:
+            await app.push_screen(ChatScreen())
+            chat = app.screen
+            assert isinstance(chat, ChatScreen)
+            chat.set_blocks(
+                (
+                    TranscriptBlock("user", "user-one", "Inspect the records"),
+                    TranscriptBlock(
+                        "tool",
+                        "tool-one",
+                        tool_card=ToolCardState(
+                            run_id="run-one",
+                            call_id="call-one",
+                            capability_id="data.query",
+                            label="Query records",
+                            state="done",
+                            details=ToolCardDetails(summary="Returned one record"),
+                        ),
                     ),
-                ),
-                TranscriptBlock("assistant", "assistant-one", "Done"),
+                    TranscriptBlock("assistant", "assistant-one", "Done"),
+                )
             )
-        )
-        composer = chat.query_one(Composer)
-        composer.focus()
-        cards = list(chat.query(ToolCard))
-        assert len(cards) == 1
-        assert cards[0].display is False
+            composer = chat.query_one(Composer)
+            composer.focus()
+            cards = list(chat.query(ToolCard))
+            assert len(cards) == 1
+            assert cards[0].display is False
 
-        await pilot.press("ctrl+o")
-        await pilot.pause()
-        assert app.screen is chat
-        assert cards[0].display is True
-        assert composer.has_focus is True
-        title = cards[0].query_one(CollapsibleTitle)
-        assert (title.styles.color.r, title.styles.color.g, title.styles.color.b) != (
-            0,
-            0,
-            0,
-        )
-        title.focus()
-        await pilot.press("enter")
-        await pilot.pause()
-        detail = cards[0].query_one("#tool-detail-call-one", Static)
-        assert "Returned one record" in str(detail.content)
-        assert (
-            detail.styles.color.r,
-            detail.styles.color.g,
-            detail.styles.color.b,
-        ) != (
-            0,
-            0,
-            0,
-        )
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            assert app.screen is chat
+            assert cards[0].display is True
+            assert composer.has_focus is True
+            title = cards[0].query_one(CollapsibleTitle)
+            assert title.styles.color.ansi == -1
+            title.focus()
+            await pilot.press("enter")
+            await pilot.pause()
+            detail = cards[0].query_one("#tool-detail-call-one", Static)
+            assert "Returned one record" in str(detail.content)
+            assert detail.styles.color.ansi == -1
 
-        await pilot.press("ctrl+o")
-        await pilot.pause()
-        assert app.screen is chat
-        assert cards[0].display is False
-        app.exit(0)
+            await pilot.press("ctrl+o")
+            await pilot.pause()
+            assert app.screen is chat
+            assert cards[0].display is False
+            app.exit(0)
+
+        finally:
+            app.exit(0)
 
 
 async def test_copy_uses_native_wrap_independent_text_selection(monkeypatch):
