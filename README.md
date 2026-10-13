@@ -62,6 +62,12 @@ approval. `/jobs` shows durable work, `/routines` manages saved assignments, and
 files. `/sources` explores connections and relationships;
 `@` narrows a question to one source. Type `/help` for the full command list.
 
+The chat command center keeps sources, active jobs, and upcoming routines in a
+sidebar (`Ctrl+B`). Open the inbox and recent artifacts drawer with `Ctrl+R`.
+Select a row to open its existing detail screen; closing it returns to your draft.
+The panes collapse automatically on small terminals, and approvals stay in the
+conversation above the composer.
+
 Scheduled work progresses only while the terminal or `daita host --agent <name>`
 keeps that agent open. One host can open an agent home at a time.
 

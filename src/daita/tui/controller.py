@@ -676,9 +676,11 @@ class PresentationController:
         return await self.require_agent().inbox(limit=50)
 
     async def list_artifacts(
-        self, *, limit: int, offset: int
+        self, *, limit: int, offset: int, newest_first: bool = False
     ) -> tuple[ArtifactRef, ...]:
-        return await self.require_agent().list_artifacts(limit=limit, offset=offset)
+        return await self.require_agent().list_artifacts(
+            limit=limit, offset=offset, newest_first=newest_first
+        )
 
     async def read_artifact(self, artifact_id: str) -> ArtifactPayload:
         return await self.require_agent().read_artifact(artifact_id)

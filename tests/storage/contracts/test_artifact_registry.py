@@ -44,6 +44,15 @@ async def test_artifact_keyset_survives_cursor_deletion_and_preserves_scope(
         )
     first = await state_store.list_artifact_records("agent-1", limit=2)
     assert first == tuple(records[:2])
+    assert await state_store.list_artifact_refs(
+        "agent-1", limit=2, newest_first=True
+    ) == (records[2].ref, records[1].ref)
+    assert (
+        await state_store.list_artifact_refs(
+            "agent-1", caller_principal_id="another-reader", newest_first=True
+        )
+        == ()
+    )
     cursor = (first[-1].ref.created_at, first[-1].ref.artifact_id)
     deleting = await state_store.transition_artifact(first[-1], ArtifactState.DELETING)
     await state_store.finish_artifact_deletion(deleting)
@@ -65,6 +74,10 @@ async def test_artifact_keyset_survives_cursor_deletion_and_preserves_scope(
     )
     with pytest.raises(ValueError):
         await state_store.list_artifact_records("agent-1", after=cursor)
+    with pytest.raises(ValueError):
+        await state_store.list_artifact_records(
+            "agent-1", limit=2, newest_first=True, after=cursor
+        )
     with pytest.raises(ValueError):
         await state_store.list_artifact_records(
             "agent-1", limit=2, offset=1, after=cursor

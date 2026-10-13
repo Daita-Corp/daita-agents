@@ -5275,12 +5275,17 @@ class SQLStateStore:
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRecord, ...]:
+        if not isinstance(newest_first, bool):
+            raise ValueError("artifact newest_first must be a boolean")
         if limit is not None and (type(limit) is not int or not 1 <= limit <= 1000):
             raise ValueError("artifact page limit must be between 1 and 1000")
         if type(offset) is not int or offset < 0:
             raise ValueError("artifact offset must be non-negative")
         if after is not None:
+            if newest_first:
+                raise ValueError("artifact cursor requires creation order")
             if offset or limit is None:
                 raise ValueError(
                     "artifact cursor requires a bounded page without offset"
@@ -5315,7 +5320,11 @@ class SQLStateStore:
                 for row in connection.execute(
                     "SELECT artifact_id, agent_id, run_id, conversation_id, caller_principal_id, state, byte_size, created_at_us, data FROM artifacts WHERE "
                     + " AND ".join(clauses)
-                    + " ORDER BY created_at_us, artifact_id LIMIT ? OFFSET ?",
+                    + (
+                        " ORDER BY created_at_us DESC, artifact_id DESC LIMIT ? OFFSET ?"
+                        if newest_first
+                        else " ORDER BY created_at_us, artifact_id LIMIT ? OFFSET ?"
+                    ),
                     (
                         *parameters,
                         limit if limit is not None else 9223372036854775807,
@@ -5336,6 +5345,7 @@ class SQLStateStore:
         limit: int | None = None,
         offset: int = 0,
         after: tuple[datetime, str] | None = None,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRef, ...]:
         return tuple(
             record.ref
@@ -5348,6 +5358,7 @@ class SQLStateStore:
                 limit=limit,
                 offset=offset,
                 after=after,
+                newest_first=newest_first,
             )
         )
 

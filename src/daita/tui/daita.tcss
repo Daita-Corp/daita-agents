@@ -21,8 +21,12 @@ Screen {
 }
 
 #status-bar {
-    height: 1;
+    height: auto;
     background: $panel;
+}
+
+#status-identity {
+    height: 1;
 }
 
 #status-primary {
@@ -41,10 +45,99 @@ Screen {
 }
 
 #background-status {
-    width: auto;
+    width: 1fr;
     height: 1;
     padding: 0 1;
-    text-align: right;
+    text-overflow: ellipsis;
+}
+
+#command-panes {
+    height: 1fr;
+    min-height: 1;
+}
+
+#conversation-pane {
+    width: 1fr;
+    height: 1fr;
+}
+
+#chat-bottom {
+    height: auto;
+}
+
+#command-sidebar {
+    width: 24;
+    height: 1fr;
+    background: $panel;
+    border-right: solid $border;
+}
+
+#command-sidebar.-collapsed {
+    width: 4;
+}
+
+#sidebar-content, #sidebar-rail {
+    height: 1fr;
+}
+
+#sidebar-counts {
+    height: 1fr;
+    color: $text-muted;
+    text-align: center;
+}
+
+#sidebar-expand {
+    width: 3;
+    min-width: 3;
+    height: 3;
+    padding: 0;
+    color: $primary;
+    background: $panel;
+    border: none;
+}
+
+#results-drawer {
+    display: none;
+    width: 26;
+    height: 1fr;
+    background: $panel;
+    border-left: solid $border;
+}
+
+.pane-heading {
+    width: 1fr;
+    min-width: 0;
+    height: 2;
+    padding: 0 1;
+    border: none;
+    color: $primary;
+    background: $panel;
+    content-align: left middle;
+}
+
+.pane-heading:hover, .pane-heading:focus, #sidebar-expand:focus {
+    background: $boost;
+}
+
+ProjectionList {
+    height: 1fr;
+    min-height: 1;
+    padding: 0 1;
+    border: none;
+    color: $foreground;
+    background: $panel;
+    scrollbar-size-vertical: 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+ProjectionList > .option-list--option-highlighted {
+    color: $foreground;
+    background: $boost;
+}
+
+ChatScreen.-narrow #context-window {
+    display: none;
 }
 
 #welcome-region {
@@ -1052,8 +1145,9 @@ SourceSetupScreen #onboard-error.-error {
 
 #approval-inline {
     display: none;
-    height: auto;
-    max-height: 45%;
+    height: 65%;
+    min-height: 8;
+    max-height: 18;
     margin-top: 1;
     padding: 0 1 1 1;
     color: $foreground;
@@ -1068,7 +1162,8 @@ SourceSetupScreen #onboard-error.-error {
 }
 
 #approval-inline-document {
-    height: auto;
+    height: 1fr;
+    min-height: 1;
     max-height: 12;
     padding: 0 1;
     color: $foreground;

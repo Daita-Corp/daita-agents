@@ -91,6 +91,8 @@ async def test_delete_hides_one_artifact_preserves_evidence_and_exports(
     assert await agent.list_artifacts(limit=1) == (ref,)
     assert await agent.list_artifacts(limit=1, offset=1) == (other,)
     assert await agent.list_artifacts(limit=1, offset=2) == ()
+    assert await agent.list_artifacts(limit=1, newest_first=True) == (other,)
+    assert await agent.list_artifacts(limit=1, offset=1, newest_first=True) == (ref,)
     original = await agent.transcript(result.run_id)
     exported = await agent.save_artifact(ref.artifact_id)
     assert await agent.delete_artifact(ref.artifact_id) is True
@@ -100,6 +102,7 @@ async def test_delete_hides_one_artifact_preserves_evidence_and_exports(
     assert Path(exported.saved_path).read_bytes() == b"payload 0"
     assert await agent._embedded._artifact_store.list_refs() == (other,)
     assert await agent.list_artifacts() == (other,)
+    assert await agent.list_artifacts(newest_first=True) == (other,)
     for call in (agent.read_artifact, agent.save_artifact):
         with pytest.raises(ArtifactError) as error:
             await call(ref.artifact_id)

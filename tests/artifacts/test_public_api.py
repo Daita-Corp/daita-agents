@@ -54,6 +54,10 @@ async def test_artifact_inventory_rejects_unbounded_or_invalid_pages(tmp_path: P
         for value in invalid_offsets:
             with pytest.raises(ValueError, match="offset"):
                 await agent.list_artifacts(offset=value)
+        invalid_orders: tuple[Any, ...] = (None, "true", 1)
+        for value in invalid_orders:
+            with pytest.raises(ValueError, match="newest_first"):
+                await agent.list_artifacts(newest_first=value)
     finally:
         await agent.close()
 

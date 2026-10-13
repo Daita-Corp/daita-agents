@@ -6,7 +6,7 @@ import time
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.widgets import Static
 
 from ..sanitization import sanitize_terminal_text
@@ -46,28 +46,28 @@ def context_window_text(used: int | None, total: int | None) -> Text:
     )
 
 
-class StatusBar(Horizontal):
+class StatusBar(Vertical):
     def __init__(self) -> None:
         super().__init__(id="status-bar")
 
     def compose(self) -> ComposeResult:
-        yield Static(
-            Text("DAITA", style="bold #ACFD21"),
-            id="status-primary",
-        )
+        with Horizontal(id="status-identity"):
+            yield Static(
+                Text("DAITA", style="bold #ACFD21"),
+                id="status-primary",
+            )
+            context = Static(context_window_text(None, None), id="context-window")
+            context.tooltip = (
+                "Exact input tokens in the latest model request / model context window"
+            )
+            yield context
         background = Static("", id="background-status")
-        background.display = False
         background.tooltip = (
             "Background jobs, autonomous reporting, and unacknowledged inbox "
             "results. Saved assignments execute only while this host is open and share "
             "the run lock. Use /jobs, /routines or /inbox."
         )
         yield background
-        context = Static(context_window_text(None, None), id="context-window")
-        context.tooltip = (
-            "Exact input tokens in the latest model request / model context window"
-        )
-        yield context
 
     def update_status(
         self,
@@ -82,6 +82,7 @@ class StatusBar(Horizontal):
         saved_routines: int = 0,
         active_reports: int = 0,
         inbox_items: int = 0,
+        source_count: int = 0,
         too_small: bool = False,
     ) -> None:
         primary = self.query_one("#status-primary", Static)
@@ -101,6 +102,7 @@ class StatusBar(Horizontal):
             saved_routines=saved_routines,
             active_reports=active_reports,
             inbox_items=inbox_items,
+            source_count=source_count,
         )
         safe_agent = sanitize_terminal_text(
             agent, maximum=32, preserve_lines=False, fallback="agent"
@@ -138,31 +140,26 @@ class StatusBar(Horizontal):
         saved_routines: int,
         active_reports: int,
         inbox_items: int,
+        source_count: int,
     ) -> None:
         for value, name in (
             (active_jobs, "active_jobs"),
             (saved_routines, "saved_routines"),
             (active_reports, "active_reports"),
             (inbox_items, "inbox_items"),
+            (source_count, "source_count"),
         ):
             if not isinstance(value, int) or isinstance(value, bool) or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
-        labels: list[tuple[str, str]] = []
-        if saved_routines:
-            count = (
-                f"{saved_routines}+" if saved_routines == 50 else str(saved_routines)
-            )
-            labels.append((f"assignments {count}", "bold #ACFD21"))
-        if active_jobs:
-            labels.append((f"jobs {active_jobs}", "bold #ACFD21"))
+        count = f"{saved_routines}+" if saved_routines == 50 else str(saved_routines)
+        labels: list[tuple[str, str]] = [
+            (f"sources {source_count}", "dim"),
+            (f"jobs {active_jobs}", "bold #ACFD21" if active_jobs else "dim"),
+            (f"routines {count}", "bold #ACFD21" if saved_routines else "dim"),
+            (f"inbox {inbox_items}", "bold #FBBF24" if inbox_items else "dim"),
+        ]
         if active_reports:
             labels.append((f"reporting {active_reports}", "bold #ACFD21"))
-        if inbox_items:
-            labels.append((f"inbox {inbox_items}", "bold #FBBF24"))
-        if not labels:
-            target.update("")
-            target.display = False
-            return
         content = Text()
         for index, (label, style) in enumerate(labels):
             if index:

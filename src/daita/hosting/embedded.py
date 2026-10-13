@@ -3831,6 +3831,7 @@ class EmbeddedAgent:
         limit: int,
         offset: int,
         caller_principal_id: str | None = None,
+        newest_first: bool = False,
     ) -> tuple[ArtifactRef, ...]:
         async with self._artifact_publication_lock:
             self._require_open()
@@ -3839,6 +3840,7 @@ class EmbeddedAgent:
                 caller_principal_id=principal_id if self._hosted else None,
                 limit=limit,
                 offset=offset,
+                newest_first=newest_first,
             )
 
     async def read_artifact(

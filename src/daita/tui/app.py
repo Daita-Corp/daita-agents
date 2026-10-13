@@ -15,7 +15,6 @@ from textual.theme import Theme
 from daita import (
     ApprovalDecision,
     ApprovalRequest,
-    GraphState,
     LocalWorkspace,
     LoopExit,
     LoopExitKind,
@@ -63,6 +62,7 @@ from .screens.routines import RoutinesScreen
 from .screens.selection import SelectionScreen
 from .screens.source_edit import SourceEditScreen
 from .widgets.approval import ApprovalPanel
+from .widgets.command_center import ACTIVE_JOB_STATES, CommandSidebar, ResultsDrawer
 from .widgets.composer import (
     ComposerExitRequested,
     ComposerLimitReached,
@@ -157,6 +157,7 @@ class DaitaApp(App[int]):
         self._routine_count = 0
         self._foreground_state = "ready"
         self._inbox_item_count = 0
+        self._source_count = 0
         self._autonomous_run_ids: set[str] = set()
         self._known_inbox_ids: set[str] | None = None
         self._background_refresh_lock = asyncio.Lock()
@@ -407,6 +408,7 @@ class DaitaApp(App[int]):
         self._active_job_count = 0
         self._routine_count = 0
         self._inbox_item_count = 0
+        self._source_count = 0
         self._autonomous_run_ids.clear()
         self._known_inbox_ids = None
 
@@ -423,10 +425,14 @@ class DaitaApp(App[int]):
         ):
             return
         async with self._background_refresh_lock:
+            screen = self.chat()
             jobs = None
             inbox = None
             try:
-                self._routine_count = len(await self.controller.list_routines())
+                routines = await self.controller.list_routines()
+                self._routine_count = len(routines)
+                if screen is not None:
+                    screen.query_one(CommandSidebar).update_routines(routines)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -445,18 +451,14 @@ class DaitaApp(App[int]):
                 pass
             if jobs is not None:
                 self._active_job_count = sum(
-                    item.state
-                    in {
-                        GraphState.QUEUED,
-                        GraphState.ACTIVE,
-                        GraphState.BLOCKED,
-                        GraphState.NEEDS_ATTENTION,
-                        GraphState.CANCEL_REQUESTED,
-                    }
-                    for item in jobs
+                    item.state in ACTIVE_JOB_STATES for item in jobs
                 )
+                if screen is not None:
+                    screen.query_one(CommandSidebar).update_jobs(jobs)
             new_delivery_ids: set[str] = set()
             if inbox is not None:
+                if screen is not None:
+                    screen.query_one(ResultsDrawer).update_inbox(inbox)
                 current_ids = {item.delivery_id for item in inbox}
                 self._inbox_item_count = len(current_ids)
                 if self._known_inbox_ids is None:
@@ -464,6 +466,32 @@ class DaitaApp(App[int]):
                 else:
                     new_delivery_ids = current_ids - self._known_inbox_ids
                     self._known_inbox_ids.update(current_ids)
+            if screen is not None:
+                try:
+                    sources = await self.controller.list_sources()
+                    self._source_count = sum(item.active for item in sources)
+                    screen.query_one(CommandSidebar).update_sources(sources)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    pass
+                screen.query_one(CommandSidebar).update_counts(
+                    sources=self._source_count,
+                    jobs=self._active_job_count,
+                    routines=self._routine_count,
+                )
+                drawer = screen.query_one(ResultsDrawer)
+                if drawer.display:
+                    try:
+                        drawer.update_artifacts(
+                            await self.controller.list_artifacts(
+                                limit=20, offset=0, newest_first=True
+                            )
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass
             await self._refresh_status()
             if notify_new and new_delivery_ids:
                 count = len(new_delivery_ids)
@@ -570,6 +598,7 @@ class DaitaApp(App[int]):
             saved_routines=self._routine_count,
             active_reports=len(self._autonomous_run_ids),
             inbox_items=self._inbox_item_count,
+            source_count=self._source_count,
             too_small=too_small,
         )
         if too_small:
@@ -579,6 +608,35 @@ class DaitaApp(App[int]):
 
     def on_resize(self) -> None:
         self.call_later(self._refresh_status)
+
+    async def open_command_center_item(self, section: str, item_id: str | None) -> None:
+        """Reuse owner screens without dispatching a model command or changing scope."""
+
+        chat = self.chat()
+        if (
+            chat is None
+            or self.controller.agent is None
+            or chat.query_one(ApprovalPanel).active
+            or (self._run_task is not None and not self._run_task.done())
+        ):
+            return
+        try:
+            if section == "sources":
+                await self._manage_sources(initial_source_id=item_id)
+            elif section == "jobs":
+                await self._await_modal(JobsScreen(job_id=item_id))
+            elif section == "routines":
+                await self._await_modal(RoutinesScreen(routine_id=item_id))
+            elif section == "inbox":
+                await self._await_modal(InboxScreen(delivery_id=item_id))
+            elif section == "artifacts":
+                await self._await_modal(ArtifactsScreen(artifact_id=item_id))
+            await self.refresh_background_status(notify_new=False)
+        except (UserInputError, ValueError, RuntimeError, OSError) as error:
+            chat.show_notice(safe_display(str(error), maximum=512))
+        finally:
+            if self.chat() is chat:
+                chat.action_focus_conversation()
 
     def on_composer_submitted(self, event: ComposerSubmitted) -> None:
         # A command may await a modal result. Keep that wait out of the App's
@@ -883,8 +941,9 @@ class DaitaApp(App[int]):
         *,
         notice: str = "",
         notice_warning: bool = False,
+        initial_source_id: str | None = None,
     ) -> None:
-        selected_source_id: str | None = None
+        selected_source_id = initial_source_id
         while True:
             sources = tuple(
                 source
