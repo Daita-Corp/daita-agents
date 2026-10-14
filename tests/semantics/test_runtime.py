@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -698,7 +699,7 @@ async def test_tool_result_evidence_is_valid_and_save_is_recalled_after_reopen(
         "semantic-tool-evidence",
         root=tmp_path,
         model=provider,
-        model_profile=_profile(provider),
+        model_profile=replace(_profile(provider), context_window_tokens=40_000),
         limits=EAGER_LIMITS,
         approval_handler=approve,
         id_factory=_ids(),

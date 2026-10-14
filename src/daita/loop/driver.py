@@ -26,6 +26,7 @@ from ..llm.errors import (
     ToolCatalogLimitExceeded,
     ToolManifestLimitExceeded,
     ToolSurfaceLimitExceeded,
+    capture_provider_attempts,
     interrupted_model_usage,
     with_cancelled_model_usage,
 )
@@ -701,23 +702,48 @@ class AgentLoop:
                     else None
                 )
                 try:
-                    response = await self._model_response(
-                        request,
+                    with capture_provider_attempts(
+                        self._observer is not None
+                    ) as attempt_records:
+                        response = await self._model_response(
+                            request,
+                            run,
+                            model_call_index=step,
+                            deadline=deadline,
+                            run_route=run_route,
+                        )
+                except ModelProviderError as error:
+                    self._emit_model_diagnostic(
                         run,
-                        model_call_index=step,
-                        deadline=deadline,
-                        run_route=run_route,
+                        error.usage,
+                        request,
+                        step,
+                        _duration_ms(model_started) if model_started is not None else 0,
+                        attempt_records,
+                        status="failed",
+                        failure_code=error.code.value,
                     )
-                except ModelProviderError:
                     # Normalized failures carry their own attempt usage below.
                     raise
                 except BaseException as error:
                     # Cancellation and the outer deadline can interrupt a billed
                     # request before the provider returns any terminal usage.
-                    usage = _add_usage(
-                        usage,
-                        interrupted_model_usage(error),
+                    interrupted = interrupted_model_usage(error)
+                    self._emit_model_diagnostic(
+                        run,
+                        interrupted,
+                        request,
+                        step,
+                        _duration_ms(model_started) if model_started is not None else 0,
+                        attempt_records,
+                        status=(
+                            "cancelled"
+                            if isinstance(error, asyncio.CancelledError)
+                            else "failed"
+                        ),
+                        failure_code="interrupted_provider_boundary",
                     )
+                    usage = _add_usage(usage, interrupted)
                     raise
                 model_duration_ms = (
                     _duration_ms(model_started) if model_started is not None else None
@@ -740,6 +766,8 @@ class AgentLoop:
                         response,
                         model_duration_ms,
                         model_call_index=step,
+                        request=request,
+                        attempt_records=attempt_records,
                     )
 
                 budget_reason = self._usage_limit_reason(usage, limits)
@@ -771,6 +799,13 @@ class AgentLoop:
                                         "error": {
                                             "code": budget_reason,
                                             "message": "The run budget prevented execution; this tool was not called.",
+                                            "details": {
+                                                "execution_disposition": "not_dispatched",
+                                                "recovery": {
+                                                    "kind": "terminal",
+                                                    "constraint": budget_reason,
+                                                },
+                                            },
                                         }
                                     },
                                 ),
@@ -848,7 +883,8 @@ class AgentLoop:
                     raise ValueError(
                         "tool runtime must return one ordered result per tool call"
                     )
-                for result in results:
+                for call, result in zip(response.tool_calls, results, strict=True):
+                    session.evidence.observe_progress(call, result)
                     session.evidence.record_outer_result(
                         result.call_id, failed=result.is_error
                     )
@@ -1000,6 +1036,8 @@ class AgentLoop:
                 sensitivity=sensitivity,
             )
             raise
+        finally:
+            session.evidence.clear_progress()
 
     async def _finish(
         self,
@@ -1135,19 +1173,82 @@ class AgentLoop:
         duration_ms: int,
         *,
         model_call_index: int,
+        request: ModelRequest,
+        attempt_records: list[dict[str, object]],
     ) -> None:
+        self._emit_model_diagnostic(
+            run,
+            response.usage,
+            request,
+            model_call_index,
+            duration_ms,
+            attempt_records,
+            status="completed",
+            response=response,
+        )
+
+    def _emit_model_diagnostic(
+        self,
+        run: RunInput,
+        usage: ModelUsage,
+        request: ModelRequest,
+        model_call_index: int,
+        duration_ms: int,
+        attempts: list[dict[str, object]],
+        *,
+        status: str,
+        response: ModelResponse | None = None,
+        failure_code: str | None = None,
+    ) -> None:
+        reported = (
+            usage.total_tokens > 0 or usage.cost_estimate.status.value == "complete"
+        )
         self._emit(
             AgentEventKind.MODEL_COMPLETED,
             run,
             {
-                "provider_id": response.provider_id or self._model.provider_id,
+                "provider_id": (response.provider_id if response is not None else None)
+                or self._model.provider_id,
                 "model_call_index": model_call_index,
-                "has_text": response.text is not None,
-                "has_tool_calls": bool(response.tool_calls),
+                "has_text": response is not None and response.text is not None,
+                "has_tool_calls": response is not None and bool(response.tool_calls),
                 "duration_ms": duration_ms,
-                "input_tokens": response.usage.input_tokens,
-                "context_input_tokens": response.request_input_tokens,
-                "output_tokens": response.usage.output_tokens,
+                "input_tokens": usage.input_tokens,
+                "context_input_tokens": (
+                    None if response is None else response.request_input_tokens
+                ),
+                "output_tokens": usage.output_tokens,
+                "total_tokens": usage.total_tokens,
+                "usage_available": reported,
+                "measured_input_tokens": usage.input_tokens if reported else None,
+                "measured_output_tokens": usage.output_tokens if reported else None,
+                "reasoning_tokens": usage.reasoning_tokens or None,
+                "cache_read_tokens": usage.cache_read_tokens or None,
+                "cache_write_tokens": usage.cache_write_tokens or None,
+                "cost_status": usage.cost_estimate.status.value,
+                "cost_amount_usd": (
+                    None
+                    if usage.cost_estimate.amount_usd is None
+                    else canonical_decimal(usage.cost_estimate.amount_usd)
+                ),
+                "status": status,
+                "failure_code": failure_code,
+                "remaining_tokens_before": request.max_total_tokens,
+                "remaining_cost_before_usd": (
+                    None
+                    if request.max_estimated_cost_usd is None
+                    else canonical_decimal(request.max_estimated_cost_usd)
+                ),
+                "physical_attempts": (
+                    len(attempts) if attempts and status != "cancelled" else None
+                ),
+                "physical_attempts_observed": len(attempts),
+                "attempt_measurements": (
+                    "partial"
+                    if status == "cancelled" and attempts
+                    else ("recorded" if attempts else "unavailable")
+                ),
+                "attempts": attempts,
             },
         )
 

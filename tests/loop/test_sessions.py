@@ -150,3 +150,59 @@ async def test_writer_start_binds_exact_terminal_conversation_predecessor():
             competing_run,
             predecessor=predecessor,
         ).start()
+
+
+def test_progress_observations_are_bounded_isolated_and_ignore_reads_and_uncertainty():
+    from daita.llm.models import ToolCall, ToolResultBlock
+    from daita.loop.session import RunSessionEvidence
+
+    tracker = RunSessionEvidence()
+
+    def failure(call_id):
+        return ToolResultBlock(
+            call_id,
+            is_error=True,
+            output={
+                "error": {
+                    "code": "invalid_argument_value",
+                    "details": {
+                        "execution_disposition": "not_dispatched",
+                        "recovery": {
+                            "kind": "correct_arguments",
+                            "argument": "resources",
+                        },
+                    },
+                }
+            },
+        )
+
+    one = ToolCall("one", "read", {"resources": ("a",)})
+    two = ToolCall("two", "read", {"resources": ("a",)})
+    tracker.observe_progress(one, failure(one.id))
+    assert tracker.progress_warnings == ()
+    tracker.observe_progress(two, failure(two.id))
+    assert len(tracker.progress_warnings) == 1
+    tracker.observe_progress(
+        ToolCall("changed", "read", {"resources": ("b",)}), failure("changed")
+    )
+    assert len(tracker.progress_warnings) == 1
+    for i in range(200):
+        call = ToolCall(str(i), "read", {"resources": (str(i),)})
+        tracker.observe_progress(call, failure(call.id))
+        tracker.observe_progress(call, failure(call.id))
+    assert len(tracker.progress_warnings) <= 8
+    clean = RunSessionEvidence()
+    for i in range(3):
+        call = ToolCall(str(i), "read", {"resources": ("a",)})
+        clean.observe_progress(call, ToolResultBlock(call.id, output={"rows": (1,)}))
+        clean.observe_progress(
+            call,
+            ToolResultBlock(
+                call.id,
+                is_error=True,
+                output={"error": {"code": "timeout", "details": {}}},
+            ),
+        )
+    assert clean.progress_warnings == ()
+    tracker.clear_progress()
+    assert tracker.progress_warnings == ()

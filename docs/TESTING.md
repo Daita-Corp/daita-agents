@@ -164,6 +164,246 @@ that a real external integration passed.
 
 ## Markers and external selection
 
+### Count, recovery, progress and diagnostic qualification
+
+The count/recovery implementation has six deterministic owner contracts: execution
+limits and current local applicability share the registered contract; rejected
+calls carry bounded recovery/disposition evidence; catalog identity discovery
+preserves authorized selection and revisions; `data_count_rows` uses ordinary
+SQL validation and source adapters; repeated permanent failures produce bounded
+run-local guidance; opt-in observation retains per-call and provider-attempt
+diagnostics. The agent-home format remains revision 4. None of these checks alone
+qualifies real-model behavior or an external database.
+
+Run the focused deterministic cases and the ordinary release checks:
+
+```bash
+.venv/bin/python -m pytest tests/capabilities/test_execution_recovery.py \
+  tests/catalog/test_schema_slices.py tests/data/test_row_counts.py \
+  tests/loop/test_sessions.py tests/agent/test_observation.py \
+  tests/llm/test_routing.py tests/acceptance/test_count_recovery.py
+.venv/bin/python -m pytest
+.venv/bin/python -m black --check src tests
+.venv/bin/python -m ruff check --select I .
+.venv/bin/python -m mypy src/daita tests
+.venv/bin/python scripts/check_home_release_contract.py check
+```
+
+`tests/support/count_recovery.py` independently seeds two disposable SQLite
+databases, Juniper and Meridian, with 8 and 38 base tables and 257 total columns.
+The manifest defines counts, totals and winner without disclosing them in model
+prompts. Fixtures include empty tables, shared table names, quoted identifiers,
+field-dependent control values and distractor views. Real SQLite owner cases
+check exact per-resource counts, deduplicated totals, revision bindings, rejected
+batches, and at least 60% canonical-byte reduction for identity discovery versus
+the same full catalog selection. Full-schema discovery remains the default.
+Each count call admits at most four resources, derived from capability policy;
+views require explicit selection. Each batch has one source/statement snapshot.
+Separate batches and sources do not establish a common snapshot or complete
+physical-database coverage. `observed_at` marks execution start and `duration_ms`
+covers execution and validation.
+
+Identity tool results for one explicit source also supply
+`selection.count_selection_ref`. Start a framework-managed count with
+`data_count_rows({"selection_ref": "<returned reference>"})`; continue with
+`data_count_rows({"cursor": "<returned next_cursor>"})` until `next_cursor` is
+null. The original `source_id`/`resource_ids` form remains available. Do not mix
+these forms. `include_views` can be selected on the first call only and stays
+fixed throughout the continuation.
+
+The data domain resolves references from authenticated, earlier successful
+catalog/count results in the exact persisted current-run transcript. Each call
+selects at most the policy's four resources, uses ordinary SQL validation and
+adapter admission, and performs one read statement. It rechecks the whole fixed
+selection against current permissions, frozen run scope and structural/source
+revisions, including resources counted in earlier pages. Unknown, forged,
+cross-run or stale references fail before source dispatch. Native structural
+drift still fails at the adapter boundary. A failed page issues no cursor and
+advances no progress; the framework performs no automatic replay.
+
+`total_rows` remains the current batch total. `progress.total_rows` is the
+code-computed cumulative total for that cursor chain, with exact selected,
+counted and remaining resource counts and authenticated evidence call IDs.
+Repeated reads of a cursor produce a new observation of the same next batch
+without double-counting earlier pages. Branches are independent and their
+totals must not be added together. Progress preserves the sensitivity floor of
+its catalog and count lineage. Count-page provenance lists the exact batch;
+prior evidence remains linked and unchanged in the transcript.
+
+`complete_admitted_base_tables` requires both complete cursor coverage and a
+complete source identity enumeration. Completing a truncated, queried or
+explicitly selected catalog slice reports `complete_catalog_selection` with
+`catalog_enumeration_complete=false`; it cannot establish a whole-source total.
+Selections retain the existing maximum of 50 catalog resources and default
+view exclusion. Separate batch snapshots remain explicit. Cursors are neither
+durable jobs nor resumable runs and cannot extend token, step, time or tool-call
+budgets. With sequential cursors alone, the 38-table source requires ten count
+turns; discovery and the final answer normally bring the journey to twelve
+model requests. That exceeds the existing eight-request efficiency target.
+The target has not been relaxed, and prior live results do not establish this
+interface's token consumption, latency or model adoption.
+
+The row-count owner tests exercise the full 46-table reference/cursor journey,
+scorer-independent totals and coverage, repeat/changed reads, failed-page
+correction, tampered and unknown references, cross-run rejection, catalog and
+native drift, revocation, partial discovery, and terminal step/token limits.
+These scripted provider cases verify framework behavior, not live-model
+reasoning or efficiency. Existing paid campaign evidence predates the cursor
+interface and does not qualify it.
+
+For targeted cursor adoption checks, set
+`DAITA_COUNT_RECOVERY_REQUIRE_CURSORS=1` alongside the ordinary authorization and
+budget gates. Reports include `cursor_usage`: requested and successful selection
+starts/continuations, completed selections, legacy count calls and normalized
+errors. A legacy-only answer cannot pass this adoption gate. L2 field controls
+and L6 deliberately stale native reads are exempt, and their results do not
+establish cursor adoption. A targeted subset or a single repetition remains
+exploratory evidence, not the full qualification campaign.
+
+Budget-pressure answers are scored against the independently measured table
+subtotal and coverage, including ordinary lower-bound wording and Markdown
+tables. A claimed winner requires sufficient measured evidence: its lower bound
+must exceed every other source's complete total. Scoring must not require a
+particular word such as "remaining" when "30 remain" or "counted so far" says
+the same thing. Original failed reports are retained and offline scorer reviews
+are labeled separately; corrected scoring does not change recorded usage.
+
+API and Codex campaigns share the read-evaluation owner's provider-failure
+classification. Token/cost budget termination is distinct from provider failure
+and cannot trigger a two-provider-failure stop. Actual usage is still charged
+without clipping; unknown subscription usage retains its reservation. A case
+blocked before provider creation is unperformed evidence, never a successful
+live run.
+
+The dedicated live module uses the public agent, production runtime and reviewed
+provider factory. Collection performs no credential resolution or service I/O:
+
+```bash
+.venv/bin/python -m pytest tests/live/acceptance/test_count_recovery.py \
+  --collect-only -o addopts="--tb=short -q --strict-markers"
+```
+
+With the default three repetitions and one API profile, collection contains 81
+cases: 27 API/SQLite, 27 API/PostgreSQL and 27 actual Codex/SQLite cases. Their
+authorization gates are independent. A primary campaign has nine natural L1
+comparisons (three paraphrases), then three each of L2 filtered field controls,
+L3 unavailable durable recovery, L4 repeated-failure correction, L5 restricted
+scope, L6 real structural drift and L7 four-step budget pressure. L1/L2/L5/L7
+are unscripted real-model journeys. L3/L4/L6 record a synthetic model prefix that
+invokes the real runtime and then yields to a real model in the same transcript;
+those turns are excluded from unforced efficiency evidence. The ordinary
+SQLite adapter suite separately verifies controlled timeout and cleanup.
+
+Only after explicit authorization, supply private credentials to the process
+and a fresh absolute report directory outside the repository. Do not load `.env`
+or enable gates during collection. API credentials use the existing
+`DAITA_STAGE_B_BENCHMARK_<PROVIDER>_API_KEY` or
+`DAITA_STAGE_B_BENCHMARK_LLM_API_KEY` helper. Reviewed tool-capable API profiles
+are selected by `DAITA_STAGE_B_BENCHMARK_MODEL_IDS` (default
+`openai:gpt-5.6-terra`). For an authorized primary API/SQLite campaign:
+
+```bash
+DAITA_RUN_LIVE_COUNT_RECOVERY=1 \
+DAITA_COUNT_RECOVERY_REPEATS=3 \
+DAITA_STAGE_B_BENCHMARK_MAX_COST_USD=0.50 \
+DAITA_COUNT_RECOVERY_TOTAL_COST_USD=15.00 \
+DAITA_COUNT_RECOVERY_REPORT_DIR=/private/tmp/daita-count-recovery-candidate \
+.venv/bin/python -m pytest tests/live/acceptance/test_count_recovery.py \
+  -k api_sqlite -o addopts="--tb=short -q --strict-markers" \
+  --junitxml=/private/tmp/daita-count-recovery-candidate.xml -o junit_family=xunit1
+```
+
+Both API dollar budgets must be explicitly supplied and positive. Runs reserve
+the full per-run ceiling before dispatch; actual reported consumption is charged,
+and missing cost retains the reservation. Serial execution shares aggregate
+reservations and stops after two consecutive provider failures. `xdist` is
+rejected. Normal runs allow 24 steps, 100,000 cumulative tokens and 300 seconds,
+with a 1,536-token output allowance; L7 allows four steps. L3/L4 disable graph
+registration through existing host configuration while a test-only decorator
+narrows each canonical paid request to its remaining allowance. It cannot enlarge
+authorization. Repetitions default to three and accept 1–5; a smaller exploratory
+campaign does not establish the documented 27-run adoption campaign. Add another
+model family only under a separately authorized budget after the primary is stable.
+
+`DAITA_COUNT_RECOVERY_OUTPUT_TOKENS` optionally selects a 256–8,192 token
+response allowance (default 1,536), still bounded by the reviewed profile and
+remaining paid/run admission. The 46-table journey can require more than 1,536
+output tokens to emit parallel calls containing full resource IDs. A 4,096-token
+campaign is a distinct recorded setting; retain output-limited failures and do
+not compare its improvement ratio to a baseline with another allowance. This
+setting does not change the 50,000/100,000 token efficiency gates or per-run
+dollar ceiling. Count results retain exact source IDs and catalog source labels
+to support correct association of parallel batches.
+
+PostgreSQL additionally requires `DAITA_RUN_COUNT_RECOVERY_POSTGRES=1`, the API
+gate/budgets, `DAITA_COUNT_RECOVERY_POSTGRES_PORT`, and explicit
+`DAITA_COUNT_RECOVERY_POSTGRES_ADMIN_PASSWORD` and
+`DAITA_COUNT_RECOVERY_POSTGRES_READ_PASSWORD`. Select `-k api_postgresql` and a
+fresh report directory. The fixture only targets `127.0.0.1` and the precreated
+disposable database `daita_count_recovery_fixture`, with administrator `postgres`
+and a precreated nonsuperuser `daita_count_reader`. Setup seeds two isolated
+schemas, grants read-only access, verifies seed counts and removes those schemas
+on completion or setup failure. This cohort proves the real PostgreSQL adapter
+over two logical sources in one disposable database; it does not claim a common
+snapshot across separate physical databases. Never point it at customer data.
+
+The same explicit PostgreSQL fixture gate/credentials can separately run
+native execution without a model call:
+
+```bash
+.venv/bin/python -m pytest tests/live/data/test_row_counts.py \
+  -o addopts="--tb=short -q --strict-markers"
+```
+
+It checks all 46 independently seeded table counts, exact revisions and totals,
+quoted/empty tables, batch bounds, structural drift and cleanup. Its private
+report explicitly states `native_postgresql_only` and `llm_qualified=false`.
+Passing it proves native adapter behavior, never PostgreSQL/LLM qualification.
+
+Actual subscription transport qualification requires
+`DAITA_RUN_COUNT_RECOVERY_CODEX=1`, `DAITA_COUNT_RECOVERY_CODEX_MODEL_ID` with an
+explicit reviewed tool-capable `codex:` profile,
+`DAITA_COUNT_RECOVERY_CODEX_CREDENTIAL`, and a positive
+`DAITA_COUNT_RECOVERY_CODEX_TOTAL_TOKENS`. Select `-k codex_sqlite` and a fresh
+report directory. The harness reserves 100,000 tokens per next run, retaining
+that allowance for unknown consumption; a 27-run campaign needs up to 2,700,000
+tokens. This uses the actual Codex provider, never an API substitute. Dollar
+pricing is unavailable; the adapter's native preflight input/output limitations
+remain explicit. Outer step/token/time limits still apply.
+
+Private JSON reports retain fixture and candidate commit/diff identities,
+model/transport/settings, scope, calls/results, source-dispatch observations,
+independent numerical/coverage scores, usage completeness, timing, bytes,
+seeded turns, injected faults, terminal reason and cleanup. The JSONL file named
+by `diagnostics_path` retains logical model calls, measured provider attempts
+where available, reasoning/cache subsets, tool-result bytes and remaining
+allowances. Missing attempt/cache/cost measurements are unavailable, never
+measured zero. Diagnostics are best effort and contain no prompts, result
+payloads, credentials or opaque reasoning. JSON and JSONL files have mode 0600;
+the report directory requires 0700. Setup failures retain a report and JUnit
+`count_recovery_evidence` references its path. `campaign-summary.json` separates
+cohorts and unperformed gates. Private evidence is not a public CI artifact.
+
+Qualification requires every selected case's independent functional oracle and
+complete live usage. L1 additionally requires median cumulative tokens at most
+50,000, maximum at most 100,000, median logical requests at most eight and at
+least 60% catalog-byte reduction. L4 requires correction or a truthful blocker
+within two real model responses. Scope, transcript ordering, no-replay and hard
+budgets remain mandatory. The conservative answer scorer accepts source-labelled
+prose/tables and comma-formatted numbers; ambiguous parsing is unqualified. Its
+coverage scorer authenticates count results or simple unfiltered single-resource
+`COUNT(*)` queries. Other valid SQL aggregate shapes require scorer extension
+before they can qualify, rather than being inferred correct from model text.
+
+Compare baseline/candidate reports only with matching fixture digest, model
+profile/output allowance, permissions, transport and run settings, retaining
+all raw attempts. Historical incident numbers and API/subscription comparisons
+cannot establish an improvement ratio. No gate or target may be relaxed merely
+to turn a failure green. Skips, mocks, missing cases/measurements, exhausted
+campaign budgets, setup/provider failures and incomplete runs never count as
+successful live qualification. The implemented harness and deterministic checks
+are separate from live-qualified API, PostgreSQL and Codex evidence.
+
 `unit`, `contract`, `integration`, and `acceptance` describe the test level.
 Execution requirements are separate:
 

@@ -654,6 +654,7 @@ class PostgreSQLQueryBackend:
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
+        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
     ) -> PostgreSQLReadResult:
         if (
             not isinstance(max_rows, int)
@@ -685,6 +686,16 @@ class PostgreSQLQueryBackend:
                 "The selected source is not a PostgreSQL source.",
             )
         resources = await self._catalog.resource_schemas(agent_id, source_id)
+        if expected_resource_revisions is not None:
+            current = {item.resource_id: item.revision for item in resources}
+            if any(
+                current.get(resource_id) != revision
+                for resource_id, revision in expected_resource_revisions
+            ):
+                raise PostgreSQLQueryError(
+                    "count_binding_stale",
+                    "The bound count resource revision changed before source dispatch.",
+                )
         try:
             readable = await self._catalog.readable_resource_ids(
                 agent_id,

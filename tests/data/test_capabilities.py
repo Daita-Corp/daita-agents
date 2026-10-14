@@ -223,6 +223,9 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
     catalog_bundle = catalog_declarations(
         "agent-relational", cast(CatalogProjection, catalog)
     )
+    from daita.domains.data.capabilities import data_count_rows_capability_declarations
+
+    count_bundle = data_count_rows_capability_declarations()
     query_bundle = data_query_capability_declarations()
     export_bundle = data_export_tabular_capability_declarations()
     preview_bundle = relational_update_preview_capability_declarations()
@@ -237,6 +240,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
     capabilities = (
         *catalog_bundle.capabilities,
         *query_bundle.capabilities,
+        *count_bundle.capabilities,
         *export_bundle.capabilities,
         *preview_bundle.capabilities,
         *update_bundle.capabilities,
@@ -252,6 +256,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
             tool_views=(
                 *catalog_bundle.tool_views,
                 *query_bundle.tool_views,
+                *count_bundle.tool_views,
                 *export_bundle.tool_views,
                 *preview_bundle.tool_views,
                 *update_bundle.tool_views,
@@ -555,6 +560,43 @@ async def test_data_query_inline_byte_limit_reports_truncation() -> None:
     assert isinstance(byte_limit, int)
     assert 0 < returned_rows < len(rows)
     assert utf8_bytes <= byte_limit
+
+
+@pytest.mark.parametrize("adapter_id", ["sqlite", "postgresql"])
+@pytest.mark.parametrize("count", [0, 2**63 - 1, -1, True, 1.5])
+async def test_row_count_normalization_preserves_large_integers_and_rejects_estimates(
+    adapter_id, count
+):
+    from daita.domains.data.capabilities import DataCountRowsExecutor
+
+    sqlite = _ReadBackend("sqlite", ({"count_0": count},))
+    postgres = _ReadBackend("postgresql", ({"count_0": count},))
+    executor = DataCountRowsExecutor("agent-count", sqlite, postgres)
+    resource_id = f"resource-{adapter_id}"
+    request = ToolExecution(
+        run_id="run-count",
+        call_id="count",
+        capability_id="data.count_rows",
+        arguments={
+            "source_id": f"source-{adapter_id}",
+            "resource_ids": (resource_id,),
+            "_resource_revisions": ((resource_id, "sha256:" + "6" * 64),),
+            "sql": 'SELECT COUNT(*) AS count_0 FROM "public"."items"',
+            "_adapter_id": adapter_id,
+        },
+    )
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        with pytest.raises(ValueError, match="exact non-negative integer"):
+            await executor.execute(request)
+    else:
+        output = await executor.execute(request)
+        assert output.data["total_rows"] == count
+        assert (
+            cast(tuple[Mapping[str, object], ...], output.data["counts"])[0]["rows"]
+            == count
+        )
+        assert output.data["coverage"] == "complete_requested_batch"
+    assert sqlite.calls + postgres.calls == 1
 
 
 class _ExportBackend:

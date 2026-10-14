@@ -212,6 +212,11 @@ class CatalogSchemaExecutor:
             CatalogSchemaRequest(
                 agent_id=self._agent_id,
                 query=query,
+                detail=(
+                    _string_argument(request, "detail")
+                    if "detail" in request.arguments
+                    else "schema"
+                ),
                 resource_ids=_string_tuple_argument(
                     request,
                     "resource_ids",
@@ -355,11 +360,19 @@ def catalog_declarations(
         id=CATALOG_SCHEMA_CAPABILITY_ID,
         description=(
             "SQL schema, bridges, paths, and exact join fields. Provide a non-empty "
-            "query or resource_ids. Do not use with catalog_traverse."
+            "query or resource_ids for schemas. Use detail=identity with an exact source_id "
+            "to enumerate admitted tabular identities without columns; "
+            "its selection.count_selection_ref can feed an available data_count_rows tool. "
+            "detail=schema (default) supplies fields and joins. Do not use with catalog_traverse."
         ),
         input_schema={
             "type": "object",
             "properties": {
+                "detail": {
+                    "type": "string",
+                    "enum": ["identity", "schema"],
+                    "default": "schema",
+                },
                 "query": {
                     "type": "string",
                     "minLength": 1,

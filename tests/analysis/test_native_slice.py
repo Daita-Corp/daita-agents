@@ -870,7 +870,7 @@ async def test_batch_uses_distinct_source_lanes_and_rechecks_revoked_authority(
         "batch-authority",
         root=tmp_path,
         model=model,
-        model_profile=_profile(model),
+        model_profile=replace(_profile(model), context_window_tokens=64_000),
         workspace=workspace_for(tmp_path),
     )
     for index in range(2):
@@ -927,7 +927,7 @@ async def test_batch_uses_distinct_source_lanes_and_rechecks_revoked_authority(
         )
         release.set()
         result = await asyncio.wait_for(task, timeout=5)
-        assert result.kind is LoopExitKind.COMPLETED
+        assert result.kind is LoopExitKind.COMPLETED, result.reason
         transcript = await agent.transcript(result.run_id)
         cell = next(
             output for call, output in transcript.tool_pairs if call.id == "batch"

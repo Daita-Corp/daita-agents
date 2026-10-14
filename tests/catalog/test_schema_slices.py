@@ -945,3 +945,64 @@ async def test_schema_and_structural_search_order_ignore_catalog_insertion_order
     finally:
         await first_agent.close()
         await second_agent.close()
+
+
+async def test_identity_projection_preserves_selection_revision_and_coverage(tmp_path):
+    database = tmp_path / "identity.sqlite"
+    _fixture_database(database)
+    agent = await Agent.create(
+        "identity-catalog", root=tmp_path, workspace=workspace_for(tmp_path)
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        service = agent._embedded._catalog_service
+        ids = tuple(
+            r.id for r in await agent.list_catalog_resources(source_id=source.id)
+        )
+        full = await service.schema_slice(
+            CatalogSchemaRequest(agent.id, resource_ids=ids, limit=50)
+        )
+        compact = await service.schema_slice(
+            CatalogSchemaRequest(
+                agent.id, resource_ids=ids, limit=50, detail="identity"
+            )
+        )
+        assert [
+            (r["resource_id"], r["revision"])
+            for r in _mapping_sequence(full["resources"])
+        ] == [
+            (r["resource_id"], r["revision"])
+            for r in _mapping_sequence(compact["resources"])
+        ]
+        assert all(
+            "columns" not in r and "structural_facts" not in r
+            for r in _mapping_sequence(compact["resources"])
+        )
+        assert compact["relationships"] == () and compact["paths"] == ()
+        assert compact["total_matches"] == full["total_matches"] == 8
+        assert (
+            _mapping(compact["selection"])["coverage"] == "admitted_catalog_selection"
+        )
+        assert _mapping_sequence(compact["sources"])[0]["observed_at"]
+        enumerated = await service.schema_slice(
+            CatalogSchemaRequest(
+                agent.id, source_id=source.id, limit=50, detail="identity"
+            )
+        )
+        assert enumerated["resources"] == compact["resources"]
+        scoped = await service.schema_slice(
+            CatalogSchemaRequest(
+                agent.id, source_id=source.id, limit=50, detail="identity"
+            ),
+            readable_resource_ids=frozenset(ids[:1]),
+        )
+        assert {r["resource_id"] for r in _mapping_sequence(scoped["resources"])} == {
+            ids[0]
+        }
+        partial = await service.schema_slice(
+            CatalogSchemaRequest(agent.id, resource_ids=ids, limit=2, detail="identity")
+        )
+        assert _mapping(partial["truncation"])["resources"] is True
+        assert len(_mapping_sequence(partial["resources"])) == 2
+    finally:
+        await agent.close()

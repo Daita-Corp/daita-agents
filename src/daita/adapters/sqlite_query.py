@@ -79,6 +79,7 @@ class SQLiteQueryBackend:
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
+        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
     ) -> SQLiteReadResult:
         registration = await self._sources.load_source(agent_id, source_id)
         if registration is None or not registration.active:
@@ -92,6 +93,16 @@ class SQLiteQueryBackend:
                 "The selected source is not a SQLite source.",
             )
         resources = await self._catalog.resource_schemas(agent_id, source_id)
+        if expected_resource_revisions is not None:
+            current = {item.resource_id: item.revision for item in resources}
+            if any(
+                current.get(resource_id) != revision
+                for resource_id, revision in expected_resource_revisions
+            ):
+                raise SQLiteQueryError(
+                    "count_binding_stale",
+                    "The bound count resource revision changed before source dispatch.",
+                )
         try:
             readable = await self._catalog.readable_resource_ids(
                 agent_id,
@@ -347,6 +358,7 @@ async def _run_query(
     expected_schema_version: int,
     max_rows: int,
     max_bytes: int,
+    timeout_seconds: float = 5.0,
 ) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...], str]:
     cancellation = threading.Event()
     worker = asyncio.create_task(
@@ -359,6 +371,7 @@ async def _run_query(
             max_rows,
             max_bytes,
             cancellation,
+            timeout_seconds,
         )
     )
     try:
@@ -571,7 +584,9 @@ def _run_query_sync(
     max_rows: int,
     max_bytes: int,
     cancellation: threading.Event,
+    timeout_seconds: float = 5.0,
 ) -> tuple[tuple[str, ...], tuple[Mapping[str, object], ...], str]:
+    deadline = time.monotonic() + timeout_seconds
     connection: sqlite3.Connection | None = None
     admitted_descriptor: int | None = None
     try:
@@ -580,7 +595,10 @@ def _run_query_sync(
         connection.execute("PRAGMA trusted_schema = OFF")
         connection.execute("PRAGMA foreign_keys = ON")
         connection.enable_load_extension(False)
-        connection.set_progress_handler(lambda: 1 if cancellation.is_set() else 0, 500)
+        deadline = time.monotonic() + timeout_seconds
+        connection.set_progress_handler(
+            lambda: int(cancellation.is_set() or time.monotonic() >= deadline), 500
+        )
         if hasattr(connection, "setlimit"):
             connection.setlimit(
                 sqlite3.SQLITE_LIMIT_LENGTH,
@@ -612,6 +630,11 @@ def _run_query_sync(
     except SQLiteQueryError:
         raise
     except sqlite3.Error as error:
+        if time.monotonic() >= deadline:
+            raise SQLiteQueryError(
+                "sqlite_query_timeout",
+                "The bounded SQLite read exceeded its statement deadline.",
+            ) from None
         raise SQLiteQueryError(
             "sqlite_query_failed",
             "SQLite could not complete the bounded read.",

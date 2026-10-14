@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Literal, Protocol
 
-from ._json import FrozenJsonObject, FrozenJsonValue
+from ._json import FrozenJsonObject, FrozenJsonValue, canonical_json
 
 _MAX_IDENTIFIER_CHARACTERS = 256
 _MAX_DATA_KEY_CHARACTERS = 128
@@ -71,6 +73,47 @@ class AgentObserver(Protocol):
     def __call__(self, event: AgentEvent, /) -> None: ...
 
 
+class PrivateDiagnosticSink:
+    """Opt-in payload-free JSONL outside the source repository; no home storage."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path)
+        if not self.path.is_absolute():
+            raise ValueError("diagnostic path must be absolute")
+        repository = Path(__file__).resolve().parents[2]
+        if (
+            repository / "pyproject.toml"
+        ).exists() and self.path.resolve().is_relative_to(repository):
+            raise ValueError("diagnostics must remain outside the repository")
+        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        os.close(descriptor)
+
+    def __call__(self, event: AgentEvent, /) -> None:
+        if event.kind not in {
+            AgentEventKind.RUN_STARTED,
+            AgentEventKind.MODEL_COMPLETED,
+            AgentEventKind.TOOL_COMPLETED,
+            AgentEventKind.RUN_COMPLETED,
+        }:
+            return
+        record = {
+            "kind": event.kind.value,
+            "occurred_at": event.occurred_at.isoformat(),
+            "run_id": event.run_id,
+            "conversation_id": event.conversation_id,
+            "run_origin": event.run_origin,
+            "data": event.data,
+        }
+        descriptor = os.open(
+            self.path, os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            os.write(descriptor, (canonical_json(record) + "\n").encode())
+        finally:
+            os.close(descriptor)
+
+
 def _emit_safely(observer: AgentObserver | None, event: AgentEvent) -> None:
     if observer is None:
         return
@@ -120,4 +163,4 @@ def _validate_data(value: FrozenJsonValue, *, key: str | None = None) -> None:
         raise ValueError("event data strings must be bounded")
 
 
-__all__ = ["AgentEvent", "AgentEventKind", "AgentObserver"]
+__all__ = ["AgentEvent", "AgentEventKind", "AgentObserver", "PrivateDiagnosticSink"]

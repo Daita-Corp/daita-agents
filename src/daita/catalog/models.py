@@ -1226,9 +1226,12 @@ class CatalogSchemaRequest:
     include_relationships: bool = True
     max_join_depth: int = CATALOG_SCHEMA_DEFAULT_JOIN_DEPTH
     relationship_limit: int = CATALOG_SCHEMA_MAX_RELATIONSHIPS
+    detail: str = "schema"
 
     def __post_init__(self) -> None:
         _required_text(self.agent_id, "catalog schema agent_id")
+        if self.detail not in {"identity", "schema"}:
+            raise ValueError("catalog detail must be identity or schema")
         if self.query is not None:
             if not isinstance(self.query, str):
                 raise TypeError("catalog schema query must be a string")
@@ -1250,7 +1253,11 @@ class CatalogSchemaRequest:
             "catalog schema source_id",
             maximum=CATALOG_SOURCE_ID_MAX_CHARACTERS,
         )
-        if self.query is None and not resource_ids:
+        if (
+            self.query is None
+            and not resource_ids
+            and not (self.detail == "identity" and self.source_id is not None)
+        ):
             raise ValueError(
                 "catalog schema requires a non-empty query or explicit resource IDs"
             )

@@ -147,7 +147,7 @@ async def test_mcp_read_evidence_reaches_follow_up_after_restart(tmp_path, shape
             )
         )
         first = await agent.run("Read the page title, then acknowledge completion.")
-        assert first.kind is LoopExitKind.COMPLETED, first.reason
+        assert first.kind is LoopExitKind.COMPLETED
         durable = await agent.transcript(first.run_id)
         assert value not in (first.final_text or "")
         await agent.close()
@@ -362,7 +362,7 @@ async def test_catalog_clarification_is_an_ordinary_completed_turn(tmp_path):
         "ordinary-clarification",
         root=tmp_path,
         model=provider,
-        model_profile=_profile(provider),
+        model_profile=replace(_profile(provider), context_window_tokens=32_000),
         workspace=workspace_for(tmp_path),
     )
     try:

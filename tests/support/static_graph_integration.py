@@ -147,6 +147,7 @@ class ObservedReadBackend:
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
+        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
     ) -> SqlReadResult:
         del parameters
         assert agent_id == AGENT_ID

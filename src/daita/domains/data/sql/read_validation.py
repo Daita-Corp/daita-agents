@@ -909,3 +909,25 @@ def _missing_column_issue(
             "candidates": candidates,
         },
     )
+
+
+def render_row_counts(resources: tuple[ResourceSchema, ...]) -> str:
+    """Render only catalog identities; the ordinary SQL validator admits the result."""
+    selections = []
+    for index, resource in enumerate(resources):
+        qualified = next(
+            (
+                alias.partition(".")
+                for alias in resource.aliases
+                if "." in alias and "\x00" not in alias
+            ),
+            None,
+        )
+        if qualified is None or qualified[2] != resource.name:
+            raise ValueError("count resource lacks an exact qualified catalog identity")
+        schema, _, table = qualified
+        quote = lambda value: '"' + value.replace('"', '""') + '"'
+        selections.append(
+            f"(SELECT COUNT(*) FROM {quote(schema)}.{quote(table)}) AS count_{index}"
+        )
+    return "SELECT " + ", ".join(selections)

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from time import monotonic
 from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject, canonical_json
@@ -27,7 +30,9 @@ from ...capabilities import (
     ToolTextTrust,
     ToolView,
 )
+from ...catalog.models import CATALOG_SCHEMA_MAX_RESOURCE_IDS
 from .controller import (
+    DATA_COUNT_ROWS_CAPABILITY_ID,
     DATA_QUERY_CAPABILITY_ID,
     DATA_QUERY_EVIDENCE_KIND,
     RELATIONAL_UPDATE_CAPABILITY_ID,
@@ -49,6 +54,15 @@ from .sql.relational_upsert import RelationalUpsertIntent
 
 DATA_QUERY_EXECUTOR_ID = "data.query.executor"
 DATA_QUERY_TOOL_NAME = "data_query"
+COUNT_EXECUTION_POLICY = ExecutionAdmissionPolicy(
+    shape="relational_counts",
+    inline_eligible=True,
+    graph_v1_eligible=False,
+    target_count_argument="resource_ids",
+    inline_max_targets=4,
+    graph_max_targets=0,
+)
+
 RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
 RELATIONAL_UPDATE_PREVIEW_TOOL_NAME = "data_preview_update_rows"
 RELATIONAL_UPDATE_EXECUTOR_ID = "data.update_rows.executor"
@@ -413,6 +427,7 @@ class SqlReadBackend(Protocol):
         parameters: tuple[object, ...],
         max_rows: int,
         max_bytes: int,
+        expected_resource_revisions: tuple[tuple[str, str], ...] | None = None,
     ) -> SqlReadResult: ...
 
 
@@ -500,14 +515,26 @@ class DataQueryExecutor:
         backend = self._backends.get(adapter_id)
         if backend is None:
             raise ValueError("relational query adapter binding is unsupported")
-        result = await backend.execute_read(
-            agent_id=self._agent_id,
-            source_id=source_id,
-            sql=sql,
-            parameters=parameters,
-            max_rows=self._max_rows,
-            max_bytes=self._max_bytes,
-        )
+        bindings = request.arguments.get("_resource_revisions")
+        if isinstance(bindings, tuple):
+            result = await backend.execute_read(
+                agent_id=self._agent_id,
+                source_id=source_id,
+                sql=sql,
+                parameters=parameters,
+                max_rows=self._max_rows,
+                max_bytes=self._max_bytes,
+                expected_resource_revisions=cast(tuple[tuple[str, str], ...], bindings),
+            )
+        else:
+            result = await backend.execute_read(
+                agent_id=self._agent_id,
+                source_id=source_id,
+                sql=sql,
+                parameters=parameters,
+                max_rows=self._max_rows,
+                max_bytes=self._max_bytes,
+            )
         expected_type = (
             PostgreSQLReadResult if adapter_id == "postgresql" else SQLiteReadResult
         )
@@ -520,6 +547,227 @@ class DataQueryExecutor:
         data = result.tool_data().to_dict()
         data["adapter_id"] = adapter_id
         return ToolOutput(kind=DATA_QUERY_EVIDENCE_KIND, data=data)
+
+
+class DataCountRowsExecutor:
+    """One atomic bounded read statement over exact admitted catalog identities."""
+
+    executor_id = "data.count_rows.executor"
+
+    def __init__(
+        self,
+        agent_id: str,
+        sqlite_backend: SQLiteReadBackend,
+        postgresql_backend: PostgreSQLReadBackend,
+    ) -> None:
+        self._query = DataQueryExecutor(
+            agent_id, sqlite_backend, postgresql_backend, max_rows=1, max_bytes=16_384
+        )
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        started = monotonic()
+        observed_at = datetime.now(UTC).isoformat()
+        result = await self._query.execute(request)
+        data = result.data
+        rows = cast(tuple[FrozenJsonObject, ...], data["rows"])
+        ids = request.arguments["resource_ids"]
+        revisions = request.arguments["_resource_revisions"]
+        assert isinstance(ids, tuple) and isinstance(revisions, tuple)
+        expected = dict(cast(tuple[tuple[str, str], ...], revisions))
+        actual = {
+            item["resource_id"]: item["revision"]
+            for item in cast(tuple[FrozenJsonObject, ...], data["resource_revisions"])
+        }
+        if actual != expected or data["truncated"] or len(rows) != 1:
+            raise ValueError("count result does not cover the exact bound batch")
+        row = rows[0]
+        counts = []
+        for index, resource_id in enumerate(ids):
+            value = row[f"count_{index}"]
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(
+                    "count backend did not return an exact non-negative integer"
+                )
+            counts.append(
+                {
+                    "resource_id": resource_id,
+                    "revision": expected[resource_id],
+                    "rows": value,
+                }
+            )
+        return ToolOutput(
+            kind="data.row_counts",
+            data={
+                "source_id": data["source_id"],
+                "source_name": request.arguments.get("_source_name", data["source_id"]),
+                "source_revision": data["source_revision"],
+                "adapter_id": data["adapter_id"],
+                "counts": counts,
+                "total_rows": sum(item["rows"] for item in counts),
+                "requested_resources": len(ids),
+                "counted_resources": len(counts),
+                "coverage": "complete_requested_batch",
+                "scope_limitation": "Selected admitted resources only; not the entire physical database. Views, when selected, may overlap base tables.",
+                "snapshot_scope": "one_source_one_statement",
+                "observed_at": observed_at,
+                "duration_ms": int((monotonic() - started) * 1000),
+                "sql_fingerprint": data["sql_fingerprint"],
+                "trust_classification": "untrusted_external_data",
+            },
+        )
+
+
+def data_count_rows_capability_declarations() -> CapabilityDeclarations:
+    properties = dict(
+        cast(
+            Mapping[str, object],
+            data_query_capability_declarations()
+            .capabilities[0]
+            .input_schema["properties"],
+        )
+    )
+    properties.pop("sql")
+    properties.pop("parameters")
+    properties["include_views"] = {"type": "boolean", "default": False}
+    properties["selection_ref"] = {"type": "string", "pattern": "^sel_[0-9a-f]{16}$"}
+    properties["cursor"] = {"type": "string", "pattern": "^cnt_[0-9a-f]{16}$"}
+    description = (
+        "Count rows exactly in a unique bounded set of admitted base tables of one source. "
+        "Prefer selection_ref from catalog_schema detail=identity for one source; then pass "
+        "only the returned next_cursor as cursor until it is null. Code selects each bounded "
+        "batch and returns cumulative totals and fixed-selection coverage in progress. "
+        "Explicit source_id/resource_ids remains available for individual batches. "
+        "Columns and SQL are not required. Sum table rows, not unique entities. A batch is atomic; "
+        "different batches/sources do not share a snapshot. Views require include_views=true."
+    )
+    fields = {
+        "source_id": "string",
+        "source_name": "string",
+        "source_revision": "string",
+        "adapter_id": "string",
+        "counts": "array",
+        "total_rows": "integer",
+        "requested_resources": "integer",
+        "counted_resources": "integer",
+        "coverage": "string",
+        "scope_limitation": "string",
+        "snapshot_scope": "string",
+        "observed_at": "string",
+        "duration_ms": "integer",
+        "sql_fingerprint": "string",
+        "trust_classification": "string",
+    }
+    capability = Capability(
+        id=DATA_COUNT_ROWS_CAPABILITY_ID,
+        description=description,
+        input_schema={
+            "type": "object",
+            "properties": properties,
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {key: properties[key] for key in keys},
+                    "required": required,
+                    "additionalProperties": False,
+                }
+                for keys, required in (
+                    (
+                        ("source_id", "resource_ids", "include_views"),
+                        ["source_id", "resource_ids"],
+                    ),
+                    (("selection_ref", "include_views"), ["selection_ref"]),
+                    (("cursor",), ["cursor"]),
+                )
+            ],
+            "additionalProperties": False,
+        },
+        output_kind="data.row_counts",
+        output_schema={
+            "type": "object",
+            "properties": {
+                **{key: {"type": value} for key, value in fields.items()},
+                "selection_ref": properties["selection_ref"],
+                "next_cursor": {
+                    "type": ["string", "null"],
+                    "pattern": "^cnt_[0-9a-f]{16}$",
+                },
+                "progress": {
+                    "type": "object",
+                    "properties": {
+                        **{
+                            key: {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+                            }
+                            for key in (
+                                "selected_resources",
+                                "counted_resources",
+                                "remaining_resources",
+                            )
+                        },
+                        "total_rows": {"type": "integer", "minimum": 0},
+                        "coverage": {
+                            "type": "string",
+                            "enum": [
+                                "complete_admitted_base_tables",
+                                "complete_catalog_selection",
+                                "partial_catalog_selection",
+                            ],
+                        },
+                        "catalog_enumeration_complete": {"type": "boolean"},
+                        "snapshot_scope": {
+                            "type": "string",
+                            "enum": ["separate_batch_snapshots"],
+                        },
+                        "evidence_call_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+                            "uniqueItems": True,
+                        },
+                    },
+                    "required": [
+                        "selected_resources",
+                        "counted_resources",
+                        "remaining_resources",
+                        "total_rows",
+                        "coverage",
+                        "catalog_enumeration_complete",
+                        "snapshot_scope",
+                        "evidence_call_ids",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "required": list(fields),
+            "additionalProperties": False,
+        },
+        executor_id=DataCountRowsExecutor.executor_id,
+        access_mode=AccessMode.READ,
+        execution_admission_policy=COUNT_EXECUTION_POLICY,
+    )
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(capability,),
+        executor_ids=(capability.executor_id,),
+        tool_views=(
+            ToolView(
+                "data_count_rows",
+                capability.id,
+                description,
+                ToolPresentation(
+                    ToolboxId.SOURCES,
+                    ToolLoadMode.ON_DEMAND,
+                    ToolTextTrust.CODE,
+                    "Count exact rows across admitted tables without loading column schemas.",
+                    "Compare scoped database/table totals; use identity selection references and count cursors.",
+                    ("count", "rows", "records", "database", "tables", "total"),
+                ),
+            ),
+        ),
+    )
 
 
 class RelationalUpdatePreviewExecutor:
@@ -635,7 +883,15 @@ def data_query_declarations(
     executor = DataQueryExecutor(agent_id, sqlite_backend, postgresql_backend)
     declarations = data_query_capability_declarations()
     return DataQueryDeclarations(
-        declarations.capabilities, (executor,), declarations.tool_views
+        (
+            *declarations.capabilities,
+            *data_count_rows_capability_declarations().capabilities,
+        ),
+        (executor, DataCountRowsExecutor(agent_id, sqlite_backend, postgresql_backend)),
+        (
+            *declarations.tool_views,
+            *data_count_rows_capability_declarations().tool_views,
+        ),
     )
 
 

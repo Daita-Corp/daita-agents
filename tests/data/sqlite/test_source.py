@@ -287,7 +287,7 @@ async def test_public_agent_queries_sqlite_and_reopens_exact_transcript(tmp_path
     provider = MockModelProvider(())
     profile = ModelProfile(
         id=provider.provider_id,
-        context_window_tokens=22_000,
+        context_window_tokens=32_000,
         max_output_tokens=1_000,
         supports_tools=True,
         supports_parallel_tools=True,
@@ -403,3 +403,35 @@ async def test_invalid_sql_is_a_model_visible_tool_error(tmp_path):
         assert provider.requests[1].messages[-1] == transcript.messages[2]
     finally:
         await agent.close()
+
+
+async def test_statement_deadline_retires_worker_without_fabricating_a_count(tmp_path):
+    path = tmp_path / "expensive-count.sqlite"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE records(n INTEGER)")
+        connection.executemany(
+            "INSERT INTO records VALUES (?)", ((i,) for i in range(1000))
+        )
+        version = connection.execute("PRAGMA schema_version").fetchone()[0]
+    admitted = sqlite_query_module._regular_unaliased_path(str(path))
+    with pytest.raises(
+        sqlite_query_module.SQLiteQueryError, match="statement deadline"
+    ):
+        await sqlite_query_module._run_query(
+            admitted,
+            "SELECT COUNT(*) FROM records a, records b, records c",
+            (),
+            expected_schema_version=version,
+            max_rows=1,
+            max_bytes=1024,
+            timeout_seconds=0.01,
+        )
+    _, rows, _ = await sqlite_query_module._run_query(
+        admitted,
+        "SELECT COUNT(*) AS total FROM records",
+        (),
+        expected_schema_version=version,
+        max_rows=1,
+        max_bytes=1024,
+    )
+    assert rows == ({"total": 1000},)

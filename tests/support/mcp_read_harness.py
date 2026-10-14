@@ -20,7 +20,7 @@ from importlib.metadata import version
 from pathlib import Path
 from statistics import median
 from time import perf_counter
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import httpx2 as httpx
 
@@ -190,6 +190,22 @@ def positive_cost(name: str, default: str) -> Decimal:
 class ReadBudget:
     """Reserve before model dispatch; incomplete usage retains its ceiling."""
 
+    provider_failure_codes: ClassVar[frozenset[str]] = frozenset(
+        {
+            ProviderErrorCode.AUTHENTICATION_ERROR.value,
+            ProviderErrorCode.RATE_LIMIT_ERROR.value,
+            ProviderErrorCode.PROVIDER_UNAVAILABLE.value,
+            ProviderErrorCode.MODEL_NOT_FOUND.value,
+            ProviderErrorCode.INVALID_REQUEST.value,
+            ProviderErrorCode.TIMEOUT.value,
+            ProviderErrorCode.CLEANUP_FAILED.value,
+            ProviderErrorCode.CLEANUP_TIMEOUT.value,
+            ProviderErrorCode.OWNER_UNAVAILABLE.value,
+            ProviderErrorCode.MALFORMED_RESPONSE.value,
+            ProviderErrorCode.CONFIGURATION_ERROR.value,
+        }
+    )
+
     total: Decimal
     per_run: Decimal
     charged: Decimal = Decimal(0)
@@ -235,20 +251,7 @@ class ReadBudget:
         provider_failure = (
             result is not None
             and result.kind is LoopExitKind.FAILED
-            and result.reason
-            in {
-                ProviderErrorCode.AUTHENTICATION_ERROR.value,
-                ProviderErrorCode.RATE_LIMIT_ERROR.value,
-                ProviderErrorCode.PROVIDER_UNAVAILABLE.value,
-                ProviderErrorCode.MODEL_NOT_FOUND.value,
-                ProviderErrorCode.INVALID_REQUEST.value,
-                ProviderErrorCode.TIMEOUT.value,
-                ProviderErrorCode.CLEANUP_FAILED.value,
-                ProviderErrorCode.CLEANUP_TIMEOUT.value,
-                ProviderErrorCode.OWNER_UNAVAILABLE.value,
-                ProviderErrorCode.MALFORMED_RESPONSE.value,
-                ProviderErrorCode.CONFIGURATION_ERROR.value,
-            }
+            and result.reason in self.provider_failure_codes
         )
         self.consecutive_provider_failures = (
             self.consecutive_provider_failures + 1 if provider_failure else 0
@@ -621,14 +624,37 @@ class ReadEvaluation:
             },
             indent=2,
         )
-        # Defense in depth for diagnostic files: neither credentials nor raw
-        # transport exceptions belong in test evidence, including failed cases.
-        for name in ("OPENAI_API_KEY", "MCP_TOKEN"):
-            value = os.environ.get(name)
-            if value:
-                payload = payload.replace(json.dumps(value)[1:-1], "[REDACTED]")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(payload + "\n")
+        write_private_report(path, json.loads(payload))
+
+
+def write_private_report(path: Path, payload: object) -> None:
+    """Shared private report publication; omit secrets and opaque provider payloads."""
+    secrets = tuple(
+        value
+        for name, value in os.environ.items()
+        if value and name.endswith(("KEY", "TOKEN", "PASSWORD", "CREDENTIAL"))
+    )
+
+    def redact(value: object) -> object:
+        if isinstance(value, str):
+            for secret in secrets:
+                value = value.replace(secret, "[REDACTED]")
+            return value
+        if isinstance(value, Mapping):
+            return {
+                redact(key) if isinstance(key, str) else key: redact(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [redact(item) for item in value]
+        return value
+
+    text = json.dumps(redact(payload), indent=2)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not path.exists():
+        path.touch(mode=0o600, exist_ok=False)
+    path.chmod(0o600)
+    path.write_text(text + "\n")
 
 
 @asynccontextmanager

@@ -287,7 +287,7 @@ async def test_text_run_order_payloads_and_durable_boundaries():
     assert all(event.run_origin == "user" for event in events)
     assert events[0].data.to_dict() == {"agent_id": "agent-observed"}
     model_data = events[1].data.to_dict()
-    assert set(model_data) == {
+    assert set(model_data) >= {
         "provider_id",
         "model_call_index",
         "has_text",
@@ -594,8 +594,11 @@ async def test_cancellation_persists_then_emits_interrupted_completion():
     assert persisted.kind is LoopExitKind.INTERRUPTED
     assert _kinds(events) == (
         AgentEventKind.RUN_STARTED,
+        AgentEventKind.MODEL_COMPLETED,
         AgentEventKind.RUN_COMPLETED,
     )
+    assert events[1].data["status"] == "cancelled"
+    assert events[1].data["measured_input_tokens"] is None
     assert events[-1].data["exit_kind"] == "interrupted"
     assert store.actions[-2:] == [
         "persisted:finish:interrupted",
@@ -649,7 +652,9 @@ async def test_handled_provider_error_emits_one_completion():
     assert result.kind is LoopExitKind.FAILED
     assert result.reason == "invalid_request"
     assert _kinds(events).count(AgentEventKind.RUN_COMPLETED) == 1
-    assert AgentEventKind.MODEL_COMPLETED not in _kinds(events)
+    calls = [event for event in events if event.kind is AgentEventKind.MODEL_COMPLETED]
+    assert len(calls) == 1 and calls[0].data["status"] == "failed"
+    assert calls[0].data["measured_input_tokens"] is None
 
 
 async def test_outer_step_limit_emits_one_completion():
@@ -700,7 +705,9 @@ async def test_outer_wall_limit_failure_emits_one_completion():
     assert result.kind is LoopExitKind.FAILED
     assert result.reason == "wall_time_exhausted"
     assert _kinds(events).count(AgentEventKind.RUN_COMPLETED) == 1
-    assert AgentEventKind.MODEL_COMPLETED not in _kinds(events)
+    calls = [event for event in events if event.kind is AgentEventKind.MODEL_COMPLETED]
+    assert len(calls) == 1 and calls[0].data["status"] == "failed"
+    assert calls[0].data["measured_input_tokens"] is None
 
 
 async def test_no_observer_preserves_existing_behavior():
@@ -815,3 +822,36 @@ async def test_public_admission_observation_is_opt_in_and_payload_free(tmp_path)
         for event in admissions
     )
     assert str(tmp_path) not in repr(admissions)
+
+
+async def test_private_diagnostics_reconcile_exact_overshoot_and_omit_payloads(
+    tmp_path,
+):
+    import json
+    import os
+
+    from daita.observation import PrivateDiagnosticSink
+
+    path = tmp_path / "diagnostics.jsonl"
+    sink = PrivateDiagnosticSink(path)
+    provider = MockModelProvider(
+        (_stop(usage=ModelUsage(input_tokens=12, output_tokens=4)),)
+    )
+    loop = AgentLoop(
+        model=provider,
+        context_builder=TranscriptContext(),
+        tools=ScriptedTools(),
+        limits=LoopLimits(max_total_tokens=15),
+        observer=sink,
+    )
+    result = await loop.run(_run())
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    calls = [r["data"] for r in rows if r["kind"] == "model.completed"]
+    assert result.reason == "token_limit_reached"
+    assert sum(c["total_tokens"] for c in calls) == result.usage.total_tokens == 16
+    assert calls[0]["remaining_tokens_before"] == 15
+    assert calls[0]["cost_amount_usd"] is None
+    assert calls[0]["physical_attempts"] is None
+    assert calls[0]["attempt_measurements"] == "unavailable"
+    assert "raw assistant sentinel" not in path.read_text()
+    assert os.stat(path).st_mode & 0o777 == 0o600

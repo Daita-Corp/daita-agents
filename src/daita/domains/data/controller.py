@@ -50,6 +50,12 @@ from .file_capabilities import (
     LOCAL_FILE_READ_CAPABILITY_ID,
 )
 from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
+from .row_counts import (
+    attach_count_selection,
+    authenticate_count_selection,
+    finalize_count_page,
+    selection_error,
+)
 from .sql import (
     DuckDBReadValidationError,
     RelationalUpdateCommand,
@@ -68,6 +74,7 @@ from .sql.relational_upsert import (
 
 DATA_DOMAIN_OWNER_ID = "data"
 DATA_QUERY_CAPABILITY_ID = "data.query"
+DATA_COUNT_ROWS_CAPABILITY_ID = "data.count_rows"
 DATA_QUERY_EVIDENCE_KIND = "data.query_result"
 DATA_EXPORT_TABULAR_CAPABILITY_ID = "data.export_tabular"
 RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID = "data.preview_update_rows"
@@ -85,7 +92,11 @@ _CATALOG_CAPABILITIES = frozenset(
     }
 )
 _RELATIONAL_READ_CAPABILITIES = frozenset(
-    {DATA_QUERY_CAPABILITY_ID, DATA_EXPORT_TABULAR_CAPABILITY_ID}
+    {
+        DATA_QUERY_CAPABILITY_ID,
+        DATA_EXPORT_TABULAR_CAPABILITY_ID,
+        DATA_COUNT_ROWS_CAPABILITY_ID,
+    }
 )
 _UPDATE_CAPABILITIES = frozenset(
     {RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID, RELATIONAL_UPDATE_CAPABILITY_ID}
@@ -452,6 +463,55 @@ class DataCapabilityDomain:
             files_only=session is not None and session.options.files_only,
         )
         run = replace(run, resolved_source_scope=scope)
+        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID and (
+            "selection_ref" in arguments or "cursor" in arguments
+        ):
+            if self._transcript_loader is None or self._registry is None:
+                raise selection_error(
+                    "Current-run count selection evidence is unavailable."
+                )
+            policy = capability.execution_admission_policy
+            if policy is None:
+                raise selection_error("Count execution limits are unavailable.")
+            selection = await authenticate_count_selection(
+                await self._transcript_loader(run.id),
+                run,
+                call,
+                self._registry,
+                policy.inline_max_targets,
+            )
+            arguments = selection.arguments(policy.inline_max_targets)
+            # Revalidate the whole selection, including already counted tables.
+            # Revocation or catalog drift never silently changes its denominator.
+            whole = FrozenJsonObject.from_mapping(
+                {
+                    "source_id": selection.source_id,
+                    "resource_ids": tuple(
+                        item["resource_id"] for item in selection.resources
+                    ),
+                }
+            )
+            await self._validate_source_scope(run, capability, whole)
+            self._validate_execution_resource_scope(run, capability, whole)
+            await self._validate_resource_read_scope(run, capability, whole)
+            current = {
+                item.resource_id: item
+                for item in await self._catalog.resource_schemas(
+                    run.agent_id, selection.source_id
+                )
+            }
+            if any(
+                item["resource_id"] not in current
+                or current[cast(str, item["resource_id"])].revision != item["revision"]
+                or current[cast(str, item["resource_id"])].source_revision
+                != selection.source_revision
+                for item in selection.resources
+            ):
+                raise CapabilityInputError(
+                    "count_binding_stale",
+                    "The fixed count selection is no longer current; rediscover identities before starting a new selection. Prior counts are historical evidence.",
+                    {"execution_disposition": "not_dispatched"},
+                )
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.validate_effect(session, call)
         await self._validate_source_scope(run, capability, arguments)
@@ -487,14 +547,97 @@ class DataCapabilityDomain:
             if (
                 (schema_query is not None and not schema_query.strip())
                 or any(not item.strip() for item in resource_ids)
-                or (schema_query is None and not resource_ids)
+                or (
+                    schema_query is None
+                    and not resource_ids
+                    and not (
+                        arguments.get("detail") == "identity"
+                        and schema_source_id is not None
+                    )
+                )
                 or (schema_source_id is not None and not schema_source_id.strip())
             ):
                 raise CapabilityInputError(
                     "catalog_invalid_schema",
                     "Catalog schema requires a non-empty query or explicit resource "
-                    "IDs and an optional non-empty current source scope.",
+                    "IDs; identity enumeration may instead use an exact source_id.",
                 )
+        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID:
+            from .sql.read_validation import render_row_counts
+
+            source_id = cast(str, arguments["source_id"])
+            policy = capability.execution_admission_policy
+            if (
+                policy is None
+                or not 1 <= policy.target_count(arguments) <= policy.inline_max_targets
+            ):
+                raise CapabilityInputError(
+                    "count_batch_limit",
+                    "Reduce count resources to the declared foreground bound.",
+                    {
+                        "execution_disposition": "not_dispatched",
+                        "recovery": {
+                            "kind": "reduce_scope",
+                            "max_targets": (
+                                0 if policy is None else policy.inline_max_targets
+                            ),
+                        },
+                    },
+                )
+            schemas = await self._catalog.resource_schemas(run.agent_id, source_id)
+            by_id = {item.resource_id: item for item in schemas}
+            ids = cast(tuple[str, ...], arguments["resource_ids"])
+            selected = tuple(by_id[item] for item in ids if item in by_id)
+            if len(selected) != len(ids):
+                raise CapabilityInputError(
+                    "resource_read_not_allowed", _RESOURCE_READ_DENIED_MESSAGE
+                )
+            include_views = arguments.get("include_views", False)
+            if any(
+                item.resource_kind != "table"
+                and not (include_views and item.resource_kind == "view")
+                for item in selected
+            ):
+                raise CapabilityInputError(
+                    "count_requires_base_tables",
+                    "Select base tables, or explicitly set include_views=true to count selected views.",
+                    {
+                        "execution_disposition": "not_dispatched",
+                        "recovery": {
+                            "kind": "correct_arguments",
+                            "argument": "include_views",
+                        },
+                    },
+                )
+            try:
+                sql = render_row_counts(selected)
+            except ValueError as error:
+                raise CapabilityInputError(
+                    "count_identity_invalid", str(error)
+                ) from None
+            source_name = next(
+                (
+                    item.get("display_name")
+                    for item in await self._catalog.source_routing_facts(
+                        run.agent_id, (source_id,)
+                    )
+                    if item["source_id"] == source_id
+                ),
+                None,
+            )
+            arguments = FrozenJsonObject.from_mapping(
+                {
+                    **arguments,
+                    "_source_name": (
+                        source_name if isinstance(source_name, str) else source_id
+                    ),
+                    "sql": sql,
+                    "parameters": (),
+                    "_resource_revisions": tuple(
+                        (item.resource_id, item.revision) for item in selected
+                    ),
+                }
+            )
         if capability.id in _RELATIONAL_READ_CAPABILITIES:
             arguments = await self._validate_sql(run, arguments)
         if capability.id in _UPDATE_CAPABILITIES | _UPSERT_CAPABILITIES:
@@ -829,6 +972,10 @@ class DataCapabilityDomain:
         session: RunSession | None = None,
     ) -> ToolOutput:
         del request_sensitivity
+        if capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
+            output = attach_count_selection(run, call, output)
+        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID:
+            output = finalize_count_page(run, call, arguments, output)
         if capability.id == DATA_EXPORT_TABULAR_CAPABILITY_ID:
             self._validate_export_summary(output)
             assert output.artifact is not None
@@ -842,7 +989,18 @@ class DataCapabilityDomain:
             )
         if capability.operational_effect is not OperationalEffect.NONE:
             self._learning.mark_effect_succeeded(session, call.id)
-        return await self._classify(run, call, capability, output)
+        output = await self._classify(run, call, capability, output)
+        selection = arguments.get("_count_selection")
+        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID and isinstance(
+            selection, FrozenJsonObject
+        ):
+            floor = ModelSensitivity(cast(str, selection["sensitivity"]))
+            ranks = tuple(ModelSensitivity)
+            assert output.sensitivity is not None
+            output = replace(
+                output, sensitivity=max((floor, output.sensitivity), key=ranks.index)
+            )
+        return output
 
     finalize_session_output = finalize_output
 
@@ -1633,7 +1791,11 @@ class DataCapabilityDomain:
             run, self._catalog, files_only=False
         )
         run = replace(run, resolved_source_scope=scope)
-        source_id = call.arguments.get("source_id")
+        source_id = (
+            output.data.get("source_id")
+            if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID
+            else call.arguments.get("source_id")
+        )
         source_ids = (
             (source_id,)
             if isinstance(source_id, str)
@@ -1657,6 +1819,13 @@ class DataCapabilityDomain:
             readable = readable & run.resolved_source_scope.resource_ids
         if run.execution_scope is not None:
             readable = readable & frozenset(run.execution_scope.allowed_resource_ids)
+        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID:
+            # This page's source evidence is its exact batch. Cumulative evidence
+            # is linked separately by authenticated prior call IDs in progress.
+            readable = readable & frozenset(
+                cast(str, item["resource_id"])
+                for item in cast(tuple[FrozenJsonObject, ...], output.data["counts"])
+            )
         return replace(
             output,
             sensitivity=sensitivity,

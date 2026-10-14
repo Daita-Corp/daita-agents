@@ -452,6 +452,35 @@ class StepToolProjection:
     source_scope: EffectiveSourceScope | None = None
     session: RunSession | None = field(default=None, repr=False, compare=False)
 
+    @property
+    def execution_guidance(self) -> str:
+        limits = "; ".join(
+            f"{entry.view.name} {policy.target_count_argument}: foreground {policy.inline_max_targets}, "
+            f"graph {policy.graph_max_targets if policy.graph_v1_eligible else 'ineligible'}"
+            for entry in self.callable_entries
+            if (policy := entry.capability.execution_admission_policy) is not None
+        )
+        if not limits:
+            return ""
+        graph = next(
+            (
+                entry
+                for entry in self.catalog_entries
+                if entry.view.name == "start_graph_job"
+            ),
+            None,
+        )
+        durable = (
+            "unavailable"
+            if graph is None
+            else (
+                graph.view.name
+                if graph in self.callable_entries
+                else "toolbox_load " + graph.view.name
+            )
+        )
+        return limits + ("; " if limits else "") + "Durable: " + durable + "."
+
     def require_current(
         self,
         *,
@@ -1598,6 +1627,33 @@ class CapabilityRuntime:
             return _ResolvedCall(call, call, entry=entry)
         control_names = {item.name for item in projection.provider_definitions}
         if call.name not in _CONTROL_TOOL_NAMES or call.name not in control_names:
+            candidate = next(
+                (
+                    item
+                    for item in projection.catalog_entries
+                    if item.view.name == call.name
+                ),
+                None,
+            )
+            if candidate is not None:
+                return _ResolvedCall(
+                    call,
+                    call,
+                    failure=_error(
+                        call,
+                        "tool_not_available",
+                        "The prepared tool is not loaded for this step. Inspect its current contract before loading the exact working set.",
+                        {
+                            "execution_disposition": "not_dispatched",
+                            "recovery": {
+                                "kind": "correct_arguments",
+                                "tool_name": "toolbox_inspect",
+                                "arguments": {"tool_name": candidate.view.name},
+                                "load_tool": "toolbox_load",
+                            },
+                        },
+                    ),
+                )
             return _ResolvedCall(
                 call,
                 call,
@@ -1711,6 +1767,7 @@ class CapabilityRuntime:
             sensitivity=sensitivity,
             validated_arguments=resolved.validated_arguments,
             session=session,
+            projection=projection,
         )
 
     async def _execute_control(
@@ -1727,10 +1784,43 @@ class CapabilityRuntime:
             asyncio.get_running_loop().time() if self._observer is not None else None
         )
         self._emit_tool_started(run, call, None, catalog_entry=None)
-        if prepared_result is not None:
+        current_names: set[str] = set()
+        if control_name in {"toolbox_search", "toolbox_load"}:
+            try:
+                for owner_id in {
+                    entry.domain_owner_id for entry in projection.catalog_entries
+                }:
+                    names = await _domain_project(
+                        self._domains[owner_id], run, projection.session
+                    )
+                    current_names.update(names)
+            except Exception:
+                result = _error(
+                    call,
+                    "toolbox_admission_unavailable",
+                    "Current local tool admission could not be checked. Report the blocker; no tools were loaded.",
+                )
+            else:
+                if control_name == "toolbox_load" and any(
+                    name not in current_names
+                    for name in cast(tuple[str, ...], call.arguments["tool_names"])
+                ):
+                    result = _error(
+                        call,
+                        "toolbox_tool_not_available",
+                        "A requested tool is no longer locally applicable; use the admitted surface or report the blocker.",
+                    )
+                elif prepared_result is not None:
+                    result = prepared_result
+                else:
+                    result = self._toolbox_search(
+                        call,
+                        projection,
+                        sensitivity=sensitivity,
+                        current_names=frozenset(current_names),
+                    )
+        elif prepared_result is not None:
             result = prepared_result
-        elif control_name == "toolbox_search":
-            result = self._toolbox_search(call, projection, sensitivity=sensitivity)
         elif control_name == "toolbox_inspect":
             result = await self._toolbox_inspect(
                 run, call, projection, sensitivity=sensitivity
@@ -1780,7 +1870,9 @@ class CapabilityRuntime:
         # Local admission only: domain projection performs no executor or remote call.
         # Intersect with the frozen candidates; later attachment cannot expand inspection.
         try:
-            current_names = await self._domains[entry.domain_owner_id].project(run)
+            current_names = await _domain_project(
+                self._domains[entry.domain_owner_id], run, projection.session
+            )
         except Exception:
             return _error(
                 call,
@@ -1848,6 +1940,7 @@ class CapabilityRuntime:
         projection: StepToolProjection,
         *,
         sensitivity: ModelSensitivity,
+        current_names: frozenset[str],
     ) -> ToolResultBlock:
         query = call.arguments.get("query")
         limit_value = call.arguments.get(
@@ -1863,6 +1956,15 @@ class CapabilityRuntime:
                 "toolbox_search_invalid",
                 "The toolbox search arguments are invalid.",
             )
+        exact_name = (
+            query.strip()
+            if re.fullmatch(r"[a-z][a-z0-9]*_[a-z0-9_]+", query.strip())
+            else None
+        )
+        exact_available = exact_name is not None and any(
+            item.view.name == exact_name and item.view.name in current_names
+            for item in projection.catalog_entries
+        )
         loaded_names = {entry.view.name for entry in projection.loaded_entries}
         scored: list[tuple[int, str, str, RunToolCatalogEntry]] = []
         for entry in projection.catalog_entries:
@@ -1891,12 +1993,25 @@ class CapabilityRuntime:
                 )
         selected = scored[position : position + limit_value]
         matches = [
-            _toolbox_search_match(score, entry, loaded_names=loaded_names)
+            _toolbox_search_match(
+                score,
+                entry,
+                loaded_names=loaded_names,
+                current_applicable=entry.view.name in current_names,
+            )
             for score, _, _, entry in selected
         ]
         while True:
             data = {
                 "catalog_digest": projection.catalog_digest,
+                **(
+                    {
+                        "exact_tool_name": exact_name,
+                        "exact_tool_available": exact_available,
+                    }
+                    if exact_name is not None
+                    else {}
+                ),
                 "matches": matches,
                 "total_matches": sum(score > 0 for score, _, _, _ in scored),
                 "total_candidates": total,
@@ -2638,6 +2753,7 @@ class CapabilityRuntime:
         validated_arguments: FrozenJsonObject | None,
         session: RunSession | None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
+        projection: StepToolProjection | None = None,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
@@ -2705,18 +2821,92 @@ class CapabilityRuntime:
                 if session is None
                 else session.options.execution_preference
             )
+            # A model-facing reference may bind exact targets in its domain.
+            # Policy admission still sees those targets before executor dispatch.
+            policy = capability.execution_admission_policy
+            targets_bound = (
+                policy is not None
+                and policy.target_count_argument is not None
+                and policy.target_count_argument not in arguments
+            )
+            if targets_bound:
+                arguments = await _domain_prepare_call(
+                    domain,
+                    run,
+                    call,
+                    capability,
+                    arguments,
+                    request_sensitivity=sensitivity,
+                    session=session,
+                )
             if run.origin is RunOrigin.USER:
                 policy = capability.execution_admission_policy
                 if policy is not None:
                     admission_error = policy.admission_error(arguments, preference)
                     if admission_error is not None:
-                        message = (
-                            "The requested bounded shape requires durable graph execution; "
-                            "submit one typed initial-task proposal with start_graph_job."
-                            if admission_error == "durable_execution_required"
-                            else "The requested execution shape is outside both inline and graph V1 admission."
+                        graph = (
+                            None
+                            if projection is None
+                            else next(
+                                (
+                                    item
+                                    for item in projection.catalog_entries
+                                    if item.view.name == "start_graph_job"
+                                ),
+                                None,
+                            )
                         )
-                        raise CapabilityInputError(admission_error, message)
+                        available = False
+                        if graph is not None and _entry_resolves_exactly(
+                            graph, self._registry
+                        ):
+                            names = await _domain_project(
+                                self._domains[graph.domain_owner_id], run, session
+                            )
+                            available = graph.view.name in names
+                        use_graph = (
+                            available
+                            and admission_error == "durable_execution_required"
+                        )
+                        recovery: dict[str, object] = {
+                            "kind": "reduce_scope",
+                            "max_targets": policy.inline_max_targets,
+                            "argument": policy.target_count_argument,
+                        }
+                        if use_graph:
+                            assert graph is not None and projection is not None
+                            recovery = {
+                                "kind": "durable_proposal",
+                                "tool_name": graph.view.name,
+                                "inspection_tool": "toolbox_inspect",
+                                "load_tool": (
+                                    None
+                                    if graph in projection.callable_entries
+                                    else "toolbox_load"
+                                ),
+                                "max_targets": policy.graph_max_targets,
+                            }
+                        message = (
+                            "No source query ran. Inspect the admitted durable proposal contract, "
+                            "or reduce the selected targets to the foreground bound."
+                            if use_graph
+                            else "No source query ran. No usable durable path admits this shape; "
+                            f"reduce the selected targets to at most {policy.inline_max_targets}."
+                        )
+                        raise CapabilityInputError(
+                            admission_error,
+                            message,
+                            {
+                                "execution_disposition": "not_dispatched",
+                                "requested_targets": policy.target_count(arguments),
+                                "foreground_max_targets": policy.inline_max_targets,
+                                "graph_max_targets": policy.graph_max_targets,
+                                "durable_available": available,
+                                "durable_shape_eligible": use_graph,
+                                "execution_limits": policy.projection(),
+                                "recovery": recovery,
+                            },
+                        )
                 elif (
                     preference is ExecutionPreference.DURABLE
                     and not capability.durable_foreground_entrypoint
@@ -2725,15 +2915,16 @@ class CapabilityRuntime:
                         "execution_not_supported_for_requested_shape",
                         "This capability is direct-only and cannot be forced into graph V1.",
                     )
-            arguments = await _domain_prepare_call(
-                domain,
-                run,
-                call,
-                capability,
-                arguments,
-                request_sensitivity=sensitivity,
-                session=session,
-            )
+            if not targets_bound:
+                arguments = await _domain_prepare_call(
+                    domain,
+                    run,
+                    call,
+                    capability,
+                    arguments,
+                    request_sensitivity=sensitivity,
+                    session=session,
+                )
             await _guard_attempt(guard, capability.id, "after_binding")
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id
@@ -3912,6 +4103,7 @@ class CapabilityRuntime:
             "tool_name": call.name,
             "duration_ms": _duration_ms(started),
             "success": not result.is_error,
+            "result_bytes": len(canonical_json(result.output).encode()),
             "error_code": _result_error_code(result),
         }
         if capability is not None:
@@ -4060,6 +4252,11 @@ def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
         "capability_id": entry.capability.id,
         "automation_eligibility": entry.capability.automation_eligibility.value,
         "requires_automation_grant": policy is not None,
+        "execution_limits": (
+            None
+            if entry.capability.execution_admission_policy is None
+            else entry.capability.execution_admission_policy.projection()
+        ),
         "grant_policy": (
             None
             if policy is None
@@ -4559,6 +4756,7 @@ def _toolbox_search_match(
     entry: RunToolCatalogEntry,
     *,
     loaded_names: set[str],
+    current_applicable: bool,
 ) -> dict[str, object]:
     load_state = (
         ToolLoadMode.PINNED.value
@@ -4575,9 +4773,15 @@ def _toolbox_search_match(
         "summary": entry.view.presentation.summary,
         "when_to_use": entry.view.presentation.when_to_use,
         "text_trust": entry.view.presentation.text_trust.value,
-        "load_state": load_state,
+        "load_state": load_state if current_applicable else "unavailable",
+        "current_applicable": current_applicable,
         "data_access": entry.capability.access_mode.value,
         "operational_effect": entry.capability.operational_effect.value,
+        "execution_limits": (
+            None
+            if entry.capability.execution_admission_policy is None
+            else entry.capability.execution_admission_policy.projection()
+        ),
         "score": score,
         "match_status": "matched" if score > 0 else "unmatched_fallback",
     }
@@ -5131,6 +5335,76 @@ def _error(
     message: str,
     details: Mapping[str, object] | None = None,
 ) -> ToolResultBlock:
+    details = dict(details or {})
+    if "recovery" not in details:
+        if code in {
+            "missing_arguments",
+            "unexpected_arguments",
+            "invalid_argument",
+            "invalid_arguments",
+            "invalid_argument_type",
+            "invalid_argument_value",
+            "sql_invalid",
+            "sql_resource_mismatch",
+            "sql_validation_failed",
+            "sql_invalid_input",
+            "sql_resource_target_mismatch",
+            "sql_resource_source_mismatch",
+        }:
+            details.update(
+                execution_disposition="not_dispatched",
+                recovery={
+                    "kind": "correct_arguments",
+                    "constraint": message[:512],
+                    "inspection_tool": "toolbox_inspect",
+                    "tool_name": call.name,
+                },
+            )
+        elif code in {
+            "source_scope_violation",
+            "resource_read_not_allowed",
+            "source_permission_state_invalid",
+            "approval_denied",
+        }:
+            details.update(
+                execution_disposition="not_dispatched",
+                recovery={
+                    "kind": "requires_human_permission",
+                    "constraint": "Use only admitted scope or report the blocker; human admission is required to expand it.",
+                },
+            )
+        elif code in {
+            "execution_contract_changed",
+            "execution_contract_unavailable",
+            "toolbox_inspect_stale",
+            "count_binding_stale",
+        }:
+            details.update(
+                execution_disposition="not_dispatched",
+                recovery={
+                    "kind": "reinspect_binding",
+                    "constraint": "Inspect current metadata; retained machine authority needs fresh human admission.",
+                },
+            )
+        elif code in {
+            "effect_unresolved",
+            "outcome_unknown",
+            "effect_reservation_conflict",
+        }:
+            details.update(
+                recovery={
+                    "kind": "requires_human_permission",
+                    "constraint": "Report the receipt/blocker. Do not replay the action.",
+                }
+            )
+        elif code in {"toolbox_tool_not_available", "tool_not_available"}:
+            details.update(
+                execution_disposition="not_dispatched",
+                recovery={
+                    "kind": "reduce_scope",
+                    "constraint": "Use an admitted tool or report the missing access.",
+                },
+            )
     return ToolResultBlock(
         call_id=call.id,
         is_error=True,

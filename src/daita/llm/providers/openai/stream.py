@@ -51,6 +51,7 @@ async def decode_openai_stream(
         _ResponseOutputOverride,
         _safe_field,
         _stream_fragment,
+        _terminal_failure_usage,
     )
 
     canonical_ids_by_index: dict[int, str] = {}
@@ -65,6 +66,7 @@ async def decode_openai_stream(
     sequence_number: int | None = None
     response_identity: str | None = None
     terminal_event: ModelStreamCompleted | None = None
+    terminal_native_response: object | None = None
     async with attempt.stream(source) as stream:
         try:
             async for event in cast(AsyncIterator[object], stream):
@@ -166,6 +168,7 @@ async def decode_openai_stream(
                     "response.failed",
                 }:
                     native_response = _field(event, "response")
+                    terminal_native_response = native_response
                     if _safe_field(native_response, "status") == "failed":
                         self._observe_failure(
                             attempt,
@@ -269,6 +272,7 @@ async def decode_openai_stream(
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "OpenAI returned a malformed stream",
                 provider_id=self.provider_id,
+                usage=_terminal_failure_usage(terminal_native_response),
                 diagnostic=(
                     terminal_diagnostic
                     or ProviderFailureDiagnostic(

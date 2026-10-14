@@ -1199,6 +1199,11 @@ class AgentContextBuilder:
                 for entry in tool_context.callable_entries
             ),
         )
+        guidance += "\n" + tool_context.execution_guidance
+        if tool_context.session is not None:
+            guidance += "\n" + "\n".join(
+                tool_context.session.evidence.progress_warnings
+            )
         projected_system = CanonicalMessage(
             role=MessageRole.SYSTEM,
             content=(
@@ -2957,6 +2962,28 @@ def _tool_guidance(
         }
     )
     instructions: list[str] = []
+    if "catalog.schema" in candidates:
+        instructions.append(
+            "Enumerate admitted tables with catalog_schema detail=identity and exact source_id "
+            "(no query needed), or catalog_search; "
+            "filters/joins need detail=schema. Never guess fields. Counts sum table rows once; "
+            "claim only admitted coverage, with separate batch/source snapshots."
+        )
+    if "data.count_rows" in candidates:
+        instructions.append(
+            reference(
+                "data.count_rows", "data_count_rows", "bounded exact table counts"
+            )
+        )
+        instructions.append(
+            "For base-table totals, enumerate catalog_schema identities and load "
+            "data_count_rows together in the same step: those reads/control calls are "
+            "independent. Pass the count_selection_ref from the catalog selection as "
+            "selection_ref; continue with only cursor=next_cursor until next_cursor is null. "
+            "Use code-computed progress.total_rows and coverage; do not copy table-ID lists "
+            "or add overlapping batch totals. A complete selection is a complete source "
+            "enumeration only when catalog_enumeration_complete is true."
+        )
     # Select procedures from the current request, never untrusted row contents
     # or unrelated conversation tasks. Procedure hints grant no authority.
     start = next(

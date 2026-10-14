@@ -341,7 +341,9 @@ def benchmark_limits() -> LoopLimits:
     return LoopLimits(max_estimated_cost_usd=_cost_limit())
 
 
-def live_provider(model_id: str) -> tuple[ModelProfile, RecordingProvider]:
+def live_provider(
+    model_id: str, *, max_output_tokens: int = 1_536
+) -> tuple[ModelProfile, RecordingProvider]:
     provider_name = model_id.partition(":")[0]
     if provider_name not in API_PROVIDERS:
         pytest.fail(
@@ -356,7 +358,7 @@ def live_provider(model_id: str) -> tuple[ModelProfile, RecordingProvider]:
     delegate = create_llm_provider(
         model_id,
         api_key=_api_key(provider_name),
-        max_output_tokens=min(profile.max_output_tokens, 1_536),
+        max_output_tokens=min(profile.max_output_tokens, max_output_tokens),
     )
     return profile, RecordingProvider(delegate)
 

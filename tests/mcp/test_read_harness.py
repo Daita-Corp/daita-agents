@@ -265,6 +265,30 @@ async def test_measured_transport_does_not_save_raw_failure_text():
     await measured.close_owned()
 
 
+def test_private_report_redacts_strings_without_corrupting_token_measurements(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("DAITA_COUNT_RECOVERY_OUTPUT_TOKENS", "4096")
+    monkeypatch.setenv("MCP_TOKEN", "123")
+    monkeypatch.setenv("EXAMPLE_API_KEY", 'secret"with\\quotes')
+    path = tmp_path / "private.json"
+    harness.write_private_report(
+        path,
+        {
+            "output_allowance": 4096,
+            "measured_tokens": 123,
+            "nested": ["credential 123", 'secret"with\\quotes'],
+            "ordinary": "4096 output tokens",
+        },
+    )
+    value = json.loads(path.read_text())
+    assert value["output_allowance"] == 4096
+    assert value["measured_tokens"] == 123
+    assert value["ordinary"] == "4096 output tokens"
+    assert value["nested"] == ["credential [REDACTED]", "[REDACTED]"]
+    assert path.stat().st_mode & 0o077 == 0
+
+
 async def test_read_report_retains_completed_run_when_grounding_assertion_fails(
     tmp_path, monkeypatch
 ):

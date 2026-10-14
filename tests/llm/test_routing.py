@@ -675,3 +675,42 @@ async def test_unresolved_lazy_secret_blocks_fallback_and_late_provider_construc
     finally:
         release.set()
         await router.close()
+
+
+async def test_attempt_diagnostics_keep_retry_usage_separate_from_logical_total():
+    from daita.llm.errors import capture_provider_attempts
+
+    provider = MockModelProvider(
+        (
+            ModelProviderError(
+                ProviderErrorCode.RATE_LIMIT_ERROR,
+                usage=ModelUsage(
+                    input_tokens=3,
+                    output_tokens=1,
+                    cost_estimate=CostEstimate.complete(Decimal(".01")),
+                ),
+            ),
+            ModelResponse(
+                finish_reason=FinishReason.STOP,
+                text="corrected",
+                usage=ModelUsage(
+                    input_tokens=7,
+                    output_tokens=2,
+                    cost_estimate=CostEstimate.complete(Decimal(".02")),
+                ),
+            ),
+        )
+    )
+    router = ModelRouter(
+        (registration(provider),), retry_policy=RetryPolicy(backoff_seconds=0)
+    )
+    with capture_provider_attempts(True) as attempts:
+        response = await router.generate(request())
+    assert [item["status"] for item in attempts] == ["failed", "completed"]
+    assert [item["total_tokens"] for item in attempts] == [4, 9]
+    assert response.usage.total_tokens == 13
+    assert sum(item["input_tokens"] for item in attempts) == response.usage.input_tokens
+    assert "attempts" not in response.provider_metadata
+    with capture_provider_attempts(True) as isolated:
+        pass
+    assert isolated == []

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from threading import Lock
 
-from ..capabilities import ExecutionPreference, GraphTaskBinding
-from ..llm.models import ModelSensitivity
+from .._json import canonical_json
+from ..capabilities import RESERVED_TOOL_NAMES, ExecutionPreference, GraphTaskBinding
+from ..llm.models import ModelSensitivity, ToolCall, ToolResultBlock
 from .models import RunInput, RunOrigin
 from .transcripts import ConversationPredecessor, RunSessionWriter
 
@@ -60,6 +63,8 @@ class RunSessionEvidence:
         "programmatic_tool_calls_attempted",
         "_outer_dispatched",
         "_outer_results",
+        "_progress_failures",
+        "_progress_warnings",
     )
 
     def __init__(self) -> None:
@@ -72,6 +77,101 @@ class RunSessionEvidence:
         self.programmatic_tool_calls_attempted = 0
         self._outer_dispatched: set[str] = set()
         self._outer_results: dict[str, bool] = {}
+        self._progress_failures: dict[str, int] = {}
+        self._progress_warnings: dict[str, str] = {}
+
+    def observe_progress(self, call: ToolCall, result: ToolResultBlock) -> None:
+        """Warning-only evidence; no dispatch, retry, transcript or budget decisions."""
+        error = result.output.get("error")
+        if not result.is_error:
+            data = result.output.get("data")
+            if (
+                result.output.get("kind") != "toolbox_search_result"
+                or result.sensitivity_provenance.get("authority")
+                != "tool_catalog_control"
+                or not isinstance(data, Mapping)
+                or data.get("exact_tool_available") is not False
+            ):
+                return
+            error = {
+                "code": "exact_tool_unavailable",
+                "details": {
+                    "execution_disposition": "not_dispatched",
+                    "recovery": {
+                        "kind": "reduce_scope",
+                        "constraint": "The exact tool is absent from prepared candidates; use admitted tools or report the blocker.",
+                    },
+                },
+            }
+        if not isinstance(error, Mapping):
+            return
+        details = error.get("details")
+        if (
+            not isinstance(details, Mapping)
+            or details.get("execution_disposition") != "not_dispatched"
+        ):
+            return
+        recovery = details.get("recovery")
+        if not isinstance(recovery, Mapping) or recovery.get("kind") not in {
+            "correct_arguments",
+            "reduce_scope",
+            "reinspect_binding",
+            "requires_human_permission",
+        }:
+            return
+        safe_recovery: dict[str, object] = {"kind": recovery["kind"]}
+        maximum = recovery.get("max_targets")
+        if isinstance(maximum, int) and not isinstance(maximum, bool):
+            safe_recovery["max_targets"] = maximum
+        next_tool = recovery.get("tool_name")
+        if isinstance(next_tool, str) and next_tool in RESERVED_TOOL_NAMES:
+            safe_recovery["tool_name"] = next_tool
+        identity = result.capability_id or "discovery control/unavailable tool"
+        fingerprint = sha256(
+            canonical_json(
+                {
+                    "capability_id": result.capability_id,
+                    "tool": call.name,
+                    "arguments": call.arguments,
+                    "outcome": result.output,
+                }
+            ).encode()
+        ).hexdigest()
+        with self._lock:
+            if (
+                fingerprint not in self._progress_failures
+                and len(self._progress_failures) >= 64
+            ):
+                oldest = next(iter(self._progress_failures))
+                del self._progress_failures[oldest]
+                self._progress_warnings.pop(oldest, None)
+            count = self._progress_failures.get(fingerprint, 0) + 1
+            self._progress_failures[fingerprint] = min(count, 2)
+            if count == 2 and fingerprint not in self._progress_warnings:
+                if len(self._progress_warnings) >= 8:
+                    del self._progress_warnings[next(iter(self._progress_warnings))]
+                self._progress_warnings[fingerprint] = (
+                    f"Repeated permanent failure for {identity}. "
+                    + (
+                        "Two exact-name searches confirmed no admitted tool. "
+                        if error.get("code") == "exact_tool_unavailable"
+                        else "Two identical calls were not dispatched. "
+                    )
+                    + "Change the relevant arguments/scope, "
+                    "use the admitted recovery path, or report the blocker. Recovery: "
+                    + canonical_json(safe_recovery)
+                    + ". This warning grants no authority or additional budget."
+                )
+
+    @property
+    def progress_warnings(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(self._progress_warnings.values())
+
+    def clear_progress(self) -> None:
+        with self._lock:
+            self._progress_failures.clear()
+            self._progress_warnings.clear()
 
     def count_tool_attempts(
         self, count: int, ceiling: int, *, programmatic: bool = False

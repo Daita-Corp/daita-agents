@@ -418,6 +418,39 @@ async def test_openai_native_stream_ignores_empty_deltas_and_uses_terminal_respo
     assert client.responses.arguments["stream"] is True
 
 
+async def test_openai_truncated_tool_arguments_retain_terminal_measured_usage():
+    response = {
+        "id": "incomplete-tool-response",
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "model": "gpt-5.6-terra",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "native-call",
+                "name": "catalog_schema",
+                "arguments": '{"query":',
+            }
+        ],
+        "usage": {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "total_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 5},
+        },
+    }
+    client = _OpenAIClient(({"type": "response.incomplete", "response": response},))
+    provider = OpenAIResponsesProvider("gpt-5.6-terra", client=cast(Any, client))
+    with pytest.raises(ModelProviderError) as caught:
+        await _events(provider, _request(tools=True))
+    assert caught.value.code is ProviderErrorCode.MALFORMED_RESPONSE
+    assert caught.value.usage.input_tokens == 100
+    assert caught.value.usage.output_tokens == 20
+    assert caught.value.usage.reasoning_tokens == 5
+    assert client.responses.arguments is not None
+
+
 async def test_openai_native_tool_stream_ignores_empty_argument_delta():
     terminal_response = {
         "id": "resp-tool",

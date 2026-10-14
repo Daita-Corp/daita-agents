@@ -699,3 +699,53 @@ def detached_provider_error(
     error.__context__ = None
     error.__suppress_context__ = True
     return error
+
+
+# Runtime-only physical-attempt observations. Lists are request-local and bounded;
+# nothing here changes provider responses or persisted assistant metadata.
+_attempt_capture: ContextVar[list[dict[str, object]] | None] = ContextVar(
+    "daita_attempt_capture", default=None
+)
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def capture_provider_attempts(enabled: bool):
+    records: list[dict[str, object]] = []
+    token = _attempt_capture.set(records if enabled else None)
+    try:
+        yield records
+    finally:
+        _attempt_capture.reset(token)
+
+
+def observe_provider_attempt(
+    provider_id: str, usage: ModelUsage, *, duration_ms: int, status: str
+) -> None:
+    records = _attempt_capture.get()
+    if records is None or len(records) >= 25:
+        return
+    reported = usage.total_tokens > 0 or usage.cost_estimate.status.value == "complete"
+    records.append(
+        {
+            "provider_id": provider_id,
+            "attempt_number": len(records) + 1,
+            "duration_ms": duration_ms,
+            "status": status,
+            "usage_available": reported,
+            "input_tokens": usage.input_tokens if reported else None,
+            "output_tokens": usage.output_tokens if reported else None,
+            "total_tokens": usage.total_tokens if reported else None,
+            "cache_read_tokens": usage.cache_read_tokens or None,
+            "cache_write_tokens": usage.cache_write_tokens or None,
+            "reasoning_tokens": usage.reasoning_tokens or None,
+            "cost_amount_usd": (
+                None
+                if usage.cost_estimate.amount_usd is None
+                else str(usage.cost_estimate.amount_usd)
+            ),
+            "cost_status": usage.cost_estimate.status.value,
+        }
+    )

@@ -1140,6 +1140,25 @@ class CatalogService:
                 )
             )
             total_matches = len(candidates)
+        elif request.detail == "identity" and request.query is None:
+            candidates = tuple(
+                sorted(
+                    (
+                        resource
+                        for resource in resources_by_id.values()
+                        if resource.source_id == request.source_id
+                        and self._is_tabular_resource(
+                            index_by_resource_id[resource.id], resource.id
+                        )
+                    ),
+                    key=lambda item: (
+                        item.native_identity.casefold(),
+                        item.native_identity,
+                        item.id,
+                    ),
+                )
+            )
+            total_matches = len(candidates)
         else:
             assert search is not None
             candidates_list: list[CatalogResource] = []
@@ -1167,7 +1186,9 @@ class CatalogService:
             candidates = tuple(candidates_list)
             total_matches = search.total_matches
 
-        if request.resource_ids:
+        if request.resource_ids or (
+            request.detail == "identity" and request.query is None
+        ):
             seed_limit = request.limit
         elif request.limit == 1:
             seed_limit = 1
@@ -1451,6 +1472,40 @@ class CatalogService:
                 key=lambda item: (item.source_id, item.id),
             )
         )
+        if request.detail == "identity":
+            keys = ("kind", "name", "resource_id", "revision", "source_id")
+            return FrozenJsonObject.from_mapping(
+                {
+                    "bounds": {"resources": request.limit},
+                    "include_relationships": False,
+                    "paths": (),
+                    "relationships": (),
+                    "resources": tuple(
+                        {key: item[key] for key in keys} for item in resource_payloads
+                    ),
+                    "sources": tuple(
+                        {
+                            **item,
+                            "observed_at": str(
+                                all_syncs_by_id[str(item["sync_id"])].completed_at
+                            ),
+                        }
+                        for item in source_payloads
+                    ),
+                    "selection": {
+                        "coverage": "admitted_catalog_selection",
+                        "unresolved_reasons": ordered_unresolved_reasons,
+                        "unresolved_terms": unresolved_terms,
+                        "returned_count": len(resource_payloads),
+                    },
+                    "total_matches": total_matches,
+                    "truncation": {
+                        "resources": resources_truncated,
+                        "reason": truncation_reason,
+                    },
+                    "trust_classification": "untrusted_external_data",
+                }
+            )
         return FrozenJsonObject.from_mapping(
             {
                 "bounds": {

@@ -6,7 +6,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
@@ -131,6 +131,10 @@ class ExecutionAdmissionPolicy:
             raise ValueError("graph target ceiling cannot be below inline")
         if not isinstance(self.synchronous_only, bool):
             raise TypeError("execution synchronous_only must be bool")
+
+    def projection(self) -> dict[str, object]:
+        """One declaration projection; current availability is a separate fact."""
+        return asdict(self)
 
     def target_count(self, arguments: Mapping[str, object]) -> int:
         if self.target_count_argument is None:
@@ -1856,7 +1860,15 @@ class CapabilityRegistry:
         view, capability = self.resolve_tool(name)
         return ToolDefinition(
             name=view.name,
-            description=_provider_description(view),
+            description=(
+                _provider_description(view)
+                + (
+                    " Execution limits (schema validity does not imply execution admission): "
+                    + canonical_json(capability.execution_admission_policy.projection())
+                    if capability.execution_admission_policy is not None
+                    else ""
+                )
+            ),
             input_schema=capability.input_schema,
         )
 

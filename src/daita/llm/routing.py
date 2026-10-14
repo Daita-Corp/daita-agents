@@ -13,6 +13,7 @@ from collections.abc import (
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal
+from time import monotonic
 from typing import cast
 
 from ..errors import ErrorRetryability
@@ -448,6 +449,7 @@ class ModelRouter:
                     )
                     total_attempts += 1
                     in_flight = True
+                    attempt_started = monotonic()
                     try:
                         permit = await self._admit_provider(
                             registration,
@@ -463,6 +465,14 @@ class ModelRouter:
                         in_flight = False
                         last_error = error
                         _number_attempt(error, attempt + 1, total_attempts)
+                        from .errors import observe_provider_attempt
+
+                        observe_provider_attempt(
+                            registration.provider.provider_id,
+                            error.usage,
+                            duration_ms=int((monotonic() - attempt_started) * 1000),
+                            status="failed",
+                        )
                         attempt_usage.append(error.usage)
                         _require_recoverable_usage(request, error, attempt_usage)
                         if not await self._wait_for_retry(
@@ -471,6 +481,14 @@ class ModelRouter:
                             break
                     else:
                         in_flight = False
+                        from .errors import observe_provider_attempt
+
+                        observe_provider_attempt(
+                            registration.provider.provider_id,
+                            response.usage,
+                            duration_ms=int((monotonic() - attempt_started) * 1000),
+                            status="completed",
+                        )
                         attempt_usage.append(response.usage)
                         if route is not None:
                             route.selected_provider_id = (
@@ -553,6 +571,7 @@ class ModelRouter:
                     emitted = False
                     completed = False
                     in_flight = True
+                    attempt_started = monotonic()
                     try:
                         permit = await self._admit_provider(
                             registration,
@@ -570,6 +589,16 @@ class ModelRouter:
                                     if isinstance(event, ModelStreamCompleted):
                                         completed = True
                                         in_flight = False
+                                        from .errors import observe_provider_attempt
+
+                                        observe_provider_attempt(
+                                            registration.provider.provider_id,
+                                            event.response.usage,
+                                            duration_ms=int(
+                                                (monotonic() - attempt_started) * 1000
+                                            ),
+                                            status="completed",
+                                        )
                                         attempt_usage.append(event.response.usage)
                                         terminal = replace(
                                             event.response,
@@ -604,7 +633,14 @@ class ModelRouter:
                             if error.provider_id is None:
                                 error.provider_id = registration.provider.provider_id
                             _number_attempt(error, attempt + 1, total_attempts)
-                            attempt_usage.append(error.usage)
+                            from .errors import observe_provider_attempt
+                        observe_provider_attempt(
+                            registration.provider.provider_id,
+                            error.usage,
+                            duration_ms=int((monotonic() - attempt_started) * 1000),
+                            status="failed",
+                        )
+                        attempt_usage.append(error.usage)
                         _require_recoverable_usage(
                             request, error, attempt_usage, terminal=emitted
                         )

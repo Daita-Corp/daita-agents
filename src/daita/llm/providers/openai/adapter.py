@@ -351,6 +351,7 @@ class OpenAIResponsesProvider:
                 ProviderErrorCode.MALFORMED_RESPONSE,
                 "OpenAI returned a malformed response",
                 provider_id=self.provider_id,
+                usage=_terminal_failure_usage(response),
                 diagnostic=_openai_failure_diagnostic(
                     response,
                     phase=ProviderFailurePhase.RESPONSE_DECODE,
@@ -876,6 +877,18 @@ def _message_text(item: object) -> list[str]:
                 "OpenAI refused the response",
             )
     return text
+
+
+def _terminal_failure_usage(response: object) -> ModelUsage:
+    """Retain measured terminal consumption even when tool content cannot decode.
+
+    No response content or partial call is admitted. Pricing remains unavailable
+    because the complete response contract could not be authenticated.
+    """
+    try:
+        return _decode_usage(_safe_field(response, "usage"))
+    except (KeyError, TypeError, ValueError):
+        return ModelUsage()
 
 
 def _decode_usage(value: object) -> ModelUsage:
