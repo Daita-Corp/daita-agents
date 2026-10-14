@@ -1,7 +1,7 @@
 """Real runtime/count adapter contracts over an independently seeded fixture."""
 
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -10,7 +10,7 @@ from daita._json import FrozenJsonObject
 from daita.adapters.models import SourceRegistration
 from daita.catalog.models import CatalogSchemaRequest, ResourceKind
 from daita.llm.models import ToolCall
-from daita.loop.models import RunInput
+from daita.loop.models import LoopLimits, RunInput
 from tests.support.capability_runtime import execute_projected
 from tests.support.count_recovery import MANIFEST, TOTALS, seed_sqlite
 from tests.support.workspace import workspace_for
@@ -36,6 +36,512 @@ def _cursor_model(respond):
             return await respond(request)
 
     return CursorModel(())
+
+
+@pytest.mark.parametrize("include_views", [False, True])
+@pytest.mark.parametrize("mixed_arguments", [False, True])
+async def test_count_operation_executes_fixed_selection_without_model_page_turns(
+    tmp_path, include_views, mixed_arguments
+):
+    from daita.llm.models import FinishReason, ModelResponse
+    from daita.loop.models import validate_completed_transcript
+
+    sources: dict[str, SourceRegistration] = {}
+
+    async def respond(request):
+        results = _results(request)
+        if not results:
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        "load",
+                        "toolbox_load",
+                        {"tool_names": ("data_count_selection", "data_count_inspect")},
+                    ),
+                    ToolCall(
+                        "inspect-contract",
+                        "toolbox_inspect",
+                        {"tool_name": "data_count_selection"},
+                    ),
+                    ToolCall(
+                        "inspect-plan",
+                        "toolbox_inspect",
+                        {"tool_name": "data_count_plan"},
+                    ),
+                    *(
+                        ToolCall(
+                            name,
+                            "catalog_schema",
+                            {"source_id": source.id, "detail": "identity", "limit": 50},
+                        )
+                        for name, source in sources.items()
+                    ),
+                ),
+            )
+        if len(model.requests) == 2:
+            definition = next(
+                t for t in request.tools if t.name == "data_count_selection"
+            )
+            assert set(definition.input_schema["properties"]) == {
+                "selection_ref",
+                "include_views",
+            }
+            assert "data_count_plan" not in {t.name for t in request.tools}
+            assert results["inspect-plan"].is_error
+            from daita._json import canonical_json
+
+            contract = results["inspect-contract"].output["data"]["value"]
+            assert canonical_json(contract["input_schema"]) == canonical_json(
+                definition.input_schema
+            )
+            from hashlib import sha256
+
+            assert (
+                contract["input_schema_digest"]
+                == "sha256:"
+                + sha256(canonical_json(definition.input_schema).encode()).hexdigest()
+            )
+            loaded = next(
+                item
+                for item in results["load"].output["data"]["contracts"]
+                if item["tool_name"] == "data_count_selection"
+            )
+            assert loaded["input_schema_digest"] == contract["input_schema_digest"]
+            assert loaded["contract_digest"] == contract["contract_digest"]
+            if mixed_arguments:
+                return ModelResponse(
+                    finish_reason=FinishReason.TOOL_CALLS,
+                    tool_calls=tuple(
+                        ToolCall(
+                            name + "-mixed",
+                            "data_count_selection",
+                            {
+                                "selection_ref": results[name].output["data"][
+                                    "selection"
+                                ]["count_selection_ref"],
+                                "source_id": source.id,
+                            },
+                        )
+                        for name, source in sources.items()
+                    ),
+                )
+        operation_step = 3 if mixed_arguments else 2
+        if len(model.requests) == operation_step:
+            if mixed_arguments:
+                for name in sources:
+                    error = results[name + "-mixed"].output["error"]
+                    assert results[name + "-mixed"].is_error
+                    assert error["code"] == "unexpected_arguments"
+                    assert tuple(error["details"]["names"]) == ("source_id",)
+                    recovery = error["details"]["recovery"]
+                    assert recovery["kind"] == "correct_arguments"
+                    assert set(recovery["allowed_fields"]) == {
+                        "selection_ref",
+                        "include_views",
+                    }
+                    assert error["details"]["execution_disposition"] == "not_dispatched"
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=tuple(
+                    ToolCall(
+                        name + "-operation",
+                        "data_count_selection",
+                        {
+                            "selection_ref": results[name].output["data"]["selection"][
+                                "count_selection_ref"
+                            ],
+                            "include_views": include_views,
+                        },
+                    )
+                    for name in sources
+                ),
+            )
+        if len(model.requests) == operation_step + 1:
+            for name in sources:
+                result = results[name + "-operation"]
+                assert not result.is_error, result.output
+                data = result.output["data"]
+                expected = TOTALS[name] + (
+                    int(MANIFEST[name][2]["rows"]) if include_views else 0
+                )
+                assert data["status"] == "completed"
+                assert data["total_rows"] == data["observed_total_rows"] == expected
+                assert (
+                    data["counted_resources"]
+                    == data["selected_resources"]
+                    == len(MANIFEST[name]) + include_views
+                )
+                assert data["unexecuted_resources"] == data["failed_resources"] == 0
+                assert data["snapshot_scope"] == "separate_batch_snapshots"
+                assert data["coverage"] == (
+                    "complete_catalog_selection"
+                    if include_views
+                    else "complete_admitted_base_tables"
+                )
+                assert "counts" not in data
+            if mixed_arguments:
+                return ModelResponse(
+                    finish_reason=FinishReason.STOP,
+                    text="Exact count operation completed.",
+                )
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=tuple(
+                    ToolCall(
+                        name + "-inspect",
+                        "data_count_inspect",
+                        {
+                            "operation_ref": results[name + "-operation"].output[
+                                "data"
+                            ]["operation_ref"],
+                            "limit": 50,
+                        },
+                    )
+                    for name in sources
+                ),
+            )
+        for name in sources:
+            result = results[name + "-inspect"]
+            assert not result.is_error, result.output
+            assert (
+                len(result.output["data"]["counts"])
+                == len(MANIFEST[name]) + include_views
+            )
+        return ModelResponse(
+            finish_reason=FinishReason.STOP, text="Exact count operation completed."
+        )
+
+    model = _cursor_model(respond)
+    agent = await Agent.create(
+        "count-operation",
+        root=tmp_path,
+        model=model,
+        model_profile=model.model_profile,
+        workspace=workspace_for(tmp_path),
+        limits=LoopLimits(max_steps=4),
+    )
+    try:
+        for name, path in seed_sqlite(tmp_path).items():
+            sources[name] = await agent.attach(SQLiteSource(path, name=name))
+        result = await agent.run(
+            "Compare admitted source row totals",
+            source_scope_ids=tuple(s.id for s in sources.values()),
+        )
+        assert result.reason == "completed", (result.reason, result.steps)
+        assert len(model.requests) == 4
+        transcript = await agent.transcript(result.run_id)
+        validate_completed_transcript(transcript, result)
+        evidence = await agent.analysis_evidence(result.run_id)
+        children = [r for r in evidence if r.kind == "child"]
+        assert len(children) == (13 if include_views else 12)
+        assert all(
+            r.facts["status"] == "succeeded"
+            and len(cast(Any, r.facts["arguments"])["resource_ids"]) <= 4
+            for r in children
+        )
+        actual = {
+            row["resource_id"]: row["rows"]
+            for r in children
+            for row in cast(Any, r.facts["result"])["data"]["counts"]
+        }
+        assert len(actual) == 46 + 2 * include_views
+        for name, source in sources.items():
+            for resource in await agent.list_catalog_resources(source_id=source.id):
+                if resource.kind.value == "view":
+                    if include_views:
+                        assert actual[resource.id] == int(MANIFEST[name][2]["rows"])
+                    continue
+                expected = next(
+                    t["rows"] for t in MANIFEST[name] if t["table"] == resource.name
+                )
+                assert actual[resource.id] == expected
+        assert await agent.list_effects() == ()
+    finally:
+        await agent.close()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "unknown",
+        "truncated",
+        "revocation",
+        "catalog_drift",
+        "queued_revocation",
+        "queued_catalog_drift",
+        "native_drift",
+        "timeout",
+        "deadline",
+        "run_budget",
+    ],
+)
+async def test_count_operation_retains_fixed_coverage_and_honest_failures(
+    tmp_path, monkeypatch, fault
+):
+    import asyncio
+    import sqlite3
+    from dataclasses import replace
+
+    from daita.adapters.sqlite_query import SQLiteQueryBackend, SQLiteQueryError
+    from daita.domains.data import capabilities as data_capabilities
+    from daita.domains.data.controller import DataCapabilityDomain
+    from daita.domains.data.row_counts import count_operation_failure_details
+    from daita.llm.models import FinishReason, ModelResponse
+    from daita.loop.models import LoopLimits, validate_completed_transcript
+    from daita.storage.sqlite_records import SourceReadMode, SourceReadScope
+
+    source = None
+    child_bindings = 0
+    dispatches = []
+    original_bind = DataCapabilityDomain.prepare_call
+    original_read = SQLiteQueryBackend.execute_read
+    paths = seed_sqlite(tmp_path)
+
+    async def bind(self, run, call, capability, arguments, **kwargs):
+        nonlocal child_bindings
+        assert source is not None
+        if (
+            capability.id == "data.count_rows"
+            and "_count_operation_binding" in arguments
+        ):
+            child_bindings += 1
+            if child_bindings == 2:
+                if fault == "revocation":
+                    await agent._embedded._store.replace_source_permission_scopes(
+                        SourceReadScope(
+                            agent_id=agent.id,
+                            source_id=source.id,
+                            mode=SourceReadMode.SELECTED,
+                            resource_ids=(
+                                arguments["_count_operation_binding"]["resources"][0][
+                                    "resource_id"
+                                ],
+                            ),
+                        ),
+                        (),
+                    )
+                if fault == "catalog_drift":
+                    with sqlite3.connect(paths["Juniper"]) as connection:
+                        connection.execute(
+                            'ALTER TABLE "records_00" ADD COLUMN drift TEXT'
+                        )
+                    await agent.refresh_source(source.id)
+                if fault == "native_drift":
+                    resource = next(
+                        r
+                        for r in await agent.list_catalog_resources(source_id=source.id)
+                        if r.id == arguments["resource_ids"][0]
+                    )
+                    with sqlite3.connect(paths["Juniper"]) as connection:
+                        connection.execute(
+                            'ALTER TABLE "'
+                            + resource.name.replace('"', '""')
+                            + '" ADD COLUMN drift TEXT'
+                        )
+        return await original_bind(self, run, call, capability, arguments, **kwargs)
+
+    async def read(self, **kwargs):
+        dispatches.append(kwargs)
+        if len(dispatches) == 2 and fault == "timeout":
+            raise SQLiteQueryError("sqlite_query_timeout", "Controlled read timeout.")
+        if len(dispatches) == 2 and fault == "deadline":
+            await asyncio.Event().wait()
+        result = await original_read(self, **kwargs)
+        if len(dispatches) == 1 and fault.startswith("queued_"):
+            assert source is not None
+            if fault == "queued_revocation":
+                await agent._embedded._store.replace_source_permission_scopes(
+                    SourceReadScope(
+                        agent_id=agent.id,
+                        source_id=source.id,
+                        mode=SourceReadMode.SELECTED,
+                        resource_ids=tuple(
+                            pair[0] for pair in kwargs["expected_resource_revisions"]
+                        ),
+                    ),
+                    (),
+                )
+            else:
+                with sqlite3.connect(paths["Juniper"]) as connection:
+                    connection.execute('ALTER TABLE "records_00" ADD COLUMN drift TEXT')
+                await agent.refresh_source(source.id)
+        return result
+
+    monkeypatch.setattr(DataCapabilityDomain, "prepare_call", bind)
+    monkeypatch.setattr(
+        DataCapabilityDomain, "prepare_session_call", bind, raising=False
+    )
+    monkeypatch.setattr(SQLiteQueryBackend, "execute_read", read)
+    if fault == "deadline":
+        monkeypatch.setattr(
+            data_capabilities,
+            "COUNT_OPERATION_POLICY",
+            replace(
+                data_capabilities.COUNT_OPERATION_POLICY, inline_max_wall_seconds=1
+            ),
+        )
+
+    async def respond(request):
+        results = _results(request)
+        assert source is not None
+        if not results:
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        "load",
+                        "toolbox_load",
+                        {"tool_names": ("data_count_selection",)},
+                    ),
+                    ToolCall(
+                        "catalog",
+                        "catalog_schema",
+                        {
+                            "source_id": source.id,
+                            "detail": "identity",
+                            "limit": 6 if fault == "truncated" else 50,
+                        },
+                    ),
+                ),
+            )
+        if len(model.requests) == 2:
+            ref = (
+                "sel_0000000000000000"
+                if fault == "unknown"
+                else results["catalog"].output["data"]["selection"][
+                    "count_selection_ref"
+                ]
+            )
+            return ModelResponse(
+                finish_reason=FinishReason.TOOL_CALLS,
+                tool_calls=(
+                    ToolCall(
+                        "operation", "data_count_selection", {"selection_ref": ref}
+                    ),
+                ),
+            )
+        assert (
+            fault != "run_budget"
+        ), "No model request is permitted after tool-budget exhaustion"
+        return ModelResponse(
+            finish_reason=FinishReason.STOP,
+            text="Retained exact evidence and honest fixed-selection coverage.",
+        )
+
+    model = _cursor_model(respond)
+    limits = (
+        LoopLimits(
+            max_parallel_reads_per_source=1,
+            max_tool_calls_per_run=4,
+            max_tool_calls_per_response=4,
+        )
+        if fault == "run_budget"
+        else LoopLimits(
+            max_parallel_reads_per_source=4 if fault.startswith("queued_") else 1
+        )
+    )
+    agent = await Agent.create(
+        "count-failure",
+        root=tmp_path,
+        model=model,
+        model_profile=model.model_profile,
+        limits=limits,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        source = await agent.attach(SQLiteSource(paths["Juniper"], name="Juniper"))
+        result = await agent.run(
+            "Count admitted table rows", source_scope_ids=(source.id,)
+        )
+        transcript = await agent.transcript(result.run_id)
+        if fault != "run_budget":
+            validate_completed_transcript(transcript, result)
+        output = next(r for c, r in transcript.tool_pairs if c.id == "operation")
+        assert output is not None
+        if fault == "unknown":
+            assert output.is_error and not dispatches
+            assert (
+                cast(Any, output.output)["error"]["details"]["execution_disposition"]
+                == "not_dispatched"
+            )
+            return
+        assert not output.is_error, output.output
+        data = cast(Any, output.output["data"])
+        records = [
+            r for r in await agent.analysis_evidence(result.run_id) if r.kind == "child"
+        ]
+        success = [
+            cast(Any, r.facts)["result"]["data"]
+            for r in records
+            if r.facts["status"] == "succeeded"
+        ]
+        assert data["observed_total_rows"] == sum(
+            row["rows"] for page in success for row in page["counts"]
+        )
+        assert data["selected_resources"] == (5 if fault == "truncated" else 8)
+        if fault == "truncated":
+            assert data["status"] == "completed"
+            assert data["coverage"] == "complete_catalog_selection"
+            assert data["catalog_enumeration_complete"] is False
+            assert data["counted_resources"] == 5
+        else:
+            assert data["total_rows"] is None
+            assert data["coverage"] == "partial_catalog_selection"
+            assert data["counted_resources"] == (0 if fault == "run_budget" else 4)
+            assert (
+                data["failed_resources"]
+                + data["interrupted_resources"]
+                + data["unexecuted_resources"]
+                == 8 - data["counted_resources"]
+            )
+            assert data["failures"]
+            details = count_operation_failure_details(data)
+            assert details["failure_codes"] == tuple(
+                dict.fromkeys(f["code"] for f in data["failures"])
+            )
+            assert details["total_rows"] is None
+            assert details["observed_total_rows"] == data["observed_total_rows"]
+            assert details["child_execution_dispatched"] is bool(dispatches)
+            action = cast(Any, details["recovery"])["arguments"]
+            assert (
+                action["kind"]
+                == {
+                    "revocation": "needs_authorization",
+                    "queued_revocation": "needs_authorization",
+                    "catalog_drift": "source_or_contract_drift",
+                    "queued_catalog_drift": "source_or_contract_drift",
+                    "native_drift": "source_or_contract_drift",
+                    "timeout": "needs_replan",
+                    "deadline": "budget_exhausted",
+                    "run_budget": "budget_exhausted",
+                }[fault]
+            )
+            assert action["details"]["counted_resources"] == data["counted_resources"]
+        assert len(dispatches) == (
+            0
+            if fault == "run_budget"
+            else (
+                1
+                if fault
+                in {
+                    "revocation",
+                    "catalog_drift",
+                    "queued_revocation",
+                    "queued_catalog_drift",
+                }
+                else 2
+            )
+        )
+        if fault == "run_budget":
+            assert result.reason == "tool_calls_per_run_exceeded"
+            assert len(model.requests) == 2
+        if fault == "deadline":
+            assert data["deadline_reached"] is True
+            assert data["interrupted_resources"] == 4
+        assert await agent.list_effects() == ()
+    finally:
+        await agent.close()
 
 
 @pytest.mark.parametrize("include_views", [False, True])
@@ -389,7 +895,10 @@ async def test_count_cursor_failures_and_repeated_reads_preserve_selection(
 
 
 @pytest.mark.parametrize("limit", ["steps", "tokens", "cross_run"])
-async def test_count_cursor_references_do_not_extend_run_or_budgets(tmp_path, limit):
+@pytest.mark.parametrize("count_tool", ["data_count_rows", "data_count_selection"])
+async def test_count_cursor_references_do_not_extend_run_or_budgets(
+    tmp_path, limit, count_tool
+):
     from daita import AgentConfig
     from daita.llm.models import FinishReason, ModelResponse, ModelUsage
     from daita.loop.models import LoopLimits
@@ -404,9 +913,7 @@ async def test_count_cursor_references_do_not_extend_run_or_budgets(tmp_path, li
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
-                    ToolCall(
-                        "load", "toolbox_load", {"tool_names": ("data_count_rows",)}
-                    ),
+                    ToolCall("load", "toolbox_load", {"tool_names": (count_tool,)}),
                     ToolCall(
                         "catalog",
                         "catalog_schema",
@@ -418,9 +925,7 @@ async def test_count_cursor_references_do_not_extend_run_or_budgets(tmp_path, li
         if "page" not in results:
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
-                tool_calls=(
-                    ToolCall("page", "data_count_rows", {"selection_ref": ref}),
-                ),
+                tool_calls=(ToolCall("page", count_tool, {"selection_ref": ref}),),
                 usage=ModelUsage(
                     input_tokens=100_000 if limit == "tokens" else 1, output_tokens=1
                 ),
@@ -444,9 +949,7 @@ async def test_count_cursor_references_do_not_extend_run_or_budgets(tmp_path, li
         source = await agent.attach(SQLiteSource(paths["Juniper"]))
         result = await agent.run("Count tables", source_scope_ids=(source.id,))
         transcript = await agent.transcript(result.run_id)
-        pages = [
-            (c, r) for c, r in transcript.tool_pairs if c.name == "data_count_rows"
-        ]
+        pages = [(c, r) for c, r in transcript.tool_pairs if c.name == count_tool]
         if pages:
             assert pages[0][1] is not None
         if limit == "steps":
@@ -456,9 +959,13 @@ async def test_count_cursor_references_do_not_extend_run_or_budgets(tmp_path, li
             assert page_result is not None and not page_result.is_error
             page_data = page_result.output["data"]
             assert isinstance(page_data, FrozenJsonObject)
-            progress = page_data["progress"]
+            progress = (
+                page_data["progress"] if count_tool == "data_count_rows" else page_data
+            )
             assert isinstance(progress, FrozenJsonObject)
-            assert progress["counted_resources"] == 4
+            assert progress["counted_resources"] == (
+                4 if count_tool == "data_count_rows" else 8
+            )
         elif limit == "tokens":
             assert result.reason == "token_limit_reached" and len(model.requests) == 2
             assert result.usage.total_tokens == 100_001
@@ -469,7 +976,12 @@ async def test_count_cursor_references_do_not_extend_run_or_budgets(tmp_path, li
             assert page_result is not None and page_result.is_error
             assert "data" not in page_result.output
         else:
-            assert result.reason == "completed" and saved["next_cursor"]
+            assert result.reason == "completed"
+            reference_arguments = (
+                {"cursor": saved["next_cursor"]}
+                if count_tool == "data_count_rows"
+                else {"selection_ref": saved["selection_ref"]}
+            )
 
             async def next_run(request):
                 results = _results(request)
@@ -480,7 +992,7 @@ async def test_count_cursor_references_do_not_extend_run_or_budgets(tmp_path, li
                             ToolCall(
                                 "load-next",
                                 "toolbox_load",
-                                {"tool_names": ("data_count_rows",)},
+                                {"tool_names": (count_tool,)},
                             ),
                         ),
                     )
@@ -490,8 +1002,8 @@ async def test_count_cursor_references_do_not_extend_run_or_budgets(tmp_path, li
                         tool_calls=(
                             ToolCall(
                                 "cross-run",
-                                "data_count_rows",
-                                {"cursor": saved["next_cursor"]},
+                                count_tool,
+                                reference_arguments,
                             ),
                         ),
                     )

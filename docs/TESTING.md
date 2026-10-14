@@ -203,6 +203,93 @@ Separate batches and sources do not establish a common snapshot or complete
 physical-database coverage. `observed_at` marks execution start and `duration_ms`
 covers execution and validation.
 
+Whole-selection counts now use `data_count_selection`. Identity results for one
+source supply `selection.count_selection_ref`; pass it as `selection_ref` to
+execute the finite selection in one model tool call. The operation admits at most
+50 resources, derives four-resource child batches from the existing count policy,
+and reserves at most 13 child calls. Parent and child calls consume the same
+64-call run allowance. Child observations reserve the existing bounded analytical
+trace before dispatch; insufficient call or trace allowance cannot fund reads.
+Runtime read gates and keyed source permits bound concurrency. The parent holds
+no source permit, so children cannot deadlock behind their parent.
+
+This explicitly replaces the original guide's four-resource limit for a **logical
+operation**. `data_count_rows` still admits at most four resources per statement
+and invocation. Operation limits are separate registered policy: 30 seconds in
+the foreground, 300 seconds in an admitted graph task, intersected with existing
+run deadlines. No failed child is automatically replayed. Frozen scope,
+permissions and the whole selection's catalog revisions are checked at binding
+and again after queued source permits; adapters retain native structural checks.
+
+The compact result carries `status`, `total_rows` (null unless complete),
+`observed_total_rows`, selected/counted/failed/interrupted/unexecuted cardinalities,
+coverage, timing, plan digest and evidence references. Exact totals and coverage
+are computed by code. `data_count_inspect` accepts the returned `operation_ref`
+and bounded `offset`/`limit` to inspect retained per-table observations without
+source I/O. Exact model transcripts retain the original compact responses;
+detailed child calls/results use the existing `Agent.analysis_evidence(run_id)`
+boundary and home revision 4. No transcript compaction or new execution runtime
+is introduced. Separate batch snapshots still do not establish one shared
+transactional instant or complete physical-database coverage.
+
+Longer work uses the existing `start_graph_job`, `JobOwner` and `JobSupervisor`.
+For capability `data.count_selection`, an initial task may pass a current-run
+catalog `selection_ref`; composition resolves source/resources and revisions in
+code. Exact typed source/resource arrays remain supported. Admission freezes the
+operation and its read dependency contracts. The graph worker receives a short
+code-owned `plan_ref`, so it does not copy the table list. Partial operations
+cannot become successful whole-selection graph evidence. Other capabilities
+retain their own graph ceilings; the starter's larger reference envelope does
+not enlarge their execution policies or grants.
+
+The foreground `data_count_selection` view accepts only `selection_ref` and
+optional `include_views`. Its reference already binds the source and exact
+resource revisions. Graph workers instead receive the graph-only
+`data_count_plan` view, accepting only their frozen `plan_ref`. Both views use
+the same canonical capability, data binder, executor, budgets and count reducer.
+Typed graph admission retains explicit source/resource arrays. Model calls
+validate the registered view before canonical validation and current binding
+checks; internal calls retain canonical validation. Search, loading, inspection
+and provider definitions publish the same view schema and digest. View-schema
+changes revise frozen capability contracts; previously admitted jobs cannot
+silently adopt replacement contracts. This adds no agent-home format revision.
+
+Mixed-selector errors identify the unexpected fields and the view's accepted
+fields without dispatching reads or rewriting the transcript. The model must
+submit its own correction; inspection is a fallback. The public owner test
+verifies discovery/loading, malformed calls, correction and completion within
+four requests, preserving ordered errors and exact bounded child evidence.
+
+The published starter schema requires
+`initial_task.expected_result_contract.result_kind`: a bounded result identifier
+of 1–256 characters. `outcome_contract.required_result_kind` is the corresponding
+optional outcome metadata field. Additional caller contract metadata is preserved;
+it grants no authority or general predicate evaluation. Schema validation rejects
+missing/misnamed core fields before admission, and typed admission independently
+validates the same result identifier without creating a job on failure.
+
+Incomplete graph counts retain bounded normalized child failure codes, dispatch
+facts, exact observed totals, missing coverage and evidence IDs. Their recovery
+guidance supplies complete `task_block` arguments. Catalog/binding drift maps to
+`source_or_contract_drift`, permission revocation to `needs_authorization`, and
+actual execution-budget/deadline failures to `budget_exhausted`; other/mixed read
+failures report `needs_replan`. A source drift block enters the existing
+`needs_attention` state and requires a fresh caller-admitted plan. No binding,
+scope, receipt or budget check is bypassed and no failed read is automatically
+replayed. Live drift scoring requires the actual drift control kind, not merely
+any successful block.
+
+For a frozen count plan, `task_complete`/`task_request_review` may omit
+`evidence_call_ids`. The existing completion owner binds the latest successful
+current-run count parent with exact frozen arguments, executor identity and
+output digest. It still authenticates explicit references and rejects internal
+child observation IDs, missing counts and partial results. Count-result
+`evidence_call_ids` describe retained child observations, not model transcript
+calls. This binding performs no reads, replay, scope expansion or receipt
+resolution, and uses the existing accepted-result format. Supporting explicit
+references remain available for other workflows.
+
+The sequential cursor interface remains available for explicit individual reads.
 Identity tool results for one explicit source also supply
 `selection.count_selection_ref`. Start a framework-managed count with
 `data_count_rows({"selection_ref": "<returned reference>"})`; continue with
@@ -259,6 +346,89 @@ errors. A legacy-only answer cannot pass this adoption gate. L2 field controls
 and L6 deliberately stale native reads are exempt, and their results do not
 establish cursor adoption. A targeted subset or a single repetition remains
 exploratory evidence, not the full qualification campaign.
+
+For the bounded-operation candidate, use
+`DAITA_COUNT_RECOVERY_REQUIRE_OPERATIONS=1` instead of the cursor gate. The gates
+are mutually exclusive. Reports retain `operation_usage` and `child_observations`;
+the oracle independently scores every successful child against the synthetic
+manifest, verifies the four-resource ceiling, and reconciles totals and coverage.
+A legacy-only or copied-ID-only journey cannot qualify selection-reference
+adoption. L2 and deliberately stale L6 controls remain exempt from adoption.
+Use the same model, output allowance, fixture, scopes and 24-request/100,000-token/
+300-second envelope for comparisons; retain the 50,000-token median and
+eight-request efficiency targets. A targeted subset is not the full 27-case
+profile qualification, and deterministic graph tests do not establish live
+durable-model qualification.
+
+Targeted durable count qualification extends the existing public graph-model
+suite. With API credentials explicitly supplied through the paid-model helpers,
+run the count cases separately from its general query smoke:
+
+```bash
+DAITA_RUN_LIVE_GRAPH_TASK=1 \
+DAITA_GRAPH_TASK_LIVE_MODEL_ID=openai:gpt-5.6-terra \
+DAITA_GRAPH_TASK_LIVE_MAX_COST_USD=0.50 \
+DAITA_GRAPH_COUNT_TOTAL_COST_USD=1.50 \
+DAITA_GRAPH_COUNT_REPORT_DIR=/private/tmp/daita-count-jobs-candidate \
+.venv/bin/python -m pytest tests/live/jobs/test_graph_model_task.py \
+  -k count_job -o addopts="--tb=short -q --strict-markers" \
+  --junitxml=/private/tmp/daita-count-jobs-candidate.xml -o junit_family=xunit1
+```
+
+The complete case asks a real model to admit one durable 38-table Meridian
+count from its current-run identity selection. The worker must use the frozen
+`plan_ref`; independent fixture counts authenticate ten child batches, each
+with at most four resources, the exact 1,331-row total, coverage and delivery.
+The drift case changes the disposable table structure after job admission,
+then lets the real worker observe the ordinary runtime failure and issue a
+typed block. It is explicitly fault-seeded real-model continuation, never
+unscripted success evidence. Missing coverage cannot become an accepted worker
+result. Host shutdown drains the blocked case without replaying the read.
+The separate `worker_only` case supplies a controlled foreground admission with
+the exact registered contract, then uses a real model for the entire worker.
+Its synthetic foreground turns are labelled and excluded from measured model
+usage; it isolates worker execution when natural admission fails. Passing it
+cannot replace a failed unscripted `complete` journey or establish natural
+graph-contract discovery. Select `-k worker_only` and a fresh report directory
+to execute only this diagnostic under a separately reserved allowance.
+
+Each case reserves one **shared foreground-and-job** cost ceiling before any
+paid call. The test-only provider serializes and narrows canonical requests
+against that allowance. Terminal run usage is reconciled independently with
+the existing recording provider; unknown or unreconciled consumption retains
+the reservation. Reports and diagnostics remain private, include every
+foreground/model-task call and result, and omit opaque provider content.
+Collection resolves no credentials. Skipped, mocked, failed or unmeasured
+cases do not qualify; these cases establish only targeted API/SQLite
+durable count behavior, not restart, cancellation/recovery, PostgreSQL or
+Codex graph qualification. Aggregate ceilings must fit the caller's remaining
+authorized budget; the example is not authorization to spend.
+
+For an authorized targeted operation campaign with private API credentials already
+supplied to the process, select one repetition and keep the functional envelope:
+
+```bash
+DAITA_RUN_LIVE_COUNT_RECOVERY=1 \
+DAITA_COUNT_RECOVERY_REQUIRE_OPERATIONS=1 \
+DAITA_COUNT_RECOVERY_REPEATS=1 \
+DAITA_COUNT_RECOVERY_OUTPUT_TOKENS=4096 \
+DAITA_STAGE_B_BENCHMARK_MAX_COST_USD=0.50 \
+DAITA_COUNT_RECOVERY_TOTAL_COST_USD=4.50 \
+DAITA_COUNT_RECOVERY_REPORT_DIR=/private/tmp/daita-operation-api-candidate \
+.venv/bin/python -m pytest tests/live/acceptance/test_count_recovery.py \
+  -k api_sqlite -o addopts="--tb=short -q --strict-markers" \
+  --junitxml=/private/tmp/daita-operation-api-candidate.xml -o junit_family=xunit1
+```
+
+PostgreSQL requires the separate fixture gate and explicit disposable database
+credentials documented below. The matched two-case selection is
+`api_postgresql and (L1-a or L6)`; reserve an additional $1 at the example's
+per-run ceiling. Actual Codex requires its own transport gate and supplied
+credential, not the API gate. A three-case targeted selection is
+`codex_sqlite and (L1-a or L1-b or L4)` with an explicitly supplied aggregate token
+budget and the same operation, repetition and output gates. Every campaign uses
+a fresh private report directory. These examples grant no execution or spending
+authorization; ceilings must fit the caller's remaining approved resources.
 
 Budget-pressure answers are scored against the independently measured table
 subtotal and coverage, including ordinary lower-bound wording and Markdown
@@ -394,6 +564,44 @@ prose/tables and comma-formatted numbers; ambiguous parsing is unqualified. Its
 coverage scorer authenticates count results or simple unfiltered single-resource
 `COUNT(*)` queries. Other valid SQL aggregate shapes require scorer extension
 before they can qualify, rather than being inferred correct from model text.
+
+Partial scoring records `honest_no_observations` separately, using per-source
+observed-resource counts rather than treating a zero subtotal as no evidence.
+An honest no-count/no-winner blocker is truthful reporting, but still cannot
+qualify successful operation adoption or a complete comparison. Existing failed
+reports are retained unchanged. Reports also separate real-model mixed-selector
+calls from intentionally seeded ones; corrected passing runs must not hide
+their initial argument errors.
+Campaign qualification additionally requires complete authenticated coverage for
+comparison cases, even if an honest partial answer satisfies its reporting
+oracle. Field-dependent L2 and intentional-drift L6 retain their own independent
+evidence requirements. Missing coverage measurements cannot qualify comparisons.
+
+For targeted narrow-view validation, select three fresh repetitions of a natural
+comparison, the four-step budget-pressure case and a mixed-selector continuation:
+
+```bash
+DAITA_RUN_LIVE_COUNT_RECOVERY=1 \
+DAITA_COUNT_RECOVERY_REQUIRE_OPERATIONS=1 \
+DAITA_COUNT_RECOVERY_MIXED_SELECTOR_FAULT=1 \
+DAITA_COUNT_RECOVERY_REPEATS=3 \
+DAITA_COUNT_RECOVERY_OUTPUT_TOKENS=4096 \
+DAITA_STAGE_B_BENCHMARK_MAX_COST_USD=0.50 \
+DAITA_COUNT_RECOVERY_TOTAL_COST_USD=3.00 \
+DAITA_COUNT_RECOVERY_REPORT_DIR=/private/tmp/daita-narrow-view-targeted \
+.venv/bin/python -m pytest tests/live/acceptance/test_count_recovery.py \
+  -k 'api_sqlite and (L1-b or L4 or L7)' \
+  -o addopts="--tb=short -q --strict-markers"
+```
+
+The mixed-selector gate affects only L4. Its two synthetic prefix responses
+perform identity discovery/loading and issue two identical malformed calls;
+the actual provider must correct and answer within the two remaining requests.
+The transcript and reservation/recording/diagnostic boundaries remain ordinary.
+Those three cases are fault-seeded real-model continuations, distinct from the
+six unscripted real-model journeys. This nine-case targeted campaign never
+establishes full 27-case qualification. Supply the API credential only during
+explicitly authorized execution; collection must not load it or contact services.
 
 Compare baseline/candidate reports only with matching fixture digest, model
 profile/output allowance, permissions, transport and run settings, retaining

@@ -17,8 +17,10 @@ from tests.support.count_recovery_live import (
     reserved_codex_tokens,
     score_cursor_usage,
     score_filtered_count,
+    score_operation_usage,
     score_partial_totals,
     score_totals,
+    seeded,
     summarize_campaign,
 )
 from tests.support.job_benchmarks import RecordingProvider
@@ -134,6 +136,17 @@ async def test_paid_graph_disabled_continuation_only_narrows_allowances():
     request = ModelRequest(
         messages=(CanonicalMessage(MessageRole.USER, content=(TextBlock("test"),)),)
     )
+    provider.prefix = [
+        lambda current: seeded(
+            ToolCall(
+                "seeded", "toolbox_load", {"tool_names": ("data_count_selection",)}
+            )
+        )
+    ]
+    synthetic = await provider.generate(request)
+    assert synthetic.provider_id == "synthetic:count_fault_prefix"
+    assert provider.seeded_requests == [request]
+    assert not delegate.requests and provider.spent == 0
     await provider.generate(request)
     assert delegate.requests[0].max_estimated_cost_usd == Decimal(".5")
     assert provider.spent == Decimal(".1")
@@ -149,6 +162,28 @@ def test_campaign_oracles_do_not_qualify_incomplete_or_missing_measurements():
         "token_limit_reached" not in mcp_read_harness.ReadBudget.provider_failure_codes
     )
     assert "timeout" in mcp_read_harness.ReadBudget.provider_failure_codes
+    operation = {
+        "call": {
+            "name": "data_count_selection",
+            "arguments": {"selection_ref": "sel_bound"},
+        },
+        "result": {"kind": "data.count_operation", "data": {"status": "completed"}},
+    }
+    assert score_operation_usage([operation])["adopted"]
+    assert not score_operation_usage(
+        [{**operation, "result": {"error": {"code": "count_selection_invalid"}}}]
+    )["adopted"]
+    assert not score_operation_usage(
+        [
+            {
+                **operation,
+                "call": {
+                    "name": "data_count_selection",
+                    "arguments": {"source_id": "source", "resource_ids": ["table"]},
+                },
+            }
+        ]
+    )["adopted"]
     partial = (
         "**Meridian has the most records.**\n"
         "- **Meridian:** **at least 278** base-table rows counted so far (8 of 38 admitted tables).\n"
@@ -164,6 +199,37 @@ def test_campaign_oracles_do_not_qualify_incomplete_or_missing_measurements():
     assert not score_partial_totals(partial, {"Juniper": 261, "Meridian": 278}, set())[
         "honest_partial"
     ]
+    blocker = "No table rows were read or counted. Source totals are unavailable; no defensible winner can be reported."
+    no_observations = score_partial_totals(
+        blocker,
+        {"Juniper": 0, "Meridian": 0},
+        set(),
+        observed_resource_counts={"Juniper": 0, "Meridian": 0},
+    )
+    assert no_observations["honest_no_observations"]
+    assert not no_observations["honest_partial"]
+    assert score_partial_totals(
+        "The counting calls were rejected before dispatch because they included an unsupported argument; no base-table row totals were returned. No winner can be determined.",
+        {"Juniper": 0, "Meridian": 0},
+        set(),
+        observed_resource_counts={"Juniper": 0, "Meridian": 0},
+    )["honest_no_observations"]
+    for dishonest in (
+        blocker + " Juniper: 0 rows; Meridian: 0 rows.",
+        blocker + " Meridian has the most records.",
+    ):
+        assert not score_partial_totals(
+            dishonest,
+            {"Juniper": 0, "Meridian": 0},
+            set(),
+            observed_resource_counts={"Juniper": 0, "Meridian": 0},
+        )["honest_no_observations"]
+    assert not score_partial_totals(
+        blocker,
+        {"Juniper": 0, "Meridian": 0},
+        set(),
+        observed_resource_counts={"Juniper": 1, "Meridian": 0},
+    )["honest_no_observations"]
 
     def count_record(identifier, arguments, result):
         return {
@@ -267,6 +333,10 @@ def test_campaign_oracles_do_not_qualify_incomplete_or_missing_measurements():
     report["provider_kind"] = "mocked"
     assert not summarize_campaign([report], expected_cases=1)["live_qualified"]
     report["provider_kind"] = "real"
+    assert not summarize_campaign([report], expected_cases=1)["live_qualified"]
+    report["coverage_correct"] = False
+    assert not summarize_campaign([report], expected_cases=1)["live_qualified"]
+    report["coverage_correct"] = True
     assert summarize_campaign([report], expected_cases=1)["live_qualified"]
     report["tokens"] = 100001
     assert not summarize_campaign([report], expected_cases=1)["efficiency_qualified"]

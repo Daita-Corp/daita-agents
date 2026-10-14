@@ -554,6 +554,7 @@ def validate_graph_task_arguments(
     context: object,
     capability_id: str,
     arguments: Mapping[str, object],
+    programmatic_parent: tuple[str, Mapping[str, object]] | None = None,
 ) -> None:
     """Validate a graph call against its immutable task role and proposal."""
 
@@ -586,6 +587,20 @@ def validate_graph_task_arguments(
     if not isinstance(initial_call, Mapping):
         raise CapabilityInputError(
             "task_context_invalid", "The frozen initial call is malformed."
+        )
+    if programmatic_parent is not None:
+        parent_id, parent_arguments = programmatic_parent
+        dependencies = initial_call.get("read_dependency_ids", ())
+        if (
+            initial_call.get("capability_id") == parent_id
+            and initial_call.get("arguments") == parent_arguments
+            and isinstance(dependencies, tuple)
+            and capability_id in dependencies
+        ):
+            return
+        raise CapabilityInputError(
+            "task_call_differs_from_proposal",
+            "The child read is outside the exact frozen parent operation.",
         )
     if capability_id.startswith("jobs.graph."):
         return

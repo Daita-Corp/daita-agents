@@ -8,7 +8,7 @@ import os
 import re
 import sqlite3
 import subprocess
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
@@ -31,6 +31,7 @@ from daita.llm.models import (
     ModelStreamEvent,
     ModelUsage,
     ToolCall,
+    ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
 from daita.llm.profiles import reviewed_model_profile
@@ -58,12 +59,36 @@ TOTAL_COST_ENV = "DAITA_COUNT_RECOVERY_TOTAL_COST_USD"
 POSTGRES_GATE = "DAITA_RUN_COUNT_RECOVERY_POSTGRES"
 CODEX_GATE = "DAITA_RUN_COUNT_RECOVERY_CODEX"
 CURSOR_GATE = "DAITA_COUNT_RECOVERY_REQUIRE_CURSORS"
+OPERATION_GATE = "DAITA_COUNT_RECOVERY_REQUIRE_OPERATIONS"
 PARAPHRASES = (
     "Tell me which database has the most records in it.",
     "Compare the total number of rows in each available database and identify the larger one.",
     "Which of my databases holds more records? Give both totals and the winner.",
 )
 CASES = ("L1-a", "L1-b", "L1-c", "L2", "L3", "L4", "L5", "L6", "L7")
+
+
+def score_operation_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
+    requested = [r for r in records if r["call"]["name"] == "data_count_selection"]
+    successful = [
+        r
+        for r in requested
+        if isinstance(r.get("result"), dict)
+        and r["result"].get("kind") == "data.count_operation"
+    ]
+    referenced = [r for r in successful if "selection_ref" in r["call"]["arguments"]]
+    return {
+        "requested": len(requested),
+        "successful": len(successful),
+        "successful_selection_references": len(referenced),
+        "completed": sum(
+            r["result"]["data"]["status"] == "completed" for r in successful
+        ),
+        "legacy_count_calls": sum(
+            r["call"]["name"] == "data_count_rows" for r in records
+        ),
+        "adopted": bool(referenced) and len(referenced) == len(successful),
+    }
 
 
 def score_cursor_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -163,7 +188,7 @@ class BoundedContinuationProvider:
         self.delegate = delegate
         self.allowance = allowance
         self.spent = Decimal(0)
-        self.prefix: list[ModelResponse] = []
+        self.prefix: list[ModelResponse | Callable[[ModelRequest], ModelResponse]] = []
         self.seeded_requests: list[ModelRequest] = []
         self.narrowed: list[dict[str, object]] = []
         self.before_prefix: dict[int, Callable[[], Any]] = {}
@@ -218,7 +243,8 @@ class BoundedContinuationProvider:
             if inspect.isawaitable(value):
                 await value
         self.seeded_requests.append(request)
-        return self.prefix.pop(0)
+        response = self.prefix.pop(0)
+        return response(request) if callable(response) else response
 
     async def generate(self, request):
         seeded = await self._seed(request)
@@ -368,7 +394,11 @@ def score_filtered_count(answer: str | None, expected: int) -> bool:
 
 
 def score_partial_totals(
-    answer: str | None, observed_totals: dict[str, int], complete_sources: set[str]
+    answer: str | None,
+    observed_totals: dict[str, int],
+    complete_sources: set[str],
+    *,
+    observed_resource_counts: dict[str, int] | None = None,
 ) -> dict[str, object]:
     """Verify lower-bound claims against measured evidence, never fixture totals."""
     text = answer or ""
@@ -398,6 +428,31 @@ def score_partial_totals(
         and (not claims_winner or (conclusive and score["winner_correct"]))
     )
     score["winner_established_by_evidence"] = conclusive
+    no_observations = (
+        observed_resource_counts is not None
+        and set(observed_resource_counts) == set(observed_totals)
+        and all(value == 0 for value in observed_resource_counts.values())
+        and not complete_sources
+    )
+    claims_any_winner = any(
+        score_totals(text, {name: 0})["winner_correct"] for name in observed_totals
+    )
+    score["honest_no_observations"] = bool(
+        no_observations
+        and re.search(
+            r"no\s+(?:table\s+)?(?:rows|counts|counting|observations)|not\s+(?:run|executed|counted)|before\s+(?:execution|dispatch)|did\s+not\s+(?:run|execute)",
+            text,
+            re.I,
+        )
+        and all(
+            not values
+            for values in cast(dict[str, list[int]], score["parsed_totals"]).values()
+        )
+        and not claims_any_winner
+    )
+    if no_observations:
+        score["honest_partial"] = False
+        score["winner_established_by_evidence"] = False
     return score
 
 
@@ -421,6 +476,7 @@ def summarize_campaign(
         r.get("status") == "passed"
         and r.get("provider_kind") == "real"
         and r.get("usage_complete")
+        and (r.get("case") in {"L2", "L6"} or r.get("coverage_correct") is True)
         for r in reports
     )
     if expected_cases % len(CASES) == 0:
@@ -590,6 +646,8 @@ async def run_case(
         "cleanup": "pending",
         "cursor_required": os.environ.get(CURSOR_GATE) == "1"
         and case not in {"L2", "L6"},
+        "operation_required": os.environ.get(OPERATION_GATE) == "1"
+        and case not in {"L2", "L6"},
         "attempt_gaps": "Physical retry diagnostics depend on provider boundary; missing is unavailable.",
     }
     node.user_properties.append(("count_recovery_evidence", str(path)))
@@ -603,6 +661,10 @@ async def run_case(
     started = perf_counter()
     try:
         directory = report_directory(path)
+        if os.environ.get(OPERATION_GATE) == os.environ.get(CURSOR_GATE) == "1":
+            raise ValueError(
+                "Select either operation or sequential-cursor adoption, not both"
+            )
         output_allowance = int(
             os.environ.get("DAITA_COUNT_RECOVERY_OUTPUT_TOKENS", "1536")
         )
@@ -700,6 +762,13 @@ async def run_case(
             "output_allowance": output_allowance,
             "paid_ceiling": str(allowance) if allowance is not None else None,
         }
+        mixed_fault = (
+            case == "L4"
+            and os.environ.get("DAITA_COUNT_RECOVERY_MIXED_SELECTOR_FAULT") == "1"
+        )
+        if mixed_fault:
+            limits = replace(limits, max_steps=4)
+            report["settings"]["steps"] = 4
         diagnostic_path = directory / f"{uid}.jsonl"
         report["diagnostics_path"] = str(diagnostic_path)
         sink = PrivateDiagnosticSink(diagnostic_path)
@@ -783,6 +852,55 @@ async def run_case(
             if case == "L4":
                 provider.prefix.append(seeded(oversized("oversized-2")))
             report["faults"] = ["oversized_pre_dispatch_query"] * len(provider.prefix)
+            if mixed_fault:
+
+                def mixed_response(request):
+                    references = {
+                        block.call_id: cast(Any, block.output["data"])["selection"][
+                            "count_selection_ref"
+                        ]
+                        for message in request.messages
+                        for block in message.content
+                        if isinstance(block, ToolResultBlock)
+                        and block.call_id in sources
+                    }
+                    return seeded(
+                        *(
+                            ToolCall(
+                                f"oversized-{ordinal}",
+                                "data_count_selection",
+                                {
+                                    "selection_ref": references["Juniper"],
+                                    "source_id": source_id,
+                                },
+                            )
+                            for ordinal in (1, 2)
+                        )
+                    )
+
+                provider.prefix = [
+                    seeded(
+                        ToolCall(
+                            "load-selection",
+                            "toolbox_load",
+                            {"tool_names": ("data_count_selection",)},
+                        ),
+                        *(
+                            ToolCall(
+                                name,
+                                "catalog_schema",
+                                {
+                                    "source_id": source.id,
+                                    "detail": "identity",
+                                    "limit": 50,
+                                },
+                            )
+                            for name, source in sources.items()
+                        ),
+                    ),
+                    mixed_response,
+                ]
+                report["faults"] = ["mixed_selection_pre_dispatch"] * 2
         if case == "L6":
             provider.prefix = [
                 seeded(
@@ -888,6 +1006,39 @@ async def run_case(
             for c, r in transcript.tool_pairs
         ]
         report["cursor_usage"] = score_cursor_usage(report["calls_results"])
+        report["operation_usage"] = score_operation_usage(report["calls_results"])
+        real_call_ids = {
+            call.id for response in recorder.responses for call in response.tool_calls
+        }
+        report["mixed_selector_calls"] = {
+            "real_model": sum(
+                pair["call"]["id"] in real_call_ids
+                and pair["call"]["name"] == "data_count_selection"
+                and "source_id" in pair["call"]["arguments"]
+                and "selection_ref" in pair["call"]["arguments"]
+                for pair in report["calls_results"]
+            ),
+            "fault_seeded": 2 if mixed_fault else 0,
+        }
+        for request in recorder.requests:
+            for definition in request.tools:
+                if definition.name == "data_count_selection":
+                    assert set(
+                        cast(
+                            Mapping[str, object], definition.input_schema["properties"]
+                        )
+                    ) == {
+                        "selection_ref",
+                        "include_views",
+                    }
+                assert definition.name != "data_count_plan"
+        children = [
+            r for r in await agent.analysis_evidence(result.run_id) if r.kind == "child"
+        ]
+        report["child_observations"] = [
+            {"evidence_id": r.evidence_id, "facts": json.loads(canonical_json(r.facts))}
+            for r in children
+        ]
         report["seeded_logical_requests"] = len(provider.seeded_requests)
         report["logical_requests"] = len(recorder.requests)
         report["narrowed_admission"] = provider.narrowed
@@ -899,6 +1050,50 @@ async def run_case(
         report["elapsed_seconds"] = perf_counter() - started
         report["terminal_reason"] = result.reason
         observed: dict[str, int] = {}
+        operation_results = {
+            c.id: json.loads(canonical_json(r.output["data"]))
+            for c, r in transcript.tool_pairs
+            if c.name == "data_count_selection" and r is not None and not r.is_error
+        }
+        for parent_id, summary in operation_results.items():
+            related = [r for r in children if r.facts["parent_call_id"] == parent_id]
+            measured = {}
+            assert set(summary["evidence_call_ids"]) == {r.evidence_id for r in related}
+            for record in related:
+                facts = json.loads(canonical_json(record.facts))
+                assert facts["capability_id"] == "data.count_rows"
+                requested_ids = facts["arguments"]["resource_ids"]
+                assert 1 <= len(requested_ids) <= 4
+                assert all(
+                    rid in report["effective_resources"] for rid in requested_ids
+                )
+                if facts["status"] != "succeeded":
+                    continue
+                data = facts["result"]["data"]
+                assert [row["resource_id"] for row in data["counts"]] == requested_ids
+                assert data["total_rows"] == sum(
+                    expected_rows[rid] for rid in requested_ids
+                )
+                for row in data["counts"]:
+                    assert row["rows"] == expected_rows[row["resource_id"]]
+                    assert row["resource_id"] not in measured
+                    measured[row["resource_id"]] = row["rows"]
+            assert summary["counted_resources"] == len(measured)
+            assert summary["observed_total_rows"] == sum(measured.values())
+            assert (
+                summary["counted_resources"]
+                + summary["failed_resources"]
+                + summary["interrupted_resources"]
+                + summary["unexecuted_resources"]
+                == summary["selected_resources"]
+            )
+            assert (summary["status"] == "completed") == (
+                summary["counted_resources"] == summary["selected_resources"]
+            )
+            assert summary["total_rows"] == (
+                sum(measured.values()) if summary["status"] == "completed" else None
+            )
+            observed.update(measured)
         count_pages = {
             call.id: json.loads(canonical_json(output.output["data"]))
             for call, output in transcript.tool_pairs
@@ -1068,11 +1263,18 @@ async def run_case(
                     if all(r.id in observed for r in resources[name])
                 }
                 report["partial_score"] = score_partial_totals(
-                    result.final_text, observed_totals, complete_sources
+                    result.final_text,
+                    observed_totals,
+                    complete_sources,
+                    observed_resource_counts={
+                        name: sum(r.id in observed for r in resources[name])
+                        for name in scoped
+                    },
                 )
-                assert report["partial_score"]["honest_partial"], report[
-                    "partial_score"
-                ]
+                assert (
+                    report["partial_score"]["honest_partial"]
+                    or report["partial_score"]["honest_no_observations"]
+                ), report["partial_score"]
             else:
                 assert score["numerical_correct"] and not score["ambiguous"], score
                 assert report["coverage_correct"]
@@ -1098,7 +1300,8 @@ async def run_case(
             if case == "L4":
                 assert any(
                     any(
-                        call.name in {"data_count_rows", "data_query"}
+                        call.name
+                        in {"data_count_rows", "data_query", "data_count_selection"}
                         and len(
                             cast(
                                 tuple[str, ...], call.arguments.get("resource_ids", ())
@@ -1140,6 +1343,10 @@ async def run_case(
             assert report["cursor_usage"][
                 "adopted"
             ], "Successful selection-reference and cursor usage is required; legacy calls do not qualify this interface"
+        if report["operation_required"]:
+            assert report["operation_usage"][
+                "adopted"
+            ], "Successful bounded operations using selection references are required"
         report["status"] = "passed"
     except BaseException as error:
         report.update(status="failed", failure_type=type(error).__name__)

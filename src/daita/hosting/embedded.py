@@ -1951,6 +1951,7 @@ class EmbeddedAgent:
             learning_candidate_guard,
             relational_export_available=relational_export is not None,
             transcript_loader=store.load,
+            evidence_loader=store.load_analysis_evidence,
             upsert_readiness=postgresql_preview_backend.upsert_readiness,
             local_file_sensitivity=(
                 None if workspace_backend is None else workspace_backend.sensitivity
@@ -2178,6 +2179,7 @@ class EmbeddedAgent:
                     owner=job_owner,
                     resolver=graph_resolver,
                     builder=graph_builder,
+                    read_selection_resolver=data_domain.resolve_graph_count_selection,
                 )
             )
             domains = (

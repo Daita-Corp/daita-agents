@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +32,7 @@ from ...capabilities import (
     ToolView,
 )
 from ...catalog.models import CATALOG_SCHEMA_MAX_RESOURCE_IDS
+from ...llm.models import ModelSensitivity
 from .controller import (
     DATA_COUNT_ROWS_CAPABILITY_ID,
     DATA_QUERY_CAPABILITY_ID,
@@ -42,6 +44,14 @@ from .controller import (
     native_preview_capability,
 )
 from .results import BoundedResultProjection
+from .row_counts import (
+    COUNT_INSPECT_CAPABILITY_ID,
+    COUNT_OPERATION_CAPABILITY_ID,
+    COUNT_PLAN_TOOL_NAME,
+    COUNT_SELECTION_TOOL_NAME,
+    count_operation_calls,
+    reduce_count_operation,
+)
 from .sql import (
     MAX_SQL_CHARACTERS,
     MAX_SQL_PARAMETERS,
@@ -61,6 +71,14 @@ COUNT_EXECUTION_POLICY = ExecutionAdmissionPolicy(
     target_count_argument="resource_ids",
     inline_max_targets=4,
     graph_max_targets=0,
+)
+COUNT_OPERATION_POLICY = ExecutionAdmissionPolicy(
+    shape="relational_count_selection",
+    inline_eligible=True,
+    graph_v1_eligible=True,
+    target_count_argument="resource_ids",
+    inline_max_targets=CATALOG_SCHEMA_MAX_RESOURCE_IDS,
+    graph_max_targets=CATALOG_SCHEMA_MAX_RESOURCE_IDS,
 )
 
 RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
@@ -770,6 +788,304 @@ def data_count_rows_capability_declarations() -> CapabilityDeclarations:
     )
 
 
+class DataCountSelectionExecutor:
+    """Execute a declared finite read operation through host-owned child calls."""
+
+    executor_id = "data.count_selection.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        broker = request.read_broker
+        if broker is None or broker.observations is None:
+            raise CapabilityInputError(
+                "count_operation_unavailable",
+                "Bounded operation execution is unavailable; no child read ran.",
+            )
+        started = monotonic()
+        observed_at = datetime.now(UTC).isoformat()
+        deadline_reached = False
+        try:
+            async with asyncio.timeout(
+                cast(int, request.arguments["_operation_wall_seconds"])
+            ):
+                await broker.batch(
+                    count_operation_calls(
+                        request.arguments, COUNT_EXECUTION_POLICY.inline_max_targets
+                    ),
+                    request.request_sensitivity,
+                    COUNT_OPERATION_POLICY.inline_max_result_bytes,
+                )
+        except TimeoutError:
+            deadline_reached = True
+        records = await broker.observations()
+        data = reduce_count_operation(
+            request.run_id,
+            request.call_id,
+            request.arguments,
+            records,
+            width=COUNT_EXECUTION_POLICY.inline_max_targets,
+            observed_at=observed_at,
+            duration_ms=int((monotonic() - started) * 1000),
+            deadline_reached=deadline_reached,
+        )
+        selection = cast(FrozenJsonObject, request.arguments["_count_selection"])
+        classifications = [ModelSensitivity(cast(str, selection["sensitivity"]))]
+        classifications.extend(
+            ModelSensitivity(cast(str, r.facts["result_sensitivity"]))
+            for r in records
+            if r.facts.get("result_sensitivity") is not None
+        )
+        return ToolOutput(
+            kind="data.count_operation",
+            data=data,
+            sensitivity=max(classifications, key=lambda s: s.routing_rank),
+            sensitivity_provenance={
+                "authority": "authenticated_count_operation",
+                "source_ids": (request.arguments["source_id"],),
+                "resource_ids": request.arguments["resource_ids"],
+                "evidence_call_ids": data["evidence_call_ids"],
+                "plan_sha256": data["plan_sha256"],
+            },
+        )
+
+
+class DataCountInspectExecutor:
+    executor_id = "data.count_inspect.executor"
+
+    async def execute(self, request: ToolExecution) -> ToolOutput:
+        return ToolOutput(
+            kind="data.count_operation_details",
+            data=cast(Mapping[str, object], request.arguments["_inspection"]),
+            sensitivity=ModelSensitivity(
+                cast(str, request.arguments["_inspection_sensitivity"])
+            ),
+            sensitivity_provenance=cast(
+                Mapping[str, object], request.arguments["_inspection_provenance"]
+            ),
+        )
+
+
+def data_count_operation_declarations() -> CapabilityDeclarations:
+    description = (
+        f"Count an entire authenticated fixed catalog selection of at most {COUNT_OPERATION_POLICY.inline_max_targets} resources. "
+        f"Use selection_ref from catalog_schema detail=identity. The framework executes a finite plan of at most "
+        f"{(COUNT_OPERATION_POLICY.inline_max_targets + COUNT_EXECUTION_POLICY.inline_max_targets - 1) // COUNT_EXECUTION_POLICY.inline_max_targets} child reads, "
+        f"each at most {COUNT_EXECUTION_POLICY.inline_max_targets} resources, within {COUNT_OPERATION_POLICY.inline_max_wall_seconds} seconds and the shared run call budget. "
+        "No model continuation or count cursors are needed. Returns code-computed exact total or observed subtotal, fixed coverage and evidence references. "
+        "Default base tables only; include_views=true explicitly includes views. Separate batches do not share a snapshot. "
+        "Failures are retained; no failed read is retried automatically. Detailed evidence is inspectable where data_count_inspect is admitted."
+    )
+    properties = {
+        "selection_ref": {"type": "string", "pattern": "^sel_[0-9a-f]{16}$"},
+        "include_views": {"type": "boolean", "default": False},
+    }
+    explicit_properties = {
+        "source_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "resource_ids": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": 256},
+            "minItems": 1,
+            "maxItems": COUNT_OPERATION_POLICY.inline_max_targets,
+            "uniqueItems": True,
+        },
+        "include_views": properties["include_views"],
+    }
+    plan_properties = {"plan_ref": {"type": "string", "pattern": "^plan_[0-9a-f]{16}$"}}
+    output_properties: dict[str, object] = {
+        name: {"type": kind}
+        for name, kind in {
+            "operation_ref": "string",
+            "selection_ref": "string",
+            "plan_sha256": "string",
+            "source_id": "string",
+            "source_name": "string",
+            "source_revision": "string",
+            "status": "string",
+            "observed_total_rows": "integer",
+            "selected_resources": "integer",
+            "counted_resources": "integer",
+            "failed_resources": "integer",
+            "interrupted_resources": "integer",
+            "unexecuted_resources": "integer",
+            "coverage": "string",
+            "catalog_enumeration_complete": "boolean",
+            "snapshot_scope": "string",
+            "scope_limitation": "string",
+            "batch_max_resources": "integer",
+            "planned_batches": "integer",
+            "evidence_call_ids": "array",
+            "failures": "array",
+            "deadline_reached": "boolean",
+            "observed_at": "string",
+            "duration_ms": "integer",
+        }.items()
+    }
+    output_properties["total_rows"] = {"type": ["integer", "null"]}
+    operation = Capability(
+        id=COUNT_OPERATION_CAPABILITY_ID,
+        description=description,
+        input_schema={
+            "type": "object",
+            "properties": {**properties, **explicit_properties, **plan_properties},
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": plan_properties,
+                    "required": ["plan_ref"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": properties,
+                    "required": ["selection_ref"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": explicit_properties,
+                    "required": ["source_id", "resource_ids"],
+                    "additionalProperties": False,
+                },
+            ],
+            "additionalProperties": False,
+        },
+        output_kind="data.count_operation",
+        output_schema={
+            "type": "object",
+            "properties": output_properties,
+            "required": list(output_properties),
+            "additionalProperties": False,
+        },
+        executor_id=DataCountSelectionExecutor.executor_id,
+        access_mode=AccessMode.READ,
+        execution_admission_policy=COUNT_OPERATION_POLICY,
+        read_dependency_ids=(DATA_COUNT_ROWS_CAPABILITY_ID,),
+    )
+    inspect_description = "Inspect exact retained per-table count evidence for an operation_ref returned in this run. Bounded pages perform no source I/O; observations remain historical if permissions or structure changed."
+    inspect_properties = {
+        "operation_ref": {"type": "string", "pattern": "^op_[0-9a-f]{16}$"},
+        "offset": {"type": "integer", "minimum": 0, "maximum": 50, "default": 0},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+    }
+    inspect_output = {
+        name: {"type": kind}
+        for name, kind in {
+            "operation_ref": "string",
+            "source_id": "string",
+            "source_revision": "string",
+            "counts": "array",
+            "offset": "integer",
+            "next_offset": ["integer", "null"],
+            "total_counts": "integer",
+            "evidence_call_ids": "array",
+            "snapshot_scope": "string",
+            "historical_evidence": "boolean",
+        }.items()
+    }
+    inspection = Capability(
+        id=COUNT_INSPECT_CAPABILITY_ID,
+        description=inspect_description,
+        input_schema={
+            "type": "object",
+            "properties": inspect_properties,
+            "required": ["operation_ref"],
+            "additionalProperties": False,
+        },
+        output_kind="data.count_operation_details",
+        output_schema={
+            "type": "object",
+            "properties": inspect_output,
+            "required": list(inspect_output),
+            "additionalProperties": False,
+        },
+        executor_id=DataCountInspectExecutor.executor_id,
+        access_mode=AccessMode.READ,
+    )
+    return CapabilityDeclarations(
+        domain_owner_id="data",
+        capabilities=(operation, inspection),
+        executor_ids=(operation.executor_id, inspection.executor_id),
+        tool_views=tuple(
+            ToolView(
+                name,
+                cap.id,
+                (
+                    "Use only selection_ref and optional include_views. The authenticated reference already binds its source, resources and revisions; do not pass source_id, resource_ids or plan_ref. "
+                    + cap.description
+                    if name == COUNT_SELECTION_TOOL_NAME
+                    else (
+                        "Execute only the exact code-owned plan_ref from this graph task; do not supply source or selection identifiers. "
+                        + cap.description
+                        if name == COUNT_PLAN_TOOL_NAME
+                        else cap.description
+                    )
+                ),
+                ToolPresentation(
+                    ToolboxId.SOURCES,
+                    ToolLoadMode.ON_DEMAND,
+                    ToolTextTrust.CODE,
+                    summary,
+                    guidance,
+                    keywords,
+                ),
+                input_schema=(
+                    {
+                        "type": "object",
+                        "properties": {
+                            "selection_ref": properties["selection_ref"],
+                            "include_views": {"type": "boolean"},
+                        },
+                        "required": ["selection_ref"],
+                        "additionalProperties": False,
+                    }
+                    if name == COUNT_SELECTION_TOOL_NAME
+                    else (
+                        {
+                            "type": "object",
+                            "properties": plan_properties,
+                            "required": ["plan_ref"],
+                            "additionalProperties": False,
+                        }
+                        if name == COUNT_PLAN_TOOL_NAME
+                        else None
+                    )
+                ),
+            )
+            for name, cap, summary, guidance, keywords in (
+                (
+                    COUNT_SELECTION_TOOL_NAME,
+                    operation,
+                    "Count a fixed table selection with framework-managed bounded reads and totals.",
+                    "Prefer for source comparisons. Use catalog identity selection references; no per-page model calls.",
+                    (
+                        "count",
+                        "rows",
+                        "records",
+                        "database",
+                        "tables",
+                        "total",
+                        "compare",
+                        "operation",
+                    ),
+                ),
+                (
+                    COUNT_PLAN_TOOL_NAME,
+                    operation,
+                    "Execute the frozen count plan for this graph task.",
+                    "Use only the task's exact plan_ref; bounded reads and totals use the same count execution owner.",
+                    ("count", "plan", "graph", "rows"),
+                ),
+                (
+                    "data_count_inspect",
+                    inspection,
+                    "Inspect retained exact table counts for a count operation.",
+                    "Use operation_ref for per-table evidence; unnecessary for answering completed source totals.",
+                    ("count", "inspect", "evidence", "rows", "operation"),
+                ),
+            )
+        ),
+    )
+
+
 class RelationalUpdatePreviewExecutor:
     executor_id = RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID
 
@@ -886,11 +1202,18 @@ def data_query_declarations(
         (
             *declarations.capabilities,
             *data_count_rows_capability_declarations().capabilities,
+            *data_count_operation_declarations().capabilities,
         ),
-        (executor, DataCountRowsExecutor(agent_id, sqlite_backend, postgresql_backend)),
+        (
+            executor,
+            DataCountRowsExecutor(agent_id, sqlite_backend, postgresql_backend),
+            DataCountSelectionExecutor(),
+            DataCountInspectExecutor(),
+        ),
         (
             *declarations.tool_views,
             *data_count_rows_capability_declarations().tool_views,
+            *data_count_operation_declarations().tool_views,
         ),
     )
 

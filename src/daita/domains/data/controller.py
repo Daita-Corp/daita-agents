@@ -39,6 +39,7 @@ from ...catalog.capabilities import (
 )
 from ...catalog.models import Sensitivity
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
+from ...loop.analysis import AnalysisEvidence
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
 from ...scope import EffectiveSourceScope, resolve_effective_source_scope
@@ -51,8 +52,14 @@ from .file_capabilities import (
 )
 from .routine_precheck import RESOURCE_REVISION_OBSERVATION_CAPABILITY_ID
 from .row_counts import (
+    COUNT_INSPECT_CAPABILITY_ID,
+    COUNT_OPERATION_CAPABILITY_ID,
+    COUNT_PLAN_TOOL_NAME,
+    CountSelection,
     attach_count_selection,
     authenticate_count_selection,
+    count_operation_failure_details,
+    count_reference,
     finalize_count_page,
     selection_error,
 )
@@ -96,6 +103,8 @@ _RELATIONAL_READ_CAPABILITIES = frozenset(
         DATA_QUERY_CAPABILITY_ID,
         DATA_EXPORT_TABULAR_CAPABILITY_ID,
         DATA_COUNT_ROWS_CAPABILITY_ID,
+        COUNT_OPERATION_CAPABILITY_ID,
+        COUNT_INSPECT_CAPABILITY_ID,
     }
 )
 _UPDATE_CAPABILITIES = frozenset(
@@ -237,6 +246,9 @@ class DataCapabilityDomain:
         *,
         relational_export_available: bool = True,
         transcript_loader: Callable[[str], Awaitable[Transcript]] | None = None,
+        evidence_loader: (
+            Callable[[str, str], Awaitable[tuple[AnalysisEvidence, ...]]] | None
+        ) = None,
         upsert_readiness: (
             Callable[[str, FrozenJsonObject], Awaitable[FrozenJsonObject]] | None
         ) = None,
@@ -275,6 +287,7 @@ class DataCapabilityDomain:
             raise TypeError("learning must be LearningCandidateGuard")
         self._upsert_readiness = upsert_readiness
         self._transcript_loader = transcript_loader
+        self._evidence_loader = evidence_loader
         self._registry: CapabilityRegistry | None = None
         self._declarations = declarations
         self._catalog = catalog
@@ -351,6 +364,20 @@ class DataCapabilityDomain:
         for name in sorted(views):
             view = views[name]
             capability = self._capabilities[view.capability_id]
+            if capability.id == COUNT_OPERATION_CAPABILITY_ID and (
+                (run.origin is RunOrigin.JOB_TASK) != (name == COUNT_PLAN_TOOL_NAME)
+            ):
+                continue
+            if capability.id in {
+                COUNT_OPERATION_CAPABILITY_ID,
+                COUNT_INSPECT_CAPABILITY_ID,
+            } and (
+                session is None
+                or self._transcript_loader is None
+                or self._evidence_loader is None
+                or self._registry is None
+            ):
+                continue
             if not self._learning.allows(
                 session,
                 name,
@@ -391,6 +418,244 @@ class DataCapabilityDomain:
         return tuple(names)
 
     project_session = project
+
+    @property
+    def programmatic_read_capability_ids(self) -> frozenset[str]:
+        # These two operations require an exact model-transcript parent; nested
+        # Python children cannot manufacture one or recursively start a plan.
+        return frozenset(self._capabilities) - {
+            COUNT_OPERATION_CAPABILITY_ID,
+            COUNT_INSPECT_CAPABILITY_ID,
+        }
+
+    async def count_operation_children(
+        self, run: RunInput, call: ToolCall
+    ) -> tuple[AnalysisEvidence, ...]:
+        if self._evidence_loader is None:
+            raise selection_error("Count operation evidence is unavailable.")
+        return tuple(
+            r
+            for r in await self._evidence_loader(run.agent_id, run.id)
+            if r.kind == "child" and r.facts.get("parent_call_id") == call.id
+        )
+
+    async def revalidate_count_operation_child(
+        self, run: RunInput, capability: Capability, arguments: FrozenJsonObject
+    ) -> None:
+        """Recheck after a queued source permit and immediately before dispatch."""
+        binding = arguments.get("_count_operation_binding")
+        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID and isinstance(
+            binding, FrozenJsonObject
+        ):
+            await self._validate_count_binding(
+                run, capability, binding, cast(str, arguments["source_id"])
+            )
+
+    async def resolve_graph_count_selection(
+        self, execution: ToolExecution, initial: Mapping[str, object]
+    ) -> tuple[FrozenJsonObject, FrozenJsonObject | None]:
+        arguments = initial.get("arguments")
+        if (
+            initial.get("capability_id") != COUNT_OPERATION_CAPABILITY_ID
+            or not isinstance(arguments, Mapping)
+            or "selection_ref" not in arguments
+        ):
+            return FrozenJsonObject.from_mapping(initial), None
+        if self._transcript_loader is None or self._registry is None:
+            raise selection_error("Count selection evidence is unavailable.")
+        transcript = await self._transcript_loader(execution.run_id)
+        calls = [
+            c
+            for m in transcript.messages
+            for c in m.tool_calls
+            if c.id == execution.call_id
+        ]
+        if len(calls) != 1 or calls[0].arguments != execution.arguments:
+            raise selection_error(
+                "Durable count admission must be its exact persisted current-run call."
+            )
+        capability = self._registry.capability(COUNT_OPERATION_CAPABILITY_ID)
+        policy = capability.execution_admission_policy
+        assert policy is not None
+        run = replace(transcript.run, resolved_source_scope=execution.source_scope)
+        validated = await self._registry.validate_arguments_async(
+            capability.id, arguments
+        )
+        selection = await authenticate_count_selection(
+            transcript,
+            run,
+            calls[0],
+            self._registry,
+            policy.graph_max_targets,
+            selection_arguments=validated,
+        )
+        bound = selection.arguments(policy.graph_max_targets)
+        binding = cast(FrozenJsonObject, bound["_count_selection"])
+        await self._validate_count_binding(
+            run, capability, binding, selection.source_id
+        )
+        resolved = {
+            "source_id": selection.source_id,
+            "resource_ids": tuple(r["resource_id"] for r in selection.resources),
+            "include_views": selection.include_views,
+        }
+        return (
+            FrozenJsonObject.from_mapping(
+                {
+                    **initial,
+                    "arguments": resolved,
+                    "retained_references": {
+                        "source_ids": (selection.source_id,),
+                        "resource_ids": resolved["resource_ids"],
+                        "connector_binding_ids": (),
+                    },
+                }
+            ),
+            binding,
+        )
+
+    async def _validate_count_binding(
+        self,
+        run: RunInput,
+        capability: Capability,
+        binding: FrozenJsonObject,
+        source_id: str,
+    ) -> None:
+        resources = cast(tuple[FrozenJsonObject, ...], binding["resources"])
+        whole = FrozenJsonObject.from_mapping(
+            {
+                "source_id": source_id,
+                "resource_ids": tuple(r["resource_id"] for r in resources),
+            }
+        )
+        await self._validate_source_scope(run, capability, whole)
+        self._validate_execution_resource_scope(run, capability, whole)
+        await self._validate_resource_read_scope(run, capability, whole)
+        current = {
+            r.resource_id: r
+            for r in await self._catalog.resource_schemas(run.agent_id, source_id)
+        }
+        if any(
+            r["resource_id"] not in current
+            or current[cast(str, r["resource_id"])].revision != r["revision"]
+            or current[cast(str, r["resource_id"])].source_revision
+            != binding["source_revision"]
+            for r in resources
+        ):
+            raise CapabilityInputError(
+                "count_binding_stale",
+                "The fixed count selection changed. Prior results remain historical evidence; rediscover before a new operation.",
+                {"execution_disposition": "not_dispatched"},
+            )
+
+    async def _prepare_count_inspection(
+        self, run: RunInput, call: ToolCall, arguments: FrozenJsonObject
+    ) -> FrozenJsonObject:
+        if self._transcript_loader is None or self._registry is None:
+            raise selection_error("Current-run count evidence is unavailable.")
+        transcript = await self._transcript_loader(run.id)
+        if transcript.run.id != run.id or transcript.run.agent_id != run.agent_id:
+            raise selection_error("Count operation belongs to another run or agent.")
+        indexes = [i for i, m in enumerate(transcript.messages) if call in m.tool_calls]
+        if len(indexes) != 1:
+            raise selection_error(
+                "Inspection must be its exact persisted current-run call."
+            )
+        matches = []
+        for index, message in enumerate(transcript.messages[: indexes[0]]):
+            for parent in message.tool_calls:
+                if (
+                    count_reference("op_", run.id, parent.id)
+                    != arguments["operation_ref"]
+                ):
+                    continue
+                _, contract, owner = self._registry.resolve_tool_owner(parent.name)
+                blocks = [
+                    b
+                    for m in transcript.messages[index + 1 : indexes[0]]
+                    for b in m.content
+                    if isinstance(b, ToolResultBlock) and b.call_id == parent.id
+                ]
+                if (
+                    owner != "data"
+                    or contract.id != COUNT_OPERATION_CAPABILITY_ID
+                    or len(blocks) != 1
+                ):
+                    raise selection_error(
+                        "Operation result does not authenticate its registered owner."
+                    )
+                block = blocks[0]
+                if (
+                    block.is_error
+                    or block.capability_id != contract.id
+                    or block.executor_id != contract.executor_id
+                    or block.sensitivity is None
+                    or block.output_sha256
+                    != "sha256:"
+                    + sha256(canonical_json(block.output).encode()).hexdigest()
+                ):
+                    raise selection_error(
+                        "Operation result is failed or unauthenticated."
+                    )
+                data = cast(FrozenJsonObject, block.output["data"])
+                self._registry.validate_output(
+                    contract.id,
+                    ToolOutput(kind=cast(str, block.output["kind"]), data=data),
+                )
+                if data["operation_ref"] != arguments["operation_ref"]:
+                    raise selection_error("Operation did not issue this reference.")
+                matches.append((parent, block, data))
+        if len(matches) != 1:
+            raise selection_error("Unknown count operation reference.")
+        parent, block, data = matches[0]
+        records = await self.count_operation_children(run, parent)
+        by_id = {r.evidence_id: r for r in records}
+        if set(by_id) != set(cast(tuple[str, ...], data["evidence_call_ids"])):
+            raise selection_error("Operation evidence is missing or duplicated.")
+        rows: list[FrozenJsonObject] = []
+        for record in sorted(records, key=lambda r: cast(int, r.facts["sequence"])):
+            child_facts = cast(FrozenJsonObject, record.facts)
+            if (
+                record.facts["capability_id"] != DATA_COUNT_ROWS_CAPABILITY_ID
+                or record.facts["executor_id"] != "data.count_rows.executor"
+                or record.facts["contract_digest"]
+                != self._registry.contract_digest(DATA_COUNT_ROWS_CAPABILITY_ID)
+            ):
+                raise selection_error("Count child contract changed.")
+            if record.facts["status"] == "succeeded":
+                result = cast(
+                    FrozenJsonObject,
+                    cast(FrozenJsonObject, child_facts["result"])["data"],
+                )
+                self._registry.validate_output(
+                    DATA_COUNT_ROWS_CAPABILITY_ID,
+                    ToolOutput(kind="data.row_counts", data=result),
+                )
+                rows.extend(cast(tuple[FrozenJsonObject, ...], result["counts"]))
+        offset, limit = cast(int, arguments.get("offset", 0)), cast(
+            int, arguments.get("limit", 20)
+        )
+        inspection = {
+            "operation_ref": arguments["operation_ref"],
+            "source_id": data["source_id"],
+            "source_revision": data["source_revision"],
+            "counts": tuple(rows[offset : offset + limit]),
+            "offset": offset,
+            "next_offset": offset + limit if offset + limit < len(rows) else None,
+            "total_counts": len(rows),
+            "evidence_call_ids": data["evidence_call_ids"],
+            "snapshot_scope": data["snapshot_scope"],
+            "historical_evidence": True,
+        }
+        assert block.sensitivity is not None
+        return FrozenJsonObject.from_mapping(
+            {
+                **arguments,
+                "_inspection": inspection,
+                "_inspection_sensitivity": block.sensitivity.value,
+                "_inspection_provenance": block.sensitivity_provenance,
+            }
+        )
 
     async def project_call(
         self, run: RunInput, call: ToolCall, session: RunSession | None
@@ -463,6 +728,156 @@ class DataCapabilityDomain:
             files_only=session is not None and session.options.files_only,
         )
         run = replace(run, resolved_source_scope=scope)
+        if capability.id == COUNT_INSPECT_CAPABILITY_ID:
+            return await self._prepare_count_inspection(run, call, arguments)
+        if capability.id == COUNT_OPERATION_CAPABILITY_ID:
+            if (
+                session is None
+                or self._transcript_loader is None
+                or self._registry is None
+                or self._evidence_loader is None
+            ):
+                raise selection_error("Bounded operation evidence is unavailable.")
+            policy = capability.execution_admission_policy
+            assert policy is not None
+            retained_binding = None
+            if "plan_ref" in arguments:
+                context = session.options.task_context
+                specification = getattr(context, "task_specification", None)
+                if run.origin is not RunOrigin.JOB_TASK or not isinstance(
+                    specification, Mapping
+                ):
+                    raise selection_error(
+                        "Plan references belong to their exact admitted graph task."
+                    )
+                initial = cast(
+                    Mapping[str, object],
+                    cast(
+                        Mapping[str, object], specification["expected_result_contract"]
+                    )["initial_call"],
+                )
+                if (
+                    initial.get("capability_id") != capability.id
+                    or initial.get("arguments") != arguments
+                    or not isinstance(initial.get("read_arguments"), Mapping)
+                ):
+                    raise selection_error("Unknown or changed graph count plan.")
+                arguments = await self._registry.validate_arguments_async(
+                    capability.id, cast(Mapping[str, object], initial["read_arguments"])
+                )
+                retained_binding = initial.get("count_selection_binding")
+            if "selection_ref" in arguments:
+                selection = await authenticate_count_selection(
+                    await self._transcript_loader(run.id),
+                    run,
+                    call,
+                    self._registry,
+                    policy.inline_max_targets,
+                )
+            else:
+                await self._validate_source_scope(run, capability, arguments)
+                self._validate_execution_resource_scope(run, capability, arguments)
+                await self._validate_resource_read_scope(run, capability, arguments)
+                source_id = cast(str, arguments["source_id"])
+                selected_ids = cast(tuple[str, ...], arguments["resource_ids"])
+                operation_schemas = {
+                    r.resource_id: r
+                    for r in await self._catalog.resource_schemas(
+                        run.agent_id, source_id
+                    )
+                }
+                if any(rid not in operation_schemas for rid in selected_ids):
+                    raise selection_error(
+                        "Count operation requires exact current admitted resources."
+                    )
+                selected = tuple(operation_schemas[rid] for rid in selected_ids)
+                operation_include_views = arguments.get("include_views", False) is True
+                if (
+                    any(
+                        r.resource_kind != "table"
+                        and not (operation_include_views and r.resource_kind == "view")
+                        for r in selected
+                    )
+                    or len({r.source_revision for r in selected}) != 1
+                    or not isinstance(selected[0].source_revision, str)
+                ):
+                    raise selection_error(
+                        "Count operation requires one current source revision and admitted base tables or explicit views."
+                    )
+                selection = CountSelection(
+                    count_reference("sel_", run.id, call.id),
+                    source_id,
+                    cast(str, selected[0].source_revision),
+                    tuple(
+                        FrozenJsonObject.from_mapping(
+                            {
+                                "source_id": source_id,
+                                "resource_id": r.resource_id,
+                                "revision": r.revision,
+                                "kind": r.resource_kind,
+                            }
+                        )
+                        for r in selected
+                    ),
+                    False,
+                    operation_include_views,
+                    (),
+                    (),
+                    request_sensitivity,
+                )
+            arguments = selection.arguments(policy.inline_max_targets)
+            if retained_binding is not None:
+                if (
+                    not isinstance(retained_binding, FrozenJsonObject)
+                    or tuple(
+                        r["resource_id"]
+                        for r in cast(
+                            tuple[FrozenJsonObject, ...], retained_binding["resources"]
+                        )
+                    )
+                    != arguments["resource_ids"]
+                ):
+                    raise selection_error(
+                        "The retained count selection differs from its exact plan."
+                    )
+                arguments = FrozenJsonObject.from_mapping(
+                    {**arguments, "_count_selection": retained_binding}
+                )
+            operation_binding = cast(FrozenJsonObject, arguments["_count_selection"])
+            await self._validate_count_binding(
+                run, capability, operation_binding, selection.source_id
+            )
+            facts = await self._catalog.source_routing_facts(
+                run.agent_id, (selection.source_id,)
+            )
+            name = next(
+                (
+                    f.get("display_name")
+                    for f in facts
+                    if f.get("source_id") == selection.source_id
+                ),
+                selection.source_id,
+            )
+            return FrozenJsonObject.from_mapping(
+                {
+                    **arguments,
+                    "_operation_wall_seconds": (
+                        policy.graph_max_wall_seconds
+                        if run.origin is RunOrigin.JOB_TASK
+                        else policy.inline_max_wall_seconds
+                    ),
+                    "_source_name": (
+                        name if isinstance(name, str) else selection.source_id
+                    ),
+                }
+            )
+        binding = arguments.get("_count_operation_binding")
+        if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID and isinstance(
+            binding, FrozenJsonObject
+        ):
+            await self._validate_count_binding(
+                run, capability, binding, cast(str, arguments["source_id"])
+            )
         if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID and (
             "selection_ref" in arguments or "cursor" in arguments
         ):
@@ -592,6 +1007,21 @@ class DataCapabilityDomain:
                 raise CapabilityInputError(
                     "resource_read_not_allowed", _RESOURCE_READ_DENIED_MESSAGE
                 )
+            binding = arguments.get("_count_operation_binding")
+            if isinstance(binding, FrozenJsonObject):
+                expected = {
+                    r["resource_id"]: r["revision"]
+                    for r in cast(tuple[FrozenJsonObject, ...], binding["resources"])
+                }
+                if any(
+                    expected.get(r.resource_id) != r.revision
+                    or r.source_revision != binding["source_revision"]
+                    for r in selected
+                ):
+                    raise CapabilityInputError(
+                        "count_binding_stale",
+                        "The count operation's fixed structural binding changed; no read was dispatched.",
+                    )
             include_views = arguments.get("include_views", False)
             if any(
                 item.resource_kind != "table"
@@ -974,6 +1404,16 @@ class DataCapabilityDomain:
         del request_sensitivity
         if capability.id == CATALOG_SCHEMA_CAPABILITY_ID:
             output = attach_count_selection(run, call, output)
+        if (
+            capability.id == COUNT_OPERATION_CAPABILITY_ID
+            and run.origin is RunOrigin.JOB_TASK
+            and output.data["status"] != "completed"
+        ):
+            raise CapabilityInputError(
+                "count_operation_incomplete",
+                "The frozen count operation is incomplete. Retained child observations are historical evidence; block this graph task rather than claiming its whole-selection total.",
+                count_operation_failure_details(output.data),
+            )
         if capability.id == DATA_COUNT_ROWS_CAPABILITY_ID:
             output = finalize_count_page(run, call, arguments, output)
         if capability.id == DATA_EXPORT_TABULAR_CAPABILITY_ID:

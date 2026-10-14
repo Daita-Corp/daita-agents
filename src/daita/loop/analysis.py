@@ -40,6 +40,7 @@ class ProgrammaticReadBroker:
         [str, Mapping[str, object], ModelSensitivity, str | None],
         Awaitable[ProgrammaticReadResult],
     ]
+    observations: Callable[[], Awaitable[tuple[AnalysisEvidence, ...]]] | None = None
 
     async def __call__(
         self, name: str, arguments: Mapping[str, object], sensitivity: ModelSensitivity

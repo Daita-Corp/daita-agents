@@ -391,8 +391,16 @@ class RunToolCatalogEntry:
     load_mode: ToolLoadMode
 
     @property
+    def input_schema(self) -> Mapping[str, object]:
+        return (
+            self.capability.input_schema
+            if self.view.input_schema is None
+            else self.view.input_schema
+        )
+
+    @property
     def parameter_names(self) -> tuple[str, ...]:
-        properties = self.capability.input_schema.get("properties", {})
+        properties = self.input_schema.get("properties", {})
         if not isinstance(properties, Mapping):
             return ()
         return tuple(sorted(name for name in properties if isinstance(name, str)))
@@ -1078,7 +1086,7 @@ class CapabilityRuntime:
                     is not AutomationEligibility.AUTOMATION_DIRECT
                 ):
                     continue
-                schema_digest = _sha256_digest(capability.input_schema)
+                schema_digest = _sha256_digest(self._registry.tool_input_schema(name))
                 origin_digest = view.origin_revision_digest or _sha256_digest(
                     {
                         "domain_owner_id": owner_id,
@@ -2240,6 +2248,12 @@ class CapabilityRuntime:
         )
         return (
             owner in {"data", "artifacts", "mcp"}
+            and capability.id
+            in getattr(
+                self._domains[owner],
+                "programmatic_read_capability_ids",
+                {capability.id},
+            )
             and (
                 capability.access_mode is AccessMode.READ
                 or local_artifact_read
@@ -2269,18 +2283,36 @@ class CapabilityRuntime:
         run: RunInput,
         parent: ToolCall,
         projection: StepToolProjection,
+        *,
+        count_binding: FrozenJsonObject | None = None,
+        count_child_limit: int | None = None,
     ):
         """Freeze one parent surface and share the ordinary single-call boundary."""
         entries = {
             entry.view.name: entry
-            for entry in projection.callable_entries
+            for entry in (
+                projection.callable_entries
+                if count_binding is None
+                else projection.catalog_entries
+            )
             if self._analysis_read_eligible(entry.domain_owner_id, entry.capability)
             or self._analysis_capture_eligible(entry.domain_owner_id, entry.capability)
         }
+        if count_binding is not None:
+            entries = {
+                name: entry
+                for name, entry in entries.items()
+                if entry.domain_owner_id == "data"
+                and entry.capability.id == "data.count_rows"
+            }
         sequence = 0
-        child_limit = cast(
-            "AnalysisCapabilityDomain", self._domains["analysis"]
-        ).child_call_limit
+        child_limit = (
+            count_child_limit
+            if count_child_limit is not None
+            else cast(
+                "AnalysisCapabilityDomain", self._domains["analysis"]
+            ).child_call_limit
+        )
 
         def allocate(
             name: str, arguments: Mapping[str, object], sensitivity: ModelSensitivity
@@ -2302,7 +2334,14 @@ class CapabilityRuntime:
                 "capability_id": None if entry is None else entry.capability.id,
                 "executor_id": None if entry is None else entry.executor_id,
                 "contract_digest": (
-                    None if entry is None else entry.origin_revision_digest
+                    None
+                    if entry is None
+                    else (
+                        self._registry.contract_digest(entry.capability.id)
+                        if entry.domain_owner_id == "data"
+                        else entry.origin_revision_digest
+                        or self._registry.contract_digest(entry.capability.id)
+                    )
                 ),
                 "sensitivity": sensitivity.value,
                 "dispatched": False,
@@ -2312,9 +2351,7 @@ class CapabilityRuntime:
                     if entry is None
                     else entry.input_schema_digest
                     or "sha256:"
-                    + sha256(
-                        canonical_json(entry.capability.input_schema).encode()
-                    ).hexdigest()
+                    + sha256(canonical_json(entry.input_schema).encode()).hexdigest()
                 ),
             }
             return child, entry, facts
@@ -2432,14 +2469,25 @@ class CapabilityRuntime:
                             AnalysisEvidence(run.id, child.id, "child", facts)
                         )
 
+                    bound_arguments = None
+                    if count_binding is not None:
+                        validated = await self._registry.validate_arguments_async(
+                            entry.capability.id, child.arguments
+                        )
+                        bound_arguments = FrozenJsonObject.from_mapping(
+                            {**validated, "_count_operation_binding": count_binding}
+                        )
                     result = await self._execute_one(
                         run,
                         child,
                         entry,
                         sensitivity=sensitivity,
-                        validated_arguments=None,
+                        validated_arguments=bound_arguments,
                         session=session,
                         dispatch_hook=dispatched,
+                        programmatic_parent=(
+                            parent if count_binding is not None else None
+                        ),
                     )
                 if capture and (
                     result.is_error
@@ -2702,8 +2750,9 @@ class CapabilityRuntime:
                     normalized, allocations, strict=True
                 )
             )
-            analysis = cast("AnalysisCapabilityDomain", self._domains["analysis"])
-            analysis.retain_child_tasks(run.id, tasks)
+            if count_binding is None:
+                analysis = cast("AnalysisCapabilityDomain", self._domains["analysis"])
+                analysis.retain_child_tasks(run.id, tasks)
             try:
                 await asyncio.wait(tasks)
             except BaseException:
@@ -2741,7 +2790,16 @@ class CapabilityRuntime:
                 name, arguments, sensitivity, capture=True, denial=denial
             )
 
-        return ProgrammaticReadBroker(invoke, batch, capture)
+        observations = None
+        if count_binding is not None:
+            from .domains.data.controller import DataCapabilityDomain
+
+            data_domain = cast(DataCapabilityDomain, self._domains["data"])
+
+            async def observations():
+                return await data_domain.count_operation_children(run, parent)
+
+        return ProgrammaticReadBroker(invoke, batch, capture, observations)
 
     async def _execute_one(
         self,
@@ -2754,6 +2812,7 @@ class CapabilityRuntime:
         session: RunSession | None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
         projection: StepToolProjection | None = None,
+        programmatic_parent: ToolCall | None = None,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
@@ -2775,7 +2834,8 @@ class CapabilityRuntime:
                 or resolved != entry.capability
                 or owner_id != entry.domain_owner_id
                 or resolved.executor_id != entry.executor_id
-                or _sha256_digest(resolved.input_schema) != entry.input_schema_digest
+                or _sha256_digest(self._registry.tool_input_schema(call.name))
+                != entry.input_schema_digest
             ):
                 raise ValueError("tool catalog execution identity changed")
             capability = resolved
@@ -2800,6 +2860,8 @@ class CapabilityRuntime:
             await self._validate_execution_contracts(run)
             domain = self._domains[owner_id]
             if validated_arguments is None:
+                if view.input_schema is not None:
+                    self._registry.validate_view_arguments(call.name, call.arguments)
                 raw_arguments = domain.normalize_arguments(capability, call.arguments)
                 arguments = await self._registry.validate_arguments_async(
                     capability.id,
@@ -2814,7 +2876,17 @@ class CapabilityRuntime:
                     origin=run.origin,
                     context=(None if session is None else session.options.task_context),
                     capability_id=capability.id,
-                    arguments=arguments,
+                    arguments=(
+                        call.arguments if programmatic_parent is not None else arguments
+                    ),
+                    programmatic_parent=(
+                        None
+                        if programmatic_parent is None
+                        else (
+                            self._registry.tool_capability(programmatic_parent.name).id,
+                            programmatic_parent.arguments,
+                        )
+                    ),
                 )
             preference = (
                 ExecutionPreference.AUTO
@@ -2971,6 +3043,29 @@ class CapabilityRuntime:
                     session=session,
                 )
             else:
+                reader = None
+                if capability.id == "data.count_selection":
+                    if session is None or projection is None:
+                        raise CapabilityInputError(
+                            "count_operation_unavailable",
+                            "Count operation requires its admitted run session and frozen tool surface.",
+                        )
+                    from .domains.data.capabilities import COUNT_EXECUTION_POLICY
+
+                    ids = cast(tuple[str, ...], arguments["resource_ids"])
+                    reader = self._programmatic_reader(
+                        session,
+                        run,
+                        call,
+                        projection,
+                        count_binding=cast(
+                            FrozenJsonObject, arguments["_count_selection"]
+                        ),
+                        count_child_limit=(
+                            len(ids) + COUNT_EXECUTION_POLICY.inline_max_targets - 1
+                        )
+                        // COUNT_EXECUTION_POLICY.inline_max_targets,
+                    )
                 output, artifact_refs = await self._execute_no_effect(
                     run,
                     call,
@@ -2983,6 +3078,7 @@ class CapabilityRuntime:
                     task_attempt_guard=guard,
                     catalog_entry=entry,
                     dispatch_hook=dispatch_hook,
+                    read_broker=reader,
                 )
                 result = _classified_success(call, output, artifact_refs=artifact_refs)
         except _ToolExecutionInterrupted:
@@ -3024,6 +3120,7 @@ class CapabilityRuntime:
         task_attempt_guard: TaskAttemptGuard | None = None,
         catalog_entry: RunToolCatalogEntry | None = None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
+        read_broker: ProgrammaticReadBroker | None = None,
     ) -> tuple[ToolOutput, tuple[ArtifactRef, ...]]:
         if capability.operational_effect is not OperationalEffect.NONE:
             raise ValueError("non-effect execution requires operational effect none")
@@ -3044,16 +3141,28 @@ class CapabilityRuntime:
                 else session.options.one_time_artifact_destinations
             ),
             task_attempt_guard=task_attempt_guard,
+            read_broker=read_broker,
         )
-        permit = await self._call_io_permit(
-            run,
-            capability,
-            arguments,
-            catalog_entry,
-            session=session,
+        # The operation itself holds no source permit; each bounded child owns it.
+        permit = (
+            None
+            if read_broker is not None
+            else await self._call_io_permit(
+                run,
+                capability,
+                arguments,
+                catalog_entry,
+                session=session,
+            )
         )
         if permit is None:
             await _guard_attempt(task_attempt_guard, capability.id, "before_dispatch")
+            if "_count_operation_binding" in arguments:
+                from .domains.data.controller import DataCapabilityDomain
+
+                await cast(
+                    DataCapabilityDomain, domain
+                ).revalidate_count_operation_child(run, capability, arguments)
             if dispatch_hook is not None:
                 await dispatch_hook()
             elif session is not None:
@@ -3064,6 +3173,12 @@ class CapabilityRuntime:
                 await _guard_attempt(
                     task_attempt_guard, capability.id, "before_io_dispatch"
                 )
+                if "_count_operation_binding" in arguments:
+                    from .domains.data.controller import DataCapabilityDomain
+
+                    await cast(
+                        DataCapabilityDomain, domain
+                    ).revalidate_count_operation_child(run, capability, arguments)
                 if dispatch_hook is not None:
                     await dispatch_hook()
                 elif session is not None:
@@ -4209,7 +4324,8 @@ def _entry_resolves_exactly(
             capability == entry.capability,
             owner_id == entry.domain_owner_id,
             capability.executor_id == entry.executor_id,
-            _sha256_digest(capability.input_schema) == entry.input_schema_digest,
+            _sha256_digest(registry.tool_input_schema(entry.view.name))
+            == entry.input_schema_digest,
             view.presentation.toolbox_id is entry.toolbox_id,
             view.presentation.load_mode is entry.load_mode,
         )
@@ -4225,7 +4341,7 @@ def _catalog_entry_material(entry: RunToolCatalogEntry) -> dict[str, object]:
         "description": entry.view.description,
         "presentation_sensitivity": entry.view.presentation_sensitivity.value,
         "connector_presentation": entry.view.connector_presentation,
-        "input_schema": entry.capability.input_schema,
+        "input_schema": entry.input_schema,
         "input_schema_digest": entry.input_schema_digest,
         "output_kind": entry.capability.output_kind,
         "data_access": entry.capability.access_mode.value,
@@ -4250,6 +4366,11 @@ def _automation_contract(entry: RunToolCatalogEntry) -> dict[str, object]:
     return {
         "tool_name": entry.view.name,
         "capability_id": entry.capability.id,
+        **(
+            {"read_dependency_ids": entry.capability.read_dependency_ids}
+            if entry.capability.read_dependency_ids
+            else {}
+        ),
         "automation_eligibility": entry.capability.automation_eligibility.value,
         "requires_automation_grant": policy is not None,
         "execution_limits": (
@@ -4300,7 +4421,7 @@ def _tool_contract(
     if include_schemas:
         contract.update(
             complete=True,
-            input_schema=entry.capability.input_schema,
+            input_schema=entry.input_schema,
             output_schema=entry.capability.output_schema,
             output_kind=entry.capability.output_kind,
             data_access=entry.capability.access_mode.value,

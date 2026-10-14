@@ -223,9 +223,13 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
     catalog_bundle = catalog_declarations(
         "agent-relational", cast(CatalogProjection, catalog)
     )
-    from daita.domains.data.capabilities import data_count_rows_capability_declarations
+    from daita.domains.data.capabilities import (
+        data_count_operation_declarations,
+        data_count_rows_capability_declarations,
+    )
 
     count_bundle = data_count_rows_capability_declarations()
+    operation_bundle = data_count_operation_declarations()
     query_bundle = data_query_capability_declarations()
     export_bundle = data_export_tabular_capability_declarations()
     preview_bundle = relational_update_preview_capability_declarations()
@@ -241,6 +245,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
         *catalog_bundle.capabilities,
         *query_bundle.capabilities,
         *count_bundle.capabilities,
+        *operation_bundle.capabilities,
         *export_bundle.capabilities,
         *preview_bundle.capabilities,
         *update_bundle.capabilities,
@@ -257,6 +262,7 @@ def _domain(catalog: _Catalog, *, local_files: bool = False) -> DataCapabilityDo
                 *catalog_bundle.tool_views,
                 *query_bundle.tool_views,
                 *count_bundle.tool_views,
+                *operation_bundle.tool_views,
                 *export_bundle.tool_views,
                 *preview_bundle.tool_views,
                 *update_bundle.tool_views,

@@ -6,13 +6,17 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
+from daita._json import canonical_json
 from daita.capabilities import (
     AccessMode,
     AutomationEligibility,
     Capability,
+    CapabilityInputError,
+    CapabilityRegistry,
     ExecutionAdmissionPolicy,
     ExecutionPreference,
     GraphTaskBinding,
@@ -245,8 +249,13 @@ async def test_normal_assistant_text_is_protocol_violation_and_bounded_retry(
         await integration.close()
 
 
+@pytest.mark.parametrize(
+    "contract_fault",
+    [None, "missing", "kind_alias", "empty", "long", "invalid_identifier"],
+)
 async def test_foreground_start_graph_job_rederives_typed_initial_task(
     tmp_path: Path,
+    contract_fault: str | None,
 ) -> None:
     integration = await ModelGraphIntegration.open(tmp_path)
     try:
@@ -276,27 +285,64 @@ async def test_foreground_start_graph_job_rederives_typed_initial_task(
             item for item in executors if isinstance(item, StartGraphJobExecutor)
         )
         resource_ids = tuple(f"resource-{item}" for item in range(5))
+        arguments: dict[str, Any] = {
+            "objective": "Perform the exact bounded durable read.",
+            "outcome_contract": {"required_result_kind": "test.graph.read"},
+            "deadline_seconds": 300,
+            "initial_task": {
+                "capability_id": READ_CAPABILITY_ID,
+                "arguments": {"resource_ids": resource_ids},
+                "expected_result_contract": {
+                    "result_kind": "test.graph.read",
+                    "requirements": {"fixture": "exact_read"},
+                },
+                "retained_references": {
+                    "source_ids": (),
+                    "resource_ids": resource_ids,
+                    "connector_binding_ids": (),
+                },
+            },
+        }
+        if contract_fault is not None:
+            arguments["initial_task"]["expected_result_contract"] = {
+                "missing": {},
+                "kind_alias": {"kind": "test.graph.read"},
+                "empty": {"result_kind": ""},
+                "long": {"result_kind": "a" * 257},
+                "invalid_identifier": {"result_kind": "not a result identifier"},
+            }[contract_fault]
+        registry = CapabilityRegistry(declarations=(declarations,), executors=executors)
+        if contract_fault is not None:
+            with pytest.raises(CapabilityInputError):
+                registry.validate_arguments("jobs.graph.start", arguments)
+            with pytest.raises(CapabilityInputError) as issue:
+                await starter.execute(
+                    ToolExecution(
+                        run_id="run-" + "b" * 32,
+                        call_id="start-invalid-contract",
+                        capability_id="jobs.graph.start",
+                        conversation_id=CONVERSATION_ID,
+                        arguments=arguments,
+                        request_sensitivity=ModelSensitivity.INTERNAL,
+                    )
+                )
+            assert issue.value.code == "graph_initial_task_invalid"
+            assert issue.value.details["execution_disposition"] == "not_dispatched"
+            assert (
+                cast(Any, issue.value.details["recovery"])["tool_name"]
+                == "start_graph_job"
+            )
+            assert await integration.store.list_graph_jobs(AGENT_ID) == ()
+            assert integration.reader.calls == []
+            return
+        validated = registry.validate_arguments("jobs.graph.start", arguments)
         output = await starter.execute(
             ToolExecution(
                 run_id="run-" + "b" * 32,
                 call_id="start-typed-graph",
                 capability_id="jobs.graph.start",
                 conversation_id=CONVERSATION_ID,
-                arguments={
-                    "objective": "Perform the exact bounded durable read.",
-                    "outcome_contract": {"required_result_kind": "test.graph.read"},
-                    "deadline_seconds": 300,
-                    "initial_task": {
-                        "capability_id": READ_CAPABILITY_ID,
-                        "arguments": {"resource_ids": resource_ids},
-                        "expected_result_contract": {"result_kind": "test.graph.read"},
-                        "retained_references": {
-                            "source_ids": (),
-                            "resource_ids": resource_ids,
-                            "connector_binding_ids": (),
-                        },
-                    },
-                },
+                arguments=validated,
                 request_sensitivity=ModelSensitivity.INTERNAL,
             )
         )
@@ -313,6 +359,10 @@ async def test_foreground_start_graph_job_rederives_typed_initial_task(
         assert all(
             item.specification.created_by == "job_owner" for item in inspection.tasks
         )
+        worker = next(t for t in inspection.tasks if t.role is TaskRole.WORKER)
+        assert canonical_json(
+            worker.specification.expected_result_contract["expected_result_contract"]
+        ) == canonical_json(arguments["initial_task"]["expected_result_contract"])
     finally:
         await integration.close()
 

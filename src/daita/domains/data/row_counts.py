@@ -22,9 +22,165 @@ from ...capabilities import (
 from ...catalog.capabilities import CATALOG_SCHEMA_CAPABILITY_ID
 from ...catalog.models import CATALOG_SCHEMA_MAX_RESOURCE_IDS
 from ...llm.models import ModelSensitivity, ToolCall, ToolResultBlock
+from ...loop.analysis import AnalysisEvidence
 from ...loop.models import RunInput, Transcript
 
 COUNT_CAPABILITY_ID = "data.count_rows"
+COUNT_OPERATION_CAPABILITY_ID = "data.count_selection"
+COUNT_INSPECT_CAPABILITY_ID = "data.count_inspect"
+COUNT_SELECTION_TOOL_NAME = "data_count_selection"
+COUNT_PLAN_TOOL_NAME = "data_count_plan"
+
+
+def count_operation_calls(
+    arguments: Mapping[str, object], width: int
+) -> tuple[FrozenJsonObject, ...]:
+    """A finite plan over the exact admitted selection, never a wildcard scan."""
+    ids = cast(tuple[str, ...], arguments["resource_ids"])
+    return tuple(
+        FrozenJsonObject.from_mapping(
+            {
+                "name": "data_count_rows",
+                "arguments": {
+                    "source_id": arguments["source_id"],
+                    "resource_ids": ids[offset : offset + width],
+                    "include_views": arguments["include_views"],
+                },
+            }
+        )
+        for offset in range(0, len(ids), width)
+    )
+
+
+def reduce_count_operation(
+    run_id: str,
+    call_id: str,
+    arguments: Mapping[str, object],
+    records: tuple[AnalysisEvidence, ...],
+    *,
+    width: int,
+    observed_at: str,
+    duration_ms: int,
+    deadline_reached: bool,
+) -> dict[str, object]:
+    """Reduce authenticated child observations against an immutable denominator."""
+    selection = cast(FrozenJsonObject, arguments["_count_selection"])
+    expected_calls = count_operation_calls(arguments, width)
+    expected = {
+        r["resource_id"]: r["revision"]
+        for r in cast(tuple[FrozenJsonObject, ...], selection["resources"])
+    }
+    counted: dict[str, int] = {}
+    failed = 0
+    interrupted = 0
+    failures = []
+    ids = []
+    seen = set()
+    for record in sorted(records, key=lambda r: cast(int, r.facts["sequence"])):
+        facts = cast(FrozenJsonObject, record.facts)
+        sequence = cast(int, facts["sequence"])
+        if (
+            record.run_id != run_id
+            or record.kind != "child"
+            or facts["parent_call_id"] != call_id
+            or sequence in seen
+            or not 1 <= sequence <= len(expected_calls)
+            or facts["tool_name"] != "data_count_rows"
+            or facts["arguments"] != expected_calls[sequence - 1]["arguments"]
+            or facts["capability_id"] != COUNT_CAPABILITY_ID
+            or facts["executor_id"] != "data.count_rows.executor"
+        ):
+            raise ToolOutputValidationError("Count operation child identity changed")
+        seen.add(sequence)
+        ids.append(record.evidence_id)
+        batch = cast(
+            tuple[str, ...], cast(FrozenJsonObject, facts["arguments"])["resource_ids"]
+        )
+        if facts["status"] != "succeeded":
+            if facts["status"] == "failed":
+                failed += len(batch)
+                error = cast(Mapping[str, object], facts["result"]).get("error", {})
+                code = cast(Mapping[str, object], error).get("code", "count_failed")
+            else:
+                interrupted += len(batch)
+                code = (
+                    "count_operation_deadline"
+                    if deadline_reached
+                    else "count_interrupted"
+                )
+            failures.append(
+                {
+                    "evidence_id": record.evidence_id,
+                    "code": code,
+                    "resource_count": len(batch),
+                    "dispatched": facts["dispatched"],
+                }
+            )
+            continue
+        data = cast(FrozenJsonObject, cast(FrozenJsonObject, facts["result"])["data"])
+        rows = cast(tuple[FrozenJsonObject, ...], data["counts"])
+        if (
+            data["source_id"] != arguments["source_id"]
+            or data["source_revision"] != selection["source_revision"]
+            or tuple(r["resource_id"] for r in rows) != batch
+            or any(r["revision"] != expected[r["resource_id"]] for r in rows)
+            or data["total_rows"] != sum(cast(int, r["rows"]) for r in rows)
+            or any(r["resource_id"] in counted for r in rows)
+        ):
+            raise ToolOutputValidationError(
+                "Count operation result differs from its plan"
+            )
+        counted.update(
+            (cast(str, r["resource_id"]), cast(int, r["rows"])) for r in rows
+        )
+    complete = len(counted) == len(expected)
+    observed = sum(counted.values())
+    return {
+        "operation_ref": count_reference("op_", run_id, call_id),
+        "selection_ref": selection["reference"],
+        "plan_sha256": "sha256:"
+        + sha256(
+            canonical_json(
+                {
+                    "source_id": arguments["source_id"],
+                    "selection": selection,
+                    "batch_width": width,
+                }
+            ).encode()
+        ).hexdigest(),
+        "source_id": arguments["source_id"],
+        "source_name": arguments["_source_name"],
+        "source_revision": selection["source_revision"],
+        "status": "completed" if complete else "partial" if counted else "failed",
+        "total_rows": observed if complete else None,
+        "observed_total_rows": observed,
+        "selected_resources": len(expected),
+        "counted_resources": len(counted),
+        "failed_resources": failed,
+        "interrupted_resources": interrupted,
+        "unexecuted_resources": len(expected) - len(counted) - failed - interrupted,
+        "coverage": (
+            "complete_admitted_base_tables"
+            if complete
+            and selection["complete_source_enumeration"]
+            and not arguments["include_views"]
+            else (
+                "complete_catalog_selection"
+                if complete
+                else "partial_catalog_selection"
+            )
+        ),
+        "catalog_enumeration_complete": selection["complete_source_enumeration"],
+        "snapshot_scope": "separate_batch_snapshots",
+        "scope_limitation": "Fixed admitted catalog selection only; no complete physical-database or shared-snapshot claim. Views may overlap tables.",
+        "batch_max_resources": width,
+        "planned_batches": len(expected_calls),
+        "evidence_call_ids": ids,
+        "failures": failures,
+        "deadline_reached": deadline_reached,
+        "observed_at": observed_at,
+        "duration_ms": duration_ms,
+    }
 
 
 def count_reference(prefix: str, run_id: str, call_id: str) -> str:
@@ -32,6 +188,86 @@ def count_reference(prefix: str, run_id: str, call_id: str) -> str:
         prefix
         + sha256(canonical_json((run_id, call_id, prefix)).encode()).hexdigest()[:16]
     )
+
+
+def count_operation_failure_details(data: Mapping[str, object]) -> dict[str, object]:
+    """Project bounded authenticated child causes into an actionable graph block.
+
+    The reducer bounds failures by its finite policy-derived batch plan. Only
+    normalized codes and dispatch facts are carried forward, never source payloads.
+    """
+    failures = cast(tuple[Mapping[str, object], ...], data["failures"])
+    codes = tuple(dict.fromkeys(cast(str, f["code"])[:128] for f in failures))
+    cause_set = set(codes)
+    if cause_set and cause_set <= {
+        "catalog_source_stale",
+        "count_binding_stale",
+        "execution_contract_changed",
+        "execution_contract_unavailable",
+    }:
+        control_kind = "source_or_contract_drift"
+        constraint = "The frozen source schema or execution contract changed. Block this task; a fresh caller-admitted plan is required. Do not retry or substitute this stale selection."
+    elif cause_set and cause_set <= {
+        "source_scope_violation",
+        "resource_read_not_allowed",
+        "source_permission_state_invalid",
+    }:
+        control_kind = "needs_authorization"
+        constraint = "The fixed selection is no longer admitted by current scope or permission. Block this task; only caller admission can restore authority."
+    elif (
+        data["deadline_reached"]
+        or cause_set
+        and cause_set
+        <= {
+            "count_operation_deadline",
+            "tool_calls_per_run_exceeded",
+            "analysis_child_budget_exhausted",
+            "analysis_batch_result_budget_exhausted",
+        }
+    ):
+        control_kind = "budget_exhausted"
+        constraint = "The bounded count operation exhausted its execution allowance. Block this task without extending the allowance."
+    else:
+        control_kind = "needs_replan"
+        constraint = "The fixed count selection could not complete its bounded reads. Block this task and report the retained failure codes; no complete total is available."
+    constraint += " The framework did not automatically replay failed child reads. Preserve genuine observations; they do not establish a complete total."
+    counts = {
+        name: data[name]
+        for name in (
+            "selected_resources",
+            "counted_resources",
+            "failed_resources",
+            "interrupted_resources",
+            "unexecuted_resources",
+            "observed_total_rows",
+        )
+    }
+    child_dispatched = bool(data["counted_resources"]) or any(
+        f["dispatched"] for f in failures
+    )
+    return {
+        **counts,
+        "total_rows": None,
+        "coverage": data["coverage"],
+        "execution_disposition": (
+            "partially_executed" if child_dispatched else "not_dispatched"
+        ),
+        "child_execution_dispatched": child_dispatched,
+        "deadline_reached": data["deadline_reached"],
+        "failure_codes": codes,
+        "failures": tuple({**f, "code": cast(str, f["code"])[:128]} for f in failures),
+        "evidence_call_ids": data["evidence_call_ids"],
+        "recovery": {
+            "kind": "block_task",
+            "tool_name": "task_block",
+            "constraint": constraint,
+            "arguments": {
+                "kind": control_kind,
+                "message": constraint,
+                "details": {**counts, "failure_codes": codes, "total_rows": None},
+            },
+        },
+    }
 
 
 def selection_error(message: str) -> CapabilityInputError:
@@ -132,6 +368,8 @@ async def authenticate_count_selection(
     call: ToolCall,
     registry: CapabilityRegistry,
     width: int,
+    *,
+    selection_arguments: Mapping[str, object] | None = None,
 ) -> CountSelection:
     """Resolve one immutable cursor chain; never trust model-authored aggregates."""
     if transcript.run.id != run.id or transcript.run.agent_id != run.agent_id:
@@ -199,8 +437,11 @@ async def authenticate_count_selection(
             ) from None
         return producer_index, producer, block, data
 
-    cursor = call.arguments.get("cursor")
-    reference = call.arguments.get("selection_ref")
+    reference_arguments = (
+        call.arguments if selection_arguments is None else selection_arguments
+    )
+    cursor = reference_arguments.get("cursor")
+    reference = reference_arguments.get("selection_ref")
     chain: list[tuple[ToolCall, ToolResultBlock, FrozenJsonObject]] = []
     before = current_index
     while cursor is not None:
@@ -245,7 +486,7 @@ async def authenticate_count_selection(
     include_views = (
         chain[-1][0].arguments.get("include_views", False)
         if chain
-        else call.arguments.get("include_views", False)
+        else reference_arguments.get("include_views", False)
     )
     resources = tuple(
         item

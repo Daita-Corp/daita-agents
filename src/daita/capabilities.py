@@ -12,13 +12,16 @@ from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from ._json_schema import project_json_schema, validate_json_schema_value
 from .artifacts.models import ArtifactAuthorship, ArtifactDraft
 from .llm.models import ModelSensitivity, ToolDefinition
 from .scope import EffectiveSourceScope
+
+if TYPE_CHECKING:
+    from .loop.analysis import ProgrammaticReadBroker
 
 _T = TypeVar("_T")
 
@@ -1226,8 +1229,24 @@ class Capability:
     execution_admission_policy: ExecutionAdmissionPolicy | None = None
     durable_foreground_entrypoint: bool = False
     external_input_schema: Mapping[str, object] | None = None
+    read_dependency_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        dependencies = tuple(self.read_dependency_ids)
+        if dependencies:
+            if (
+                self.access_mode is not AccessMode.READ
+                or self.operational_effect is not OperationalEffect.NONE
+                or len(dependencies) > 4
+                or len(set(dependencies)) != len(dependencies)
+                or self.id in dependencies
+            ):
+                raise ValueError(
+                    "Read operation dependencies require a bounded effect-free declaration"
+                )
+            for dependency in dependencies:
+                _text(dependency, "read dependency capability id")
+        object.__setattr__(self, "read_dependency_ids", dependencies)
         for value, name in (
             (self.id, "capability id"),
             (self.description, "capability description"),
@@ -1333,6 +1352,7 @@ def capability_contract_digest(
     capability: Capability,
     *,
     domain_owner_id: str,
+    tool_views: tuple[ToolView, ...] = (),
 ) -> str:
     """Return the exact immutable execution contract identity for a capability."""
 
@@ -1342,8 +1362,27 @@ def capability_contract_digest(
     material = {
         "domain_owner_id": domain_owner_id,
         "capability_id": capability.id,
+        **(
+            {"read_dependency_ids": capability.read_dependency_ids}
+            if capability.read_dependency_ids
+            else {}
+        ),
         "description": capability.description,
         "input_schema": capability.input_schema,
+        **(
+            {
+                "tool_input_schemas": {
+                    view.name: (
+                        view.input_schema
+                        if view.input_schema is not None
+                        else capability.input_schema
+                    )
+                    for view in sorted(tool_views, key=lambda item: item.name)
+                }
+            }
+            if any(view.input_schema is not None for view in tool_views)
+            else {}
+        ),
         "output_kind": capability.output_kind,
         "output_schema": capability.output_schema,
         "executor_id": capability.executor_id,
@@ -1435,8 +1474,13 @@ class ToolView:
     origin_revision_digest: str | None = None
     presentation_sensitivity: ModelSensitivity = ModelSensitivity.PUBLIC
     connector_presentation: FrozenJsonObject | None = None
+    input_schema: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
+        if self.input_schema is not None:
+            schema = FrozenJsonObject.from_mapping(self.input_schema)
+            _check_schema(schema)
+            object.__setattr__(self, "input_schema", schema)
         for value, name in (
             (self.name, "tool name"),
             (self.capability_id, "tool capability_id"),
@@ -1520,8 +1564,14 @@ class ToolExecution:
     caller_principal_id: str | None = None
     execution_scope: ExecutionScope | None = None
     caller_principal_verified: bool = True
+    read_broker: ProgrammaticReadBroker | None = None
 
     def __post_init__(self) -> None:
+        if self.read_broker is not None:
+            from .loop.analysis import ProgrammaticReadBroker
+
+            if not isinstance(self.read_broker, ProgrammaticReadBroker):
+                raise TypeError("tool read broker must be host supplied")
         _text(self.run_id, "tool run_id")
         _text(self.call_id, "tool call_id")
         _text(self.capability_id, "tool capability_id")
@@ -1725,6 +1775,11 @@ class CapabilityRegistry:
                                         "contract_digest": capability_contract_digest(
                                             capability,
                                             domain_owner_id=declaration.domain_owner_id,
+                                            tool_views=tuple(
+                                                view
+                                                for view in declaration.tool_views
+                                                if view.capability_id == capability.id
+                                            ),
                                         ),
                                         "description": capability.description,
                                         "input_schema": capability.input_schema,
@@ -1786,6 +1841,11 @@ class CapabilityRegistry:
                                         "origin_revision_digest": (
                                             view.origin_revision_digest
                                         ),
+                                        **(
+                                            {"input_schema": view.input_schema}
+                                            if view.input_schema is not None
+                                            else {}
+                                        ),
                                     }
                                     for view in sorted(
                                         declaration.tool_views,
@@ -1806,6 +1866,11 @@ class CapabilityRegistry:
                 capability.id: capability_contract_digest(
                     capability,
                     domain_owner_id=self._domain_owners[capability.id],
+                    tool_views=tuple(
+                        view
+                        for view in self._views.values()
+                        if view.capability_id == capability.id
+                    ),
                 )
                 for capability in self._capabilities.values()
             }
@@ -1869,8 +1934,45 @@ class CapabilityRegistry:
                     else ""
                 )
             ),
-            input_schema=capability.input_schema,
+            input_schema=self.tool_input_schema(name),
         )
+
+    def tool_input_schema(self, name: str) -> Mapping[str, object]:
+        """Immutable model-view schema; canonical execution validation still applies."""
+        view, capability = self.resolve_tool(name)
+        return (
+            capability.input_schema if view.input_schema is None else view.input_schema
+        )
+
+    def validate_view_arguments(
+        self, name: str, arguments: Mapping[str, object]
+    ) -> FrozenJsonObject:
+        schema = self.tool_input_schema(name)
+        value = FrozenJsonObject.from_mapping(arguments)
+        try:
+            _validate_rule("arguments", value, schema, CapabilityInputError)
+        except CapabilityInputError as error:
+            properties = schema.get("properties", {})
+            fields = (
+                tuple(sorted(properties)) if isinstance(properties, Mapping) else ()
+            )
+            details: dict[str, object] = dict(error.details)
+            names = cast(tuple[str, ...], details.get("names", ()))
+            constraint = f"This tool view accepts only: {', '.join(fields)}. Correct the arguments and submit a new call."
+            if error.code == "unexpected_arguments":
+                constraint = f"Unexpected fields: {', '.join(names)}. " + constraint
+            details.update(
+                execution_disposition="not_dispatched",
+                recovery={
+                    "kind": "correct_arguments",
+                    "constraint": constraint[:512],
+                    "allowed_fields": fields,
+                    "tool_name": name,
+                    "inspection_tool": "toolbox_inspect",
+                },
+            )
+            raise CapabilityInputError(error.code, constraint, details) from None
+        return value
 
     def validate_arguments(
         self, capability_id: str, arguments: Mapping[str, object]

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+import re
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
-from typing import Protocol
+from typing import Protocol, cast
 
 from ..._json import FrozenJsonObject
 from ...capabilities import (
@@ -87,6 +88,12 @@ _GRAPH_SUPPORT_CAPABILITY_IDS = (
     TASK_COMPLETE_CAPABILITY_ID,
     TASK_REQUEST_REVIEW_CAPABILITY_ID,
 )
+_RESULT_KIND_SCHEMA = {
+    "type": "string",
+    "minLength": 1,
+    "maxLength": 256,
+    "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]*$",
+}
 _NATIVE_GRAPH_EFFECT_CAPABILITY_IDS = frozenset(
     {"data.update_rows", "data.upsert_rows"}
 )
@@ -131,6 +138,8 @@ class InitialTaskProposal:
     per_run_max_cost_usd: Decimal
     preview_capability_id: str | None = None
     requested_grant_constraints: Mapping[str, object] | None = None
+    read_dependency_ids: tuple[str, ...] = ()
+    retained_read_selection: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -142,6 +151,12 @@ class InitialTaskProposal:
         object.__setattr__(
             self, "arguments", FrozenJsonObject.from_mapping(self.arguments)
         )
+        if self.retained_read_selection is not None:
+            object.__setattr__(
+                self,
+                "retained_read_selection",
+                FrozenJsonObject.from_mapping(self.retained_read_selection),
+            )
         object.__setattr__(
             self,
             "expected_result_contract",
@@ -158,7 +173,12 @@ class InitialTaskProposal:
                 "requested_grant_constraints",
                 FrozenJsonObject.from_mapping(self.requested_grant_constraints),
             )
-        for name in ("source_ids", "resource_ids", "connector_binding_ids"):
+        for name in (
+            "source_ids",
+            "resource_ids",
+            "connector_binding_ids",
+            "read_dependency_ids",
+        ):
             values = tuple(getattr(self, name))
             if values != tuple(sorted(set(values))) or any(
                 not isinstance(value, str) or not value for value in values
@@ -206,6 +226,7 @@ class InitialTaskProposal:
             sorted(
                 (
                     self.capability_id,
+                    *self.read_dependency_ids,
                     *(
                         ()
                         if self.preview_capability_id is None
@@ -225,6 +246,11 @@ class InitialTaskProposal:
         return canonical_digest(
             {
                 "capability_id": self.capability_id,
+                **(
+                    {"read_dependency_ids": self.read_dependency_ids}
+                    if self.read_dependency_ids
+                    else {}
+                ),
                 "arguments": self.arguments,
                 "expected_result_contract": self.expected_result_contract,
                 "source_ids": self.source_ids,
@@ -236,6 +262,11 @@ class InitialTaskProposal:
                 "contract_bindings": self.contract_bindings.material(),
                 "preview_capability_id": self.preview_capability_id,
                 "requested_grant_constraints": self.requested_grant_constraints,
+                **(
+                    {"retained_read_selection": self.retained_read_selection}
+                    if self.retained_read_selection is not None
+                    else {}
+                ),
                 "max_steps": self.max_steps,
                 "max_wall_time_seconds": self.max_wall_time_seconds,
                 "per_run_max_tokens": self.per_run_max_tokens,
@@ -381,6 +412,11 @@ class RegistryInitialTaskProposalResolver:
             )
         source_ids = _reference_ids(references, "source_ids")
         resource_ids = _reference_ids(references, "resource_ids")
+        if len(resource_ids) > policy.graph_max_targets:
+            raise CapabilityInputError(
+                "execution_not_supported_for_requested_shape",
+                "Retained resources exceed this exact capability's graph ceiling.",
+            )
         connector_ids = _reference_ids(references, "connector_binding_ids")
         if source_scope is not None and (
             not set(source_ids) <= set(source_scope.source_ids)
@@ -394,11 +430,33 @@ class RegistryInitialTaskProposalResolver:
             sorted(
                 (
                     capability_id,
+                    *capability.read_dependency_ids,
                     *((preview_capability_id,) if preview_capability_id else ()),
                     *_GRAPH_SUPPORT_CAPABILITY_IDS,
                 )
             )
         )
+        for dependency_id in capability.read_dependency_ids:
+            dependency = self._registry.capability(dependency_id)
+            if (
+                dependency.access_mode is not AccessMode.READ
+                or dependency.operational_effect is not OperationalEffect.NONE
+                or dependency.artifact_policy is not None
+                or dependency.read_dependency_ids
+            ):
+                raise CapabilityInputError(
+                    "graph_read_dependency_invalid",
+                    "A read operation requires exact nonrecursive effect-free child contracts.",
+                )
+        if capability.read_dependency_ids and (
+            source_ids != (validated.get("source_id"),)
+            or resource_ids
+            != tuple(sorted(cast(tuple[str, ...], validated.get("resource_ids", ()))))
+        ):
+            raise CapabilityInputError(
+                "graph_read_selection_invalid",
+                "Retained references must cover the operation's exact fixed selection.",
+            )
         bindings = await self._contract_reader(
             agent_id=self._agent_id,
             source_ids=source_ids,
@@ -422,10 +480,23 @@ class RegistryInitialTaskProposalResolver:
                 "A proposed graph capability contract is no longer current.",
             )
         result_kind = result_contract.get("result_kind")
-        if not isinstance(result_kind, str) or not result_kind:
+        if (
+            not isinstance(result_kind, str)
+            or len(result_kind) > 256
+            or re.fullmatch(cast(str, _RESULT_KIND_SCHEMA["pattern"]), result_kind)
+            is None
+        ):
             raise CapabilityInputError(
                 "graph_initial_task_invalid",
-                "The initial task requires one bounded result_kind.",
+                "Set initial_task.expected_result_contract.result_kind to one bounded result identifier (1–256 characters).",
+                {
+                    "execution_disposition": "not_dispatched",
+                    "recovery": {
+                        "kind": "correct_arguments",
+                        "tool_name": START_GRAPH_JOB_TOOL_NAME,
+                        "constraint": "Supply initial_task.expected_result_contract.result_kind, usually the admitted capability output_kind. No graph was created.",
+                    },
+                },
             )
         return InitialTaskProposal(
             capability_id=capability_id,
@@ -445,6 +516,7 @@ class RegistryInitialTaskProposalResolver:
             per_run_max_cost_usd=self._per_run_max_cost_usd,
             preview_capability_id=preview_capability_id,
             requested_grant_constraints=requested_constraints,
+            read_dependency_ids=tuple(sorted(capability.read_dependency_ids)),
         )
 
 
@@ -473,6 +545,23 @@ class GraphAdmissionBuilder:
             raise TypeError("graph admission requires CapabilityRegistry")
         self._registry = registry
 
+    @property
+    def initial_resource_limit(self) -> int:
+        return max(
+            (
+                policy.graph_max_targets
+                for name in self._registry.tool_names
+                if (
+                    policy := self._registry.tool_capability(
+                        name
+                    ).execution_admission_policy
+                )
+                is not None
+                and policy.graph_v1_eligible
+            ),
+            default=16,
+        )
+
     def bind_grant_preparer(self, preparer: GraphGrantPreparer) -> None:
         if self._grant_preparer is not None:
             raise RuntimeError("graph grant preparer is already bound")
@@ -491,6 +580,15 @@ class GraphAdmissionBuilder:
         deadline_seconds: int,
         proposal: InitialTaskProposal,
     ) -> GraphAdmission:
+        if proposal.read_dependency_ids != tuple(
+            sorted(
+                self._registry.capability(proposal.capability_id).read_dependency_ids
+            )
+        ):
+            raise CapabilityInputError(
+                "graph_read_dependency_invalid",
+                "The operation's frozen dependencies differ from its registered contract.",
+            )
         grant: CapabilityGrant | None = None
         if proposal.effectful:
             if self._grant_preparer is None:
@@ -835,7 +933,39 @@ class GraphAdmissionBuilder:
                 "capability_id": proposal.capability_id,
                 "callable_tool_names": callable_tool_names,
                 "arguments": proposal.arguments,
+                **(
+                    {"read_dependency_ids": proposal.read_dependency_ids}
+                    if proposal.read_dependency_ids
+                    else {}
+                ),
             }
+            if proposal.read_dependency_ids:
+                plan_arguments = {
+                    "plan_ref": "plan_" + proposal.digest.removeprefix("sha256:")[:16]
+                }
+                compatible_names = []
+                for name in callable_tool_names:
+                    try:
+                        self._registry.validate_view_arguments(name, plan_arguments)
+                    except CapabilityInputError:
+                        continue
+                    compatible_names.append(name)
+                if not compatible_names:
+                    raise CapabilityInputError(
+                        "execution_not_supported_for_requested_shape",
+                        "The frozen read plan has no compatible model tool view.",
+                    )
+                initial_call = {
+                    **initial_call,
+                    "callable_tool_names": tuple(compatible_names),
+                    "arguments": plan_arguments,
+                    "read_arguments": proposal.arguments,
+                    **(
+                        {"count_selection_binding": proposal.retained_read_selection}
+                        if proposal.retained_read_selection is not None
+                        else {}
+                    ),
+                }
         else:
             preview_names = tuple(
                 sorted(
@@ -994,18 +1124,34 @@ class StartGraphJobExecutor:
         owner: JobOwner,
         resolver: InitialTaskProposalResolver,
         builder: GraphAdmissionBuilder,
+        read_selection_resolver: (
+            Callable[
+                [ToolExecution, Mapping[str, object]],
+                Awaitable[tuple[FrozenJsonObject, FrozenJsonObject | None]],
+            ]
+            | None
+        ) = None,
     ) -> None:
         self._owner = owner
         self._resolver = resolver
         self._builder = builder
+        self._read_selection_resolver = read_selection_resolver
 
     async def _proposal(self, request: ToolExecution) -> InitialTaskProposal:
         initial = request.arguments["initial_task"]
         assert isinstance(initial, Mapping)
-        return await self._resolver(
+        selection = None
+        if self._read_selection_resolver is not None:
+            initial, selection = await self._read_selection_resolver(request, initial)
+        proposal = await self._resolver(
             proposal=initial,
             source_scope=request.source_scope,
             sensitivity=request.request_sensitivity,
+        )
+        return (
+            proposal
+            if selection is None
+            else replace(proposal, retained_read_selection=selection)
         )
 
     async def preflight(self, request: ToolExecution) -> FrozenJsonObject:
@@ -1174,18 +1320,31 @@ def graph_admission_declarations(
     owner: JobOwner,
     resolver: InitialTaskProposalResolver,
     builder: GraphAdmissionBuilder,
+    read_selection_resolver: (
+        Callable[
+            [ToolExecution, Mapping[str, object]],
+            Awaitable[tuple[FrozenJsonObject, FrozenJsonObject | None]],
+        ]
+        | None
+    ) = None,
 ) -> tuple[CapabilityDeclarations, tuple[Executor, ...]]:
     capability = Capability(
         id=START_GRAPH_JOB_CAPABILITY_ID,
         description=(
             "Start one bounded durable graph from an exact typed initial-task "
-            "proposal. Released effects require a separately approved exact grant."
+            "proposal. initial_task.expected_result_contract requires result_kind "
+            "(usually the capability output_kind); outcome_contract may use "
+            "required_result_kind. Released effects require a separately approved exact grant."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "objective": {"type": "string", "minLength": 1, "maxLength": 16384},
-                "outcome_contract": {"type": "object"},
+                "outcome_contract": {
+                    "type": "object",
+                    "properties": {"required_result_kind": _RESULT_KIND_SCHEMA},
+                    "additionalProperties": True,
+                },
                 "deadline_seconds": {
                     "type": "integer",
                     "minimum": _MIN_DEADLINE_SECONDS,
@@ -1196,7 +1355,13 @@ def graph_admission_declarations(
                     "properties": {
                         "capability_id": {"type": "string", "minLength": 1},
                         "arguments": {"type": "object"},
-                        "expected_result_contract": {"type": "object"},
+                        "expected_result_contract": {
+                            "type": "object",
+                            "description": "Frozen initial task result contract. result_kind is the exact result identifier the worker must submit, usually the capability output_kind. Additional caller metadata is retained.",
+                            "properties": {"result_kind": _RESULT_KIND_SCHEMA},
+                            "required": ["result_kind"],
+                            "additionalProperties": True,
+                        },
                         "retained_references": {
                             "type": "object",
                             "properties": {
@@ -1210,7 +1375,7 @@ def graph_admission_declarations(
                                     "type": "array",
                                     "items": {"type": "string", "minLength": 1},
                                     "uniqueItems": True,
-                                    "maxItems": 16,
+                                    "maxItems": builder.initial_resource_limit,
                                 },
                                 "connector_binding_ids": {
                                     "type": "array",
@@ -1261,7 +1426,7 @@ def graph_admission_declarations(
             toolbox_id=ToolboxId.JOBS,
             load_mode=ToolLoadMode.ON_DEMAND,
             text_trust=ToolTextTrust.CODE,
-            summary=capability.description,
+            summary="Start a durable graph with an exact initial task and required expected_result_contract.result_kind.",
             when_to_use=(
                 "Use for explicit durable intent or a graph-eligible call rejected "
                 "with durable_execution_required."
@@ -1276,7 +1441,12 @@ def graph_admission_declarations(
         tool_views=(view,),
     )
     return declarations, (
-        StartGraphJobExecutor(owner=owner, resolver=resolver, builder=builder),
+        StartGraphJobExecutor(
+            owner=owner,
+            resolver=resolver,
+            builder=builder,
+            read_selection_resolver=read_selection_resolver,
+        ),
     )
 
 

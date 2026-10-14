@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from daita._json import canonical_json
 from tests.capabilities._toolbox_support import (
     NOW,
     TOOLBOX_DEFINITIONS,
@@ -144,6 +145,25 @@ def test_registry_digest_includes_presentation_and_effects_cannot_be_pinned() ->
     assert updated_registry.contract_digest(capability.id) == (
         original_registry.contract_digest(capability.id)
     )
+    narrow_schema = {"type": "object", "properties": {}, "additionalProperties": False}
+    narrowed = CapabilityRegistry(
+        declarations=(
+            CapabilityDeclarations(
+                domain_owner_id="digest",
+                capabilities=(capability,),
+                executor_ids=(executor.executor_id,),
+                tool_views=(replace(updated_view, input_schema=narrow_schema),),
+            ),
+        ),
+        executors=(executor,),
+    )
+    assert narrowed.contract_digest(capability.id) != original_registry.contract_digest(
+        capability.id
+    )
+    assert canonical_json(
+        narrowed.tool_definition(updated_view.name).input_schema
+    ) == canonical_json(narrow_schema)
+    assert narrowed.capability(capability.id).input_schema == capability.input_schema
 
     effect_executor = _Executor("pinned_effect", effectful=True)
     effect_capability = replace(
