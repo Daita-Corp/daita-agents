@@ -109,6 +109,7 @@ __all__ = (
     "replace",
     "run_failure_notice",
     "sanitize_terminal_text",
+    "settle_until",
     "sqlite3",
     "workspace_for",
 )
@@ -116,17 +117,18 @@ __all__ = (
 import asyncio
 import os
 import sqlite3
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
 
 import pytest
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.geometry import Offset
+from textual.pilot import Pilot
 from textual.selection import Selection
 from textual.widgets import (
     Button,
@@ -342,3 +344,17 @@ def _create_sqlite_source(path: Path, table: str) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+async def settle_until(
+    pilot: Pilot, ready: Callable[[], bool], *, attempts: int = 100
+) -> None:
+    """Pause until a rendered state appears, bounded, instead of after one pause.
+
+    Under parallel test load one ``pilot.pause()`` can return before a pushed
+    screen mounts or a status refresh renders. Callers still assert the state.
+    """
+    for _ in range(attempts):
+        await pilot.pause()
+        if ready():
+            return

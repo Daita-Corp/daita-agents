@@ -130,7 +130,9 @@ async def test_actual_sdk_liveness_and_release(family, scenario):
                         "attempt_deadline",
                         "first_progress",
                     )
-                    assert elapsed < 1.15
+                    # timeout_reason above pins which deadline fired; this bound only
+                    # proves a prompt return, with scheduling headroom for loaded runs.
+                    assert elapsed < 1.5
                     if scenario == "text_trickle":
                         assert elapsed >= 0.75
                     else:

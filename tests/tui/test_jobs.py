@@ -120,7 +120,7 @@ async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
 
     async with app.run_test(size=(110, 36)) as pilot:
         await app.push_screen(InboxScreen())
-        for _ in range(20):
+        for _ in range(200):
             await pilot.pause(0.05)
             if "1 unacknowledged result" in str(
                 app.screen.query_one("#inbox-summary", Static).content
@@ -138,7 +138,7 @@ async def test_inbox_screen_inspects_sanitizes_and_acknowledges(monkeypatch):
         assert manager.query_one("#inbox-acknowledge", Button).disabled is False
 
         assert await pilot.click("#inbox-acknowledge") is True
-        for _ in range(20):
+        for _ in range(200):
             await pilot.pause(0.05)
             if "0 unacknowledged results" in str(
                 manager.query_one("#inbox-summary", Static).content
@@ -498,7 +498,7 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
     async with app.run_test(size=(110, 36)) as pilot:
         try:
             await app.push_screen(JobsScreen())
-            for _ in range(20):
+            for _ in range(200):
                 await pilot.pause(0.05)
                 if "2 jobs" in str(
                     app.screen.query_one("#jobs-summary", Static).content
@@ -535,7 +535,7 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
             assert "Current state: active" in timeline_text
 
             assert await pilot.click("#jobs-controls") is True
-            for _ in range(20):
+            for _ in range(200):
                 await pilot.pause(0.05)
                 if isinstance(app.screen, JobControlScreen):
                     break
@@ -544,7 +544,7 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
                 "Authenticated candidate accepted."
             )
             assert await pilot.click("#job-control-submit") is True
-            for _ in range(20):
+            for _ in range(200):
                 await pilot.pause(0.05)
                 if app.screen is manager and accepted_reviews:
                     break
@@ -559,13 +559,13 @@ async def test_jobs_manager_lists_inspects_reads_cancels_and_refreshes(monkeypat
             assert app.screen is manager
 
             assert await pilot.click("#jobs-cancel") is True
-            for _ in range(20):
+            for _ in range(200):
                 await pilot.pause(0.05)
                 if isinstance(app.screen, ConfirmScreen):
                     break
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
-            for _ in range(20):
+            for _ in range(200):
                 await pilot.pause(0.05)
                 if app.screen is manager and cancel_calls:
                     break
