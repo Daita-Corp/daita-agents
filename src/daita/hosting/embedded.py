@@ -2150,7 +2150,7 @@ class EmbeddedAgent:
         graph_routes = _stage_c_model_routes(model, model_route)
         graph_builder: GraphAdmissionBuilder | None = None
         graph_resolver: RegistryInitialTaskProposalResolver | None = None
-        if graph_routes and limits.max_estimated_cost_usd is not None:
+        if graph_routes:
             graph_prerequisite_registry = CapabilityRegistry(
                 declarations=tuple(domain.declarations for domain in domains),
                 executors=registered_executors,
@@ -2162,7 +2162,6 @@ class EmbeddedAgent:
                 model_route_id=graph_routes[0],
                 max_steps=min(limits.max_steps, MAX_MODEL_REQUESTS_PER_ATTEMPT),
                 per_run_max_tokens=limits.max_total_tokens,
-                per_run_max_cost_usd=limits.max_estimated_cost_usd,
             )
             graph_builder = GraphAdmissionBuilder(
                 agent_id=identity.id,

@@ -1170,9 +1170,6 @@ def _planner_child_task(
         "per_run_max_tokens": planner.specification.expected_result_contract[
             "per_run_max_tokens"
         ],
-        "per_run_max_cost_usd": planner.specification.expected_result_contract[
-            "per_run_max_cost_usd"
-        ],
         "attempt_budgets": {"work_units": 1},
         "input_result_ids": input_result_ids,
         "reduction": reduction,

@@ -526,9 +526,11 @@ fairness and finalization; all capability work still executes through the one
 
 `start_data_profile` admits the static effect-free profile graph. `start_graph_job`
 admits one code-resolved graph-eligible initial task and internal finalizer when a
-model route and finite cost ceiling are configured. Planner-created work is a
-validated immutable-authority subset. Unmappable migrated work is
-`needs_attention`; no legacy executor can run it.
+model route is configured. Graph work is bounded by per-task steps, the host
+per-run token ceiling, wall time and `work_units` attempts; graph contracts and
+graph-task scopes carry no dollar ceiling, and only graph-task scopes may omit
+one. Planner-created work is a validated immutable-authority subset. Unmappable
+migrated work is `needs_attention`; no legacy executor can run it.
 
 An effectful initial task additionally requires foreground approval and one
 code-normalized exact grant. Native grants bind the exact PostgreSQL source,

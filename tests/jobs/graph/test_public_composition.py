@@ -198,7 +198,6 @@ async def test_public_agent_executes_graph_model_task_in_current_home(
         root=home.root,
         model=provider,
         model_profile=provider.model_profile,
-        limits=LoopLimits(max_estimated_cost_usd=Decimal("1")),
         workspace=workspace_for(home.root),
     )
     try:

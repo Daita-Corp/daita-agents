@@ -337,7 +337,6 @@ async def test_foreground_start_graph_job_rederives_typed_initial_task(
             model_route_id=MODEL_ROUTE_ID,
             max_steps=6,
             per_run_max_tokens=10_000,
-            per_run_max_cost_usd=Decimal("1"),
         )
         builder = GraphAdmissionBuilder(
             agent_id=AGENT_ID,

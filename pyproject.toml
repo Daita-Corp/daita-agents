@@ -112,3 +112,9 @@ python_version = "3.11"
 check_untyped_defs = true
 no_implicit_optional = true
 warn_unused_ignores = true
+
+# The frozen revision-2 migration compares only routine scopes, which always
+# carry a per-run cost; graph-task scopes (the only ones that omit it) postdate it.
+[[tool.mypy.overrides]]
+module = "daita.storage.home_migrations.revision_0002_legacy_autonomy"
+disable_error_code = ["operator"]

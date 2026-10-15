@@ -11,7 +11,6 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
 from hashlib import sha256
 
 from ..._json import FrozenJsonObject
@@ -114,22 +113,14 @@ def model_task_contract(task: GraphTask) -> Mapping[str, object]:
         raise ValueError("the model graph task contract is malformed")
     route_id = contract.get("model_route_id")
     max_tokens = contract.get("per_run_max_tokens")
-    max_cost = contract.get("per_run_max_cost_usd")
     if (
         not isinstance(route_id, str)
         or route_id not in task.specification.authority.model_route_ids
         or not isinstance(max_tokens, int)
         or isinstance(max_tokens, bool)
         or max_tokens < 1
-        or not isinstance(max_cost, str)
     ):
         raise ValueError("the model graph task route or budget is malformed")
-    try:
-        cost = Decimal(max_cost)
-    except Exception as error:
-        raise ValueError("the model graph task cost budget is malformed") from error
-    if not cost.is_finite() or cost < 0:
-        raise ValueError("the model graph task cost budget is malformed")
     return {**contract, "executor_id": route_id}
 
 
@@ -349,7 +340,7 @@ def model_task_execution_scope(
         ),
         sensitivity_ceiling=authority.sensitivity,
         eligible_model_routes=authority.model_route_ids,
-        per_run_max_cost_usd=Decimal(str(contract["per_run_max_cost_usd"])),
+        per_run_max_cost_usd=None,
         per_run_max_tokens=max_tokens,
         distribution_plan_digest=inspection.job.specification.distribution_plan_digest,
         contract_bindings=bindings,
