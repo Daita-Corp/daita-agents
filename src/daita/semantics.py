@@ -1452,7 +1452,7 @@ def semantic_declarations(
                 "Create, replace, or supersede one resource-scoped durable business "
                 "definition through the sole approval card. Use only for explicit "
                 "user assertions/confirmations or validated tool-result evidence. "
-                "Provide evidence kind and, for tool_result, tool_call_id; the runtime "
+                "Provide evidence kind and, for tool_result, its result_ref; the runtime "
                 "binds the exact current run ID and transcript message position. "
                 "Never invent transcript IDs or positions. Tool-result evidence must "
                 "come from an earlier completed tool step in this run. "
@@ -1476,6 +1476,7 @@ def semantic_declarations(
             access_mode=AccessMode.NONE,
             operational_effect=OperationalEffect.CHANGE_ADVISORY_CONTEXT,
             automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+            result_ref_arguments=("evidence[].result_ref",),
         ),
         Capability(
             id=SEMANTIC_DELETE_CAPABILITY_ID,
@@ -1951,11 +1952,12 @@ class SemanticCapabilityDomain:
                     )
                 entry["message_position"] = user_positions[0]
             else:
-                call_id = item.get("tool_call_id")
+                # The runtime resolved the model's result_ref to its call.
+                call_id = item.get("result_ref")
                 if not isinstance(call_id, str):
                     raise CapabilityInputError(
                         "semantic_invalid_evidence",
-                        "Tool-result evidence requires a tool_call_id.",
+                        "Tool-result evidence requires a result_ref.",
                     )
                 positions = tuple(
                     index
@@ -2467,7 +2469,10 @@ def _save_input_schema() -> dict[str, object]:
                             "type": "string",
                             "enum": [item.value for item in SemanticEvidenceKind],
                         },
-                        "tool_call_id": identifier,
+                        "result_ref": {
+                            **identifier,
+                            "description": "For tool_result: its result_ref, like r3.",
+                        },
                         "note": {
                             "type": "string",
                             "minLength": 1,

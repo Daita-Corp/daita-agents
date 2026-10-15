@@ -7,7 +7,13 @@ from typing import cast
 
 from ...._json import FrozenJsonObject, canonical_json
 from ...errors import ModelProviderError, ProviderErrorCode
-from ...models import CanonicalMessage, MessageRole, TextBlock, ToolResultBlock
+from ...models import (
+    CanonicalMessage,
+    MessageRole,
+    TextBlock,
+    ToolResultBlock,
+    model_tool_result,
+)
 from .._fields import field as _field, required_text as _required_text
 
 _CONTINUATION_KEY = "anthropic_continuation"
@@ -19,6 +25,7 @@ _OPAQUE_BLOCK_TYPES = frozenset({"thinking", "redacted_thinking"})
 def _message_input(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
+    result_refs: Mapping[str, str] | None = None,
 ) -> tuple[str | None, list[dict[str, object]]]:
     system_parts: list[str] = []
     provider_messages: list[dict[str, object]] = []
@@ -68,7 +75,11 @@ def _message_input(
                             block.call_id,
                             block.call_id,
                         ),
-                        "content": canonical_json(block.output),
+                        "content": canonical_json(
+                            model_tool_result(
+                                block, (result_refs or {}).get(block.call_id)
+                            )
+                        ),
                         "is_error": block.is_error,
                     }
                 )

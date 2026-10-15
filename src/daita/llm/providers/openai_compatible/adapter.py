@@ -324,7 +324,9 @@ class OpenAICompatibleProvider:
         try:
             arguments: dict[str, object] = {
                 "max_tokens": self._max_tokens,
-                "messages": _chat_messages(request.messages, self.provider_id),
+                "messages": _chat_messages(
+                    request.messages, self.provider_id, request.tool_result_refs
+                ),
                 "model": self.model,
             }
             if request.allow_parallel_tool_calls is not None:

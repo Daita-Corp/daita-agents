@@ -188,7 +188,7 @@ async def test_broker_artifact_reads_and_authenticated_child_input_use_existing_
                 {
                     "code": "print(inputs.get('preview')['data']['text'])",
                     "inputs": {
-                        "preview": {"kind": "tool_result", "call_id": evidence_id}
+                        "preview": {"kind": "tool_result", "evidence_id": evidence_id}
                     },
                     "expected_state": {"generation": 1, "revision": 1},
                 },
@@ -348,9 +348,7 @@ async def test_invalid_inputs_and_candidates_never_publish(
             "open('bad.json','w').write('{broken')\noutputs.add('bad','bad.json')"
         )
     elif failure == "forged_input":
-        arguments["inputs"] = {
-            "bad": {"kind": "tool_result", "call_id": "unissued-result"}
-        }
+        arguments["inputs"] = {"bad": {"kind": "tool_result", "result_ref": "r99"}}
     else:
         arguments["expected_state"] = {"generation": 9, "revision": 99}
     agent = await make_agent(tmp_path, (_tool("invalid", "python_execute", arguments),))

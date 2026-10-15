@@ -44,9 +44,12 @@ from ..capabilities import (
     ExecutionAdmissionPolicy,
     Executor,
     OperationalEffect,
+    RecoveryKind,
     ToolExecution,
     ToolOutput,
+    ToolRecovery,
     ToolView,
+    recovery_details,
     validate_tool_schema_value,
 )
 from ..capability_runtime import CapabilityFailure, SideEffectPlan
@@ -57,6 +60,11 @@ from ..loop.session import RunSession
 from ..security import SecretProvider
 
 MCP_DOMAIN_OWNER_ID = "mcp"
+_MCP_BINDING_CHANGED = ToolRecovery(
+    RecoveryKind.REINSPECT_BINDING,
+    "The connection changed after it was admitted; the person must review "
+    "and re-admit it before this tool can run. It was not called.",
+)
 MCP_OUTPUT_KIND = "mcp.tool.result"
 
 MCP_GRANT_POLICY = AutomationGrantPolicy(
@@ -318,7 +326,10 @@ class MCPToolExecutor:
             raise MCPProtocolError(
                 "mcp_binding_stale",
                 "The MCP server identity, schema or invocation contract changed.",
-                {"binding_id": self._binding.binding_id, "reason": drift},
+                recovery_details(
+                    _MCP_BINDING_CHANGED,
+                    {"binding_id": self._binding.binding_id, "reason": drift},
+                ),
             )
         # The bounded remote inspection awaited I/O: recheck local revocation.
         _require_current_binding(
@@ -1250,7 +1261,7 @@ def _require_current_binding(
         raise MCPProtocolError(
             "mcp_binding_stale",
             "The admitted MCP capability mapping changed.",
-            {"binding_id": accepted.binding_id},
+            recovery_details(_MCP_BINDING_CHANGED, {"binding_id": accepted.binding_id}),
         )
 
 

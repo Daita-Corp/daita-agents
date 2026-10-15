@@ -331,7 +331,13 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
             "resource_read_not_allowed",
             "resource_read_not_allowed",
         )
-        assert all(not error["details"] for error in errors)
+        # Denials report only that nothing ran, never details about the
+        # guessed or denied resources.
+        assert all(
+            dict(cast(Mapping[str, object], error["details"]))
+            == {"execution_disposition": "not_dispatched"}
+            for error in errors
+        )
         assert resources["child"].id not in str(
             tuple(result.output for result in results)
         )

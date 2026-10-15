@@ -375,6 +375,9 @@ class ModelRequest:
     deadline: float | None = None
     call_policy: ModelCallPolicy = ModelCallPolicy()
     attempt_deadline: float | None = None
+    # Run-scoped model-visible handles keyed by canonical ToolCall.id; adapters
+    # render them beside each result and the stored transcript never holds them.
+    tool_result_refs: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         messages = tuple(self.messages)
@@ -445,6 +448,13 @@ class ModelRequest:
             raise ValueError("attempt deadline cannot exceed logical deadline")
         if not isinstance(self.call_policy, ModelCallPolicy):
             raise TypeError("call_policy must be ModelCallPolicy")
+        refs = FrozenJsonObject.from_mapping(self.tool_result_refs)
+        if any(
+            not isinstance(value, str) or _RESULT_REF.fullmatch(value) is None
+            for value in refs.values()
+        ):
+            raise ValueError("model-request tool_result_refs are invalid")
+        object.__setattr__(self, "tool_result_refs", refs)
         object.__setattr__(self, "messages", messages)
         object.__setattr__(self, "tools", tools)
         object.__setattr__(self, "response_schema", response_schema)
@@ -485,6 +495,72 @@ class ModelRequest:
                 reason, "The model request allowance is exhausted.", usage=usage
             )
         return replace(self, max_total_tokens=tokens, max_estimated_cost_usd=cost)
+
+
+_RESULT_REF = re.compile(r"r[1-9][0-9]{0,5}\Z")
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResultRefs:
+    """Run-scoped model-visible result handles and the calls they name.
+
+    Every tool result in the current run gets ``r1``, ``r2``... in transcript
+    order. Only successful capability results are citable as evidence.
+    """
+
+    by_call_id: Mapping[str, str]
+    call_ids: Mapping[str, str]
+    citable: tuple[str, ...]
+
+    def resolve(self, ref: object) -> str | None:
+        """Return the canonical call ID one citable ref names, else None."""
+
+        if not isinstance(ref, str) or ref not in self.citable:
+            return None
+        return self.call_ids[ref]
+
+
+def tool_result_refs(
+    messages: tuple[CanonicalMessage, ...],
+    *,
+    uncitable_tool_names: frozenset[str] = frozenset(),
+) -> ToolResultRefs:
+    """Number every current-run tool result in order; one shared definition."""
+
+    names = {call.id: call.name for message in messages for call in message.tool_calls}
+    by_call_id: dict[str, str] = {}
+    citable: list[str] = []
+    for message in messages:
+        for block in message.content:
+            if not isinstance(block, ToolResultBlock) or block.call_id in by_call_id:
+                continue
+            ref = f"r{len(by_call_id) + 1}"
+            by_call_id[block.call_id] = ref
+            if (
+                not block.is_error
+                and block.call_id in names
+                and names[block.call_id] not in uncitable_tool_names
+            ):
+                citable.append(ref)
+    return ToolResultRefs(
+        by_call_id=by_call_id,
+        call_ids={ref: call_id for call_id, ref in by_call_id.items()},
+        citable=tuple(citable),
+    )
+
+
+def model_tool_result(
+    block: ToolResultBlock,
+    result_ref: str | None,
+) -> dict[str, object]:
+    """Return the one model-facing rendering of a tool result for every adapter."""
+
+    rendered: dict[str, object] = (
+        {} if result_ref is None else {"result_ref": result_ref}
+    )
+    rendered["is_error"] = block.is_error
+    rendered["output"] = FrozenJsonObject.from_mapping(block.output).to_dict()
+    return rendered
 
 
 @dataclass(frozen=True, slots=True)

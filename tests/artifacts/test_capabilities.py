@@ -57,6 +57,7 @@ from tests.support.capability_runtime import (
 )
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
+    result_ref,
 )
 from tests.support.workspace import workspace_for
 
@@ -213,7 +214,7 @@ async def test_result_snapshot_commits_exact_current_run_result_with_lineage(
             _call(
                 "snapshot",
                 RESULT_SNAPSHOT_TOOL_NAME,
-                {"call_id": "create", "filename": "result.json"},
+                {"result_ref": result_ref("create"), "filename": "result.json"},
             ),
             _stop(),
         ),
@@ -260,7 +261,11 @@ async def test_result_snapshot_rejects_cross_run_evidence(tmp_path: Path) -> Non
         (
             _document_call(),
             _stop("first run complete"),
-            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "create"}),
+            _call(
+                "snapshot",
+                RESULT_SNAPSHOT_TOOL_NAME,
+                {"result_ref": result_ref("create")},
+            ),
             _stop("second run complete"),
         ),
         provider_id="mock:result-snapshot-cross-run",
@@ -285,7 +290,7 @@ async def test_result_snapshot_rejects_cross_run_evidence(tmp_path: Path) -> Non
 
     assert second.artifacts == ()
     assert snapshot.is_error is True
-    assert _result_error_code(snapshot) == "artifact_snapshot_evidence_invalid"
+    assert _result_error_code(snapshot) == "result_ref_invalid"
 
 
 async def test_result_snapshot_rejects_cross_agent_evidence(tmp_path: Path) -> None:
@@ -308,7 +313,11 @@ async def test_result_snapshot_rejects_cross_agent_evidence(tmp_path: Path) -> N
 
     consumer = MockModelProvider(
         (
-            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "create"}),
+            _call(
+                "snapshot",
+                RESULT_SNAPSHOT_TOOL_NAME,
+                {"result_ref": result_ref("create")},
+            ),
             _stop(),
         ),
         provider_id="mock:result-snapshot-agent-two",
@@ -329,7 +338,7 @@ async def test_result_snapshot_rejects_cross_agent_evidence(tmp_path: Path) -> N
 
     assert result.artifacts == ()
     assert snapshot.is_error is True
-    assert _result_error_code(snapshot) == "artifact_snapshot_evidence_invalid"
+    assert _result_error_code(snapshot) == "result_ref_invalid"
 
 
 async def test_result_snapshot_rejects_failed_call_evidence(tmp_path: Path) -> None:
@@ -340,7 +349,11 @@ async def test_result_snapshot_rejects_failed_call_evidence(tmp_path: Path) -> N
                 DOCUMENT_CREATE_TOOL_NAME,
                 {"format": "pdf", "content": "not admitted"},
             ),
-            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "failed"}),
+            _call(
+                "snapshot",
+                RESULT_SNAPSHOT_TOOL_NAME,
+                {"result_ref": result_ref("failed")},
+            ),
             _stop(),
         ),
         provider_id="mock:result-snapshot-failed-call",
@@ -362,7 +375,7 @@ async def test_result_snapshot_rejects_failed_call_evidence(tmp_path: Path) -> N
     assert _tool_result(transcript, "failed").is_error is True
     snapshot = _tool_result(transcript, "snapshot")
     assert snapshot.is_error is True
-    assert _result_error_code(snapshot) == "artifact_snapshot_evidence_invalid"
+    assert _result_error_code(snapshot) == "result_ref_invalid"
     assert result.artifacts == ()
 
 
@@ -379,7 +392,7 @@ class _TranscriptTamperingProvider(MockModelProvider):
                 _call(
                     "snapshot",
                     RESULT_SNAPSHOT_TOOL_NAME,
-                    {"call_id": "create"},
+                    {"result_ref": result_ref("create")},
                 ),
                 _stop(),
             ),
@@ -507,7 +520,11 @@ async def test_result_snapshot_obeys_the_existing_artifact_quota(
     provider = MockModelProvider(
         (
             _document_call(),
-            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "create"}),
+            _call(
+                "snapshot",
+                RESULT_SNAPSHOT_TOOL_NAME,
+                {"result_ref": result_ref("create")},
+            ),
             _stop(),
         ),
         provider_id="mock:result-snapshot-quota",
@@ -538,7 +555,11 @@ async def test_result_snapshot_cancellation_cannot_publish_a_partial_artifact(
     provider = MockModelProvider(
         (
             _document_call(),
-            _call("snapshot", RESULT_SNAPSHOT_TOOL_NAME, {"call_id": "create"}),
+            _call(
+                "snapshot",
+                RESULT_SNAPSHOT_TOOL_NAME,
+                {"result_ref": result_ref("create")},
+            ),
             _stop(),
         ),
         provider_id="mock:result-snapshot-cancelled",

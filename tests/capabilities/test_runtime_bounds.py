@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from tests.support.kernel import (
     CATALOG_SEARCH_CAPABILITY_ID,
     NOW,
@@ -54,9 +56,21 @@ async def test_tool_call_response_bound_rejects_batch_before_execution():
 
     assert result.kind is LoopExitKind.FAILED
     assert result.reason == "tool_calls_per_response_exceeded"
-    assert tuple(
-        message.role for message in (await store.load(result.run_id)).messages
-    ) == (MessageRole.USER, MessageRole.ASSISTANT, MessageRole.TOOL, MessageRole.TOOL)
+    messages = (await store.load(result.run_id)).messages
+    assert tuple(message.role for message in messages) == (
+        MessageRole.USER,
+        MessageRole.ASSISTANT,
+        MessageRole.TOOL,
+        MessageRole.TOOL,
+    )
+    for message in messages[2:]:
+        block = message.content[0]
+        assert isinstance(block, ToolResultBlock)
+        error = block.output["error"]
+        assert isinstance(error, Mapping)
+        details = error["details"]
+        assert details["execution_disposition"] == "not_dispatched"
+        assert details["recovery"]["kind"] == "terminal"
 
 
 async def test_tool_call_run_bound_counts_across_responses():

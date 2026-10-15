@@ -9,6 +9,7 @@ from daita.llm.models import (
     ModelSensitivity,
     ToolDefinition,
     ToolResultBlock,
+    tool_result_refs,
 )
 from daita.loop import (
     ToolBatchOutcome,
@@ -52,6 +53,7 @@ class TranscriptContext:
             messages=(*static, *messages),
             tools=tools,
             sensitivity=sensitivity,
+            tool_result_refs=tool_result_refs(messages).by_call_id,
         )
 
 

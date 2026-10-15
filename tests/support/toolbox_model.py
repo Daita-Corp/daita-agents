@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import replace
 from decimal import Decimal
+from typing import cast
 
 from daita.capabilities import RESERVED_TOOL_NAMES
 from daita.llm.models import (
@@ -133,7 +135,7 @@ class ToolboxAwareMockModelProvider:
                 )
         self._logical_requests.append(request)
         try:
-            return await self._scripted.generate(request)
+            return cite_result_refs(await self._scripted.generate(request), request)
         finally:
             self._logical_cursor += 1
             self._toolbox_load_attempt = None
@@ -143,6 +145,45 @@ class ToolboxAwareMockModelProvider:
 
     def assert_consumed(self) -> None:
         self._scripted.assert_consumed()
+
+
+RESULT_REF_PREFIX = "ref:"
+
+
+def result_ref(call_id: str) -> str:
+    """Script a citation of one earlier call by its model-visible result_ref."""
+
+    return RESULT_REF_PREFIX + call_id
+
+
+def cite_result_refs(response: ModelResponse, request: ModelRequest) -> ModelResponse:
+    """Replace scripted ``ref:<call id>`` values with the request's result_ref.
+
+    A scripted model cannot know run-scoped refs in advance; a real model reads
+    them from the rendered results. Unknown call IDs stay unresolved.
+    """
+
+    def rewrite(value: object) -> object:
+        if isinstance(value, str) and value.startswith(RESULT_REF_PREFIX):
+            return request.tool_result_refs.get(value[len(RESULT_REF_PREFIX) :], value)
+        if isinstance(value, Mapping):
+            return {key: rewrite(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [rewrite(item) for item in value]
+        return value
+
+    if not response.tool_calls:
+        return response
+    return replace(
+        response,
+        tool_calls=tuple(
+            replace(
+                call,
+                arguments=cast(Mapping[str, object], rewrite(call.arguments)),
+            )
+            for call in response.tool_calls
+        ),
+    )
 
 
 def _loaded_names_from_transcript(request: ModelRequest) -> frozenset[str]:
@@ -167,3 +208,10 @@ def _loaded_names_from_transcript(request: ModelRequest) -> frozenset[str]:
 
 
 __all__ = ["ToolboxAwareMockModelProvider"]
+
+
+class RefCitingMockModelProvider(MockModelProvider):
+    """Scripted provider whose ``ref:<call id>`` values cite result_refs."""
+
+    async def generate(self, request: ModelRequest) -> ModelResponse:
+        return cite_result_refs(await super().generate(request), request)

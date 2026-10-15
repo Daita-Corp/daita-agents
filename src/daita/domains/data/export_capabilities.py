@@ -73,6 +73,7 @@ from ...capabilities import (
     ArtifactPolicy,
     AutomationEligibility,
     AutomationScopeProposal,
+    CallProvenance,
     Capability,
     CapabilityDeclarations,
     CapabilityInputError,
@@ -90,12 +91,17 @@ from ...capabilities import (
 )
 from ...capability_runtime import CapabilityFailure, SideEffectPlan
 from ...catalog.models import Sensitivity
-from ...llm.models import MessageRole, ModelSensitivity, ToolCall, ToolResultBlock
+from ...llm.models import (
+    CanonicalMessage,
+    MessageRole,
+    ModelSensitivity,
+    ToolCall,
+    ToolResultBlock,
+)
 from ...loop.analysis import AnalysisEvidence
 from ...loop.models import RunInput, RunOrigin, Transcript
 from ...loop.session import RunSession
 from ...scope import SourceScopeCatalog, resolve_effective_source_scope
-from ...storage.sqlite_records import SourcePermissionStateError
 from ..learning import LearningCandidateGuard
 from .controller import DATA_EXPORT_TABULAR_CAPABILITY_ID
 from .sql import (
@@ -305,16 +311,14 @@ class DocumentArtifactExecutor:
         content = request.arguments["content"]
         format_name = request.arguments["format"]
         filename = request.arguments.get("filename")
-        evidence = request.arguments.get("evidence_call_ids", ())
         assert isinstance(content, str)
         assert isinstance(format_name, str)
         assert filename is None or isinstance(filename, str)
-        assert isinstance(evidence, tuple)
         draft = render_model_document(
             content=content,
             format=format_name,
             filename=filename,
-            evidence_call_ids=tuple(str(item) for item in evidence),
+            evidence_call_ids=request.provenance.evidence_call_ids,
         )
         return ToolOutput(
             kind=DOCUMENT_CREATE_OUTPUT_KIND,
@@ -334,7 +338,8 @@ class ModelTabularArtifactExecutor:
         rows = request.arguments["rows"]
         format_name = request.arguments["format"]
         filename = request.arguments.get("filename")
-        evidence = request.arguments["evidence_call_ids"]
+        # The runtime resolved each result_ref to its canonical call.
+        evidence = request.arguments["evidence_refs"]
         assert isinstance(columns, tuple)
         assert isinstance(rows, tuple)
         assert isinstance(format_name, str)
@@ -387,7 +392,7 @@ class ResultSnapshotExecutor:
         binding = ArtifactResultBinding(
             capability_id=str(request.arguments["_producer_capability_id"]),
             executor_id=str(request.arguments["_producer_executor_id"]),
-            call_id=str(request.arguments["call_id"]),
+            call_id=str(request.arguments["result_ref"]),
             capability_contract_digest=str(
                 request.arguments["_capability_contract_digest"]
             ),
@@ -1095,12 +1100,6 @@ def artifact_capability_declarations(
                 "format": {"type": "string", "enum": ["markdown", "txt"]},
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
                 "content": {"type": "string", "minLength": 1, "maxLength": 200_000},
-                "evidence_call_ids": {
-                    "type": "array",
-                    "items": {"type": "string", "minLength": 1, "maxLength": 256},
-                    "maxItems": 16,
-                    "uniqueItems": True,
-                },
             },
             "required": ["format", "content"],
             "additionalProperties": False,
@@ -1117,6 +1116,7 @@ def artifact_capability_declarations(
         },
         executor_id=DOCUMENT_CREATE_EXECUTOR_ID,
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        derives_call_provenance=True,
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({"text/markdown", "text/plain"}),
             allowed_authorships=frozenset({ArtifactAuthorship.MODEL_AUTHORED_ANALYSIS}),
@@ -1169,19 +1169,21 @@ def artifact_capability_declarations(
                     "minLength": 1,
                     "maxLength": 120,
                 },
-                "evidence_call_ids": {
+                "evidence_refs": {
                     "type": "array",
                     "items": {"type": "string", "minLength": 1, "maxLength": 256},
                     "minItems": 1,
                     "maxItems": 16,
                     "uniqueItems": True,
+                    "description": "result_ref values (like r3) of the earlier "
+                    "successful results the table is derived from.",
                 },
             },
             "required": [
                 "columns",
                 "rows",
                 "format",
-                "evidence_call_ids",
+                "evidence_refs",
             ],
             "additionalProperties": False,
         },
@@ -1223,6 +1225,7 @@ def artifact_capability_declarations(
         },
         executor_id=ARTIFACT_CREATE_TABULAR_EXECUTOR_ID,
         automation_eligibility=AutomationEligibility.INTERACTIVE_ONLY,
+        result_ref_arguments=("evidence_refs[]",),
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset(
                 {"text/csv", XLSX_MEDIA_TYPE, HTML_MEDIA_TYPE}
@@ -1243,15 +1246,20 @@ def artifact_capability_declarations(
         id=RESULT_SNAPSHOT_CAPABILITY_ID,
         description=(
             "Create one canonical JSON artifact from the exact validated output "
-            "data of one earlier successful tool call in the current run."
+            "data of one earlier successful tool result in the current run."
         ),
         input_schema={
             "type": "object",
             "properties": {
-                "call_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "result_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256,
+                    "description": "The result_ref (like r3) of that result.",
+                },
                 "filename": {"type": "string", "minLength": 1, "maxLength": 120},
             },
-            "required": ["call_id"],
+            "required": ["result_ref"],
             "additionalProperties": False,
         },
         output_kind=RESULT_SNAPSHOT_OUTPUT_KIND,
@@ -1280,6 +1288,7 @@ def artifact_capability_declarations(
         },
         executor_id=RESULT_SNAPSHOT_EXECUTOR_ID,
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
+        result_ref_arguments=("result_ref",),
         artifact_policy=ArtifactPolicy(
             allowed_media_types=frozenset({RESULT_SNAPSHOT_MEDIA_TYPE}),
             allowed_authorships=frozenset({ArtifactAuthorship.VALIDATED_TOOL_RESULT}),
@@ -1823,6 +1832,33 @@ class _ValidatedArtifactEvidence:
     data: Mapping[str, object]
 
 
+def _same_current_call(
+    registry: CapabilityRegistry,
+    persisted: ToolCall,
+    current: ToolCall,
+    messages: tuple[CanonicalMessage, ...],
+) -> bool:
+    """Match a persisted model call to the call executing now.
+
+    The executing call may carry the canonical calls its result_ref values
+    named; the persisted call keeps exactly what the model sent.
+    """
+
+    if persisted.name != current.name:
+        return False
+    if persisted.arguments == current.arguments:
+        return True
+    try:
+        resolved = registry.resolved_call_arguments(
+            persisted.name, persisted.arguments, messages
+        )
+    except (CapabilityInputError, KeyError):
+        return False
+    return FrozenJsonObject.from_mapping(resolved) == FrozenJsonObject.from_mapping(
+        current.arguments
+    )
+
+
 class ArtifactCapabilityDomain:
     """Own artifact availability, provenance, conversion, and delivery rules."""
 
@@ -2201,10 +2237,8 @@ class ArtifactCapabilityDomain:
             for candidate in message.tool_calls
             if candidate.id == current_call.id
         )
-        if (
-            len(current_calls) != 1
-            or current_calls[0][1].name != current_call.name
-            or current_calls[0][1].arguments != current_call.arguments
+        if len(current_calls) != 1 or not _same_current_call(
+            registry, current_calls[0][1], current_call, transcript.messages
         ):
             raise CapabilityInputError(error_code, error_message)
         current_index = current_calls[0][0]
@@ -2365,7 +2399,7 @@ class ArtifactCapabilityDomain:
                 "artifact_snapshot_unavailable",
                 "Result snapshot validation is unavailable in this runtime.",
             )
-        evidence_call_id = arguments.get("call_id")
+        evidence_call_id = arguments.get("result_ref")
         if not isinstance(evidence_call_id, str):
             raise CapabilityInputError(
                 "artifact_snapshot_evidence_invalid",
@@ -2454,6 +2488,74 @@ class ArtifactCapabilityDomain:
         return FrozenJsonObject.from_mapping(prepared)
 
     prepare_session_call = prepare_call
+
+    async def derive_call_provenance(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        *,
+        session: RunSession | None = None,
+    ) -> CallProvenance:
+        """Derive document evidence from this run's earlier authenticated reads."""
+
+        del arguments, session
+        registry = self._registry
+        if capability.id != DOCUMENT_CREATE_CAPABILITY_ID or registry is None:
+            return CallProvenance()
+        try:
+            transcript = await self._transcripts.load(run.id)
+        except KeyError:
+            return CallProvenance()
+        current = next(
+            (
+                index
+                for index, message in enumerate(transcript.messages)
+                if any(candidate.id == call.id for candidate in message.tool_calls)
+            ),
+            None,
+        )
+        if current is None:
+            return CallProvenance()
+        candidates: list[str] = []
+        for message in transcript.messages[:current]:
+            for block in message.content:
+                if (
+                    not isinstance(block, ToolResultBlock)
+                    or block.is_error
+                    or block.capability_id is None
+                    or block.call_id in candidates
+                ):
+                    continue
+                try:
+                    producer = registry.capability(block.capability_id)
+                except KeyError:
+                    continue
+                if producer.access_mode is AccessMode.READ:
+                    candidates.append(block.call_id)
+        selected = tuple(candidates[-16:])
+        if not selected:
+            return CallProvenance()
+        error = "artifact_evidence_invalid"
+        try:
+            await self._validated_current_run_evidence(
+                run, call, selected, error_code=error, error_message=error
+            )
+            return CallProvenance(selected)
+        except CapabilityInputError:
+            pass
+        # One stale or revoked read must not hide the others.
+        valid: list[str] = []
+        for call_id in selected:
+            try:
+                await self._validated_current_run_evidence(
+                    run, call, (call_id,), error_code=error, error_message=error
+                )
+            except CapabilityInputError:
+                continue
+            valid.append(call_id)
+        return CallProvenance(tuple(valid))
 
     async def prepare_automation_grant(
         self,
@@ -2705,7 +2807,7 @@ class ArtifactCapabilityDomain:
                 or not isinstance(producer_provenance, Mapping)
                 or draft.content != canonical_json(result_data).encode("utf-8")
                 or draft.sensitivity is not binding.result_sensitivity
-                or binding.call_id != arguments.get("call_id")
+                or binding.call_id != arguments.get("result_ref")
                 or binding.capability_id != arguments.get("_producer_capability_id")
                 or binding.executor_id != arguments.get("_producer_executor_id")
                 or binding.capability_contract_digest
@@ -2913,28 +3015,6 @@ class ArtifactCapabilityDomain:
             ),
             None,
         )
-
-    async def _require_readable(
-        self,
-        run: RunInput,
-        source_id: str,
-        resource_ids: tuple[str, ...],
-    ) -> None:
-        try:
-            readable = await self._catalog.readable_resource_ids(
-                run.agent_id,
-                (source_id,),
-            )
-        except SourcePermissionStateError as error:
-            raise CapabilityInputError(
-                "source_permission_state_invalid",
-                "Stored source permission state is missing or invalid.",
-            ) from error
-        if any(item not in readable for item in resource_ids):
-            raise CapabilityInputError(
-                "resource_read_not_allowed",
-                "The requested resource is not available for reading.",
-            )
 
 
 def _resolved_sensitivity(values: tuple[Sensitivity, ...]) -> Sensitivity:

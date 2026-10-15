@@ -8,7 +8,13 @@ from typing import cast
 
 from ...._json import FrozenJsonObject
 from ...errors import ModelProviderError, ProviderErrorCode
-from ...models import CanonicalMessage, MessageRole, TextBlock, ToolResultBlock
+from ...models import (
+    CanonicalMessage,
+    MessageRole,
+    TextBlock,
+    ToolResultBlock,
+    model_tool_result,
+)
 from .._fields import optional_text as _optional_text, required_text as _required_text
 
 
@@ -92,6 +98,7 @@ def _count_request(arguments: Mapping[str, object]) -> dict[str, object]:
 def _gemini_contents(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
+    result_refs: Mapping[str, str] | None = None,
 ) -> tuple[list[dict[str, object]], str | None]:
     contents: list[dict[str, object]] = []
     system_parts: list[str] = []
@@ -156,10 +163,9 @@ def _gemini_contents(
                     ) from error
                 function_response: dict[str, object] = {
                     "name": name,
-                    "response": {
-                        "is_error": block.is_error,
-                        "output": FrozenJsonObject.from_mapping(block.output).to_dict(),
-                    },
+                    "response": model_tool_result(
+                        block, (result_refs or {}).get(block.call_id)
+                    ),
                 }
                 if native_id is not None:
                     function_response["id"] = native_id

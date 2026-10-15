@@ -295,8 +295,9 @@ revalidating normally.
 Upsert supplies exact `key_columns`, `insert_columns`, `update_columns`, and
 `rows`. Every row has exactly the insert-column shape. The key columns must be
 included, and update columns must be a nonempty subset of the supplied non-key
-columns. Optional `evidence_call_ids` retain ordered, successful current-run
-research lineage. These values are explicitly model-derived claims; a URL is
+columns. The model supplies no evidence argument: the runtime records earlier
+successful reads of the same table in the current run as the write's evidence.
+These records are explicitly model-derived claims; a URL is
 not independent proof and a successful transaction does not verify research.
 
 Conflict keys must be cataloged, immediate, valid, plain, nonpartial unique

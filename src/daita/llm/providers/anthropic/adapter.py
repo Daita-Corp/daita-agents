@@ -433,7 +433,9 @@ class AnthropicMessagesProvider:
             return response
 
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
-        system, messages = _message_input(request.messages, self.provider_id)
+        system, messages = _message_input(
+            request.messages, self.provider_id, request.tool_result_refs
+        )
         arguments: dict[str, object] = {
             "model": self.model,
             "max_tokens": self.max_tokens,

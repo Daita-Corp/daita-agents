@@ -38,7 +38,7 @@ async def test_release_script_uses_current_public_contract_and_normalizes_invali
         approval_handler=approve,
     )
     try:
-        arguments = {**batch, "evidence_call_ids": ()}
+        arguments = dict(batch)
         if case in {"bytes", "approval"}:
             arguments["rows"] = [
                 {
