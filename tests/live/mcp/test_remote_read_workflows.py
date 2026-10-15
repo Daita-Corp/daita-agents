@@ -23,6 +23,7 @@ from daita.security import (
     SecretReference,
 )
 from tests.support.job_benchmarks import assert_on_demand_invocation, results_for
+from tests.support.live_billing import cost_cap, live_model_id
 from tests.support.mcp_read_harness import (
     AUTHORIZATION,
     MeasuredMCPTransport,
@@ -113,8 +114,10 @@ async def test_real_remote_natural_reads_reuse_session_restart_and_answer_follow
                     root=tmp_path / "home",
                     hosted=True,
                     model=scenario.provider,
-                    model_profile=reviewed_model_profile(model_id),
-                    limits=LoopLimits(max_estimated_cost_usd=read_budget.per_run),
+                    model_profile=reviewed_model_profile(live_model_id(model_id)),
+                    limits=LoopLimits(
+                        max_estimated_cost_usd=cost_cap(read_budget.per_run)
+                    ),
                     secret_provider=secrets,
                     mcp_client_factory=SDKMCPClientFactory(http_transport=transport),
                 )

@@ -30,6 +30,7 @@ from tests.support.job_benchmarks import (
     record_metrics,
     wait_for_terminal,
 )
+from tests.support.live_billing import require_api_billing
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_B_CATALOG_BENCHMARK"
 _CATALOG_SIZES = (16, 64, 128)
@@ -77,6 +78,7 @@ async def test_profile_target_survives_catalog_distractors(
     distractor_tables: int,
     record_property: Callable[[str, object], None],
 ) -> None:
+    require_api_billing("background job admission")
     fixture = await create_live_agent(
         tmp_path,
         f"catalog-profile-{distractor_tables}",

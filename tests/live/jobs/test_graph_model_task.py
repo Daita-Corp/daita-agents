@@ -16,6 +16,7 @@ from daita.llm.profiles import reviewed_model_profile
 from daita.loop.models import LoopExitKind
 from daita.storage.home_migrations import CURRENT_HOME_REVISION
 from tests.support.job_benchmarks import create_probe_home
+from tests.support.live_billing import require_api_billing
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_GRAPH_TASK"
@@ -70,6 +71,7 @@ async def _wait_terminal(agent: Agent, job_id: str) -> None:
 async def test_live_model_task_uses_public_revision_2_composition(
     tmp_path: Path,
 ) -> None:
+    require_api_billing("graph task admission")
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
     provider_name = model_id.partition(":")[0]
     if provider_name not in _API_PROVIDERS:
