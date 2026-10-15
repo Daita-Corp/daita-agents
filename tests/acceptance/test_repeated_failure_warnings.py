@@ -44,7 +44,7 @@ from daita.llm.providers.mock import MockModelProvider
 from daita.loop.session import RunSessionEvidence
 from tests.support.conversations import CatalogSpy
 from tests.support.model_graph_integration import READ_TOOL_NAME, ModelGraphIntegration
-from tests.support.toolbox_model import result_ref
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider, result_ref
 from tests.support.workspace import workspace_for
 
 pytestmark = pytest.mark.acceptance
@@ -79,7 +79,9 @@ def _stop(text: str) -> ModelResponse:
     return ModelResponse(finish_reason=FinishReason.STOP, text=text, usage=USAGE)
 
 
-def _profile(provider: MockModelProvider) -> ModelProfile:
+def _profile(
+    provider: MockModelProvider | ToolboxAwareMockModelProvider,
+) -> ModelProfile:
     return ModelProfile(
         id=provider.provider_id,
         context_window_tokens=128_000,
@@ -440,3 +442,62 @@ async def test_graph_task_attempts_warn_separately_without_changing_limits(
     silent_provider, silent = await _graph(tmp_path / "silent")
     assert not any(_warned(request) for request in silent_provider.requests)
     assert warned == silent
+
+
+async def test_repeated_invalid_sql_warns_on_the_second_identical_query(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "orders.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE orders (value INTEGER NOT NULL)")
+    provider = ToolboxAwareMockModelProvider(
+        (),
+        provider_id="mock:repeated-invalid-sql",
+        complete_pricing=True,
+    )
+    agent = await Agent.create(
+        "repeated-invalid-sql",
+        root=tmp_path / "state",
+        workspace=workspace_for(tmp_path),
+        model=provider,
+        model_profile=_profile(provider),
+        clock=lambda: NOW,
+    )
+    try:
+        source = await agent.attach(SQLiteSource(database))
+        (resource,) = await agent.list_catalog_resources(source_id=source.id)
+        query = {
+            "source_id": source.id,
+            "resource_ids": (resource.id,),
+            "sql": "SELECT missing_total FROM orders",
+            "parameters": (),
+        }
+        provider.replace_script(
+            (
+                _tool("sql-1", "data_query", **query),
+                _tool("sql-2", "data_query", **query),
+                _stop("The orders table has no missing_total column."),
+            )
+        )
+        result = await agent.run("Total the orders.", source_scope_ids=(source.id,))
+        transcript = await agent.transcript(result.run_id)
+        codes = {
+            block.call_id: block.output["error"]["code"]  # type: ignore[index]
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        }
+        assert codes == {
+            "sql-1": "sql_validation_failed",
+            "sql-2": "sql_validation_failed",
+        }
+        assert tuple(_warned(request) for request in provider.requests) == (
+            False,
+            False,
+            True,
+        )
+        system = provider.requests[2].messages[0].content[0]
+        assert isinstance(system, TextBlock)
+        assert "`data_query`" in system.text
+    finally:
+        await agent.close()
