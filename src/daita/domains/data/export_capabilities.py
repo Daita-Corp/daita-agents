@@ -2299,7 +2299,9 @@ class ArtifactCapabilityDomain:
                 )
             assert producer_call is not None
             try:
-                _view, producer_capability = registry.resolve_tool(producer_call.name)
+                _view, producer_capability = registry.resolve_tool(
+                    producer_call.name, capability_id=block.capability_id
+                )
                 if (
                     producer_capability.id != block.capability_id
                     or producer_capability.executor_id != block.executor_id
@@ -2308,7 +2310,9 @@ class ArtifactCapabilityDomain:
                     raise ValueError("result execution lineage differs")
                 await registry.validate_arguments_async(
                     producer_capability.id,
-                    producer_call.arguments,
+                    registry.target_arguments(
+                        producer_call.name, producer_call.arguments
+                    ),
                 )
                 if set(block.output) not in (
                     {"kind", "data"},

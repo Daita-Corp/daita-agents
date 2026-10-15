@@ -631,7 +631,7 @@ class GraphAdmissionBuilder:
             sorted(
                 name
                 for name in self._registry.tool_names
-                if self._registry.tool_capability(name).id == proposal.capability_id
+                if proposal.capability_id in self._registry.tool_capability_ids(name)
             )
         )
         if not callable_tool_names:
@@ -842,8 +842,8 @@ class GraphAdmissionBuilder:
                     name
                     for name in self._registry.tool_names
                     if proposal.preview_capability_id is not None
-                    and self._registry.tool_capability(name).id
-                    == proposal.preview_capability_id
+                    and proposal.preview_capability_id
+                    in self._registry.tool_capability_ids(name)
                 )
             )
             if proposal.preview_capability_id is not None and not preview_names:

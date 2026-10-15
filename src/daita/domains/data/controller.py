@@ -415,10 +415,17 @@ class DataCapabilityDomain:
         for name in sorted(views):
             view = views[name]
             capability = self._capabilities[view.capability_id]
+            routed = tuple(
+                self._capabilities[capability_id]
+                for _mode, capability_id in view.mode_capability_ids
+            ) or (capability,)
             if not self._learning.allows(
                 session,
                 name,
-                effectful=capability.operational_effect is not OperationalEffect.NONE,
+                effectful=all(
+                    item.operational_effect is not OperationalEffect.NONE
+                    for item in routed
+                ),
             ):
                 continue
             if capability.id in _CATALOG_CAPABILITIES:
@@ -1515,8 +1522,20 @@ class DataCapabilityDomain:
                 "write_preview_not_authenticated",
                 "The preview belongs to another run or agent.",
             )
+        registry = self._registry
+
+        def target(candidate: ToolCall) -> ToolCall:
+            # A mode-routed tool persists its model call with the mode selector;
+            # its capability received the same call without it.
+            return replace(
+                candidate,
+                arguments=registry.target_arguments(
+                    candidate.name, candidate.arguments
+                ),
+            )
+
         current_calls = [
-            (index, candidate)
+            (index, target(candidate))
             for index, message in enumerate(transcript.messages)
             for candidate in message.tool_calls
             if candidate.id == call.id
@@ -1528,7 +1547,7 @@ class DataCapabilityDomain:
             )
         current_index = current_calls[0][0]
         calls = {
-            candidate.id: candidate
+            candidate.id: target(candidate)
             for message in transcript.messages[:current_index]
             for candidate in message.tool_calls
         }
@@ -1570,7 +1589,8 @@ class DataCapabilityDomain:
                     continue
                 try:
                     _, result_capability = self._registry.resolve_tool(
-                        calls[block.call_id].name
+                        calls[block.call_id].name,
+                        capability_id=block.capability_id,
                     )
                     if (
                         result_capability.id != block.capability_id
@@ -1621,9 +1641,16 @@ class DataCapabilityDomain:
             )
             != evidence_ids
         ):
+            known = {block.call_id for block in results}
+            unknown = [item for item in evidence_ids if item not in known]
             raise CapabilityInputError(
                 "write_evidence_invalid",
-                "Evidence must identify ordered successful authenticated current-run results.",
+                "Evidence must identify ordered successful authenticated current-run results"
+                + (
+                    f"; not a successful call id in this run: {', '.join(unknown[:4])}."
+                    if unknown
+                    else "; the call ids are out of order."
+                ),
             )
         if not execution:
             return

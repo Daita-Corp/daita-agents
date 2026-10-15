@@ -1433,6 +1433,10 @@ class ToolView:
     origin_revision_digest: str | None = None
     presentation_sensitivity: ModelSensitivity = ModelSensitivity.PUBLIC
     connector_presentation: FrozenJsonObject | None = None
+    # One model-visible tool may select among existing capabilities by its
+    # ``mode`` argument. Each mode keeps its capability's own execution path,
+    # effects, approvals and receipts; ``capability_id`` is the primary mode.
+    mode_capability_ids: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -1441,6 +1445,28 @@ class ToolView:
             (self.description, "tool description"),
         ):
             _text(value, name)
+        routes = tuple(tuple(item) for item in self.mode_capability_ids)
+        if routes:
+            modes = tuple(mode for mode, _ in routes)
+            capability_ids = tuple(capability_id for _, capability_id in routes)
+            if (
+                len(routes) < 2
+                or any(len(item) != 2 for item in routes)
+                or any(
+                    not isinstance(mode, str)
+                    or re.fullmatch(r"[a-z][a-z_]{0,31}", mode) is None
+                    for mode in modes
+                )
+                or len(set(modes)) != len(modes)
+                or len(set(capability_ids)) != len(capability_ids)
+                or self.capability_id not in capability_ids
+            ):
+                raise ValueError("tool mode routes are invalid")
+            for capability_id in capability_ids:
+                _text(capability_id, "tool mode capability_id")
+            if self.connector_presentation is not None:
+                raise ValueError("connector tools cannot route by mode")
+        object.__setattr__(self, "mode_capability_ids", routes)
         if self.name in RESERVED_TOOL_NAMES:
             raise ValueError(f"reserved runtime control tool name: {self.name}")
         if not isinstance(self.presentation, ToolPresentation):
@@ -1680,15 +1706,31 @@ class CapabilityRegistry:
         for capability in self._capabilities.values():
             if capability.executor_id not in self._executors:
                 raise ValueError(f"missing executor: {capability.executor_id}")
+        mode_input_schemas: dict[str, Mapping[str, object]] = {}
         for view in self._views.values():
-            if view.capability_id not in self._capabilities:
-                raise ValueError(f"missing capability: {view.capability_id}")
-            capability = self._capabilities[view.capability_id]
-            if (
-                capability.operational_effect is not OperationalEffect.NONE
-                and view.presentation.load_mode is not ToolLoadMode.ON_DEMAND
-            ):
-                raise ValueError(f"effectful tool must be on demand: {view.name}")
+            routed_ids = tuple(
+                capability_id for _, capability_id in view.mode_capability_ids
+            ) or (view.capability_id,)
+            for capability_id in routed_ids:
+                if capability_id not in self._capabilities:
+                    raise ValueError(f"missing capability: {capability_id}")
+                capability = self._capabilities[capability_id]
+                if (
+                    capability.operational_effect is not OperationalEffect.NONE
+                    and view.presentation.load_mode is not ToolLoadMode.ON_DEMAND
+                ):
+                    raise ValueError(f"effectful tool must be on demand: {view.name}")
+            if view.mode_capability_ids:
+                owners = {self._domain_owners[item] for item in routed_ids}
+                if len(owners) != 1:
+                    raise ValueError(f"mode routes must share one domain: {view.name}")
+                mode_input_schemas[view.name] = _mode_input_schema(
+                    tuple(
+                        (mode, self._capabilities[capability_id].input_schema)
+                        for mode, capability_id in view.mode_capability_ids
+                    )
+                )
+        self._mode_input_schemas = MappingProxyType(mode_input_schemas)
         declared_executor_ids = {
             executor_id
             for declaration in declared.values()
@@ -1784,6 +1826,10 @@ class CapabilityRegistry:
                                         "origin_revision_digest": (
                                             view.origin_revision_digest
                                         ),
+                                        "mode_capability_ids": [
+                                            list(item)
+                                            for item in view.mode_capability_ids
+                                        ],
                                     }
                                     for view in sorted(
                                         declaration.tool_views,
@@ -1813,6 +1859,20 @@ class CapabilityRegistry:
     def tool_names(self) -> frozenset[str]:
         return frozenset(self._views)
 
+    def tool_capability_ids(self, name: str) -> tuple[str, ...]:
+        """Return every capability one tool name can execute, primary first."""
+
+        try:
+            view = self._views[name]
+        except KeyError as error:
+            raise KeyError(f"unknown tool: {name}") from error
+        routed = tuple(
+            capability_id
+            for _, capability_id in view.mode_capability_ids
+            if capability_id != view.capability_id
+        )
+        return (view.capability_id, *routed)
+
     @property
     def domain_owner_ids(self) -> frozenset[str]:
         return frozenset(self._declarations)
@@ -1821,12 +1881,64 @@ class CapabilityRegistry:
     def digest(self) -> str:
         return self._digest
 
-    def resolve_tool(self, name: str) -> tuple[ToolView, Capability]:
+    def resolve_tool(
+        self,
+        name: str,
+        *,
+        capability_id: str | None = None,
+    ) -> tuple[ToolView, Capability]:
+        """Resolve a tool to its primary capability, or to one exact route."""
+
         try:
             view = self._views[name]
-            return view, self._capabilities[view.capability_id]
         except KeyError as error:
             raise KeyError(f"unknown tool: {name}") from error
+        selected = view.capability_id if capability_id is None else capability_id
+        if selected not in self.tool_capability_ids(name):
+            raise KeyError(f"tool {name} does not route to {selected}")
+        return view, self._capabilities[selected]
+
+    def call_capability(
+        self,
+        name: str,
+        arguments: Mapping[str, object],
+    ) -> Capability:
+        """Return the capability one persisted model call selected."""
+
+        view = self._views.get(name)
+        if view is not None and view.mode_capability_ids:
+            return self.resolve_tool_mode(name, arguments.get(TOOL_MODE_ARGUMENT))[1]
+        return self.tool_capability(name)
+
+    def target_arguments(
+        self,
+        name: str,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        """Return the arguments the selected capability of one call receives.
+
+        A mode-routed tool removes its ``mode`` selector; every other tool, and
+        any name this registry does not know, keeps its arguments unchanged.
+        """
+
+        view = self._views.get(name)
+        if view is None or not view.mode_capability_ids:
+            return arguments
+        return {
+            key: value for key, value in arguments.items() if key != TOOL_MODE_ARGUMENT
+        }
+
+    def resolve_tool_mode(self, name: str, mode: object) -> tuple[ToolView, Capability]:
+        """Resolve a mode-routed tool call to the capability its mode selects."""
+
+        try:
+            view = self._views[name]
+        except KeyError as error:
+            raise KeyError(f"unknown tool: {name}") from error
+        routes = dict(view.mode_capability_ids)
+        if not isinstance(mode, str) or mode not in routes:
+            raise KeyError(f"tool {name} has no mode {mode!r}")
+        return view, self._capabilities[routes[mode]]
 
     def resolve_domain_owner(self, capability_id: str) -> str:
         try:
@@ -1850,16 +1962,25 @@ class CapabilityRegistry:
         except KeyError as error:
             raise KeyError(f"unknown tool: {name}") from error
 
-    def resolve_tool_owner(self, name: str) -> tuple[ToolView, Capability, str]:
-        view, capability = self.resolve_tool(name)
+    def resolve_tool_owner(
+        self,
+        name: str,
+        *,
+        capability_id: str | None = None,
+    ) -> tuple[ToolView, Capability, str]:
+        view, capability = self.resolve_tool(name, capability_id=capability_id)
         return view, capability, self.resolve_domain_owner(capability.id)
 
     def tool_definition(self, name: str) -> ToolDefinition:
         view, capability = self.resolve_tool(name)
+        if not view.mode_capability_ids:
+            input_schema: Mapping[str, object] = capability.input_schema
+        else:
+            input_schema = self._mode_input_schemas[name]
         return ToolDefinition(
             name=view.name,
             description=_provider_description(view),
-            input_schema=capability.input_schema,
+            input_schema=input_schema,
         )
 
     def validate_arguments(
@@ -1905,7 +2026,11 @@ class CapabilityRegistry:
         material = tuple(capability_ids)
         if not material or len(material) != len(set(material)):
             raise ValueError("execution scope grant requires distinct capabilities")
-        public_capability_ids = {view.capability_id for view in self._views.values()}
+        public_capability_ids = {
+            capability_id
+            for name in self._views
+            for capability_id in self.tool_capability_ids(name)
+        }
         for capability_id in material:
             try:
                 capability = self._capabilities[capability_id]
@@ -1943,7 +2068,7 @@ class CapabilityRegistry:
         contract_digest: str,
     ) -> tuple[Capability, Executor, str]:
         capability, executor = self.resolve_execution(capability_id)
-        if any(view.capability_id == capability_id for view in self._views.values()):
+        if any(capability_id in self.tool_capability_ids(name) for name in self._views):
             raise ValueError(
                 "trusted internal execution requires an internal-only capability"
             )
@@ -2039,6 +2164,57 @@ def _unique(items: Iterable[_T], key: Callable[[_T], str], name: str) -> dict[st
             raise ValueError(f"duplicate {name}: {item_key}")
         result[item_key] = item
     return result
+
+
+TOOL_MODE_ARGUMENT = "mode"
+
+
+def _mode_input_schema(
+    routes: tuple[tuple[str, Mapping[str, object]], ...],
+) -> dict[str, object]:
+    """Merge route schemas into one flat schema keyed by ``mode``.
+
+    Shared properties must be identical. Arguments that only one mode accepts
+    stay optional here and are enforced by that mode's own capability schema.
+    """
+
+    properties: dict[str, object] = {
+        TOOL_MODE_ARGUMENT: {
+            "type": "string",
+            "enum": [mode for mode, _ in routes],
+        }
+    }
+    required: set[str] | None = None
+    for _mode, schema in routes:
+        if (
+            schema.get("type") != "object"
+            or schema.get("additionalProperties") is not False
+        ):
+            raise ValueError("mode routes require closed object schemas")
+        route_properties = schema.get("properties", {})
+        route_required = schema.get("required", ())
+        if not isinstance(route_properties, Mapping) or not isinstance(
+            route_required, (tuple, list)
+        ):
+            raise ValueError("mode route schema is malformed")
+        if TOOL_MODE_ARGUMENT in route_properties:
+            raise ValueError("mode route schemas cannot declare mode")
+        for name, rule in route_properties.items():
+            if name in properties and canonical_json(
+                properties[name]
+            ) != canonical_json(rule):
+                raise ValueError(f"mode routes disagree on argument {name}")
+            properties[name] = rule
+        names = {str(item) for item in route_required}
+        required = names if required is None else required & names
+    merged = {
+        "type": "object",
+        "properties": properties,
+        "required": [TOOL_MODE_ARGUMENT, *sorted(required or ())],
+        "additionalProperties": False,
+    }
+    _check_schema(merged)
+    return merged
 
 
 def _provider_description(view: ToolView) -> str:

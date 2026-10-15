@@ -638,7 +638,7 @@ async def test_catalog_describe_replaces_split_tools_without_ordering_rules(
         description = registry.tool_definition("catalog_describe").description
         for ordering_rule in ("Do not use with", "later step", "alongside"):
             assert ordering_rule not in description
-        assert "one call is enough" in description
+        assert "multi-hop resolved in code" in description
         assert "estimates" in description
     finally:
         await agent.close()

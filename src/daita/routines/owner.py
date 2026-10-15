@@ -1317,7 +1317,7 @@ class RoutineOwner:
                 if call.name in RESERVED_TOOL_NAMES:
                     continue
                 try:
-                    capability = capabilities.tool_capability(call.name)
+                    capability = capabilities.call_capability(call.name, call.arguments)
                 except KeyError as error:
                     raise RoutineError(
                         "routine_basis_lineage_unknown",

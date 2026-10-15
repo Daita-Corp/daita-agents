@@ -54,9 +54,43 @@ from .sql.relational_upsert import RelationalUpsertIntent
 DATA_QUERY_EXECUTOR_ID = "data.query.executor"
 DATA_QUERY_TOOL_NAME = "data_query"
 RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID = "data.preview_update_rows.executor"
-RELATIONAL_UPDATE_PREVIEW_TOOL_NAME = "data_preview_update_rows"
 RELATIONAL_UPDATE_EXECUTOR_ID = "data.update_rows.executor"
 RELATIONAL_UPDATE_TOOL_NAME = "data_update_rows"
+RELATIONAL_UPSERT_TOOL_NAME = "data_upsert_rows"
+DATA_QUERY_DESCRIPTION = (
+    "Run read-only SQL on exact catalog resources of one source. Use sql, or "
+    "statements for up to 8 reads in one call; resource_ids must list every "
+    "table read (up to 64). Returns columns, rows, tables_touched, truncation "
+    "and timing. Limits: 5s per statement, 15s total, 100 rows and 16 KB "
+    "shared by all statements. "
+    'Example: {"source_id": "...", "resource_ids": ["..."], '
+    '"sql": "SELECT region, sum(total) FROM orders GROUP BY region"}. '
+    "Mistakes: columns absent from catalog evidence; joining on matching "
+    "names alone; treating truncated rows as complete."
+)
+RELATIONAL_UPDATE_DESCRIPTION = (
+    "Update rows in one PostgreSQL catalog table. mode=preview "
+    "changes nothing and returns matched_rows, samples and "
+    "preview_fingerprint. mode=apply repeats those arguments plus "
+    "preview_fingerprint and expected_affected_rows=matched_rows; calling it "
+    "is what requests approval. Only outcome=committed proves it. Limits: "
+    "structured filters, literal values, no SQL. "
+    'Example: {"mode": "preview", "where": [{"column": "id", "operator": '
+    '"eq", "value": 7}], "assignments": [{"column": "status", "value": '
+    '"paid"}], ...}. Mistakes: asking for approval in chat; applying a '
+    "zero-match preview; retrying after denial."
+)
+RELATIONAL_UPSERT_DESCRIPTION = (
+    "Insert missing rows and update existing ones in one PostgreSQL table, "
+    "matched on key_columns; needs upsert permission. mode=preview changes "
+    "nothing and classifies rows as insert, update or unchanged. mode=apply "
+    "sends the same batch plus preview_fingerprint, requests approval, locks "
+    "the table briefly and reports verified counts. Limits: one uniform batch "
+    "of up to 1000 scalar rows, no chunking. "
+    'Example: {"mode": "preview", "key_columns": ["sku"], "rows": '
+    '[{"sku": "A1", "qty": 3}], ...}. Mistakes: omitting a column to clear '
+    "it (send null); retrying after denial or failure."
+)
 _MAX_PREVIEW_OUTPUT_BYTES = 256 * 1_024
 
 RELATIONAL_UPDATE_RECEIPT_POLICY = EffectReceiptPolicy(
@@ -975,24 +1009,10 @@ def relational_update_preview_capability_declarations() -> CapabilityDeclaration
         access_mode=AccessMode.READ,
         automation_eligibility=AutomationEligibility.AUTOMATION_DIRECT,
     )
-    view = ToolView(
-        name=RELATIONAL_UPDATE_PREVIEW_TOOL_NAME,
-        capability_id=capability.id,
-        description=capability.description,
-        presentation=ToolPresentation(
-            toolbox_id=ToolboxId.SOURCES,
-            load_mode=ToolLoadMode.ON_DEMAND,
-            text_trust=ToolTextTrust.CODE,
-            summary="Preview matching rows and proposed changes for a relational update.",
-            when_to_use="Use before applying an admitted update to existing rows.",
-            keywords=("data", "relational", "postgresql", "rows", "update", "preview"),
-        ),
-    )
     return CapabilityDeclarations(
         domain_owner_id="data",
         capabilities=(capability,),
         executor_ids=(capability.executor_id,),
-        tool_views=(view,),
     )
 
 
@@ -1097,19 +1117,24 @@ def relational_update_capability_declarations() -> CapabilityDeclarations:
     view = ToolView(
         name=RELATIONAL_UPDATE_TOOL_NAME,
         capability_id=capability.id,
-        description=capability.description,
+        description=RELATIONAL_UPDATE_DESCRIPTION,
+        mode_capability_ids=(
+            ("preview", RELATIONAL_UPDATE_PREVIEW_CAPABILITY_ID),
+            ("apply", capability.id),
+        ),
         presentation=ToolPresentation(
             toolbox_id=ToolboxId.SOURCES,
             load_mode=ToolLoadMode.ON_DEMAND,
             text_trust=ToolTextTrust.CODE,
-            summary="Apply an exact previewed update to existing relational rows.",
-            when_to_use="Use after a successful update preview, with approval or an exact standing grant.",
+            summary="Preview, then apply, an exact update to existing relational rows.",
+            when_to_use="Use mode=preview first; apply that exact preview with approval or a standing grant.",
             keywords=(
                 "data",
                 "relational",
                 "postgresql",
                 "rows",
                 "update",
+                "preview",
                 "apply",
                 "approval",
             ),
@@ -1134,11 +1159,7 @@ def _query_declarations(
     }
     capability = Capability(
         id=DATA_QUERY_CAPABILITY_ID,
-        description=(
-            "Run one or more validated, read-only relational statements against "
-            "exact current catalog resources of one source, bounded by statement "
-            "time, total time, rows and bytes."
-        ),
+        description=DATA_QUERY_DESCRIPTION,
         input_schema={
             "type": "object",
             "properties": {
@@ -1351,9 +1372,9 @@ __all__ = [
     "DataQueryDeclarations",
     "DataQueryExecutor",
     "RELATIONAL_UPDATE_PREVIEW_EXECUTOR_ID",
-    "RELATIONAL_UPDATE_PREVIEW_TOOL_NAME",
     "RELATIONAL_UPDATE_EXECUTOR_ID",
     "RELATIONAL_UPDATE_TOOL_NAME",
+    "RELATIONAL_UPSERT_TOOL_NAME",
     "PostgreSQLReadBackend",
     "PostgreSQLReadResult",
     "RelationalPreviewFingerprint",
@@ -1392,12 +1413,18 @@ NATIVE_WRITE_GRANT_POLICY = AutomationGrantPolicy(
     constraints_kind="data.relational_write",
     constraints_schema={
         "type": "object",
-        "description": "The proposed allowed_capability_ids must include the matching preview: "
+        "description": "Only for routine proposals: allowed_capability_ids lists both "
+        "routes of the one write tool: "
         + "; ".join(
-            f"{capability_id} requires {native_preview_capability(capability_id)}"
-            for capability_id in (RELATIONAL_UPDATE_CAPABILITY_ID, "data.upsert_rows")
+            f"{tool_name} needs {capability_id} and "
+            f"{native_preview_capability(capability_id)}"
+            for tool_name, capability_id in (
+                (RELATIONAL_UPDATE_TOOL_NAME, RELATIONAL_UPDATE_CAPABILITY_ID),
+                (RELATIONAL_UPSERT_TOOL_NAME, "data.upsert_rows"),
+            )
         )
-        + ". Each occurrence must obtain its own authenticated preview before writing.",
+        + ". These are its mode=apply and mode=preview routes, not separate tools "
+        "to load. Each occurrence calls mode=preview before mode=apply.",
         "properties": {
             "source_id": {"type": "string", "maxLength": 256},
             "resource_id": {"type": "string", "maxLength": 256},
@@ -1579,7 +1606,9 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
             "type": "array",
             "maxItems": 32,
             "uniqueItems": True,
-            "items": {"type": "string", "maxLength": 256},
+            "items": {"type": "string", "minLength": 1, "maxLength": 256},
+            "description": "Omit in normal use; it is for programs that hold "
+            "exact current-run call ids. Never tool names or empty strings.",
         },
     }
     required = [
@@ -1653,17 +1682,24 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
         domain_owner_id="data",
         capabilities=(preview, write),
         executor_ids=(preview.executor_id, write.executor_id),
-        tool_views=tuple(
+        tool_views=(
             ToolView(
-                name=cap.id.replace(".", "_"),
-                capability_id=cap.id,
-                description=cap.description,
+                name=RELATIONAL_UPSERT_TOOL_NAME,
+                capability_id=write.id,
+                description=RELATIONAL_UPSERT_DESCRIPTION,
+                mode_capability_ids=(("preview", preview.id), ("apply", write.id)),
                 presentation=ToolPresentation(
                     toolbox_id=ToolboxId.SOURCES,
                     load_mode=ToolLoadMode.ON_DEMAND,
                     text_trust=ToolTextTrust.CODE,
-                    summary=summary,
-                    when_to_use=when_to_use,
+                    summary=(
+                        "Preview, then apply, an exact relational batch: insert missing "
+                        "rows, update existing rows, or leave them unchanged."
+                    ),
+                    when_to_use=(
+                        "Use mode=preview first for a batch identified by exact conflict "
+                        "keys; apply that exact preview with approval or a standing grant."
+                    ),
                     keywords=(
                         "data",
                         "relational",
@@ -1675,24 +1711,13 @@ def relational_upsert_capability_declarations() -> CapabilityDeclarations:
                         "table",
                         "batch",
                         "research",
-                        *action_keywords,
+                        "preview",
+                        "apply",
+                        "save",
+                        "approval",
                     ),
                 ),
-            )
-            for cap, summary, when_to_use, action_keywords in (
-                (
-                    preview,
-                    "Preview an exact relational batch: insert missing rows, update existing rows, or leave them unchanged.",
-                    "Use before applying an admitted upsert batch identified by exact conflict keys.",
-                    ("preview",),
-                ),
-                (
-                    write,
-                    "Insert missing rows or update existing rows in a relational table using one exact previewed batch.",
-                    "Use after a successful upsert preview, with approval or an exact standing grant.",
-                    ("apply", "save", "approval"),
-                ),
-            )
+            ),
         ),
     )
 

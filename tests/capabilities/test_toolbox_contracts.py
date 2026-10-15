@@ -247,6 +247,35 @@ async def test_production_inventory_has_exact_membership_and_loading_policy(
         assert registry.resolve_tool("start_data_profile")[
             0
         ].presentation.toolbox_id is (ToolboxId.JOBS)
+        assert {
+            "catalog_schema",
+            "catalog_inspect",
+            "catalog_traverse",
+            "data_preview_update_rows",
+            "data_preview_upsert_rows",
+        }.isdisjoint(registry.tool_names)
+        assert {
+            name: registry.resolve_tool(name)[0].mode_capability_ids
+            for name in registry.tool_names
+            if registry.resolve_tool(name)[0].mode_capability_ids
+        } == {
+            "data_update_rows": (
+                ("preview", "data.preview_update_rows"),
+                ("apply", "data.update_rows"),
+            ),
+            "data_upsert_rows": (
+                ("preview", "data.preview_upsert_rows"),
+                ("apply", "data.upsert_rows"),
+            ),
+        }
+        for name in (
+            "catalog_search",
+            "catalog_describe",
+            "data_query",
+            "data_update_rows",
+            "data_upsert_rows",
+        ):
+            assert len(registry.tool_definition(name).description.encode()) <= 600
     finally:
         await agent.close()
 

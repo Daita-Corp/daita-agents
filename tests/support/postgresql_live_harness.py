@@ -135,28 +135,59 @@ def report_path(case_id):
     return folder / (hashlib.sha256(case_id.encode()).hexdigest()[:20] + ".json")
 
 
-def calls_for(transcript, tool_name):
+def calls_for(transcript, tool_name, mode=None):
     return [
         call
         for message in transcript.messages
         for call in message.tool_calls
         if call.name == tool_name
+        and (mode is None or call.arguments.get("mode") == mode)
     ]
 
 
-def assert_report(result, status, counts=None):
+_REPORT_COUNTS = ("inserted_count", "updated_count", "unchanged_count")
+
+
+def stage_note(stages=()):
+    if not stages:
+        return "no effect stage was verified before this failure"
+    return "verified before this failure: " + ", ".join(stages)
+
+
+def _report_count_matches(actual, expected, status):
+    # Positive counts the effect evidence establishes are exact. Zero and null
+    # both claim no effect, so either is honest where nothing happened (an
+    # update inserts nothing; a rolled-back or unapplied write changes nothing)
+    # unless the outcome is uncertain, where only null is. A missing, invented
+    # or positive-while-uncertain count fails.
+    if expected:
+        return actual == expected
+    if status == "uncertain":
+        return actual is None
+    return actual is None or actual == 0
+
+
+def assert_report(result, status, counts=None, stages=()):
     assert result.final_text, (
         getattr(result, "reason", "missing_final_answer"),
         "A terminal run without an answer cannot satisfy reporting acceptance.",
+        stage_note(stages),
     )
     report = json.loads(result.final_text or "")
-    assert report["status"] == status, report
+    assert report["status"] == status, (report, stage_note(stages))
     assert isinstance(report["explanation"], str) and report["explanation"].strip()
-    actual = tuple(
-        report[key] for key in ("inserted_count", "updated_count", "unchanged_count")
+    actual = tuple(report[key] for key in _REPORT_COUNTS)
+    assert all(value is None or type(value) is int for value in actual), report
+    expected = counts if counts is not None else (None, None, None)
+    mismatched = {
+        key: {"reported": value, "expected": want}
+        for key, value, want in zip(_REPORT_COUNTS, actual, expected, strict=True)
+        if not _report_count_matches(value, want, status)
+    }
+    assert not mismatched, (
+        f"report counts disagree with effect evidence: {mismatched}",
+        stage_note(stages),
     )
-    assert actual == (counts if counts is not None else (None, None, None)), report
-    assert all(value is None or type(value) is int for value in actual)
 
 
 class Evaluation:
@@ -498,7 +529,7 @@ class Evaluation:
     def assert_report(self, result, status, counts=None):
         self.assert_completed_runs()
         if self.profile == "strict":
-            assert_report(result, status, counts)
+            assert_report(result, status, counts, self.stages)
         else:
             # Exact state/effect assertions remain in the case. Prose semantics
             # require a separate evidence review, not a permissive regex or a
@@ -519,6 +550,7 @@ class Evaluation:
             assert result.kind is LoopExitKind.COMPLETED, (
                 result.reason,
                 result.final_text,
+                stage_note(self.stages),
             )
             validate_completed_transcript(transcript, result)
             assert 0 < result.usage.total_tokens <= self.config.limits.max_total_tokens
@@ -874,15 +906,45 @@ async def evaluate(
             raise validation_error
 
 
+def _error_code(block):
+    error = block.output.get("error") if isinstance(block.output, Mapping) else None
+    return error.get("code", "error") if isinstance(error, Mapping) else "error"
+
+
+def write_call_summary(transcript, tool_name):
+    errors = {
+        block.call_id: _error_code(block)
+        for message in transcript.messages
+        for block in message.content
+        if isinstance(block, ToolResultBlock) and block.is_error
+    }
+    calls = calls_for(transcript, tool_name)
+    return {
+        mode: {
+            "calls": sum(
+                1 for call in calls if str(call.arguments.get("mode")) == mode
+            ),
+            "rejected": [
+                errors[call.id]
+                for call in calls
+                if str(call.arguments.get("mode")) == mode and call.id in errors
+            ],
+        }
+        for mode in sorted({str(call.arguments.get("mode")) for call in calls})
+    }
+
+
 def assert_preview_binding(transcript, operation="upsert"):
-    calls = calls_for(transcript, f"data_{operation}_rows")
+    tool_name = f"data_{operation}_rows"
+    calls = calls_for(transcript, tool_name, "apply")
     assert len(calls) == 1, (
-        f"Expected exactly one data_{operation}_rows call; observed {len(calls)}. "
+        f"Expected exactly one {tool_name} mode=apply call; observed {len(calls)}. "
+        f"Calls by mode: {write_call_summary(transcript, tool_name)}. "
         "A missing write or duplicate request fails effectiveness."
     )
     call = calls[0]
     preview_ids = {
-        item.id for item in calls_for(transcript, f"data_preview_{operation}_rows")
+        item.id for item in calls_for(transcript, f"data_{operation}_rows", "preview")
     }
     previews = [
         block
@@ -904,9 +966,14 @@ def assert_preview_binding(transcript, operation="upsert"):
 def assert_exact_preview(scenario, transcript, operation="upsert"):
     call = assert_preview_binding(transcript, operation)
     matching = [item for item in scenario.approvals if item["call_id"] == call.id]
-    assert len(matching) == 1 and matching[0]["approved"]
+    assert len(matching) == 1 and matching[0]["approved"], (
+        "The harness approval oracle denied the apply call: its arguments do not "
+        "equal the scenario's exact expected write.",
+        {"proposed": call.arguments, "expected": scenario.expected_write},
+        stage_note(scenario.stages),
+    )
     assert canonical_json(matching[0]["arguments"]["arguments"]) == canonical_json(
-        call.arguments
+        {key: value for key, value in call.arguments.items() if key != "mode"}
     )
     previews = [
         block.output["data"]
