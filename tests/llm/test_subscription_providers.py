@@ -246,6 +246,36 @@ async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     ]
 
 
+async def test_codex_keeps_a_machine_run_start_instruction_as_input():
+    client = _Client()
+    provider = CodexSubscriptionProvider(
+        "gpt-test",
+        credential=_credential().to_secret(),
+        max_output_tokens=2_048,
+        client=client,
+    )
+    # Machine runs (graph tasks, routines, job events) start with a system
+    # instruction and no user message; the surface rejects an empty input.
+    request = replace(
+        _request(),
+        messages=(
+            _request().messages[0],
+            CanonicalMessage(
+                role=MessageRole.SYSTEM,
+                content=(TextBlock("Machine-originated bounded run."),),
+            ),
+        ),
+    )
+    await provider.generate(request)
+
+    arguments = client.responses.arguments
+    assert arguments is not None
+    assert arguments["instructions"] == "Keep answers grounded."
+    assert arguments["input"] == [
+        {"role": "developer", "content": "Machine-originated bounded run."}
+    ]
+
+
 def test_codex_default_client_uses_bounded_transport_without_sdk_retries(monkeypatch):
     captured: dict[str, object] = {}
     client = _Client()
