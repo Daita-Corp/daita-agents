@@ -217,8 +217,8 @@ Live suites bill API keys by default. Adopted suites can instead run their
 reviewed `openai:<model>` choice through the matching `codex:<model>` ChatGPT
 subscription route by setting `DAITA_LIVE_BILLING=subscription` alongside their
 usual `DAITA_RUN_*` gate. Adopted suites are PostgreSQL write acceptance,
-write-unavailable, tool selection, the Stage B benchmarks, data operations and
-the live MCP read workflows.
+write-unavailable, tool selection, result references, the Stage B benchmarks,
+data operations and the live MCP read workflows.
 
 Log in once through the existing device-code flow:
 

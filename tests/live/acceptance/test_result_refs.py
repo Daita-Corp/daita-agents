@@ -20,7 +20,7 @@ from typing import cast
 
 import pytest
 
-from daita import Agent, GraphState, LoopLimits, create_llm_provider
+from daita import Agent, GraphState, LoopLimits
 from daita.capabilities import RESERVED_TOOL_NAMES
 from daita.domains.data import DATA_QUERY_EVIDENCE_KIND
 from daita.jobs.graph.models import AttemptState, TaskRole
@@ -30,10 +30,10 @@ from daita.llm.models import (
     ToolResultBlock,
     tool_result_refs,
 )
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import LoopExitKind, Transcript
 from tests.support.job_benchmarks import create_probe_home
+from tests.support.live_billing import cost_cap, live_provider, require_api_billing
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_RESULT_REFS"
@@ -91,18 +91,14 @@ def _live_provider() -> tuple[ModelProfile, ManagedModelProvider]:
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
     if model_id.partition(":")[0] not in _API_PROVIDERS:
         pytest.fail(f"{_MODEL_ID} must name an API-backed provider")
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{_MODEL_ID} must name a reviewed tool-capable model")
-    api_key = os.environ.get(_MODEL_KEY)
-    if api_key is None or not api_key.strip():
-        pytest.skip(f"{_MODEL_KEY} is unavailable for the authorized live case")
-    provider = create_llm_provider(
-        model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 2_048),
-    )
-    return profile, provider
+
+    def api_key() -> str:
+        value = os.environ.get(_MODEL_KEY)
+        if value is None or not value.strip():
+            pytest.skip(f"{_MODEL_KEY} is unavailable for the authorized live case")
+        return value
+
+    return live_provider(model_id, api_key=api_key, max_output_tokens=2_048)
 
 
 def _error_code(block: ToolResultBlock) -> str | None:
@@ -145,7 +141,7 @@ async def test_l8_csv_of_a_query_result_cites_that_result(
         limits=LoopLimits(
             max_steps=10,
             max_total_tokens=60_000,
-            max_estimated_cost_usd=_cost_limit(),
+            max_estimated_cost_usd=cost_cap(_cost_limit()),
         ),
         workspace=workspace_for(home.root),
     )
@@ -209,6 +205,7 @@ async def _wait_terminal(agent: Agent, job_id: str) -> None:
 async def test_l8_graph_task_complete_cites_its_read(
     tmp_path: Path, repeat: int
 ) -> None:
+    require_api_billing("graph task admission")
     profile, provider = _live_provider()
     home = await create_probe_home(tmp_path, f"l8-graph-{repeat}", distractor_tables=3)
     resources = tuple(sorted(home.resource_ids.items()))
@@ -225,7 +222,7 @@ async def test_l8_graph_task_complete_cites_its_read(
         limits=LoopLimits(
             max_steps=8,
             max_total_tokens=40_000,
-            max_estimated_cost_usd=_cost_limit(),
+            max_estimated_cost_usd=cost_cap(_cost_limit()),
         ),
         workspace=workspace_for(home.root),
     )
