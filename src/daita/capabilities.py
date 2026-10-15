@@ -2232,6 +2232,10 @@ class CapabilityRegistry:
             raise CapabilityInputError(
                 "invalid_arguments",
                 "Arguments do not satisfy the admitted external schema.",
+                recovery=ToolRecovery(
+                    RecoveryKind.CORRECT_ARGUMENTS,
+                    "Send arguments that match the tool's input schema.",
+                ),
             ) from None
         return value
 

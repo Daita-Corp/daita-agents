@@ -214,6 +214,16 @@ def _sql_statements(
     return tuple(statements)
 
 
+_COPY_CATALOG_IDS = ToolRecovery(
+    RecoveryKind.CORRECT_ARGUMENTS,
+    "Use exact resource IDs from this run's catalog; a resource outside it "
+    "cannot be read in this run.",
+)
+_CORRECT_SQL = ToolRecovery(
+    RecoveryKind.CORRECT_ARGUMENTS,
+    "Fix every reported issue in the SQL or its source and resource IDs; "
+    "the same call will be refused again.",
+)
 _WRITE_PERMISSION_REQUIRED = ToolRecovery(
     RecoveryKind.REQUIRES_HUMAN_PERMISSION,
     "The person must grant write permission for this table before any write.",
@@ -1169,6 +1179,7 @@ class DataCapabilityDomain:
                 raise CapabilityInputError(
                     "resource_read_not_allowed",
                     _RESOURCE_READ_DENIED_MESSAGE,
+                    recovery=_COPY_CATALOG_IDS,
                 )
 
     async def _validate_resource_read_scope(
@@ -1209,6 +1220,7 @@ class DataCapabilityDomain:
             raise CapabilityInputError(
                 "resource_read_not_allowed",
                 _RESOURCE_READ_DENIED_MESSAGE,
+                recovery=_COPY_CATALOG_IDS,
             )
 
     async def _validate_sql(
@@ -1233,6 +1245,7 @@ class DataCapabilityDomain:
                 "SQL reads require an exact source_id, one or more resource_ids, "
                 "and either non-empty sql with an array of parameters or a "
                 "statements array of {sql, parameters}, not both.",
+                recovery=_CORRECT_SQL,
             )
         adapter_id = await self._catalog.source_adapter_id(
             run.agent_id,
@@ -1256,12 +1269,14 @@ class DataCapabilityDomain:
                 raise CapabilityInputError(
                     "resource_read_not_allowed",
                     _RESOURCE_READ_DENIED_MESSAGE,
+                    recovery=_COPY_CATALOG_IDS,
                 )
             if identity[0] != source_id:
                 raise CapabilityInputError(
                     "sql_resource_source_mismatch",
                     "Every requested resource must belong to the selected source.",
                     {"resource_id": resource_id, "source_id": source_id},
+                    recovery=_CORRECT_SQL,
                 )
         resources = await self._catalog.resource_schemas(run.agent_id, source_id)
         try:
@@ -1301,6 +1316,7 @@ class DataCapabilityDomain:
                     raise CapabilityInputError(
                         "resource_read_not_allowed",
                         _RESOURCE_READ_DENIED_MESSAGE,
+                        recovery=_COPY_CATALOG_IDS,
                     )
                 details: dict[str, object] = {
                     "issues": [
@@ -1320,6 +1336,7 @@ class DataCapabilityDomain:
                     "The SQL read is invalid. Correct all reported issues before "
                     "retrying.",
                     details,
+                    recovery=_CORRECT_SQL,
                 )
             referenced.update(result.resource_ids)
             revisions.update(result.resource_revisions)
@@ -1332,6 +1349,7 @@ class DataCapabilityDomain:
                     "source_id": source_id,
                     "requested_resource_ids": requested_resource_ids,
                 },
+                recovery=_CORRECT_SQL,
             )
         prepared = dict(arguments)
         prepared["_adapter_id"] = adapter_id

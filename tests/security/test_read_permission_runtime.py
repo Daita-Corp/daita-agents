@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import cast
 import pytest
 
 from daita import Agent, SQLiteSource
-from daita._json import FrozenJsonObject
+from daita._json import FrozenJsonObject, canonical_json
 from daita.catalog import (
     CATALOG_DESCRIBE_CAPABILITY_ID,
     CATALOG_SEARCH_CAPABILITY_ID,
@@ -331,11 +332,18 @@ async def test_runtime_denies_guessed_and_multi_resource_reads_before_io(
             "resource_read_not_allowed",
             "resource_read_not_allowed",
         )
-        # Denials report only that nothing ran, never details about the
-        # guessed or denied resources.
+        # Denials report only that nothing ran and one fixed recovery, never
+        # details about the guessed or denied resources.
         assert all(
-            dict(cast(Mapping[str, object], error["details"]))
-            == {"execution_disposition": "not_dispatched"}
+            json.loads(canonical_json(error["details"]))
+            == {
+                "execution_disposition": "not_dispatched",
+                "recovery": {
+                    "kind": "correct_arguments",
+                    "constraint": "Use exact resource IDs from this run's catalog; "
+                    "a resource outside it cannot be read in this run.",
+                },
+            }
             for error in errors
         )
         assert resources["child"].id not in str(
