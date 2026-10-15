@@ -19,6 +19,7 @@ from daita.distribution.models import OutcomeState, outcome_contract_projection
 from daita.loop.models import LoopExitKind
 from daita.storage.sqlite_records import EffectResolutionDecision
 from tests.support.distribution import no_artifact_outcome_contract
+from tests.support.live_billing import require_api_billing
 from tests.support.postgresql_live import _TABLE, database as database, row
 from tests.support.postgresql_live_harness import (
     AUTHORIZATION,
@@ -439,6 +440,7 @@ async def test_live_uncertain_commit_restart_and_human_recovery(
 async def test_live_model_authors_and_executes_immediate_weekly_upsert(
     database, scenario_factory, model_id, setup
 ):
+    require_api_billing("routine admission")
     await database.permissions("upsert", max_rows=1)
     async with scenario_factory(
         max_runs=3 if setup == "model_authored" else 2, setup_mode=setup

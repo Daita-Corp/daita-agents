@@ -40,6 +40,7 @@ from tests.support.job_benchmarks import (
     wait_for_running,
     wait_for_terminal,
 )
+from tests.support.live_billing import require_api_billing
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_STAGE_B_PARAPHRASE_BENCHMARK"
 
@@ -175,6 +176,7 @@ async def test_paraphrased_background_requests_admit_one_exact_job(
     prompt: str,
     record_property: Callable[[str, object], None],
 ) -> None:
+    require_api_billing("background job admission")
     fixture = await create_live_agent(
         tmp_path,
         f"paraphrase-start-{case_id}",
@@ -216,6 +218,7 @@ async def test_paraphrased_status_questions_are_agent_scoped_and_direct(
     prompt: str,
     record_property: Callable[[str, object], None],
 ) -> None:
+    require_api_billing("background job admission")
     fixture, job_id = await seed_completed_profile_agent(
         tmp_path,
         f"paraphrase-status-{case_id}",
@@ -248,6 +251,7 @@ async def test_paraphrased_result_questions_recover_exact_artifacts(
     prompt: str,
     record_property: Callable[[str, object], None],
 ) -> None:
+    require_api_billing("background job admission")
     fixture, job_id = await seed_completed_profile_agent(
         tmp_path,
         f"paraphrase-result-{case_id}",
@@ -293,6 +297,7 @@ async def test_paraphrased_cancellation_targets_one_running_job(
     cancel_prompt: str,
     record_property: Callable[[str, object], None],
 ) -> None:
+    require_api_billing("background job admission")
     fixture = await create_live_agent(
         tmp_path,
         f"paraphrase-cancel-{case_id}",

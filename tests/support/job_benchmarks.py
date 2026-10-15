@@ -16,7 +16,7 @@ from time import perf_counter
 
 import pytest
 
-from daita import Agent, GraphState, LoopLimits, SQLiteSource, create_llm_provider
+from daita import Agent, GraphState, LoopLimits, SQLiteSource
 from daita._json import canonical_json
 from daita.llm._lifecycle import closing_stream
 from daita.llm.errors import (
@@ -36,7 +36,6 @@ from daita.llm.models import (
     ToolCall,
     ToolResultBlock,
 )
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import (
     ManagedModelProvider,
     StreamingModelProvider,
@@ -48,6 +47,11 @@ from daita.loop.models import (
     LoopExitKind,
     Transcript,
     validate_completed_transcript,
+)
+from tests.support.live_billing import (
+    api_equivalent_cost,
+    cost_cap,
+    live_provider as live_billing_provider,
 )
 from tests.support.workspace import workspace_for
 
@@ -338,7 +342,7 @@ def configured_model_ids() -> tuple[str, ...]:
 
 
 def benchmark_limits() -> LoopLimits:
-    return LoopLimits(max_estimated_cost_usd=_cost_limit())
+    return LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit()))
 
 
 def live_provider(model_id: str) -> tuple[ModelProfile, RecordingProvider]:
@@ -348,15 +352,11 @@ def live_provider(model_id: str) -> tuple[ModelProfile, RecordingProvider]:
             f"{MODEL_IDS_ENV} must contain only API-backed providers: "
             + ", ".join(sorted(API_PROVIDERS))
         )
-    profile = reviewed_model_profile(model_id)
-    if profile is None or not profile.supports_tools:
-        pytest.fail(f"{model_id} is not a release-reviewed tool-capable model")
-    if not profile.supports_streaming:
-        pytest.fail(f"{model_id} does not have reviewed streaming support")
-    delegate = create_llm_provider(
+    profile, delegate = live_billing_provider(
         model_id,
-        api_key=_api_key(provider_name),
-        max_output_tokens=min(profile.max_output_tokens, 1_536),
+        api_key=lambda: _api_key(provider_name),
+        max_output_tokens=1_536,
+        require_streaming=True,
     )
     return profile, RecordingProvider(delegate)
 
@@ -778,6 +778,9 @@ def record_metrics(
         "estimated_cost_usd",
         None if estimate.amount_usd is None else str(estimate.amount_usd),
     )
+    notional = api_equivalent_cost(capture.result.usage, capture.result.provider_id)
+    if notional is not None:
+        record_property("api_equivalent_cost", notional)
 
 
 def _cost_limit() -> Decimal:

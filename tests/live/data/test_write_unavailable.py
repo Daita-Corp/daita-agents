@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from daita import Agent, LoopLimits, create_llm_provider
+from daita import Agent, LoopLimits
 from daita.capabilities import ApprovalDecision, ApprovalRequest
 from daita.domains.data.capabilities import (
     RELATIONAL_UPDATE_TOOL_NAME,
@@ -23,10 +23,10 @@ from daita.llm.models import (
     ToolResultBlock,
 )
 from daita.llm.pricing import CostEstimate
-from daita.llm.profiles import reviewed_model_profile
 from daita.llm.protocols import ManagedModelProvider, provider_has_complete_pricing
 from daita.loop.models import LoopExitKind, Transcript
 from daita.security import EnvironmentSecretProvider, SecretReference
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.relational_writes import update_constraints
 from tests.support.workspace import workspace_for
 
@@ -216,19 +216,14 @@ def _tool_results(
 async def test_live_openai_cannot_write_with_read_only_database_role(
     tmp_path: Path,
 ) -> None:
-    api_key = _required_environment(_MODEL_KEY)
     database_password = _required_environment(_DATABASE_PASSWORD)
     model_id = os.environ.get(_MODEL_ID, _DEFAULT_MODEL_ID)
     if not model_id.startswith("openai:"):
         pytest.fail(f"{_MODEL_ID} must name an OpenAI provider model")
-    profile = reviewed_model_profile(model_id)
-    if profile is None:
-        pytest.fail(f"{_MODEL_ID} must name one release-reviewed tool-capable model")
-
-    delegate = create_llm_provider(
+    profile, delegate = live_provider(
         model_id,
-        api_key=api_key,
-        max_output_tokens=min(profile.max_output_tokens, 2_048),
+        api_key=lambda: _required_environment(_MODEL_KEY),
+        max_output_tokens=2_048,
     )
     provider = _GuardedRecordingProvider(delegate)
     port = int(os.environ.get(_DATABASE_PORT, "55432"))
@@ -251,7 +246,7 @@ async def test_live_openai_cannot_write_with_read_only_database_role(
         model_profile=profile,
         secret_provider=EnvironmentSecretProvider(),
         approval_handler=reject_unexpected_approval,
-        limits=LoopLimits(max_estimated_cost_usd=_cost_limit()),
+        limits=LoopLimits(max_estimated_cost_usd=cost_cap(_cost_limit())),
         workspace=workspace_for(tmp_path),
     )
     try:
