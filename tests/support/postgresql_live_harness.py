@@ -261,11 +261,12 @@ class Evaluation:
     @property
     def routine_budgets(self):
         limits = self.config.limits
+        cost = limits.max_estimated_cost_usd
         return {
             "per_run_max_tokens": limits.max_total_tokens,
-            "per_run_max_cost_usd": str(limits.max_estimated_cost_usd),
+            "per_run_max_cost_usd": None if cost is None else str(cost),
             "cumulative_max_tokens": 2 * limits.max_total_tokens,
-            "cumulative_max_cost_usd": str(2 * limits.max_estimated_cost_usd),
+            "cumulative_max_cost_usd": None if cost is None else str(2 * cost),
             "cumulative_max_attempts": 2,
             "cumulative_max_occurrences": 2,
         }
@@ -468,6 +469,10 @@ class Evaluation:
         for key, value in self.routine_contract.items():
             actual = proposal.get(key)
             if key in {"per_run_max_cost_usd", "cumulative_max_cost_usd"}:
+                if value is None:
+                    if actual is not None:
+                        return False
+                    continue
                 if (
                     not isinstance(actual, str)
                     or not isinstance(value, str)

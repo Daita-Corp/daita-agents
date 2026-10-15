@@ -33,7 +33,7 @@ from daita.llm.models import (
 from daita.llm.protocols import ManagedModelProvider
 from daita.loop.models import LoopExitKind, Transcript
 from tests.support.job_benchmarks import create_probe_home
-from tests.support.live_billing import cost_cap, live_provider, require_api_billing
+from tests.support.live_billing import cost_cap, live_provider
 from tests.support.workspace import workspace_for
 
 _AUTHORIZATION = "DAITA_RUN_LIVE_RESULT_REFS"
@@ -205,7 +205,6 @@ async def _wait_terminal(agent: Agent, job_id: str) -> None:
 async def test_l8_graph_task_complete_cites_its_read(
     tmp_path: Path, repeat: int
 ) -> None:
-    require_api_billing("graph task admission")
     profile, provider = _live_provider()
     home = await create_probe_home(tmp_path, f"l8-graph-{repeat}", distractor_tables=3)
     resources = tuple(sorted(home.resource_ids.items()))

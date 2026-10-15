@@ -51,7 +51,7 @@ from tests.support.data_operations import (
 )
 from tests.support.distribution import no_artifact_outcome_contract
 from tests.support.job_benchmarks import assert_completed, results_for
-from tests.support.live_billing import cost_cap, require_api_billing
+from tests.support.live_billing import cost_cap
 from tests.support.mcp_read_harness import account_identity
 
 pytestmark = [pytest.mark.acceptance, pytest.mark.integration, pytest.mark.requires_llm]
@@ -470,9 +470,9 @@ async def routine_delivery(evaluation, origin, *, python: bool):
         )[0].destination_id,
         eligible_model_routes=(evaluation.provider.provider_id,),
         per_run_max_tokens=100000,
-        per_run_max_cost_usd=evaluation.budget.per_run,
+        per_run_max_cost_usd=cost_cap(evaluation.budget.per_run),
         cumulative_max_tokens=100000,
-        cumulative_max_cost_usd=evaluation.budget.per_run,
+        cumulative_max_cost_usd=cost_cap(evaluation.budget.per_run),
         cumulative_max_attempts=1,
         cumulative_max_occurrences=1,
         maximum_consecutive_failures=1,
@@ -558,7 +558,6 @@ async def routine_delivery(evaluation, origin, *, python: bool):
     "python", (False, True), ids=("scheduled_sql", "scheduled_python_target")
 )
 async def test_live_foreground_to_scheduled_report(dataops, python):
-    require_api_billing("routine admission")
     evaluation, _service = dataops
     origin = await evaluation.run(
         CASES[0].prompt,
