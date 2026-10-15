@@ -49,6 +49,7 @@ _ALLOWED_MODEL_CALLS = frozenset(
     {
         "toolbox_search",
         "toolbox_load",
+        "toolbox_inspect",
         "catalog_search",
         "catalog_describe",
         RELATIONAL_UPDATE_TOOL_NAME,

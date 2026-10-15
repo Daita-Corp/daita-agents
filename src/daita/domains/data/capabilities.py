@@ -1413,12 +1413,18 @@ NATIVE_WRITE_GRANT_POLICY = AutomationGrantPolicy(
     constraints_kind="data.relational_write",
     constraints_schema={
         "type": "object",
-        "description": "The proposed allowed_capability_ids must include the matching preview: "
+        "description": "Only for routine proposals: allowed_capability_ids lists both "
+        "routes of the one write tool: "
         + "; ".join(
-            f"{capability_id} requires {native_preview_capability(capability_id)}"
-            for capability_id in (RELATIONAL_UPDATE_CAPABILITY_ID, "data.upsert_rows")
+            f"{tool_name} needs {capability_id} and "
+            f"{native_preview_capability(capability_id)}"
+            for tool_name, capability_id in (
+                (RELATIONAL_UPDATE_TOOL_NAME, RELATIONAL_UPDATE_CAPABILITY_ID),
+                (RELATIONAL_UPSERT_TOOL_NAME, "data.upsert_rows"),
+            )
         )
-        + ". Each occurrence must obtain its own authenticated preview before writing.",
+        + ". These are its mode=apply and mode=preview routes, not separate tools "
+        "to load. Each occurrence calls mode=preview before mode=apply.",
         "properties": {
             "source_id": {"type": "string", "maxLength": 256},
             "resource_id": {"type": "string", "maxLength": 256},
