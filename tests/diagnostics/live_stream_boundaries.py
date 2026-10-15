@@ -88,7 +88,7 @@ READ_TOOLS = frozenset(
         "toolbox_load",
         "toolbox_inspect",
         "catalog_search",
-        "catalog_inspect",
+        "catalog_describe",
         "data_query",
         "file_search",
         "file_read",

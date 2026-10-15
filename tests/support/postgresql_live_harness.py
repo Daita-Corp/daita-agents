@@ -432,9 +432,7 @@ class Evaluation:
                     required = set(value)
                     allowed = required | {
                         "catalog.search",
-                        "catalog.inspect",
-                        "catalog.schema",
-                        "catalog.traverse",
+                        "catalog.describe",
                         "data.query",
                     }
                     if not required <= set(actual) <= allowed:

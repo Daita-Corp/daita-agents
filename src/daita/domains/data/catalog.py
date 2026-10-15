@@ -8,6 +8,7 @@ from typing import Protocol
 from ..._json import FrozenJsonObject
 from ...adapters.protocols import SourceStore
 from ...catalog.models import (
+    CatalogDescribeRequest,
     CatalogResource,
     CatalogSchemaRequest,
     CatalogSearchRequest,
@@ -266,6 +267,23 @@ class CatalogDataView:
         if readable_resource_ids is not None:
             readable &= readable_resource_ids
         return await self._service.schema_slice(
+            request,
+            readable_resource_ids=readable,
+        )
+
+    async def describe(
+        self,
+        request: CatalogDescribeRequest,
+        *,
+        readable_resource_ids: frozenset[str] | None = None,
+    ) -> FrozenJsonObject:
+        readable = await self.readable_resource_ids(
+            request.agent_id,
+            (() if request.source_id is None else (request.source_id,)),
+        )
+        if readable_resource_ids is not None:
+            readable &= readable_resource_ids
+        return await self._service.describe(
             request,
             readable_resource_ids=readable,
         )

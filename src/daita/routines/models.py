@@ -811,10 +811,8 @@ class ScheduledRoutine:
             # generic freshness or data-value dependency expression.
             revision_tools = {
                 "data.resource_revision_observation",
-                "catalog.schema",
-                "catalog.inspect",
+                "catalog.describe",
                 "catalog.search",
-                "catalog.traverse",
                 "artifact.create_document",
                 "artifact.snapshot_result",
                 "skill.view",

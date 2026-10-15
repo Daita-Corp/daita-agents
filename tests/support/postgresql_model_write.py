@@ -83,7 +83,7 @@ async def admit_owner_routine(scenario, owner_prompt):
         # This owner-authored natural fixture explicitly authorizes schema access
         # to the same frozen table. It is not inferred by routine admission.
         arguments["allowed_capability_ids"] = sorted(
-            {*arguments["allowed_capability_ids"], "catalog.schema"}
+            {*arguments["allowed_capability_ids"], "catalog.describe"}
         )
         arguments["authorized_instruction"] = (
             "Keep company new.test in our companies table with name New and evidence "

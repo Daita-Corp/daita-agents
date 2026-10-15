@@ -1,4 +1,4 @@
-"""Component-owned tests split from ``test_schema_slices.py``."""
+"""Component-owned tests split from ``test_describe.py``."""
 
 from __future__ import annotations
 

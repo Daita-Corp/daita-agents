@@ -333,7 +333,7 @@ async def test_live_mixed_file_source_comparison_uses_separate_queries(
         < names.index("toolbox_load")
         < names.index("file_query")
     )
-    assert names.index("catalog_schema") < names.index("data_query")
+    assert names.index("catalog_describe") < names.index("data_query")
     file_call, file_result = _successful(transcript, "file_query")[-1]
     source_call, source_result = _successful(transcript, "data_query")[-1]
     assert file_call.arguments["path_pattern"] == "sales.csv"

@@ -31,7 +31,7 @@ from daita import (
     create_llm_provider,
 )
 from daita.artifacts.models import ArtifactAuthorship
-from daita.catalog.capabilities import CATALOG_SCHEMA_CAPABILITY_ID
+from daita.catalog.capabilities import CATALOG_DESCRIBE_CAPABILITY_ID
 from daita.domains.data.export_capabilities import (
     DATA_EXPORT_TABULAR_CAPABILITY_ID,
     DATA_EXPORT_TABULAR_TOOL_NAME,
@@ -195,7 +195,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
                 allowed_connector_binding_ids=(),
                 allowed_resource_ids=(resource.id,),
                 allowed_capability_ids=(
-                    CATALOG_SCHEMA_CAPABILITY_ID,
+                    CATALOG_DESCRIBE_CAPABILITY_ID,
                     DATA_EXPORT_TABULAR_CAPABILITY_ID,
                 ),
                 sensitivity_ceiling=ModelSensitivity.INTERNAL,
@@ -239,7 +239,7 @@ async def test_live_model_selects_frozen_sqlite_csv_for_inbox_outcome(
         assert scope.allowed_source_ids == (source.id,)
         assert scope.allowed_resource_ids == (resource.id,)
         assert scope.allowed_capability_ids == (
-            CATALOG_SCHEMA_CAPABILITY_ID,
+            CATALOG_DESCRIBE_CAPABILITY_ID,
             DATA_EXPORT_TABULAR_CAPABILITY_ID,
         )
         calls = tuple(

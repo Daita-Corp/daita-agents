@@ -49,7 +49,7 @@ from daita.capabilities import (
     ToolExecution,
     ToolOutput,
 )
-from daita.catalog.capabilities import CATALOG_SCHEMA_CAPABILITY_ID
+from daita.catalog.capabilities import CATALOG_DESCRIBE_CAPABILITY_ID
 from daita.distribution import OutcomeState, conversation_inbox_destination_id
 from daita.domains.data import DATA_QUERY_CAPABILITY_ID
 from daita.llm._lifecycle import closing_stream
@@ -440,7 +440,7 @@ async def _run_live_routine(
             allowed_connector_binding_ids=(),
             allowed_resource_ids=(scenario.resource_id,),
             allowed_capability_ids=(
-                CATALOG_SCHEMA_CAPABILITY_ID,
+                CATALOG_DESCRIBE_CAPABILITY_ID,
                 DATA_QUERY_CAPABILITY_ID,
             ),
             sensitivity_ceiling=ModelSensitivity.INTERNAL,
@@ -502,7 +502,7 @@ async def _run_live_routine(
     assert scope.allowed_source_ids == (scenario.source_id,)
     assert scope.allowed_resource_ids == (scenario.resource_id,)
     assert scope.allowed_capability_ids == (
-        CATALOG_SCHEMA_CAPABILITY_ID,
+        CATALOG_DESCRIBE_CAPABILITY_ID,
         DATA_QUERY_CAPABILITY_ID,
     )
     assert scope.allowed_access_modes == frozenset({AccessMode.READ})

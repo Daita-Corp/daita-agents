@@ -134,7 +134,7 @@ async def test_routine_reporting_input_error_precedes_binding_and_approval(
         arguments["reporting_mode"] = mode
         if mode == "always":
             arguments["precheck"] = {
-                "capability_id": "catalog.schema",
+                "capability_id": "catalog.describe",
                 "contract_digest": "sha256:" + "a" * 64,
                 "source_id": "source",
                 "resource_id": "resource",
@@ -237,7 +237,7 @@ async def test_public_routine_surface_walks_create_and_lifecycle(
             allowed_source_ids=(source.id,),
             allowed_connector_binding_ids=(),
             allowed_resource_ids=(resource.id,),
-            allowed_capability_ids=("catalog.inspect",),
+            allowed_capability_ids=("catalog.describe",),
             sensitivity_ceiling=ModelSensitivity.INTERNAL,
             outcome_contract=no_artifact_outcome_contract(),
             distribution_destination_id=destinations[0].destination_id,

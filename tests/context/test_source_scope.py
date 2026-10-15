@@ -623,7 +623,7 @@ async def test_one_foreground_run_compares_two_exact_sources_without_selection(
             tool_calls=(
                 ToolCall(
                     "structure",
-                    "catalog_schema",
+                    "catalog_describe",
                     {"resource_ids": tuple(resource.id for resource in resources)},
                 ),
             ),

@@ -1315,7 +1315,7 @@ async def test_scheduled_text_report_uses_the_same_inbox_path(tmp_path: Path) ->
             source_ids=(source.id,),
             connector_binding_ids=(),
             resource_ids=(resource.id,),
-            capability_ids=("catalog.inspect",),
+            capability_ids=("catalog.describe",),
             outcome_contract=_text_contract(),
             script=(_stop("Current value is 7."),),
         )

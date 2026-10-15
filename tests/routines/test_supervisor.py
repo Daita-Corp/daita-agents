@@ -104,7 +104,7 @@ def _routine(
         else "Read the exact resource and report its current value."
     )
     capability_ids = (
-        ("catalog.schema", "data.resource_revision_observation")
+        ("catalog.describe", "data.resource_revision_observation")
         if precheck is not None
         else ("data.query",)
     )
@@ -585,7 +585,9 @@ def test_revision_precheck_rejects_assignments_it_cannot_observe(change):
         elif change == "mcp":
             replace(routine, allowed_connector_binding_ids=("binding-web",))
         else:
-            replace(routine, precheck=replace(precheck, capability_id="catalog.schema"))
+            replace(
+                routine, precheck=replace(precheck, capability_id="catalog.describe")
+            )
 
 
 @pytest.mark.parametrize(

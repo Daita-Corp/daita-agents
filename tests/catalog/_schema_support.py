@@ -3,8 +3,8 @@ from __future__ import annotations
 __all__ = (
     "CATALOG_MAX_LIMIT",
     "CATALOG_RESOURCE_ID_MAX_CHARACTERS",
-    "CATALOG_SCHEMA_CAPABILITY_ID",
-    "CATALOG_SCHEMA_EVIDENCE_KIND",
+    "CATALOG_DESCRIBE_CAPABILITY_ID",
+    "CATALOG_DESCRIBE_EVIDENCE_KIND",
     "CATALOG_SCHEMA_MAX_RESOURCE_IDS",
     "CATALOG_SEARCH_CAPABILITY_ID",
     "CATALOG_SEARCH_REQUEST_DEFAULT_LIMIT",
@@ -12,7 +12,6 @@ __all__ = (
     "CATALOG_SOURCE_ID_MAX_CHARACTERS",
     "CATALOG_TOOL_DEFAULT_LIMIT",
     "CATALOG_TOOL_QUERY_MAX_CHARACTERS",
-    "CATALOG_TRAVERSE_CAPABILITY_ID",
     "_OBSERVED_AT",
     "Agent",
     "CapabilityInputError",
@@ -103,10 +102,9 @@ from daita.catalog import (
     catalog_resource_id,
 )
 from daita.catalog.capabilities import (
-    CATALOG_SCHEMA_CAPABILITY_ID,
-    CATALOG_SCHEMA_EVIDENCE_KIND,
+    CATALOG_DESCRIBE_CAPABILITY_ID,
+    CATALOG_DESCRIBE_EVIDENCE_KIND,
     CATALOG_SEARCH_CAPABILITY_ID,
-    CATALOG_TRAVERSE_CAPABILITY_ID,
 )
 from daita.catalog.models import (
     CATALOG_MAX_LIMIT,
@@ -461,23 +459,18 @@ class _InventoryProvider:
         self.requests.append(request)
         if len(self.requests) == 1:
             guidance = repr(request.messages)
-            assert (
-                "catalog_schema first for SQL (bounded bridges and paths)" in guidance
-            )
-            assert "reported unresolved paths after schema inspection" in guidance
-            assert "never call both together" in guidance
-            assert "catalog_inspect gives full facets" in guidance
+            assert "catalog_describe detail=schema before SQL" in guidance
+            assert "it resolves join paths in one call" in guidance
             self.catalog_tool_call_count += 1
             return ModelResponse(
                 finish_reason=FinishReason.TOOL_CALLS,
                 tool_calls=(
                     ToolCall(
                         id="inventory-schema",
-                        name="catalog_schema",
+                        name="catalog_describe",
                         arguments={
                             "query": "tables relationships",
                             "limit": 50,
-                            "include_relationships": True,
                         },
                     ),
                 ),
@@ -528,14 +521,13 @@ class _RegionalMarginProvider:
                 tool_calls=(
                     ToolCall(
                         id="regional-schema",
-                        name="catalog_schema",
+                        name="catalog_describe",
                         arguments={
                             "query": (
                                 "customers regions orders order_items products "
                                 "region_code total_amount unit_cost unit_price"
                             ),
                             "limit": 8,
-                            "include_relationships": True,
                         },
                     ),
                 ),
@@ -664,11 +656,10 @@ class _BridgePlanningProvider:
                 tool_calls=(
                     ToolCall(
                         id="bridge-schema",
-                        name="catalog_schema",
+                        name="catalog_describe",
                         arguments={
                             "query": "customers products",
                             "limit": 5,
-                            "max_join_depth": 3,
                         },
                     ),
                 ),
@@ -771,7 +762,7 @@ class _RevisionReuseProvider:
         schema_results = tuple(
             block
             for block in _tool_results(request)
-            if block.output.get("kind") == CATALOG_SCHEMA_EVIDENCE_KIND
+            if block.output.get("kind") == CATALOG_DESCRIBE_EVIDENCE_KIND
         )
         if not schema_results:
             self.schema_calls += 1
@@ -780,7 +771,7 @@ class _RevisionReuseProvider:
                 tool_calls=(
                     ToolCall(
                         id=f"schema-revision-{self.schema_calls}",
-                        name="catalog_schema",
+                        name="catalog_describe",
                         arguments={
                             "query": "tables relationships",
                             "limit": 50,

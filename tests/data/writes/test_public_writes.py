@@ -369,7 +369,7 @@ def script(
             response(
                 ToolCall(
                     id="schema",
-                    name="catalog_schema",
+                    name="catalog_describe",
                     arguments={"resource_ids": [batch["resource_id"]]},
                 )
             ),
@@ -420,7 +420,7 @@ async def test_native_insert_discovery_keeps_catalog_and_export_queries_distinct
             "data_upsert_rows",
             3,
         ),
-        ("catalog schema columns", "catalog_schema", 1),
+        ("catalog schema columns", "catalog_describe", 1),
         ("export all database rows csv", "data_export_tabular", 1),
     )
     provider.replace_script(
@@ -805,7 +805,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 "data.preview_upsert_rows",
                 "data.upsert_rows",
                 *(
-                    ("catalog.schema",)
+                    ("catalog.describe",)
                     if mode in {"natural_schema", "model_schema"}
                     else ()
                 ),
@@ -1039,14 +1039,15 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                     if isinstance(block, TextBlock)
                 )
                 assert "Routine authoring facts" not in system
-                assert "catalog_inspect gives" not in system
                 if mode == "success":
-                    assert "catalog_schema first" not in system
-                    assert "catalog_schema" not in {tool.name for tool in request.tools}
+                    assert "catalog_describe detail=schema" not in system
+                    assert "catalog_describe" not in {
+                        tool.name for tool in request.tools
+                    }
                     assert "Missing structure is unknown" in system
                 else:
-                    assert "catalog_schema first" in system
-                    assert "catalog_schema" in {tool.name for tool in request.tools}
+                    assert "catalog_describe detail=schema" in system
+                    assert "catalog_describe" in {tool.name for tool in request.tools}
             inspection = await agent.inspect_routine(routine.routine_id)
             assert inspection is not None
             assert (
@@ -1077,7 +1078,7 @@ async def test_immediate_and_weekly_research_upsert_production_path(
                 schemas = [
                     block
                     for block in results
-                    if block.capability_id == "catalog.schema"
+                    if block.capability_id == "catalog.describe"
                 ]
                 assert len(schemas) == (
                     1 if mode in {"natural_schema", "model_schema"} else 0

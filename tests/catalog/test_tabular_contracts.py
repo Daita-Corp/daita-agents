@@ -1,6 +1,8 @@
-"""Component-owned tests split from ``test_schema_slices.py``."""
+"""Component-owned tests split from ``test_describe.py``."""
 
 from __future__ import annotations
+
+from datetime import UTC, datetime
 
 from tests.catalog._schema_support import (
     Agent,
@@ -170,3 +172,42 @@ async def test_catalog_boundary_rejects_malformed_tabular_payload(
             await service.tabular_resources(agent.id, source.id)
     finally:
         await agent.close()
+
+
+def test_tabular_estimates_are_optional_labeled_and_never_structural():
+    facet = _tabular_decoder_fixture()
+    assert "size_bytes_estimate" not in facet.to_payload()
+    assert "statistics_as_of" not in facet.to_payload()
+
+    analyzed = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+    estimated = replace(
+        facet,
+        row_count_estimate=1_250,
+        size_bytes_estimate=65_536,
+        statistics_as_of=analyzed,
+    )
+    payload = estimated.to_payload()
+    assert payload["size_bytes_estimate"] == 65_536
+    assert payload["statistics_as_of"] == analyzed.isoformat()
+    assert TabularFacet.from_payload(payload) == estimated
+    assert estimated.structural_payload() == facet.structural_payload()
+
+    observed = datetime(2026, 1, 3, tzinfo=UTC)
+    estimates = estimated.estimates_payload(observed)
+    assert estimates is not None
+    assert set(estimates) == {
+        "approximate_row_count",
+        "approximate_size_bytes",
+        "statistics_as_of",
+        "discovered_at",
+    }
+    assert "row_count" not in estimates
+    assert estimates["approximate_row_count"] == 1_250
+    assert replace(facet, row_count_estimate=None).estimates_payload(observed) is None
+
+    with pytest.raises(ValueError, match="omits unreported estimates"):
+        TabularFacet.from_payload({**payload, "size_bytes_estimate": None})
+    with pytest.raises(ValueError, match="size_bytes_estimate"):
+        TabularFacet.from_payload({**payload, "size_bytes_estimate": -1})
+    with pytest.raises(ValueError, match="statistics_as_of"):
+        replace(facet, statistics_as_of=datetime(2026, 1, 2))

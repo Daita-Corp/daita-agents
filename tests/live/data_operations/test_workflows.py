@@ -419,7 +419,7 @@ async def test_live_mcp_binding_selection_and_schema_drift(dataops):
 async def routine_delivery(evaluation, origin, *, python: bool):
     now = datetime.now(UTC)
     scope = source_scope(evaluation)
-    capabilities: tuple[str, ...] = ("catalog.schema", "data.query")
+    capabilities: tuple[str, ...] = ("catalog.describe", "data.query")
     outcome = no_artifact_outcome_contract()
     instruction = CASES[0].prompt
     if python:

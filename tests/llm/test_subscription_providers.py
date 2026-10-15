@@ -61,7 +61,7 @@ def _request() -> ModelRequest:
         ),
         tools=(
             ToolDefinition(
-                name="catalog_schema",
+                name="catalog_describe",
                 description="Inspect the admitted catalog schema",
                 input_schema={
                     "type": "object",
@@ -94,7 +94,7 @@ class _Stream:
 class _Responses:
     def __init__(self) -> None:
         self.arguments: dict[str, object] | None = None
-        self.tool_name = "catalog_schema"
+        self.tool_name = "catalog_describe"
         self.tool_arguments = '{"source_id":"source-1"}'
 
     async def create(self, **kwargs: object) -> _Stream:
@@ -213,7 +213,7 @@ async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     assert response.finish_reason is FinishReason.TOOL_CALLS
     assert response.provider_id == "codex:gpt-test"
     assert response.provider_response_id == "response-1"
-    assert response.tool_calls[0].name == "catalog_schema"
+    assert response.tool_calls[0].name == "catalog_describe"
     assert dict(response.tool_calls[0].arguments) == {"source_id": "source-1"}
     metadata = dict(response.provider_metadata)
     attempt = metadata.pop("attempt_diagnostic")
@@ -238,7 +238,7 @@ async def test_codex_subscription_uses_direct_responses_and_daita_tool_loop():
     assert arguments["tools"] == [
         {
             "type": "function",
-            "name": "catalog_schema",
+            "name": "catalog_describe",
             "description": "Inspect the admitted catalog schema",
             "parameters": schema,
             "strict": False,
@@ -412,7 +412,7 @@ async def test_claude_subscription_remains_an_official_client_transport(monkeypa
                         "text": "",
                         "tool_calls": [
                             {
-                                "name": "catalog_schema",
+                                "name": "catalog_describe",
                                 "arguments_json": '{"source_id":"source-1"}',
                             }
                         ],
@@ -429,7 +429,7 @@ async def test_claude_subscription_remains_an_official_client_transport(monkeypa
 
     assert response.provider_id == "claude-code:sonnet"
     assert response.finish_reason is FinishReason.TOOL_CALLS
-    assert response.tool_calls[0].name == "catalog_schema"
+    assert response.tool_calls[0].name == "catalog_describe"
     assert response.provider_metadata["auth_mode"] == "subscription"
     assert response.provider_metadata["transport"] == "claude_code_cli"
     diagnostic = response.provider_metadata["attempt_diagnostic"]

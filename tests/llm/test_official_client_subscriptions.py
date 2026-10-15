@@ -58,7 +58,7 @@ def _request() -> ModelRequest:
         ),
         tools=(
             ToolDefinition(
-                name="catalog_schema",
+                name="catalog_describe",
                 description="Inspect the admitted catalog schema",
                 input_schema={
                     "type": "object",
@@ -78,7 +78,7 @@ def _tool_envelope() -> dict[str, object]:
         "text": "",
         "tool_calls": [
             {
-                "name": "catalog_schema",
+                "name": "catalog_describe",
                 "arguments_json": '{"source_id":"source-1"}',
             }
         ],

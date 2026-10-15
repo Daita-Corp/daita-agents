@@ -762,15 +762,15 @@ def test_observer_measurement_is_bounded_content_free_and_counts_corrections():
             AgentEventKind.TOOL_STARTED,
             {
                 "call_id": "catalog-call",
-                "tool_name": "catalog_schema",
-                "capability_id": "catalog.schema",
+                "tool_name": "catalog_describe",
+                "capability_id": "catalog.describe",
             },
         ),
         _event(
             AgentEventKind.TOOL_COMPLETED,
             {
                 "call_id": "catalog-call",
-                "tool_name": "catalog_schema",
+                "tool_name": "catalog_describe",
                 "duration_ms": 1,
                 "success": True,
                 "error_code": None,

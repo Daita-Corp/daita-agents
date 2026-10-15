@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import math
 import re
 import socket
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
@@ -229,6 +230,31 @@ GROUP BY con.oid, con.conname, src_ns.nspname, src.relname,
          con.confupdtype, con.confdeltype
 ORDER BY src_ns.nspname, src.relname, con.conname
 LIMIT $2
+"""
+
+# Planner statistics are approximate and nonstructural. They are read once at
+# discovery, never during query revalidation, and never change a revision.
+_ESTIMATES_SQL = """
+/* daita:postgresql.estimates */
+SELECT
+    n.nspname AS schema_name,
+    c.relname AS resource_name,
+    c.reltuples::double precision AS reltuples,
+    pg_total_relation_size(c.oid) AS size_bytes,
+    GREATEST(
+        s.last_vacuum,
+        s.last_autovacuum,
+        s.last_analyze,
+        s.last_autoanalyze
+    ) AS statistics_as_of
+FROM pg_class AS c
+JOIN pg_namespace AS n ON n.oid = c.relnamespace
+JOIN unnest($1::text[], $2::text[]) AS known(schema_name, resource_name)
+  ON known.schema_name = n.nspname AND known.resource_name = c.relname
+LEFT JOIN pg_stat_user_tables AS s ON s.relid = c.oid
+WHERE c.relkind IN ('r', 'p')
+ORDER BY n.nspname, c.relname
+LIMIT $3
 """
 
 _SCHEMA_PROBE_SQL = """
@@ -497,12 +523,14 @@ class PostgreSQLResourceAdapter:
                     max_indexes=request.max_indexes_per_resource,
                     max_relationships=request.max_relationships,
                 )
+                estimates = await _load_estimates(self._connection, structure)
                 completed_at = max(self._clock(), request.requested_at)
                 snapshot = _catalog_snapshot(
                     self._registration,
                     request,
                     structure,
                     completed_at,
+                    estimates,
                 )
                 await transaction.commit()
                 transaction_finished = True
@@ -828,11 +856,73 @@ async def _load_structure(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class _TableEstimates:
+    """Approximate planner statistics; never exact row counts."""
+
+    row_count: int | None
+    size_bytes: int | None
+    statistics_as_of: datetime | None
+
+
+async def _load_estimates(
+    connection: Any,
+    structure: PostgreSQLStructure,
+) -> dict[tuple[str, str], _TableEstimates]:
+    if not structure.tables:
+        return {}
+    rows = await connection.fetch(
+        _ESTIMATES_SQL,
+        [table.schema for table in structure.tables],
+        [table.name for table in structure.tables],
+        len(structure.tables) + 1,
+    )
+    known = {(table.schema, table.name) for table in structure.tables}
+    estimates: dict[tuple[str, str], _TableEstimates] = {}
+    for row in rows:
+        key = (_row_text(row, "schema_name"), _row_text(row, "resource_name"))
+        if key not in known:
+            continue
+        estimates[key] = _table_estimates(row)
+    return estimates
+
+
+def _table_estimates(row: Mapping[str, object]) -> _TableEstimates:
+    raw_tuples = row.get("reltuples")
+    raw_size = row.get("size_bytes")
+    raw_as_of = row.get("statistics_as_of")
+    as_of = (
+        raw_as_of
+        if isinstance(raw_as_of, datetime) and raw_as_of.utcoffset() is not None
+        else None
+    )
+    row_count: int | None = None
+    if (
+        isinstance(raw_tuples, (int, float))
+        and not isinstance(raw_tuples, bool)
+        and math.isfinite(raw_tuples)
+        and raw_tuples >= 0
+        # PostgreSQL before 14 stores 0 for a never-analyzed table. Without a
+        # statistics timestamp that zero is unknown, not an empty table.
+        and (raw_tuples > 0 or as_of is not None)
+    ):
+        row_count = int(round(raw_tuples))
+    size_bytes = (
+        raw_size
+        if isinstance(raw_size, int)
+        and not isinstance(raw_size, bool)
+        and raw_size >= 0
+        else None
+    )
+    return _TableEstimates(row_count, size_bytes, as_of)
+
+
 def _catalog_snapshot(
     registration: SourceRegistration,
     request: DiscoveryRequest,
     structure: PostgreSQLStructure,
     completed_at: datetime,
+    estimates: Mapping[tuple[str, str], _TableEstimates] | None = None,
 ) -> SourceCatalogSnapshot:
     facets: dict[tuple[str, str], CatalogFacet] = {}
     resource_ids: dict[tuple[str, str], tuple[str, ResourceKind]] = {}
@@ -844,11 +934,20 @@ def _catalog_snapshot(
             native_identity,
         )
         resource_ids[(table.schema, table.name)] = (resource_id, table.kind)
+        estimate = (estimates or {}).get((table.schema, table.name))
         facets[(table.schema, table.name)] = CatalogFacet.from_tabular(
             resource_id=resource_id,
             sync_id=request.sync_id,
             observed_at=request.requested_at,
-            facet=TabularFacet(columns=table.columns, indexes=table.indexes),
+            facet=TabularFacet(
+                columns=table.columns,
+                indexes=table.indexes,
+                row_count_estimate=None if estimate is None else estimate.row_count,
+                size_bytes_estimate=(None if estimate is None else estimate.size_bytes),
+                statistics_as_of=(
+                    None if estimate is None else estimate.statistics_as_of
+                ),
+            ),
         )
     relationships: list[CatalogRelationship] = []
     for relation in structure.relationships:

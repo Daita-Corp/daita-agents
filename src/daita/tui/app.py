@@ -1407,7 +1407,7 @@ class DaitaApp(App[int]):
                 "file_read": "Reading local file",
                 "file_query": "Querying local file data",
                 "catalog_search": "Searching catalog",
-                "catalog_schema": "Reading catalog schema",
+                "catalog_describe": "Describing catalog",
                 "data_query": "Querying data source",
                 "python_execute": "Running Python",
                 "artifact_create_document": "Creating document",
