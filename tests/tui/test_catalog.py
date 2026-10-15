@@ -22,6 +22,7 @@ from tests.tui._support import (
     Tree,
     _create_sqlite_source,
     asyncio,
+    settle_until,
     sqlite3,
     workspace_for,
 )
@@ -47,12 +48,18 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
                 composer = app.screen.query_one(Composer)
                 composer.load_text("/source permissions")
                 composer.action_submit()
-                await pilot.pause()
+                await settle_until(
+                    pilot,
+                    lambda: isinstance(app.screen, PermissionsScreen)
+                    and bool(app.screen.query("#perm-source")),
+                )
 
                 permissions = app.screen
                 assert isinstance(permissions, PermissionsScreen)
                 assert await pilot.click("#perm-source") is True
-                await pilot.pause()
+                await settle_until(
+                    pilot, lambda: isinstance(app.screen, SelectionScreen)
+                )
 
                 picker = app.screen
                 assert isinstance(picker, SelectionScreen)
