@@ -13,6 +13,7 @@ from daita._json import FrozenJsonObject
 from daita.artifacts.store import AgentHomeArtifactStore
 from daita.capabilities import (
     AccessMode,
+    CallProvenance,
     CapabilityInputError,
     CapabilityRegistry,
     EffectEvidenceBasis,
@@ -91,6 +92,13 @@ class _Context:
             tools=tool_context.provider_definitions,
             sensitivity=ModelSensitivity.INTERNAL,
         )
+
+
+class _DocumentDomain(StaticTestDomain):
+    async def derive_call_provenance(
+        self, run, call, capability, arguments, *, session=None
+    ):
+        return CallProvenance()
 
 
 class _StandingDomain(StaticTestDomain):
@@ -234,7 +242,7 @@ async def _assignment(
     document_view = next(
         item for item in declarations.tool_views if item.capability_id == document.id
     )
-    document_domain = StaticTestDomain(
+    document_domain = _DocumentDomain(
         (document,), (document_view,), domain_owner_id="artifact"
     )
     if await store.load_identity() is None:

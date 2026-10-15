@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from ...._json import FrozenJsonObject, canonical_json, thaw_json
 from ...errors import ModelProviderError, ProviderErrorCode
-from ...models import CanonicalMessage, MessageRole, TextBlock, ToolResultBlock
+from ...models import (
+    CanonicalMessage,
+    MessageRole,
+    TextBlock,
+    ToolResultBlock,
+    model_tool_result,
+)
 
 
 def _response_input(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
+    result_refs: Mapping[str, str] | None = None,
 ) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     provider_call_ids: dict[str, str] = {}
@@ -62,7 +71,9 @@ def _response_input(
                         "type": "function_call_output",
                         "call_id": provider_call_ids.get(block.call_id, block.call_id),
                         "output": canonical_json(
-                            {"is_error": block.is_error, "output": block.output}
+                            model_tool_result(
+                                block, (result_refs or {}).get(block.call_id)
+                            )
                         ),
                     }
                 )

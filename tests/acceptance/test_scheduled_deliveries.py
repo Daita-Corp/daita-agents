@@ -86,7 +86,7 @@ from tests.support.mcp import (
     MCPFixtureIdentity,
     conformance_identities,
 )
-from tests.support.toolbox_model import ToolboxAwareMockModelProvider
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider, result_ref
 from tests.support.workspace import workspace_for
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
@@ -901,7 +901,7 @@ async def test_scheduled_mcp_result_snapshot_uses_the_same_inbox_path(
                         id="mcp-snapshot",
                         name=RESULT_SNAPSHOT_TOOL_NAME,
                         arguments={
-                            "call_id": "mcp-result",
+                            "result_ref": result_ref("mcp-result"),
                             "filename": "mcp-result.json",
                         },
                     )
@@ -986,7 +986,7 @@ async def test_schema_less_mcp_result_cannot_be_snapshotted(
                 ToolCall(
                     id="schema-less-snapshot",
                     name=RESULT_SNAPSHOT_TOOL_NAME,
-                    arguments={"call_id": "schema-less-result"},
+                    arguments={"result_ref": result_ref("schema-less-result")},
                 )
             ),
             _stop("The schema-less result was not packaged."),

@@ -51,6 +51,7 @@ from tests.support.model_graph_integration import (
     ModelGraphIntegration,
     successful_script,
 )
+from tests.support.toolbox_model import result_ref
 
 pytestmark = pytest.mark.integration
 
@@ -277,9 +278,9 @@ async def test_real_context_builder_uses_only_the_immutable_task_bundle(
         required = complete.input_schema["required"]
         properties = complete.input_schema["properties"]
         assert isinstance(required, tuple) and isinstance(properties, Mapping)
-        assert "evidence_call_ids" not in required
+        assert "evidence_refs" not in required
         assert "artifact_ids" not in required
-        assert "Never put receipt" in properties["evidence_call_ids"]["description"]
+        assert "Never put receipt" in properties["evidence_refs"]["description"]
         assert "receipt IDs are never" in properties["artifact_ids"]["description"]
     finally:
         await integration.close()
@@ -508,7 +509,7 @@ async def test_checkpoint_comment_and_prelimit_warning_remain_bounded(
                     "result_kind": "test.graph.read",
                     "summary": "Completed after durable progress records.",
                     "payload": {"value": 42},
-                    "evidence_call_ids": ("read-call",),
+                    "evidence_refs": (result_ref("read-call"),),
                     "artifact_ids": (),
                     "residual_risk": None,
                     "downstream_constraints": {},
@@ -562,7 +563,7 @@ async def test_checkpoint_comment_and_prelimit_warning_remain_bounded(
                 "result_kind": "test.graph.read",
                 "summary": "Review this bounded candidate.",
                 "payload": {"candidate": True},
-                "evidence_call_ids": (),
+                "evidence_refs": (),
                 "artifact_ids": (),
                 "residual_risk": None,
                 "downstream_constraints": {},

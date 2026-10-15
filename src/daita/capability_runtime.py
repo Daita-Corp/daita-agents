@@ -33,6 +33,7 @@ from .capabilities import (
     ApprovalRequest,
     AutomationEligibility,
     AutomationScopeProposal,
+    CallProvenance,
     Capability,
     CapabilityDeclarations,
     CapabilityGrant,
@@ -60,6 +61,7 @@ from .capabilities import (
     ToolRecovery,
     ToolView,
     recovery_details,
+    resolve_result_refs,
     validate_tool_schema_value,
 )
 from .errors import DaitaError
@@ -75,6 +77,8 @@ from .llm.models import (
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
+    ToolResultRefs,
+    tool_result_refs,
 )
 from .loop.analysis import (
     AnalysisEvidence,
@@ -1430,6 +1434,9 @@ class CapabilityRuntime:
             projection,
             sensitivity=sensitivity,
         )
+        result_refs = tool_result_refs(
+            messages, uncitable_tool_names=_CONTROL_TOOL_NAMES
+        )
         if session is not None:
             analysis = self._domains.get("analysis")
             if analysis is not None:
@@ -1498,6 +1505,7 @@ class CapabilityRuntime:
                         resolved,
                         projection,
                         sensitivity=sensitivity,
+                        result_refs=result_refs,
                         session=session,
                     )
 
@@ -1569,6 +1577,7 @@ class CapabilityRuntime:
                         projection,
                         sensitivity=sensitivity,
                         session=session,
+                        result_refs=result_refs,
                     )
                 except _ToolExecutionInterrupted as interrupted:
                     results[index] = interrupted.result
@@ -1831,6 +1840,7 @@ class CapabilityRuntime:
         *,
         sensitivity: ModelSensitivity,
         session: RunSession | None,
+        result_refs: ToolResultRefs | None = None,
     ) -> ToolResultBlock:
         if resolved.failure is not None:
             call = (
@@ -1887,6 +1897,7 @@ class CapabilityRuntime:
             validated_arguments=resolved.validated_arguments,
             session=session,
             projection=projection,
+            result_refs=result_refs,
         )
 
     async def _execute_control(
@@ -2918,6 +2929,7 @@ class CapabilityRuntime:
         session: RunSession | None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
         projection: StepToolProjection | None = None,
+        result_refs: ToolResultRefs | None = None,
     ) -> ToolResultBlock:
         started = (
             asyncio.get_running_loop().time() if self._observer is not None else None
@@ -2975,7 +2987,10 @@ class CapabilityRuntime:
             await self._validate_execution_contracts(run)
             domain = self._domains[owner_id]
             if validated_arguments is None:
-                raw_arguments = domain.normalize_arguments(capability, call.arguments)
+                raw_arguments = domain.normalize_arguments(
+                    capability,
+                    resolve_result_refs(capability, call.arguments, result_refs),
+                )
                 arguments = await self._registry.validate_arguments_async(
                     capability.id,
                     raw_arguments,
@@ -3031,6 +3046,9 @@ class CapabilityRuntime:
                 request_sensitivity=sensitivity,
                 session=session,
             )
+            provenance = await _domain_call_provenance(
+                domain, run, call, capability, arguments, session=session
+            )
             await _guard_attempt(guard, capability.id, "after_binding")
             resolved_capability, executor = self._registry.resolve_execution(
                 capability.id
@@ -3058,6 +3076,7 @@ class CapabilityRuntime:
                     else session.options.one_time_artifact_destinations
                 ),
                 task_attempt_guard=guard,
+                provenance=provenance,
             )
             if capability.operational_effect is not OperationalEffect.NONE:
                 (
@@ -3090,6 +3109,7 @@ class CapabilityRuntime:
                     task_attempt_guard=guard,
                     catalog_entry=entry,
                     dispatch_hook=mark_dispatch,
+                    provenance=provenance,
                 )
                 result = _classified_success(call, output, artifact_refs=artifact_refs)
         except _ToolExecutionInterrupted:
@@ -3224,6 +3244,7 @@ class CapabilityRuntime:
         task_attempt_guard: TaskAttemptGuard | None = None,
         catalog_entry: RunToolCatalogEntry | None = None,
         dispatch_hook: Callable[[], Awaitable[None]] | None = None,
+        provenance: CallProvenance = CallProvenance(),
     ) -> tuple[ToolOutput, tuple[ArtifactRef, ...]]:
         if capability.operational_effect is not OperationalEffect.NONE:
             raise ValueError("non-effect execution requires operational effect none")
@@ -3244,6 +3265,7 @@ class CapabilityRuntime:
                 else session.options.one_time_artifact_destinations
             ),
             task_attempt_guard=task_attempt_guard,
+            provenance=provenance,
         )
         permit = await self._call_io_permit(
             run,
@@ -3613,7 +3635,18 @@ class CapabilityRuntime:
                     request_sensitivity=sensitivity,
                     session=session,
                 )
-                if current_arguments != arguments:
+                current_provenance = await _domain_call_provenance(
+                    domain,
+                    run,
+                    call,
+                    capability,
+                    current_arguments,
+                    session=session,
+                )
+                if (
+                    current_arguments != arguments
+                    or current_provenance != execution.provenance
+                ):
                     raise CapabilityInputError(
                         "state_changed",
                         "Current effect binding changed after approval.",
@@ -5681,6 +5714,28 @@ async def _domain_prepare_call(
         arguments,
         request_sensitivity=request_sensitivity,
     )
+
+
+async def _domain_call_provenance(
+    domain: CapabilityDomain,
+    run: RunInput,
+    call: ToolCall,
+    capability: Capability,
+    arguments: FrozenJsonObject,
+    *,
+    session: RunSession | None,
+) -> CallProvenance:
+    """Ask the owning domain for evidence its capability declares it derives."""
+
+    if not capability.derives_call_provenance:
+        return CallProvenance()
+    derive = getattr(domain, "derive_call_provenance", None)
+    if not callable(derive):
+        raise ValueError("capability derives provenance its domain cannot supply")
+    provenance = await derive(run, call, capability, arguments, session=session)
+    if not isinstance(provenance, CallProvenance):
+        raise TypeError("domain call provenance must be CallProvenance")
+    return provenance
 
 
 async def _domain_side_effect_plan(

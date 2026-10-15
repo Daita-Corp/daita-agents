@@ -15,8 +15,9 @@ Choose a tabular tool by the kind of evidence you need:
   exact current catalog resources and creates a complete CSV or XLSX artifact
   within fixed source-export bounds. Its provenance is exact source data.
 - `artifact_create_tabular` packages bounded model-authored findings as CSV,
-  XLSX, or HTML. It requires one or more exact earlier successful tool-call IDs
-  from the current run. Those results may come from catalog-backed data,
+  XLSX, or HTML. It requires one or more `evidence_refs`: the visible
+  `result_ref` values (`r1`, `r2`, ...) of earlier successful results in the
+  current run. Those results may come from catalog-backed data,
   local files, or admitted MCP tools.
 
 `artifact_create_tabular` does not claim that its rows are a complete or exact
@@ -26,10 +27,11 @@ highest sensitivity, and records their call IDs. Relational evidence also
 retains exact current catalog resource revisions.
 
 Use `artifact_create_document` for bounded Markdown or plain-text narrative.
-Its optional `evidence_call_ids` receive the same authentication, sensitivity,
-and provenance treatment. Use `artifact_snapshot_result` when the requirement
-is an exact canonical JSON copy of one validated structured tool result rather
-than model-authored analysis.
+It takes no evidence argument: the runtime records the preceding successful
+reads of the run as its evidence, with the same authentication, sensitivity,
+and provenance treatment. Use `artifact_snapshot_result` with one `result_ref`
+when the requirement is an exact canonical JSON copy of one validated
+structured tool result rather than model-authored analysis.
 
 ## Formats and safety
 

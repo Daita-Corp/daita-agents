@@ -20,6 +20,7 @@ from ...artifacts.renderers import ARROW_MEDIA_TYPE, arrow_schema
 from ...capabilities import (
     AccessMode,
     AutomationScopeProposal,
+    CallProvenance,
     Capability,
     CapabilityDeclarations,
     CapabilityGrant,
@@ -294,6 +295,36 @@ class DataDomainCatalog(
         agent_id: str,
         source_ids: tuple[str, ...] = (),
     ) -> ModelSensitivity | None: ...
+
+
+def _reads_resource(
+    data: Mapping[str, object], source_id: object, resource_id: object
+) -> bool:
+    """Whether one read result covers the exact source resource.
+
+    Query results name their source and resource revisions; catalog results
+    list resources that each carry their own source.
+    """
+
+    revisions = data.get("resource_revisions", ())
+    if data.get("source_id") == source_id and (
+        data.get("resource_id") == resource_id
+        or (
+            isinstance(revisions, tuple)
+            and any(
+                isinstance(item, Mapping) and item.get("resource_id") == resource_id
+                for item in revisions
+            )
+        )
+    ):
+        return True
+    resources = data.get("resources", ())
+    return isinstance(resources, tuple) and any(
+        isinstance(item, Mapping)
+        and item.get("source_id") == source_id
+        and item.get("resource_id") == resource_id
+        for item in resources
+    )
 
 
 class DataCapabilityDomain:
@@ -1526,6 +1557,116 @@ class DataCapabilityDomain:
     ) -> None:
         if not execution and not evidence_ids:
             return
+        calls, results = await self._authenticated_prior_results(run, call)
+        if (
+            evidence_ids
+            and tuple(
+                block.call_id for block in results if block.call_id in evidence_ids
+            )
+            != evidence_ids
+        ):
+            known = {block.call_id for block in results}
+            unknown = [item for item in evidence_ids if item not in known]
+            raise CapabilityInputError(
+                "write_evidence_invalid",
+                "Evidence must identify ordered successful authenticated current-run results"
+                + (
+                    f"; not a successful call id in this run: {', '.join(unknown[:4])}."
+                    if unknown
+                    else "; the call ids are out of order."
+                ),
+            )
+        if not execution:
+            return
+        expected = native_preview_capability(capability.id)
+        for result in results:
+            data = result.output.get("data")
+            if (
+                result.capability_id != expected
+                or not isinstance(data, Mapping)
+                or data.get("preview_fingerprint") != arguments["preview_fingerprint"]
+            ):
+                continue
+            original = calls[result.call_id].arguments
+            if expected == "data.preview_upsert_rows":
+                current = RelationalUpsertIntent.from_mapping(arguments)
+                previewed = RelationalUpsertIntent.from_mapping(original)
+                # Typed validation and adapter preflight authenticate semantic equality; compare all requested values here.
+                a, b = current.to_payload(), previewed.to_payload()
+                a["rows"] = tuple(sorted(current.rows, key=canonical_json))
+                b["rows"] = tuple(sorted(previewed.rows, key=canonical_json))
+                if canonical_json(a) == canonical_json(b):
+                    return
+            else:
+                current_update = RelationalUpdateCommand.from_mapping(arguments).intent
+                original_update = RelationalUpdateIntent.from_mapping(original)
+                resources = await self._catalog.resource_schemas(
+                    run.agent_id, current_update.source_id
+                )
+                a_update = validate_relational_update_intent(
+                    current_update, resources=resources
+                ).validated
+                b_update = validate_relational_update_intent(
+                    original_update, resources=resources
+                ).validated
+                if (
+                    a_update is not None
+                    and b_update is not None
+                    and a_update.intent_sha256 == b_update.intent_sha256
+                ):
+                    return
+        raise CapabilityInputError(
+            "write_preview_not_authenticated",
+            "The write requires its exact successful current-run preview and matching intent.",
+            recovery=ToolRecovery(
+                RecoveryKind.CORRECT_ARGUMENTS,
+                "Call mode=preview with the same arguments in this run, then "
+                "apply with its preview_fingerprint.",
+            ),
+        )
+
+    async def derive_call_provenance(
+        self,
+        run: RunInput,
+        call: ToolCall,
+        capability: Capability,
+        arguments: FrozenJsonObject,
+        *,
+        session: RunSession | None = None,
+    ) -> CallProvenance:
+        """Derive upsert evidence: earlier authenticated reads of the same table."""
+
+        del session
+        registry = self._registry
+        if capability.id not in _UPSERT_CAPABILITIES or registry is None:
+            return CallProvenance()
+        try:
+            _, results = await self._authenticated_prior_results(run, call)
+        except CapabilityInputError:
+            return CallProvenance()
+        source_id, resource_id = arguments["source_id"], arguments["resource_id"]
+        evidence: list[str] = []
+        for block in results:
+            data = block.output.get("data")
+            if (
+                block.capability_id is None
+                or block.capability_id in _UPSERT_CAPABILITIES | _UPDATE_CAPABILITIES
+                or registry.capability(block.capability_id).access_mode
+                is not AccessMode.READ
+                or not isinstance(data, Mapping)
+            ):
+                continue
+            if _reads_resource(data, source_id, resource_id):
+                evidence.append(block.call_id)
+        return CallProvenance(tuple(evidence[-32:]))
+
+    async def _authenticated_prior_results(
+        self,
+        run: RunInput,
+        call: ToolCall,
+    ) -> tuple[dict[str, ToolCall], list[ToolResultBlock]]:
+        """Return this call's earlier successful results with verified lineage."""
+
         if self._transcript_loader is None or self._registry is None:
             raise CapabilityInputError(
                 "write_preview_not_authenticated",
@@ -1649,72 +1790,7 @@ class DataCapabilityDomain:
                 except (KeyError, TypeError, ValueError):
                     continue
                 results.append(block)
-        if (
-            evidence_ids
-            and tuple(
-                block.call_id for block in results if block.call_id in evidence_ids
-            )
-            != evidence_ids
-        ):
-            known = {block.call_id for block in results}
-            unknown = [item for item in evidence_ids if item not in known]
-            raise CapabilityInputError(
-                "write_evidence_invalid",
-                "Evidence must identify ordered successful authenticated current-run results"
-                + (
-                    f"; not a successful call id in this run: {', '.join(unknown[:4])}."
-                    if unknown
-                    else "; the call ids are out of order."
-                ),
-            )
-        if not execution:
-            return
-        expected = native_preview_capability(capability.id)
-        for result in results:
-            data = result.output.get("data")
-            if (
-                result.capability_id != expected
-                or not isinstance(data, Mapping)
-                or data.get("preview_fingerprint") != arguments["preview_fingerprint"]
-            ):
-                continue
-            original = calls[result.call_id].arguments
-            if expected == "data.preview_upsert_rows":
-                current = RelationalUpsertIntent.from_mapping(arguments)
-                previewed = RelationalUpsertIntent.from_mapping(original)
-                # Typed validation and adapter preflight authenticate semantic equality; compare all requested values here.
-                a, b = current.to_payload(), previewed.to_payload()
-                a["rows"] = tuple(sorted(current.rows, key=canonical_json))
-                b["rows"] = tuple(sorted(previewed.rows, key=canonical_json))
-                if canonical_json(a) == canonical_json(b):
-                    return
-            else:
-                current_update = RelationalUpdateCommand.from_mapping(arguments).intent
-                original_update = RelationalUpdateIntent.from_mapping(original)
-                resources = await self._catalog.resource_schemas(
-                    run.agent_id, current_update.source_id
-                )
-                a_update = validate_relational_update_intent(
-                    current_update, resources=resources
-                ).validated
-                b_update = validate_relational_update_intent(
-                    original_update, resources=resources
-                ).validated
-                if (
-                    a_update is not None
-                    and b_update is not None
-                    and a_update.intent_sha256 == b_update.intent_sha256
-                ):
-                    return
-        raise CapabilityInputError(
-            "write_preview_not_authenticated",
-            "The write requires its exact successful current-run preview and matching intent.",
-            recovery=ToolRecovery(
-                RecoveryKind.CORRECT_ARGUMENTS,
-                "Call mode=preview with the same arguments in this run, then "
-                "apply with its preview_fingerprint.",
-            ),
-        )
+        return calls, results
 
     async def _classify(
         self,

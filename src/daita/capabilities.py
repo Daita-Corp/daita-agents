@@ -12,12 +12,18 @@ from decimal import Decimal
 from enum import Enum
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Protocol, TypeVar
+from typing import Protocol, TypeVar, cast
 
 from ._json import FrozenJsonObject, canonical_json
 from ._json_schema import project_json_schema, validate_json_schema_value
 from .artifacts.models import ArtifactAuthorship, ArtifactDraft
-from .llm.models import ModelSensitivity, ToolDefinition
+from .llm.models import (
+    CanonicalMessage,
+    ModelSensitivity,
+    ToolDefinition,
+    ToolResultRefs,
+    tool_result_refs,
+)
 from .scope import EffectiveSourceScope
 
 _T = TypeVar("_T")
@@ -1269,6 +1275,98 @@ class ArtifactPolicy:
         object.__setattr__(self, "allowed_extensions", extensions)
 
 
+_RESULT_REF_PATH = re.compile(
+    r"[a-z][a-z0-9_]{0,63}(\[\])?(\.(\*|[a-z][a-z0-9_]{0,63}(\[\])?)){0,3}\Z"
+)
+
+
+def resolve_result_refs(
+    capability: Capability,
+    arguments: Mapping[str, object],
+    refs: ToolResultRefs | None,
+) -> Mapping[str, object]:
+    """Replace declared result_ref values with the canonical calls they name.
+
+    Paths are dotted argument names; ``name[]`` walks an array and ``*`` walks
+    every value of an object. Absent paths are left for schema validation.
+    """
+
+    if not capability.result_ref_arguments:
+        return arguments
+
+    def invalid(path: str, value: object) -> CapabilityInputError:
+        valid = () if refs is None else refs.citable[-16:]
+        return CapabilityInputError(
+            "result_ref_invalid",
+            "A result reference must be a result_ref shown on an earlier "
+            "successful result in this run.",
+            {"name": path, "value": value if isinstance(value, str) else None},
+            recovery=ToolRecovery(
+                RecoveryKind.CORRECT_ARGUMENTS,
+                (
+                    "Use one of these result_ref values: " + ", ".join(valid) + "."
+                    if valid
+                    else "No earlier successful result exists in this run yet."
+                ),
+            ),
+        )
+
+    def walk(value: object, segments: tuple[str, ...], path: str) -> object:
+        if not segments:
+            resolved = None if refs is None else refs.resolve(value)
+            if resolved is None:
+                raise invalid(path, value)
+            return resolved
+        if not isinstance(value, Mapping):
+            return value
+        head, rest = segments[0], segments[1:]
+        if head == "*":
+            return {
+                key: walk(item, rest, f"{path}.{key}" if path else str(key))
+                for key, item in value.items()
+            }
+        many = head.endswith("[]")
+        key = head[:-2] if many else head
+        if key not in value:
+            return value
+        name = f"{path}.{key}" if path else key
+        item = value[key]
+        if many:
+            if not isinstance(item, (list, tuple)):
+                return value
+            updated: object = tuple(
+                walk(element, rest, f"{name}[{index}]")
+                for index, element in enumerate(item)
+            )
+        else:
+            updated = walk(item, rest, name)
+        return {**value, key: updated}
+
+    resolved = arguments
+    for ref_path in capability.result_ref_arguments:
+        resolved = cast(
+            Mapping[str, object], walk(resolved, tuple(ref_path.split(".")), "")
+        )
+    return resolved
+
+
+@dataclass(frozen=True, slots=True)
+class CallProvenance:
+    """Runtime-derived evidence for one call; never a model argument."""
+
+    evidence_call_ids: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        evidence = tuple(self.evidence_call_ids)
+        if (
+            len(evidence) > 32
+            or len(evidence) != len(set(evidence))
+            or any(not isinstance(item, str) or not item.strip() for item in evidence)
+        ):
+            raise ValueError("call provenance evidence is invalid")
+        object.__setattr__(self, "evidence_call_ids", evidence)
+
+
 @dataclass(frozen=True, slots=True)
 class Capability:
     id: str
@@ -1289,6 +1387,11 @@ class Capability:
     execution_admission_policy: ExecutionAdmissionPolicy | None = None
     durable_foreground_entrypoint: bool = False
     external_input_schema: Mapping[str, object] | None = None
+    # Argument paths that name an earlier result by its model-visible
+    # result_ref; the runtime resolves them to ToolCall.id before validation.
+    result_ref_arguments: tuple[str, ...] = ()
+    # The owning domain derives this call's evidence from the transcript.
+    derives_call_provenance: bool = False
 
     def __post_init__(self) -> None:
         for value, name in (
@@ -1375,6 +1478,15 @@ class Capability:
                 )
         if not isinstance(self.durable_foreground_entrypoint, bool):
             raise TypeError("durable_foreground_entrypoint must be bool")
+        if not isinstance(self.derives_call_provenance, bool):
+            raise TypeError("derives_call_provenance must be bool")
+        ref_paths = tuple(self.result_ref_arguments)
+        if len(ref_paths) != len(set(ref_paths)) or any(
+            not isinstance(path, str) or _RESULT_REF_PATH.fullmatch(path) is None
+            for path in ref_paths
+        ):
+            raise ValueError("result_ref_arguments are invalid")
+        object.__setattr__(self, "result_ref_arguments", ref_paths)
         input_schema = FrozenJsonObject.from_mapping(self.input_schema)
         output_schema = FrozenJsonObject.from_mapping(self.output_schema)
         if self.external_input_schema is None:
@@ -1483,6 +1595,16 @@ def capability_contract_digest(
         **(
             {"durable_foreground_entrypoint": True}
             if capability.durable_foreground_entrypoint
+            else {}
+        ),
+        **(
+            {"result_ref_arguments": list(capability.result_ref_arguments)}
+            if capability.result_ref_arguments
+            else {}
+        ),
+        **(
+            {"derives_call_provenance": True}
+            if capability.derives_call_provenance
             else {}
         ),
     }
@@ -1609,9 +1731,12 @@ class ToolExecution:
     caller_principal_id: str | None = None
     execution_scope: ExecutionScope | None = None
     caller_principal_verified: bool = True
+    provenance: CallProvenance = CallProvenance()
 
     def __post_init__(self) -> None:
         _text(self.run_id, "tool run_id")
+        if not isinstance(self.provenance, CallProvenance):
+            raise TypeError("tool provenance must be CallProvenance")
         _text(self.call_id, "tool call_id")
         _text(self.capability_id, "tool capability_id")
         if self.caller_principal_id is not None:
@@ -1992,6 +2117,24 @@ class CapabilityRegistry:
         return {
             key: value for key, value in arguments.items() if key != TOOL_MODE_ARGUMENT
         }
+
+    def resolved_call_arguments(
+        self,
+        name: str,
+        arguments: Mapping[str, object],
+        messages: tuple[CanonicalMessage, ...],
+    ) -> Mapping[str, object]:
+        """Return the arguments one persisted current-run call executed with.
+
+        This removes a mode selector and resolves declared result_ref values
+        against the same current-run transcript the runtime numbered.
+        """
+
+        return resolve_result_refs(
+            self.call_capability(name, arguments),
+            self.target_arguments(name, arguments),
+            tool_result_refs(messages, uncitable_tool_names=RESERVED_TOOL_NAMES),
+        )
 
     def resolve_tool_mode(self, name: str, mode: object) -> tuple[ToolView, Capability]:
         """Resolve a mode-routed tool call to the capability its mode selects."""
@@ -2579,6 +2722,7 @@ __all__ = [
     "ApprovalHandler",
     "ApprovalRequest",
     "ArtifactPolicy",
+    "CallProvenance",
     "Capability",
     "CapabilityInputError",
     "CapabilityRegistry",
@@ -2604,4 +2748,5 @@ __all__ = [
     "recovery_details",
     "render_approval_arguments",
     "validate_tool_schema_value",
+    "resolve_result_refs",
 ]

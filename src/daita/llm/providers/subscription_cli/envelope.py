@@ -17,6 +17,7 @@ from ...models import (
     TextBlock,
     ToolCall,
     ToolResultBlock,
+    model_tool_result,
 )
 from .process import (
     _MAX_REQUEST_BYTES,
@@ -94,7 +95,10 @@ def _response_envelope_schema(request: ModelRequest) -> dict[str, object]:
     }
 
 
-def _project_message(message: CanonicalMessage) -> dict[str, object]:
+def _project_message(
+    message: CanonicalMessage,
+    result_refs: Mapping[str, str] | None = None,
+) -> dict[str, object]:
     content: list[dict[str, object]] = []
     for block in message.content:
         if isinstance(block, TextBlock):
@@ -104,8 +108,7 @@ def _project_message(message: CanonicalMessage) -> dict[str, object]:
                 {
                     "type": "tool_result",
                     "call_id": block.call_id,
-                    "output": block.output,
-                    "is_error": block.is_error,
+                    **model_tool_result(block, (result_refs or {}).get(block.call_id)),
                 }
             )
     projected: dict[str, object] = {
@@ -128,7 +131,10 @@ def _request_document(request: ModelRequest, max_output_tokens: int) -> str:
     from ...pricing import bound_request_output
 
     document = {
-        "messages": [_project_message(message) for message in request.messages],
+        "messages": [
+            _project_message(message, request.tool_result_refs)
+            for message in request.messages
+        ],
         "tools": [
             {
                 "name": tool.name,

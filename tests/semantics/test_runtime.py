@@ -41,6 +41,7 @@ from daita.tui.commands import (
 from tests.support.capability_runtime import execute_projected, make_run_session
 from tests.support.toolbox_model import (
     ToolboxAwareMockModelProvider as MockModelProvider,
+    result_ref,
 )
 from tests.support.workspace import workspace_for
 
@@ -186,7 +187,7 @@ def _semantic_call(
 ) -> ToolCall:
     evidence: dict[str, object] = {"kind": evidence_kind}
     if tool_call_id is not None:
-        evidence["tool_call_id"] = tool_call_id
+        evidence["result_ref"] = result_ref(tool_call_id)
     arguments: dict[str, object] = {
         "id": annotation_id,
         "subject": {
@@ -480,7 +481,7 @@ async def test_catalog_and_transcript_evidence_fail_before_approval(tmp_path):
             "source_scope_violation",
             "semantic_stale_revision",
             "semantic_unknown_field",
-            "semantic_invalid_evidence",
+            "result_ref_invalid",
         )
         assert approvals == []
         assert await agent.list_semantic_annotations() == ()

@@ -223,7 +223,19 @@ class AnalysisCapabilityDomain:
                 "type": "object",
                 "properties": {
                     "kind": {"type": "string", "enum": ["tool_result", "artifact"]},
-                    "call_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                    "result_ref": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "description": "For tool_result: its result_ref, like r3.",
+                    },
+                    "evidence_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256,
+                        "description": "For tool_result: an evidence_id shown in "
+                        "an earlier python_execute child_calls list.",
+                    },
                     "artifact_id": {"type": "string", "minLength": 1, "maxLength": 256},
                 },
                 "required": ["kind"],
@@ -268,6 +280,7 @@ class AnalysisCapabilityDomain:
         capability = replace(
             capability,
             input_schema=schema,
+            result_ref_arguments=("inputs.*.result_ref",),
             output_schema={
                 "type": "object",
                 "properties": output_properties,
@@ -1352,11 +1365,11 @@ class AnalysisCapabilityDomain:
                 )
             kind = value.get("kind")
             expected = (
-                {"kind", "call_id"}
+                ({"kind", "result_ref"}, {"kind", "evidence_id"})
                 if kind == "tool_result"
-                else {"kind", "artifact_id"}
+                else ({"kind", "artifact_id"},)
             )
-            if kind not in {"tool_result", "artifact"} or set(value) != expected:
+            if kind not in {"tool_result", "artifact"} or set(value) not in expected:
                 raise ValueError("Unknown input reference contract")
             references[name] = value
         if len(references) > 16:
@@ -1372,7 +1385,16 @@ class AnalysisCapabilityDomain:
                     raise ValueError("Authenticated input evidence is unavailable")
                 evidence = (
                     await self._evidence_owner.authenticate_analysis_inputs(
-                        run, call, (str(reference["call_id"]),)
+                        # The runtime resolved a result_ref to its call; an
+                        # evidence_id names one visible child call directly.
+                        run,
+                        call,
+                        (
+                            str(
+                                reference.get("result_ref")
+                                or reference.get("evidence_id")
+                            ),
+                        ),
                     )
                 )[0]
                 if evidence.capability.access_mode is not AccessMode.READ and not (

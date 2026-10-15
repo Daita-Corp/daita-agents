@@ -514,7 +514,9 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert len(write_results) == 1 and not write_results[0].is_error
         assert isinstance(write_results[0].output["data"], Mapping)
         assert write_results[0].output["data"]["authorship"] == "model_derived"
-        assert write_results[0].output["data"]["evidence_call_ids"] == ("research",)
+        # Evidence is derived from earlier reads of the same table; the MCP
+        # research read is not one, so the receipt cites none.
+        assert write_results[0].output["data"]["evidence_call_ids"] == ()
         approval = next(
             item for item in approvals if item.capability_id == "data.upsert_rows"
         )
@@ -548,6 +550,54 @@ async def test_foreground_research_upsert_uses_authenticated_preview_and_one_rec
         assert "Connection: Company research" in document
         assert "Preview: 1 insert, 0 update, 0 unchanged" in document
         assert "Exact validated details:" in document
+    finally:
+        await agent.close()
+
+
+async def test_upsert_evidence_is_derived_from_earlier_reads_of_the_same_table(
+    tmp_path, monkeypatch
+):
+    (
+        agent,
+        provider,
+        db,
+        research,
+        binding,
+        resource,
+        constraints,
+        batch,
+        clock,
+        approvals,
+    ) = await create_fixture(tmp_path, monkeypatch)
+    try:
+        script(provider, binding, batch, schema=True)
+        result = await agent.run(
+            "Research companies doing business with Acme and save cited findings now."
+        )
+        assert result.reason == "completed"
+        transcript = await agent._embedded._store.load(result.run_id)
+        outputs = {
+            block.call_id: block
+            for message in transcript.messages
+            for block in message.content
+            if isinstance(block, ToolResultBlock)
+        }
+        assert not outputs["schema"].is_error
+        assert not outputs["research"].is_error
+        # Only the authenticated read of the written table is evidence; the
+        # unrelated MCP research read and the write's own preview are not.
+        for call_id in ("preview", "write"):
+            data = outputs[call_id].output["data"]
+            assert isinstance(data, Mapping)
+            assert data["evidence_call_ids"] == ("schema",)
+        approval = next(
+            item for item in approvals if item.capability_id == "data.upsert_rows"
+        )
+        assert "evidence_call_ids" not in dict(approval.arguments["arguments"])
+        definition = agent._embedded._capabilities.tool_definition("data_upsert_rows")
+        properties = definition.input_schema["properties"]
+        assert isinstance(properties, Mapping)
+        assert "evidence_call_ids" not in properties
     finally:
         await agent.close()
 
@@ -1176,11 +1226,14 @@ async def test_public_upsert_admission_cannot_invent_preview_evidence_or_insert_
                 confirmation_fingerprint=preview.confirmation_fingerprint,
             )
         name = "data_upsert_rows"
-        arguments = (
+        arguments: dict[str, object] = (
             {**batch, "mode": "apply", "preview_fingerprint": "sha256:" + "0" * 64}
             if invalid == "missing_preview"
             else {**batch, "mode": "preview"}
         )
+        if invalid == "missing_evidence":
+            # Evidence is runtime-derived; a model cannot cite invented ids.
+            arguments["evidence_call_ids"] = ("research",)
         provider.replace_script(
             (
                 response(

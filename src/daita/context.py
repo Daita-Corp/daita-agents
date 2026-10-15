@@ -91,6 +91,7 @@ from .llm.models import (
     ToolCall,
     ToolDefinition,
     ToolResultBlock,
+    tool_result_refs,
 )
 from .loop.models import ConversationRun, LoopExitKind, RunInput, RunOrigin
 from .loop.session import RunSessionOptions
@@ -1212,6 +1213,7 @@ class AgentContextBuilder:
             tools=tools,
             sensitivity=sensitivity,
             sensitivity_provenance=provenance,
+            tool_result_refs=tool_result_refs(messages).by_call_id,
             allow_parallel_tool_calls=(
                 True if tools and snapshot.profile.supports_parallel_tools else None
             ),

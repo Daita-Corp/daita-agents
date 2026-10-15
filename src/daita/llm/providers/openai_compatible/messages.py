@@ -6,7 +6,13 @@ from collections.abc import Mapping
 
 from ...._json import canonical_json
 from ...errors import ModelProviderError, ProviderErrorCode
-from ...models import CanonicalMessage, MessageRole, TextBlock, ToolResultBlock
+from ...models import (
+    CanonicalMessage,
+    MessageRole,
+    TextBlock,
+    ToolResultBlock,
+    model_tool_result,
+)
 
 _CONTINUATION_KEY = "openai_compatible_continuation"
 
@@ -14,6 +20,7 @@ _CONTINUATION_KEY = "openai_compatible_continuation"
 def _chat_messages(
     messages: tuple[CanonicalMessage, ...],
     provider_id: str,
+    result_refs: Mapping[str, str] | None = None,
 ) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     call_ids: dict[str, str] = {}
@@ -58,7 +65,9 @@ def _chat_messages(
                         "role": "tool",
                         "tool_call_id": call_ids.get(block.call_id, block.call_id),
                         "content": canonical_json(
-                            {"is_error": block.is_error, "output": block.output}
+                            model_tool_result(
+                                block, (result_refs or {}).get(block.call_id)
+                            )
                         ),
                     }
                 )

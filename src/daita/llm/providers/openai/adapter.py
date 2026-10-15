@@ -539,7 +539,9 @@ class OpenAIResponsesProvider:
     def _request_arguments(self, request: ModelRequest) -> dict[str, object]:
         arguments: dict[str, object] = {
             "model": self.model,
-            "input": _response_input(request.messages, self.provider_id),
+            "input": _response_input(
+                request.messages, self.provider_id, request.tool_result_refs
+            ),
             "include": ["reasoning.encrypted_content"],
             "service_tier": self._service_tier,
             "store": False,

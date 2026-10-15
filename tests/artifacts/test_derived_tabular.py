@@ -48,7 +48,7 @@ from daita.loop.models import Transcript
 from daita.storage.sqlite import SQLiteStateStore
 from daita.storage.sqlite_codecs import decode_message, encode_message
 from tests.support.mcp import MCPConformanceTransport, conformance_identities
-from tests.support.toolbox_model import ToolboxAwareMockModelProvider
+from tests.support.toolbox_model import ToolboxAwareMockModelProvider, result_ref
 from tests.support.workspace import workspace_for
 
 NOW = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
@@ -119,7 +119,7 @@ class _LineageTamperingProvider(ToolboxAwareMockModelProvider):
                         "columns": ["answer"],
                         "rows": [["alpha"]],
                         "format": "csv",
-                        "evidence_call_ids": ["evidence"],
+                        "evidence_refs": [result_ref("evidence")],
                     },
                 ),
                 ModelResponse(finish_reason=FinishReason.STOP, text="done"),
@@ -197,13 +197,13 @@ def test_artifact_create_tabular_is_one_bounded_source_neutral_tool() -> None:
         "rows",
         "format",
         "filename",
-        "evidence_call_ids",
+        "evidence_refs",
     }
     assert capability.input_schema.get("required") == (
         "columns",
         "rows",
         "format",
-        "evidence_call_ids",
+        "evidence_refs",
     )
     assert capability.input_schema.get("additionalProperties") is False
     assert "source_id" not in properties
@@ -214,7 +214,8 @@ def test_artifact_create_tabular_is_one_bounded_source_neutral_tool() -> None:
         "xlsx",
         "html",
     )
-    evidence = cast(Mapping[str, object], properties["evidence_call_ids"])
+    assert capability.result_ref_arguments == ("evidence_refs[]",)
+    evidence = cast(Mapping[str, object], properties["evidence_refs"])
     assert evidence["minItems"] == 1
     assert evidence["maxItems"] == 16
     assert evidence["uniqueItems"] is True
@@ -242,7 +243,7 @@ async def test_artifact_create_tabular_commits_derived_csv_from_current_run_evid
                     "rows": [["alpha", 1]],
                     "format": "csv",
                     "filename": "findings.csv",
-                    "evidence_call_ids": ["evidence"],
+                    "evidence_refs": [result_ref("evidence")],
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="done"),
@@ -313,7 +314,7 @@ async def test_mcp_result_can_feed_tabular_and_document_artifacts_with_inherited
                     "columns": ["answer"],
                     "rows": [["alpha"]],
                     "format": "csv",
-                    "evidence_call_ids": ["mcp-result"],
+                    "evidence_refs": [result_ref("mcp-result")],
                 },
             ),
             _call(
@@ -322,7 +323,6 @@ async def test_mcp_result_can_feed_tabular_and_document_artifacts_with_inherited
                 {
                     "format": "txt",
                     "content": "The admitted result was alpha.\n",
-                    "evidence_call_ids": ["mcp-result"],
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="done"),
@@ -363,6 +363,76 @@ async def test_mcp_result_can_feed_tabular_and_document_artifacts_with_inherited
     )
 
 
+async def test_document_evidence_is_derived_from_the_reads_before_it(
+    tmp_path: Path,
+) -> None:
+    alpha, _beta = conformance_identities()
+    factory = SDKMCPClientFactory(
+        http_transport=httpx.MockTransport(MCPConformanceTransport(alpha))
+    )
+    agent = await Agent.create(
+        "derived-document-evidence",
+        root=tmp_path,
+        clock=lambda: NOW,
+        mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
+    )
+    status = await agent.attach_mcp_server(
+        endpoint=alpha.endpoint,
+        maximum_outbound_sensitivity=ModelSensitivity.CONFIDENTIAL,
+        selections=(
+            MCPToolSelection(
+                remote_name="lookup",
+                local_alias="lookup",
+                description="Read one admitted fixture finding.",
+                result_sensitivity=ModelSensitivity.CONFIDENTIAL,
+            ),
+        ),
+    )
+    lookup = status.binding.tools[0].local_name
+    await agent.close()
+
+    document = {"format": "txt", "content": "Findings.\n"}
+    provider = ToolboxAwareMockModelProvider(
+        (
+            _call("early-document", DOCUMENT_CREATE_TOOL_NAME, document),
+            _call("read-a", lookup, {"query": "alpha"}),
+            _call("failed-read", lookup, {"query": ""}),
+            _call("read-b", lookup, {"query": "beta"}),
+            _call("document", DOCUMENT_CREATE_TOOL_NAME, document),
+            _call("read-c", lookup, {"query": "gamma"}),
+            ModelResponse(finish_reason=FinishReason.STOP, text="done"),
+        ),
+        provider_id="mock:derived-document-evidence",
+    )
+    reopened = await Agent.open(
+        "derived-document-evidence",
+        root=tmp_path,
+        clock=lambda: NOW,
+        model=provider,
+        model_profile=_profile(provider),
+        mcp_client_factory=factory,
+        workspace=workspace_for(tmp_path),
+    )
+    try:
+        result = await reopened.run("Read findings and write them up.")
+        transcript = await reopened.transcript(result.run_id)
+    finally:
+        await reopened.close()
+
+    assert _tool_result(transcript, "failed-read").is_error
+    early, late = result.artifacts
+    assert early.provenance.evidence_call_ids == ()
+    assert late.provenance.evidence_call_ids == ("read-a", "read-b")
+    document_call = next(
+        call
+        for message in transcript.messages
+        for call in message.tool_calls
+        if call.id == "document"
+    )
+    assert dict(document_call.arguments) == document
+
+
 async def test_artifact_create_tabular_rejects_cross_run_evidence(
     tmp_path: Path,
 ) -> None:
@@ -381,7 +451,7 @@ async def test_artifact_create_tabular_rejects_cross_run_evidence(
                     "columns": ["answer"],
                     "rows": [["alpha"]],
                     "format": "csv",
-                    "evidence_call_ids": ["evidence"],
+                    "evidence_refs": [result_ref("evidence")],
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="second done"),
@@ -410,7 +480,7 @@ async def test_artifact_create_tabular_rejects_cross_run_evidence(
     assert second.artifacts == ()
     table_result = _tool_result(transcript, "table")
     assert table_result.is_error is True
-    assert _error_code(table_result) == "artifact_evidence_invalid"
+    assert _error_code(table_result) == "result_ref_invalid"
 
 
 async def test_artifact_create_tabular_rejects_tampered_execution_lineage(
@@ -478,7 +548,7 @@ async def test_relational_evidence_preserves_exact_current_resource_bindings(
                     "columns": ["answer", "count"],
                     "rows": [["alpha", 1]],
                     "format": "html",
-                    "evidence_call_ids": ["query"],
+                    "evidence_refs": [result_ref("query")],
                 },
             ),
             ModelResponse(finish_reason=FinishReason.STOP, text="done"),
@@ -521,7 +591,7 @@ async def test_artifact_read_previews_model_authored_xlsx_data(
                     "columns": ["formula", "count"],
                     "rows": [["=1+1", 2]],
                     "format": "xlsx",
-                    "evidence_call_ids": ["evidence"],
+                    "evidence_refs": [result_ref("evidence")],
                 },
             ),
             _call(

@@ -254,7 +254,6 @@ async def create_fixture(
                 "evidence_url": "https://source.test/new",
             },
         ),
-        "evidence_call_ids": ("research",),
     }
     return (
         agent,
