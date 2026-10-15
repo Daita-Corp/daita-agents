@@ -2375,7 +2375,10 @@ def heartbeat_attempt(
         raise ValueError("heartbeat lease is outside its bound")
     prior = attempt.heartbeat_at or attempt.started_at
     if prior is not None and heartbeat_at < prior + timedelta(seconds=10):
-        raise ValueError("task heartbeat is rate limited")
+        # The caller paces on the monotonic clock but stamps with the wall
+        # clock, so a renewal can land slightly early. The lease is still
+        # fresh; skip the write rather than fail the running attempt.
+        return attempt
     if heartbeat_at >= attempt.absolute_deadline_at:
         return None
     renewed = replace(

@@ -475,7 +475,9 @@ class Evaluation:
         if self.cost_limit is None:
             return per_run is None and cumulative is None
         return (
-            Decimal(str(per_run)) == self.cost_limit
+            per_run is not None
+            and cumulative is not None
+            and Decimal(str(per_run)) == self.cost_limit
             and Decimal(str(cumulative)) == 2 * self.cost_limit
         )
 

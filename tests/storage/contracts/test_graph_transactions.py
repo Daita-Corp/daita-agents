@@ -458,6 +458,16 @@ async def test_checkpoint_comment_and_control_round_trip_transactionally(
         heartbeat_at=GRAPH_NOW + timedelta(seconds=11),
     )
     assert heartbeat is not None
+    early = await store.heartbeat_graph_attempt(
+        "agent-1",
+        "job-1",
+        "worker",
+        "attempt-1",
+        claim_token="attempt-1:claim",
+        fencing_epoch=attempt.fencing_epoch,
+        heartbeat_at=GRAPH_NOW + timedelta(seconds=20),
+    )
+    assert early == heartbeat  # an early renewal writes nothing and keeps the lease
     checkpoint = TaskCheckpoint(
         agent_id="agent-1",
         job_id="job-1",
