@@ -331,16 +331,15 @@ def _effective_run_limits(configured: LoopLimits, run: RunInput) -> LoopLimits:
     scope = run.execution_scope
     if scope is None:
         return configured
-    configured_cost = configured.max_estimated_cost_usd
-    scoped_cost = scope.per_run_max_cost_usd
+    costs = [
+        cost
+        for cost in (configured.max_estimated_cost_usd, scope.per_run_max_cost_usd)
+        if cost is not None
+    ]
     return replace(
         configured,
         max_total_tokens=min(configured.max_total_tokens, scope.per_run_max_tokens),
-        max_estimated_cost_usd=(
-            scoped_cost
-            if configured_cost is None
-            else min(configured_cost, scoped_cost)
-        ),
+        max_estimated_cost_usd=min(costs) if costs else None,
     )
 
 

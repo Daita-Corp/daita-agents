@@ -1482,7 +1482,6 @@ def _reviewer_task_from_control(
             "candidate_digest": candidate_digest,
             "model_route_id": route_id,
             "per_run_max_tokens": contract["per_run_max_tokens"],
-            "per_run_max_cost_usd": contract["per_run_max_cost_usd"],
             "attempt_budgets": {"work_units": 1},
         },
         authority=authority,

@@ -284,7 +284,6 @@ class ModelGraphIntegration:
             limits=LoopLimits(
                 max_steps=6,
                 max_total_tokens=loop_max_total_tokens,
-                max_estimated_cost_usd=Decimal(1),
             ),
             clock=resolved_clock,
         )
@@ -334,7 +333,6 @@ class ModelGraphIntegration:
         resource_count: int = 5,
         model_route_id: str = MODEL_ROUTE_ID,
         per_run_max_tokens: int = 10_000,
-        per_run_max_cost_usd: Decimal = Decimal(1),
     ) -> InitialTaskProposal:
         resource_ids = tuple(f"resource-{index}" for index in range(resource_count))
         capability_ids = _MODEL_CAPABILITY_IDS
@@ -363,7 +361,6 @@ class ModelGraphIntegration:
             max_steps=6,
             max_wall_time_seconds=300,
             per_run_max_tokens=per_run_max_tokens,
-            per_run_max_cost_usd=per_run_max_cost_usd,
         )
 
     def build(
@@ -372,7 +369,6 @@ class ModelGraphIntegration:
         resource_count: int = 5,
         model_route_id: str = MODEL_ROUTE_ID,
         per_run_max_tokens: int = 10_000,
-        per_run_max_cost_usd: Decimal = Decimal(1),
     ) -> GraphAdmission:
         return self.builder.build(
             run_id="run-" + "a" * 32,
@@ -385,7 +381,6 @@ class ModelGraphIntegration:
                 resource_count=resource_count,
                 model_route_id=model_route_id,
                 per_run_max_tokens=per_run_max_tokens,
-                per_run_max_cost_usd=per_run_max_cost_usd,
             ),
         )
 

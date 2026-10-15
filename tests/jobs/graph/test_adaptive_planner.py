@@ -174,6 +174,12 @@ async def test_model_graph_harness_propagates_independent_token_ceilings(
         planner_result = planner_specification["expected_result_contract"]
         assert isinstance(planner_result, Mapping)
         assert planner_result["per_run_max_tokens"] == 80_000
+        # Graph work is bounded by turns, tokens, time and attempts, never dollars.
+        assert loop._limits.max_estimated_cost_usd is None
+        assert (
+            "per_run_max_cost_usd" not in worker.specification.expected_result_contract
+        )
+        assert "per_run_max_cost_usd" not in planner_result
     finally:
         await integration.close()
 
