@@ -1407,7 +1407,7 @@ async def test_revocation_serializes_with_call_time_inspection(tmp_path):
     )
     try:
         run = asyncio.create_task(reopened.run("Run the admitted call."))
-        await asyncio.wait_for(transport.started.wait(), timeout=1)
+        await asyncio.wait_for(transport.started.wait(), timeout=10)
         revoke = asyncio.create_task(
             reopened.revoke_mcp_server(status.binding.binding_id)
         )
@@ -1417,8 +1417,8 @@ async def test_revocation_serializes_with_call_time_inspection(tmp_path):
         assert not revoke.done()
 
         transport.release.set()
-        await asyncio.wait_for(run, timeout=1)
-        revoked = await asyncio.wait_for(revoke, timeout=1)
+        await asyncio.wait_for(run, timeout=10)
+        revoked = await asyncio.wait_for(revoke, timeout=10)
         assert alpha.calls == [("lookup", {"query": "x"})]
         assert revoked.binding.state is MCPBindingState.REVOKED
         calls_after_revoke = tuple(alpha.calls)

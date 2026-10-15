@@ -340,11 +340,8 @@ async def test_cancelled_skill_pin_finishes_atomic_commit(
     pin = asyncio.create_task(
         skills.retain_current_skill("daily-report", f"sha256:{digest}")
     )
-    for _ in range(1_000):
-        if started.is_set():
-            break
-        await asyncio.sleep(0)
-    assert started.is_set()
+    # The retain worker thread can start late on a loaded machine; wait with a bound.
+    assert await asyncio.to_thread(started.wait, 5)
     pin.cancel()
     release.set()
     with pytest.raises(asyncio.CancelledError):

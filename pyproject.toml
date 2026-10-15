@@ -81,6 +81,9 @@ pythonpath = ["src", "."]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 addopts = "--tb=short -q --strict-markers --ignore=tests/live --ignore=tests/slow"
+# A test still running after this many seconds dumps every thread's stack, so a
+# hang names itself instead of silently holding a worker.
+faulthandler_timeout = 300
 markers = [
     "unit: fast isolated tests",
     "contract: portable contract tests",

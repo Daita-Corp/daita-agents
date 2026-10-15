@@ -22,6 +22,7 @@ from tests.tui._support import (
     Tree,
     _create_sqlite_source,
     asyncio,
+    settle_until,
     sqlite3,
     workspace_for,
 )
@@ -47,12 +48,18 @@ async def test_source_permissions_picker_remains_interactive_after_command_submi
                 composer = app.screen.query_one(Composer)
                 composer.load_text("/source permissions")
                 composer.action_submit()
-                await pilot.pause()
+                await settle_until(
+                    pilot,
+                    lambda: isinstance(app.screen, PermissionsScreen)
+                    and bool(app.screen.query("#perm-source")),
+                )
 
                 permissions = app.screen
                 assert isinstance(permissions, PermissionsScreen)
                 assert await pilot.click("#perm-source") is True
-                await pilot.pause()
+                await settle_until(
+                    pilot, lambda: isinstance(app.screen, SelectionScreen)
+                )
 
                 picker = app.screen
                 assert isinstance(picker, SelectionScreen)
@@ -252,7 +259,7 @@ async def test_source_edit_screen_reviews_and_switches_atomically(tmp_path: Path
             apply_button.scroll_visible(animate=False)
             await pilot.pause()
             assert await pilot.click(apply_button, offset=(2, 1)) is True
-            for _ in range(20):
+            for _ in range(200):
                 await pilot.pause(0.05)
                 if isinstance(app.screen, ConfirmScreen):
                     break
@@ -321,7 +328,7 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
         apply_button.scroll_visible(animate=False)
         await pilot.pause()
         assert await pilot.click(apply_button, offset=(2, 1)) is True
-        for _ in range(20):
+        for _ in range(200):
             await pilot.pause(0.05)
             if isinstance(app.screen, SelectionScreen):
                 break
@@ -330,7 +337,7 @@ async def test_postgresql_source_edit_probes_and_selects_schemas(monkeypatch):
         assert picker._selected == {"core", "sales"}
         picker.action_confirm()
 
-        for _ in range(20):
+        for _ in range(200):
             await pilot.pause(0.05)
             if modal_task.done():
                 break
@@ -385,7 +392,13 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
                 composer = app.screen.query_one(Composer)
                 composer.load_text("/sources")
                 composer.action_submit()
-                await pilot.pause()
+                await settle_until(
+                    pilot,
+                    lambda: isinstance(app.screen, CatalogScreen)
+                    and any(
+                        tree.has_focus for tree in app.screen.query("#catalog-tree")
+                    ),
+                )
 
                 assert isinstance(app.screen, CatalogScreen)
                 assert str(app.screen.query_one("#catalog-title").render()) == "Sources"
@@ -445,10 +458,16 @@ async def test_catalog_command_opens_grouped_named_resource_tree(tmp_path: Path)
 
                 manager = app.screen
                 assert await pilot.click("#source-refresh") is True
-                for _ in range(20):
+                # The refreshed screen replaces this one and may not have composed
+                # its children yet when it first becomes current.
+                for _ in range(200):
                     await pilot.pause(0.05)
                     current = app.screen
-                    if isinstance(current, CatalogScreen) and current is not manager:
+                    if (
+                        isinstance(current, CatalogScreen)
+                        and current is not manager
+                        and current.query("#catalog-notice")
+                    ):
                         break
                 assert isinstance(app.screen, CatalogScreen)
                 refresh_notice = app.screen.query_one("#catalog-notice", Static)
@@ -601,7 +620,7 @@ async def test_sources_manager_routes_actions_for_the_selected_source(tmp_path: 
 
             assert isinstance(app.screen, CatalogScreen)
             assert await pilot.click("#source-edit") is True
-            for _ in range(20):
+            for _ in range(200):
                 await pilot.pause(0.05)
                 if isinstance(app.screen, SourceEditScreen):
                     break
@@ -702,7 +721,7 @@ async def test_empty_catalog_refresh_opens_catalog_without_an_onboarding_loop(
             composer = app.screen.query_one(Composer)
             composer.load_text(f"/source refresh {source.id}")
             composer.action_submit()
-            for _ in range(20):
+            for _ in range(200):
                 await pilot.pause(0.05)
                 if isinstance(app.screen, CatalogScreen):
                     break

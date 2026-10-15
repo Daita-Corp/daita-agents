@@ -114,10 +114,14 @@ async def test_tabs_show_one_view_preserve_draft_and_fit_terminal(tmp_path, size
             assert chat.section == "chat" and chat.focused is composer
             assert not transcript.is_empty
             assert composer.text == "unsent question"
+            # Resize and the 2s background poll both refresh status from the
+            # controller; give it the same model so a late refresh agrees.
+            model = "provider/long-model-name-with-extra-identifiers"
+            app.controller.model_label = lambda: model  # type: ignore[method-assign]
             await pilot.resize_terminal(*size)
             chat.set_status(
                 agent="A long agent name that needs truncation",
-                model="provider/long-model-name-with-extra-identifiers",
+                model=model,
                 source="All readable sources",
                 state="ready",
                 source_count=50,
